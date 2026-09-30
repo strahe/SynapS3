@@ -277,8 +277,8 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"max_open_conns = 4",
 		"max_size_gb = 100",
 		"eviction_policy = \"lru\"",
-		"lru_high_watermark_percent = 90",
-		"lru_low_watermark_percent = 80",
+		"lru_high_watermark_percent = 80",
+		"lru_low_watermark_percent = 50",
 	} {
 		assertConfigLacksEnabledLine(t, text, disabled)
 	}

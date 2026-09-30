@@ -82,7 +82,7 @@ func TestDiscardOrphanedContentsKeepsNamedContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureContent: %v", err)
 	}
-	if _, err := tb.cache.Put(ctx, bucket.Name, model.ContentCacheKey(orphan.ID), strings.NewReader(body)); err != nil {
+	if _, err := tb.cache.Put(ctx, bucket.Name, model.ContentCacheKey(orphan.ID), strings.NewReader(body), int64(len(body))); err != nil {
 		t.Fatalf("caching orphan bytes: %v", err)
 	}
 

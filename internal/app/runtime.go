@@ -19,6 +19,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/s3access"
@@ -150,6 +151,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		ParkedPieces:     pdpStatusChecker,
 		EvictionPolicy:   evictionPolicy,
 		MaxCacheBytes:    maxCacheBytes,
+		MaxWriteBytes:    objectlimits.MaxFOCUploadSize,
 		LRUHighPercent:   cfg.Cache.LRUHighWatermarkPercent,
 		LRULowPercent:    cfg.Cache.LRULowWatermarkPercent,
 		DefaultCopies:    cfg.Filecoin.DefaultCopies,

@@ -6,8 +6,13 @@ import (
 	"io"
 )
 
-// ErrCacheFull is returned when the cache has reached its maximum capacity.
+// ErrCacheFull is returned when the cache cannot hold a write's size on top of
+// committed and in-progress writes.
 var ErrCacheFull = errors.New("cache: storage capacity exceeded")
+
+// ErrSizeExceeded is returned when a write supplies more bytes than the size it
+// reserved.
+var ErrSizeExceeded = errors.New("cache: write exceeds its declared size")
 
 // ErrInvalidPath is returned when a bucket or key would escape the cache root.
 var ErrInvalidPath = errors.New("cache: invalid path (traversal attempt)")
@@ -49,16 +54,19 @@ type Cache interface {
 	// Put writes data to the cache under the given bucket/key and returns
 	// the resulting metadata (path, size, etag, checksum).
 	// The data is fsync'd before returning to guarantee durability.
-	// Returns ErrCacheFull if the cache has reached its maximum capacity.
+	// size is the most bytes r may supply; the write holds that much capacity
+	// before reading r and returns ErrCacheFull without reading when the cache
+	// cannot hold it, or ErrSizeExceeded when r supplies more.
 	// Returns ErrInvalidPath if bucket/key would escape the cache root.
-	Put(ctx context.Context, bucket, key string, r io.Reader) (*ObjectInfo, error)
+	Put(ctx context.Context, bucket, key string, r io.Reader, size int64) (*ObjectInfo, error)
 
 	// PutStaged writes data to a temp file (fsync'd) without replacing the
 	// existing cache entry. Returns a StagedObject whose Commit method
 	// atomically renames the temp file to the final path. If Commit is not
-	// called, Rollback removes the temp file.
+	// called, Rollback removes the temp file. The capacity held for size, as
+	// in Put, lasts until Commit or Rollback.
 	// Callers choose whether to commit before or after their DB transaction.
-	PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*StagedObject, error)
+	PutStaged(ctx context.Context, bucket, key string, r io.Reader, size int64) (*StagedObject, error)
 
 	// Get opens a cached object for reading. Returns os.ErrNotExist if the
 	// object is not in the cache.
@@ -72,8 +80,12 @@ type Cache interface {
 	// Exists reports whether an object is present in the cache.
 	Exists(ctx context.Context, bucket, key string) bool
 
-	// UsedBytes returns the total bytes consumed by cached objects.
+	// UsedBytes returns the total bytes consumed by committed cached objects.
 	UsedBytes() int64
+
+	// ConsumeWriteRefusal reports whether a write was refused with
+	// ErrCacheFull since the previous call, and clears that record.
+	ConsumeWriteRefusal() bool
 
 	// CreateBucketDir ensures the directory for a bucket exists.
 	// Returns ErrInvalidPath if bucket would escape the cache root.
@@ -85,14 +97,16 @@ type Cache interface {
 
 	// PutPart writes a multipart upload part to the cache.
 	// Parts are stored under .multipart/<uploadID>/<partNumber>.
+	// size bounds and reserves the part as in Put.
 	// Returns ObjectInfo with the part's Size, ETag (MD5), and Checksum (SHA-256).
-	PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader) (*ObjectInfo, error)
+	PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*ObjectInfo, error)
 
 	// AssemblePartsStaged concatenates the specified parts in order into a
 	// staged file next to bucket/key, plus the ordered list of individual part
 	// MD5 hex digests (for S3 ETag computation). The caller names the final
 	// destination through Commit or CommitAs once the assembled checksum has
 	// resolved a content row. The part files are NOT deleted; call DeleteUpload.
+	// Capacity for the assembled size is held before assembly starts.
 	AssemblePartsStaged(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*StagedObject, []string, error)
 
 	// DeleteUpload removes all part files for the given upload ID.

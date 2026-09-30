@@ -193,7 +193,7 @@ The request returns `409 Conflict` when the selected version is a delete marker 
 }
 ```
 
-A missing or permanently deleted source returns `404 Not Found`; insufficient cache capacity returns `507 Insufficient Storage`; invalid input returns `400 Bad Request`; source read and internal failures return `500 Internal Server Error`.
+A missing or permanently deleted source returns `404 Not Found`; insufficient cache capacity returns `503 Service Unavailable`; invalid input returns `400 Bad Request`; source read and internal failures return `500 Internal Server Error`.
 
 The restore streams synchronously for up to one hour and requires enough cache capacity for the new destination version.
 

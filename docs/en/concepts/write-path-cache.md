@@ -40,13 +40,13 @@ Repeated reads of the same version coalesce access-time updates to at most one d
 
 | Policy | Behavior |
 | --- | --- |
-| `lru` | At the high capacity watermark, queue the least recently accessed remotely safe versions until planned usage reaches the low watermark. |
+| `lru` | At the high capacity watermark, or when a write is refused because the cache is full, queue the least recently accessed remotely safe versions until planned usage reaches the low watermark. |
 | `after_upload` | Queue each version for removal after its bucket's minimum durable copies commit. |
 | `none` | Do not create or run automatic cache eviction work. |
 
 A bucket is created with the minimum equal to its replica target, so cache is released only once every replica of an upload is stored. In the dashboard, set this on the bucket under Settings → Replica policy. An operator can set an explicit count from 1 through the current target. That count stays if Replicas later increases. Replicas itself can only be raised: lowering it is not supported, so those options are shown but not selectable. Lowering the threshold makes retained cache eligible for removal while remaining replicas continue syncing. Actual removal still follows `after_upload`, `lru`, or `none`. The minimum is clamped to each upload's target. Raising it affects cache that still exists; it cannot recreate cache that has already been deleted.
 
-Only versions that currently meet their minimum and have a readable committed remote copy are eligible. Eviction checks the current minimum again before authorizing deletion and waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `507 Insufficient Storage` when cleanup cannot keep pace or no safe candidate exists.
+Only versions that currently meet their minimum and have a readable committed remote copy are eligible. Eviction checks the current minimum again before authorizing deletion and waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `503 SlowDown` when cleanup cannot keep pace or no safe candidate exists.
 
 ## Multipart Uploads
 
@@ -59,7 +59,7 @@ Multipart uploads keep parts in local storage until completion. Completing an up
 | Cache disk is full | New writes can fail before Filecoin storage is involved. |
 | Background storage is not running | Confirmed writes remain local, but remote storage will not progress. |
 | Cache entry is evicted | Reads can still succeed when remote metadata exists and retrieval works. |
-| LRU has no safe candidate | Existing unsafe or in-progress data remains local; new writes can still fail with insufficient storage. |
+| LRU has no safe candidate | Existing unsafe or in-progress data remains local; new writes can still be refused with `SlowDown`. |
 | Database commit fails | The S3 write does not return success. |
 
 For capacity and recovery steps, see [Runtime Data](../configuration/runtime-data.md) and [Troubleshooting](../operations/troubleshooting.md).

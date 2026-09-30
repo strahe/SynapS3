@@ -47,7 +47,7 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatalf("reading rehydrate body: %v", err)
@@ -136,7 +136,7 @@ func TestOpenVersionForCopyUsesProviderWithoutRehydratingSourceCache(t *testing.
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, _ io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, _ io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			putCalls++
 			return nil, errors.New("unexpected source cache rehydration")
 		},
@@ -205,7 +205,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatalf("reading rehydrate body: %v", err)
@@ -576,7 +576,7 @@ func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			_, _ = io.Copy(io.Discard, r)
 			return nil, errors.New("cache full")
 		},
@@ -639,7 +639,7 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatalf("reading rehydrate body: %v", err)
@@ -704,7 +704,7 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatalf("reading rehydrate body: %v", err)

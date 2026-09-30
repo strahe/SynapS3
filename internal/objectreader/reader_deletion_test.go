@@ -38,7 +38,7 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			putCalls++
 			data, err := io.ReadAll(r)
 			if err != nil {

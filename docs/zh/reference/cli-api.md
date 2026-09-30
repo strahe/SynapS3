@@ -80,7 +80,7 @@ synaps3 admin s3-user update <access-key> --name "归档客户端"
 synaps3 admin s3-user rotate-secret <access-key>
 synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
-synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_percent=90 cache.lru_low_watermark_percent=80
+synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_percent=80 cache.lru_low_watermark_percent=50
 synaps3 admin task stats
 synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42

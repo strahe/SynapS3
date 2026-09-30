@@ -92,8 +92,8 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
-| `cache.lru_high_watermark_percent` | `90` |
-| `cache.lru_low_watermark_percent` | `80` |
+| `cache.lru_high_watermark_percent` | `80` |
+| `cache.lru_low_watermark_percent` | `50` |
 | `worker.tasks.concurrency` | `12` |
 | `worker.tasks.poll_interval` | `5s` |
 | `worker.tasks.lease_duration` | `5m` |
@@ -127,7 +127,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 
 Cache eviction policies have these user-visible results:
 
-- `lru`: when cache usage reaches the high watermark, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark.
+- `lru`: when cache usage reaches the high watermark, or a write is refused because the cache is full, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark. The effective low watermark never leaves less than one largest object (`1,065,353,216` bytes) of free space, which matters only for small caches.
 - `after_upload`: after a version meets its bucket's minimum durable copies, SynapS3 queues it for asynchronous removal. A later remote read can restore the cache, and that restored entry is not immediately removed again.
 - `none`: SynapS3 does not automatically remove local cache data.
 
@@ -136,11 +136,11 @@ The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain sav
 ```toml
 [cache]
 eviction_policy = "lru"
-lru_high_watermark_percent = 90
-lru_low_watermark_percent = 80
+lru_high_watermark_percent = 80
+lru_low_watermark_percent = 50
 ```
 
-Eviction settings take effect after restart. Cache cleanup is asynchronous: a `PutObject` does not wait for or trigger an immediate LRU pass.
+Eviction settings take effect after restart. Cache cleanup is asynchronous: a write does not wait for an LRU pass, and a refused write only requests the next one.
 
 ## High-Risk Fields
 

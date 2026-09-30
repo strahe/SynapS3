@@ -320,7 +320,7 @@ func (r *Reader) streamAndRehydrate(
 					skipRehydration = true
 					return nil
 				}
-				_, err = r.cache.Put(ctx, bucket, cacheKey, pr)
+				_, err = r.cache.Put(ctx, bucket, cacheKey, pr, persistedVersion.Size)
 				if err != nil {
 					return err
 				}

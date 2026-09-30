@@ -251,7 +251,7 @@ func (u *cacheBackedObjectUploader) PutObject(ctx context.Context, input s3respo
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
-	info, err := u.cache.Put(ctx, *input.Bucket, model.ContentCacheKey(content.ID), bytes.NewReader(body))
+	info, err := u.cache.Put(ctx, *input.Bucket, model.ContentCacheKey(content.ID), bytes.NewReader(body), int64(len(body)))
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -708,7 +708,7 @@ func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repos
 	if err != nil {
 		t.Fatalf("Contents.EnsureContent: %v", err)
 	}
-	info, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(body))
+	info, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(body), int64(len(body)))
 	if err != nil {
 		t.Fatalf("cache.Put: %v", err)
 	}
@@ -4897,7 +4897,12 @@ func TestAPIBucketObjectUpload_MapsUploaderErrors(t *testing.T) {
 	}{
 		{name: "s3 api error", err: s3err.GetAPIError(s3err.ErrNoSuchBucket), status: http.StatusNotFound},
 		{name: "typed s3 error", err: s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, "0"), status: http.StatusBadRequest, wantError: "InvalidArgument"},
-		{name: "cache full", err: fmt.Errorf("staging object: %w", cache.ErrCacheFull), status: http.StatusInsufficientStorage},
+		{
+			name:      "slow down shows its reason",
+			err:       s3err.APIError{Code: "SlowDown", Description: "The local cache is full. Please retry later.", HTTPStatusCode: http.StatusServiceUnavailable},
+			status:    http.StatusServiceUnavailable,
+			wantError: "The local cache is full. Please retry later.",
+		},
 		{
 			name:      "http max bytes",
 			err:       fmt.Errorf("staging object: %w", &http.MaxBytesError{Limit: int64(chain.MaxUploadSize)}),
@@ -5035,7 +5040,7 @@ func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureContent old: %v", err)
 	}
-	oldInfo, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(oldContent.ID), strings.NewReader("old admin"))
+	oldInfo, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(oldContent.ID), strings.NewReader("old admin"), int64(len("old admin")))
 	if err != nil {
 		t.Fatalf("cache.Put old: %v", err)
 	}
@@ -5061,7 +5066,7 @@ func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureContent new: %v", err)
 	}
-	newInfo, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(newContent.ID), strings.NewReader("new admin"))
+	newInfo, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(newContent.ID), strings.NewReader("new admin"), int64(len("new admin")))
 	if err != nil {
 		t.Fatalf("cache.Put new: %v", err)
 	}

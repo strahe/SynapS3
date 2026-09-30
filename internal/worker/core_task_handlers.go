@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -58,6 +59,7 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}
+	var pendingWriteRefusal atomic.Bool
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		if h.deps.EvictionPolicy != cache.EvictionPolicyLRU {
 			return taskengine.Suspend(model.TaskResumeModeExecute, taskGCInterval, "scheduled", "Automatic cache cleanup is disabled", nil)
@@ -74,17 +76,25 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		}
 		usedBytes := h.deps.Cache.UsedBytes()
 		highBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRUHighPercent)
-		lowBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent)
+		lowBytes := h.lruLowBytes()
+		// A refused write starts a cycle below the high watermark too: when the
+		// headroom above it is smaller than the write, usage would otherwise never
+		// reach the watermark and the write would be refused indefinitely.
+		writeRefused := pendingWriteRefusal.Swap(false)
+		writeRefused = h.deps.Cache.ConsumeWriteRefusal() || writeRefused
 		cycleActive := checkpoint.CycleActive
 		switch {
 		case usedBytes <= lowBytes:
 			cycleActive = false
-		case usedBytes >= highBytes:
+		case usedBytes >= highBytes, writeRefused:
 			cycleActive = true
 		}
 		if cycleActive != checkpoint.CycleActive {
 			checkpoint.CycleActive = cycleActive
 			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+				if writeRefused {
+					pendingWriteRefusal.Store(true)
+				}
 				return retryTask(err, "cache_capacity_checkpoint_failed")
 			}
 		}
@@ -228,7 +238,7 @@ func (h *TaskHandlers) runCacheEviction(
 				result = h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
 				return
 			}
-			if h.deps.Cache.UsedBytes() <= cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent) {
+			if h.deps.Cache.UsedBytes() <= h.lruLowBytes() {
 				result = h.cancelCacheEviction(input, execution.ID(), "Local cache usage reached its target")
 				return
 			}
@@ -401,7 +411,7 @@ func (h *TaskHandlers) reserveLRUDeletion(size int64) bool {
 	if h.lruInFlightDeletes == 0 {
 		h.lruProjectedBytes = h.deps.Cache.UsedBytes()
 	}
-	if h.lruProjectedBytes <= cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent) {
+	if h.lruProjectedBytes <= h.lruLowBytes() {
 		return false
 	}
 	h.lruProjectedBytes -= size
@@ -420,6 +430,13 @@ func (h *TaskHandlers) finishLRUDeletion(size int64, deleted bool) {
 		h.lruInFlightDeletes = 0
 		h.lruProjectedBytes = 0
 	}
+}
+
+// lruLowBytes is the usage LRU cleanup brings the cache down to: the low
+// watermark, or less when it would leave no room for the largest write.
+func (h *TaskHandlers) lruLowBytes() int64 {
+	lowBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent)
+	return max(0, min(lowBytes, h.deps.MaxCacheBytes-h.deps.MaxWriteBytes))
 }
 
 func cacheWatermarkBytes(maxBytes int64, percent int) int64 {

@@ -88,12 +88,18 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		return nil, s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, fmt.Sprint(*input.PartNumber))
 	}
 
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(input.Body))
+	// A part is reserved at its declared length, so an oversized one is rejected
+	// before it can be mistaken for a full cache.
+	if input.ContentLength != nil && *input.ContentLength > objectlimits.MaxFOCUploadSize {
+		return nil, objectSizeAPIError(&objectlimits.SizeError{Size: *input.ContentLength, Err: objectlimits.ErrTooLarge})
+	}
+
+	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(input.Body), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {
 			return nil, objectSizeAPIError(err)
 		}
-		return nil, fmt.Errorf("caching part: %w", err)
+		return nil, contentWriteError(fmt.Errorf("caching part: %w", err))
 	}
 
 	part := &model.MultipartPart{
@@ -161,12 +167,12 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 	}
 	defer func() { _ = srcResult.Body.Close() }()
 
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(srcResult.Body))
+	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(srcResult.Body), srcResult.Size)
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {
 			return s3response.CopyPartResult{}, objectSizeAPIError(err)
 		}
-		return s3response.CopyPartResult{}, fmt.Errorf("caching copied part: %w", err)
+		return s3response.CopyPartResult{}, contentWriteError(fmt.Errorf("caching copied part: %w", err))
 	}
 
 	part := &model.MultipartPart{
@@ -294,7 +300,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	// only nameable once the assembled checksum resolves a content row.
 	staged, _, err := b.cache.AssemblePartsStaged(ctx, bucketName, stagingCacheKey(versionID), uploadID, partNumbers)
 	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("assembling parts: %w", err)
+		return s3response.CompleteMultipartUploadResult{}, "", contentWriteError(fmt.Errorf("assembling parts: %w", err))
 	}
 	defer func() { _ = staged.Rollback() }()
 	cacheInfo := staged.Info

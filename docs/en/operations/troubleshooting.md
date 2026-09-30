@@ -94,7 +94,7 @@ Successful faucet claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`
 
 ## Cache Full
 
-Upload endpoints can fail when cache capacity is exhausted. Check usage:
+When the local cache cannot hold a write, S3 clients and dashboard uploads receive `503 SlowDown`. Uploads in progress hold cache capacity for their full size, so a new upload can be refused while reported usage is still below the limit. Completing a multipart upload needs free capacity for the assembled object in addition to its parts. Check usage:
 
 ```bash
 synaps3 admin status
@@ -112,7 +112,7 @@ Recovery options:
 - Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable copies commit.
 - Use `none` when automatic removal must be disabled.
 
-LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. A write does not synchronously run cleanup, so `507 Insufficient Storage` can continue until background cleanup catches up or safe candidates become available.
+LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. With `lru`, a refused write requests background cleanup when usage exceeds the effective low watermark. Writes do not wait for cleanup, so `503 SlowDown` can continue until cleanup catches up or safe candidates become available. Default S3 client retries may give up sooner; retry the upload later.
 
 Failed LRU deletion tasks remain visible as failed work. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` when the task is marked retryable.
 

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectlimits"
@@ -90,6 +89,10 @@ func (s *Server) handleAPIRestoreObjectVersion(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) writeObjectVersionRestoreError(w http.ResponseWriter, err error, bucketName, key, sourceVersionID string) {
+	if reason, ok := slowDownReason(err); ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": reason})
+		return
+	}
 	switch {
 	case errors.Is(err, repository.ErrInvalidInput), errors.Is(err, objectlimits.ErrTooSmall), errors.Is(err, objectlimits.ErrTooLarge):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid restore request"})
@@ -102,8 +105,6 @@ func (s *Server) writeObjectVersionRestoreError(w http.ResponseWriter, err error
 		})
 	case errors.Is(err, repository.ErrConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "object versions changed; refresh and confirm the restore again"})
-	case errors.Is(err, cache.ErrCacheFull):
-		writeJSON(w, http.StatusInsufficientStorage, map[string]string{"error": "cache capacity exceeded"})
 	default:
 		s.logger.Error("api: failed to restore object version", "error", err, "bucket", bucketName, "key", key, "sourceVersionID", sourceVersionID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})

@@ -159,7 +159,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"cache.lru_low_watermark_percent": {
 		Label:       "LRU Low Watermark",
-		Description: "Stops LRU cache cleanup after usage falls to this percentage of the configured maximum. Restart required.",
+		Description: "Sets the LRU cleanup target as a percentage of cache capacity. Cleanup may go lower to leave room for the largest supported object. Restart required.",
 		Env:         "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT",
 		Editable:    true,
 	},

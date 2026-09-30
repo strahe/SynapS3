@@ -87,7 +87,7 @@ func putTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body string
 	if err != nil {
 		t.Fatalf("seeding content %s/%s: %v", bucket, key, err)
 	}
-	info, err := tb.cache.Put(ctx, bucket, model.ContentCacheKey(content.ID), strings.NewReader(body))
+	info, err := tb.cache.Put(ctx, bucket, model.ContentCacheKey(content.ID), strings.NewReader(body), int64(len(body)))
 	if err != nil {
 		t.Fatalf("seeding cache object %s/%s: %v", bucket, key, err)
 	}
@@ -539,7 +539,7 @@ func TestPutObject_HappyPath(t *testing.T) {
 	}
 }
 
-func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
+func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
 	tests := []struct {
 		name          string
 		body          string
@@ -557,6 +557,12 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 			contentLength: ptrInt64(chain.MaxUploadSize + 1),
 			wantCode:      s3err.ErrEntityTooLarge,
 		},
+		{
+			name:          "body longer than declared length",
+			body:          validTestObjectBody("body") + "x",
+			contentLength: ptrInt64(chain.MinUploadSize),
+			wantCode:      s3err.ErrContentLengthMismatch,
+		},
 	}
 
 	for _, tt := range tests {
@@ -572,7 +578,7 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 				ContentLength: tt.contentLength,
 			})
 			if err == nil {
-				t.Fatal("expected size limit error")
+				t.Fatal("expected body size error")
 			}
 			apiErr, ok := err.(s3err.APIError)
 			if !ok {
@@ -580,6 +586,9 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 			}
 			if want := s3err.GetAPIError(tt.wantCode); apiErr.Code != want.Code {
 				t.Fatalf("error code = %s, want %s", apiErr.Code, want.Code)
+			}
+			if used := tb.cache.UsedBytes(); used != 0 {
+				t.Fatalf("rejected body left %d bytes in the cache", used)
 			}
 		})
 	}
@@ -711,27 +720,126 @@ func TestPutObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	}
 }
 
-func TestPutObject_CacheFull(t *testing.T) {
-	mc := &synaps3testutil.MockCache{
-		PutStagedFunc: func(_ context.Context, _, _ string, _ io.Reader) (*cache.StagedObject, error) {
-			return nil, cache.ErrCacheFull
-		},
-		CreateBucketDirFunc: func(_ context.Context, _ string) error { return nil },
-	}
-	tb := newTestBackendWithMockCache(t, mc)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "full-bucket")
+// unreadObjectBody fails the test when a refused write reads its body.
+type unreadObjectBody struct{ t *testing.T }
 
-	_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: aws.String("full-bucket"),
-		Key:    aws.String("file.txt"),
-		Body:   strings.NewReader(validTestObjectBody("data")),
-	})
-	if err == nil {
-		t.Fatal("expected error when cache is full")
+func (b unreadObjectBody) Read([]byte) (int, error) {
+	b.t.Error("refused write read its body")
+	return 0, io.EOF
+}
+
+func TestWritesReportFullCacheAsSlowDown(t *testing.T) {
+	// Two versions and one part fill 381 bytes of a 400-byte cache, so no
+	// further 127-byte write fits.
+	fsCache := newTestCache(t, 400)
+	tb := newTestBackendWithCache(t, fsCache)
+	ctx := context.Background()
+	const bucket = "full-bucket"
+	seedActiveBucket(t, tb, bucket)
+	put := func(key, seed string) string {
+		t.Helper()
+		body := validTestObjectBody(seed)
+		out, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+			Bucket:        aws.String(bucket),
+			Key:           aws.String(key),
+			Body:          strings.NewReader(body),
+			ContentLength: ptrInt64(int64(len(body))),
+		})
+		if err != nil {
+			t.Fatalf("PutObject(%s): %v", key, err)
+		}
+		return out.VersionID
 	}
-	if !errors.Is(err, cache.ErrCacheFull) && !strings.Contains(err.Error(), "cache") {
-		t.Errorf("unexpected error: %v", err)
+	oldVersion := put("file.txt", "old")
+	currentVersion := put("file.txt", "new")
+	upload, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("assembled.bin"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	partBody := validTestObjectBody("part")
+	firstPart := int32(1)
+	partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:        aws.String(bucket),
+		Key:           aws.String("assembled.bin"),
+		UploadId:      aws.String(upload.UploadId),
+		PartNumber:    &firstPart,
+		Body:          strings.NewReader(partBody),
+		ContentLength: ptrInt64(int64(len(partBody))),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	usedBefore := fsCache.UsedBytes()
+	secondPart := int32(2)
+
+	tests := []struct {
+		name  string
+		write func() error
+	}{
+		{name: "PutObject", write: func() error {
+			_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+				Bucket:        aws.String(bucket),
+				Key:           aws.String("new.txt"),
+				Body:          unreadObjectBody{t},
+				ContentLength: ptrInt64(chain.MinUploadSize),
+			})
+			return err
+		}},
+		{name: "CopyObject", write: func() error {
+			_, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
+				Bucket:     aws.String(bucket),
+				Key:        aws.String("copy.txt"),
+				CopySource: aws.String("/" + bucket + "/file.txt"),
+			})
+			return err
+		}},
+		{name: "UploadPart", write: func() error {
+			_, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket:        aws.String(bucket),
+				Key:           aws.String("assembled.bin"),
+				UploadId:      aws.String(upload.UploadId),
+				PartNumber:    &secondPart,
+				Body:          unreadObjectBody{t},
+				ContentLength: ptrInt64(chain.MinUploadSize),
+			})
+			return err
+		}},
+		{name: "UploadPartCopy", write: func() error {
+			_, err := tb.backend.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+				Bucket:     aws.String(bucket),
+				Key:        aws.String("assembled.bin"),
+				UploadId:   aws.String(upload.UploadId),
+				PartNumber: &secondPart,
+				CopySource: aws.String("/" + bucket + "/file.txt"),
+			})
+			return err
+		}},
+		{name: "CompleteMultipartUpload", write: func() error {
+			_, _, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+				Bucket:   aws.String(bucket),
+				Key:      aws.String("assembled.bin"),
+				UploadId: aws.String(upload.UploadId),
+				MultipartUpload: &types.CompletedMultipartUpload{
+					Parts: []types.CompletedPart{{PartNumber: &firstPart, ETag: partOut.ETag}},
+				},
+			})
+			return err
+		}},
+		{name: "RestoreObjectVersion", write: func() error {
+			_, err := tb.backend.RestoreObjectVersion(ctx, bucket, "file.txt", oldVersion, currentVersion)
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireAPIErrorCode(t, tt.write(), s3err.GetAPIError(s3err.ErrSlowDown))
+			if used := fsCache.UsedBytes(); used != usedBefore {
+				t.Fatalf("cache usage = %d, want %d", used, usedBefore)
+			}
+		})
 	}
 }
 
@@ -1363,7 +1471,7 @@ func TestGetObject_SPFallback(t *testing.T) {
 				Path: "/fake/path", Size: int64(len(rehydrated)), ETag: "fakemd5", Checksum: "fakesha256",
 			}, nil
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, _ := io.ReadAll(r)
 			rehydrated = data
 			return &cache.ObjectInfo{
@@ -1422,7 +1530,7 @@ func TestGetObject_SPFallback_CurrentVersionChangeDoesNotServeStaleData(t *testi
 				Path: "/fake/new", Size: int64(len(data)), ETag: "new", Checksum: "new",
 			}, nil
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, _ := io.ReadAll(r)
 			return &cache.ObjectInfo{Path: "/fake/path", Size: int64(len(data)), ETag: "fakemd5", Checksum: "fakesha256"}, nil
 		},
@@ -1465,7 +1573,7 @@ func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, _ := io.ReadAll(r)
 			return &cache.ObjectInfo{Path: "/fake", Size: int64(len(data)), ETag: "e", Checksum: "c"}, nil
 		},
@@ -1510,7 +1618,7 @@ func TestGetObject_NilStorage(t *testing.T) {
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
 			data, _ := io.ReadAll(r)
 			return &cache.ObjectInfo{Path: "/fake", Size: int64(len(data)), ETag: "e", Checksum: "c"}, nil
 		},
@@ -3430,7 +3538,7 @@ func TestRestoreObjectVersionRejectsUnavailableSources(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ensure content: %v", err)
 			}
-			info, err := tb.cache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(payload))
+			info, err := tb.cache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(payload), int64(len(payload)))
 			if err != nil {
 				t.Fatalf("cache Put: %v", err)
 			}
@@ -3503,8 +3611,8 @@ type cancelingPutStagedCache struct {
 	cancel context.CancelFunc
 }
 
-func (c *cancelingPutStagedCache) PutStaged(ctx context.Context, bucket, key string, body io.Reader) (*cache.StagedObject, error) {
-	staged, err := c.Cache.PutStaged(ctx, bucket, key, body)
+func (c *cancelingPutStagedCache) PutStaged(ctx context.Context, bucket, key string, body io.Reader, size int64) (*cache.StagedObject, error) {
+	staged, err := c.Cache.PutStaged(ctx, bucket, key, body, size)
 	if err == nil && c.cancel != nil {
 		c.cancel()
 	}
@@ -3584,7 +3692,7 @@ func TestRestoreObjectVersionCASConflictCleansCommittedCache(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ensure concurrent content: %v", err)
 		}
-		info, err := baseCache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(payload))
+		info, err := baseCache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(payload), int64(len(payload)))
 		if err != nil {
 			t.Fatalf("cache concurrent version: %v", err)
 		}
@@ -3645,7 +3753,7 @@ func TestCopyObjectBindsImplicitCurrentReadToResolvedVersion(t *testing.T) {
 				hookErr = err
 				return
 			}
-			info, err := tb.cache.Put(ctx, "copy-implicit-race-src", model.ContentCacheKey(content.ID), strings.NewReader("new"))
+			info, err := tb.cache.Put(ctx, "copy-implicit-race-src", model.ContentCacheKey(content.ID), strings.NewReader("new"), int64(len("new")))
 			if err != nil {
 				hookErr = err
 				return

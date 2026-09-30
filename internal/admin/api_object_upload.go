@@ -104,8 +104,7 @@ func (s *Server) handleAPIUploadObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeObjectUploadError(w http.ResponseWriter, err error, bucketName string, key string) {
-	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
+	if maxBytesErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		s.writeObjectUploadSizeError(w, &objectlimits.SizeError{Size: maxBytesErr.Limit + 1, Err: objectlimits.ErrTooLarge})
 		return
 	}
@@ -113,16 +112,15 @@ func (s *Server) writeObjectUploadError(w http.ResponseWriter, err error, bucket
 		s.writeObjectUploadSizeError(w, err)
 		return
 	}
-	if errors.Is(err, cache.ErrCacheFull) {
-		writeJSON(w, http.StatusInsufficientStorage, map[string]string{"error": "cache capacity exceeded"})
+	if reason, ok := slowDownReason(err); ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": reason})
 		return
 	}
 	if errors.Is(err, cache.ErrInvalidPath) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid object path"})
 		return
 	}
-	var s3Err s3err.S3Error
-	if errors.As(err, &s3Err) {
+	if s3Err, ok := errors.AsType[s3err.S3Error](err); ok {
 		apiErr := s3Err.BaseError()
 		status := s3Err.StatusCode()
 		if status == 0 {
@@ -143,6 +141,20 @@ func (s *Server) writeObjectUploadError(w http.ResponseWriter, err error, bucket
 	}
 	s.logger.Error("api: failed to upload object", "error", err, "bucket", bucketName, "key", key)
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+}
+
+// slowDownReason returns the readable reason carried by an S3 SlowDown error,
+// which tells the user why the write was refused and that a retry can succeed.
+func slowDownReason(err error) (string, bool) {
+	s3Err, ok := errors.AsType[s3err.S3Error](err)
+	if !ok {
+		return "", false
+	}
+	apiErr := s3Err.BaseError()
+	if apiErr.Code != "SlowDown" || apiErr.Description == "" {
+		return "", false
+	}
+	return apiErr.Description, true
 }
 
 func (s *Server) writeObjectUploadSizeError(w http.ResponseWriter, err error) {

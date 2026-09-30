@@ -6,7 +6,10 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -79,7 +82,7 @@ func TestPutGetRoundtrip(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("hello world")
 
-	info, err := fs.Put(ctx, "bkt", "key1", bytes.NewReader(data))
+	info, err := fs.Put(ctx, "bkt", "key1", bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -120,7 +123,7 @@ func TestPutOverwrite(t *testing.T) {
 	data1 := []byte("version1")
 	data2 := []byte("version2-longer")
 
-	_, err := fs.Put(ctx, "bkt", "key", bytes.NewReader(data1))
+	_, err := fs.Put(ctx, "bkt", "key", bytes.NewReader(data1), int64(len(data1)))
 	if err != nil {
 		t.Fatalf("Put v1: %v", err)
 	}
@@ -128,7 +131,7 @@ func TestPutOverwrite(t *testing.T) {
 		t.Errorf("UsedBytes after v1 = %d, want %d", fs.UsedBytes(), len(data1))
 	}
 
-	_, err = fs.Put(ctx, "bkt", "key", bytes.NewReader(data2))
+	_, err = fs.Put(ctx, "bkt", "key", bytes.NewReader(data2), int64(len(data2)))
 	if err != nil {
 		t.Fatalf("Put v2: %v", err)
 	}
@@ -150,7 +153,7 @@ func TestDeleteAndExists(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("to-delete")
 
-	_, _ = fs.Put(ctx, "bkt", "key", bytes.NewReader(data))
+	_, _ = fs.Put(ctx, "bkt", "key", bytes.NewReader(data), int64(len(data)))
 
 	if !fs.Exists(ctx, "bkt", "key") {
 		t.Error("Exists = false after Put, want true")
@@ -200,12 +203,12 @@ func TestUsedBytesTracking(t *testing.T) {
 	d1 := []byte("aaaa")    // 4 bytes
 	d2 := []byte("bbbbbbb") // 7 bytes
 
-	_, _ = fs.Put(ctx, "b", "k1", bytes.NewReader(d1))
+	_, _ = fs.Put(ctx, "b", "k1", bytes.NewReader(d1), int64(len(d1)))
 	if fs.UsedBytes() != 4 {
 		t.Errorf("after k1: UsedBytes = %d, want 4", fs.UsedBytes())
 	}
 
-	_, _ = fs.Put(ctx, "b", "k2", bytes.NewReader(d2))
+	_, _ = fs.Put(ctx, "b", "k2", bytes.NewReader(d2), int64(len(d2)))
 	if fs.UsedBytes() != 11 {
 		t.Errorf("after k2: UsedBytes = %d, want 11", fs.UsedBytes())
 	}
@@ -253,9 +256,9 @@ func TestDeleteBucketDirAccounting(t *testing.T) {
 	fs := newTestCache(t)
 	ctx := context.Background()
 
-	_, _ = fs.Put(ctx, "bkt", "a", bytes.NewReader([]byte("aaa")))
-	_, _ = fs.Put(ctx, "bkt", "b", bytes.NewReader([]byte("bbbbb")))
-	_, _ = fs.Put(ctx, "other", "c", bytes.NewReader([]byte("cc")))
+	_, _ = fs.Put(ctx, "bkt", "a", strings.NewReader("aaa"), 3)
+	_, _ = fs.Put(ctx, "bkt", "b", strings.NewReader("bbbbb"), 5)
+	_, _ = fs.Put(ctx, "other", "c", strings.NewReader("cc"), 2)
 
 	if fs.UsedBytes() != 10 {
 		t.Fatalf("UsedBytes = %d, want 10", fs.UsedBytes())
@@ -289,7 +292,7 @@ func TestPathTraversal(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.bucket+"/"+tc.key, func(t *testing.T) {
-			_, err := fs.Put(ctx, tc.bucket, tc.key, strings.NewReader("bad"))
+			_, err := fs.Put(ctx, tc.bucket, tc.key, strings.NewReader("bad"), 3)
 			if err != ErrInvalidPath {
 				t.Errorf("Put: err = %v, want ErrInvalidPath", err)
 			}
@@ -331,7 +334,7 @@ func TestPathTraversal(t *testing.T) {
 		t.Errorf("DeleteBucketDir dot bucket: err = %v, want ErrInvalidPath", err)
 	}
 
-	_, err = fs.PutPart(ctx, "../upload-escape", 1, strings.NewReader("bad"))
+	_, err = fs.PutPart(ctx, "../upload-escape", 1, strings.NewReader("bad"), 3)
 	if err != ErrInvalidPath {
 		t.Errorf("PutPart traversal upload: err = %v, want ErrInvalidPath", err)
 	}
@@ -351,8 +354,8 @@ func TestStartupWalk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = fs1.Put(ctx, "b", "k1", bytes.NewReader([]byte("aaaa")))
-	_, _ = fs1.Put(ctx, "b", "k2", bytes.NewReader([]byte("bbb")))
+	_, _ = fs1.Put(ctx, "b", "k1", strings.NewReader("aaaa"), 4)
+	_, _ = fs1.Put(ctx, "b", "k2", strings.NewReader("bbb"), 3)
 
 	// Simulate a stale temp file.
 	tmpFile := filepath.Join(dir, "b", ".synaps3-stale.tmp")
@@ -384,29 +387,30 @@ func TestCapacityEnforcement(t *testing.T) {
 	}
 
 	// First write: 8 bytes — should succeed.
-	_, err = fs.Put(ctx, "b", "k1", bytes.NewReader([]byte("12345678")))
+	_, err = fs.Put(ctx, "b", "k1", strings.NewReader("12345678"), 8)
 	if err != nil {
 		t.Fatalf("Put within capacity: %v", err)
 	}
 
 	// Second write: 5 bytes — would exceed 10-byte limit.
-	_, err = fs.Put(ctx, "b", "k2", bytes.NewReader([]byte("12345")))
+	_, err = fs.Put(ctx, "b", "k2", strings.NewReader("12345"), 5)
 	if err != ErrCacheFull {
 		t.Errorf("Put exceeding capacity: err = %v, want ErrCacheFull", err)
 	}
 
-	// Overwrite with smaller data: 3 bytes — should succeed (replaces 8 with 3).
-	_, err = fs.Put(ctx, "b", "k1", bytes.NewReader([]byte("abc")))
+	// The old file stays on disk until the overwrite replaces it, so the
+	// overwrite needs room beside it; afterwards only the new bytes count.
+	_, err = fs.Put(ctx, "b", "k1", strings.NewReader("ab"), 2)
 	if err != nil {
 		t.Fatalf("Put overwrite within capacity: %v", err)
 	}
 
-	if fs.UsedBytes() != 3 {
-		t.Errorf("UsedBytes = %d, want 3", fs.UsedBytes())
+	if fs.UsedBytes() != 2 {
+		t.Errorf("UsedBytes = %d, want 2", fs.UsedBytes())
 	}
 
-	// Now 7 bytes free — 5-byte write should succeed.
-	_, err = fs.Put(ctx, "b", "k2", bytes.NewReader([]byte("12345")))
+	// Now 8 bytes free — 5-byte write should succeed.
+	_, err = fs.Put(ctx, "b", "k2", strings.NewReader("12345"), 5)
 	if err != nil {
 		t.Fatalf("Put after freeing space: %v", err)
 	}
@@ -421,14 +425,14 @@ func TestPutPartCapacityEnforcement(t *testing.T) {
 		t.Fatalf("NewFilesystem: %v", err)
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 1, bytes.NewReader([]byte("12345678"))); err != nil {
+	if _, err := fs.PutPart(ctx, "up-cap", 1, strings.NewReader("12345678"), 8); err != nil {
 		t.Fatalf("PutPart within capacity: %v", err)
 	}
 	if fs.UsedBytes() != 8 {
 		t.Fatalf("UsedBytes after first part = %d, want 8", fs.UsedBytes())
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 2, bytes.NewReader([]byte("12345"))); err != ErrCacheFull {
+	if _, err := fs.PutPart(ctx, "up-cap", 2, strings.NewReader("12345"), 5); err != ErrCacheFull {
 		t.Fatalf("PutPart over capacity err = %v, want ErrCacheFull", err)
 	}
 	if fs.UsedBytes() != 8 {
@@ -442,18 +446,18 @@ func TestPutPartCapacityEnforcement(t *testing.T) {
 		t.Fatalf("failed part exists: %v", err)
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 1, bytes.NewReader([]byte("abc"))); err != nil {
+	if _, err := fs.PutPart(ctx, "up-cap", 1, strings.NewReader("ab"), 2); err != nil {
 		t.Fatalf("PutPart overwrite within capacity: %v", err)
 	}
-	if fs.UsedBytes() != 3 {
-		t.Fatalf("UsedBytes after smaller overwrite = %d, want 3", fs.UsedBytes())
+	if fs.UsedBytes() != 2 {
+		t.Fatalf("UsedBytes after smaller overwrite = %d, want 2", fs.UsedBytes())
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 2, bytes.NewReader([]byte("12345"))); err != nil {
+	if _, err := fs.PutPart(ctx, "up-cap", 2, strings.NewReader("12345"), 5); err != nil {
 		t.Fatalf("PutPart after freeing space: %v", err)
 	}
-	if fs.UsedBytes() != 8 {
-		t.Fatalf("UsedBytes after second part = %d, want 8", fs.UsedBytes())
+	if fs.UsedBytes() != 7 {
+		t.Fatalf("UsedBytes after second part = %d, want 7", fs.UsedBytes())
 	}
 }
 
@@ -466,27 +470,20 @@ func TestAssemblePartsCapacityEnforcement(t *testing.T) {
 		t.Fatalf("NewFilesystem: %v", err)
 	}
 
-	if _, err := fs.PutPart(ctx, "up-assemble-cap", 1, bytes.NewReader([]byte("12345"))); err != nil {
+	if _, err := fs.PutPart(ctx, "up-assemble-cap", 1, strings.NewReader("12345"), 5); err != nil {
 		t.Fatalf("PutPart 1: %v", err)
 	}
-	if _, err := fs.PutPart(ctx, "up-assemble-cap", 2, bytes.NewReader([]byte("67890"))); err != nil {
+	if _, err := fs.PutPart(ctx, "up-assemble-cap", 2, strings.NewReader("67890"), 5); err != nil {
 		t.Fatalf("PutPart 2: %v", err)
 	}
 	if fs.UsedBytes() != 10 {
 		t.Fatalf("UsedBytes after parts = %d, want 10", fs.UsedBytes())
 	}
 
-	// Capacity is reserved when the staged file claims its destination, so the
-	// refusal surfaces at commit rather than during assembly.
-	staged, _, err := fs.AssemblePartsStaged(ctx, "bkt", "key", "up-assemble-cap", []int{1, 2})
-	if err != nil {
-		t.Fatalf("AssemblePartsStaged: %v", err)
-	}
-	if err := staged.Commit(); err != ErrCacheFull {
-		t.Fatalf("assembled commit over capacity err = %v, want ErrCacheFull", err)
-	}
-	if err := staged.Rollback(); err != nil {
-		t.Fatalf("Rollback: %v", err)
+	// The parts stay until the upload is deleted, so assembly needs room for a
+	// second copy of their bytes and is refused before it writes any.
+	if _, _, err := fs.AssemblePartsStaged(ctx, "bkt", "key", "up-assemble-cap", []int{1, 2}); err != ErrCacheFull {
+		t.Fatalf("AssemblePartsStaged over capacity err = %v, want ErrCacheFull", err)
 	}
 	if fs.UsedBytes() != 10 {
 		t.Fatalf("UsedBytes after failed assemble = %d, want 10", fs.UsedBytes())
@@ -511,7 +508,7 @@ func TestCapacityExactBoundary(t *testing.T) {
 	}
 
 	// Write exactly 10 bytes — should succeed (exact fit).
-	_, err = fs.Put(ctx, "b", "k1", bytes.NewReader([]byte("1234567890")))
+	_, err = fs.Put(ctx, "b", "k1", strings.NewReader("1234567890"), 10)
 	if err != nil {
 		t.Fatalf("Put at exact capacity: %v", err)
 	}
@@ -519,16 +516,151 @@ func TestCapacityExactBoundary(t *testing.T) {
 		t.Errorf("UsedBytes = %d, want 10", fs.UsedBytes())
 	}
 
-	// Overwrite with exactly 10 bytes — should succeed (same size).
-	_, err = fs.Put(ctx, "b", "k1", bytes.NewReader([]byte("abcdefghij")))
-	if err != nil {
-		t.Fatalf("Overwrite at exact capacity: %v", err)
-	}
-
 	// Write 1 more byte — should fail.
-	_, err = fs.Put(ctx, "b", "k2", bytes.NewReader([]byte("x")))
+	_, err = fs.Put(ctx, "b", "k2", strings.NewReader("x"), 1)
 	if err != ErrCacheFull {
 		t.Errorf("Put over capacity: err = %v, want ErrCacheFull", err)
+	}
+}
+
+// unreadBody fails the test when a write reads a body it should have refused.
+type unreadBody struct{ t *testing.T }
+
+func (b unreadBody) Read([]byte) (int, error) {
+	b.t.Error("refused write read its body")
+	return 0, io.EOF
+}
+
+func TestPutStagedHoldsCapacityUntilCommitOrRollback(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFilesystem(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+
+	// Declares 6 bytes but supplies 4.
+	first, err := fs.PutStaged(ctx, "bkt", "first", strings.NewReader("1234"), 6)
+	if err != nil {
+		t.Fatalf("PutStaged first: %v", err)
+	}
+	if _, err := fs.PutStaged(ctx, "bkt", "second", unreadBody{t}, 5); err != ErrCacheFull {
+		t.Fatalf("PutStaged beside held capacity err = %v, want ErrCacheFull", err)
+	}
+	if !fs.ConsumeWriteRefusal() {
+		t.Fatal("ConsumeWriteRefusal = false after a refused write")
+	}
+	if fs.ConsumeWriteRefusal() {
+		t.Fatal("ConsumeWriteRefusal reported the same refusal twice")
+	}
+
+	// Commit charges the bytes written and releases the rest of the hold.
+	if err := first.Commit(); err != nil {
+		t.Fatalf("Commit first: %v", err)
+	}
+	if fs.UsedBytes() != 4 {
+		t.Fatalf("UsedBytes after commit = %d, want 4", fs.UsedBytes())
+	}
+
+	second, err := fs.PutStaged(ctx, "bkt", "second", strings.NewReader("123456"), 6)
+	if err != nil {
+		t.Fatalf("PutStaged second: %v", err)
+	}
+	if err := second.Rollback(); err != nil {
+		t.Fatalf("Rollback second: %v", err)
+	}
+	if _, err := fs.Put(ctx, "bkt", "third", strings.NewReader("abcdef"), 6); err != nil {
+		t.Fatalf("Put after rollback released its hold: %v", err)
+	}
+	if fs.UsedBytes() != 10 {
+		t.Fatalf("UsedBytes = %d, want 10", fs.UsedBytes())
+	}
+}
+
+func TestWriteRejectsBodyLongerThanDeclaredSize(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		write func(fs *Filesystem, body string, size int64) error
+	}{
+		{name: "Put", write: func(fs *Filesystem, body string, size int64) error {
+			_, err := fs.Put(ctx, "bkt", "key", strings.NewReader(body), size)
+			return err
+		}},
+		{name: "PutPart", write: func(fs *Filesystem, body string, size int64) error {
+			_, err := fs.PutPart(ctx, "upload", 1, strings.NewReader(body), size)
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, err := NewFilesystem(t.TempDir(), 10)
+			if err != nil {
+				t.Fatalf("NewFilesystem: %v", err)
+			}
+
+			if err := tt.write(fs, "12345", 4); !errors.Is(err, ErrSizeExceeded) {
+				t.Fatalf("longer body err = %v, want ErrSizeExceeded", err)
+			}
+			if fs.UsedBytes() != 0 {
+				t.Fatalf("rejected write left %d bytes in the cache", fs.UsedBytes())
+			}
+			if err := tt.write(fs, "1234567890", 10); err != nil {
+				t.Fatalf("write after rejected write released its hold: %v", err)
+			}
+		})
+	}
+}
+
+func TestPutRefusesDeclaredSizeThatOverflowsAccounting(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFilesystem(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+	if _, err := fs.Put(ctx, "bkt", "seed", strings.NewReader("a"), 1); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if _, err := fs.PutStaged(ctx, "bkt", "huge", unreadBody{t}, math.MaxInt64); err != ErrCacheFull {
+		t.Fatalf("PutStaged of MaxInt64 bytes err = %v, want ErrCacheFull", err)
+	}
+	// Nothing was held, so a write that fits is still admitted.
+	if _, err := fs.Put(ctx, "bkt", "fits", strings.NewReader("123456789"), 9); err != nil {
+		t.Fatalf("Put after refused huge write: %v", err)
+	}
+}
+
+func TestConcurrentWritesStayWithinCapacity(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFilesystem(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+
+	const writers = 10
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Go(func() {
+			_, errs[i] = fs.Put(ctx, "bkt", fmt.Sprintf("key-%d", i), strings.NewReader("abc"), 3)
+		})
+	}
+	wg.Wait()
+
+	var stored int64
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			stored += 3
+		case err != ErrCacheFull:
+			t.Fatalf("writer %d err = %v, want nil or ErrCacheFull", i, err)
+		}
+	}
+	if stored > 10 {
+		t.Fatalf("stored %d bytes in a 10-byte cache", stored)
+	}
+	if fs.UsedBytes() != stored {
+		t.Fatalf("UsedBytes = %d, want %d", fs.UsedBytes(), stored)
 	}
 }
 
@@ -545,7 +677,7 @@ func TestConcurrentPuts(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			data := bytes.Repeat([]byte{byte(idx)}, 100)
-			_, errs[idx] = fs.Put(ctx, "bkt", "same-key", bytes.NewReader(data))
+			_, errs[idx] = fs.Put(ctx, "bkt", "same-key", bytes.NewReader(data), int64(len(data)))
 		}(i)
 	}
 	wg.Wait()
@@ -578,7 +710,7 @@ func TestNestedKeys(t *testing.T) {
 	ctx := context.Background()
 
 	data := []byte("nested-value")
-	_, err := fs.Put(ctx, "bkt", "a/b/c/deep.txt", bytes.NewReader(data))
+	_, err := fs.Put(ctx, "bkt", "a/b/c/deep.txt", bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("Put nested key: %v", err)
 	}
@@ -604,7 +736,7 @@ func TestPutPartAndAssemble(t *testing.T) {
 	part1Data := []byte("hello ")
 	part2Data := []byte("world")
 
-	info1, err := fs.PutPart(ctx, "upload-1", 1, bytes.NewReader(part1Data))
+	info1, err := fs.PutPart(ctx, "upload-1", 1, bytes.NewReader(part1Data), int64(len(part1Data)))
 	if err != nil {
 		t.Fatalf("PutPart 1: %v", err)
 	}
@@ -616,7 +748,7 @@ func TestPutPartAndAssemble(t *testing.T) {
 		t.Errorf("PutPart 1 ETag wrong")
 	}
 
-	info2, err := fs.PutPart(ctx, "upload-1", 2, bytes.NewReader(part2Data))
+	info2, err := fs.PutPart(ctx, "upload-1", 2, bytes.NewReader(part2Data), int64(len(part2Data)))
 	if err != nil {
 		t.Fatalf("PutPart 2: %v", err)
 	}
@@ -681,13 +813,13 @@ func TestPutPartOverwrite(t *testing.T) {
 	data1 := []byte("version1")
 	data2 := []byte("v2")
 
-	_, _ = fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data1))
+	_, _ = fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data1), int64(len(data1)))
 	if fs.UsedBytes() != int64(len(data1)) {
 		t.Errorf("UsedBytes = %d, want %d", fs.UsedBytes(), len(data1))
 	}
 
 	// Overwrite same part
-	info, err := fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data2))
+	info, err := fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data2), int64(len(data2)))
 	if err != nil {
 		t.Fatalf("PutPart overwrite: %v", err)
 	}
@@ -704,8 +836,8 @@ func TestDeleteUpload(t *testing.T) {
 	fs := newTestCache(t)
 	ctx := context.Background()
 
-	_, _ = fs.PutPart(ctx, "up-del", 1, bytes.NewReader([]byte("aaa")))
-	_, _ = fs.PutPart(ctx, "up-del", 2, bytes.NewReader([]byte("bbbbb")))
+	_, _ = fs.PutPart(ctx, "up-del", 1, strings.NewReader("aaa"), 3)
+	_, _ = fs.PutPart(ctx, "up-del", 2, strings.NewReader("bbbbb"), 5)
 
 	if fs.UsedBytes() != 8 {
 		t.Fatalf("UsedBytes = %d, want 8", fs.UsedBytes())
@@ -736,8 +868,8 @@ func TestAssemblePartsUsedBytes(t *testing.T) {
 
 	p1 := []byte("part1")
 	p2 := []byte("part2")
-	_, _ = fs.PutPart(ctx, "up-ub", 1, bytes.NewReader(p1))
-	_, _ = fs.PutPart(ctx, "up-ub", 2, bytes.NewReader(p2))
+	_, _ = fs.PutPart(ctx, "up-ub", 1, bytes.NewReader(p1), int64(len(p1)))
+	_, _ = fs.PutPart(ctx, "up-ub", 2, bytes.NewReader(p2), int64(len(p2)))
 	partsSize := int64(len(p1) + len(p2))
 
 	staged, _, err := fs.AssemblePartsStaged(ctx, "bkt", "key", "up-ub", []int{1, 2})
@@ -766,7 +898,7 @@ func TestPutStagedRollbackIsRepeatable(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("staged-data")
 
-	staged, err := fs.PutStaged(ctx, "bkt", "staged-key", bytes.NewReader(data))
+	staged, err := fs.PutStaged(ctx, "bkt", "staged-key", bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("PutStaged: %v", err)
 	}
@@ -791,7 +923,7 @@ func TestPutStagedCommitMakesObjectReadable(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("staged-data")
 
-	staged, err := fs.PutStaged(ctx, "bkt", "commit-key", bytes.NewReader(data))
+	staged, err := fs.PutStaged(ctx, "bkt", "commit-key", bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("PutStaged: %v", err)
 	}
@@ -833,7 +965,7 @@ func TestPutStagedCommitAndRollbackCanOverlap(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("staged-data")
 
-	staged, err := fs.PutStaged(ctx, "bkt", "overlap-key", bytes.NewReader(data))
+	staged, err := fs.PutStaged(ctx, "bkt", "overlap-key", bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("PutStaged: %v", err)
 	}

@@ -162,6 +162,32 @@ func TestUploadPart_HappyPath(t *testing.T) {
 	}
 }
 
+func TestUploadPartRejectsDeclaredLengthAboveObjectLimit(t *testing.T) {
+	// The cache cannot hold the declared length, yet the part is reported as too
+	// large rather than as a full cache a retry could clear.
+	tb := newTestBackendWithCache(t, newTestCache(t, 400))
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "big-part-bucket")
+	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String("big-part-bucket"),
+		Key:    aws.String("parts.bin"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+
+	partNum := int32(1)
+	_, err = tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:        aws.String("big-part-bucket"),
+		Key:           aws.String("parts.bin"),
+		UploadId:      aws.String(initResult.UploadId),
+		PartNumber:    &partNum,
+		Body:          unreadObjectBody{t},
+		ContentLength: ptrInt64(chain.MaxUploadSize + 1),
+	})
+	requireAPIErrorCode(t, err, s3err.GetAPIError(s3err.ErrEntityTooLarge))
+}
+
 func TestUploadPartCopyMissingCopySourceUsesHeaderArgumentName(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
