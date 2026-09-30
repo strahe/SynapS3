@@ -224,10 +224,13 @@ func normalizeWalletOperationLimit(limit int) int {
 }
 
 func validWalletOperationAmount(opType model.WalletOperationType, amount string) bool {
-	if opType == model.WalletOperationTypeApprove {
+	//exhaustive:enforce
+	switch opType {
+	case model.WalletOperationTypeApprove:
 		return amount == "0"
-	}
-	if opType != model.WalletOperationTypeFund && opType != model.WalletOperationTypeWithdraw {
+	case model.WalletOperationTypeFund, model.WalletOperationTypeWithdraw:
+		// A positive amount, checked below.
+	default:
 		return false
 	}
 	if amount == "" || amount[0] == '0' {

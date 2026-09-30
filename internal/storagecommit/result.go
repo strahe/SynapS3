@@ -17,6 +17,7 @@ const (
 // Valid reports whether the application can write this release reason. The
 // database keeps the column open so newer binaries can add reasons safely.
 func (r ReleaseReason) Valid() bool {
+	//exhaustive:enforce
 	switch r {
 	case ReleaseBeforeSubmitCanceled, ReleaseDataSetUnavailable, ReleaseOwnerTerminal, ReleaseManualDuplicateAck:
 		return true

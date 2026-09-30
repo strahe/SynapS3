@@ -185,13 +185,17 @@ func firstStringPtr(values ...*string) *string {
 }
 
 func signalLevelForStatus(status Status) SignalLevel {
+	//exhaustive:enforce
 	switch status {
+	case StatusAvailable:
+		return SignalOK
 	case StatusUnavailable:
 		return SignalBlocking
 	case StatusDegraded, StatusUnknown:
 		return SignalWarning
 	default:
-		return SignalOK
+		// A status this version does not know is not evidence of health.
+		return SignalWarning
 	}
 }
 

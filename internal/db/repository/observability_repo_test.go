@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -90,6 +91,32 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ProviderID.String() != "101" {
 		t.Fatalf("provider page after prune = total:%d items:%+v, want only provider 101", page.Total, page.Items)
+	}
+
+	// Status values are not checked by the schema, so an unknown one is refused
+	// before a snapshot claims its collection time.
+	unknown := observability.ProviderState{
+		ProviderID: onChainID(t, "101"), Status: observability.Status("terminated"),
+		ReasonCodes: []observability.ReasonCode{}, LastCheckedAt: checkedAt.Add(2 * time.Minute), Evidence: map[string]any{},
+	}
+	if err := repos.Observability.ReplaceProviderStates(ctx, checkedAt.Add(2*time.Minute), []observability.ProviderState{unknown}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("ReplaceProviderStates with unknown status error = %v, want ErrInvalidInput", err)
+	}
+	if err := repos.Observability.UpsertProviderObservation(ctx, checkedAt.Add(2*time.Minute), unknown); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("UpsertProviderObservation with unknown status error = %v, want ErrInvalidInput", err)
+	}
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt.Add(2*time.Minute), []observability.DataSetState{{
+		LocalDataSetID: 1, Status: observability.Status("terminated"),
+	}}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("ReplaceDataSetStates with unknown status error = %v, want ErrInvalidInput", err)
+	}
+	page, err = repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProviderStates after refused writes: %v", err)
+	}
+	if page.Total != 1 || page.Items[0].Status != observability.StatusUnavailable ||
+		page.LastCheckedAt == nil || !page.LastCheckedAt.Equal(checkedAt.Add(time.Minute)) {
+		t.Fatalf("provider page after refused writes = total:%d items:%+v checked:%v, want the previous snapshot", page.Total, page.Items, page.LastCheckedAt)
 	}
 }
 
@@ -266,6 +293,51 @@ func TestObservabilityRepoProviderOrderAndPaginatedSummary(t *testing.T) {
 	}
 	if len(page.Items) != 2 || page.Items[0].ProviderID.String() != "10" || page.Items[1].ProviderID.String() != "101" {
 		t.Fatalf("provider page items = %+v, want numeric order page [10,101]", page.Items)
+	}
+}
+
+// A status written by a newer version is not one this binary can place in a
+// bucket, so the summary counts it as unknown instead of leaving it out.
+func TestObservabilityRepoSummaryCountsUnrecognizedStatusAsUnknown(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
+	unrecognized := observability.Status("terminated")
+
+	bucket := seedBucket(t, db, "unrecognized-status")
+	local := seedStorageDataSet(t, db, bucket.ID, "101", "1001", model.StorageDataSetStatusReady)
+	if err := repos.Observability.ReplaceProviderStates(ctx, checkedAt, []observability.ProviderState{
+		{ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable, ReasonCodes: []observability.ReasonCode{}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{ProviderID: onChainID(t, "202"), Status: observability.StatusAvailable, ReasonCodes: []observability.ReasonCode{}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+	}); err != nil {
+		t.Fatalf("ReplaceProviderStates: %v", err)
+	}
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, dataSetSnapshot(local, observability.StatusAvailable)); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+	if _, err := db.NewUpdate().Model((*observability.ProviderState)(nil)).
+		Set("status = ?", unrecognized).Where("provider_id = ?", "202").Exec(ctx); err != nil {
+		t.Fatalf("store unrecognized provider status: %v", err)
+	}
+	if _, err := db.NewUpdate().Model((*observability.DataSetState)(nil)).
+		Set("status = ?", unrecognized).Where("local_data_set_id = ?", local.ID).Exec(ctx); err != nil {
+		t.Fatalf("store unrecognized data set status: %v", err)
+	}
+
+	providers, err := repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProviderStates: %v", err)
+	}
+	if got := providers.Summary; got.Total != 2 || got.Available != 1 || got.Unknown != 1 {
+		t.Fatalf("provider summary = %+v, want the unrecognized status counted as unknown", got)
+	}
+	dataSets, err := repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDataSetStates: %v", err)
+	}
+	if got := dataSets.Summary; got.Total != 1 || got.Available != 0 || got.Unknown != 1 {
+		t.Fatalf("data set summary = %+v, want the unrecognized status counted as unknown", got)
 	}
 }
 

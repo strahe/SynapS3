@@ -19,6 +19,17 @@ const (
 	BucketStatusActive = BucketStatusReady
 )
 
+// Valid reports whether the value is a known bucket status.
+func (s BucketStatus) Valid() bool {
+	//exhaustive:enforce
+	switch s {
+	case BucketStatusProvisioning, BucketStatusReady:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsVisible reports whether S3 clients may discover the bucket namespace.
 func (s BucketStatus) IsVisible() bool {
 	return s == BucketStatusProvisioning || s == BucketStatusReady

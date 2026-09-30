@@ -540,11 +540,19 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 	}
 	for i := range copies {
 		copyRow := copies[i]
+		//exhaustive:enforce
 		switch copyRow.Status {
 		// A deletion the provider cannot perform stays recorded as unsupported
 		// and does not keep the content from being finalized.
 		case model.StorageCleanupCopyStatusRemoved, model.StorageCleanupCopyStatusUnsupported:
 			continue
+		case model.StorageCleanupCopyStatusPending, model.StorageCleanupCopyStatusDeleteScheduled, model.StorageCleanupCopyStatusFailed:
+			// Resolved against the chain below.
+		default:
+			// A status this version does not know may record a paid request it
+			// cannot judge, so the copy is left untouched.
+			return taskengine.Suspend(model.TaskResumeModeRecover, dependencyWait, "cleanup_status",
+				"Waiting for a newer version that supports this copy's cleanup record", nil)
 		}
 		// Zero is a legal on-chain ID; a missing data set is the only
 		// identity gap that prevents an exact piece-ID lookup.
@@ -879,6 +887,7 @@ func validTaskWalletAmount(operationType model.WalletOperationType, amount *big.
 	if amount == nil {
 		return false
 	}
+	//exhaustive:enforce
 	switch operationType {
 	case model.WalletOperationTypeApprove:
 		return amount.Sign() == 0
@@ -890,6 +899,7 @@ func validTaskWalletAmount(operationType model.WalletOperationType, amount *big.
 }
 
 func broadcastWalletOperation(ctx context.Context, operator synapse.WalletOperator, operationType model.WalletOperationType, amount *big.Int) (string, bool, error) {
+	//exhaustive:enforce
 	switch operationType {
 	case model.WalletOperationTypeFund:
 		hash, err := operator.FundUSDFC(ctx, amount)

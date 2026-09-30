@@ -68,6 +68,7 @@ func TestBuildSignalMapsStatusAndStale(t *testing.T) {
 		{name: "degraded", status: StatusDegraded, lastCheckedAt: &freshCheckedAt, want: SignalWarning},
 		{name: "unknown", status: StatusUnknown, lastCheckedAt: &freshCheckedAt, want: SignalWarning},
 		{name: "unavailable", status: StatusUnavailable, lastCheckedAt: &freshCheckedAt, want: SignalBlocking},
+		{name: "unrecognized", status: Status("terminated"), lastCheckedAt: &freshCheckedAt, want: SignalWarning},
 		{name: "available stale", status: StatusAvailable, lastCheckedAt: &staleCheckedAt, want: SignalWarning},
 	}
 

@@ -34,6 +34,7 @@ const (
 
 // Valid reports whether the value is a known wait reason.
 func (r WaitReason) Valid() bool {
+	//exhaustive:enforce
 	switch r {
 	case WaitReasonReadableSource, WaitReasonTarget, WaitReasonTargetCreating, WaitReasonTargetWritable,
 		WaitReasonFunding, WaitReasonProvider,

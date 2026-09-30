@@ -2,6 +2,13 @@ version: "2"
 
 linters:
   default: standard
+  enable:
+    - exhaustive
+  settings:
+    exhaustive:
+      # Only switches marked //exhaustive:enforce must name every constant, so
+      # a new value fails lint where it has to be classified.
+      explicit-exhaustive-switch: true
   exclusions:
     paths:
       - ^versitygw/

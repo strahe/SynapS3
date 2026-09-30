@@ -242,6 +242,7 @@ func olderOverviewObservation(current *time.Time, observed time.Time) *time.Time
 }
 
 func addStorageHealthStatus(summary *observability.Summary, status observability.Status) {
+	//exhaustive:enforce
 	switch status {
 	case observability.StatusAvailable:
 		summary.Available++
@@ -249,7 +250,10 @@ func addStorageHealthStatus(summary *observability.Summary, status observability
 		summary.Degraded++
 	case observability.StatusUnavailable:
 		summary.Unavailable++
+	case observability.StatusUnknown:
+		summary.Unknown++
 	default:
+		// A status this version does not know is not evidence of health.
 		summary.Unknown++
 	}
 }

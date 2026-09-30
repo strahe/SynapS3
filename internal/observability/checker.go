@@ -521,6 +521,7 @@ func worseStatus(current, next Status) Status {
 }
 
 func statusRank(status Status) int {
+	//exhaustive:enforce
 	switch status {
 	case StatusUnavailable:
 		return 3
@@ -528,8 +529,11 @@ func statusRank(status Status) int {
 		return 2
 	case StatusUnknown:
 		return 1
-	default:
+	case StatusAvailable:
 		return 0
+	default:
+		// A status this version does not know is not evidence of health.
+		return 1
 	}
 }
 

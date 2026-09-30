@@ -90,6 +90,14 @@ func TestS3AccountRepo_CRUDAndRootFiltering(t *testing.T) {
 	if updated.Role != auth.RoleAdmin {
 		t.Fatalf("role = %q, want admin", updated.Role)
 	}
+	// Roles belong to the gateway and are not checked by the schema.
+	unknownRole := auth.Role("owner")
+	if err := repos.S3Accounts.Create(ctx, &model.S3Account{AccessKey: "unknown-role", SecretKey: "secret", Role: unknownRole}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("Create with unknown role error = %v, want ErrInvalidInput", err)
+	}
+	if err := repos.S3Accounts.Update(ctx, "user-access", repository.S3AccountUpdate{Role: unknownRole}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("Update to unknown role error = %v, want ErrInvalidInput", err)
+	}
 	if err := repos.S3Accounts.Update(ctx, "missing", repository.S3AccountUpdate{Role: auth.RoleAdmin}); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("Update missing error = %v, want ErrNotFound", err)
 	}

@@ -113,6 +113,38 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	}
 }
 
+// Transfer methods grow with new copy paths, so the schema leaves the column
+// open and the repository refuses a method it does not know.
+func TestCreateUploadCopiesRejectsUnknownTransferMethod(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "unknown-transfer-method")
+	content, err := repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 1,
+		Checksum: testutil.StorageChecksum("unknown-transfer-method"), RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByContentID: content.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = repos.Contents.CreateUploadCopiesForBindings(t.Context(), content.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID, CopyIndex: 0, ProviderID: binding.ProviderID,
+		TransferMethod: model.StorageCopyTransferMethod("repair"),
+	}})
+	if !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("CreateUploadCopiesForBindings error = %v, want ErrInvalidInput", err)
+	}
+	copies, err := repos.Contents.ListCopies(t.Context(), content.ID)
+	if err != nil || len(copies) != 0 {
+		t.Fatalf("copies after refused insert = %#v, err=%v", copies, err)
+	}
+}
+
 func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

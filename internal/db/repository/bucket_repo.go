@@ -20,8 +20,8 @@ var _ BucketRepository = (*BunBucketRepo)(nil)
 // Create inserts a bucket together with the replica slots its durability policy
 // asks for, so a bucket never exists without the slots its data sets bind to.
 func (r *BunBucketRepo) Create(ctx context.Context, bucket *model.Bucket) error {
-	if !model.ValidStorageCopies(bucket.DefaultCopies) || !model.ValidStorageCopies(bucket.MinimumDurableCopies) ||
-		bucket.MinimumDurableCopies > bucket.DefaultCopies {
+	// An empty status takes the database default.
+	if (bucket.Status != "" && !bucket.Status.Valid()) || !validCopyPolicy(bucket.DefaultCopies, bucket.MinimumDurableCopies) {
 		return fmt.Errorf("inserting bucket %q: %w", bucket.Name, ErrInvalidInput)
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
@@ -97,6 +97,9 @@ func (r *BunBucketRepo) ListActive(ctx context.Context) ([]model.Bucket, error) 
 }
 
 func (r *BunBucketRepo) UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error {
+	if !to.Valid() {
+		return fmt.Errorf("updating bucket status to %q: %w", to, ErrInvalidInput)
+	}
 	res, err := r.db.NewUpdate().
 		Model((*model.Bucket)(nil)).
 		Set("status = ?", to).
@@ -201,8 +204,9 @@ func (r *BunBucketRepo) UpdateCopyPolicy(ctx context.Context, input UpdateBucket
 		bucket.MinimumDurableCopies = minimum
 		update = update.Set("minimum_durable_copies = ?", minimum)
 	}
-	if bucket.MinimumDurableCopies > bucket.DefaultCopies {
-		return nil, fmt.Errorf("minimum durable copies exceeds explicit default copies: %w", ErrInvalidInput)
+	if !validCopyPolicy(bucket.DefaultCopies, bucket.MinimumDurableCopies) {
+		return nil, fmt.Errorf("replica target %d with minimum %d: %w",
+			bucket.DefaultCopies, bucket.MinimumDurableCopies, ErrInvalidInput)
 	}
 	if _, err := update.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("updating bucket copy policy: %w", err)
@@ -225,6 +229,13 @@ func (r *BunBucketRepo) ActiveReplicaSlots(ctx context.Context, bucketID int64) 
 		return nil, fmt.Errorf("listing active bucket replica slots: %w", err)
 	}
 	return indexes, nil
+}
+
+// validCopyPolicy holds a replica target and minimum to the product limits; the
+// schema only requires them to be positive.
+func validCopyPolicy(defaultCopies, minimumDurableCopies int) bool {
+	return model.ValidStorageCopies(defaultCopies) && model.ValidStorageCopies(minimumDurableCopies) &&
+		minimumDurableCopies <= defaultCopies
 }
 
 // openBucketReplicaSlots makes slots 0..copies-1 active. Nothing closes a slot

@@ -14,6 +14,7 @@ const (
 )
 
 func (c AttentionCode) Valid() bool {
+	//exhaustive:enforce
 	switch c {
 	case AttentionAttemptOnlyAmbiguous,
 		AttentionUnattributedPiece,

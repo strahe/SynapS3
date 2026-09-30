@@ -528,6 +528,7 @@ func worstObservabilityStatus(current observability.Status, candidate observabil
 }
 
 func observabilityStatusRank(status observability.Status) int {
+	//exhaustive:enforce
 	switch status {
 	case observability.StatusUnavailable:
 		return 3
@@ -535,8 +536,11 @@ func observabilityStatusRank(status observability.Status) int {
 		return 2
 	case observability.StatusDegraded:
 		return 1
-	default:
+	case observability.StatusAvailable:
 		return 0
+	default:
+		// A status this version does not know is not evidence of health.
+		return 2
 	}
 }
 
