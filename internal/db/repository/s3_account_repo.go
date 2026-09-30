@@ -18,6 +18,9 @@ type BunS3AccountRepo struct {
 var _ S3AccountRepository = (*BunS3AccountRepo)(nil)
 
 func (r *BunS3AccountRepo) Create(ctx context.Context, account *model.S3Account) error {
+	if !account.Role.IsValid() {
+		return fmt.Errorf("inserting S3 account role %q: %w", account.Role, ErrInvalidInput)
+	}
 	_, err := r.db.NewInsert().Model(account).Exec(ctx)
 	if err != nil {
 		if isS3AccountNameUniqueViolation(err) {
@@ -77,6 +80,9 @@ func (r *BunS3AccountRepo) ListNonRoot(ctx context.Context) ([]model.S3Account, 
 }
 
 func (r *BunS3AccountRepo) Update(ctx context.Context, accessKey string, update S3AccountUpdate) error {
+	if update.Role != "" && !update.Role.IsValid() {
+		return fmt.Errorf("updating S3 account role %q: %w", update.Role, ErrInvalidInput)
+	}
 	query := r.db.NewUpdate().
 		Model((*model.S3Account)(nil)).
 		Set("updated_at = ?", time.Now().UTC()).

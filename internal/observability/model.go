@@ -19,6 +19,17 @@ const (
 	StatusUnknown     Status = "unknown"
 )
 
+// Valid reports whether the value is a known status.
+func (s Status) Valid() bool {
+	//exhaustive:enforce
+	switch s {
+	case StatusAvailable, StatusDegraded, StatusUnavailable, StatusUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
 type ReasonCode string
 
 const (

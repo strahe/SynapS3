@@ -45,6 +45,17 @@ const (
 	StorageCopyTransferMethodCacheRestore StorageCopyTransferMethod = "cache_restore"
 )
 
+// Valid reports whether the value is a known transfer method.
+func (m StorageCopyTransferMethod) Valid() bool {
+	//exhaustive:enforce
+	switch m {
+	case StorageCopyTransferMethodIngress, StorageCopyTransferMethodPeerPull, StorageCopyTransferMethodCacheRestore:
+		return true
+	default:
+		return false
+	}
+}
+
 type StorageCopyStatus string
 
 const (

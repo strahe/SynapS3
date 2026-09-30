@@ -911,7 +911,11 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 		if unreferenced {
 			return h.completeCopyTask(input, execution.ID(), "Storage copy is no longer required")
 		}
-		if copyRow.TransferMethod == model.StorageCopyTransferMethodPeerPull {
+		//exhaustive:enforce
+		switch copyRow.TransferMethod {
+		case model.StorageCopyTransferMethodIngress, model.StorageCopyTransferMethodCacheRestore:
+			// Stored from the local cache below.
+		case model.StorageCopyTransferMethodPeerPull:
 			sources, err := h.deps.Repositories.Contents.ListReadableCommittedCopies(ctx, copyRow.ContentID)
 			if err != nil {
 				return h.retryCopyTask(execution, input, copyRow, err, "copy_source_load_failed")
@@ -934,6 +938,11 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 				return taskengine.Fail(errors.New("stored content migration has no readable source or local cache"), "migration_cache_missing", nil)
 			}
 			return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
+		default:
+			// A method this version does not know may not be a store, so the
+			// copy waits instead of being uploaded.
+			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "transfer_method",
+				"Waiting for a newer version that supports this copy's transfer method", nil)
 		}
 		available, err := h.copyCacheAvailable(ctx, copyRow)
 		if err != nil {

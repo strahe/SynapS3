@@ -82,7 +82,13 @@ const (
 
 // Valid reports whether the value is a known selection mode.
 func (m SelectionMode) Valid() bool {
-	return m == SelectionModeAutomatic || m == SelectionModeManual
+	//exhaustive:enforce
+	switch m {
+	case SelectionModeAutomatic, SelectionModeManual:
+		return true
+	default:
+		return false
+	}
 }
 
 // ItemStatus is the lifecycle of one unit of migration work. An item is keyed

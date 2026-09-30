@@ -240,7 +240,6 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			model: (*s3Account2026090101)(nil),
 			constraints: []string{
 				"CONSTRAINT chk_s3_accounts_identity CHECK (access_key <> '' AND secret_key <> '')",
-				"CONSTRAINT chk_s3_accounts_role CHECK (role IN ('admin', 'user', 'userplus'))",
 			},
 		},
 		{
@@ -248,12 +247,11 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			model: (*bucket2026090101)(nil),
 			constraints: []string{
 				"CONSTRAINT chk_buckets_identity CHECK (name <> '' AND (owner_access_key IS NULL OR owner_access_key <> ''))",
-				"CONSTRAINT chk_buckets_status CHECK (status IN ('provisioning', 'ready'))",
 				// The durability policy is materialised from configuration when
 				// the bucket is created, so "how many replicas does this bucket
 				// want" never depends on reading config at query time.
-				"CONSTRAINT chk_buckets_default_copies CHECK (default_copies BETWEEN 1 AND 8)",
-				"CONSTRAINT chk_buckets_minimum_durable_copies CHECK (minimum_durable_copies BETWEEN 1 AND 8)",
+				"CONSTRAINT chk_buckets_default_copies CHECK (default_copies >= 1)",
+				"CONSTRAINT chk_buckets_minimum_durable_copies CHECK (minimum_durable_copies >= 1)",
 				"CONSTRAINT chk_buckets_explicit_copy_policy CHECK (minimum_durable_copies <= default_copies)",
 				"CONSTRAINT chk_buckets_durability_generation CHECK (durability_generation >= 0)",
 			},
@@ -267,10 +265,7 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			model: (*bucketReplicaSlot2026090101)(nil),
 			constraints: []string{
 				"CONSTRAINT uq_bucket_replica_slots_identity UNIQUE (bucket_id, copy_index)",
-				"CONSTRAINT chk_bucket_replica_slots_copy_index CHECK (copy_index BETWEEN 0 AND 7)",
-				// A shrunk slot is decommissioned, never deleted: retired data
-				// set generations still point at it.
-				"CONSTRAINT chk_bucket_replica_slots_status CHECK (status IN ('active', 'decommissioned'))",
+				"CONSTRAINT chk_bucket_replica_slots_copy_index CHECK (copy_index >= 0)",
 			},
 			foreignKeys: []string{
 				"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
@@ -735,7 +730,7 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				"CONSTRAINT uq_storage_contents_addr UNIQUE (id, bucket_id, content_size)",
 				"CONSTRAINT chk_storage_contents_identity CHECK ((" + checksumCheck + ") AND (piece_cid IS NULL OR piece_cid <> ''))",
 				"CONSTRAINT chk_storage_contents_content_size CHECK (content_size >= 0)",
-				"CONSTRAINT chk_storage_contents_requested_copies CHECK (requested_copies BETWEEN 1 AND 8)",
+				"CONSTRAINT chk_storage_contents_requested_copies CHECK (requested_copies >= 1)",
 				"CONSTRAINT chk_storage_contents_cleanup_generation CHECK (cleanup_generation >= 0)",
 			},
 			foreignKeys: []string{
@@ -781,14 +776,13 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				// evidence at all, so both directions are stated here.
 				"CONSTRAINT chk_storage_copies_committed_evidence CHECK ((status = 'committed') = (confirmed_attempt_id IS NOT NULL))",
 				"CONSTRAINT chk_storage_copies_confirmed_attempt_shape CHECK ((confirmed_attempt_id IS NULL AND confirmed_attempt_status IS NULL) OR (confirmed_attempt_id IS NOT NULL AND confirmed_attempt_id <> '' AND confirmed_attempt_status IS NOT NULL))",
-				"CONSTRAINT chk_storage_copies_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull', 'cache_restore'))",
 				"CONSTRAINT chk_storage_copies_optional_identity CHECK (provider_id <> '' AND (piece_id IS NULL OR piece_id <> '') AND (retrieval_url IS NULL OR retrieval_url <> '') AND (commit_extra_data_hex IS NULL OR commit_extra_data_hex <> ''))",
 				"CONSTRAINT chk_storage_copies_committed_shape CHECK (status <> 'committed' OR (piece_id IS NOT NULL AND piece_id <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))",
 				"CONSTRAINT chk_storage_copies_commit_ready CHECK (commit_ready_at IS NULL OR status IN ('piece_ready', 'committing', 'committed'))",
 				"CONSTRAINT chk_storage_copies_content_size CHECK (content_size >= 0)",
 				// Store progress belongs to the transfer that produces it;
 				// peer-pull copies never carry it.
-				"CONSTRAINT chk_storage_copies_ingress_progress CHECK (transfer_method IN ('ingress', 'cache_restore') OR (ingress_bytes_transferred = 0 AND ingress_store_attempt = 0 AND progress_updated_at IS NULL))",
+				"CONSTRAINT chk_storage_copies_ingress_progress CHECK (transfer_method <> 'peer_pull' OR (ingress_bytes_transferred = 0 AND ingress_store_attempt = 0 AND progress_updated_at IS NULL))",
 				"CONSTRAINT chk_storage_copies_ingress_bytes CHECK (ingress_bytes_transferred >= 0 AND ingress_bytes_transferred <= content_size)",
 				"CONSTRAINT chk_storage_copies_ingress_attempt CHECK (ingress_store_attempt >= 0)",
 			},
@@ -884,11 +878,9 @@ func storageReplacementTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_replacements_identity CHECK (client_request_id <> '' AND (requested_provider_id IS NULL OR requested_provider_id <> ''))",
 			// The replica slot is a row, so the index is a foreign key rather than a range check.
 			"CONSTRAINT fk_storage_replacements_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"CONSTRAINT chk_storage_replacements_selection_mode CHECK (selection_mode IN ('automatic', 'manual'))",
 			"CONSTRAINT chk_storage_replacements_status CHECK (status IN ('preparing_target', 'migrating', 'waiting', 'retiring', 'cleanup_attention', 'failed', 'completed', 'superseded'))",
 			"CONSTRAINT chk_storage_replacements_wait_reason CHECK (wait_reason IS NULL OR wait_reason <> '')",
 			"CONSTRAINT chk_storage_replacements_failure_reason CHECK (failure_reason IS NULL OR failure_reason <> '')",
-			"CONSTRAINT chk_storage_replacements_client_request_id CHECK (length(client_request_id) BETWEEN 1 AND 128)",
 			"CONSTRAINT chk_storage_replacements_distinct_data_sets CHECK (source_data_set_id <> target_data_set_id)",
 			"CONSTRAINT chk_storage_replacements_generation CHECK (task_generation >= 1)",
 			"CONSTRAINT chk_storage_replacements_wait_shape CHECK ((status = 'waiting') = (wait_reason IS NOT NULL))",
@@ -934,7 +926,6 @@ func storageCleanupCopyTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_cleanup_copies_identity CHECK (provider_id <> '' AND piece_id <> '' AND piece_cid <> '' AND checksum <> '' AND (data_set_id IS NULL OR data_set_id <> '') AND (client_data_set_id IS NULL OR client_data_set_id <> '') AND (delete_tx_hash IS NULL OR delete_tx_hash <> ''))",
 			// The replica slot is a row, so the index is a foreign key rather than a range check.
 			"CONSTRAINT fk_storage_cleanup_copies_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"CONSTRAINT chk_storage_cleanup_copies_status CHECK (status IN ('pending', 'delete_scheduled', 'removed', 'failed', 'unsupported'))",
 			"CONSTRAINT chk_storage_cleanup_copies_delete_scheduled CHECK (status <> 'delete_scheduled' OR (delete_tx_hash IS NOT NULL AND scheduled_at IS NOT NULL))",
 			"CONSTRAINT uq_storage_cleanup_copies_physical UNIQUE (content_id, storage_data_set_id, piece_id)",
 		},
@@ -1012,16 +1003,17 @@ type walletOperation2026090101 struct {
 }
 
 func createWalletSchema(ctx context.Context, db bun.IDB) error {
-	amountCheck := `((type = 'approve' AND amount = '0') OR (type IN ('fund', 'withdraw') AND amount GLOB '[1-9]*' AND amount NOT GLOB '*[^0-9]*'))`
+	// The amount is a canonical base-10 integer. Which operation types need
+	// zero or a positive amount is checked where operations are created.
+	amountCheck := `(amount = '0' OR (amount GLOB '[1-9]*' AND amount NOT GLOB '*[^0-9]*'))`
 	if db.Dialect().Name() == dialect.PG {
-		amountCheck = `((type = 'approve' AND amount = '0') OR (type IN ('fund', 'withdraw') AND amount ~ '^[1-9][0-9]*$'))`
+		amountCheck = `(amount ~ '^(0|[1-9][0-9]*)$')`
 	}
 	if err := createInitialTable(ctx, db, initialTableSpec{
 		name:  "wallet_operations",
 		model: (*walletOperation2026090101)(nil),
 		constraints: []string{
 			"CONSTRAINT chk_wallet_operations_identity CHECK (client_request_id <> '' AND amount <> '' AND (tx_hash IS NULL OR tx_hash <> ''))",
-			"CONSTRAINT chk_wallet_operations_type CHECK (type IN ('fund', 'withdraw', 'approve'))",
 			"CONSTRAINT chk_wallet_operations_status CHECK (status IN ('pending', 'submitted', 'confirmed', 'failed', 'unknown'))",
 			"CONSTRAINT chk_wallet_operations_submitted_shape CHECK (status <> 'submitted' OR (tx_hash IS NOT NULL AND submitted_at IS NOT NULL))",
 			// A settled operation has finished and released its task.
@@ -1132,9 +1124,6 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 		{
 			name:  "observability_collection_states",
 			model: (*observabilityCollectionState2026090101)(nil),
-			constraints: []string{
-				"CONSTRAINT chk_observability_collection_type CHECK (collection_type IN ('providers', 'data_sets'))",
-			},
 		},
 		{
 			name:        "observability_provider_states",
@@ -1142,7 +1131,6 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 			jsonColumns: initialJSONColumns("observability_provider_states"),
 			constraints: []string{
 				"CONSTRAINT chk_observability_provider_identity CHECK (provider_id <> '')",
-				"CONSTRAINT chk_observability_provider_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))",
 			},
 		},
 		{
@@ -1155,7 +1143,6 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 			name:        "provider_tier_snapshots",
 			model:       (*providerTierSnapshot2026090101)(nil),
 			jsonColumns: initialJSONColumns("provider_tier_snapshots"),
-			constraints: []string{"CONSTRAINT chk_provider_tier_snapshots_tier CHECK (tier IN ('approved', 'endorsed'))"},
 		},
 		{
 			name:  "provider_upload_speed_tests",
@@ -1174,7 +1161,6 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 			constraints: []string{
 				"CONSTRAINT chk_observability_data_set_identity CHECK (provider_id <> '' AND (chain_data_set_id IS NULL OR chain_data_set_id <> '') AND (client_data_set_id IS NULL OR client_data_set_id <> ''))",
 				"CONSTRAINT fk_observability_data_set_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"CONSTRAINT chk_observability_data_set_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))",
 			},
 			foreignKeys: []string{
 				"(local_data_set_id, bucket_id, copy_index, provider_id) REFERENCES storage_data_sets (id, bucket_id, copy_index, provider_id) ON UPDATE RESTRICT ON DELETE CASCADE",

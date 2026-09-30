@@ -211,6 +211,46 @@ func TestBucketRepo_UpdateCopyPolicyRefusesLoweringTheTarget(t *testing.T) {
 	}
 }
 
+// The schema only requires a positive replica target and says nothing about
+// status values, so the replica ceiling and the known statuses are enforced
+// here.
+func TestBucketRepo_RejectsCopiesAboveTheLimitAndUnknownStatus(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	unknown := model.BucketStatus("deleting")
+	if err := repos.Buckets.Create(ctx, &model.Bucket{
+		Name: "unknown-status", Status: unknown, DefaultCopies: 1, MinimumDurableCopies: 1,
+	}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("Create with unknown status error = %v, want ErrInvalidInput", err)
+	}
+
+	bucket := &model.Bucket{Name: "copies-limit", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	aboveLimit := model.StorageCopiesMax + 1
+	zero := 0
+	for name, input := range map[string]repository.UpdateBucketCopyPolicyInput{
+		"target above the limit": {Name: bucket.Name, SetDefaultCopies: true, DefaultCopies: &aboveLimit},
+		"minimum below one":      {Name: bucket.Name, SetMinimumDurableCopies: true, MinimumDurableCopies: &zero},
+	} {
+		if _, err := repos.Buckets.UpdateCopyPolicy(ctx, input); !errors.Is(err, repository.ErrInvalidInput) {
+			t.Fatalf("UpdateCopyPolicy %s error = %v, want ErrInvalidInput", name, err)
+		}
+	}
+	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil || got == nil || got.DefaultCopies != 2 || got.MinimumDurableCopies != 2 {
+		t.Fatalf("policy after refused updates = %#v err=%v, want unchanged 2/2", got, err)
+	}
+	assertActiveReplicaSlots(t, ctx, repos, bucket.ID, 2)
+
+	if err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, unknown); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("UpdateStatus to unknown status error = %v, want ErrInvalidInput", err)
+	}
+}
+
 func assertActiveReplicaSlots(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64, want int) {
 	t.Helper()
 	slots, err := repos.Buckets.ActiveReplicaSlots(ctx, bucketID)

@@ -65,6 +65,11 @@ type BunObservabilityRepo struct {
 }
 
 func (r *BunObservabilityRepo) ReplaceProviderStates(ctx context.Context, checkedAt time.Time, states []observability.ProviderState) error {
+	for i := range states {
+		if err := validProviderStateStatus(states[i]); err != nil {
+			return err
+		}
+	}
 	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
 		checkedAt = normalizeCheckedAt(checkedAt, time.Now())
 		claimed, err := claimObservabilityCollection(ctx, db, observability.CollectionProviders, checkedAt)
@@ -95,6 +100,9 @@ func (r *BunObservabilityRepo) ReplaceProviderStates(ctx context.Context, checke
 }
 
 func (r *BunObservabilityRepo) UpsertProviderObservation(ctx context.Context, checkedAt time.Time, state observability.ProviderState) error {
+	if err := validProviderStateStatus(state); err != nil {
+		return err
+	}
 	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
 		checkedAt = normalizeCheckedAt(checkedAt, time.Now().UTC())
 		prepareProviderState(&state, checkedAt)
@@ -290,6 +298,11 @@ func (r *BunObservabilityRepo) ListProviderStates(ctx context.Context, opts obse
 }
 
 func (r *BunObservabilityRepo) ReplaceDataSetStates(ctx context.Context, checkedAt time.Time, states []observability.DataSetState) error {
+	for i := range states {
+		if !states[i].Status.Valid() {
+			return fmt.Errorf("data set %d observation status %q: %w", states[i].LocalDataSetID, states[i].Status, ErrInvalidInput)
+		}
+	}
 	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
 		checkedAt = normalizeCheckedAt(checkedAt, time.Now())
 		claimed, err := claimObservabilityCollection(ctx, db, observability.CollectionDataSets, checkedAt)
@@ -359,6 +372,13 @@ func (r *BunObservabilityRepo) withTx(ctx context.Context, fn func(context.Conte
 		})
 	}
 	return fn(ctx, r.db)
+}
+
+func validProviderStateStatus(state observability.ProviderState) error {
+	if !state.Status.Valid() {
+		return fmt.Errorf("provider %s observation status %q: %w", state.ProviderID.String(), state.Status, ErrInvalidInput)
+	}
+	return nil
 }
 
 func prepareProviderState(state *observability.ProviderState, checkedAt time.Time) {
@@ -481,7 +501,9 @@ type observabilityStateAggregate struct {
 	Available   int
 	Degraded    int
 	Unavailable int
-	Unknown     int
+	// Unknown also counts a status this version does not know, so the summary
+	// never reads healthier than the rows behind it.
+	Unknown int
 }
 
 func (r *BunObservabilityRepo) providerStateAggregate(ctx context.Context, opts observability.ListOptions) (observabilityStateAggregate, error) {
@@ -491,7 +513,8 @@ func (r *BunObservabilityRepo) providerStateAggregate(ctx context.Context, opts 
 		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS available", observability.StatusAvailable).
 		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS degraded", observability.StatusDegraded).
 		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS unavailable", observability.StatusUnavailable).
-		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS unknown", observability.StatusUnknown).
+		ColumnExpr("COALESCE(SUM(CASE WHEN status NOT IN (?, ?, ?) THEN 1 ELSE 0 END), 0) AS unknown",
+			observability.StatusAvailable, observability.StatusDegraded, observability.StatusUnavailable).
 		Scan(ctx, &aggregate)
 	return aggregate, err
 }
@@ -503,7 +526,8 @@ func (r *BunObservabilityRepo) dataSetStateAggregate(ctx context.Context, opts o
 		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS available", observability.StatusAvailable).
 		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS degraded", observability.StatusDegraded).
 		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS unavailable", observability.StatusUnavailable).
-		ColumnExpr("COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS unknown", observability.StatusUnknown).
+		ColumnExpr("COALESCE(SUM(CASE WHEN status NOT IN (?, ?, ?) THEN 1 ELSE 0 END), 0) AS unknown",
+			observability.StatusAvailable, observability.StatusDegraded, observability.StatusUnavailable).
 		Scan(ctx, &aggregate)
 	return aggregate, err
 }

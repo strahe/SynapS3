@@ -1035,6 +1035,43 @@ func TestStorageCleanupWaitsWhenDataSetIsNotLive(t *testing.T) {
 	}
 }
 
+// A cleanup status this version does not know may record a paid request, so
+// the copy is neither checked, deleted, nor rewritten.
+func TestStorageCleanupLeavesUnknownCopyStatusUntouched(t *testing.T) {
+	var stateChecks, deleteCalls atomic.Int64
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				deleteCalls.Add(1)
+				return &sdktypes.WriteResult{Hash: common.HexToHash("0x1")}, nil
+			}}, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			stateChecks.Add(1)
+			return synapse.CleanupPieceState{Live: true}, nil
+		},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	unknown := model.StorageCleanupCopyStatus("removal_queued")
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("status = ?", unknown).Where("content_id = ?", content.ID).Exec(ctx); err != nil {
+		t.Fatalf("store unknown cleanup status: %v", err)
+	}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "cleanup_status"
+	})
+	if stateChecks.Load() != 0 || deleteCalls.Load() != 0 {
+		t.Fatalf("state checks = %d, delete calls = %d, want none", stateChecks.Load(), deleteCalls.Load())
+	}
+	copyRows, err := runtime.repos.StorageCleanup.AuthorizeTask(ctx, content.ID, 1, taskRow.ID)
+	if err != nil || len(copyRows) != 1 || copyRows[0].Status != unknown {
+		t.Fatalf("cleanup copy after waiting = %#v, err=%v", copyRows, err)
+	}
+}
+
 func TestStorageCleanupReissuesOnlyAfterConfirmedFailureAndManualRetry(t *testing.T) {
 	oldHash := common.HexToHash("0x1")
 	newHash := common.HexToHash("0x2")
@@ -2247,6 +2284,45 @@ func TestInitialPeerPullWaitsForCommittedSourceEvenWithCache(t *testing.T) {
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 	if err != nil || copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != plan.ID {
 		t.Fatalf("peer copy after source wait = %#v, err=%v", copyRow, err)
+	}
+}
+
+// A transfer method this version does not know may not be a store, so the copy
+// waits even though its bytes are cached and could be uploaded.
+func TestTransferPlanWaitsOnUnknownTransferMethod(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		cache:  &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return true }},
+		policy: cache.EvictionPolicyNone,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	version := &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "unknown-method.bin",
+		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+		ETag: "unknown-method", ContentType: "application/octet-stream",
+	}
+	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
+		t.Fatal(err)
+	}
+	unknown := model.StorageCopyTransferMethod("repair")
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCopy)(nil)).
+		Set("transfer_method = ?", unknown).Where("id = ?", pipeline.target.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	plan := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, plan.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "transfer_method"
+	})
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.TransferMethod != unknown || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != plan.ID {
+		t.Fatalf("copy after waiting = %#v, err=%v", copyRow, err)
 	}
 }
 

@@ -10,5 +10,11 @@ const (
 
 // Valid reports whether the value is a known permanent failure reason.
 func (r FailureReason) Valid() bool {
-	return r == FailureReasonTargetInUse
+	//exhaustive:enforce
+	switch r {
+	case FailureReasonTargetInUse:
+		return true
+	default:
+		return false
+	}
 }

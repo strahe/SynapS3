@@ -38,7 +38,7 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			VALUES (?, 'provider', 0, 1, FALSE, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID)
 		mustRejectStatement(t, db, `INSERT INTO wallet_operations
 			(type, client_request_id, amount, created_at, updated_at)
-			VALUES ('fund', 'invalid-amount', '0', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+			VALUES ('fund', 'invalid-amount', '01', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 		mustRejectStatement(t, db, `INSERT INTO storage_data_sets
 			(bucket_id, provider_id, copy_index, generation, is_current, status, created_at, updated_at)
 			VALUES (?, 'ready-without-id', 1, 1, FALSE, 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID)

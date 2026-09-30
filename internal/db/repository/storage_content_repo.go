@@ -914,6 +914,9 @@ func (r *BunStorageContentRepo) CreateUploadCopiesForBindings(ctx context.Contex
 			if input.ProviderID.IsZero() {
 				return fmt.Errorf("providerID is required: %w", ErrInvalidInput)
 			}
+			if !input.TransferMethod.Valid() {
+				return fmt.Errorf("transfer method %q: %w", input.TransferMethod, ErrInvalidInput)
+			}
 			binding := new(model.StorageDataSet)
 			if err := db.NewSelect().
 				Model(binding).
