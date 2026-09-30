@@ -358,29 +358,30 @@ func (m *MockWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.WalletI
 // MockCache is a configurable test double for cache.Cache.
 // Use for fault injection tests; for happy-path tests prefer real cache.NewFilesystem.
 type MockCache struct {
-	PutFunc             func(ctx context.Context, bucket, key string, r io.Reader) (*cache.ObjectInfo, error)
-	PutStagedFunc       func(ctx context.Context, bucket, key string, r io.Reader) (*cache.StagedObject, error)
-	GetFunc             func(ctx context.Context, bucket, key string) (io.ReadCloser, *cache.ObjectInfo, error)
-	DeleteFunc          func(ctx context.Context, bucket, key string) error
-	ExistsFunc          func(ctx context.Context, bucket, key string) bool
-	UsedBytesFunc       func() int64
-	CreateBucketDirFunc func(ctx context.Context, bucket string) error
-	DeleteBucketDirFunc func(ctx context.Context, bucket string) error
-	PutPartFunc         func(ctx context.Context, uploadID string, partNumber int, r io.Reader) (*cache.ObjectInfo, error)
-	AssemblePartsFunc   func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error)
-	DeleteUploadFunc    func(ctx context.Context, uploadID string) error
+	PutFunc                 func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.ObjectInfo, error)
+	PutStagedFunc           func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.StagedObject, error)
+	GetFunc                 func(ctx context.Context, bucket, key string) (io.ReadCloser, *cache.ObjectInfo, error)
+	DeleteFunc              func(ctx context.Context, bucket, key string) error
+	ExistsFunc              func(ctx context.Context, bucket, key string) bool
+	UsedBytesFunc           func() int64
+	ConsumeWriteRefusalFunc func() bool
+	CreateBucketDirFunc     func(ctx context.Context, bucket string) error
+	DeleteBucketDirFunc     func(ctx context.Context, bucket string) error
+	PutPartFunc             func(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.ObjectInfo, error)
+	AssemblePartsFunc       func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error)
+	DeleteUploadFunc        func(ctx context.Context, uploadID string) error
 }
 
-func (m *MockCache) Put(ctx context.Context, bucket, key string, r io.Reader) (*cache.ObjectInfo, error) {
+func (m *MockCache) Put(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.ObjectInfo, error) {
 	if m.PutFunc != nil {
-		return m.PutFunc(ctx, bucket, key, r)
+		return m.PutFunc(ctx, bucket, key, r, size)
 	}
 	return nil, errors.New("MockCache.Put not configured")
 }
 
-func (m *MockCache) PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*cache.StagedObject, error) {
+func (m *MockCache) PutStaged(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.StagedObject, error) {
 	if m.PutStagedFunc != nil {
-		return m.PutStagedFunc(ctx, bucket, key, r)
+		return m.PutStagedFunc(ctx, bucket, key, r, size)
 	}
 	return nil, errors.New("MockCache.PutStaged not configured")
 }
@@ -413,6 +414,13 @@ func (m *MockCache) UsedBytes() int64 {
 	return 0
 }
 
+func (m *MockCache) ConsumeWriteRefusal() bool {
+	if m.ConsumeWriteRefusalFunc != nil {
+		return m.ConsumeWriteRefusalFunc()
+	}
+	return false
+}
+
 func (m *MockCache) CreateBucketDir(ctx context.Context, bucket string) error {
 	if m.CreateBucketDirFunc != nil {
 		return m.CreateBucketDirFunc(ctx, bucket)
@@ -427,9 +435,9 @@ func (m *MockCache) DeleteBucketDir(ctx context.Context, bucket string) error {
 	return nil
 }
 
-func (m *MockCache) PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader) (*cache.ObjectInfo, error) {
+func (m *MockCache) PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.ObjectInfo, error) {
 	if m.PutPartFunc != nil {
-		return m.PutPartFunc(ctx, uploadID, partNumber, r)
+		return m.PutPartFunc(ctx, uploadID, partNumber, r, size)
 	}
 	return nil, errors.New("MockCache.PutPart not configured")
 }

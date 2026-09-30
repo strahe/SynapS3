@@ -75,11 +75,15 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		usedBytes := h.deps.Cache.UsedBytes()
 		highBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRUHighPercent)
 		lowBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent)
+		// A refused write starts a cycle below the high watermark too: when the
+		// headroom above it is smaller than the write, usage would otherwise never
+		// reach the watermark and the write would be refused indefinitely.
+		writeRefused := h.deps.Cache.ConsumeWriteRefusal()
 		cycleActive := checkpoint.CycleActive
 		switch {
 		case usedBytes <= lowBytes:
 			cycleActive = false
-		case usedBytes >= highBytes:
+		case usedBytes >= highBytes, writeRefused:
 			cycleActive = true
 		}
 		if cycleActive != checkpoint.CycleActive {

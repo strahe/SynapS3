@@ -193,7 +193,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-源版本不存在或已被永久删除时返回 `404 Not Found`；缓存容量不足时返回 `507 Insufficient Storage`；输入无效时返回 `400 Bad Request`；源版本读取失败或内部错误返回 `500 Internal Server Error`。
+源版本不存在或已被永久删除时返回 `404 Not Found`；缓存容量不足时返回 `503 Service Unavailable`；输入无效时返回 `400 Bad Request`；源版本读取失败或内部错误返回 `500 Internal Server Error`。
 
 恢复操作同步流式执行，最长一小时，并且缓存必须能容纳新的目标版本。
 

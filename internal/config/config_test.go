@@ -25,9 +25,9 @@ func validConfig() *Config {
 func TestValidate_DefaultConfig(t *testing.T) {
 	cfg := validConfig()
 	if cfg.Cache.EvictionPolicy != "lru" ||
-		cfg.Cache.LRUHighWatermarkPercent != 90 ||
-		cfg.Cache.LRULowWatermarkPercent != 80 {
-		t.Fatalf("default cache config = %#v, want lru with 90/80 watermarks", cfg.Cache)
+		cfg.Cache.LRUHighWatermarkPercent != 80 ||
+		cfg.Cache.LRULowWatermarkPercent != 50 {
+		t.Fatalf("default cache config = %#v, want lru with 80/50 watermarks", cfg.Cache)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got: %v", err)

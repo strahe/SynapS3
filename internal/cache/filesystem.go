@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -21,26 +20,17 @@ import (
 
 const privateDirMode os.FileMode = 0o700
 
-// errLimitReader wraps an io.Reader and returns ErrCacheFull when the
-// read limit is exceeded. Used to bound temp file writes during Put.
-type errLimitReader struct {
-	r         io.Reader
+// sizeLimitWriter fails a write that would go past the size its caller reserved.
+type sizeLimitWriter struct {
+	w         io.Writer
 	remaining int64
 }
 
-func (l *errLimitReader) Read(p []byte) (int, error) {
-	if l.remaining <= 0 {
-		// Probe: does the underlying reader have more data beyond the limit?
-		var probe [1]byte
-		if n, _ := l.r.Read(probe[:]); n > 0 {
-			return 0, ErrCacheFull // genuinely over limit
-		}
-		return 0, io.EOF // exact fit — data exhausted at limit
-	}
+func (l *sizeLimitWriter) Write(p []byte) (int, error) {
 	if int64(len(p)) > l.remaining {
-		p = p[:l.remaining]
+		return 0, ErrSizeExceeded
 	}
-	n, err := l.r.Read(p)
+	n, err := l.w.Write(p)
 	l.remaining -= int64(n)
 	return n, err
 }
@@ -51,6 +41,61 @@ type Filesystem struct {
 	maxBytes  int64 // 0 means unlimited
 	usedBytes atomic.Int64
 	keyShards [256]sync.Mutex // fixed-size shard locks to serialize per-key operations
+
+	// capacityMu admits writes against usedBytes plus reservedBytes, so
+	// committed and in-progress bytes together never exceed maxBytes.
+	capacityMu    sync.Mutex
+	reservedBytes int64
+	writeRefused  atomic.Bool
+}
+
+// capacityReservation is the capacity one write holds until it commits or
+// is abandoned.
+type capacityReservation struct {
+	f    *Filesystem
+	held int64
+}
+
+// reserve holds size bytes for a write that has not started, or returns
+// ErrCacheFull when the cache cannot hold them.
+func (f *Filesystem) reserve(size int64) (*capacityReservation, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("cache: negative write size %d", size)
+	}
+	res := &capacityReservation{f: f}
+	if f.maxBytes <= 0 {
+		return res, nil
+	}
+	f.capacityMu.Lock()
+	defer f.capacityMu.Unlock()
+	if f.usedBytes.Load()+f.reservedBytes+size > f.maxBytes {
+		f.writeRefused.Store(true)
+		return nil, ErrCacheFull
+	}
+	f.reservedBytes += size
+	res.held = size
+	return res, nil
+}
+
+// settle records a committed write that changed usage by delta and releases
+// the capacity it held in the same step.
+func (r *capacityReservation) settle(delta int64) {
+	r.f.capacityMu.Lock()
+	r.f.usedBytes.Add(delta)
+	r.f.reservedBytes -= r.held
+	r.f.capacityMu.Unlock()
+	r.held = 0
+}
+
+// release returns the capacity held by a write that will not commit.
+func (r *capacityReservation) release() {
+	if r.held == 0 {
+		return
+	}
+	r.f.capacityMu.Lock()
+	r.f.reservedBytes -= r.held
+	r.f.capacityMu.Unlock()
+	r.held = 0
 }
 
 var _ Cache = (*Filesystem)(nil)
@@ -181,8 +226,8 @@ func fsyncDir(dir string) error {
 	return d.Sync()
 }
 
-func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (*ObjectInfo, error) {
-	staged, err := f.PutStaged(ctx, bucket, key, r)
+func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader, size int64) (*ObjectInfo, error) {
+	staged, err := f.PutStaged(ctx, bucket, key, r, size)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +253,7 @@ func (f *Filesystem) stagedDestination(bucket, key string) (string, string, erro
 	return dst, dir, nil
 }
 
-func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*StagedObject, error) {
+func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Reader, size int64) (*StagedObject, error) {
 	dst, err := f.safePath(bucket, key)
 	if err != nil {
 		return nil, err
@@ -218,24 +263,15 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
-	// Approximate old file size for capacity estimation (no shard lock).
-	// This is racy but safe: Commit does the authoritative capacity check.
-	var oldSizeApprox int64
-	if stat, statErr := os.Stat(dst); statErr == nil {
-		oldSizeApprox = stat.Size()
-	}
-
-	// Pre-flight capacity check (without shard lock — approximate).
-	if f.maxBytes > 0 {
-		avail := f.maxBytes - f.usedBytes.Load() + oldSizeApprox
-		if avail <= 0 {
-			return nil, ErrCacheFull
-		}
+	res, err := f.reserve(size)
+	if err != nil {
+		return nil, err
 	}
 
 	// Use os.CreateTemp for unique temp files.
 	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
 	if err != nil {
+		res.release()
 		return nil, fmt.Errorf("creating temp file: %w", err)
 	}
 	tmpPath := file.Name()
@@ -243,28 +279,16 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 		if file != nil {
 			_ = file.Close()
 			_ = os.Remove(tmpPath)
+			res.release()
 		}
 	}()
 
 	md5Hash := md5.New()
 	sha256Hash := sha256.New()
-	w := io.MultiWriter(file, md5Hash, sha256Hash)
+	w := &sizeLimitWriter{w: io.MultiWriter(file, md5Hash, sha256Hash), remaining: size}
 
-	// Bound the write to prevent disk exhaustion.
-	src := r
-	if f.maxBytes > 0 {
-		avail := f.maxBytes - f.usedBytes.Load() + oldSizeApprox
-		if avail <= 0 {
-			return nil, ErrCacheFull
-		}
-		src = &errLimitReader{r: r, remaining: avail}
-	}
-
-	n, err := io.Copy(w, src)
+	n, err := io.Copy(w, r)
 	if err != nil {
-		if errors.Is(err, ErrCacheFull) {
-			return nil, ErrCacheFull
-		}
 		return nil, fmt.Errorf("writing cache file: %w", err)
 	}
 
@@ -310,22 +334,7 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 			oldSize = stat.Size()
 		}
 
-		// Reserve capacity.
-		delta := n - oldSize
-		var reserved bool
-		if f.maxBytes > 0 && delta > 0 {
-			newUsed := f.usedBytes.Add(delta)
-			if newUsed > f.maxBytes {
-				f.usedBytes.Add(-delta)
-				return ErrCacheFull
-			}
-			reserved = true
-		}
-
 		if err := os.Rename(tmpPath, destPath); err != nil {
-			if reserved {
-				f.usedBytes.Add(-delta)
-			}
 			return fmt.Errorf("renaming temp to final: %w", err)
 		}
 
@@ -334,11 +343,7 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 			slog.Warn("fsync parent dir failed", "dir", destDir, "error", err)
 		}
 
-		// Apply remaining accounting (shrink or unlimited mode).
-		if !reserved {
-			f.usedBytes.Add(delta)
-		}
-
+		res.settle(n - oldSize)
 		committed = true
 		info.Path = destPath
 		slog.Debug("cached object", "bucket", destBucket, "key", destKey, "size", n)
@@ -355,6 +360,7 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 			if committed {
 				return nil
 			}
+			res.release()
 			err := os.Remove(tmpPath)
 			if err != nil && !os.IsNotExist(err) {
 				return err
@@ -438,6 +444,10 @@ func (f *Filesystem) UsedBytes() int64 {
 	return f.usedBytes.Load()
 }
 
+func (f *Filesystem) ConsumeWriteRefusal() bool {
+	return f.writeRefused.Swap(false)
+}
+
 func (f *Filesystem) CreateBucketDir(_ context.Context, bucket string) error {
 	p, err := f.safePath(bucket)
 	if err != nil {
@@ -499,7 +509,7 @@ func (f *Filesystem) partPath(uploadID string, partNumber int) (string, error) {
 	return f.safePath(".multipart", uploadID, fmt.Sprintf("%d", partNumber))
 }
 
-func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int, r io.Reader) (*ObjectInfo, error) {
+func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*ObjectInfo, error) {
 	dst, err := f.partPath(uploadID, partNumber)
 	if err != nil {
 		return nil, err
@@ -508,6 +518,12 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 	if err := ensurePrivateDir(dir); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
+
+	res, err := f.reserve(size)
+	if err != nil {
+		return nil, err
+	}
+	defer res.release()
 
 	// Use shard lock keyed on uploadID+partNumber for per-part serialization.
 	mu := f.shardFor(".multipart/"+uploadID, fmt.Sprintf("%d", partNumber))
@@ -533,54 +549,22 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 
 	md5Hash := md5.New()
 	sha256Hash := sha256.New()
-	w := io.MultiWriter(file, md5Hash, sha256Hash)
+	w := &sizeLimitWriter{w: io.MultiWriter(file, md5Hash, sha256Hash), remaining: size}
 
-	src := r
-	if f.maxBytes > 0 {
-		avail := f.maxBytes - f.usedBytes.Load() + oldSize
-		if avail <= 0 {
-			return nil, ErrCacheFull
-		}
-		src = &errLimitReader{r: r, remaining: avail}
-	}
-
-	n, err := io.Copy(w, src)
+	n, err := io.Copy(w, r)
 	if err != nil {
-		if errors.Is(err, ErrCacheFull) {
-			return nil, ErrCacheFull
-		}
 		return nil, fmt.Errorf("writing part file: %w", err)
 	}
 
-	delta := n - oldSize
-	var reserved bool
-	if f.maxBytes > 0 && delta > 0 {
-		newUsed := f.usedBytes.Add(delta)
-		if newUsed > f.maxBytes {
-			f.usedBytes.Add(-delta)
-			return nil, ErrCacheFull
-		}
-		reserved = true
-	}
-
 	if err := file.Sync(); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		return nil, fmt.Errorf("fsync part file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		return nil, fmt.Errorf("closing part file: %w", err)
 	}
 	file = nil
 
 	if err := os.Rename(tmpPath, dst); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("renaming part to final: %w", err)
 	}
@@ -589,9 +573,7 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 		slog.Warn("fsync multipart dir failed", "dir", dir, "error", err)
 	}
 
-	if !reserved {
-		f.usedBytes.Add(delta)
-	}
+	res.settle(n - oldSize)
 
 	return &ObjectInfo{
 		Path:     dst,
@@ -611,8 +593,29 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 		return nil, nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
+	partFiles := make([]string, len(partNumbers))
+	var expectedSize int64
+	for i, pn := range partNumbers {
+		partFile, pErr := f.partPath(uploadID, pn)
+		if pErr != nil {
+			return nil, nil, fmt.Errorf("part path %d: %w", pn, pErr)
+		}
+		stat, statErr := os.Stat(partFile)
+		if statErr != nil {
+			return nil, nil, fmt.Errorf("opening part %d: %w", pn, statErr)
+		}
+		partFiles[i] = partFile
+		expectedSize += stat.Size()
+	}
+
+	res, err := f.reserve(expectedSize)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
 	if err != nil {
+		res.release()
 		return nil, nil, fmt.Errorf("creating temp file: %w", err)
 	}
 	tmpPath := file.Name()
@@ -620,21 +623,18 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 		if file != nil {
 			_ = file.Close()
 			_ = os.Remove(tmpPath)
+			res.release()
 		}
 	}()
 
 	sha256Hash := sha256.New()
-	w := io.MultiWriter(file, sha256Hash)
+	w := &sizeLimitWriter{w: io.MultiWriter(file, sha256Hash), remaining: expectedSize}
 
 	var totalSize int64
 	partETags := make([]string, 0, len(partNumbers))
 
-	for _, pn := range partNumbers {
-		partFile, pErr := f.partPath(uploadID, pn)
-		if pErr != nil {
-			return nil, nil, fmt.Errorf("part path %d: %w", pn, pErr)
-		}
-		pf, openErr := os.Open(partFile)
+	for i, pn := range partNumbers {
+		pf, openErr := os.Open(partFiles[i])
 		if openErr != nil {
 			return nil, nil, fmt.Errorf("opening part %d: %w", pn, openErr)
 		}
@@ -689,21 +689,7 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 			oldSize = stat.Size()
 		}
 
-		delta := totalSize - oldSize
-		var reserved bool
-		if f.maxBytes > 0 && delta > 0 {
-			newUsed := f.usedBytes.Add(delta)
-			if newUsed > f.maxBytes {
-				f.usedBytes.Add(-delta)
-				return ErrCacheFull
-			}
-			reserved = true
-		}
-
 		if err := os.Rename(tmpPath, destPath); err != nil {
-			if reserved {
-				f.usedBytes.Add(-delta)
-			}
 			return fmt.Errorf("renaming assembled to final: %w", err)
 		}
 
@@ -711,10 +697,7 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 			slog.Warn("fsync dir after assemble failed", "dir", destDir, "error", err)
 		}
 
-		if !reserved {
-			f.usedBytes.Add(delta)
-		}
-
+		res.settle(totalSize - oldSize)
 		committed = true
 		info.Path = destPath
 		return nil
@@ -730,6 +713,7 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 			if committed {
 				return nil
 			}
+			res.release()
 			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
 				return err
 			}

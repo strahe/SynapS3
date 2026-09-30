@@ -183,8 +183,8 @@ func defaultConfig() *Config {
 		Cache: CacheConfig{
 			MaxSizeGB:               100,
 			EvictionPolicy:          string(cachepkg.EvictionPolicyLRU),
-			LRUHighWatermarkPercent: 90,
-			LRULowWatermarkPercent:  80,
+			LRUHighWatermarkPercent: 80,
+			LRULowWatermarkPercent:  50,
 		},
 		Worker: WorkerConfig{
 			Tasks: TaskWorkerConfig{

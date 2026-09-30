@@ -92,8 +92,8 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
-| `cache.lru_high_watermark_percent` | `90` |
-| `cache.lru_low_watermark_percent` | `80` |
+| `cache.lru_high_watermark_percent` | `80` |
+| `cache.lru_low_watermark_percent` | `50` |
 | `worker.tasks.concurrency` | `12` |
 | `worker.tasks.poll_interval` | `5s` |
 | `worker.tasks.lease_duration` | `5m` |
@@ -136,8 +136,8 @@ LRU 水位始终必须满足 `0 <= low < high <= 100`。在 `after_upload` 或 `
 ```toml
 [cache]
 eviction_policy = "lru"
-lru_high_watermark_percent = 90
-lru_low_watermark_percent = 80
+lru_high_watermark_percent = 80
+lru_low_watermark_percent = 50
 ```
 
 淘汰设置会在重启后生效。缓存清理是异步流程；`PutObject` 不会同步等待或触发一次 LRU 检查。

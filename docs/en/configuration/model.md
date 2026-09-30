@@ -92,8 +92,8 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
-| `cache.lru_high_watermark_percent` | `90` |
-| `cache.lru_low_watermark_percent` | `80` |
+| `cache.lru_high_watermark_percent` | `80` |
+| `cache.lru_low_watermark_percent` | `50` |
 | `worker.tasks.concurrency` | `12` |
 | `worker.tasks.poll_interval` | `5s` |
 | `worker.tasks.lease_duration` | `5m` |
@@ -136,8 +136,8 @@ The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain sav
 ```toml
 [cache]
 eviction_policy = "lru"
-lru_high_watermark_percent = 90
-lru_low_watermark_percent = 80
+lru_high_watermark_percent = 80
+lru_low_watermark_percent = 50
 ```
 
 Eviction settings take effect after restart. Cache cleanup is asynchronous: a `PutObject` does not wait for or trigger an immediate LRU pass.

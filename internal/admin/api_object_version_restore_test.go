@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/versity/versitygw/s3err"
 )
 
 type recordingObjectVersionRestorer struct {
@@ -125,12 +124,18 @@ func TestAPIObjectVersionRestoreMapsErrors(t *testing.T) {
 		err        error
 		wantStatus int
 		wantCode   string
+		wantError  string
 	}{
 		{name: "invalid", err: repository.ErrInvalidInput, wantStatus: http.StatusBadRequest},
 		{name: "missing", err: repository.ErrNotFound, wantStatus: http.StatusNotFound},
 		{name: "already current", err: repository.ErrAlreadyCurrent, wantStatus: http.StatusConflict, wantCode: objectVersionAlreadyCurrentCode},
 		{name: "conflict", err: repository.ErrConflict, wantStatus: http.StatusConflict},
-		{name: "cache full", err: fmt.Errorf("staging restore: %w", cache.ErrCacheFull), wantStatus: http.StatusInsufficientStorage},
+		{
+			name:       "slow down shows its reason",
+			err:        s3err.APIError{Code: "SlowDown", Description: "The local cache is full. Please retry later.", HTTPStatusCode: http.StatusServiceUnavailable},
+			wantStatus: http.StatusServiceUnavailable,
+			wantError:  "The local cache is full. Please retry later.",
+		},
 		{name: "internal", err: errors.New("provider read failed"), wantStatus: http.StatusInternalServerError},
 	}
 
@@ -157,6 +162,9 @@ func TestAPIObjectVersionRestoreMapsErrors(t *testing.T) {
 			}
 			if body["error"] == "" {
 				t.Fatal("error response is empty")
+			}
+			if tt.wantError != "" && body["error"] != tt.wantError {
+				t.Fatalf("error = %q, want %q", body["error"], tt.wantError)
 			}
 			if body["code"] != tt.wantCode {
 				t.Fatalf("error code = %q, want %q", body["code"], tt.wantCode)

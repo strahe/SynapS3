@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/admin"
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -56,13 +57,13 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 
 	// Stage beside the content directory: the destination is content-addressed
 	// and only nameable once the staged checksum resolves a content row.
-	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(input.Body))
+	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(input.Body), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		if errors.Is(err, objectlimits.ErrTooLarge) {
 			return s3response.PutObjectOutput{}, objectSizeAPIError(err)
 		}
-		return s3response.PutObjectOutput{}, fmt.Errorf("staging object: %w", err)
+		return s3response.PutObjectOutput{}, contentWriteError(fmt.Errorf("staging object: %w", err))
 	}
 	defer func() { _ = staged.Rollback() }()
 
@@ -740,10 +741,10 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 	}
 
 	versionID := model.NewVersionID()
-	staged, err := b.cache.PutStaged(ctx, input.DestinationBucket.Name, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(srcResult.Body))
+	staged, err := b.cache.PutStaged(ctx, input.DestinationBucket.Name, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(srcResult.Body), srcResult.Size)
 	_ = srcResult.Body.Close()
 	if err != nil {
-		return copyObjectVersionResult{}, fmt.Errorf("staging copy destination: %w", err)
+		return copyObjectVersionResult{}, contentWriteError(fmt.Errorf("staging copy destination: %w", err))
 	}
 	defer func() { _ = staged.Rollback() }()
 	cacheInfo := staged.Info
@@ -1049,16 +1050,34 @@ func (b *SynapseBackend) requireWritableBucket(ctx context.Context, name string)
 	return bucket, nil
 }
 
-// contentWriteError asks the client to retry a write whose bytes are still
-// being removed after their last version was deleted; the retry then stores
-// them as new content.
+// contentWriteError reports write failures the client can act on as S3
+// errors. A retry succeeds once the earlier copy of the same bytes has been
+// removed, or once the cache has room again; a body longer than its declared
+// length is the client's to fix. Other errors are returned unchanged.
 func contentWriteError(err error) error {
-	if !errors.Is(err, repository.ErrContentCleanupInProgress) {
+	switch {
+	case errors.Is(err, repository.ErrContentCleanupInProgress):
+		apiErr := s3err.GetAPIError(s3err.ErrSlowDown)
+		apiErr.Description = "The same data is still being removed after an earlier delete. Please retry shortly."
+		return apiErr
+	case errors.Is(err, cache.ErrCacheFull):
+		apiErr := s3err.GetAPIError(s3err.ErrSlowDown)
+		apiErr.Description = "The local cache is full. Please retry later."
+		return apiErr
+	case errors.Is(err, cache.ErrSizeExceeded):
+		return s3err.GetAPIError(s3err.ErrContentLengthMismatch)
+	default:
 		return err
 	}
-	apiErr := s3err.GetAPIError(s3err.ErrSlowDown)
-	apiErr.Description = "The same data is still being removed after an earlier delete. Please retry shortly."
-	return apiErr
+}
+
+// declaredWriteSize is the capacity a write reserves in the cache: its
+// declared length, or the largest object size when no length was declared.
+func declaredWriteSize(contentLength *int64) int64 {
+	if contentLength == nil || *contentLength <= 0 {
+		return objectlimits.MaxFOCUploadSize
+	}
+	return *contentLength
 }
 
 func stringOrDefault(s *string, def string) string {

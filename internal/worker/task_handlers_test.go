@@ -1810,71 +1810,90 @@ func TestCacheCapacityTaskStaysPendingWhenLRUDisabled(t *testing.T) {
 }
 
 func TestCacheCapacityTaskEvictsLRUItemsOnlyToLowWatermark(t *testing.T) {
-	var used atomic.Int64
-	used.Store(33)
-	var deletedMu sync.Mutex
-	var deleted []string
-	cacheStore := &testutil.MockCache{
-		UsedBytesFunc: used.Load,
-		DeleteFunc: func(_ context.Context, _, key string) error {
-			deletedMu.Lock()
-			deleted = append(deleted, key)
-			deletedMu.Unlock()
-			used.Add(-11)
-			return nil
-		},
+	// A 30-byte cache with watermarks at 27 and 18 bytes holds three 11-byte items.
+	tests := []struct {
+		name         string
+		used         int64
+		writeRefused bool
+		wantEvicted  int
+	}{
+		{name: "usage at high watermark", used: 33, wantEvicted: 2},
+		{name: "write refused below high watermark", used: 22, writeRefused: true, wantEvicted: 1},
 	}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		cache: cacheStore, policy: cache.EvictionPolicyLRU, maxBytes: 30,
-		highPercent: 90, lowPercent: 60, concurrency: 1,
-	})
-	base := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Microsecond)
-	versions := []*model.ObjectVersion{
-		seedStoredCacheObject(t, runtime, 11, base),
-		seedStoredCacheObject(t, runtime, 11, base.Add(time.Hour)),
-		seedStoredCacheObject(t, runtime, 11, base.Add(2*time.Hour)),
-	}
-	planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-		Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
-	})
-	if err != nil || !created {
-		t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
-	}
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var used atomic.Int64
+			used.Store(tt.used)
+			var refused atomic.Bool
+			refused.Store(tt.writeRefused)
+			var deletedMu sync.Mutex
+			var deleted []string
+			cacheStore := &testutil.MockCache{
+				UsedBytesFunc:           used.Load,
+				ConsumeWriteRefusalFunc: func() bool { return refused.Swap(false) },
+				DeleteFunc: func(_ context.Context, _, key string) error {
+					deletedMu.Lock()
+					deleted = append(deleted, key)
+					deletedMu.Unlock()
+					used.Add(-11)
+					return nil
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				cache: cacheStore, policy: cache.EvictionPolicyLRU, maxBytes: 30,
+				highPercent: 90, lowPercent: 60, concurrency: 1,
+			})
+			base := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Microsecond)
+			versions := []*model.ObjectVersion{
+				seedStoredCacheObject(t, runtime, 11, base),
+				seedStoredCacheObject(t, runtime, 11, base.Add(time.Hour)),
+				seedStoredCacheObject(t, runtime, 11, base.Add(2*time.Hour)),
+			}
+			planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
+				Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
+				Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+			})
+			if err != nil || !created {
+				t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && used.Load() > 11 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if used.Load() != 11 {
-		t.Fatalf("cache usage = %d, want 11", used.Load())
-	}
-	deletedMu.Lock()
-	gotDeleted := append([]string(nil), deleted...)
-	deletedMu.Unlock()
-	wantDeleted := []string{versions[0].CacheKey(), versions[1].CacheKey()}
-	if len(gotDeleted) != len(wantDeleted) || gotDeleted[0] != wantDeleted[0] || gotDeleted[1] != wantDeleted[1] {
-		t.Fatalf("deleted cache keys = %#v, want %#v", gotDeleted, wantDeleted)
-	}
-	for index, version := range versions {
-		stored, err := runtime.repos.Objects.GetVersionByID(t.Context(), version.VersionID)
-		if err != nil || stored == nil {
-			t.Fatalf("load version %d: %#v err=%v", index, stored, err)
-		}
-		if index < 2 && stored.InCache {
-			t.Fatalf("version %d remained in cache", index)
-		}
-		if index == 2 && !stored.InCache {
-			t.Fatal("most recently used version was evicted")
-		}
-	}
-	page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{
-		Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
-	})
-	if err != nil || len(page.Tasks) != 2 {
-		t.Fatalf("completed cache tasks = %#v, err=%v", page.Tasks, err)
+			wantUsed := tt.used - int64(tt.wantEvicted)*11
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) && used.Load() > wantUsed {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if used.Load() != wantUsed {
+				t.Fatalf("cache usage = %d, want %d", used.Load(), wantUsed)
+			}
+			deletedMu.Lock()
+			gotDeleted := append([]string(nil), deleted...)
+			deletedMu.Unlock()
+			if len(gotDeleted) != tt.wantEvicted {
+				t.Fatalf("deleted cache keys = %#v, want the %d least recently used", gotDeleted, tt.wantEvicted)
+			}
+			for index, key := range gotDeleted {
+				if key != versions[index].CacheKey() {
+					t.Fatalf("deleted cache keys = %#v, want the %d least recently used", gotDeleted, tt.wantEvicted)
+				}
+			}
+			for index, version := range versions {
+				stored, err := runtime.repos.Objects.GetVersionByID(t.Context(), version.VersionID)
+				if err != nil || stored == nil {
+					t.Fatalf("load version %d: %#v err=%v", index, stored, err)
+				}
+				if evicted := index < tt.wantEvicted; stored.InCache == evicted {
+					t.Fatalf("version %d in cache = %v, want %v", index, stored.InCache, !evicted)
+				}
+			}
+			page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{
+				Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
+			})
+			if err != nil || len(page.Tasks) != tt.wantEvicted {
+				t.Fatalf("completed cache tasks = %#v, err=%v", page.Tasks, err)
+			}
+		})
 	}
 }
 
