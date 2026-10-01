@@ -44,16 +44,17 @@ type taskListItem struct {
 // task holds while it waits for review. Releasable is set only once the task has
 // stopped, because a confirmation still being observed may yet land.
 type taskStorageConfirmation struct {
-	CopyID      int64  `json:"copy_id"`
-	AttemptID   string `json:"attempt_id"`
-	ReasonCode  string `json:"reason_code"`
-	ProviderID  string `json:"provider_id"`
-	DataSetID   string `json:"data_set_id,omitempty"`
-	PieceCID    string `json:"piece_cid,omitempty"`
-	SubmitError string `json:"submit_error,omitempty"`
-	AttemptedAt string `json:"attempted_at"`
-	AttentionAt string `json:"attention_at"`
-	Releasable  bool   `json:"releasable"`
+	CopyID        int64  `json:"copy_id"`
+	AttemptID     string `json:"attempt_id"`
+	ReasonCode    string `json:"reason_code"`
+	ProviderID    string `json:"provider_id"`
+	DataSetID     string `json:"data_set_id,omitempty"`
+	PieceCID      string `json:"piece_cid,omitempty"`
+	TransactionID string `json:"transaction_id,omitempty"`
+	SubmitError   string `json:"submit_error,omitempty"`
+	AttemptedAt   string `json:"attempted_at"`
+	AttentionAt   string `json:"attention_at"`
+	Releasable    bool   `json:"releasable"`
 }
 
 type taskListResponse struct {
@@ -225,8 +226,9 @@ func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []mode
 		items[i].StorageConfirmation = &taskStorageConfirmation{
 			CopyID: record.CopyID, AttemptID: record.AttemptID, ReasonCode: string(record.Code),
 			ProviderID: record.ProviderID, DataSetID: record.DataSetID, PieceCID: record.PieceCID,
-			SubmitError: record.SubmitError,
-			AttemptedAt: record.AttemptedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
+			TransactionID: record.TransactionID,
+			SubmitError:   record.SubmitError,
+			AttemptedAt:   record.AttemptedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
 			Releasable: rows[i].Status == model.TaskStatusFailed,
 		}
 	}

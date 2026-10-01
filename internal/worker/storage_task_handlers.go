@@ -1635,6 +1635,11 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	}
 	if err != nil {
 		if advanced.State == storagecommit.AdvancePending || advanced.State == storagecommit.AdvanceSubmitted {
+			if recordErr, ok := errors.AsType[*storagecommit.SubmitFailureRecordError](err); ok {
+				h.deps.Logger.Warn("storage registration submission reply could not be recorded",
+					"task_id", execution.ID(), "copy_id", copyRow.ID, "attempt_id", advanced.AttemptID,
+					"error", synapse.ErrorSummary(recordErr.Err))
+			}
 			h.deps.Logger.Warn("storage registration submission failed",
 				"task_id", execution.ID(), "copy_id", copyRow.ID, "content_id", copyRow.ContentID,
 				"provider_id", copyRow.ProviderID, "storage_data_set_id", copyRow.StorageDataSetID,

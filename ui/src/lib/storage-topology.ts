@@ -1,4 +1,5 @@
 import type {
+  ObservabilityDataSetListResponse,
   ObservabilityDataSetObservation,
   ObservabilityFreshness,
   ObservabilityListResponse,
@@ -354,6 +355,23 @@ export function mergeTopologyDataSetSnapshots(
     }
   }
   return Array.from(dataSetMap.values())
+}
+
+export function mergeTopologyStorageConfirmationCounts(
+  snapshots: Array<{ data?: ObservabilityDataSetListResponse; dataUpdatedAt: number } | undefined>
+) {
+  const counts: Record<string, number> = {}
+  const ordered = snapshots
+    .filter((snapshot) => snapshot !== undefined)
+    .sort((a, b) => a.dataUpdatedAt - b.dataUpdatedAt)
+  for (const snapshot of ordered) {
+    if (!snapshot.data) continue
+    for (const item of snapshot.data.items) {
+      const id = String(item.facts.local_data_set_id)
+      counts[id] = snapshot.data.storage_confirmations_by_data_set?.[id] ?? 0
+    }
+  }
+  return counts
 }
 
 export function storageTopologyPinnedContextForSelection(

@@ -237,7 +237,7 @@ func (a *Advancer) submitReserved(
 			})
 			cancel()
 			if recordErr != nil {
-				submitErr = errors.Join(submitErr, fmt.Errorf("recording storage commit submit failure: %w", recordErr))
+				submitErr = errors.Join(submitErr, &SubmitFailureRecordError{Err: recordErr})
 			}
 		}
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
@@ -267,6 +267,18 @@ func (a *Advancer) submitReserved(
 type commitEvidenceError struct {
 	err error
 }
+
+// SubmitFailureRecordError reports that the provider's failed submission reply
+// could not be retained, independently of the provider error itself.
+type SubmitFailureRecordError struct {
+	Err error
+}
+
+func (e *SubmitFailureRecordError) Error() string {
+	return fmt.Sprintf("recording storage commit submit failure: %v", e.Err)
+}
+
+func (e *SubmitFailureRecordError) Unwrap() error { return e.Err }
 
 func (a *Advancer) observe(
 	ctx context.Context,

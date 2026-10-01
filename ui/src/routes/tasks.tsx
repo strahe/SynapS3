@@ -9,6 +9,7 @@ import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialo
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
@@ -318,14 +319,16 @@ function TasksPage() {
           setReleaseTarget(null)
         }}
         title="Release storage confirmation"
-        description={`Registration stopped because it is unknown whether the provider accepted this piece. ${storageConfirmationReleaseWarning}`}
+        description={`${releaseTarget ? storageConfirmationAttentionView(releaseTarget.reason_code).label : ''}. ${storageConfirmationReleaseWarning}`}
         confirmLabel="Release and resubmit"
         pending={release.isPending}
         error={release.error ? errorMessage(release.error) : null}
         onConfirm={() => {
           if (releaseTarget) release.mutate(releaseTarget)
         }}
-      />
+      >
+        {releaseTarget && <StorageConfirmationDetails confirmation={releaseTarget} />}
+      </DangerActionAlertDialog>
 
       <DangerActionAlertDialog
         open={dismissAllScope !== null}
@@ -480,6 +483,12 @@ function TaskDetails({ task }: { task: TaskItem }) {
             maxLength={80}
           />
         )}
+        <details className="text-sm">
+          <summary className="cursor-pointer text-muted-foreground">Confirmation details</summary>
+          <div className="mt-2">
+            <StorageConfirmationDetails confirmation={confirmation} />
+          </div>
+        </details>
       </div>
     )
   }

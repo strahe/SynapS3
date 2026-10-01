@@ -1029,6 +1029,7 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 				}
 				writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
 					"copy_id": 42, "content_id": 7, "copy_index": 1,
+					"task_id": 12345, "submit_error": "provider returned HTTP 500:\n piece not found",
 					"data_set_row_id": 9, "provider_id": "provider-1", "data_set_id": "dataset-1",
 					"piece_cid": "bafy-piece-1", "attempt_id": "attempt-1", "transaction_id": "0xcommit",
 					"reason_code":  "attempt_only_ambiguous",
@@ -1058,7 +1059,9 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 			!strings.Contains(out, "PIECE CID") || !strings.Contains(out, "ATTEMPTED AT") ||
 			!strings.Contains(out, "bafy-piece-1") || !strings.Contains(out, "2026-08-30T01:00:00Z") ||
 			!strings.Contains(out, "attempt_only_ambiguous") || !strings.Contains(out, "provider-1") ||
-			!strings.Contains(out, "attempt-1") || !strings.Contains(out, "0xcommit") {
+			!strings.Contains(out, "attempt-1") || !strings.Contains(out, "0xcommit") ||
+			!strings.Contains(out, "TASK ID") || !strings.Contains(out, "12345") ||
+			!strings.Contains(out, "PROVIDER RESPONSE") || !strings.Contains(out, "provider returned HTTP 500: piece not found") {
 			t.Fatalf("list output missing confirmation details:\n%s", out)
 		}
 		out, err = runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42", "--attempt-id", "attempt-1", "--yes"})

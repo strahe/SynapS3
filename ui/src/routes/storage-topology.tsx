@@ -20,6 +20,7 @@ import {
   clampPageForLoadedTotal,
   findStorageTopologySelection,
   mergeTopologyDataSetSnapshots,
+  mergeTopologyStorageConfirmationCounts,
   type ObservabilityStatusFilter,
   observabilityStatusOptions,
   paginateItems,
@@ -163,17 +164,26 @@ function StorageTopologyPage() {
     () => providerSnapshot.data?.items ?? emptyProviderObservations,
     [providerSnapshot.data?.items]
   )
-  // Each data set list reports the stopped confirmations for the data sets it returned.
   const storageConfirmations = useMemo(
-    () => ({
-      ...dataSetSnapshot.data?.storage_confirmations_by_data_set,
-      ...scopedDeepLinkDataSetSnapshot.data?.storage_confirmations_by_data_set,
-      ...dataSetInventory.data?.storage_confirmations_by_data_set,
-    }),
+    () =>
+      mergeTopologyStorageConfirmationCounts([
+        { data: dataSetSnapshot.data, dataUpdatedAt: dataSetSnapshot.dataUpdatedAt },
+        scopedDeepLinkSnapshotEnabled
+          ? { data: scopedDeepLinkDataSetSnapshot.data, dataUpdatedAt: scopedDeepLinkDataSetSnapshot.dataUpdatedAt }
+          : undefined,
+        dataSetInventoryEnabled
+          ? { data: dataSetInventory.data, dataUpdatedAt: dataSetInventory.dataUpdatedAt }
+          : undefined,
+      ]),
     [
-      dataSetSnapshot.data?.storage_confirmations_by_data_set,
-      scopedDeepLinkDataSetSnapshot.data?.storage_confirmations_by_data_set,
-      dataSetInventory.data?.storage_confirmations_by_data_set,
+      dataSetSnapshot.data,
+      dataSetSnapshot.dataUpdatedAt,
+      scopedDeepLinkDataSetSnapshot.data,
+      scopedDeepLinkDataSetSnapshot.dataUpdatedAt,
+      scopedDeepLinkSnapshotEnabled,
+      dataSetInventory.data,
+      dataSetInventory.dataUpdatedAt,
+      dataSetInventoryEnabled,
     ]
   )
   const baseDataSets = useMemo(

@@ -62,6 +62,7 @@ type handlerTestRuntime struct {
 }
 
 type handlerRuntimeOptions struct {
+	logger                 *slog.Logger
 	cache                  cache.Cache
 	events                 worker.EventPublisher
 	storage                *testutil.MockStorageClient
@@ -123,6 +124,10 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	} else if options.uploadSpeedProbe != nil {
 		observabilityService = observability.NewService(observability.ServiceOptions{Store: repos.Observability})
 	}
+	logger := options.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
 		Repositories: repos, Events: options.events, Cache: cacheStore, CacheGate: gate, CacheTracker: tracker,
 		Storage: storageClient, Wallet: options.wallet, Receipts: options.receipts,
@@ -133,7 +138,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		Observability: observabilityService, UploadSpeedProbe: options.uploadSpeedProbe,
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
-		DefaultCopies: 2, MaxRetries: maxRetries, Logger: slog.Default(),
+		DefaultCopies: 2, MaxRetries: maxRetries, Logger: logger,
 	})
 	if err != nil {
 		t.Fatalf("new task handlers: %v", err)
@@ -3749,62 +3754,116 @@ func TestCommitRecoverableAttentionKeepsObserving(t *testing.T) {
 	}
 }
 
-// A submission that fails without evidence stops for review, and the stopped
-// task says what the provider answered.
-func TestCommitSubmitFailureStopsWithTheProviderReply(t *testing.T) {
-	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
-		SubmitCommitFunc: func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
-			return nil, &pdp.HTTPError{
-				Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: 500, Body: "piece not found",
-			}
-		},
-		PieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-			return &storage.PieceStatus{}, nil
-		},
-	}
-	storageClient := &testutil.MockStorageClient{}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: storageClient, policy: cache.EvictionPolicyNone,
-		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
-			return handlers.RegisterStorage(registry)
-		},
-	})
-	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPieceReady)
-	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{
-		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "submit-failure.bin",
-		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
-		ETag: "submit-failure", ContentType: "application/octet-stream",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
-	dataSetID := pipeline.targetSet.DataSetID.SDK()
-	target.DataSetIDValue = &dataSetID
-	target.ClientDataSetIDValue = pipeline.targetClient
-	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
-		return target, nil
-	}
-	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
+type submitFailureRecordRepo struct {
+	repository.StorageContentRepository
+	err error
+}
 
-	reply := "provider returned HTTP 500: piece not found"
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == reply
-	})
-	wakeTask(t, runtime, taskRow.ID)
-	stopped := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusFailed
-	})
-	want := "storage registration requires attention: " + reply
-	if stopped.LastError == nil || *stopped.LastError != want ||
-		stopped.FailureReason == nil || *stopped.FailureReason != string(storagecommit.AttentionAttemptOnlyAmbiguous) {
-		t.Fatalf("stopped task = error:%v reason:%v, want %q", stopped.LastError, stopped.FailureReason, want)
-	}
-	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow.CommitSubmitError == nil || *copyRow.CommitSubmitError != reply {
-		t.Fatalf("commit copy = %#v, err=%v, want the provider reply kept with the attempt", copyRow, err)
+func (r *submitFailureRecordRepo) RecordCommitSubmitFailure(context.Context, storagecommit.SubmitFailureInput) error {
+	return r.err
+}
+
+func TestCommitSubmitFailureVisibility(t *testing.T) {
+	for _, recordFails := range []bool{false, true} {
+		name := "reply retained"
+		if recordFails {
+			name = "reply persistence failed"
+		}
+		t.Run(name, func(t *testing.T) {
+			logFile, err := os.CreateTemp(t.TempDir(), "submission.log")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := logFile.Close(); err != nil {
+					t.Errorf("close submission log: %v", err)
+				}
+			}()
+			logger := slog.New(slog.NewTextHandler(logFile, nil))
+			var submissions atomic.Int64
+			target := &testutil.MockStorageTarget{
+				PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
+				SubmitCommitFunc: func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+					submissions.Add(1)
+					return nil, &pdp.HTTPError{
+						Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: 500, Body: "piece not found",
+					}
+				},
+				PieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
+					return &storage.PieceStatus{}, nil
+				},
+			}
+			storageClient := &testutil.MockStorageClient{}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: storageClient, policy: cache.EvictionPolicyNone, logger: logger,
+				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+					return handlers.RegisterStorage(registry)
+				},
+			})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPieceReady)
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{
+				VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "submit-failure.bin",
+				ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+				ETag: "submit-failure", ContentType: "application/octet-stream",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+			dataSetID := pipeline.targetSet.DataSetID.SDK()
+			target.DataSetIDValue = &dataSetID
+			target.ClientDataSetIDValue = pipeline.targetClient
+			storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				return target, nil
+			}
+			taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
+			writeErr := errors.New("database could not record the submission reply")
+			if recordFails {
+				runtime.repos.Contents = &submitFailureRecordRepo{StorageContentRepository: runtime.repos.Contents, err: writeErr}
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+
+			reply := "provider returned HTTP 500: piece not found"
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == reply
+			})
+			wakeTask(t, runtime, taskRow.ID)
+			stopped := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusFailed
+			})
+			want := "storage registration requires attention"
+			if !recordFails {
+				want += ": " + reply
+			}
+			if stopped.LastError == nil || *stopped.LastError != want ||
+				stopped.FailureReason == nil || *stopped.FailureReason != string(storagecommit.AttentionAttemptOnlyAmbiguous) {
+				t.Fatalf("stopped task = error:%v reason:%v, want %q", stopped.LastError, stopped.FailureReason, want)
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recordFails {
+				if copyRow.CommitSubmitError != nil {
+					t.Fatalf("submit error = %v, want absent after the failed write", copyRow.CommitSubmitError)
+				}
+			} else if copyRow.CommitSubmitError == nil || *copyRow.CommitSubmitError != reply {
+				t.Fatalf("submit error = %v, want the provider reply", copyRow.CommitSubmitError)
+			}
+			if submissions.Load() != 1 {
+				t.Fatalf("submissions = %d, want no resubmission after observation", submissions.Load())
+			}
+			logs, err := os.ReadFile(logFile.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(logs), reply) {
+				t.Fatalf("logs lack the provider reply: %s", logs)
+			}
+			if recordFails && (!strings.Contains(string(logs), "submission reply could not be recorded") || !strings.Contains(string(logs), writeErr.Error())) {
+				t.Fatalf("logs lack the separate persistence failure: %s", logs)
+			}
+		})
 	}
 }
 

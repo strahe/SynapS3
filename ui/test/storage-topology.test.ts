@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '../src/api/client.ts'
+import type {
+  ObservabilityDataSetListResponse,
+  ObservabilityDataSetObservation,
+  ObservabilityProviderObservation,
+} from '../src/api/client.ts'
 import {
   bucketIssueTone,
   bucketStorageDataSetTopologyLinkModel,
@@ -20,6 +24,7 @@ import {
   formatOptionalTopologyText,
   freshnessLabel,
   mergeTopologyDataSetSnapshots,
+  mergeTopologyStorageConfirmationCounts,
   paginateItems,
   providerRowsForTopologyContext,
   reconcileStorageTopologySelectionSearch,
@@ -356,6 +361,43 @@ test('storage topology detects partial loaded snapshots from page boundaries', (
 test('storage topology merges scoped data sets only when scoped snapshot is enabled', () => {
   assert.deepEqual(mergeTopologyDataSetSnapshots([mediaDataSet], [logsDataSet], false), [mediaDataSet])
   assert.deepEqual(mergeTopologyDataSetSnapshots([mediaDataSet], [logsDataSet], true), [mediaDataSet, logsDataSet])
+})
+
+test('storage confirmation counts use the newest response, including zero counts', () => {
+  const id = String(mediaDataSet.facts.local_data_set_id)
+  const oldPage: ObservabilityDataSetListResponse = {
+    items: [mediaDataSet],
+    total: 1,
+    limit: 20,
+    offset: 0,
+    storage_confirmations_by_data_set: { [id]: 1 },
+  }
+  const currentPage: ObservabilityDataSetListResponse = { items: [mediaDataSet], total: 1, limit: 20, offset: 0 }
+  const oldSnapshot = { data: oldPage, dataUpdatedAt: 1 }
+  const currentSnapshot = { data: currentPage, dataUpdatedAt: 2 }
+  assert.equal(mergeTopologyStorageConfirmationCounts([currentSnapshot, oldSnapshot])[id], 0)
+  assert.equal(mergeTopologyStorageConfirmationCounts([oldSnapshot, currentSnapshot])[id], 0)
+  assert.equal(mergeTopologyStorageConfirmationCounts([currentSnapshot, { data: oldPage, dataUpdatedAt: 3 }])[id], 1)
+})
+
+test('storage confirmation counts retain other listed data sets and omit inactive snapshots', () => {
+  const mediaID = String(mediaDataSet.facts.local_data_set_id)
+  const logsID = String(logsDataSet.facts.local_data_set_id)
+  const page: ObservabilityDataSetListResponse = {
+    items: [mediaDataSet, logsDataSet],
+    total: 2,
+    limit: 20,
+    offset: 0,
+    storage_confirmations_by_data_set: { [mediaID]: 1, [logsID]: 2 },
+  }
+  assert.deepEqual(
+    mergeTopologyStorageConfirmationCounts([
+      { data: page, dataUpdatedAt: 1 },
+      undefined,
+      { data: { items: [mediaDataSet], total: 1, limit: 20, offset: 0 }, dataUpdatedAt: 2 },
+    ]),
+    { [mediaID]: 0, [logsID]: 2 }
+  )
 })
 
 test('storage topology data set selection search keeps chain, local fallback, and scope', () => {

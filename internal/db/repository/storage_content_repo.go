@@ -718,9 +718,6 @@ func (r *BunStorageContentRepo) EnsureDataSetBinding(ctx context.Context, input 
 	return binding, err
 }
 
-// MarkDataSetCreating records a creation request that went out. A generation
-// that replacement drained while the request was in flight stays draining; the
-// request is still recorded so the data set it creates can be resolved.
 // RecordDataSetCreationError keeps why a creation request whose outcome is
 // unknown failed. It changes nothing once another task owns the data set or
 // the creation has moved on; creation evidence and readiness clear it.
@@ -744,6 +741,9 @@ func (r *BunStorageContentRepo) RecordDataSetCreationError(ctx context.Context, 
 	return nil
 }
 
+// MarkDataSetCreating records a creation request that went out. A generation
+// that replacement drained while the request was in flight stays draining; the
+// request is still recorded so the data set it creates can be resolved.
 func (r *BunStorageContentRepo) MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().

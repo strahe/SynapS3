@@ -716,6 +716,7 @@ export interface TaskStorageConfirmation {
   provider_id: string
   data_set_id?: string
   piece_cid?: string
+  transaction_id?: string
   submit_error?: string
   attempted_at: string
   attention_at: string
