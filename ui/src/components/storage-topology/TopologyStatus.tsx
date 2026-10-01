@@ -1,3 +1,4 @@
+import { Link } from '@tanstack/react-router'
 import type { ObservabilitySignal, ObservabilityStatus, ProviderUploadSpeedTest } from '@/api/client'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -6,6 +7,7 @@ import {
   providerUploadSpeedLabel,
   providerUploadSpeedShortLabel,
 } from '@/lib/provider-upload-speed'
+import { storageConfirmationTasksSearch } from '@/lib/storage-confirmation-attention'
 import { observabilitySignalDetails, observabilityStatusLabel, observabilityStatusTone } from '@/lib/storage-topology'
 import { timeAgo } from '@/lib/utils'
 
@@ -52,4 +54,15 @@ function uploadSpeedDetails(test?: ProviderUploadSpeedTest) {
   if (fullLabel !== providerUploadSpeedShortLabel(test)) details.push(fullLabel)
   if (test.tested_at) details.push(`Tested ${timeAgo(test.tested_at)} with ${providerUploadSampleSize(test)}`)
   return details
+}
+
+/** Stopped storage confirmations holding a data set, linked to where they are reviewed. */
+export function StorageConfirmationsBadge({ count }: { count: number }) {
+  if (count <= 0) return null
+  const label = count === 1 ? '1 confirmation to review' : `${count} confirmations to review`
+  return (
+    <Link to="/tasks" search={storageConfirmationTasksSearch} aria-label={`Review ${label}`}>
+      <StatusBadge tone="danger">{label}</StatusBadge>
+    </Link>
+  )
 }

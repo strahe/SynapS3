@@ -481,3 +481,37 @@ func decodeOverviewResponseWithRaw(t *testing.T, srv *Server) (overviewResponse,
 	}
 	return body, raw
 }
+
+type stoppedConfirmationCountRepo struct {
+	repository.StorageContentRepository
+	counts map[int64]int64
+}
+
+func (r *stoppedConfirmationCountRepo) CountStoppedCommitAttentionByDataSet(context.Context) (map[int64]int64, error) {
+	return r.counts, nil
+}
+
+func TestAPIOverviewCountsStoppedStorageConfirmations(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	repos.Contents = &stoppedConfirmationCountRepo{StorageContentRepository: repos.Contents, counts: map[int64]int64{5: 3, 1: 1}}
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	rr := httptest.NewRecorder()
+	srv.handleAPIOverview(rr, httptest.NewRequest(http.MethodGet, "/api/v1/overview", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Tasks struct {
+			Attention struct {
+				StorageConfirmations int64 `json:"storage_confirmations"`
+			} `json:"attention"`
+		} `json:"tasks"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	if body.Tasks.Attention.StorageConfirmations != 4 {
+		t.Fatalf("storage confirmations = %d, want 4", body.Tasks.Attention.StorageConfirmations)
+	}
+}

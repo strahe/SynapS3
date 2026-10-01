@@ -255,7 +255,34 @@ func (s *Server) handleAPIObservabilityDataSets(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, page)
+	writeJSON(w, http.StatusOK, dataSetObservationPageResponse{
+		DataSetObservationPage: page,
+		StorageConfirmations:   s.stoppedStorageConfirmations(r.Context(), page.Items),
+	})
+}
+
+// dataSetObservationPageResponse adds, by local data set ID, the stopped storage
+// confirmations that hold each listed data set's commit capacity.
+type dataSetObservationPageResponse struct {
+	observability.DataSetObservationPage
+	StorageConfirmations map[int64]int64 `json:"storage_confirmations_by_data_set,omitempty"`
+}
+
+// stoppedStorageConfirmations counts stopped confirmations for the listed data
+// sets. A failed count leaves the list without it.
+func (s *Server) stoppedStorageConfirmations(ctx context.Context, items []observability.DataSetObservation) map[int64]int64 {
+	counts, err := s.repos.Contents.CountStoppedCommitAttentionByDataSet(ctx)
+	if err != nil {
+		s.logger.Warn("api: failed to count data set storage confirmations", "error", err)
+		return nil
+	}
+	listed := make(map[int64]int64)
+	for _, item := range items {
+		if count := counts[item.Facts.LocalDataSetID]; count > 0 {
+			listed[item.Facts.LocalDataSetID] = count
+		}
+	}
+	return listed
 }
 
 func (s *Server) handleAPIRefreshObservabilityDataSets(w http.ResponseWriter, r *http.Request) {

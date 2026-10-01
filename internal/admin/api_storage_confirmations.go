@@ -12,6 +12,7 @@ import (
 
 type storageConfirmationAttentionResponse struct {
 	CopyID        int64     `json:"copy_id"`
+	TaskID        *int64    `json:"task_id,omitempty"`
 	ContentID     int64     `json:"content_id"`
 	CopyIndex     int       `json:"copy_index"`
 	DataSetRowID  int64     `json:"data_set_row_id"`
@@ -20,6 +21,7 @@ type storageConfirmationAttentionResponse struct {
 	PieceCID      string    `json:"piece_cid,omitempty"`
 	AttemptID     string    `json:"attempt_id"`
 	TransactionID string    `json:"transaction_id,omitempty"`
+	SubmitError   string    `json:"submit_error,omitempty"`
 	ReasonCode    string    `json:"reason_code"`
 	AttemptedAt   time.Time `json:"attempted_at"`
 	AttentionAt   time.Time `json:"attention_at"`
@@ -53,10 +55,11 @@ func (s *Server) handleAPIListStorageConfirmations(w http.ResponseWriter, r *htt
 	response := make([]storageConfirmationAttentionResponse, 0, len(records))
 	for _, record := range records {
 		response = append(response, storageConfirmationAttentionResponse{
-			CopyID: record.CopyID, ContentID: record.ContentID, CopyIndex: record.CopyIndex,
+			CopyID: record.CopyID, TaskID: record.TaskID, ContentID: record.ContentID, CopyIndex: record.CopyIndex,
 			DataSetRowID: record.DataSetRowID, ProviderID: record.ProviderID, DataSetID: record.DataSetID,
 			PieceCID: record.PieceCID, AttemptID: record.AttemptID, TransactionID: record.TransactionID,
-			ReasonCode: string(record.Code), AttemptedAt: record.AttemptedAt, AttentionAt: record.AttentionAt,
+			SubmitError: record.SubmitError, ReasonCode: string(record.Code),
+			AttemptedAt: record.AttemptedAt, AttentionAt: record.AttentionAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, response)

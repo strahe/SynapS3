@@ -60,6 +60,14 @@ type EvidenceInput struct {
 	Now           time.Time
 }
 
+// SubmitFailureInput records why a submission whose outcome is unknown failed.
+type SubmitFailureInput struct {
+	Copy      CopyIdentity
+	AttemptID string
+	Message   string
+	Now       time.Time
+}
+
 type AttentionInput struct {
 	Copy      CopyIdentity
 	AttemptID string
@@ -95,6 +103,7 @@ type Store interface {
 	ReserveCommitAttempt(context.Context, ReserveInput) (ReserveResult, error)
 	MarkCommitAttempted(context.Context, AttemptInput) (AttemptResult, error)
 	RecordCommitSubmission(context.Context, EvidenceInput) error
+	RecordCommitSubmitFailure(context.Context, SubmitFailureInput) error
 	MarkCommitAttention(context.Context, AttentionInput) error
 	ResetCommitAttempt(context.Context, ResetInput) error
 	ReleaseCommitAttempt(context.Context, ReleaseInput) error

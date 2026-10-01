@@ -227,6 +227,19 @@ func (a *Advancer) submitReserved(
 		// Every remaining submission failure is ambiguous, so the attempt fence
 		// stays and the next pass observes it. The error still travels back so the
 		// caller can record why, which parking alone would discard.
+		if !callbackObserved.Load() {
+			evidenceCtx, cancel := evidenceContext(ctx)
+			recordErr := a.Store.RecordCommitSubmitFailure(evidenceCtx, SubmitFailureInput{
+				Copy:      identity,
+				AttemptID: attemptID,
+				Message:   synapse.ErrorSummary(submitErr),
+				Now:       a.now(),
+			})
+			cancel()
+			if recordErr != nil {
+				submitErr = errors.Join(submitErr, fmt.Errorf("recording storage commit submit failure: %w", recordErr))
+			}
+		}
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
 	}
 	if submission == nil {

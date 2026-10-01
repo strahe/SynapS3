@@ -265,7 +265,7 @@ Manual confirmation does not check FWSS approval or whether the provider still r
 
 ### Storage confirmation attention
 
-When SynapS3 cannot determine whether a provider accepted a piece, it does not submit that piece again automatically. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists the affected copy, data set, attempt, known transaction, timestamps, and stable `reason_code`.
+When SynapS3 cannot determine whether a provider accepted a piece, it does not submit that piece again automatically. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists the affected copy, owning task (`task_id`), data set, attempt, known transaction, the provider's reply when the submission failed (`submit_error`), timestamps, and stable `reason_code`. The Tasks page shows the same confirmations on their stopped Confirm storage tasks and releases them with the request below.
 
 `POST /api/v1/storage-confirmations/{copy-id}/release` lets normal recovery continue and may permit a duplicate submission. Inspect the current list entry first, then send both its attempt ID and the explicit risk acknowledgement:
 
@@ -289,7 +289,7 @@ If the attempt changed after it was inspected, the API returns `409 Conflict`. I
 | `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk dismissal would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
 | `POST` | `/api/v1/tasks/acknowledge` | Dismiss a backlog of failed tasks at once. Returns `acknowledged` with the number dismissed. |
 
-`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags.
+`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. A Confirm storage task whose storage confirmation awaits review also includes `storage_confirmation` with `copy_id`, `attempt_id`, `reason_code`, `submit_error`, timestamps, and `releasable`, which is true once the task has stopped. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; release the confirmation instead.
 
 The `status` filter also accepts `dismissed`. `status=failed` returns only unacknowledged failures, while `status=dismissed` returns acknowledged failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`.
 
@@ -313,7 +313,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 Passing that `as_of` back as `failed_before` dismisses exactly what was counted.
 
-`/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`.
+`/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`. `tasks.attention.storage_confirmations` counts stopped storage confirmations waiting for review.
 
 Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacement recovery remains in the Data Sets API. Wallet operations are retryable before a broadcast starts or after an internal error; a retry sends the transaction only if it was never broadcast. Storage transfer tasks that stopped because of an internal error are also retryable. Retrying an uncertain Store checks the provider and does not upload the bytes again.
 
@@ -334,7 +334,7 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 | `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | Refresh one provider's Registry profile and health. Concurrent requests for the same ID conflict. |
 | `POST` | `/api/v1/observability/provider-tiers/refresh` | Refresh approved and endorsed lists concurrently. Returns `approved_result` and `endorsed_result`, each with success, attempt time, and collection time or error. A failed list retains its previous profile flags and collection times. |
 | `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | Start one 32 MiB upload speed test for an available provider. Returns `202 Accepted` with `task_id`, `404 Not Found` for an unknown provider, or `409 Conflict` if a test is already running or the provider is ineligible. |
-| `GET` | `/api/v1/observability/data-sets` | Local data set health data. |
+| `GET` | `/api/v1/observability/data-sets` | Local data set health data, with stopped storage confirmations per listed data set in `storage_confirmations_by_data_set`. |
 | `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
 
 Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests cannot be retried through the task retry endpoint; start a new test instead. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.

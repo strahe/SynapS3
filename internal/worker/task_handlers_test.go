@@ -3749,6 +3749,65 @@ func TestCommitRecoverableAttentionKeepsObserving(t *testing.T) {
 	}
 }
 
+// A submission that fails without evidence stops for review, and the stopped
+// task says what the provider answered.
+func TestCommitSubmitFailureStopsWithTheProviderReply(t *testing.T) {
+	target := &testutil.MockStorageTarget{
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
+		SubmitCommitFunc: func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+			return nil, &pdp.HTTPError{
+				Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: 500, Body: "piece not found",
+			}
+		},
+		PieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
+			return &storage.PieceStatus{}, nil
+		},
+	}
+	storageClient := &testutil.MockStorageClient{}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: storageClient, policy: cache.EvictionPolicyNone,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPieceReady)
+	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "submit-failure.bin",
+		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+		ETag: "submit-failure", ContentType: "application/octet-stream",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+	dataSetID := pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &dataSetID
+	target.ClientDataSetIDValue = pipeline.targetClient
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	reply := "provider returned HTTP 500: piece not found"
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == reply
+	})
+	wakeTask(t, runtime, taskRow.ID)
+	stopped := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	want := "storage registration requires attention: " + reply
+	if stopped.LastError == nil || *stopped.LastError != want ||
+		stopped.FailureReason == nil || *stopped.FailureReason != string(storagecommit.AttentionAttemptOnlyAmbiguous) {
+		t.Fatalf("stopped task = error:%v reason:%v, want %q", stopped.LastError, stopped.FailureReason, want)
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.CommitSubmitError == nil || *copyRow.CommitSubmitError != reply {
+		t.Fatalf("commit copy = %#v, err=%v, want the provider reply kept with the attempt", copyRow, err)
+	}
+}
+
 func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 	var broadcasts, observations atomic.Int64
 	transactionHash := "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -3906,11 +3965,14 @@ func TestWalletReceiptLookupHasIndependentDeadline(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+	waiting := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
 	if observations.Load() != 1 {
 		t.Fatalf("wallet receipt observations = %d, want 1", observations.Load())
+	}
+	if waiting.LastError == nil || *waiting.LastError != context.DeadlineExceeded.Error() {
+		t.Fatalf("waiting task last_error = %v, want why the receipt lookup failed", waiting.LastError)
 	}
 }
 
@@ -5454,11 +5516,17 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	if err != nil || recorded.ClientDataSetID == nil || recorded.ClientDataSetID.String() != sentIDs[0] {
 		t.Fatalf("generation after the first request = %#v err=%v, want its client data set ID recorded", recorded, err)
 	}
+	if recorded.LastError == nil || *recorded.LastError != "connection reset by provider" {
+		t.Fatalf("generation last_error = %v, want why the request failed", recorded.LastError)
+	}
 
 	// Nothing is visible once the request has had time to land.
 	stored, err := runtime.repos.Tasks.GetByID(ctx, fixture.ensureTask.ID)
 	if err != nil {
 		t.Fatalf("load ensure task: %v", err)
+	}
+	if stored.LastError == nil || *stored.LastError != "connection reset by provider" {
+		t.Fatalf("waiting task last_error = %v, want why the request failed", stored.LastError)
 	}
 	var checkpoint map[string]any
 	if err := json.Unmarshal(stored.Checkpoint, &checkpoint); err != nil {
@@ -5486,7 +5554,8 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	}
 	ready, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
 	if err != nil || ready.Status != model.StorageDataSetStatusReady || ready.DataSetID == nil ||
-		ready.DataSetID.String() != createdID.String() || ready.ClientDataSetID.String() != sentIDs[0] {
+		ready.DataSetID.String() != createdID.String() || ready.ClientDataSetID.String() != sentIDs[0] ||
+		ready.LastError != nil {
 		t.Fatalf("generation = %#v err=%v, want the data set the first request created", ready, err)
 	}
 }

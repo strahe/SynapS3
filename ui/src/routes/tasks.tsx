@@ -1,9 +1,9 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, RotateCcw, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, RotateCcw, Send, X } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
 
-import { api, type TaskItem } from '@/api/client'
+import { api, type TaskItem, type TaskStorageConfirmation } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
@@ -19,6 +19,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTasks } from '@/hooks/queries'
+import {
+  storageConfirmationAttentionView,
+  storageConfirmationReleaseWarning,
+} from '@/lib/storage-confirmation-attention'
 import { timeAgo } from '@/lib/utils'
 
 const PAGE_SIZE = 20
@@ -103,6 +107,7 @@ function TasksPage() {
   // it counted, and the operation it counted for. Confirming sends all three
   // back, so nothing that failed while the dialog was open is swept up.
   const [dismissAllScope, setDismissAllScope] = useState<DismissAllScope | null>(null)
+  const [releaseTarget, setReleaseTarget] = useState<TaskStorageConfirmation | null>(null)
 
   useEffect(() => {
     if (previousFilterKey.current === filterKey) return
@@ -115,6 +120,16 @@ function TasksPage() {
     queryClient.invalidateQueries({ queryKey: ['tasks'] })
     queryClient.invalidateQueries({ queryKey: ['taskStats'] })
   }
+  const release = useMutation({
+    mutationFn: (confirmation: TaskStorageConfirmation) =>
+      api.releaseStorageConfirmation(confirmation.copy_id, confirmation.attempt_id),
+    onSuccess: () => {
+      setReleaseTarget(null)
+      refreshTasks()
+      queryClient.invalidateQueries({ queryKey: ['overview'] })
+      queryClient.invalidateQueries({ queryKey: ['observabilityDataSets'] })
+    },
+  })
   const retry = useMutation({ mutationFn: api.retryTask, onSuccess: refreshTasks })
   const acknowledge = useMutation({ mutationFn: api.acknowledgeTask, onSuccess: refreshTasks })
   const previewDismissAll = useMutation({
@@ -259,6 +274,10 @@ function TasksPage() {
               retry.reset()
               acknowledge.mutate(id)
             }}
+            onRelease={(confirmation) => {
+              release.reset()
+              setReleaseTarget(confirmation)
+            }}
           />
           {(cursorHistory.length > 0 || tasks.data.next_cursor) && (
             <Pagination>
@@ -290,6 +309,23 @@ function TasksPage() {
           </EmptyHeader>
         </Empty>
       )}
+
+      <DangerActionAlertDialog
+        open={releaseTarget !== null}
+        onOpenChange={(open) => {
+          if (open) return
+          release.reset()
+          setReleaseTarget(null)
+        }}
+        title="Release storage confirmation"
+        description={`Registration stopped because it is unknown whether the provider accepted this piece. ${storageConfirmationReleaseWarning}`}
+        confirmLabel="Release and resubmit"
+        pending={release.isPending}
+        error={release.error ? errorMessage(release.error) : null}
+        onConfirm={() => {
+          if (releaseTarget) release.mutate(releaseTarget)
+        }}
+      />
 
       <DangerActionAlertDialog
         open={dismissAllScope !== null}
@@ -329,12 +365,14 @@ function TaskTable({
   acknowledgingID,
   onRetry,
   onAcknowledge,
+  onRelease,
 }: {
   tasks: TaskItem[]
   retryingID?: number
   acknowledgingID?: number
   onRetry: (id: number) => void
   onAcknowledge: (id: number) => void
+  onRelease: (confirmation: TaskStorageConfirmation) => void
 }) {
   return (
     <div className="overflow-hidden rounded-lg border border-border">
@@ -376,6 +414,17 @@ function TaskTable({
               </TableCell>
               <TableCell className="px-4">
                 <div className="flex justify-end gap-2">
+                  {task.storage_confirmation?.releasable && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={retryingID !== undefined || acknowledgingID !== undefined}
+                      onClick={() => task.storage_confirmation && onRelease(task.storage_confirmation)}
+                    >
+                      <Send data-icon="inline-start" />
+                      Release
+                    </Button>
+                  )}
                   {task.retryable && (
                     <Button
                       variant="outline"
@@ -417,6 +466,23 @@ function TaskTable({
 }
 
 function TaskDetails({ task }: { task: TaskItem }) {
+  const confirmation = task.storage_confirmation
+  if (confirmation) {
+    const attention = storageConfirmationAttentionView(confirmation.reason_code)
+    return (
+      <div className="flex flex-col gap-1">
+        <span className="text-sm text-status-warning">{attention.label}</span>
+        {confirmation.submit_error && (
+          <CopyableValue
+            value={confirmation.submit_error}
+            label="Provider response"
+            displayValue={confirmation.submit_error}
+            maxLength={80}
+          />
+        )}
+      </div>
+    )
+  }
   const value = task.last_error || task.status_message || '—'
   if (value === '—') return <span className="text-muted-foreground">—</span>
   return (

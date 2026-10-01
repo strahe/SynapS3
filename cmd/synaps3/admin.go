@@ -1033,6 +1033,7 @@ type adminTaskStatusCount struct {
 
 type adminStorageConfirmationAttention struct {
 	CopyID        int64  `json:"copy_id"`
+	TaskID        *int64 `json:"task_id,omitempty"`
 	ContentID     int64  `json:"content_id"`
 	CopyIndex     int    `json:"copy_index"`
 	DataSetRowID  int64  `json:"data_set_row_id"`
@@ -1041,6 +1042,7 @@ type adminStorageConfirmationAttention struct {
 	PieceCID      string `json:"piece_cid,omitempty"`
 	AttemptID     string `json:"attempt_id"`
 	TransactionID string `json:"transaction_id,omitempty"`
+	SubmitError   string `json:"submit_error,omitempty"`
 	ReasonCode    string `json:"reason_code"`
 	AttemptedAt   string `json:"attempted_at"`
 	AttentionAt   string `json:"attention_at"`

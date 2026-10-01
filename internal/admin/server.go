@@ -471,6 +471,8 @@ func (s *Server) handleAPITaskAcknowledge(w http.ResponseWriter, r *http.Request
 	if err := s.taskService.Acknowledge(r.Context(), id); err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
+		} else if errors.Is(err, repository.ErrConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "this task's storage confirmation needs review before it can be dismissed"})
 		} else {
 			s.logger.Error("api: failed to acknowledge task", "taskID", id, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})

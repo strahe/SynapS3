@@ -23,7 +23,7 @@ import {
   type StorageTopologyProviderRow,
 } from '@/lib/storage-topology'
 import { cn } from '@/lib/utils'
-import { TopologySignalBadge, UploadSpeedText } from './TopologyStatus'
+import { StorageConfirmationsBadge, TopologySignalBadge, UploadSpeedText } from './TopologyStatus'
 
 export function ProvidersTableCard({
   rows,
@@ -234,6 +234,7 @@ function ProviderTierBadges({ profile }: { profile?: ProviderProfile }) {
 export function DataSetsTableCard({
   dataSets,
   providersByID,
+  storageConfirmations,
   total,
   page,
   totalPages,
@@ -244,6 +245,7 @@ export function DataSetsTableCard({
 }: {
   dataSets: ObservabilityDataSetObservation[]
   providersByID: Map<string, ObservabilityProviderObservation>
+  storageConfirmations: Record<string, number>
   total: number
   page: number
   totalPages: number
@@ -306,9 +308,14 @@ export function DataSetsTableCard({
                     <OptionalCopyableValue label="Chain data set" value={dataSetChainIDValue(dataSet)} />
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2">
-                    <StatusBadge tone={localStatusTone(dataSet.facts.local_status)}>
-                      {localStatusLabel(dataSet.facts.local_status)}
-                    </StatusBadge>
+                    <div className="flex items-center gap-2">
+                      <StatusBadge tone={localStatusTone(dataSet.facts.local_status)}>
+                        {localStatusLabel(dataSet.facts.local_status)}
+                      </StatusBadge>
+                      <StorageConfirmationsBadge
+                        count={storageConfirmations[String(dataSet.facts.local_data_set_id)] ?? 0}
+                      />
+                    </div>
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2">
                     <TopologySignalBadge status={dataSet.signal.status} signal={dataSet.signal} />

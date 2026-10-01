@@ -574,6 +574,7 @@ type storageCommitAttempt2026090101 struct {
 	ExtraDataHex           *string `bun:"type:text"`
 	TransactionID          *string `bun:"type:text"`
 	StatusURL              *string `bun:"type:text"`
+	SubmitError            *string `bun:"type:text"`
 	ConfirmedTransactionID *string `bun:"type:text"`
 	AttentionCode          *string `bun:"type:text"`
 	AttentionAt            *time.Time
@@ -829,7 +830,7 @@ func storageCommitAttemptTable2026090101() initialTableSpec {
 		name:  "storage_commit_attempts",
 		model: (*storageCommitAttempt2026090101)(nil),
 		constraints: []string{
-			"CONSTRAINT chk_storage_commit_attempts_identity CHECK (attempt_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (attention_code IS NULL OR attention_code <> '') AND (release_reason IS NULL OR release_reason <> ''))",
+			"CONSTRAINT chk_storage_commit_attempts_identity CHECK (attempt_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (submit_error IS NULL OR submit_error <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (attention_code IS NULL OR attention_code <> '') AND (release_reason IS NULL OR release_reason <> ''))",
 			"CONSTRAINT chk_storage_commit_attempts_status CHECK (status IN ('reserved', 'attempted', 'confirmed', 'released', 'rejected'))",
 			// Candidate key for the copy's confirmed-attempt projection.
 			"CONSTRAINT uq_storage_commit_attempts_projection UNIQUE (attempt_id, status, content_id, storage_data_set_id)",
@@ -842,6 +843,8 @@ func storageCommitAttemptTable2026090101() initialTableSpec {
 				OR (status = 'rejected' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND confirmed_transaction_id IS NULL AND last_error IS NOT NULL AND last_error <> '')
 			)`,
 			"CONSTRAINT chk_storage_commit_attempts_submission_evidence CHECK ((transaction_id IS NULL AND status_url IS NULL) OR (transaction_id IS NOT NULL AND status_url IS NOT NULL))",
+			// Only an attempt that reached the provider can have failed there.
+			"CONSTRAINT chk_storage_commit_attempts_submit_error CHECK (submit_error IS NULL OR attempted_at IS NOT NULL)",
 			"CONSTRAINT chk_storage_commit_attempts_attention CHECK ((attention_code IS NULL AND attention_at IS NULL) OR (attention_code IS NOT NULL AND attention_at IS NOT NULL AND attempted_at IS NOT NULL))",
 			"CONSTRAINT chk_storage_commit_attempts_release CHECK ((status = 'released' AND release_reason IS NOT NULL) OR (status <> 'released' AND release_reason IS NULL))",
 		},

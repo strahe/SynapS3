@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 )
 
 type taskListItem struct {
@@ -34,6 +36,24 @@ type taskListItem struct {
 	AcknowledgedAt  *string `json:"acknowledged_at,omitempty"`
 	CreatedAt       string  `json:"created_at"`
 	UpdatedAt       string  `json:"updated_at"`
+
+	StorageConfirmation *taskStorageConfirmation `json:"storage_confirmation,omitempty"`
+}
+
+// taskStorageConfirmation describes the storage confirmation a Confirm storage
+// task holds while it waits for review. Releasable is set only once the task has
+// stopped, because a confirmation still being observed may yet land.
+type taskStorageConfirmation struct {
+	CopyID      int64  `json:"copy_id"`
+	AttemptID   string `json:"attempt_id"`
+	ReasonCode  string `json:"reason_code"`
+	ProviderID  string `json:"provider_id"`
+	DataSetID   string `json:"data_set_id,omitempty"`
+	PieceCID    string `json:"piece_cid,omitempty"`
+	SubmitError string `json:"submit_error,omitempty"`
+	AttemptedAt string `json:"attempted_at"`
+	AttentionAt string `json:"attention_at"`
+	Releasable  bool   `json:"releasable"`
 }
 
 type taskListResponse struct {
@@ -57,6 +77,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 	for i := range page.Tasks {
 		items = append(items, s.taskListItem(&page.Tasks[i]))
 	}
+	s.attachTaskStorageConfirmations(r.Context(), page.Tasks, items)
 	response := taskListResponse{Tasks: items}
 	if page.NextBeforeID > 0 {
 		response.NextCursor = &page.NextBeforeID
@@ -169,6 +190,46 @@ func (s *Server) taskListItem(row *model.Task) taskListItem {
 	item.FinishedAt = formattedTime(row.FinishedAt)
 	item.AcknowledgedAt = formattedTime(row.AcknowledgedAt)
 	return item
+}
+
+// attachTaskStorageConfirmations adds the confirmation each Confirm storage
+// task holds for review. A failed lookup leaves the list without it; dismissal
+// is still refused by the repository.
+func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []model.Task, items []taskListItem) {
+	var commitTaskIDs []int64
+	for i := range rows {
+		if rows[i].Type == model.TaskTypeStorageCommit {
+			commitTaskIDs = append(commitTaskIDs, rows[i].ID)
+		}
+	}
+	if len(commitTaskIDs) == 0 {
+		return
+	}
+	records, err := s.repos.Contents.ListCommitAttentionForTasks(ctx, commitTaskIDs)
+	if err != nil {
+		s.logger.Warn("api: failed to list task storage confirmations", "error", err)
+		return
+	}
+	byTask := make(map[int64]storagecommit.AttentionRecord, len(records))
+	for _, record := range records {
+		if record.TaskID != nil {
+			byTask[*record.TaskID] = record
+		}
+	}
+	for i := range rows {
+		record, ok := byTask[rows[i].ID]
+		if !ok {
+			continue
+		}
+		items[i].Acknowledgeable = false
+		items[i].StorageConfirmation = &taskStorageConfirmation{
+			CopyID: record.CopyID, AttemptID: record.AttemptID, ReasonCode: string(record.Code),
+			ProviderID: record.ProviderID, DataSetID: record.DataSetID, PieceCID: record.PieceCID,
+			SubmitError: record.SubmitError,
+			AttemptedAt: record.AttemptedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
+			Releasable: rows[i].Status == model.TaskStatusFailed,
+		}
+	}
 }
 
 func taskPresentationStatus(row *model.Task, now time.Time) string {

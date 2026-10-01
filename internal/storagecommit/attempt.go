@@ -31,6 +31,7 @@ type Attempt struct {
 	ExtraDataHex           *string       `bun:"extra_data_hex,type:text,nullzero"`
 	TransactionID          *string       `bun:"transaction_id,type:text,nullzero"`
 	StatusURL              *string       `bun:"status_url,type:text,nullzero"`
+	SubmitError            *string       `bun:"submit_error,type:text,nullzero"`
 	ConfirmedTransactionID *string       `bun:"confirmed_transaction_id,type:text,nullzero"`
 	AttentionCode          *string       `bun:"attention_code,type:text,nullzero"`
 	AttentionAt            *time.Time    `bun:"attention_at,nullzero"`

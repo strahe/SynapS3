@@ -4,6 +4,7 @@ import "time"
 
 type AttentionRecord struct {
 	CopyID        int64
+	TaskID        *int64
 	ContentID     int64
 	CopyIndex     int
 	DataSetRowID  int64
@@ -12,6 +13,7 @@ type AttentionRecord struct {
 	PieceCID      string
 	AttemptID     string
 	TransactionID string
+	SubmitError   string
 	Code          AttentionCode
 	AttemptedAt   time.Time
 	AttentionAt   time.Time

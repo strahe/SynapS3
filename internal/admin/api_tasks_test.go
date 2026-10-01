@@ -14,6 +14,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
@@ -214,6 +215,60 @@ func TestAPITasksSeparatesFailedAndDismissedFilters(t *testing.T) {
 		if len(page.Tasks) != 1 || page.Tasks[0].ID != tt.wantID || page.Tasks[0].Status != string(model.TaskStatusFailed) || page.Tasks[0].Presentation != tt.presentation {
 			t.Fatalf("status=%s page = %#v", tt.status, page)
 		}
+	}
+}
+
+type commitAttentionTaskRepo struct {
+	repository.StorageContentRepository
+	records []storagecommit.AttentionRecord
+}
+
+func (r *commitAttentionTaskRepo) ListCommitAttentionForTasks(context.Context, []int64) ([]storagecommit.AttentionRecord, error) {
+	return r.records, nil
+}
+
+type heldAcknowledgeTaskRepo struct {
+	repository.TaskRepository
+}
+
+func (heldAcknowledgeTaskRepo) AcknowledgeFailed(context.Context, int64, time.Duration) error {
+	return repository.ErrConflict
+}
+
+// A stopped Confirm storage task carries the confirmation it holds, offers its
+// release instead of a dismissal, and a dismissal is refused.
+func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	stopped := fixture.enqueue(t, model.TaskTypeStorageCommit, "stopped-commit", time.Now(), "", "")
+	fixture.transition(t, stopped.ID, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("attempt_only_ambiguous"), LastError: new("storage registration requires attention"),
+	})
+	now := time.Date(2026, 9, 30, 19, 53, 39, 0, time.UTC)
+	fixture.repos.Contents = &commitAttentionTaskRepo{StorageContentRepository: fixture.repos.Contents, records: []storagecommit.AttentionRecord{{
+		CopyID: 447, TaskID: &stopped.ID, ProviderID: "32", DataSetID: "39911", PieceCID: "piece-1",
+		AttemptID: "attempt-1", SubmitError: "provider returned HTTP 500: piece not found",
+		Code: storagecommit.AttentionAttemptOnlyAmbiguous, AttemptedAt: now.Add(-6 * time.Second), AttentionAt: now,
+	}}}
+
+	rr := fixture.request(http.MethodGet, "/api/v1/tasks?type=storage_commit&status=failed", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var page taskListResponse
+	decodeJSON(t, rr, &page)
+	if len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || page.Tasks[0].StorageConfirmation == nil {
+		t.Fatalf("page = %#v, want the stopped task with its confirmation and no dismissal", page)
+	}
+	if confirmation := page.Tasks[0].StorageConfirmation; confirmation.CopyID != 447 || confirmation.AttemptID != "attempt-1" ||
+		!confirmation.Releasable || confirmation.SubmitError != "provider returned HTTP 500: piece not found" {
+		t.Fatalf("confirmation = %#v, want a releasable confirmation with the provider reply", confirmation)
+	}
+
+	fixture.repos.Tasks = heldAcknowledgeTaskRepo{TaskRepository: fixture.repos.Tasks}
+	rr = fixture.request(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(stopped.ID, 10)+"/acknowledge", nil)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("dismiss status = %d body=%s, want conflict", rr.Code, rr.Body.String())
 	}
 }
 

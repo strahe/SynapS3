@@ -252,6 +252,13 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			SET extra_data_hex = 'abcd'
 			WHERE attempt_id = 'attempt-2'`)
 		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
+			SET submit_error = 'provider returned HTTP 500'
+			WHERE attempt_id = 'attempt-2'`)
+		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
+			SET status = 'attempted', attempted_at = current_timestamp,
+			    extra_data_hex = 'abcd', submit_error = ''
+			WHERE attempt_id = 'attempt-2'`)
+		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
 			SET status = 'attempted', attempted_at = current_timestamp,
 			    extra_data_hex = 'abcd', status_url = 'https://provider.example/status'
 			WHERE attempt_id = 'attempt-2'`)

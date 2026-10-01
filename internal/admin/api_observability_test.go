@@ -154,6 +154,35 @@ func TestAPIObservabilityDataSetBucketFilters(t *testing.T) {
 	}
 }
 
+func TestAPIObservabilityDataSetsCountStoppedStorageConfirmations(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	repos.Contents = &stoppedConfirmationCountRepo{StorageContentRepository: repos.Contents, counts: map[int64]int64{5: 4, 9: 2}}
+	service := observability.NewService(observability.ServiceOptions{
+		Store: &observabilityAPIStore{dataSets: []observability.DataSetState{
+			{LocalDataSetID: 5, Status: observability.StatusAvailable},
+			{LocalDataSetID: 6, Status: observability.StatusAvailable},
+		}},
+		RefreshInterval: time.Minute,
+	})
+	srv := &Server{addr: "127.0.0.1:9090", repos: repos, observability: service, logger: testLogger()}
+	rr := httptest.NewRecorder()
+	srv.handleAPIObservabilityDataSets(rr, httptest.NewRequest(http.MethodGet, "/api/v1/observability/data-sets", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Items                []observability.DataSetObservation `json:"items"`
+		StorageConfirmations map[string]int64                   `json:"storage_confirmations_by_data_set"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Items) != 2 || len(body.StorageConfirmations) != 1 || body.StorageConfirmations["5"] != 4 {
+		t.Fatalf("data sets = %d items, confirmations = %v, want 4 on the listed data set 5 only", len(body.Items), body.StorageConfirmations)
+	}
+}
+
 func TestAPIObservabilityProviders(t *testing.T) {
 	service := observability.NewService(observability.ServiceOptions{
 		Store: &observabilityAPIStore{

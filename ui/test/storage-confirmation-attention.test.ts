@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   storageConfirmationAttentionView,
-  storageConfirmationListCommand,
   storageConfirmationReleaseWarning,
 } from '../src/lib/storage-confirmation-attention.ts'
 
@@ -37,8 +36,7 @@ test('unknown confirmation reasons preserve the raw code behind a safe fallback'
   })
 })
 
-test('confirmation recovery copy names the supported command and duplicate storage risk', () => {
-  assert.equal(storageConfirmationListCommand, 'synaps3 admin storage-confirmation list')
-  assert.match(storageConfirmationReleaseWarning, /only if/)
-  assert.match(storageConfirmationReleaseWarning, /duplicate paid storage/)
+test('release copy names the resubmission and the duplicate storage cost', () => {
+  assert.match(storageConfirmationReleaseWarning, /submits the piece again/)
+  assert.match(storageConfirmationReleaseWarning, /pay for both copies/)
 })

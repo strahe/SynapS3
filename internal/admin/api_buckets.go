@@ -796,6 +796,7 @@ type objectProvenanceCopyResponse struct {
 	IsNewDataSet     bool                      `json:"is_new_data_set"`
 	AttentionCode    *string                   `json:"attention_code,omitempty"`
 	AttentionAt      *string                   `json:"attention_at,omitempty"`
+	SubmitError      *string                   `json:"submit_error,omitempty"`
 }
 
 type uploadProgressResponse struct {
@@ -1882,6 +1883,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			IsNewDataSet:     copyRow.IsNewDataSet,
 			AttentionCode:    copyRow.CommitAttentionCode,
 			AttentionAt:      attentionAt,
+			SubmitError:      copyRow.CommitSubmitError,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)

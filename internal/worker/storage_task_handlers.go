@@ -556,7 +556,17 @@ func (h *TaskHandlers) sendDataSetCreation(
 	}
 	// The request may have reached the provider without its submission reaching
 	// us, so the chain is checked before anything is sent again.
-	return taskengine.Suspend(model.TaskResumeModeRecover, unobservedOutcomeDelay(checkpoint.Sends), "provider_confirmation", "Checking storage service creation", nil)
+	delay := unobservedOutcomeDelay(checkpoint.Sends)
+	if summary := synapse.ErrorSummary(createErr); summary != "" && ctx.Err() == nil {
+		h.deps.Logger.Warn("storage service creation request failed",
+			"task_id", execution.ID(), "storage_data_set_id", binding.ID, "provider_id", binding.ProviderID,
+			"sends", checkpoint.Sends, "error", summary)
+		return taskengine.SuspendWithError(model.TaskResumeModeRecover, delay, "provider_confirmation", "Checking storage service creation",
+			errors.New(summary), func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.Contents.RecordDataSetCreationError(ctx, binding.ID, execution.ID(), summary)
+			})
+	}
+	return taskengine.Suspend(model.TaskResumeModeRecover, delay, "provider_confirmation", "Checking storage service creation", nil)
 }
 
 // findRequestedDataSet reads the chain for the data set a request with an
@@ -659,7 +669,8 @@ func (h *TaskHandlers) waitDataSetCreation(
 			}
 			return taskengine.Fail(err, "dataset_creation_rejected", dataSetFailureSettlement(binding.ID, execution.ID(), err.Error(), true))
 		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage service", nil)
+		return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage service",
+			synapse.SummarizedError(err), nil)
 	}
 	dataSetID, createdClientID, err := dataSetResultIDs(binding, result)
 	if err != nil {
@@ -1295,7 +1306,13 @@ func (h *TaskHandlers) storeWithProviderSlot(
 			}
 			return h.retryStoreNotStarted(execution, err)
 		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		if ctx.Err() == nil {
+			h.deps.Logger.Warn("storage transfer request failed",
+				"task_id", execution.ID(), "copy_id", copyRow.ID, "content_id", copyRow.ContentID,
+				"provider_id", copyRow.ProviderID, "storage_data_set_id", copyRow.StorageDataSetID, "error", synapse.ErrorSummary(err))
+		}
+		return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer",
+			synapse.SummarizedError(err), nil)
 	}
 	if stored == nil || !stored.PieceCID.Equals(pieceInfo.CIDv2) || stored.Size != content.ContentSize {
 		err := errors.New("storage provider returned a mismatched piece identity or size")
@@ -1517,7 +1534,8 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 	if err != nil {
 		switch synapse.ClassifyPullError(err) {
 		case synapse.PullErrorRetryable:
-			return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+			return taskengine.SuspendWithError(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer",
+				synapse.SummarizedError(err), nil)
 		case synapse.PullErrorTerminal:
 			if result, recovered := h.recoverMigrationFromCache(ctx, execution, input, copyRow, checkpoint.AttemptID); recovered {
 				return result
@@ -1590,7 +1608,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 				if advanced.Continue && advanced.AttentionCode.Valid() {
 					return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
 				}
-				return taskengine.Fail(errors.New("storage registration requires attention"), commitAttentionFailureReason(advanced.AttentionCode), nil)
+				return taskengine.Fail(commitAttentionError(copyRow), commitAttentionFailureReason(advanced.AttentionCode), nil)
 			}
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
@@ -1617,13 +1635,18 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	}
 	if err != nil {
 		if advanced.State == storagecommit.AdvancePending || advanced.State == storagecommit.AdvanceSubmitted {
-			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
+			h.deps.Logger.Warn("storage registration submission failed",
+				"task_id", execution.ID(), "copy_id", copyRow.ID, "content_id", copyRow.ContentID,
+				"provider_id", copyRow.ProviderID, "storage_data_set_id", copyRow.StorageDataSetID,
+				"attempt_id", advanced.AttemptID, "error", synapse.ErrorSummary(err))
+			return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation",
+				"Checking storage registration", synapse.SummarizedError(err), nil)
 		}
 		return h.retryCopyTask(execution, input, copyRow, err, "commit_advance_failed")
 	}
 	switch advanced.State {
 	case storagecommit.AdvanceWaitingCapacity:
-		return taskengine.Suspend(model.TaskResumeModeRecover, commitCapacityBackstop, "capacity", "Waiting to register storage", nil)
+		return taskengine.Suspend(model.TaskResumeModeRecover, commitCapacityBackstop, "capacity", commitCapacityMessage(advanced.AttentionHeld), nil)
 	case storagecommit.AdvanceSubmitted, storagecommit.AdvancePending:
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage registration", nil)
 	case storagecommit.AdvanceRejected:
@@ -1632,7 +1655,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 		if advanced.Continue && advanced.AttentionCode.Valid() {
 			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
 		}
-		return taskengine.Fail(errors.New("storage registration requires attention"), commitAttentionFailureReason(advanced.AttentionCode), nil)
+		return taskengine.Fail(commitAttentionError(copyRow), commitAttentionFailureReason(advanced.AttentionCode), nil)
 	case storagecommit.AdvanceReleased:
 		if !advanced.ReleaseReason.Valid() {
 			return taskengine.Fail(fmt.Errorf("storage registration was released with unknown reason %q", advanced.ReleaseReason), "commit_release_reason_unknown", nil)
@@ -1687,6 +1710,28 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 		})
 	default:
 		return taskengine.Fail(fmt.Errorf("unknown storage commit result %q", advanced.State), "commit_result_invalid", nil)
+	}
+}
+
+// commitAttentionError names why a storage registration stopped for review,
+// including the provider's reply when the submission failed there.
+func commitAttentionError(copyRow *model.StorageCopy) error {
+	if copyRow.CommitSubmitError != nil && *copyRow.CommitSubmitError != "" {
+		return fmt.Errorf("storage registration requires attention: %s", *copyRow.CommitSubmitError)
+	}
+	return errors.New("storage registration requires attention")
+}
+
+// commitCapacityMessage explains a registration waiting for its storage
+// service, naming earlier registrations that hold it while they await review.
+func commitCapacityMessage(attentionHeld int) string {
+	switch {
+	case attentionHeld == 1:
+		return "Waiting to register storage; 1 earlier registration for this storage service needs review"
+	case attentionHeld > 1:
+		return fmt.Sprintf("Waiting to register storage; %d earlier registrations for this storage service need review", attentionHeld)
+	default:
+		return "Waiting to register storage"
 	}
 }
 

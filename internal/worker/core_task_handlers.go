@@ -661,7 +661,13 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 				}
 				return retryTask(err, "cleanup_not_started")
 			}
-			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Checking remote cleanup", nil)
+			if ctx.Err() == nil {
+				h.deps.Logger.Warn("remote cleanup request failed",
+					"task_id", execution.ID(), "cleanup_copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
+					"error", synapse.ErrorSummary(err))
+			}
+			return taskengine.SuspendWithError(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Checking remote cleanup",
+				synapse.SummarizedError(err), nil)
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}
@@ -855,13 +861,15 @@ func (h *TaskHandlers) recoverWalletOperation(ctx context.Context, execution tas
 	requestCtx, cancel := context.WithTimeout(ctx, h.deps.WalletReceiptTimeout)
 	receipt, err := h.deps.Receipts.TransactionReceipt(requestCtx, common.HexToHash(txHash))
 	cancel()
-	if errors.Is(err, ethereum.NotFound) || receipt == nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
-		})
+	markSubmitted := func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 	}
-	if err != nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Checking wallet transaction", nil)
+	if err != nil && !errors.Is(err, ethereum.NotFound) {
+		return taskengine.SuspendWithError(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction",
+			synapse.SummarizedError(err), markSubmitted)
+	}
+	if err != nil || receipt == nil {
+		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
 	}
 	if receipt.Status == ethtypes.ReceiptStatusSuccessful {
 		return taskengine.Complete("Wallet transaction confirmed", func(ctx context.Context, repos *repository.Repositories) error {

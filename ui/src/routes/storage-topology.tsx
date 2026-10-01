@@ -163,6 +163,19 @@ function StorageTopologyPage() {
     () => providerSnapshot.data?.items ?? emptyProviderObservations,
     [providerSnapshot.data?.items]
   )
+  // Each data set list reports the stopped confirmations for the data sets it returned.
+  const storageConfirmations = useMemo(
+    () => ({
+      ...dataSetSnapshot.data?.storage_confirmations_by_data_set,
+      ...scopedDeepLinkDataSetSnapshot.data?.storage_confirmations_by_data_set,
+      ...dataSetInventory.data?.storage_confirmations_by_data_set,
+    }),
+    [
+      dataSetSnapshot.data?.storage_confirmations_by_data_set,
+      scopedDeepLinkDataSetSnapshot.data?.storage_confirmations_by_data_set,
+      dataSetInventory.data?.storage_confirmations_by_data_set,
+    ]
+  )
   const baseDataSets = useMemo(
     () => dataSetSnapshot.data?.items ?? emptyDataSetObservations,
     [dataSetSnapshot.data?.items]
@@ -520,6 +533,7 @@ function StorageTopologyPage() {
         <DataSetsTableCard
           dataSets={dataSetTableData}
           providersByID={detailProvidersByID}
+          storageConfirmations={storageConfirmations}
           total={dataSetTableTotal}
           page={dataSetPage}
           totalPages={dataSetTableTotalPages}
@@ -535,6 +549,7 @@ function StorageTopologyPage() {
         graph={graph}
         providers={detailProviders}
         dataSets={detailDataSets}
+        storageConfirmations={storageConfirmations}
         onNavigate={selectTopologySelection}
         onOpenChange={(open) => {
           if (open) return

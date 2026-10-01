@@ -492,7 +492,13 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 			// The outcome is unknown, or the provider is still publishing it. The
 			// next request reads the chain first and only goes out while the
 			// service is still running there.
-			return taskengine.Suspend(model.TaskResumeModeExecute, unobservedOutcomeDelay(checkpoint.Sends), "provider_confirmation", "Checking storage service retirement", nil)
+			if ctx.Err() == nil {
+				h.deps.Logger.Warn("storage service termination request failed",
+					"task_id", execution.ID(), "storage_data_set_id", dataSet.ID, "sends", checkpoint.Sends,
+					"error", synapse.ErrorSummary(err))
+			}
+			return taskengine.SuspendWithError(model.TaskResumeModeExecute, unobservedOutcomeDelay(checkpoint.Sends), "provider_confirmation",
+				"Checking storage service retirement", synapse.SummarizedError(err), nil)
 		}
 		if terminationEpochValue < 0 {
 			return stopRetirement(abandoned, row.ID,
