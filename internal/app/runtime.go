@@ -66,6 +66,9 @@ type FilecoinServices struct {
 	// the gateway can tell an accepted termination from a completed one.
 	Terminator synapse.ServiceTerminator
 	Epochs     synapse.ChainEpochReader
+	// CommitNonces reads the chain record that settles a storage commit the
+	// provider never confirmed.
+	CommitNonces synapse.CommitNonceReader
 }
 
 // RuntimeOptions configures the application composition root. Database,
@@ -149,6 +152,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		Observability:    observabilityService,
 		UploadSpeedProbe: uploadSpeedProbe,
 		ParkedPieces:     pdpStatusChecker,
+		CommitNonces:     opts.Filecoin.CommitNonces,
 		EvictionPolicy:   evictionPolicy,
 		MaxCacheBytes:    maxCacheBytes,
 		MaxWriteBytes:    objectlimits.MaxFOCUploadSize,
@@ -395,6 +399,7 @@ func validateOptions(opts RuntimeOptions) error {
 		{name: "filecoin observability", value: opts.Filecoin.Observability},
 		{name: "filecoin service terminator", value: opts.Filecoin.Terminator},
 		{name: "filecoin chain epochs", value: opts.Filecoin.Epochs},
+		{name: "filecoin commit nonces", value: opts.Filecoin.CommitNonces},
 	}
 	for _, dependency := range dependencies {
 		if isNil(dependency.value) {

@@ -15,12 +15,20 @@ import (
 	"github.com/strahe/synapse-go/warmstorage"
 )
 
+// dataSetWriteReader reads the FWSS state that decides whether a data set
+// still accepts new pieces.
+type dataSetWriteReader interface {
+	GetDataSet(context.Context, sdktypes.BigInt) (*warmstorage.DataSetInfo, error)
+	ValidateDataSet(context.Context, sdktypes.BigInt) error
+}
+
 // StorageServiceAdapter adapts synapse-go's concrete immutable storage
 // contexts to SynapS3's testable staged storage interface.
 type StorageServiceAdapter struct {
 	service    *storage.Service
 	terminator storageServiceTerminator
 	dataSets   dataSetStateReader
+	writable   dataSetWriteReader
 	identity   storage.ContextIdentity
 	verifier   common.Address
 	cleanup    *cleanupPieceReader
@@ -34,6 +42,7 @@ func AdaptStorageService(service *storage.Service, dataSets *warmstorage.Service
 	adapter := &StorageServiceAdapter{service: service, terminator: service, identity: identity}
 	if dataSets != nil {
 		adapter.dataSets = dataSets
+		adapter.writable = dataSets
 		adapter.verifier = dataSets.PDPVerifierAddress()
 	}
 	return adapter
@@ -100,7 +109,7 @@ func (s *StorageServiceAdapter) SelectUploadTargets(ctx context.Context, opts st
 	}
 	out := make([]StorageTarget, 0, len(selection.Contexts))
 	for _, storageCtx := range selection.Contexts {
-		target, err := wrapStorageTarget(storageCtx)
+		target, err := wrapStorageTarget(storageCtx, s.writable)
 		if err != nil {
 			return nil, err
 		}
@@ -128,7 +137,7 @@ func (s *StorageServiceAdapter) OpenDataSetTarget(ctx context.Context, dataSetID
 	if storageCtx == nil {
 		return nil, errors.New("opening data set target returned no context")
 	}
-	return newDataSetTargetAdapter(storageCtx), nil
+	return newDataSetTargetAdapter(storageCtx, s.writable), nil
 }
 
 func (s *StorageServiceAdapter) OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error) {
@@ -188,7 +197,7 @@ func cloneDataSetMetadata(metadata map[string]string) map[string]string {
 	return out
 }
 
-func wrapStorageTarget(storageCtx storage.StorageContext) (StorageTarget, error) {
+func wrapStorageTarget(storageCtx storage.StorageContext, writable dataSetWriteReader) (StorageTarget, error) {
 	switch concrete := storageCtx.(type) {
 	case *storage.ProviderContext:
 		if concrete == nil {
@@ -199,7 +208,7 @@ func wrapStorageTarget(storageCtx storage.StorageContext) (StorageTarget, error)
 		if concrete == nil {
 			return nil, errors.New("storage selection returned a nil data set context")
 		}
-		return newDataSetTargetAdapter(concrete), nil
+		return newDataSetTargetAdapter(concrete, writable), nil
 	default:
 		return nil, fmt.Errorf("storage selection returned unsupported context %T", storageCtx)
 	}
@@ -264,14 +273,15 @@ func (c *providerTargetAdapter) FindDataSetByClientDataSetID(
 
 type dataSetTargetAdapter struct {
 	storageTargetAdapter
-	dataSet *storage.DataSetContext
+	dataSet  *storage.DataSetContext
+	writable dataSetWriteReader
 }
 
-func newDataSetTargetAdapter(dataSet *storage.DataSetContext) *dataSetTargetAdapter {
+func newDataSetTargetAdapter(dataSet *storage.DataSetContext, writable dataSetWriteReader) *dataSetTargetAdapter {
 	if dataSet == nil {
 		return nil
 	}
-	return &dataSetTargetAdapter{storageTargetAdapter: storageTargetAdapter{inner: dataSet}, dataSet: dataSet}
+	return &dataSetTargetAdapter{storageTargetAdapter: storageTargetAdapter{inner: dataSet}, dataSet: dataSet, writable: writable}
 }
 
 func (c *dataSetTargetAdapter) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
@@ -302,6 +312,33 @@ func (c *dataSetTargetAdapter) GetCommitStatus(ctx context.Context, statusURL st
 func (c *dataSetTargetAdapter) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
 	result, err := c.dataSet.PieceStatus(ctx, pieceCID)
 	return result, NormalizeProviderOperationError(ctx, err)
+}
+
+// CheckWritable repeats the chain checks SubmitCommit makes before it contacts
+// the provider.
+func (c *dataSetTargetAdapter) CheckWritable(ctx context.Context) error {
+	if c.writable == nil {
+		return errors.New("data set state reader is unavailable")
+	}
+	ref, ok := c.dataSet.DataSetRef()
+	if !ok {
+		return errors.New("data set target has no data set")
+	}
+	return checkDataSetWritable(ctx, c.writable, ref.DataSetID())
+}
+
+func checkDataSetWritable(ctx context.Context, reader dataSetWriteReader, dataSetID sdktypes.BigInt) error {
+	info, err := reader.GetDataSet(ctx, dataSetID)
+	if err != nil {
+		return normalizeDataSetLifecycleError(err)
+	}
+	if info == nil {
+		return fmt.Errorf("FWSS returned no data set %s", dataSetID.String())
+	}
+	if info.PDPEndEpoch != 0 {
+		return &storage.DataSetPDPPaymentTerminatedError{DataSetID: dataSetID.Copy(), PDPEndEpoch: info.PDPEndEpoch}
+	}
+	return normalizeDataSetLifecycleError(reader.ValidateDataSet(ctx, dataSetID))
 }
 
 var (

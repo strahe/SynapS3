@@ -384,7 +384,119 @@ func TestAdvancerDataSetUnavailableSeparatesReservationFromAttempt(t *testing.T)
 	})
 }
 
-func TestAdvancerAmbiguousSubmitErrorRetainsAttemptFence(t *testing.T) {
+// A 5xx may come after the provider sent its transaction, so the attempt stays
+// fenced. A 4xx is answered before any transaction: the attempt is released and
+// the copy keeps its signed request, except when the data set itself is gone.
+func TestAdvancerSubmitErrorFollowsProviderStatus(t *testing.T) {
+	for _, tt := range []struct {
+		status     int
+		wantState  storagecommit.AdvanceState
+		wantReason storagecommit.ReleaseReason
+	}{
+		{status: 500, wantState: storagecommit.AdvancePending},
+		{status: 400, wantState: storagecommit.AdvanceDeferred, wantReason: storagecommit.ReleaseProviderRejected},
+		{status: 429, wantState: storagecommit.AdvanceDeferred, wantReason: storagecommit.ReleaseProviderRejected},
+		{status: 409, wantState: storagecommit.AdvanceReleased, wantReason: storagecommit.ReleaseDataSetUnavailable},
+	} {
+		t.Run(fmt.Sprint(tt.status), func(t *testing.T) {
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+			target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+			target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+				return []byte{0xab}, nil
+			}
+			submitErr := fmt.Errorf("add pieces: %w", &pdp.HTTPError{
+				Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: tt.status, Body: "piece not found",
+			})
+			target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+				return nil, submitErr
+			}
+
+			result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
+				Copy: copies[0], Binding: *binding, Target: target,
+				Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+			})
+			persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+			reply := fmt.Sprintf("provider returned HTTP %d: piece not found", tt.status)
+			switch tt.wantState {
+			case storagecommit.AdvancePending:
+				if !errors.Is(err, submitErr) || result.State != tt.wantState {
+					t.Fatalf("advance = %#v err=%v, want a fenced pending result carrying the submit error", result, err)
+				}
+				if persisted.Status != model.StorageCopyStatusCommitting || persisted.CommitAttemptID == nil ||
+					persisted.CommitSubmitError == nil || *persisted.CommitSubmitError != reply {
+					t.Fatalf("copy = %#v, want the attempt fenced with the provider's reply", persisted)
+				}
+				return
+			case storagecommit.AdvanceDeferred:
+				if err != nil || result.State != tt.wantState || result.ReleaseReason != tt.wantReason ||
+					result.RetryAfter != time.Minute || !errors.Is(result.Cause, submitErr) {
+					t.Fatalf("advance = %#v err=%v, want a deferred release", result, err)
+				}
+				if persisted.CommitReadyAt == nil || persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != "ab" {
+					t.Fatalf("copy = %#v, want its queue place and signed request kept", persisted)
+				}
+			default:
+				if err != nil || result.State != tt.wantState || result.ReleaseReason != tt.wantReason {
+					t.Fatalf("advance = %#v err=%v, want a released unavailable data set", result, err)
+				}
+				if persisted.CommitExtraDataHex != nil {
+					t.Fatalf("copy = %#v, want the request dropped with the data set", persisted)
+				}
+			}
+			if persisted.Status != model.StorageCopyStatusPieceReady || persisted.CommitAttemptID != nil {
+				t.Fatalf("copy = %#v, want the attempt released", persisted)
+			}
+			attempt := loadAdvancerAttempt(t, db, result.AttemptID)
+			if attempt.Status != storagecommit.AttemptStatusReleased || attempt.ReleaseReason == nil ||
+				*attempt.ReleaseReason != string(tt.wantReason) {
+				t.Fatalf("attempt = %#v, want released for %s", attempt, tt.wantReason)
+			}
+			if tt.wantReason == storagecommit.ReleaseProviderRejected && (attempt.SubmitError == nil || *attempt.SubmitError != reply) {
+				t.Fatalf("submit error = %v, want the provider's reply", attempt.SubmitError)
+			}
+		})
+	}
+}
+
+// Each consecutive refusal doubles the wait. From the fifth on, the copy gives
+// up its place at the head of the queue.
+func TestAdvancerConsecutiveRejectionsBackOffThenYieldQueueHead(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	var signed int
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		signed++
+		return []byte{0xab}, nil
+	}
+	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+		return nil, &pdp.HTTPError{StatusCode: 429}
+	}
+	advancer := storagecommit.Advancer{Store: repos.Contents}
+	for i, wantDelay := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute} {
+		result, err := advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+			Copy: *loadAdvancerCopy(t, repos, copies[0].ID), Binding: *binding, Target: target,
+			Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+		})
+		if err != nil || result.State != storagecommit.AdvanceDeferred || result.RetryAfter != wantDelay {
+			t.Fatalf("refusal %d = %#v err=%v, want a %s wait", i+1, result, err, wantDelay)
+		}
+		persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+		if keepsHead := i < 4; (persisted.CommitReadyAt != nil) != keepsHead {
+			t.Fatalf("refusal %d left commit_ready_at = %v, want kept=%v", i+1, persisted.CommitReadyAt, keepsHead)
+		}
+	}
+	if signed != 1 {
+		t.Fatalf("requests signed = %d, want one for every refusal", signed)
+	}
+}
+
+// A data set whose state cannot be read before submitting releases the
+// reservation and waits, rather than leaving an attempt to recover.
+func TestAdvancerWriteCheckFailureReleasesReservation(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
@@ -392,27 +504,27 @@ func TestAdvancerAmbiguousSubmitErrorRetainsAttemptFence(t *testing.T) {
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
 		return []byte{0xab}, nil
 	}
-	submitErr := fmt.Errorf("add pieces: %w", &pdp.HTTPError{
-		Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: 500, Body: "piece not found",
-	})
+	readErr := errors.New("chain RPC unavailable")
+	target.CheckWritableFunc = func(context.Context) error { return readErr }
 	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
-		return nil, submitErr
+		t.Fatal("a failed write check reached SubmitCommit")
+		return nil, nil
 	}
 
 	result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
 		Copy: copies[0], Binding: *binding, Target: target,
 		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
 	})
-	if !errors.Is(err, submitErr) || result.State != storagecommit.AdvancePending {
-		t.Fatalf("advance = %#v err=%v, want a fenced pending result carrying the submit error", result, err)
+	if err != nil || result.State != storagecommit.AdvanceDeferred || result.ReleaseReason != storagecommit.ReleaseBeforeSubmitCanceled ||
+		result.RetryAfter != time.Minute || !errors.Is(result.Cause, readErr) {
+		t.Fatalf("advance = %#v err=%v, want a deferred reservation release", result, err)
 	}
 	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
-	if persisted.Status != model.StorageCopyStatusCommitting ||
-		persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil {
-		t.Fatalf("ambiguous submit error lost attempt fence: %#v", persisted)
+	if persisted.CommitAttemptID != nil || persisted.CommitAttemptedAt != nil || persisted.CommitReadyAt == nil {
+		t.Fatalf("copy = %#v, want no attempt and its queue place kept", persisted)
 	}
-	if persisted.CommitSubmitError == nil || *persisted.CommitSubmitError != "provider returned HTTP 500: piece not found" {
-		t.Fatalf("submit error = %v, want the provider's reply", persisted.CommitSubmitError)
+	if attempt := loadAdvancerAttempt(t, db, result.AttemptID); attempt.Status != storagecommit.AttemptStatusReleased || attempt.AttemptedAt != nil {
+		t.Fatalf("attempt = %#v, want the unsent reservation released", attempt)
 	}
 }
 
@@ -854,86 +966,240 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 	}
 }
 
-func TestAdvancerAttemptOnlyUsesPieceStatusAsDiagnosticEvidence(t *testing.T) {
+// nonceCase is one copy whose attempt went out signed with nonce 7 and was
+// never acknowledged by the provider.
+type nonceCase struct {
+	db          *bun.DB
+	repos       *repository.Repositories
+	binding     *model.StorageDataSet
+	copyRow     model.StorageCopy
+	pieceCID    cid.Cid
+	target      *testutil.MockStorageTarget
+	nonces      *testutil.MockCommitNonces
+	attemptedAt time.Time
+}
+
+const unacknowledgedNonce = 7
+
+func seedUnacknowledgedAttempt(t *testing.T) nonceCase {
+	t.Helper()
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	attemptedAt := time.Date(2026, time.September, 30, 18, 0, 0, 0, time.UTC)
 	identity := advancerCopyIdentity(copies[0])
 	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-		Copy: identity, AttemptID: "attempt-only",
+		Copy: identity, AttemptID: "unacknowledged", Now: attemptedAt,
 	}); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "attempt-only", ExtraDataHex: "abcd",
+		Copy: identity, AttemptID: "unacknowledged", ExtraDataHex: testutil.CommitExtraDataHex(unacknowledgedNonce), Now: attemptedAt,
 	}); err != nil {
 		t.Fatalf("mark attempted: %v", err)
 	}
-	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
 	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-	pieceStatusCalls := 0
-	target.PieceStatusFunc = func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-		pieceStatusCalls++
-		return &storage.PieceStatus{Exists: true}, nil
-	}
-
-	result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
-		Copy: *copyRow, Binding: *binding, Target: target,
-		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-	})
-	if err != nil || result.State != storagecommit.AdvanceNeedsAttention ||
-		result.AttentionCode != storagecommit.AttentionUnattributedPiece || result.Continue {
-		t.Fatalf("advance = %#v err=%v", result, err)
-	}
-	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
-	if persisted.PieceID != nil || persisted.Status != model.StorageCopyStatusCommitting ||
-		persisted.CommitAttentionAt == nil || persisted.CommitAttentionCode == nil ||
-		*persisted.CommitAttentionCode != string(storagecommit.AttentionUnattributedPiece) {
-		t.Fatalf("attempt-only evidence was incorrectly adopted: %#v", persisted)
-	}
-	result, err = (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
-		Copy: *persisted, Binding: *binding, Target: target,
-		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-	})
-	if err != nil || result.State != storagecommit.AdvanceNeedsAttention || pieceStatusCalls != 1 {
-		t.Fatalf("second advance = %#v err=%v pieceStatusCalls=%d", result, err, pieceStatusCalls)
+	target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
+	return nonceCase{
+		db: db, repos: repos, binding: binding, copyRow: copies[0], pieceCID: pieceCID,
+		target: target, nonces: &testutil.MockCommitNonces{}, attemptedAt: attemptedAt,
 	}
 }
 
-func seedCommitAttentionTask(t *testing.T, db *bun.DB) (*repository.Repositories, model.StorageCopy, *model.Task, string) {
+func (c nonceCase) advance(t *testing.T, at time.Time, input storagecommit.AdvanceInput) (storagecommit.AdvanceResult, error) {
 	t.Helper()
-	repos := repository.NewRepositories(db)
-	_, copies, _ := seedAdvancerCopies(t, db, 1)
-	copyRow := copies[0]
+	input.Copy = *loadAdvancerCopy(t, c.repos, c.copyRow.ID)
+	input.Binding, input.Target = *c.binding, c.target
+	input.Pieces = []storage.PieceInput{{PieceCID: c.pieceCID}}
+	advancer := storagecommit.Advancer{Store: c.repos.Contents, Nonces: c.nonces, Now: func() time.Time { return at }}
+	return advancer.Advance(t.Context(), input)
+}
+
+// A consumed nonce proves where the pieces landed even though no provider
+// reported the transaction, and the copy is committed without one.
+func TestAdvancerConfirmsUnacknowledgedAttemptByNonce(t *testing.T) {
+	c := seedUnacknowledgedAttempt(t)
+	pieceID := sdktypes.NewBigInt(41)
+	c.nonces.Consume(unacknowledgedNonce, c.binding.DataSetID.SDK(), pieceID, c.pieceCID)
+
+	result, err := c.advance(t, c.attemptedAt.Add(time.Minute), storagecommit.AdvanceInput{})
+	if err != nil || result.State != storagecommit.AdvanceConfirmed || !result.ProvenByNonce || result.Confirmation == nil ||
+		result.Confirmation.TransactionID != "" || result.Confirmation.ConfirmedTransactionID != "" ||
+		len(result.Confirmation.PieceIDs) != 1 || !result.Confirmation.PieceIDs[0].Equal(pieceID) {
+		t.Fatalf("advance = %#v err=%v, want a confirmation proven by the nonce", result, err)
+	}
+	committedPiece := idtypes.OnChainIDFromSDK(pieceID)
+	settlement := repository.MarkUploadCopyCommittedInput{
+		StorageCopyID: c.copyRow.ID, ContentID: c.copyRow.ContentID, CopyIndex: c.copyRow.CopyIndex,
+		PieceCID: c.pieceCID.String(), PieceID: &committedPiece, RetrievalURL: c.target.PieceURL(c.pieceCID),
+		CommitExtraDataHex: testutil.CommitExtraDataHex(unacknowledgedNonce), CommitAttemptID: result.AttemptID,
+		ProvenByNonce: true,
+	}
+	for range 2 {
+		if err := c.repos.Contents.MarkUploadCopyCommitted(t.Context(), settlement); err != nil {
+			t.Fatalf("settle nonce confirmation: %v", err)
+		}
+	}
+	persisted := loadAdvancerCopy(t, c.repos, c.copyRow.ID)
+	if persisted.Status != model.StorageCopyStatusCommitted || persisted.PieceID == nil || !persisted.PieceID.Equal(committedPiece) {
+		t.Fatalf("copy = %#v, want it committed at the nonce's piece", persisted)
+	}
+	attempt := loadAdvancerAttempt(t, c.db, result.AttemptID)
+	if attempt.Status != storagecommit.AttemptStatusConfirmed || attempt.TransactionID != nil || attempt.ConfirmedTransactionID != nil {
+		t.Fatalf("attempt = %#v, want confirmed without a transaction", attempt)
+	}
+}
+
+// A nonce consumed anywhere but this copy's piece in its data set, or another
+// request this copy signed that landed, stops the copy for an operator instead
+// of sending anything.
+func TestAdvancerStopsWhenNonceEvidenceDisagrees(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		consume func(c nonceCase)
+	}{
+		{name: "another data set", consume: func(c nonceCase) {
+			c.nonces.Consume(unacknowledgedNonce, sdktypes.NewBigInt(9999), sdktypes.NewBigInt(41), c.pieceCID)
+		}},
+		{name: "another piece", consume: func(c nonceCase) {
+			other, err := cid.Parse("bafkqaaa")
+			if err != nil {
+				panic(err)
+			}
+			c.nonces.Consume(unacknowledgedNonce, c.binding.DataSetID.SDK(), sdktypes.NewBigInt(41), other)
+		}},
+		{name: "earlier request landed", consume: func(c nonceCase) {
+			now := c.attemptedAt.Add(-time.Hour)
+			earlier := testutil.CommitExtraDataHex(6)
+			reason := string(storagecommit.ReleaseManualDuplicateAck)
+			if _, err := c.db.NewInsert().Model(&storagecommit.Attempt{
+				AttemptID: "released-by-hand", ContentID: c.copyRow.ContentID, StorageDataSetID: c.binding.ID,
+				Status: storagecommit.AttemptStatusReleased, ExtraDataHex: &earlier, ReleaseReason: &reason,
+				AttemptedAt: &now, ResolvedAt: &now, CreatedAt: now, UpdatedAt: now,
+			}).Exec(context.Background()); err != nil {
+				panic(err)
+			}
+			c.nonces.Consume(6, c.binding.DataSetID.SDK(), sdktypes.NewBigInt(40), c.pieceCID)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := seedUnacknowledgedAttempt(t)
+			tt.consume(c)
+			var resent bool
+			result, err := c.advance(t, c.attemptedAt.Add(time.Hour), storagecommit.AdvanceInput{
+				Resend: func(context.Context, storagecommit.SendHistory, func(context.Context) error) (bool, error) {
+					resent = true
+					return false, nil
+				},
+			})
+			if err != nil || result.State != storagecommit.AdvanceNeedsAttention || result.Continue ||
+				result.AttentionCode != storagecommit.AttentionSubmissionMismatch || resent {
+				t.Fatalf("advance = %#v err=%v resent=%v, want a stopped mismatch", result, err, resent)
+			}
+		})
+	}
+}
+
+// While the chain shows the nonce unused, recovery waits for the provider to
+// give up on the request, then lets execute send the same signed request.
+func TestAdvancerResendsUnusedNonceWithTheSameRequest(t *testing.T) {
+	c := seedUnacknowledgedAttempt(t)
+	result, err := c.advance(t, c.attemptedAt.Add(4*time.Minute), storagecommit.AdvanceInput{})
+	if err != nil || result.State != storagecommit.AdvancePending || result.RetryAfter != time.Minute {
+		t.Fatalf("early recovery = %#v err=%v, want a one-minute wait", result, err)
+	}
+	result, err = c.advance(t, c.attemptedAt.Add(5*time.Minute), storagecommit.AdvanceInput{})
+	if err != nil || result.State != storagecommit.AdvanceResendDue {
+		t.Fatalf("due recovery = %#v err=%v, want resend due", result, err)
+	}
+	// After a second send the wait doubles from that send.
+	sent := storagecommit.SendHistory{Sends: 2, LastSentAt: c.attemptedAt.Add(5 * time.Minute)}
+	result, err = c.advance(t, c.attemptedAt.Add(14*time.Minute), storagecommit.AdvanceInput{Sent: sent})
+	if err != nil || result.State != storagecommit.AdvancePending || result.RetryAfter != time.Minute {
+		t.Fatalf("recovery after a resend = %#v err=%v, want a one-minute wait", result, err)
+	}
+
+	// An earlier version flagged the attempt; the first receipt answers it.
+	if err := c.repos.Contents.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
+		Copy: advancerCopyIdentity(c.copyRow), AttemptID: "unacknowledged", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
+	}); err != nil {
+		t.Fatalf("flag attempt: %v", err)
+	}
+	ref, _ := c.target.DataSetRef()
+	var submitted []byte
+	c.target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+		submitted = request.ExtraData
+		submission := storage.CommitSubmission{
+			Kind: storage.CommitKindAddPieces, TransactionID: "0xresent", StatusURL: "https://provider.example/status/resent",
+			DataSet: &ref, PieceCIDs: []cid.Cid{c.pieceCID},
+		}
+		request.OnSubmitted(submission)
+		return &submission, nil
+	}
+	var recorded storagecommit.SendHistory
+	result, err = c.advance(t, c.attemptedAt.Add(15*time.Minute), storagecommit.AdvanceInput{
+		Sent: sent,
+		Resend: func(ctx context.Context, next storagecommit.SendHistory, effect func(context.Context) error) (bool, error) {
+			recorded = next
+			return true, effect(ctx)
+		},
+	})
+	if err != nil || result.State != storagecommit.AdvanceSubmitted {
+		t.Fatalf("resend = %#v err=%v, want submitted", result, err)
+	}
+	if string(submitted) != string(testutil.CommitExtraData(unacknowledgedNonce)) {
+		t.Fatal("resend did not carry the attempt's signed request")
+	}
+	if recorded.Sends != 3 || !recorded.LastSentAt.Equal(c.attemptedAt.Add(15*time.Minute)) {
+		t.Fatalf("recorded send = %#v, want the third send at the resend time", recorded)
+	}
+	persisted := loadAdvancerCopy(t, c.repos, c.copyRow.ID)
+	if persisted.CommitTransactionID == nil || *persisted.CommitTransactionID != "0xresent" ||
+		persisted.CommitAttentionAt != nil || persisted.CommitAttentionCode != nil {
+		t.Fatalf("copy = %#v, want the receipt recorded and the old flag cleared", persisted)
+	}
+}
+
+// A chain that cannot be read leaves the attempt fenced and sends nothing.
+func TestAdvancerUnreadableNonceWaitsWithoutSending(t *testing.T) {
+	c := seedUnacknowledgedAttempt(t)
+	readErr := errors.New("chain RPC unavailable")
+	c.nonces.Err = readErr
+	var resent bool
+	result, err := c.advance(t, c.attemptedAt.Add(time.Hour), storagecommit.AdvanceInput{
+		Resend: func(context.Context, storagecommit.SendHistory, func(context.Context) error) (bool, error) {
+			resent = true
+			return false, nil
+		},
+	})
+	if !errors.Is(err, readErr) || result.State != storagecommit.AdvancePending || result.RetryAfter != time.Minute || resent {
+		t.Fatalf("advance = %#v err=%v resent=%v, want a fenced wait", result, err, resent)
+	}
+}
+
+// A stopped confirmation keeps its task visible and counted: neither a single
+// nor a bulk dismissal can hide it. Retry checks the chain again, and a
+// confirmation found there clears it.
+func TestStoppedCommitAttentionStaysVisibleUntilRetried(t *testing.T) {
+	c := seedUnacknowledgedAttempt(t)
+	repos := c.repos
 	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: "release-attention", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "release-attention", Status: model.TaskStatusPending,
+		Type: model.TaskTypeStorageCommit, IdempotencyKey: "stopped-attention", InputVersion: 1,
+		Input: []byte(`{}`), InputHash: "stopped-attention", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue commit task = %#v created=%v err=%v", taskRow, created, err)
 	}
-	generation, err := repos.Contents.NextCopyWorkGeneration(t.Context(), copyRow.ID)
+	generation, err := repos.Contents.NextCopyWorkGeneration(t.Context(), c.copyRow.ID)
 	if err != nil {
 		t.Fatalf("next copy generation: %v", err)
 	}
-	if err := repos.Contents.BindCopyTask(t.Context(), copyRow.ID, generation, taskRow.ID); err != nil {
+	if err := repos.Contents.BindCopyTask(t.Context(), c.copyRow.ID, generation, taskRow.ID); err != nil {
 		t.Fatalf("bind commit task: %v", err)
 	}
-	identity := advancerCopyIdentity(copyRow)
-	const attemptID = "release-attention-attempt"
-	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-		Copy: identity, AttemptID: attemptID,
-	}); err != nil {
-		t.Fatalf("reserve commit attempt: %v", err)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: attemptID, ExtraDataHex: "abcd",
-	}); err != nil {
-		t.Fatalf("mark commit attempted: %v", err)
-	}
 	if err := repos.Contents.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
-		Copy: identity, AttemptID: attemptID, Code: storagecommit.AttentionAttemptOnlyAmbiguous,
+		Copy: advancerCopyIdentity(c.copyRow), AttemptID: "unacknowledged", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
 	}); err != nil {
 		t.Fatalf("mark commit attention: %v", err)
 	}
@@ -941,41 +1207,6 @@ func seedCommitAttentionTask(t *testing.T, db *bun.DB) (*repository.Repositories
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("claim commit task = %#v err=%v", claimed, err)
 	}
-	return repos, copyRow, claimed, attemptID
-}
-
-func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
-	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, testutil.NewTestDB(t))
-	reason := string(storagecommit.AttentionAttemptOnlyAmbiguous)
-	message := "storage registration requires attention"
-	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: &reason, LastError: &message,
-	}); err != nil {
-		t.Fatalf("fail commit task: %v", err)
-	}
-
-	if err := repos.Contents.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
-		CopyID: copyRow.ID, ExpectedAttemptID: attemptID, AcknowledgePossibleDuplicate: true,
-	}); err != nil {
-		t.Fatalf("release commit attention: %v", err)
-	}
-	resumed, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
-	if err != nil || resumed == nil || resumed.Status != model.TaskStatusPending ||
-		resumed.ResumeMode != model.TaskResumeModeRecover || resumed.RetryCount != 0 {
-		t.Fatalf("resumed task = %#v err=%v", resumed, err)
-	}
-	persisted := loadAdvancerCopy(t, repos, copyRow.ID)
-	if persisted.Status != model.StorageCopyStatusPieceReady || persisted.CommitAttemptID != nil ||
-		persisted.ActiveTaskID == nil || *persisted.ActiveTaskID != claimed.ID {
-		t.Fatalf("released copy = %#v, want piece-ready copy fenced to resumed task", persisted)
-	}
-}
-
-// A stopped confirmation keeps its task visible and counted until it is
-// released: neither a single nor a bulk dismissal can hide it.
-func TestStoppedCommitAttentionStaysVisibleUntilReleased(t *testing.T) {
-	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, testutil.NewTestDB(t))
 	reason := string(storagecommit.AttentionAttemptOnlyAmbiguous)
 	message := "storage registration requires attention"
 	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
@@ -996,86 +1227,50 @@ func TestStoppedCommitAttentionStaysVisibleUntilReleased(t *testing.T) {
 		t.Fatalf("bulk dismissal = %d err=%v, want the stopped confirmation left out", count, err)
 	}
 	records, err := repos.Contents.ListCommitAttentionForTasks(t.Context(), []int64{claimed.ID})
-	if err != nil || len(records) != 1 || records[0].AttemptID != attemptID ||
+	if err != nil || len(records) != 1 || records[0].AttemptID != "unacknowledged" ||
 		records[0].TaskID == nil || *records[0].TaskID != claimed.ID {
 		t.Fatalf("task confirmations = %#v err=%v, want the stopped attempt", records, err)
 	}
 	counts, err := repos.Contents.CountStoppedCommitAttentionByDataSet(t.Context())
-	if err != nil || len(counts) != 1 || counts[copyRow.StorageDataSetID] != 1 {
+	if err != nil || len(counts) != 1 || counts[c.binding.ID] != 1 {
 		t.Fatalf("stopped confirmations = %v err=%v, want one on the copy's data set", counts, err)
 	}
 
-	if err := repos.Contents.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
-		CopyID: copyRow.ID, ExpectedAttemptID: attemptID, AcknowledgePossibleDuplicate: true,
+	pieceID := sdktypes.NewBigInt(41)
+	c.nonces.Consume(unacknowledgedNonce, c.binding.DataSetID.SDK(), pieceID, c.pieceCID)
+	result, err := c.advance(t, time.Now(), storagecommit.AdvanceInput{})
+	if err != nil || result.State != storagecommit.AdvanceConfirmed || !result.ProvenByNonce {
+		t.Fatalf("retried recovery = %#v err=%v, want a nonce confirmation", result, err)
+	}
+	committedPiece := idtypes.OnChainIDFromSDK(pieceID)
+	if err := repos.Contents.MarkUploadCopyCommitted(t.Context(), repository.MarkUploadCopyCommittedInput{
+		StorageCopyID: c.copyRow.ID, ContentID: c.copyRow.ContentID, CopyIndex: c.copyRow.CopyIndex,
+		PieceCID: c.pieceCID.String(), PieceID: &committedPiece, RetrievalURL: c.target.PieceURL(c.pieceCID),
+		CommitExtraDataHex: testutil.CommitExtraDataHex(unacknowledgedNonce), CommitAttemptID: result.AttemptID,
+		ProvenByNonce: true,
 	}); err != nil {
-		t.Fatalf("release commit attention: %v", err)
+		t.Fatalf("settle retried confirmation: %v", err)
 	}
 	counts, err = repos.Contents.CountStoppedCommitAttentionByDataSet(t.Context())
 	if err != nil || len(counts) != 0 {
-		t.Fatalf("stopped confirmations after release = %v err=%v, want none", counts, err)
-	}
-}
-
-func TestReleaseCommitAttentionFencesRunningTask(t *testing.T) {
-	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, testutil.NewTestDB(t))
-	if err := repos.Contents.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
-		CopyID: copyRow.ID, ExpectedAttemptID: attemptID, AcknowledgePossibleDuplicate: true,
-	}); err != nil {
-		t.Fatalf("release commit attention: %v", err)
-	}
-	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-	}); !errors.Is(err, repository.ErrTaskLeaseLost) {
-		t.Fatalf("old task settlement = %v, want lost lease", err)
-	}
-	resumed, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
-	if err != nil || resumed == nil || resumed.Status != model.TaskStatusPending ||
-		resumed.ResumeMode != model.TaskResumeModeRecover || resumed.LeaseUntil != nil || resumed.ClaimedAt != nil {
-		t.Fatalf("resumed task = %#v err=%v", resumed, err)
-	}
-	persisted := loadAdvancerCopy(t, repos, copyRow.ID)
-	if persisted.Status != model.StorageCopyStatusPieceReady || persisted.CommitAttemptID != nil ||
-		persisted.ActiveTaskID == nil || *persisted.ActiveTaskID != claimed.ID {
-		t.Fatalf("released copy = %#v", persisted)
-	}
-	next, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
-	if err != nil || next == nil || next.ID != claimed.ID || next.ClaimGeneration <= claimed.ClaimGeneration ||
-		next.ResumeMode != model.TaskResumeModeRecover {
-		t.Fatalf("next claim = %#v err=%v", next, err)
+		t.Fatalf("stopped confirmations after the retry = %v err=%v, want none", counts, err)
 	}
 }
 
 func TestAdvancerCanceledObservationDoesNotWriteAttention(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
-	identity := advancerCopyIdentity(copies[0])
-	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-		Copy: identity, AttemptID: "canceled-observation",
-	}); err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "canceled-observation", ExtraDataHex: "abcd",
-	}); err != nil {
-		t.Fatalf("mark attempted: %v", err)
-	}
-	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	c := seedUnacknowledgedAttempt(t)
+	c.nonces.Consume(unacknowledgedNonce, sdktypes.NewBigInt(9999), sdktypes.NewBigInt(41), c.pieceCID)
 	ctx, cancel := context.WithCancel(t.Context())
-	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-	target.PieceStatusFunc = func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-		cancel()
-		return nil, context.Canceled
-	}
-
-	result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(ctx, storagecommit.AdvanceInput{
-		Copy: *copyRow, Binding: *binding, Target: target,
-		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	cancel()
+	advancer := storagecommit.Advancer{Store: c.repos.Contents, Nonces: c.nonces}
+	result, err := advancer.Advance(ctx, storagecommit.AdvanceInput{
+		Copy: *loadAdvancerCopy(t, c.repos, c.copyRow.ID), Binding: *c.binding, Target: c.target,
+		Pieces: []storage.PieceInput{{PieceCID: c.pieceCID}},
 	})
-	if err != nil || result.State != storagecommit.AdvancePending {
-		t.Fatalf("advance = %#v err=%v, want pending cancellation", result, err)
+	if err != nil || result.State != storagecommit.AdvancePending || c.nonces.Reads() != 0 {
+		t.Fatalf("advance = %#v err=%v reads=%d, want pending cancellation", result, err, c.nonces.Reads())
 	}
-	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	persisted := loadAdvancerCopy(t, c.repos, c.copyRow.ID)
 	if persisted.CommitAttentionAt != nil || persisted.CommitAttentionCode != nil {
 		t.Fatalf("canceled observation wrote attention: %#v", persisted)
 	}
@@ -1267,6 +1462,15 @@ func loadAdvancerCopy(t *testing.T, repos *repository.Repositories, copyID int64
 		t.Fatalf("load copy %d: %v", copyID, err)
 	}
 	return copyRow
+}
+
+func loadAdvancerAttempt(t *testing.T, db *bun.DB, attemptID string) *storagecommit.Attempt {
+	t.Helper()
+	attempt := new(storagecommit.Attempt)
+	if err := db.NewSelect().Model(attempt).Where("attempt_id = ?", attemptID).Scan(t.Context()); err != nil {
+		t.Fatalf("load attempt %s: %v", attemptID, err)
+	}
+	return attempt
 }
 
 func advancerCopyIdentity(copyRow model.StorageCopy) storagecommit.CopyIdentity {

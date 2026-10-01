@@ -235,8 +235,8 @@ func (heldAcknowledgeTaskRepo) AcknowledgeFailed(context.Context, int64, time.Du
 	return repository.ErrConflict
 }
 
-// A stopped Confirm storage task carries the confirmation it holds, offers its
-// release instead of a dismissal, and a dismissal is refused.
+// A stopped Confirm storage task carries the confirmation it holds and offers
+// Retry instead of a dismissal, which is refused.
 func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	fixture := newAdminTaskFixture(t)
 	stopped := fixture.enqueue(t, model.TaskTypeStorageCommit, "stopped-commit", time.Now(), "", "")
@@ -257,14 +257,14 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	}
 	var page taskListResponse
 	decodeJSON(t, rr, &page)
-	if len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || page.Tasks[0].StorageConfirmation == nil {
-		t.Fatalf("page = %#v, want the stopped task with its confirmation and no dismissal", page)
+	if len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || !page.Tasks[0].Retryable || page.Tasks[0].StorageConfirmation == nil {
+		t.Fatalf("page = %#v, want the stopped task with its confirmation, Retry, and no dismissal", page)
 	}
 	if confirmation := page.Tasks[0].StorageConfirmation; confirmation.CopyID != 447 || confirmation.AttemptID != "attempt-1" ||
-		!confirmation.Releasable || confirmation.SubmitError != "provider returned HTTP 500: piece not found" ||
+		confirmation.SubmitError != "provider returned HTTP 500: piece not found" ||
 		confirmation.ProviderID != "32" || confirmation.DataSetID != "39911" ||
 		confirmation.PieceCID != "piece-1" || confirmation.TransactionID != "0xcommit" {
-		t.Fatalf("confirmation = %#v, want a releasable confirmation with the provider reply", confirmation)
+		t.Fatalf("confirmation = %#v, want the confirmation with the provider reply", confirmation)
 	}
 
 	fixture.repos.Tasks = heldAcknowledgeTaskRepo{TaskRepository: fixture.repos.Tasks}

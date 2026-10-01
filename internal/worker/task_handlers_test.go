@@ -74,6 +74,7 @@ type handlerRuntimeOptions struct {
 	terminator             synapse.ServiceTerminator
 	epochs                 synapse.ChainEpochReader
 	parkedPieces           synapse.ParkedPieceChecker
+	commitNonces           synapse.CommitNonceReader
 	uploadSpeedProbe       interface {
 		Probe(context.Context, string) (time.Duration, error)
 	}
@@ -134,7 +135,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		WalletBroadcastTimeout: options.walletBroadcastTimeout,
 		WalletReceiptTimeout:   options.walletReceiptTimeout,
 		Terminator:             options.terminator, Epochs: options.epochs,
-		ParkedPieces:  options.parkedPieces,
+		ParkedPieces: options.parkedPieces, CommitNonces: options.commitNonces,
 		Observability: observabilityService, UploadSpeedProbe: options.uploadSpeedProbe,
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
@@ -3763,6 +3764,47 @@ func (r *submitFailureRecordRepo) RecordCommitSubmitFailure(context.Context, sto
 	return r.err
 }
 
+// commitFixture is a piece-ready peer copy whose commit request is signed with
+// nonce 11, with an object version so its content stays referenced.
+func commitFixture(t *testing.T, options handlerRuntimeOptions, target *testutil.MockStorageTarget) (handlerTestRuntime, seededCopyPipeline) {
+	t.Helper()
+	storageClient := &testutil.MockStorageClient{}
+	options.storage, options.policy = storageClient, cache.EvictionPolicyNone
+	options.register = func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+		return handlers.RegisterStorage(registry)
+	}
+	runtime := newHandlerTestRuntime(t, options)
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPieceReady)
+	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "commit.bin",
+		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+		ETag: "commit", ContentType: "application/octet-stream",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCopy)(nil)).
+		Set("commit_extra_data_hex = ?", testutil.CommitExtraDataHex(11)).
+		Where("id = ?", pipeline.target.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+	dataSetID := pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &dataSetID
+	target.ClientDataSetIDValue = pipeline.targetClient
+	// The seeded piece-ready copy was transferred to this provider.
+	target.ServiceURLValue = "https://target.example"
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		return nil, errors.New("the copy already signed its commit request")
+	}
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	return runtime, pipeline
+}
+
+// A submission that fails with a 5xx stays fenced and keeps the provider's
+// reply. Once the provider can no longer be handling it and the chain shows
+// its nonce unused, the same signed request is sent again.
 func TestCommitSubmitFailureVisibility(t *testing.T) {
 	for _, recordFails := range []bool{false, true} {
 		name := "reply retained"
@@ -3779,42 +3821,38 @@ func TestCommitSubmitFailureVisibility(t *testing.T) {
 					t.Errorf("close submission log: %v", err)
 				}
 			}()
-			logger := slog.New(slog.NewTextHandler(logFile, nil))
-			var submissions atomic.Int64
-			target := &testutil.MockStorageTarget{
-				PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
-				SubmitCommitFunc: func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
-					submissions.Add(1)
+			var mu sync.Mutex
+			var sent [][]byte
+			target := &testutil.MockStorageTarget{}
+			target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+				mu.Lock()
+				sent = append(sent, request.ExtraData)
+				first := len(sent) == 1
+				mu.Unlock()
+				if first {
 					return nil, &pdp.HTTPError{
 						Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: 500, Body: "piece not found",
 					}
-				},
-				PieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-					return &storage.PieceStatus{}, nil
-				},
+				}
+				ref, _ := target.DataSetRef()
+				submission := storage.CommitSubmission{
+					Kind: storage.CommitKindAddPieces, TransactionID: "0xresent", StatusURL: "https://provider.example/status/resent",
+					DataSet: &ref, PieceCIDs: []cid.Cid{request.Pieces[0].PieceCID},
+				}
+				request.OnSubmitted(submission)
+				return &submission, nil
 			}
-			storageClient := &testutil.MockStorageClient{}
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-				storage: storageClient, policy: cache.EvictionPolicyNone, logger: logger,
-				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
-					return handlers.RegisterStorage(registry)
-				},
-			})
-			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPieceReady)
-			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{
-				VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "submit-failure.bin",
-				ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
-				ETag: "submit-failure", ContentType: "application/octet-stream",
-			}); err != nil {
-				t.Fatal(err)
+			target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
+				ref, _ := target.DataSetRef()
+				return &storage.CommitStatus{
+					Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: "0xresent",
+					DataSet: &ref, PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(8801)},
+				}, nil
 			}
-			target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
-			dataSetID := pipeline.targetSet.DataSetID.SDK()
-			target.DataSetIDValue = &dataSetID
-			target.ClientDataSetIDValue = pipeline.targetClient
-			storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
-				return target, nil
-			}
+			nonces := &testutil.MockCommitNonces{}
+			runtime, pipeline := commitFixture(t, handlerRuntimeOptions{
+				logger: slog.New(slog.NewTextHandler(logFile, nil)), commitNonces: nonces,
+			}, target)
 			taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
 			writeErr := errors.New("database could not record the submission reply")
 			if recordFails {
@@ -3827,31 +3865,48 @@ func TestCommitSubmitFailureVisibility(t *testing.T) {
 			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				return task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == reply
 			})
+			// Too soon after the first request: the chain is read and nothing is sent.
 			wakeTask(t, runtime, taskRow.ID)
-			stopped := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusFailed
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return nonces.Reads() > 0 && task.Status == model.TaskStatusPending && task.AvailableAt.After(time.Now().Add(time.Minute))
 			})
-			want := "storage registration requires attention"
-			if !recordFails {
-				want += ": " + reply
+			if _, err := runtime.db.NewUpdate().Model((*storagecommit.Attempt)(nil)).
+				Set("attempted_at = ?", time.Now().Add(-6*time.Minute)).
+				Where("content_id = ? AND storage_data_set_id = ? AND resolved_at IS NULL", pipeline.target.ContentID, pipeline.target.StorageDataSetID).
+				Exec(t.Context()); err != nil {
+				t.Fatal(err)
 			}
-			if stopped.LastError == nil || *stopped.LastError != want ||
-				stopped.FailureReason == nil || *stopped.FailureReason != string(storagecommit.AttentionAttemptOnlyAmbiguous) {
-				t.Fatalf("stopped task = error:%v reason:%v, want %q", stopped.LastError, stopped.FailureReason, want)
+			wakeTask(t, runtime, taskRow.ID)
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(sent) == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+			})
+			wakeTask(t, runtime, taskRow.ID)
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusCompleted
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			for i, extraData := range sent {
+				if string(extraData) != string(testutil.CommitExtraData(11)) {
+					t.Fatalf("submission %d carried another signed request", i+1)
+				}
 			}
 			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-			if err != nil {
+			if err != nil || copyRow.Status != model.StorageCopyStatusCommitted || copyRow.ConfirmedAttemptID == nil {
+				t.Fatalf("copy = %#v err=%v, want it committed", copyRow, err)
+			}
+			attempt := new(storagecommit.Attempt)
+			if err := runtime.db.NewSelect().Model(attempt).Where("attempt_id = ?", *copyRow.ConfirmedAttemptID).Scan(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			if recordFails {
-				if copyRow.CommitSubmitError != nil {
-					t.Fatalf("submit error = %v, want absent after the failed write", copyRow.CommitSubmitError)
+				if attempt.SubmitError != nil {
+					t.Fatalf("submit error = %v, want absent after the failed write", attempt.SubmitError)
 				}
-			} else if copyRow.CommitSubmitError == nil || *copyRow.CommitSubmitError != reply {
-				t.Fatalf("submit error = %v, want the provider reply", copyRow.CommitSubmitError)
-			}
-			if submissions.Load() != 1 {
-				t.Fatalf("submissions = %d, want no resubmission after observation", submissions.Load())
+			} else if attempt.SubmitError == nil || *attempt.SubmitError != reply {
+				t.Fatalf("submit error = %v, want the provider reply", attempt.SubmitError)
 			}
 			logs, err := os.ReadFile(logFile.Name())
 			if err != nil {
@@ -3864,6 +3919,222 @@ func TestCommitSubmitFailureVisibility(t *testing.T) {
 				t.Fatalf("logs lack the separate persistence failure: %s", logs)
 			}
 		})
+	}
+}
+
+// A provider that refused a submission may have deleted the piece it was
+// asked to add. The copy then transfers again and registers under the request
+// it already signed; otherwise it waits and asks again.
+func TestCommitRefusedByProvider(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		parked synapse.ParkedPieceState
+	}{
+		{name: "piece dropped", parked: synapse.ParkedPieceMissing},
+		{name: "piece still held", parked: synapse.ParkedPieceReady},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var sent [][]byte
+			target := &testutil.MockStorageTarget{}
+			target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+				mu.Lock()
+				sent = append(sent, request.ExtraData)
+				first := len(sent) == 1
+				mu.Unlock()
+				if first {
+					return nil, &pdp.HTTPError{StatusCode: http.StatusBadRequest, Body: "piece not found"}
+				}
+				ref, _ := target.DataSetRef()
+				submission := storage.CommitSubmission{
+					Kind: storage.CommitKindAddPieces, TransactionID: "0xretransferred", StatusURL: "https://provider.example/status/retransferred",
+					DataSet: &ref, PieceCIDs: []cid.Cid{request.Pieces[0].PieceCID},
+				}
+				request.OnSubmitted(submission)
+				return &submission, nil
+			}
+			target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
+				ref, _ := target.DataSetRef()
+				return &storage.CommitStatus{
+					Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: "0xretransferred",
+					DataSet: &ref, PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(8802)},
+				}, nil
+			}
+			var pulled []string
+			target.PullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				mu.Lock()
+				pulled = append(pulled, hex.EncodeToString(request.ExtraData))
+				mu.Unlock()
+				return &storage.PullResult{Status: storage.PullStatusComplete}, nil
+			}
+			parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+				return tt.parked, nil
+			})
+			runtime, pipeline := commitFixture(t, handlerRuntimeOptions{
+				parkedPieces: parked, commitNonces: &testutil.MockCommitNonces{},
+			}, target)
+			taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+
+			if tt.parked == synapse.ParkedPieceReady {
+				waiting := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusPending && task.WaitReason != nil &&
+						*task.WaitReason == storagecommit.ProviderRejectedWaitReason
+				})
+				if waiting.ResumeMode != model.TaskResumeModeExecute || !waiting.AvailableAt.After(time.Now().Add(30*time.Second)) ||
+					waiting.RetryCount != 0 || waiting.LastError == nil || !strings.Contains(*waiting.LastError, "piece not found") {
+					t.Fatalf("waiting task = %#v, want a backoff without spending a retry", waiting)
+				}
+				copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+				if err != nil || copyRow.Status != model.StorageCopyStatusPieceReady || copyRow.CommitAttemptID != nil ||
+					copyRow.CommitReadyAt == nil || copyRow.CommitExtraDataHex == nil || *copyRow.CommitExtraDataHex != testutil.CommitExtraDataHex(11) {
+					t.Fatalf("copy = %#v err=%v, want its place in the queue and signed request kept", copyRow, err)
+				}
+				return
+			}
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusCompleted
+			})
+			submitted := waitForCopy(t, runtime, pipeline.target.ID, func(copyRow *model.StorageCopy) bool {
+				return copyRow.CommitTransactionID != nil && copyRow.ActiveTaskID != nil
+			})
+			waitForTask(t, runtime.repos, *submitted.ActiveTaskID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending
+			})
+			wakeTask(t, runtime, *submitted.ActiveTaskID)
+			committed := waitForCopy(t, runtime, pipeline.target.ID, func(copyRow *model.StorageCopy) bool {
+				return copyRow.Status == model.StorageCopyStatusCommitted
+			})
+			if committed.CommitExtraDataHex == nil || *committed.CommitExtraDataHex != testutil.CommitExtraDataHex(11) {
+				t.Fatalf("committed copy = %#v, want the original signed request", committed)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(pulled) != 1 || pulled[0] != testutil.CommitExtraDataHex(11) {
+				t.Fatalf("pulls = %v, want one carrying the original signed request", pulled)
+			}
+			if len(sent) != 2 || string(sent[0]) != string(sent[1]) {
+				t.Fatalf("submissions = %d, want two with the same signed request", len(sent))
+			}
+		})
+	}
+}
+
+// A confirmation the chain contradicts stops for an operator, who can retry it
+// once the evidence is settled; the retry confirms from the chain without
+// sending anything.
+func TestStoppedCommitRetriesFromChainEvidence(t *testing.T) {
+	target := &testutil.MockStorageTarget{}
+	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+		return nil, errors.New("the stopped confirmation sent a request")
+	}
+	nonces := &testutil.MockCommitNonces{}
+	runtime, pipeline := commitFixture(t, handlerRuntimeOptions{commitNonces: nonces}, target)
+	identity := storagecommit.CopyIdentity{
+		StorageCopyID: pipeline.target.ID, ContentID: pipeline.target.ContentID,
+		CopyIndex: pipeline.target.CopyIndex, StorageDataSetID: pipeline.target.StorageDataSetID,
+	}
+	if _, err := runtime.repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{Copy: identity, AttemptID: "stopped"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "stopped", ExtraDataHex: testutil.CommitExtraDataHex(11),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pieceID := sdktypes.NewBigInt(8803)
+	nonces.Consume(11, sdktypes.NewBigInt(9999), pieceID, pipeline.pieceCID)
+	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != string(storagecommit.AttentionSubmissionMismatch) || !runtime.service.Retryable(failed) {
+		t.Fatalf("stopped task = %#v, want a retryable mismatch", failed)
+	}
+	nonces.Consume(11, pipeline.targetSet.DataSetID.SDK(), pieceID, pipeline.pieceCID)
+	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+		t.Fatalf("retry stopped confirmation: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.Status != model.StorageCopyStatusCommitted || copyRow.PieceID == nil ||
+		!copyRow.PieceID.Equal(idtypes.OnChainIDFromSDK(pieceID)) {
+		t.Fatalf("copy = %#v err=%v, want it committed at the nonce's piece", copyRow, err)
+	}
+}
+
+// A data set with as many transferred copies waiting to register as it may
+// hold starts no new transfer until some of them register.
+func TestTransfersWaitForCommitBacklog(t *testing.T) {
+	for _, taskType := range []model.TaskType{model.TaskTypeStorageStore, model.TaskTypeStoragePull} {
+		t.Run(string(taskType), func(t *testing.T) {
+			target := &testutil.MockStorageTarget{
+				PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
+					t.Error("a backlogged transfer signed a commit request")
+					return nil, errors.New("unexpected presign")
+				},
+			}
+			storageClient := &testutil.MockStorageClient{
+				OpenDataSetTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+					return target, nil
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: storageClient, policy: cache.EvictionPolicyNone,
+				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+					return handlers.RegisterStorage(registry)
+				},
+			})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+			target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+			dataSetID := pipeline.targetSet.DataSetID.SDK()
+			target.DataSetIDValue = &dataSetID
+			target.ClientDataSetIDValue = pipeline.targetClient
+			runtime.repos.Contents = &readyCopyCountRepo{StorageContentRepository: runtime.repos.Contents, count: storagecommit.MaxReadyCopiesPerDataSet}
+			taskRow := bindCopyTask(t, runtime, pipeline.target, taskType)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+
+			waiting := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "commit_backlog"
+			})
+			if waiting.ResumeMode != model.TaskResumeModeExecute || len(waiting.Checkpoint) != 0 {
+				t.Fatalf("waiting task = %#v, want an execute wait without a transfer checkpoint", waiting)
+			}
+		})
+	}
+}
+
+type readyCopyCountRepo struct {
+	repository.StorageContentRepository
+	count int
+}
+
+func (r *readyCopyCountRepo) CountReadyCopiesForDataSet(context.Context, int64) (int, error) {
+	return r.count, nil
+}
+
+func waitForCopy(t *testing.T, runtime handlerTestRuntime, copyID int64, predicate func(*model.StorageCopy) bool) *model.StorageCopy {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyID)
+		if err != nil {
+			t.Fatalf("load copy %d: %v", copyID, err)
+		}
+		if predicate(copyRow) {
+			return copyRow
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("copy %d did not reach the expected state: %#v", copyID, copyRow)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

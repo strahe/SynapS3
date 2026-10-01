@@ -93,7 +93,6 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 后台任务和存储健康 | 任务重试与确认、存储提供方和数据集刷新 | 重新入队任务、将已核对的失败标记为已处理并开始保留期，或刷新运维状态。 |
 | 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
-| 存储确认 | `POST /api/v1/storage-confirmations/{copy-id}/release` | 可能允许存储提供方再次存储同一个 piece。释放前必须核对当前 attempt。 |
 
 ## 健康检查和指标
 
@@ -135,7 +134,6 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | 恢复处于 `failed` 或 `cleanup_attention` 的存储提供方替换。 |
 | `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的存储确认。 |
-| `POST` | `/api/v1/storage-confirmations/{copy-id}/release` | 确认可能产生重复存储后，释放一条无法判定的确认。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
 
@@ -265,18 +263,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 存储确认处理
 
-当 SynapS3 无法判定存储提供方是否已接受 piece 时，不会自动再次提交该 piece。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出受影响的 copy、所属任务（`task_id`）、data set、attempt、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、时间和稳定的 `reason_code`。Tasks 页面会在已停止的 Confirm storage 任务上显示同样的确认，并通过下面的请求释放。
+存储提供方没有确认存储登记时，SynapS3 会在链上核对该 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次，因此 piece 不会被重复存储。存储提供方拒绝该请求时会稍后再试，登记前已被存储提供方删除的 piece 会重新上传。只有链上记录与该 copy 不符时，确认才会停止。
 
-`POST /api/v1/storage-confirmations/{copy-id}/release` 会让正常恢复继续，并可能产生重复提交。先核对清单中的当前记录，再同时发送该记录的 attempt ID 和明确的风险确认：
-
-```json
-{
-  "expected_attempt_id": "current-attempt-id",
-  "acknowledge_possible_duplicate": true
-}
-```
-
-如果核对后 attempt 已发生变化，API 返回 `409 Conflict`。如果确认在人工释放前自行成功，该记录会自动消失。
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储确认：受影响的 copy、所属任务（`task_id`）、data set、attempt、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、时间和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的确认。对已停止的确认，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试会先重新核对链上记录，再决定是否提交。
 
 ## 任务
 
@@ -289,7 +278,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
 | `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。存储确认等待处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `copy_id`、`attempt_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_cid`、已知的 `transaction_id`、`submit_error`、时间和 `releasable`；任务停止后 `releasable` 才为 true。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为释放该确认。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。存储确认需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `copy_id`、`attempt_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_cid`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
 `status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
 
@@ -313,7 +302,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 把返回的 `as_of` 作为 `failed_before` 回传，处理的就正好是统计到的那些。
 
-`/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。`tasks.attention.storage_confirmations` 统计已停止、等待处理的存储确认。
+`/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。`tasks.attention.storage_confirmations` 统计已停止的存储确认。
 
 分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换仍通过 Data Sets API 恢复。钱包操作在广播开始前、或因内部错误停止后可以重试；只有从未广播过的交易才会在重试时发出。因内部错误停止的存储传输任务也可以重试。重试结果不确定的 Store 只会查询存储提供方，不会重新上传字节。
 

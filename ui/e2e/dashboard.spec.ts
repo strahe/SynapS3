@@ -5,7 +5,7 @@ import { expect, test } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
 
-test('storage confirmation release shows its identity and requires risk acknowledgement', async ({
+test('a stopped storage confirmation shows its identity and offers Retry instead of a release', async ({
   page,
   systemServer,
 }) => {
@@ -16,7 +16,7 @@ test('storage confirmation release shows its identity and requires risk acknowle
     operation: 'Confirm storage',
     status: 'failed',
     presentation_status: 'failed',
-    retryable: false,
+    retryable: true,
     acknowledgeable: false,
     retry_count: 0,
     available_at: '2026-10-01T00:00:00Z',
@@ -32,19 +32,14 @@ test('storage confirmation release shows its identity and requires risk acknowle
       transaction_id: transaction,
       attempted_at: '2026-10-01T00:00:00Z',
       attention_at: '2026-10-01T00:00:01Z',
-      releasable: true,
     },
   }
-  let releases = 0
-  await page.route('**/api/v1/tasks?*', (route) => route.fulfill({ json: { tasks: releases ? [] : [task] } }))
-  await page.route('**/api/v1/storage-confirmations/447/release', async (route) => {
+  let retries = 0
+  await page.route('**/api/v1/tasks?*', (route) => route.fulfill({ json: { tasks: retries ? [] : [task] } }))
+  await page.route('**/api/v1/tasks/9001/retry', async (route) => {
     expect(route.request().method()).toBe('POST')
-    expect(route.request().postDataJSON()).toEqual({
-      acknowledge_possible_duplicate: true,
-      expected_attempt_id: 'attempt-1',
-    })
-    releases++
-    await route.fulfill({ json: { copy_id: 447, status: 'released' } })
+    retries++
+    await route.fulfill({ json: { id: 9001, status: 'pending' } })
   })
   await page.goto(systemServer.adminURL)
   await page.getByLabel('Username').fill('admin')
@@ -52,28 +47,21 @@ test('storage confirmation release shows its identity and requires risk acknowle
   await page.getByRole('button', { name: 'Sign In' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
   await page.getByRole('link', { name: 'Tasks', exact: true }).click()
+  await expect(page.getByText('Confirmation does not match')).toBeVisible()
   await page.getByText('Confirmation details', { exact: true }).click()
-  await expect(page.getByRole('note', { name: `Transaction: ${transaction}`, exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Release', exact: true }).click()
-  const dialog = page.getByRole('alertdialog', { name: 'Release storage confirmation' })
   for (const identity of [
     'Provider: 32',
     'Data set: 39911',
     'Piece CID: bafy-piece-1',
     `Transaction: ${transaction}`,
   ]) {
-    await expect(dialog.getByRole('note', { name: identity, exact: true })).toBeVisible()
+    await expect(page.getByRole('note', { name: identity, exact: true })).toBeVisible()
   }
-  await expect(dialog.getByText(/Confirmation does not match/)).toBeVisible()
-  await expect(dialog.getByText(/you pay for both copies/)).toBeVisible()
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
-  await expect(dialog).toBeHidden()
-  expect(releases).toBe(0)
-  await page.getByRole('button', { name: 'Release', exact: true }).click()
-  await dialog.getByRole('button', { name: 'Release and resubmit', exact: true }).click()
-  await expect(dialog).toBeHidden()
   await expect(page.getByRole('button', { name: 'Release', exact: true })).toHaveCount(0)
-  expect(releases).toBe(1)
+  await expect(page.getByRole('button', { name: 'Dismiss', exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Recover', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Recover', exact: true })).toHaveCount(0)
+  expect(retries).toBe(1)
 })
 
 type AuthRefreshTestState = {

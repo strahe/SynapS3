@@ -93,7 +93,6 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
 | Tasks and storage health | task retry and acknowledgement, storage provider and data set refresh | Requeues work, dismisses a reviewed failure and starts its retention period, or refreshes operational status. |
 | Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
-| Storage confirmation | `POST /api/v1/storage-confirmations/{copy-id}/release` | May permit the provider to store the same piece again. Verify the current attempt before releasing it. |
 
 ## Health and Metrics
 
@@ -135,7 +134,6 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | Resume a failed or attention-holding provider replacement. |
 | `GET` | `/api/v1/storage-confirmations` | List storage confirmations that need operator attention. |
-| `POST` | `/api/v1/storage-confirmations/{copy-id}/release` | Release an ambiguous confirmation after acknowledging possible duplicate storage. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
 
@@ -265,18 +263,9 @@ Manual confirmation does not check FWSS approval or whether the provider still r
 
 ### Storage confirmation attention
 
-When SynapS3 cannot determine whether a provider accepted a piece, it does not submit that piece again automatically. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists the affected copy, owning task (`task_id`), data set, attempt, known transaction, the provider's reply when the submission failed (`submit_error`), timestamps, and stable `reason_code`. The Tasks page shows the same confirmations on their stopped Confirm storage tasks and releases them with the request below.
+When a provider does not confirm a storage registration, SynapS3 checks on chain whether the piece was registered. If it was not, SynapS3 submits the original request again; the chain accepts that request only once, so the piece is never stored twice. A provider that refuses the request is asked again later, and a piece it dropped before registration is uploaded again. A confirmation stops only when the chain does not match the copy.
 
-`POST /api/v1/storage-confirmations/{copy-id}/release` lets normal recovery continue and may permit a duplicate submission. Inspect the current list entry first, then send both its attempt ID and the explicit risk acknowledgement:
-
-```json
-{
-  "expected_attempt_id": "current-attempt-id",
-  "acknowledge_possible_duplicate": true
-}
-```
-
-If the attempt changed after it was inspected, the API returns `409 Conflict`. If confirmation succeeds before release, the entry disappears automatically.
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists confirmations that need attention: the affected copy, owning task (`task_id`), data set, attempt, known transaction, the provider's reply when the submission failed (`submit_error`), timestamps, and stable `reason_code`. The Tasks page shows the same confirmations on their Confirm storage tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; the retry checks the chain again before submitting anything.
 
 ## Tasks
 
@@ -289,7 +278,7 @@ If the attempt changed after it was inspected, the API returns `409 Conflict`. I
 | `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk dismissal would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
 | `POST` | `/api/v1/tasks/acknowledge` | Dismiss a backlog of failed tasks at once. Returns `acknowledged` with the number dismissed. |
 
-`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. A Confirm storage task whose storage confirmation awaits review also includes `storage_confirmation` with `copy_id`, `attempt_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_cid`, any known `transaction_id`, `submit_error`, timestamps, and `releasable`, which is true once the task has stopped. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; release the confirmation instead.
+`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. A Confirm storage task whose storage confirmation needs attention also includes `storage_confirmation` with `copy_id`, `attempt_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_cid`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
 
 The `status` filter also accepts `dismissed`. `status=failed` returns only unacknowledged failures, while `status=dismissed` returns acknowledged failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`.
 
@@ -313,7 +302,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 Passing that `as_of` back as `failed_before` dismisses exactly what was counted.
 
-`/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`. `tasks.attention.storage_confirmations` counts stopped storage confirmations waiting for review.
+`/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`. `tasks.attention.storage_confirmations` counts stopped storage confirmations.
 
 Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacement recovery remains in the Data Sets API. Wallet operations are retryable before a broadcast starts or after an internal error; a retry sends the transaction only if it was never broadcast. Storage transfer tasks that stopped because of an internal error are also retryable. Retrying an uncertain Store checks the provider and does not upload the bytes again.
 

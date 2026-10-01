@@ -254,7 +254,6 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", s.handleAPIListDataSetReplacementProviders)
 		mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", s.handleAPIRetryStorageReplacement)
 		mux.HandleFunc("GET /api/v1/storage-confirmations", s.handleAPIListStorageConfirmations)
-		mux.HandleFunc("POST /api/v1/storage-confirmations/{id}/release", s.handleAPIReleaseStorageConfirmation)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", s.handleAPIDeleteBucketObject)
@@ -472,7 +471,7 @@ func (s *Server) handleAPITaskAcknowledge(w http.ResponseWriter, r *http.Request
 		if errors.Is(err, repository.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
 		} else if errors.Is(err, repository.ErrConflict) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "this task's storage confirmation needs review before it can be dismissed"})
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "this task's storage confirmation is unresolved; retry the task instead of dismissing it"})
 		} else {
 			s.logger.Error("api: failed to acknowledge task", "taskID", id, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})

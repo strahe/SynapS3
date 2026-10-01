@@ -293,7 +293,7 @@ export interface ObservabilityListResponse<T> {
 }
 
 export interface ObservabilityDataSetListResponse extends ObservabilityListResponse<ObservabilityDataSetObservation> {
-  /** Stopped storage confirmations waiting for review, by local data set ID. */
+  /** Stopped storage confirmations, by local data set ID. */
   storage_confirmations_by_data_set?: Record<string, number>
 }
 
@@ -708,7 +708,7 @@ export interface TaskItem {
   storage_confirmation?: TaskStorageConfirmation
 }
 
-/** The storage confirmation a Confirm storage task holds while it waits for review. */
+/** The storage confirmation a Confirm storage task holds while it is flagged for attention. */
 export interface TaskStorageConfirmation {
   copy_id: number
   attempt_id: string
@@ -720,7 +720,6 @@ export interface TaskStorageConfirmation {
   submit_error?: string
   attempted_at: string
   attention_at: string
-  releasable: boolean
 }
 
 export interface TaskListResponse {
@@ -1246,11 +1245,6 @@ export const api = {
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
   acknowledgeTask: (id: number) => fetchJSON(`/tasks/${id}/acknowledge`, { method: 'POST' }),
-  releaseStorageConfirmation: (copyID: number, attemptID: string) =>
-    fetchJSON<{ copy_id: number; status: 'released' }>(`/storage-confirmations/${copyID}/release`, {
-      method: 'POST',
-      body: JSON.stringify({ acknowledge_possible_duplicate: true, expected_attempt_id: attemptID }),
-    }),
   previewAcknowledgeTasks: (payload: { type?: string }) => {
     const qs = payload.type ? `?${new URLSearchParams({ type: payload.type }).toString()}` : ''
     return fetchJSON<{ count: number; as_of: string }>(`/tasks/acknowledge/preview${qs}`)

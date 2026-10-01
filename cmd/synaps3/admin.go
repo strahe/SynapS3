@@ -543,46 +543,6 @@ func adminStorageConfirmationCommand() *cli.Command {
 					return writeAdminStorageConfirmationsTable(cmd.Root().Writer, confirmations)
 				},
 			},
-			{
-				Name:      "release",
-				Usage:     "release a storage confirmation for a possible duplicate submission",
-				ArgsUsage: "<copy-id>",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "attempt-id", Usage: "attempt ID shown by storage-confirmation list", Required: true},
-					&cli.BoolFlag{Name: "yes", Usage: "acknowledge that the provider may already have accepted the piece"},
-				},
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					copyID, err := requireSingleArg(cmd, "copy id")
-					if err != nil {
-						return err
-					}
-					parsedID, err := strconv.ParseInt(copyID, 10, 64)
-					if err != nil || parsedID <= 0 {
-						return fmt.Errorf("invalid copy id %q", copyID)
-					}
-					if !cmd.Bool("yes") {
-						return errors.New("releasing a storage confirmation requires --yes")
-					}
-					client, opts, err := newAdminClientFromCommand(ctx, cmd)
-					if err != nil {
-						return err
-					}
-					var response adminStorageConfirmationRelease
-					path := "/api/v1/storage-confirmations/" + url.PathEscape(copyID) + "/release"
-					body := map[string]any{
-						"acknowledge_possible_duplicate": true,
-						"expected_attempt_id":            strings.TrimSpace(cmd.String("attempt-id")),
-					}
-					if err := client.postJSON(ctx, path, body, &response, true); err != nil {
-						return err
-					}
-					if opts.JSON {
-						return writeAdminJSON(cmd.Root().Writer, response)
-					}
-					_, err = fmt.Fprintf(cmd.Root().Writer, "Storage confirmation released for copy %d\n", response.CopyID)
-					return err
-				},
-			},
 		},
 	}
 }
@@ -1046,11 +1006,6 @@ type adminStorageConfirmationAttention struct {
 	ReasonCode    string `json:"reason_code"`
 	AttemptedAt   string `json:"attempted_at"`
 	AttentionAt   string `json:"attention_at"`
-}
-
-type adminStorageConfirmationRelease struct {
-	CopyID int64  `json:"copy_id"`
-	Status string `json:"status"`
 }
 
 type adminSettingKind int

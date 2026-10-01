@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {
-  storageConfirmationAttentionView,
-  storageConfirmationReleaseWarning,
-} from '../src/lib/storage-confirmation-attention.ts'
+import { storageConfirmationAttentionView } from '../src/lib/storage-confirmation-attention.ts'
 
 test('known confirmation reasons use operator-facing labels', () => {
   const cases = [
@@ -34,9 +31,4 @@ test('unknown confirmation reasons preserve the raw code behind a safe fallback'
     label: 'Unknown confirmation issue',
     reasonCode: 'constructor',
   })
-})
-
-test('release copy names the resubmission and the duplicate storage cost', () => {
-  assert.match(storageConfirmationReleaseWarning, /submits the piece again/)
-  assert.match(storageConfirmationReleaseWarning, /pay for both copies/)
 })

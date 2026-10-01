@@ -5,6 +5,7 @@ package systemtest
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +18,12 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	appTypes "github.com/strahe/synaps3/internal/types"
 	sdkcosts "github.com/strahe/synapse-go/costs"
@@ -55,9 +58,12 @@ type MemoryFilecoin struct {
 	pendingDataSets   map[string]sdktypes.BigInt
 	submissions       map[string]sdktypes.BigInt
 	commitSubmissions map[string]storage.CommitSubmission
-	pieces            map[string]*memoryPiece
-	nextDataSet       map[string]uint64
-	nextPiece         uint64
+	// clientNonces records, by add-pieces nonce, what FWSS would: the data set
+	// the pieces joined and the piece ID it assigns next.
+	clientNonces map[string]synapse.ClientNonceState
+	pieces       map[string]*memoryPiece
+	nextDataSet  map[string]uint64
+	nextPiece    uint64
 	// terminated records the epoch at which each data set's service ends, and
 	// epoch is the observed chain head. Tests advance the head to prove that
 	// retirement waits for the chain rather than for the call returning.
@@ -88,6 +94,7 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 		pendingDataSets:   make(map[string]sdktypes.BigInt),
 		submissions:       make(map[string]sdktypes.BigInt),
 		commitSubmissions: make(map[string]storage.CommitSubmission),
+		clientNonces:      make(map[string]synapse.ClientNonceState),
 		pieces:            make(map[string]*memoryPiece),
 		nextDataSet:       make(map[string]uint64),
 		nextPiece:         1,
@@ -481,8 +488,26 @@ func (c *memoryDataSetTarget) PresignForCommit(ctx context.Context, pieces []sto
 		}
 	}
 	c.filecoin.mu.RUnlock()
-	return []byte("commit-" + c.provider.String()), nil
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	return memoryAddPiecesExtraData.Pack(new(big.Int).SetBytes(nonce[:]), [][]string{}, [][]string{}, []byte("commit-"+c.provider.String()))
 }
+
+// memoryAddPiecesExtraData encodes extra data the way the SDK signs an
+// add-pieces request, so the nonce in it can be read back.
+var memoryAddPiecesExtraData = func() abi.Arguments {
+	var arguments abi.Arguments
+	for _, typeName := range []string{"uint256", "string[][]", "string[][]", "bytes"} {
+		argumentType, err := abi.NewType(typeName, "", nil)
+		if err != nil {
+			panic(err)
+		}
+		arguments = append(arguments, abi.Argument{Type: argumentType})
+	}
+	return arguments
+}()
 
 func (c *memoryDataSetTarget) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -520,6 +545,10 @@ func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.
 	if dataSetID == nil || len(request.Pieces) == 0 || len(request.ExtraData) == 0 {
 		return nil, fmt.Errorf("%w: commit requires a dataset, pieces, and authorization", errInvalidFilecoinSequence)
 	}
+	nonce, err := storagecommit.ExtraDataNonce(request.ExtraData)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errInvalidFilecoinSequence, err)
+	}
 	c.filecoin.mu.Lock()
 	dataSet := c.filecoin.dataSets[dataSetID.String()]
 	if dataSet == nil || !dataSet.provider.Equal(c.provider) {
@@ -545,6 +574,16 @@ func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.
 		}
 		pieceIDs = append(pieceIDs, pieceID.Copy())
 		piece.committedDataSets[dataSetID.String()] = struct{}{}
+	}
+	if _, consumed := c.filecoin.clientNonces[nonce.String()]; !consumed {
+		next, err := sdktypes.BigIntFromBig(new(big.Int).Add(pieceIDs[len(pieceIDs)-1].Big(), big.NewInt(1)))
+		if err != nil {
+			c.filecoin.mu.Unlock()
+			return nil, err
+		}
+		c.filecoin.clientNonces[nonce.String()] = synapse.ClientNonceState{
+			Consumed: true, DataSetID: dataSetID.Copy(), NextPieceID: next,
+		}
 	}
 	txID := fmt.Sprintf("commit-%s-%s", dataSetID.String(), pieceIDs[0].String())
 	c.filecoin.mu.Unlock()
@@ -600,6 +639,52 @@ func (c *memoryDataSetTarget) GetCommitStatus(ctx context.Context, statusURL str
 		Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed,
 		TransactionID: submission.TransactionID, DataSet: &c.ref, PieceIDs: pieceIDs,
 	}, nil
+}
+
+// CheckWritable accepts a data set the fake holds.
+func (c *memoryDataSetTarget) CheckWritable(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.filecoin.mu.RLock()
+	defer c.filecoin.mu.RUnlock()
+	dataSet := c.filecoin.dataSets[c.ref.DataSetID().String()]
+	if dataSet == nil || !dataSet.provider.Equal(c.provider) {
+		return storage.ErrDataSetUnavailable
+	}
+	return nil
+}
+
+// ClientNonce reports the add-pieces nonces SubmitCommit consumed.
+func (m *MemoryFilecoin) ClientNonce(ctx context.Context, nonce sdktypes.BigInt) (synapse.ClientNonceState, error) {
+	if err := ctx.Err(); err != nil {
+		return synapse.ClientNonceState{}, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	state := m.clientNonces[nonce.String()]
+	return synapse.ClientNonceState{
+		Consumed: state.Consumed, DataSetID: state.DataSetID.Copy(), NextPieceID: state.NextPieceID.Copy(),
+	}, nil
+}
+
+// PieceCIDAt returns the piece a data set holds at a piece ID.
+func (m *MemoryFilecoin) PieceCIDAt(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (cid.Cid, error) {
+	if err := ctx.Err(); err != nil {
+		return cid.Undef, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	dataSet := m.dataSets[dataSetID.String()]
+	if dataSet == nil {
+		return cid.Undef, nil
+	}
+	for pieceCID, storedID := range dataSet.pieces {
+		if storedID.Equal(pieceID) {
+			return cid.Parse(pieceCID)
+		}
+	}
+	return cid.Undef, nil
 }
 
 func pieceCIDs(pieces []storage.PieceInput) []cid.Cid {

@@ -36,6 +36,7 @@ type TaskHandlerDependencies struct {
 	Observability          *observability.Service
 	UploadSpeedProbe       providerbenchmark.UploadProbe
 	ParkedPieces           synapse.ParkedPieceChecker
+	CommitNonces           synapse.CommitNonceReader
 	EvictionPolicy         cache.EvictionPolicy
 	MaxCacheBytes          int64
 	MaxWriteBytes          int64 // largest single cache write; 0 means no room is kept for it

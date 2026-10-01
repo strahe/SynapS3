@@ -1291,8 +1291,11 @@ func resolvePullAttempt(ctx context.Context, db bun.IDB, attemptID string, now t
 
 func (r *BunStorageContentRepo) MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error {
 	if input.ContentID <= 0 || input.CopyIndex < 0 || input.PieceCID == "" || input.PieceID == nil || input.RetrievalURL == "" ||
-		input.CommitAttemptID == "" || input.StorageCopyID <= 0 || input.CommitExtraDataHex == "" ||
-		input.CommitTransactionID == "" || input.CommitConfirmedTransactionID == "" {
+		input.CommitAttemptID == "" || input.StorageCopyID <= 0 || input.CommitExtraDataHex == "" {
+		return fmt.Errorf("marking storage upload copy committed: %w", ErrInvalidInput)
+	}
+	if input.ProvenByNonce && input.CommitConfirmedTransactionID != "" ||
+		!input.ProvenByNonce && (input.CommitTransactionID == "" || input.CommitConfirmedTransactionID == "") {
 		return fmt.Errorf("marking storage upload copy committed: %w", ErrInvalidInput)
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
@@ -1372,14 +1375,22 @@ func (r *BunStorageContentRepo) MarkUploadCopyCommitted(ctx context.Context, inp
 			attemptQuery := db.NewUpdate().
 				Model((*storagecommit.Attempt)(nil)).
 				Set("status = ?", storagecommit.AttemptStatusConfirmed).
-				Set("confirmed_transaction_id = ?", input.CommitConfirmedTransactionID).
 				Set("resolved_at = ?", now).
 				Set("updated_at = ?", now).
 				Where("attempt_id = ?", input.CommitAttemptID).
 				Where("content_id = ? AND storage_data_set_id = ?", input.ContentID, copyIdentity.StorageDataSetID).
-				Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-				Where("transaction_id = ?", input.CommitTransactionID).
-				Where("status_url IS NOT NULL")
+				Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted)
+			switch {
+			case !input.ProvenByNonce:
+				attemptQuery = attemptQuery.
+					Set("confirmed_transaction_id = ?", input.CommitConfirmedTransactionID).
+					Where("transaction_id = ?", input.CommitTransactionID).
+					Where("status_url IS NOT NULL")
+			case input.CommitTransactionID != "":
+				attemptQuery = attemptQuery.Where("transaction_id = ?", input.CommitTransactionID)
+			default:
+				attemptQuery = attemptQuery.Where("transaction_id IS NULL AND status_url IS NULL")
+			}
 			if input.CommitExtraDataHex != "" {
 				attemptQuery = attemptQuery.Where("extra_data_hex = ?", input.CommitExtraDataHex)
 			}
@@ -1643,6 +1654,52 @@ func reopenFailedUploadCopy(ctx context.Context, db bun.IDB, copyID int64) error
 		return fmt.Errorf("abandoning storage pull attempt: %w", err)
 	}
 	return nil
+}
+
+func (r *BunStorageContentRepo) ReturnPieceReadyCopyToTransfer(ctx context.Context, input ReturnPieceReadyCopyInput) error {
+	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 {
+		return fmt.Errorf("returning storage copy to transfer: %w", ErrInvalidInput)
+	}
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		initial := new(model.StorageCopy)
+		if err := db.NewSelect().Model(initial).Where("id = ?", input.CopyID).Scan(ctx); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("returning storage copy to transfer: %w", ErrNotFound)
+			}
+			return fmt.Errorf("returning storage copy to transfer: %w", err)
+		}
+		copyID, _, err := lockCommitCopyFamily(ctx, db, storagecommit.CopyIdentity{
+			StorageCopyID: initial.ID, ContentID: initial.ContentID,
+			CopyIndex: initial.CopyIndex, StorageDataSetID: initial.StorageDataSetID,
+		})
+		if err != nil {
+			return fmt.Errorf("returning storage copy to transfer: %w", err)
+		}
+		// The signed commit request stays: the provider may still add a piece
+		// under it, and every later submission has to carry the same nonce.
+		result, err := db.NewUpdate().
+			Model((*model.StorageCopy)(nil)).
+			Set("status = ?", model.StorageCopyStatusPending).
+			Set("retrieval_url = NULL").
+			Set("commit_ready_at = NULL").
+			Set("updated_at = ?", time.Now()).
+			Where("id = ? AND work_generation = ? AND active_task_id = ?", copyID, input.Generation, input.TaskID).
+			Where("status = ?", model.StorageCopyStatusPieceReady).
+			Where(`NOT EXISTS (
+				SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
+				WHERE unresolved_attempt.content_id = storage_copy.content_id
+				  AND unresolved_attempt.storage_data_set_id = storage_copy.storage_data_set_id
+				  AND unresolved_attempt.resolved_at IS NULL
+			)`).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("returning storage copy to transfer: %w", err)
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return fmt.Errorf("returning storage copy to transfer: %w", ErrConflict)
+		}
+		return wakeCommitFIFOHead(ctx, db, initial.StorageDataSetID)
+	})
 }
 
 func countSubmittedCommitCopies(ctx context.Context, db bun.IDB, contentID int64) (int, error) {

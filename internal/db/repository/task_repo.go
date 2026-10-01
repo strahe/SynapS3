@@ -577,8 +577,8 @@ func (r *BunTaskRepo) ReactivateTerminal(ctx context.Context, id int64) error {
 }
 
 // awaitingCommitReviewSQL matches a task whose storage copy has a confirmation
-// waiting for review. Dismissing that task would hide the only sign that the
-// confirmation still holds its data set's commit capacity.
+// flagged for attention. Dismissing that task would hide the only sign that
+// the confirmation still holds its data set's commit capacity.
 const awaitingCommitReviewSQL = `EXISTS (
 	SELECT 1 FROM storage_copies AS review_copy
 	JOIN storage_commit_attempts AS review_attempt
@@ -590,7 +590,8 @@ const awaitingCommitReviewSQL = `EXISTS (
 )`
 
 // AcknowledgeFailed dismisses one failure. A failure whose storage confirmation
-// awaits review is refused with ErrConflict until that confirmation is resolved.
+// is flagged for attention is refused with ErrConflict until that confirmation
+// is resolved.
 func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error {
 	if retention <= 0 {
 		return fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
