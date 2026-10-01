@@ -20,6 +20,8 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type migrationLockBarrier struct {
@@ -275,60 +277,93 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	}
 }
 
-func TestNew_SQLiteConcurrentReadThenWriteTransactionsDoNotBusy(t *testing.T) {
+func TestNew_SQLiteReadWriteTransactionsAcquireWriteLockAtBegin(t *testing.T) {
 	t.Parallel()
 
 	db, err := New(config.DatabaseConfig{
 		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), "read-then-write.db") + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 25,
-		MaxIdleConns: 5,
+		DSN:          "file:" + filepath.Join(t.TempDir(), "read-then-write.db"),
+		MaxOpenConns: 2,
+		MaxIdleConns: 2,
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 	if err := RunMigrations(ctx, db); err != nil {
 		t.Fatalf("RunMigrations() error = %v", err)
 	}
 
-	// Each transaction reads before it writes, like an S3 version write, while
-	// the others keep committing in between.
-	repos := repository.NewRepositories(db)
-	const workers, writesPerWorker = 8, 25
-	var wg sync.WaitGroup
-	for worker := range workers {
-		wg.Go(func() {
-			for i := range writesPerWorker {
-				versionID := fmt.Sprintf("01J0000000000000000%02d%05d", worker, i)
-				err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-					if _, err := txRepos.Tasks.CountByStatus(ctx); err != nil {
-						return err
-					}
-					_, _, err := txRepos.Tasks.Enqueue(ctx, &model.Task{
-						Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload-plan:" + versionID,
-						InputVersion: 1, Input: []byte(fmt.Sprintf(`{"version_id":%q}`, versionID)), InputHash: versionID,
-						Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-					})
-					return err
-				})
-				if err != nil {
-					t.Errorf("read-then-write transaction error = %v", err)
-					return
-				}
-			}
-		})
+	probe, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("reserving probe connection: %v", err)
 	}
-	wg.Wait()
+	t.Cleanup(func() { _ = probe.Close() })
+	if _, err := probe.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
+		t.Fatalf("disabling probe lock wait: %v", err)
+	}
+
+	readThenEnqueue := func(txRepos *repository.Repositories, wantCount int64) error {
+		counts, err := txRepos.Tasks.CountByStatus(ctx)
+		if err != nil {
+			return err
+		}
+		var count int64
+		for _, statusCount := range counts {
+			count += statusCount.Count
+		}
+		if count != wantCount {
+			return fmt.Errorf("visible tasks = %d, want %d", count, wantCount)
+		}
+		versionID := fmt.Sprintf("01J00000000000000000%06d", wantCount+1)
+		_, created, err := txRepos.Tasks.Enqueue(ctx, &model.Task{
+			Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload-plan:" + versionID,
+			InputVersion: 1, Input: []byte(fmt.Sprintf(`{"version_id":%q}`, versionID)), InputHash: versionID,
+			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+		})
+		if err != nil {
+			return err
+		}
+		if !created {
+			return errors.New("read-then-write transaction did not create its task")
+		}
+		return nil
+	}
+
+	repos := repository.NewRepositories(db)
+	if err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		// Probe before any read or write to distinguish IMMEDIATE from DEFERRED.
+		_, err := probe.ExecContext(ctx, "BEGIN IMMEDIATE")
+		if err == nil {
+			if _, err := probe.ExecContext(ctx, "ROLLBACK"); err != nil {
+				return fmt.Errorf("rolling back unexpected probe transaction: %w", err)
+			}
+			return errors.New("competing write transaction began before the first transaction committed")
+		}
+		var sqliteErr *sqlite.Error
+		if !errors.As(err, &sqliteErr) || sqliteErr.Code() != sqlite3.SQLITE_BUSY {
+			return fmt.Errorf("competing write transaction error = %v, want SQLITE_BUSY", err)
+		}
+		return readThenEnqueue(txRepos, 0)
+	}); err != nil {
+		t.Fatalf("first read-then-write transaction: %v", err)
+	}
+
+	if err := probe.RunInTx(ctx, nil, func(_ context.Context, tx bun.Tx) error {
+		return readThenEnqueue(repository.NewRepositories(tx), 1)
+	}); err != nil {
+		t.Fatalf("read-then-write transaction after lock release: %v", err)
+	}
 
 	count, err := db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeUploadPlan).Count(ctx)
 	if err != nil {
 		t.Fatalf("counting tasks: %v", err)
 	}
-	if count != workers*writesPerWorker {
-		t.Fatalf("committed tasks = %d, want %d", count, workers*writesPerWorker)
+	if count != 2 {
+		t.Fatalf("committed tasks = %d, want 2", count)
 	}
 }
 
