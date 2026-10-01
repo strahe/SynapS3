@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -316,6 +318,41 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEngineSuspendKeepsWaitErrorUntilALaterResult(t *testing.T) {
+	limit := 1
+	var runs atomic.Int64
+	harness := newTaskHarness(t, scriptedHandler{
+		definition: testDefinition(&limit, true),
+		execute: func(context.Context, Execution) Result {
+			if runs.Add(1) == 1 {
+				return SuspendWithError(model.TaskResumeModeExecute, 0, "provider_confirmation", "Checking request",
+					errors.New(strings.Repeat("é", maxTaskErrorBytes)), nil)
+			}
+			return Suspend(model.TaskResumeModeExecute, 0, "provider_confirmation", "Checking request", nil)
+		},
+	}, nil)
+	row := enqueueTestTask(t, harness, "wait-error", "wait-error")
+
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil {
+		t.Fatalf("get waiting task: %v", err)
+	}
+	if stored.Status != model.TaskStatusPending || stored.LastError == nil ||
+		len(*stored.LastError) > maxTaskErrorBytes+len("…") || !utf8.ValidString(*stored.LastError) {
+		t.Fatalf("waiting task = status:%s last_error:%v, want pending with a bounded error", stored.Status, stored.LastError)
+	}
+
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+	stored, err = harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil {
+		t.Fatalf("get waiting task: %v", err)
+	}
+	if stored.LastError != nil {
+		t.Fatalf("last_error = %q, want cleared by a wait without an error", *stored.LastError)
 	}
 }
 

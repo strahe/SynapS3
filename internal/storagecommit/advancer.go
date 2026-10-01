@@ -227,6 +227,19 @@ func (a *Advancer) submitReserved(
 		// Every remaining submission failure is ambiguous, so the attempt fence
 		// stays and the next pass observes it. The error still travels back so the
 		// caller can record why, which parking alone would discard.
+		if !callbackObserved.Load() {
+			evidenceCtx, cancel := evidenceContext(ctx)
+			recordErr := a.Store.RecordCommitSubmitFailure(evidenceCtx, SubmitFailureInput{
+				Copy:      identity,
+				AttemptID: attemptID,
+				Message:   synapse.ErrorSummary(submitErr),
+				Now:       a.now(),
+			})
+			cancel()
+			if recordErr != nil {
+				submitErr = errors.Join(submitErr, &SubmitFailureRecordError{Err: recordErr})
+			}
+		}
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
 	}
 	if submission == nil {
@@ -254,6 +267,18 @@ func (a *Advancer) submitReserved(
 type commitEvidenceError struct {
 	err error
 }
+
+// SubmitFailureRecordError reports that the provider's failed submission reply
+// could not be retained, independently of the provider error itself.
+type SubmitFailureRecordError struct {
+	Err error
+}
+
+func (e *SubmitFailureRecordError) Error() string {
+	return fmt.Sprintf("recording storage commit submit failure: %v", e.Err)
+}
+
+func (e *SubmitFailureRecordError) Unwrap() error { return e.Err }
 
 func (a *Advancer) observe(
 	ctx context.Context,

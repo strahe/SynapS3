@@ -20,6 +20,7 @@ import {
   clampPageForLoadedTotal,
   findStorageTopologySelection,
   mergeTopologyDataSetSnapshots,
+  mergeTopologyStorageConfirmationCounts,
   type ObservabilityStatusFilter,
   observabilityStatusOptions,
   paginateItems,
@@ -162,6 +163,28 @@ function StorageTopologyPage() {
   const providers = useMemo(
     () => providerSnapshot.data?.items ?? emptyProviderObservations,
     [providerSnapshot.data?.items]
+  )
+  const storageConfirmations = useMemo(
+    () =>
+      mergeTopologyStorageConfirmationCounts([
+        { data: dataSetSnapshot.data, dataUpdatedAt: dataSetSnapshot.dataUpdatedAt },
+        scopedDeepLinkSnapshotEnabled
+          ? { data: scopedDeepLinkDataSetSnapshot.data, dataUpdatedAt: scopedDeepLinkDataSetSnapshot.dataUpdatedAt }
+          : undefined,
+        dataSetInventoryEnabled
+          ? { data: dataSetInventory.data, dataUpdatedAt: dataSetInventory.dataUpdatedAt }
+          : undefined,
+      ]),
+    [
+      dataSetSnapshot.data,
+      dataSetSnapshot.dataUpdatedAt,
+      scopedDeepLinkDataSetSnapshot.data,
+      scopedDeepLinkDataSetSnapshot.dataUpdatedAt,
+      scopedDeepLinkSnapshotEnabled,
+      dataSetInventory.data,
+      dataSetInventory.dataUpdatedAt,
+      dataSetInventoryEnabled,
+    ]
   )
   const baseDataSets = useMemo(
     () => dataSetSnapshot.data?.items ?? emptyDataSetObservations,
@@ -520,6 +543,7 @@ function StorageTopologyPage() {
         <DataSetsTableCard
           dataSets={dataSetTableData}
           providersByID={detailProvidersByID}
+          storageConfirmations={storageConfirmations}
           total={dataSetTableTotal}
           page={dataSetPage}
           totalPages={dataSetTableTotalPages}
@@ -535,6 +559,7 @@ function StorageTopologyPage() {
         graph={graph}
         providers={detailProviders}
         dataSets={detailDataSets}
+        storageConfirmations={storageConfirmations}
         onNavigate={selectTopologySelection}
         onOpenChange={(open) => {
           if (open) return

@@ -296,7 +296,7 @@ function AttentionLinkRow({ row }: { row: ReturnType<typeof attentionDisplayRows
     return (
       <Link
         to="/tasks"
-        search={{ status: row.taskStatus }}
+        search={{ status: row.taskStatus, type: row.taskType }}
         className={className}
         aria-label={`${row.label}: ${formatNumber(row.value)}`}
       >

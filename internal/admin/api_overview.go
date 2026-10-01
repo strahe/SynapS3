@@ -48,6 +48,9 @@ type objectAttentionOverview struct {
 
 type taskAttentionOverview struct {
 	Failed int64 `json:"failed"`
+	// StorageConfirmations counts stopped storage confirmations waiting for
+	// review; each holds its data set's commit capacity until released.
+	StorageConfirmations int64 `json:"storage_confirmations"`
 }
 
 type taskPipelineOverview struct {
@@ -138,7 +141,15 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("overview: failed to count task attention", "error", err)
 	} else {
-		resp.Tasks.Attention = taskAttentionOverview{Failed: unacknowledgedFailed}
+		resp.Tasks.Attention.Failed = unacknowledgedFailed
+	}
+	stoppedConfirmations, err := s.repos.Contents.CountStoppedCommitAttentionByDataSet(ctx)
+	if err != nil {
+		s.logger.Warn("overview: failed to count storage confirmations", "error", err)
+	} else {
+		for _, count := range stoppedConfirmations {
+			resp.Tasks.Attention.StorageConfirmations += count
+		}
 	}
 	taskPipelineCounts, err := s.repos.Tasks.CountOverviewActivePipeline(ctx)
 	if err != nil {

@@ -34,8 +34,8 @@ func TestAPIStorageConfirmationsListAndRelease(t *testing.T) {
 	repo := &storageConfirmationAPIRepo{records: []storagecommit.AttentionRecord{{
 		CopyID: 12, ContentID: 7, CopyIndex: 1, DataSetRowID: 9,
 		ProviderID: "provider-1", DataSetID: "dataset-1", PieceCID: "piece-1",
-		AttemptID: "attempt-1", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
-		AttemptedAt: now.Add(-time.Second), AttentionAt: now,
+		AttemptID: "attempt-1", SubmitError: "provider returned HTTP 500: piece not found",
+		Code: storagecommit.AttentionAttemptOnlyAmbiguous, AttemptedAt: now.Add(-time.Second), AttentionAt: now,
 	}}}
 	srv := &Server{repos: &repository.Repositories{Contents: repo}, logger: testLogger()}
 	mux := http.NewServeMux()
@@ -51,7 +51,8 @@ func TestAPIStorageConfirmationsListAndRelease(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&listed); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if len(listed) != 1 || listed[0].CopyID != 12 || listed[0].ReasonCode != "attempt_only_ambiguous" {
+	if len(listed) != 1 || listed[0].CopyID != 12 || listed[0].ReasonCode != "attempt_only_ambiguous" ||
+		listed[0].SubmitError != "provider returned HTTP 500: piece not found" {
 		t.Fatalf("listed = %#v", listed)
 	}
 

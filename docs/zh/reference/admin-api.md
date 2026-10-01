@@ -265,7 +265,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 存储确认处理
 
-当 SynapS3 无法判定存储提供方是否已接受 piece 时，不会自动再次提交该 piece。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出受影响的 copy、data set、attempt、已知 transaction、时间和稳定的 `reason_code`。
+当 SynapS3 无法判定存储提供方是否已接受 piece 时，不会自动再次提交该 piece。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出受影响的 copy、所属任务（`task_id`）、data set、attempt、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、时间和稳定的 `reason_code`。Tasks 页面会在已停止的 Confirm storage 任务上显示同样的确认，并通过下面的请求释放。
 
 `POST /api/v1/storage-confirmations/{copy-id}/release` 会让正常恢复继续，并可能产生重复提交。先核对清单中的当前记录，再同时发送该记录的 attempt ID 和明确的风险确认：
 
@@ -289,7 +289,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
 | `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。存储确认等待处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `copy_id`、`attempt_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_cid`、已知的 `transaction_id`、`submit_error`、时间和 `releasable`；任务停止后 `releasable` 才为 true。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为释放该确认。
 
 `status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
 
@@ -313,7 +313,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 把返回的 `as_of` 作为 `failed_before` 回传，处理的就正好是统计到的那些。
 
-`/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。
+`/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。`tasks.attention.storage_confirmations` 统计已停止、等待处理的存储确认。
 
 分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换仍通过 Data Sets API 恢复。钱包操作在广播开始前、或因内部错误停止后可以重试；只有从未广播过的交易才会在重试时发出。因内部错误停止的存储传输任务也可以重试。重试结果不确定的 Store 只会查询存储提供方，不会重新上传字节。
 
@@ -334,7 +334,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | 刷新单个节点的 Registry 资料和健康状态；同 ID 并发刷新会冲突。 |
 | `POST` | `/api/v1/observability/provider-tiers/refresh` | 并行刷新 approved 和 endorsed 名单；分别返回成功状态、尝试时间及成功采集时间或错误。单路失败时保留该路之前的资料状态和采集时间。 |
 | `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 对可用的存储提供方发起一次 32 MiB 上传测速。返回 `202 Accepted` 和 `task_id`；存储提供方不存在时返回 `404 Not Found`；已有测速进行中或存储提供方不满足测速条件时返回 `409 Conflict`。 |
-| `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据。 |
+| `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的存储确认数量。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
 存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。失败测速不能通过任务重试接口重试，请重新发起测速。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。

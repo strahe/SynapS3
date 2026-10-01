@@ -70,7 +70,7 @@ After a restart, unfinished work becomes eligible to continue automatically.
 - A wallet operation can be retried from Tasks when no broadcast started, or when it stopped because of an internal error. Retry checks the operation first: it sends the transaction only if none was ever broadcast, and otherwise checks the transaction already sent. If a broadcast may have gone out without a recorded transaction, the operation is marked unknown and cannot be retried.
 - **Retry upload** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
 - `status=failed` lists unacknowledged failures. Use `status=dismissed` to list acknowledged failures.
-- Review unresolved storage confirmations with `synaps3 admin storage-confirmation list`.
+- Review unresolved storage confirmations in **Tasks** (Confirm storage, Failed) or with `synaps3 admin storage-confirmation list`. A stopped confirmation shows the provider's response. **Release** submits the piece again; if the provider already accepted it, the piece is stored twice.
 
 Useful commands:
 

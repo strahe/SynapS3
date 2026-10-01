@@ -27,7 +27,7 @@ test('worker health rows use stable product labels and ordering', () => {
 test('attention rows stay quiet when nothing needs attention', () => {
   const rows = attentionDisplayRows({
     objects: { needs_attention: 0, unavailable: 0 },
-    tasks: { failed: 0 },
+    tasks: { failed: 0, storage_confirmations: 0 },
   })
 
   assert.deepEqual(rows, [])
@@ -36,12 +36,21 @@ test('attention rows stay quiet when nothing needs attention', () => {
 test('attention rows show only nonzero attention items', () => {
   const rows = attentionDisplayRows({
     objects: { needs_attention: 2, unavailable: 1 },
-    tasks: { failed: 3 },
+    tasks: { failed: 3, storage_confirmations: 4 },
   })
 
   assert.deepEqual(rows, [
     { key: 'object_failures', label: 'Object failures', value: 2, tone: 'warning', target: 'buckets' },
     { key: 'unavailable', label: 'Unavailable objects', value: 1, tone: 'danger', target: 'buckets' },
+    {
+      key: 'storage_confirmations',
+      label: 'Storage confirmations to review',
+      value: 4,
+      tone: 'danger',
+      target: 'tasks',
+      taskStatus: 'failed',
+      taskType: 'storage_commit',
+    },
     { key: 'failed_tasks', label: 'Failed tasks', value: 3, tone: 'danger', target: 'tasks', taskStatus: 'failed' },
   ])
 })

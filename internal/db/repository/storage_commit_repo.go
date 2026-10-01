@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -223,6 +224,32 @@ func (r *BunStorageContentRepo) RecordCommitSubmission(ctx context.Context, inpu
 	})
 }
 
+// RecordCommitSubmitFailure keeps the provider's answer to a submission whose
+// outcome stayed unknown. A submission that produced evidence is not one.
+func (r *BunStorageContentRepo) RecordCommitSubmitFailure(ctx context.Context, input storagecommit.SubmitFailureInput) error {
+	if err := validateCommitCopyIdentity(input.Copy); err != nil || input.AttemptID == "" || strings.TrimSpace(input.Message) == "" {
+		return fmt.Errorf("recording storage commit submit failure: %w", ErrInvalidInput)
+	}
+	return r.mutateAttempt(ctx, input.Copy, "recording storage commit submit failure", func(db bun.IDB, _ int64) error {
+		res, err := db.NewUpdate().
+			Model((*storagecommit.Attempt)(nil)).
+			Set("submit_error = ?", input.Message).
+			Set("updated_at = ?", commitInputTime(input.Now)).
+			Where("attempt_id = ?", input.AttemptID).
+			Where("content_id = ? AND storage_data_set_id = ?", input.Copy.ContentID, input.Copy.StorageDataSetID).
+			Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
+			Where("transaction_id IS NULL").
+			Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
+}
+
 func (r *BunStorageContentRepo) MarkCommitAttention(ctx context.Context, input storagecommit.AttentionInput) error {
 	if err := validateCommitCopyIdentity(input.Copy); err != nil || input.AttemptID == "" || !input.Code.Valid() {
 		return fmt.Errorf("marking storage commit attention: %w", ErrInvalidInput)
@@ -430,25 +457,61 @@ func countCommitAttentionAttemptsForDataSet(ctx context.Context, db bun.IDB, sto
 	return count, nil
 }
 
+// ListCommitAttention lists the unresolved storage confirmations waiting for
+// review, oldest first.
 func (r *BunStorageContentRepo) ListCommitAttention(ctx context.Context, limit int) ([]storagecommit.AttentionRecord, error) {
-	type attentionRow struct {
-		CopyID        int64     `bun:"copy_id"`
-		ContentID     int64     `bun:"content_id"`
-		CopyIndex     int       `bun:"copy_index"`
-		DataSetRowID  int64     `bun:"data_set_row_id"`
-		ProviderID    string    `bun:"provider_id"`
-		DataSetID     string    `bun:"data_set_id"`
-		PieceCID      string    `bun:"piece_cid"`
-		AttemptID     string    `bun:"attempt_id"`
-		TransactionID string    `bun:"transaction_id"`
-		Code          string    `bun:"attention_code"`
-		AttemptedAt   time.Time `bun:"attempted_at"`
-		AttentionAt   time.Time `bun:"attention_at"`
+	q := commitAttentionQuery(r.db).
+		OrderExpr("commit_attempt.attention_at ASC").
+		OrderExpr("storage_copy.id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
 	}
-	var rows []attentionRow
-	q := r.db.NewSelect().
+	return scanCommitAttention(ctx, q)
+}
+
+// ListCommitAttentionForTasks returns the storage confirmations waiting for
+// review that the given tasks own.
+func (r *BunStorageContentRepo) ListCommitAttentionForTasks(ctx context.Context, taskIDs []int64) ([]storagecommit.AttentionRecord, error) {
+	if len(taskIDs) == 0 {
+		return nil, nil
+	}
+	return scanCommitAttention(ctx, commitAttentionQuery(r.db).Where("storage_copy.active_task_id IN (?)", bun.List(taskIDs)))
+}
+
+// CountStoppedCommitAttentionByDataSet counts, per data set row, the storage
+// confirmations waiting for review whose task has failed. Nothing advances them
+// until an operator releases them, and they keep holding commit capacity.
+func (r *BunStorageContentRepo) CountStoppedCommitAttentionByDataSet(ctx context.Context) (map[int64]int64, error) {
+	var rows []struct {
+		StorageDataSetID int64 `bun:"storage_data_set_id"`
+		Count            int64 `bun:"count"`
+	}
+	err := r.db.NewSelect().
+		TableExpr("storage_commit_attempts AS commit_attempt").
+		ColumnExpr("commit_attempt.storage_data_set_id").
+		ColumnExpr("COUNT(*) AS count").
+		Join("JOIN storage_copies AS storage_copy ON storage_copy.content_id = commit_attempt.content_id AND storage_copy.storage_data_set_id = commit_attempt.storage_data_set_id").
+		Join("JOIN tasks AS owner_task ON owner_task.id = storage_copy.active_task_id").
+		Where("commit_attempt.status = ? AND commit_attempt.resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
+		Where("commit_attempt.attention_at IS NOT NULL").
+		Where("owner_task.status = ?", model.TaskStatusFailed).
+		GroupExpr("commit_attempt.storage_data_set_id").
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("counting stopped storage confirmations: %w", err)
+	}
+	counts := make(map[int64]int64, len(rows))
+	for _, row := range rows {
+		counts[row.StorageDataSetID] = row.Count
+	}
+	return counts, nil
+}
+
+func commitAttentionQuery(db bun.IDB) *bun.SelectQuery {
+	return db.NewSelect().
 		TableExpr("storage_commit_attempts AS commit_attempt").
 		ColumnExpr("storage_copy.id AS copy_id").
+		ColumnExpr("storage_copy.active_task_id AS task_id").
 		ColumnExpr("commit_attempt.content_id").
 		ColumnExpr("storage_copy.copy_index").
 		ColumnExpr("commit_attempt.storage_data_set_id AS data_set_row_id").
@@ -457,6 +520,7 @@ func (r *BunStorageContentRepo) ListCommitAttention(ctx context.Context, limit i
 		ColumnExpr("COALESCE(storage_content.piece_cid, '') AS piece_cid").
 		ColumnExpr("commit_attempt.attempt_id").
 		ColumnExpr("COALESCE(commit_attempt.transaction_id, '') AS transaction_id").
+		ColumnExpr("COALESCE(commit_attempt.submit_error, '') AS submit_error").
 		ColumnExpr("commit_attempt.attention_code").
 		ColumnExpr("commit_attempt.attempted_at").
 		ColumnExpr("commit_attempt.attention_at").
@@ -464,22 +528,38 @@ func (r *BunStorageContentRepo) ListCommitAttention(ctx context.Context, limit i
 		Join("JOIN storage_contents AS storage_content ON storage_content.id = commit_attempt.content_id").
 		Join("JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = commit_attempt.storage_data_set_id").
 		Where("commit_attempt.status = ? AND commit_attempt.resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-		Where("commit_attempt.attention_at IS NOT NULL").
-		OrderExpr("commit_attempt.attention_at ASC").
-		OrderExpr("storage_copy.id ASC")
-	if limit > 0 {
-		q = q.Limit(limit)
+		Where("commit_attempt.attention_at IS NOT NULL")
+}
+
+func scanCommitAttention(ctx context.Context, q *bun.SelectQuery) ([]storagecommit.AttentionRecord, error) {
+	type attentionRow struct {
+		CopyID        int64     `bun:"copy_id"`
+		TaskID        *int64    `bun:"task_id"`
+		ContentID     int64     `bun:"content_id"`
+		CopyIndex     int       `bun:"copy_index"`
+		DataSetRowID  int64     `bun:"data_set_row_id"`
+		ProviderID    string    `bun:"provider_id"`
+		DataSetID     string    `bun:"data_set_id"`
+		PieceCID      string    `bun:"piece_cid"`
+		AttemptID     string    `bun:"attempt_id"`
+		TransactionID string    `bun:"transaction_id"`
+		SubmitError   string    `bun:"submit_error"`
+		Code          string    `bun:"attention_code"`
+		AttemptedAt   time.Time `bun:"attempted_at"`
+		AttentionAt   time.Time `bun:"attention_at"`
 	}
+	var rows []attentionRow
 	if err := q.Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("listing storage confirmation attention: %w", err)
 	}
 	out := make([]storagecommit.AttentionRecord, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, storagecommit.AttentionRecord{
-			CopyID: row.CopyID, ContentID: row.ContentID, CopyIndex: row.CopyIndex,
+			CopyID: row.CopyID, TaskID: row.TaskID, ContentID: row.ContentID, CopyIndex: row.CopyIndex,
 			DataSetRowID: row.DataSetRowID, ProviderID: row.ProviderID, DataSetID: row.DataSetID,
 			PieceCID: row.PieceCID, AttemptID: row.AttemptID, TransactionID: row.TransactionID,
-			Code: storagecommit.AttentionCode(row.Code), AttemptedAt: row.AttemptedAt, AttentionAt: row.AttentionAt,
+			SubmitError: row.SubmitError, Code: storagecommit.AttentionCode(row.Code),
+			AttemptedAt: row.AttemptedAt, AttentionAt: row.AttentionAt,
 		})
 	}
 	return out, nil
@@ -696,6 +776,7 @@ func projectActiveCommitAttempt(q *bun.SelectQuery, copyAlias string) {
 		ColumnExpr("active_commit_attempt.attempted_at AS commit_attempted_at").
 		ColumnExpr("active_commit_attempt.transaction_id AS commit_transaction_id").
 		ColumnExpr("active_commit_attempt.status_url AS commit_status_url").
+		ColumnExpr("active_commit_attempt.submit_error AS commit_submit_error").
 		ColumnExpr("active_commit_attempt.confirmed_transaction_id AS commit_confirmed_transaction_id").
 		ColumnExpr("active_commit_attempt.attention_code AS commit_attention_code").
 		ColumnExpr("active_commit_attempt.attention_at AS commit_attention_at").

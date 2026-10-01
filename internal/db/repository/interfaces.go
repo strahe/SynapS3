@@ -494,6 +494,7 @@ type StorageContentRepository interface {
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
+	RecordDataSetCreationError(ctx context.Context, id, taskID int64, message string) error
 	// RecordDataSetClientID ties a generation to the client data set ID of its
 	// create request before the request is sent. The ID never changes later.
 	RecordDataSetClientID(ctx context.Context, id int64, clientDataSetID types.OnChainID) error
@@ -535,12 +536,15 @@ type StorageContentRepository interface {
 	ReserveCommitAttempt(ctx context.Context, input storagecommit.ReserveInput) (storagecommit.ReserveResult, error)
 	MarkCommitAttempted(ctx context.Context, input storagecommit.AttemptInput) (storagecommit.AttemptResult, error)
 	RecordCommitSubmission(ctx context.Context, input storagecommit.EvidenceInput) error
+	RecordCommitSubmitFailure(ctx context.Context, input storagecommit.SubmitFailureInput) error
 	MarkCommitAttention(ctx context.Context, input storagecommit.AttentionInput) error
 	ResetCommitAttempt(ctx context.Context, input storagecommit.ResetInput) error
 	ReleaseCommitAttempt(ctx context.Context, input storagecommit.ReleaseInput) error
 	ReleaseCommitReservation(ctx context.Context, input storagecommit.ReservationReleaseInput) error
 	CountActiveCommitAttemptsForDataSet(ctx context.Context, storageDataSetID int64) (int, error)
 	ListCommitAttention(ctx context.Context, limit int) ([]storagecommit.AttentionRecord, error)
+	ListCommitAttentionForTasks(ctx context.Context, taskIDs []int64) ([]storagecommit.AttentionRecord, error)
+	CountStoppedCommitAttentionByDataSet(ctx context.Context) (map[int64]int64, error)
 	ReleaseCommitAttention(ctx context.Context, input storagecommit.ManualReleaseInput) error
 	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
 	MarkUploadCopyFailed(ctx context.Context, input MarkUploadCopyFailedInput) error

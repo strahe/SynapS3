@@ -181,8 +181,8 @@ import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import {
   storageConfirmationAttentionView,
-  storageConfirmationListCommand,
   storageConfirmationReleaseWarning,
+  storageConfirmationTasksSearch,
 } from '@/lib/storage-confirmation-attention'
 import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
@@ -865,7 +865,11 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3">
                   <StatusBadge tone={copyStatusTone(copy)}>{copyStatusLabel(copy)}</StatusBadge>
                   {copy.attention_code && (
-                    <CopyAttentionDetails reasonCode={copy.attention_code} attentionAt={copy.attention_at} />
+                    <CopyAttentionDetails
+                      reasonCode={copy.attention_code}
+                      attentionAt={copy.attention_at}
+                      submitError={copy.submit_error}
+                    />
                   )}
                 </TableCell>
                 <TableCell className="px-3">
@@ -1062,7 +1066,15 @@ function copyStatusLabel(copy: ObjectProvenanceCopy) {
   }
 }
 
-function CopyAttentionDetails({ reasonCode, attentionAt }: { reasonCode: string; attentionAt?: string }) {
+function CopyAttentionDetails({
+  reasonCode,
+  attentionAt,
+  submitError,
+}: {
+  reasonCode: string
+  attentionAt?: string
+  submitError?: string
+}) {
   const attention = storageConfirmationAttentionView(reasonCode)
 
   return (
@@ -1071,12 +1083,20 @@ function CopyAttentionDetails({ reasonCode, attentionAt }: { reasonCode: string;
         {attention.label}
         {attentionAt ? ` · ${timeAgo(attentionAt)}` : ''}
       </summary>
-      <div className="mt-2 space-y-2 rounded-md border border-border bg-muted/30 p-2 leading-relaxed">
+      <div className="mt-2 space-y-2 whitespace-normal rounded-md border border-border bg-muted/30 p-2 leading-relaxed">
+        {submitError && (
+          <div className="space-y-1">
+            <div>Provider response</div>
+            <CopyableValue label="Provider response" value={submitError} displayValue={submitError} maxLength={60} />
+          </div>
+        )}
         <p>
-          Run <code className="break-all font-mono text-foreground">{storageConfirmationListCommand}</code> and review
-          the provider, piece, current attempt, and any transaction evidence.
+          Review it in{' '}
+          <Link to="/tasks" search={storageConfirmationTasksSearch} className="text-foreground underline">
+            Tasks
+          </Link>
+          . {storageConfirmationReleaseWarning}
         </p>
-        <p>{storageConfirmationReleaseWarning}</p>
         {!attention.known && (
           <div className="space-y-1">
             <div>Reason code</div>

@@ -576,6 +576,21 @@ func (r *BunTaskRepo) ReactivateTerminal(ctx context.Context, id int64) error {
 	})
 }
 
+// awaitingCommitReviewSQL matches a task whose storage copy has a confirmation
+// waiting for review. Dismissing that task would hide the only sign that the
+// confirmation still holds its data set's commit capacity.
+const awaitingCommitReviewSQL = `EXISTS (
+	SELECT 1 FROM storage_copies AS review_copy
+	JOIN storage_commit_attempts AS review_attempt
+	  ON review_attempt.content_id = review_copy.content_id
+	 AND review_attempt.storage_data_set_id = review_copy.storage_data_set_id
+	WHERE review_copy.active_task_id = ?TableAlias.id
+	  AND review_attempt.resolved_at IS NULL
+	  AND review_attempt.attention_at IS NOT NULL
+)`
+
+// AcknowledgeFailed dismisses one failure. A failure whose storage confirmation
+// awaits review is refused with ErrConflict until that confirmation is resolved.
 func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error {
 	if retention <= 0 {
 		return fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
@@ -587,15 +602,26 @@ func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention
 		Set("retention_until = COALESCE(retention_until, ?)", now.Add(retention)).
 		Set("updated_at = ?", now).
 		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
+		Where("NOT " + awaitingCommitReviewSQL).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("acknowledging task %d: %w", id, err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrNotFound
+	if rows, _ := result.RowsAffected(); rows == 1 {
+		return nil
 	}
-	return nil
+	held, err := r.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
+		Where(awaitingCommitReviewSQL).
+		Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("acknowledging task %d: %w", id, err)
+	}
+	if held {
+		return ErrConflict
+	}
+	return ErrNotFound
 }
 
 // acknowledgeFailedMatching selects the failures one bulk dismissal covers. The
@@ -605,7 +631,8 @@ func acknowledgeFailedMatching(filter TaskAcknowledgeFilter) func(bun.QueryBuild
 	return func(query bun.QueryBuilder) bun.QueryBuilder {
 		query = query.
 			Where("status = ? AND acknowledged_at IS NULL", model.TaskStatusFailed).
-			Where("finished_at IS NOT NULL AND finished_at <= ?", filter.FailedBefore)
+			Where("finished_at IS NOT NULL AND finished_at <= ?", filter.FailedBefore).
+			Where("NOT " + awaitingCommitReviewSQL)
 		if filter.Type != "" {
 			query = query.Where("type = ?", filter.Type)
 		}

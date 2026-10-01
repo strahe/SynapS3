@@ -10,10 +10,11 @@ const knownAttentionLabels = {
 
 const attentionLabels = new Map<string, string>(Object.entries(knownAttentionLabels))
 
-export const storageConfirmationListCommand = 'synaps3 admin storage-confirmation list'
-
 export const storageConfirmationReleaseWarning =
-  'Release the current attempt from the CLI only if you accept that the provider may already have stored the piece. Releasing it can submit the piece again and create duplicate paid storage.'
+  'Releasing it submits the piece again. If the provider already accepted the piece, it is stored twice and you pay for both copies.'
+
+/** Tasks page filter that lists storage confirmations stopped for review. */
+export const storageConfirmationTasksSearch = { type: 'storage_commit', status: 'failed' } as const
 
 export interface StorageConfirmationAttentionView {
   known: boolean

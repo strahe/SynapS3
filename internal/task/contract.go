@@ -190,6 +190,14 @@ func Suspend(mode model.TaskResumeMode, delay time.Duration, reason, message str
 	}
 }
 
+// SuspendWithError waits like Suspend and keeps err as the task's last error,
+// so a wait caused by a failed request shows why until a later result clears it.
+func SuspendWithError(mode model.TaskResumeMode, delay time.Duration, reason, message string, err error, settlement Settlement) Result {
+	result := Suspend(mode, delay, reason, message, settlement)
+	result.err = err
+	return result
+}
+
 // ResourceWait yields a task that found its resource gate full. It resumes in
 // execute mode after a backoff that grows with the task's consecutive waits,
 // and it consumes no retry budget.

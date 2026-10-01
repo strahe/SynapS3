@@ -12,6 +12,7 @@ export interface AttentionDisplayRow {
   tone: AttentionTone
   target: 'buckets' | 'tasks'
   taskStatus?: 'failed'
+  taskType?: 'storage_commit'
 }
 
 export interface PipelineDisplayRow {
@@ -126,6 +127,15 @@ export function attentionDisplayRows(attention: {
       value: attention.objects.unavailable,
       tone: 'danger' as const,
       target: 'buckets' as const,
+    },
+    {
+      key: 'storage_confirmations',
+      label: 'Storage confirmations to review',
+      value: attention.tasks.storage_confirmations,
+      tone: 'danger' as const,
+      target: 'tasks' as const,
+      taskStatus: 'failed' as const,
+      taskType: 'storage_commit' as const,
     },
     {
       key: 'failed_tasks',

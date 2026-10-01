@@ -70,7 +70,7 @@ SynapS3 不会修改不兼容的数据库。废弃的 `worker.upload`、`worker.
 - 钱包操作在尚未发出广播、或因内部错误停止时，可以从 Tasks 重试。重试会先核对这笔操作：从未广播过时才会发出交易，否则只检查已经发出的交易。如果广播可能已经发出、却没有记录到交易，操作会被标为结果未知，不能再重试。
 - **Retry upload** 会先检查存储提供方是否已有分片；确认缺失后才重新上传。重传可能增加带宽用量或开启另一次上传会话。
 - `status=failed` 只列出尚未确认的失败；使用 `status=dismissed` 查看已确认的失败。
-- 使用 `synaps3 admin storage-confirmation list` 核对尚未解决的存储确认。
+- 在 **Tasks**（Confirm storage、Failed）中或使用 `synaps3 admin storage-confirmation list` 核对尚未解决的存储确认。已停止的确认会显示存储提供方的回复。**Release** 会再次提交该 piece；如果存储提供方其实已经接受，piece 会被存储两次。
 
 常用命令：
 

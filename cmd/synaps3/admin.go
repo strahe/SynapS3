@@ -1033,6 +1033,7 @@ type adminTaskStatusCount struct {
 
 type adminStorageConfirmationAttention struct {
 	CopyID        int64  `json:"copy_id"`
+	TaskID        *int64 `json:"task_id,omitempty"`
 	ContentID     int64  `json:"content_id"`
 	CopyIndex     int    `json:"copy_index"`
 	DataSetRowID  int64  `json:"data_set_row_id"`
@@ -1041,6 +1042,7 @@ type adminStorageConfirmationAttention struct {
 	PieceCID      string `json:"piece_cid,omitempty"`
 	AttemptID     string `json:"attempt_id"`
 	TransactionID string `json:"transaction_id,omitempty"`
+	SubmitError   string `json:"submit_error,omitempty"`
 	ReasonCode    string `json:"reason_code"`
 	AttemptedAt   string `json:"attempted_at"`
 	AttentionAt   string `json:"attention_at"`
@@ -1551,13 +1553,17 @@ func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {
 
 func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStorageConfirmationAttention) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "COPY ID\tCONTENT ID\tCOPY\tPROVIDER\tDATA SET\tPIECE CID\tATTEMPT\tATTEMPTED AT\tTRANSACTION\tREASON\tATTENTION AT"); err != nil {
+	if _, err := fmt.Fprintln(tw, "COPY ID\tCONTENT ID\tCOPY\tPROVIDER\tDATA SET\tPIECE CID\tATTEMPT\tATTEMPTED AT\tTRANSACTION\tREASON\tATTENTION AT\tTASK ID\tPROVIDER RESPONSE"); err != nil {
 		return err
 	}
 	for _, confirmation := range confirmations {
+		taskID := ""
+		if confirmation.TaskID != nil {
+			taskID = strconv.FormatInt(*confirmation.TaskID, 10)
+		}
 		if _, err := fmt.Fprintf(
 			tw,
-			"%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			"%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			confirmation.CopyID,
 			confirmation.ContentID,
 			confirmation.CopyIndex,
@@ -1569,6 +1575,8 @@ func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStora
 			confirmation.TransactionID,
 			confirmation.ReasonCode,
 			confirmation.AttentionAt,
+			taskID,
+			strings.Join(strings.Fields(confirmation.SubmitError), " "),
 		); err != nil {
 			return err
 		}

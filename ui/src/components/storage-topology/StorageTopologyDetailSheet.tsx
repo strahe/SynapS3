@@ -47,7 +47,7 @@ import {
   topologyDetailTarget,
 } from '@/lib/storage-topology'
 import { cn, timeAgo } from '@/lib/utils'
-import { TopologySignalBadge } from './TopologyStatus'
+import { StorageConfirmationsBadge, TopologySignalBadge } from './TopologyStatus'
 
 type ProviderTarget = Extract<StorageTopologyDetailTarget, { kind: 'provider' }>
 type DataSetTarget = Extract<StorageTopologyDetailTarget, { kind: 'data-set' }>
@@ -64,6 +64,7 @@ export function TopologyDetailSheet({
   graph,
   providers,
   dataSets,
+  storageConfirmations,
   onOpenChange,
   onNavigate,
 }: {
@@ -71,6 +72,7 @@ export function TopologyDetailSheet({
   graph: StorageTopologyGraph
   providers: ObservabilityProviderObservation[]
   dataSets: ObservabilityDataSetObservation[]
+  storageConfirmations: Record<string, number>
   onOpenChange: (open: boolean) => void
   onNavigate: (selection: StorageTopologySelection) => void
 }) {
@@ -119,6 +121,7 @@ export function TopologyDetailSheet({
           <DataSetDetails
             key={detailTargetKey(shownTarget)}
             target={shownTarget}
+            storageConfirmations={storageConfirmations[String(shownTarget.dataSet.facts.local_data_set_id)] ?? 0}
             titleRef={titleRef}
             navigation={navigation}
           />
@@ -343,10 +346,12 @@ function ProviderTierField({ profile }: { profile?: ProviderProfile }) {
 
 function DataSetDetails({
   target,
+  storageConfirmations,
   titleRef,
   navigation,
 }: {
   target: DataSetTarget
+  storageConfirmations: number
   titleRef: TitleRef
   navigation: DetailNavigation
 }) {
@@ -382,9 +387,12 @@ function DataSetDetails({
             </DetailField>
             <DetailField label="Replica">{replicaLabel(facts.copy_index)}</DetailField>
             <DetailField label="Local status">
-              <StatusBadge tone={localStatusTone(facts.local_status)}>
-                {localStatusLabel(facts.local_status)}
-              </StatusBadge>
+              <div className="flex flex-wrap items-center gap-2">
+                <StatusBadge tone={localStatusTone(facts.local_status)}>
+                  {localStatusLabel(facts.local_status)}
+                </StatusBadge>
+                <StorageConfirmationsBadge count={storageConfirmations} />
+              </div>
             </DetailField>
             <DetailField label="Pieces">{activePiecesValue(facts)}</DetailField>
             <DetailField label="Last checked">{freshnessLabel(dataSet.signal.freshness)}</DetailField>

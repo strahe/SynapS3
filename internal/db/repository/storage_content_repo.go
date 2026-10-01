@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -255,6 +256,7 @@ func (r *BunStorageContentRepo) ListCopies(ctx context.Context, contentID int64)
 			active_commit_attempt.attempted_at AS commit_attempted_at,
 			active_commit_attempt.transaction_id AS commit_transaction_id,
 			active_commit_attempt.status_url AS commit_status_url,
+			active_commit_attempt.submit_error AS commit_submit_error,
 			active_commit_attempt.confirmed_transaction_id AS commit_confirmed_transaction_id,
 			active_commit_attempt.attention_code AS commit_attention_code,
 			active_commit_attempt.attention_at AS commit_attention_at
@@ -714,6 +716,29 @@ func (r *BunStorageContentRepo) EnsureDataSetBinding(ctx context.Context, input 
 		return nil
 	})
 	return binding, err
+}
+
+// RecordDataSetCreationError keeps why a creation request whose outcome is
+// unknown failed. It changes nothing once another task owns the data set or
+// the creation has moved on; creation evidence and readiness clear it.
+func (r *BunStorageContentRepo) RecordDataSetCreationError(ctx context.Context, id, taskID int64, message string) error {
+	if id <= 0 || taskID <= 0 || strings.TrimSpace(message) == "" {
+		return fmt.Errorf("recording storage data set creation error: %w", ErrInvalidInput)
+	}
+	_, err := r.db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("last_error = ?", message).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND ensure_task_id = ?", id, taskID).
+		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
+			model.StorageDataSetStatusPending,
+			model.StorageDataSetStatusCreating,
+		})).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("recording storage data set creation error: %w", err)
+	}
+	return nil
 }
 
 // MarkDataSetCreating records a creation request that went out. A generation

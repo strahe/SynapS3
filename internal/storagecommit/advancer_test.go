@@ -392,21 +392,27 @@ func TestAdvancerAmbiguousSubmitErrorRetainsAttemptFence(t *testing.T) {
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
 		return []byte{0xab}, nil
 	}
+	submitErr := fmt.Errorf("add pieces: %w", &pdp.HTTPError{
+		Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: 500, Body: "piece not found",
+	})
 	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
-		return nil, storage.ErrInvalidArgument
+		return nil, submitErr
 	}
 
 	result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
 		Copy: copies[0], Binding: *binding, Target: target,
 		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
 	})
-	if !errors.Is(err, storage.ErrInvalidArgument) || result.State != storagecommit.AdvancePending {
+	if !errors.Is(err, submitErr) || result.State != storagecommit.AdvancePending {
 		t.Fatalf("advance = %#v err=%v, want a fenced pending result carrying the submit error", result, err)
 	}
 	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
 	if persisted.Status != model.StorageCopyStatusCommitting ||
 		persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil {
 		t.Fatalf("ambiguous submit error lost attempt fence: %#v", persisted)
+	}
+	if persisted.CommitSubmitError == nil || *persisted.CommitSubmitError != "provider returned HTTP 500: piece not found" {
+		t.Fatalf("submit error = %v, want the provider's reply", persisted.CommitSubmitError)
 	}
 }
 
@@ -963,6 +969,50 @@ func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
 	if persisted.Status != model.StorageCopyStatusPieceReady || persisted.CommitAttemptID != nil ||
 		persisted.ActiveTaskID == nil || *persisted.ActiveTaskID != claimed.ID {
 		t.Fatalf("released copy = %#v, want piece-ready copy fenced to resumed task", persisted)
+	}
+}
+
+// A stopped confirmation keeps its task visible and counted until it is
+// released: neither a single nor a bulk dismissal can hide it.
+func TestStoppedCommitAttentionStaysVisibleUntilReleased(t *testing.T) {
+	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, testutil.NewTestDB(t))
+	reason := string(storagecommit.AttentionAttemptOnlyAmbiguous)
+	message := "storage registration requires attention"
+	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: &reason, LastError: &message,
+	}); err != nil {
+		t.Fatalf("fail commit task: %v", err)
+	}
+
+	if err := repos.Tasks.AcknowledgeFailed(t.Context(), claimed.ID, time.Hour); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("dismiss stopped confirmation task err = %v, want conflict", err)
+	}
+	backlog := repository.TaskAcknowledgeFilter{Type: model.TaskTypeStorageCommit, FailedBefore: time.Now().Add(time.Minute)}
+	if count, err := repos.Tasks.CountFailedMatching(t.Context(), backlog); err != nil || count != 0 {
+		t.Fatalf("bulk dismissal preview = %d err=%v, want the stopped confirmation left out", count, err)
+	}
+	if count, err := repos.Tasks.AcknowledgeFailedMatching(t.Context(), backlog, time.Hour); err != nil || count != 0 {
+		t.Fatalf("bulk dismissal = %d err=%v, want the stopped confirmation left out", count, err)
+	}
+	records, err := repos.Contents.ListCommitAttentionForTasks(t.Context(), []int64{claimed.ID})
+	if err != nil || len(records) != 1 || records[0].AttemptID != attemptID ||
+		records[0].TaskID == nil || *records[0].TaskID != claimed.ID {
+		t.Fatalf("task confirmations = %#v err=%v, want the stopped attempt", records, err)
+	}
+	counts, err := repos.Contents.CountStoppedCommitAttentionByDataSet(t.Context())
+	if err != nil || len(counts) != 1 || counts[copyRow.StorageDataSetID] != 1 {
+		t.Fatalf("stopped confirmations = %v err=%v, want one on the copy's data set", counts, err)
+	}
+
+	if err := repos.Contents.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
+		CopyID: copyRow.ID, ExpectedAttemptID: attemptID, AcknowledgePossibleDuplicate: true,
+	}); err != nil {
+		t.Fatalf("release commit attention: %v", err)
+	}
+	counts, err = repos.Contents.CountStoppedCommitAttentionByDataSet(t.Context())
+	if err != nil || len(counts) != 0 {
+		t.Fatalf("stopped confirmations after release = %v err=%v, want none", counts, err)
 	}
 }
 
