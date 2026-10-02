@@ -565,12 +565,7 @@ export interface ObjectStatusDetail {
 
 export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 'committed' | 'failed'
 
-export type StorageCommitAttentionCode =
-  | 'attempt_only_ambiguous'
-  | 'unattributed_piece'
-  | 'submission_mismatch'
-  | 'data_set_unavailable'
-  | 'confirmation_timeout'
+export type StorageCommitAttentionCode = 'submission_mismatch' | 'data_set_unavailable' | 'confirmation_timeout'
 
 /** One provider offered for a replacement, with why it cannot be chosen. */
 export interface ReplacementProviderCandidate {
@@ -708,17 +703,17 @@ export interface TaskItem {
   storage_confirmation?: TaskStorageConfirmation
 }
 
-/** The storage confirmation a Confirm storage task holds while it is flagged for attention. */
+/** The storage registration a Confirm storage task holds while it is flagged for attention. */
 export interface TaskStorageConfirmation {
-  copy_id: number
-  attempt_id: string
+  request_id: string
   reason_code: string
   provider_id: string
   data_set_id?: string
-  piece_cid?: string
+  piece_count: number
+  piece_cids: string[]
   transaction_id?: string
   submit_error?: string
-  attempted_at: string
+  submitted_at: string
   attention_at: string
 }
 
@@ -927,6 +922,9 @@ export interface SettingsTaskWorkerConfig {
   retention: string
   provider_mutation_concurrency: number
   destructive_mutation_concurrency: number
+  commit_max_pieces: number
+  commit_max_wait: string
+  commit_max_backlog: number
 }
 
 export interface SettingsLoggingConfig {

@@ -40,19 +40,19 @@ type taskListItem struct {
 	StorageConfirmation *taskStorageConfirmation `json:"storage_confirmation,omitempty"`
 }
 
-// taskStorageConfirmation describes the storage confirmation a Confirm storage
-// task holds while it is flagged for attention.
+// taskStorageConfirmation describes the storage registration a Confirm
+// storage task holds while it is flagged for attention.
 type taskStorageConfirmation struct {
-	CopyID        int64  `json:"copy_id"`
-	AttemptID     string `json:"attempt_id"`
-	ReasonCode    string `json:"reason_code"`
-	ProviderID    string `json:"provider_id"`
-	DataSetID     string `json:"data_set_id,omitempty"`
-	PieceCID      string `json:"piece_cid,omitempty"`
-	TransactionID string `json:"transaction_id,omitempty"`
-	SubmitError   string `json:"submit_error,omitempty"`
-	AttemptedAt   string `json:"attempted_at"`
-	AttentionAt   string `json:"attention_at"`
+	RequestID     string   `json:"request_id"`
+	ReasonCode    string   `json:"reason_code"`
+	ProviderID    string   `json:"provider_id"`
+	DataSetID     string   `json:"data_set_id,omitempty"`
+	PieceCount    int      `json:"piece_count"`
+	PieceCIDs     []string `json:"piece_cids"`
+	TransactionID string   `json:"transaction_id,omitempty"`
+	SubmitError   string   `json:"submit_error,omitempty"`
+	SubmittedAt   string   `json:"submitted_at"`
+	AttentionAt   string   `json:"attention_at"`
 }
 
 type taskListResponse struct {
@@ -221,12 +221,17 @@ func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []mode
 			continue
 		}
 		items[i].Acknowledgeable = false
+		pieceCIDs := record.PieceCIDs
+		if pieceCIDs == nil {
+			pieceCIDs = []string{}
+		}
 		items[i].StorageConfirmation = &taskStorageConfirmation{
-			CopyID: record.CopyID, AttemptID: record.AttemptID, ReasonCode: string(record.Code),
-			ProviderID: record.ProviderID, DataSetID: record.DataSetID, PieceCID: record.PieceCID,
+			RequestID: record.RequestID, ReasonCode: string(record.Code),
+			ProviderID: record.ProviderID, DataSetID: record.DataSetID,
+			PieceCount: len(pieceCIDs), PieceCIDs: pieceCIDs,
 			TransactionID: record.TransactionID,
 			SubmitError:   record.SubmitError,
-			AttemptedAt:   record.AttemptedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
+			SubmittedAt:   record.SubmittedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
 		}
 	}
 }

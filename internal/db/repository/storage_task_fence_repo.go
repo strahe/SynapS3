@@ -65,7 +65,7 @@ func (r *BunStorageContentRepo) BindCopyTask(ctx context.Context, copyID, genera
 func (r *BunStorageContentRepo) AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error) {
 	copyRow := new(model.StorageCopy)
 	q := r.db.NewSelect().Model(copyRow)
-	projectActiveCommitAttempt(q, "storage_copy")
+	projectCommitRequest(q, "storage_copy")
 	err := q.
 		Join("JOIN tasks AS copy_task ON copy_task.id = storage_copy.active_task_id").
 		Where("storage_copy.id = ? AND storage_copy.work_generation = ? AND storage_copy.active_task_id = ?", copyID, generation, taskID).
@@ -88,7 +88,7 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 ||
 		input.AttemptID == "" || input.SourcePieceCID == "" ||
 		input.SourceProviderID == nil || input.SourceDataSetID == nil || input.SourcePieceID == nil ||
-		input.SourceRetrievalURL == "" || input.CommitExtraDataHex == "" {
+		input.SourceRetrievalURL == "" || input.CommitRequest.RequestID == "" {
 		return ErrInvalidInput
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
@@ -96,7 +96,7 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 		copyRow := new(model.StorageCopy)
 		if err := db.NewSelect().
 			Model(copyRow).
-			Column("content_id", "storage_data_set_id").
+			Column("content_id", "storage_data_set_id", "commit_request_id").
 			Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
 			Scan(ctx); err != nil {
 			if err == sql.ErrNoRows {
@@ -104,18 +104,6 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 			}
 			return fmt.Errorf("reserving storage pull request: %w", err)
 		}
-		// The extra data is presigned for this target and is reused across
-		// recovery, so it stays on the copy where the commit path reads it.
-		if _, err := db.NewUpdate().
-			Model((*model.StorageCopy)(nil)).
-			Set("commit_extra_data_hex = COALESCE(commit_extra_data_hex, ?)", input.CommitExtraDataHex).
-			Set("updated_at = ?", now).
-			Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
-			Where("commit_extra_data_hex IS NULL OR commit_extra_data_hex = ?", input.CommitExtraDataHex).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("reserving storage pull commit evidence: %w", err)
-		}
-
 		existing := new(storagepull.Attempt)
 		err := db.NewSelect().
 			Model(existing).
@@ -148,7 +136,21 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 			}
 			return fmt.Errorf("reserving storage pull request: %w", err)
 		}
-		return nil
+		// The Pull hands the provider a signed add-pieces request, so that
+		// request is on record before it leaves this process. A signed member
+		// pulled again sends the request it already belongs to.
+		if copyRow.CommitRequestID != nil {
+			if *copyRow.CommitRequestID != input.CommitRequest.RequestID {
+				return fmt.Errorf("reserving storage pull request: %w", ErrConflict)
+			}
+			return nil
+		}
+		request := input.CommitRequest
+		request.CopyID, request.ContentID, request.StorageDataSetID, request.Now = input.CopyID, copyRow.ContentID, copyRow.StorageDataSetID, now
+		if request.PieceCID == "" {
+			request.PieceCID = input.SourcePieceCID
+		}
+		return createPullCommitRequest(ctx, db, request)
 	})
 }
 

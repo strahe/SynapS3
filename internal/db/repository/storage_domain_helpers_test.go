@@ -762,7 +762,7 @@ func commitStorageHealthCopy(
 	}}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		ContentID: contentID, CopyIndex: copyIndex, PieceCID: "bafk2bzacestorhealth",
 		PieceID: onChainIDPtr(t, pieceID), RetrievalURL: retrievalURL,
 	})

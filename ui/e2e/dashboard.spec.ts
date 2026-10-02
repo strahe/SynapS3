@@ -5,7 +5,7 @@ import { expect, test } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
 
-test('a stopped storage confirmation shows its identity and offers Retry instead of a release', async ({
+test('a stopped storage registration shows its identity and offers Retry instead of a release', async ({
   page,
   systemServer,
 }) => {
@@ -23,14 +23,14 @@ test('a stopped storage confirmation shows its identity and offers Retry instead
     created_at: '2026-10-01T00:00:00Z',
     updated_at: '2026-10-01T00:00:00Z',
     storage_confirmation: {
-      copy_id: 447,
-      attempt_id: 'attempt-1',
+      request_id: 'request-1',
       reason_code: 'submission_mismatch',
       provider_id: '32',
       data_set_id: '39911',
-      piece_cid: 'bafy-piece-1',
+      piece_count: 2,
+      piece_cids: ['bafy-piece-1', 'bafy-piece-2'],
       transaction_id: transaction,
-      attempted_at: '2026-10-01T00:00:00Z',
+      submitted_at: '2026-10-01T00:00:00Z',
       attention_at: '2026-10-01T00:00:01Z',
     },
   }
@@ -53,6 +53,7 @@ test('a stopped storage confirmation shows its identity and offers Retry instead
     'Provider: 32',
     'Data set: 39911',
     'Piece CID: bafy-piece-1',
+    'Piece CID: bafy-piece-2',
     `Transaction: ${transaction}`,
   ]) {
     await expect(page.getByRole('note', { name: identity, exact: true })).toBeVisible()

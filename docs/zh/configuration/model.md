@@ -101,6 +101,9 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `worker.tasks.retention` | `168h` |
 | `worker.tasks.provider_mutation_concurrency` | `4` |
 | `worker.tasks.destructive_mutation_concurrency` | `2` |
+| `worker.tasks.commit_max_pieces` | `32` |
+| `worker.tasks.commit_max_wait` | `30s` |
+| `worker.tasks.commit_max_backlog` | `256` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
@@ -108,6 +111,8 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `admin.auth.session_ttl` | `12h` |
 
 `worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。操作遇到对应额度已满时会先让出、稍后自动再试，不占用 `concurrency` 名额，其他后台任务照常运行。任务设置修改后必须重启 SynapS3，已经创建的任务保留创建时记录的重试上限。
+
+写入同一存储服务的上传会合并在链上登记，一次签名请求和一笔交易即可覆盖多个 piece。`commit_max_pieces`（1–200）限制一次登记包含的 piece 数；在网络紧凑存储分界之前创建的存储服务每次最多 80 个。同一存储服务仍有其他上传在传输时，登记最多等待 `commit_max_wait`（0–10m）让它们加入。从其他存储提供方复制的副本每次只登记一个 piece。某个存储服务等待登记的已上传 piece 达到 `commit_max_backlog`（不小于 `commit_max_pieces`）后，写入该存储服务的后续上传会等待。把 `commit_max_pieces` 调到 40 以上之前，请先在你的网络上确认一次大批量登记能够成功。
 
 ## Admin 会话时长
 

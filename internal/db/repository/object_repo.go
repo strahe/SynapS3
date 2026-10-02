@@ -13,7 +13,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
@@ -1094,7 +1093,7 @@ func prepareObjectVersionsForPermanentDelete(
 	var copies []model.StorageCopy
 	if len(contentIDs) > 0 {
 		query := db.NewSelect().Model(&copies)
-		projectActiveCommitAttempt(query, "storage_copy")
+		projectCommitRequest(query, "storage_copy")
 		if err := query.
 			Where("storage_copy.content_id IN (?)", bun.List(contentIDs)).
 			OrderExpr("storage_copy.id ASC").
@@ -1158,30 +1157,21 @@ func prepareObjectVersionsForPermanentDelete(
 			continue
 		}
 		for _, copyRow := range copiesByContentID[contentID] {
-			if storageUploadCopyHasAttemptedCommit(copyRow) {
+			if storageUploadCopyAwaitsRegistration(copyRow) {
 				return ErrPermanentDeleteStorageBusy
 			}
 			if !storageUploadCopyCanBeCancelledForPermanentDelete(copyRow) {
 				continue
 			}
 			now := time.Now()
-			if _, err := db.NewUpdate().
-				Model((*storagecommit.Attempt)(nil)).
-				Set("status = ?", storagecommit.AttemptStatusReleased).
-				Set("release_reason = ?", string(storagecommit.ReleaseOwnerTerminal)).
-				Set("resolved_at = ?", now).
-				Set("updated_at = ?", now).
-				Where("content_id = ? AND storage_data_set_id = ?", copyRow.ContentID, copyRow.StorageDataSetID).
-				Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusReserved).
-				Exec(ctx); err != nil {
-				return fmt.Errorf("releasing storage reservation for permanent delete: %w", err)
+			if err := releaseCollectingCommitMembership(ctx, db, copyRow.ID, now); err != nil {
+				return fmt.Errorf("releasing storage registration for permanent delete: %w", err)
 			}
 			res, err := db.NewUpdate().
 				Model((*model.StorageCopy)(nil)).
 				Set("status = ?", model.StorageCopyStatusFailed).
 				Set("active_task_id = NULL").
 				Set("commit_ready_at = NULL").
-				Set("commit_extra_data_hex = NULL").
 				Set("last_error = ?", "cancelled because the last object version was permanently deleted").
 				Set("updated_at = ?", now).
 				Where("id = ?", copyRow.ID).
@@ -1195,12 +1185,9 @@ func prepareObjectVersionsForPermanentDelete(
 					WHERE terminal_task.id = storage_copy.active_task_id
 					  AND terminal_task.status IN (?, ?, ?)
 				)`, model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled).
-				Where(`NOT EXISTS (
-					SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
-					WHERE unresolved_attempt.content_id = storage_copy.content_id
-					  AND unresolved_attempt.storage_data_set_id = storage_copy.storage_data_set_id
-					  AND unresolved_attempt.resolved_at IS NULL
-				)`).
+				// A copy signed into a request since it was read is that request's
+				// to decide.
+				Where("commit_position IS NULL").
 				Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("cancelling storage copy for permanent delete: %w", err)
@@ -1208,9 +1195,6 @@ func prepareObjectVersionsForPermanentDelete(
 			rows, _ := res.RowsAffected()
 			if rows == 0 {
 				return fmt.Errorf("cancelling storage copy %d for permanent delete: %w", copyRow.ID, ErrPermanentDeleteStorageBusy)
-			}
-			if err := wakeCommitFIFOHead(ctx, db, copyRow.StorageDataSetID); err != nil {
-				return err
 			}
 		}
 		if _, err := db.NewUpdate().
@@ -1305,16 +1289,11 @@ func storageUploadCopyCanBeCancelledForPermanentDelete(copyRow model.StorageCopy
 	}
 }
 
-func storageUploadCopyHasAttemptedCommit(copyRow model.StorageCopy) bool {
-	if copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" && copyRow.CommitAttemptedAt != nil {
-		return true
-	}
-	// A transaction id outside 'committed' records a submission whose outcome was
-	// never resolved, including rows older code left behind when it sent a
-	// submitted copy back to 'piece_ready'. Treat those as busy so a permanent
-	// delete cannot discard a piece the provider may still be paid to keep.
-	return copyRow.Status != model.StorageCopyStatusCommitted &&
-		copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
+// storageUploadCopyAwaitsRegistration reports a copy signed into a request
+// that is not settled. Its piece may already be on chain, or will be once the
+// request is sent, so the bytes cannot be released yet.
+func storageUploadCopyAwaitsRegistration(copyRow model.StorageCopy) bool {
+	return copyRow.CommitPinned()
 }
 
 // reserveStorageCleanupForDeletedVersions starts the cleanup of content once the

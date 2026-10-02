@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
@@ -392,35 +391,21 @@ func clearUnattemptedReplacementReservation(
 	if targetDataSetID == 0 {
 		return nil
 	}
-	if _, err := db.NewUpdate().
-		Model((*storagecommit.Attempt)(nil)).
-		Set("status = ?", storagecommit.AttemptStatusReleased).
-		Set("release_reason = ?", string(storagecommit.ReleaseOwnerTerminal)).
-		Set("resolved_at = ?", now).
-		Set("updated_at = ?", now).
-		Where("content_id = ? AND storage_data_set_id = ?", contentID, targetDataSetID).
-		Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusReserved).
-		Exec(ctx); err != nil {
-		return err
-	}
-	_, err := db.NewUpdate().
+	var copyIDs []int64
+	if err := db.NewSelect().
 		Model((*model.StorageCopy)(nil)).
-		Set("commit_ready_at = NULL").
-		Set("commit_extra_data_hex = NULL").
-		Set("updated_at = ?", now).
+		Column("id").
 		Where("content_id = ? AND storage_data_set_id = ?", contentID, targetDataSetID).
 		Where("status = ?", model.StorageCopyStatusPieceReady).
-		Where(`NOT EXISTS (
-			SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
-			WHERE unresolved_attempt.content_id = storage_copy.content_id
-			  AND unresolved_attempt.storage_data_set_id = storage_copy.storage_data_set_id
-			  AND unresolved_attempt.resolved_at IS NULL
-		)`).
-		Exec(ctx)
-	if err != nil {
+		Scan(ctx, &copyIDs); err != nil {
 		return err
 	}
-	return wakeCommitFIFOHead(ctx, db, targetDataSetID)
+	for _, copyID := range copyIDs {
+		if err := releaseCollectingCommitMembership(ctx, db, copyID, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func sourceCopyState(ctx context.Context, db bun.IDB, contentID, sourceDataSetID int64) (bool, bool, error) {

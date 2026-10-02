@@ -119,6 +119,11 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 		Retention:                      time.Hour,
 		ProviderMutationConcurrency:    4,
 		DestructiveMutationConcurrency: 2,
+		CommitMaxPieces:                config.DefaultCommitMaxPieces,
+		// Uploads made together still register together, without the
+		// production wait for stragglers.
+		CommitMaxWait:    time.Second,
+		CommitMaxBacklog: config.DefaultCommitMaxBacklog,
 	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(AdminPassword), bcrypt.MinCost)
 	if err != nil {

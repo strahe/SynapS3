@@ -71,17 +71,19 @@ func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID,
 				return ErrConflict
 			}
 		}
+		// The Pull's request named a piece the target never received; a Store
+		// from cache registers through a request of its own.
+		if err := abandonUnsentPullCommitRequest(ctx, db, copyID, "pull failed; recovering from cache", now); err != nil {
+			return err
+		}
 		result, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
 			Set("transfer_method = ?", model.StorageCopyTransferMethodCacheRestore).
-			Set("commit_extra_data_hex = NULL").Set("ingress_bytes_transferred = 0").
+			Set("ingress_bytes_transferred = 0").
 			Set("ingress_store_attempt = 0").Set("progress_updated_at = NULL").
 			Set("updated_at = ?", now).
 			Where("id = ? AND work_generation = ? AND active_task_id = ?", copyID, generation, taskID).
 			Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodPeerPull).
-			Where(`NOT EXISTS (SELECT 1 FROM storage_commit_attempts AS attempt
-				WHERE attempt.content_id = storage_copy.content_id
-				  AND attempt.storage_data_set_id = storage_copy.storage_data_set_id
-				  AND attempt.resolved_at IS NULL)`).Exec(ctx)
+			Where("commit_request_id IS NULL").Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("setting cache restore transfer: %w", err)
 		}
@@ -121,7 +123,7 @@ func (r *BunStorageContentRepo) AbandonMigrationPull(ctx context.Context, copyID
 		if rows, _ := result.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		return nil
+		return abandonUnsentPullCommitRequest(ctx, db, copyID, "pull failed; local cache unavailable", now)
 	})
 }
 

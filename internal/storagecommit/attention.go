@@ -2,19 +2,18 @@ package storagecommit
 
 import "time"
 
+// AttentionRecord describes one submitted request flagged for operator
+// attention.
 type AttentionRecord struct {
-	CopyID        int64
+	RequestID     string
 	TaskID        *int64
-	ContentID     int64
-	CopyIndex     int
 	DataSetRowID  int64
 	ProviderID    string
 	DataSetID     string
-	PieceCID      string
-	AttemptID     string
+	PieceCIDs     []string
 	TransactionID string
 	SubmitError   string
 	Code          AttentionCode
-	AttemptedAt   time.Time
+	SubmittedAt   time.Time
 	AttentionAt   time.Time
 }

@@ -538,22 +538,22 @@ type storageCopy2026090101 struct {
 	// ContentSize repeats storage_contents.content_size so the ingress bound
 	// stays a local CHECK. A composite foreign key keeps the copy from
 	// drifting away from the content it transfers.
-	ContentSize        int64   `bun:",notnull"`
-	StorageDataSetID   int64   `bun:",notnull"`
-	CopyIndex          int     `bun:"type:integer,notnull"`
-	ProviderID         string  `bun:"type:text,notnull"`
-	PieceID            *string `bun:"type:text"`
-	TransferMethod     string  `bun:"type:text,notnull"`
-	Status             string  `bun:"type:text,notnull,default:'pending'"`
-	RetrievalURL       *string `bun:"type:text"`
-	CommitExtraDataHex *string `bun:"type:text"`
-	CommitReadyAt      *time.Time
-	// The confirmed commit attempt this copy projects. Its status is repeated so
-	// a composite foreign key can require the referenced attempt to be
-	// confirmed, and the same key carries the copy's content and data set, so
-	// the attempt must be the one made for this copy.
-	ConfirmedAttemptID      *string `bun:"type:text"`
-	ConfirmedAttemptStatus  *string `bun:"type:text"`
+	ContentSize      int64   `bun:",notnull"`
+	StorageDataSetID int64   `bun:",notnull"`
+	CopyIndex        int     `bun:"type:integer,notnull"`
+	ProviderID       string  `bun:"type:text,notnull"`
+	PieceID          *string `bun:"type:text"`
+	TransferMethod   string  `bun:"type:text,notnull"`
+	Status           string  `bun:"type:text,notnull,default:'pending'"`
+	RetrievalURL     *string `bun:"type:text"`
+	CommitReadyAt    *time.Time
+	// The commit request this copy belongs to and, once sealed, its position in
+	// that request. CommitRequestStatus repeats the request's status only once
+	// the copy is committed, so a composite foreign key can require that request
+	// to be confirmed.
+	CommitRequestID         *string `bun:"type:text"`
+	CommitPosition          *int    `bun:"type:integer"`
+	CommitRequestStatus     *string `bun:"type:text"`
 	IngressBytesTransferred int64   `bun:",notnull,default:0"`
 	IngressStoreAttempt     int     `bun:"type:integer,notnull,default:0"`
 	ProgressUpdatedAt       *time.Time
@@ -564,26 +564,50 @@ type storageCopy2026090101 struct {
 	UpdatedAt               time.Time `bun:",notnull"`
 }
 
-type storageCommitAttempt2026090101 struct {
-	bun.BaseModel `bun:"table:storage_commit_attempts"`
+// storageCommitRequest2026090101 is the ledger of one signed add-pieces
+// request: the data set it names, every send of it, and its outcome. It
+// outlives the copies it registers.
+type storageCommitRequest2026090101 struct {
+	bun.BaseModel `bun:"table:storage_commit_requests"`
 
-	AttemptID              string  `bun:"type:text,pk"`
-	ContentID              int64   `bun:",notnull"`
-	StorageDataSetID       int64   `bun:",notnull"`
-	Status                 string  `bun:"type:text,notnull,default:'reserved'"`
+	RequestID              string `bun:"type:text,pk"`
+	StorageDataSetID       int64  `bun:",notnull"`
+	Status                 string `bun:"type:text,notnull"`
+	TaskID                 *int64
+	PieceCount             int     `bun:"type:integer,notnull"`
 	ExtraDataHex           *string `bun:"type:text"`
+	SealedAt               *time.Time
+	FirstSentAt            *time.Time
+	Sends                  int `bun:"type:integer,notnull"`
+	SubmittedAt            *time.Time
+	LastSentAt             *time.Time
 	TransactionID          *string `bun:"type:text"`
 	StatusURL              *string `bun:"type:text"`
 	SubmitError            *string `bun:"type:text"`
+	Refusals               int     `bun:"type:integer,notnull"`
+	RetryAt                *time.Time
+	FirstPieceID           *string `bun:"type:text"`
 	ConfirmedTransactionID *string `bun:"type:text"`
+	ConfirmedAt            *time.Time
+	LastError              *string `bun:"type:text"`
 	AttentionCode          *string `bun:"type:text"`
 	AttentionAt            *time.Time
-	ReleaseReason          *string `bun:"type:text"`
-	LastError              *string `bun:"type:text"`
-	AttemptedAt            *time.Time
-	ResolvedAt             *time.Time
 	CreatedAt              time.Time `bun:",notnull"`
 	UpdatedAt              time.Time `bun:",notnull"`
+}
+
+// storageCommitRequestPiece2026090101 names one piece of a sealed request at
+// its position. Rows are written once, when the request is signed.
+type storageCommitRequestPiece2026090101 struct {
+	bun.BaseModel `bun:"table:storage_commit_request_pieces"`
+
+	ID               int64     `bun:",pk,autoincrement,identity"`
+	RequestID        string    `bun:"type:text,notnull"`
+	Position         int       `bun:"type:integer,notnull"`
+	ContentID        int64     `bun:",notnull"`
+	StorageDataSetID int64     `bun:",notnull"`
+	PieceCID         string    `bun:"type:text,notnull"`
+	CreatedAt        time.Time `bun:",notnull"`
 }
 
 // storagePullAttempt2026090101 is the ledger of provider-side copy requests.
@@ -760,6 +784,8 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				"(retirement_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
 		},
+		storageCommitRequestTable2026090101(),
+		storageCommitRequestPieceTable2026090101(),
 		{
 			name:  "storage_copies",
 			model: (*storageCopy2026090101)(nil),
@@ -769,15 +795,25 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				"CONSTRAINT fk_storage_copies_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"CONSTRAINT chk_storage_copies_work_generation CHECK (work_generation >= 0)",
 				"CONSTRAINT chk_storage_copies_status CHECK (status IN ('pending', 'piece_ready', 'committing', 'committed', 'failed'))",
-				// The projected status is pinned to a literal so the composite
-				// foreign key below can only ever reach a confirmed attempt.
-				"CONSTRAINT chk_storage_copies_confirmed_attempt_status CHECK (confirmed_attempt_status IS NULL OR confirmed_attempt_status = 'confirmed')",
-				// Committed and "has confirmed evidence" are the same fact. The
+				// The repeated request status is pinned to a literal so the
+				// composite foreign key below can only ever reach a confirmed
+				// request.
+				"CONSTRAINT chk_storage_copies_commit_request_status CHECK (commit_request_status IS NULL OR commit_request_status = 'confirmed')",
+				// Committed and "names a confirmed request" are the same fact. The
 				// foreign key alone would still allow a committed copy with no
-				// evidence at all, so both directions are stated here.
-				"CONSTRAINT chk_storage_copies_committed_evidence CHECK ((status = 'committed') = (confirmed_attempt_id IS NOT NULL))",
-				"CONSTRAINT chk_storage_copies_confirmed_attempt_shape CHECK ((confirmed_attempt_id IS NULL AND confirmed_attempt_status IS NULL) OR (confirmed_attempt_id IS NOT NULL AND confirmed_attempt_id <> '' AND confirmed_attempt_status IS NOT NULL))",
-				"CONSTRAINT chk_storage_copies_optional_identity CHECK (provider_id <> '' AND (piece_id IS NULL OR piece_id <> '') AND (retrieval_url IS NULL OR retrieval_url <> '') AND (commit_extra_data_hex IS NULL OR commit_extra_data_hex <> ''))",
+				// request at all, so both directions are stated here.
+				"CONSTRAINT chk_storage_copies_committed_evidence CHECK ((status = 'committed') = (commit_request_status IS NOT NULL))",
+				"CONSTRAINT chk_storage_copies_commit_membership CHECK ((commit_request_id IS NULL OR commit_request_id <> '') AND (commit_position IS NULL OR (commit_request_id IS NOT NULL AND commit_position >= 0)) AND (commit_request_status IS NULL OR commit_position IS NOT NULL))",
+				// A position is assigned when the request is signed, which is also
+				// when its transferred members start registering; a member sent
+				// back to transfer is pending, never piece_ready.
+				"CONSTRAINT chk_storage_copies_commit_position CHECK ((status <> 'committing' OR commit_position IS NOT NULL) AND (status <> 'piece_ready' OR commit_position IS NULL))",
+				"CONSTRAINT fk_storage_copies_commit_request FOREIGN KEY (commit_request_id, storage_data_set_id) REFERENCES storage_commit_requests (request_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+				// A sealed copy names its own position in the request it was signed
+				// into, and a committed one names a confirmed request.
+				"CONSTRAINT fk_storage_copies_commit_piece FOREIGN KEY (commit_request_id, commit_position, content_id, storage_data_set_id) REFERENCES storage_commit_request_pieces (request_id, position, content_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+				"CONSTRAINT fk_storage_copies_confirmed_request FOREIGN KEY (commit_request_id, storage_data_set_id, commit_request_status) REFERENCES storage_commit_requests (request_id, storage_data_set_id, status) ON UPDATE RESTRICT ON DELETE RESTRICT",
+				"CONSTRAINT chk_storage_copies_optional_identity CHECK (provider_id <> '' AND (piece_id IS NULL OR piece_id <> '') AND (retrieval_url IS NULL OR retrieval_url <> ''))",
 				"CONSTRAINT chk_storage_copies_committed_shape CHECK (status <> 'committed' OR (piece_id IS NOT NULL AND piece_id <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))",
 				"CONSTRAINT chk_storage_copies_commit_ready CHECK (commit_ready_at IS NULL OR status IN ('piece_ready', 'committing', 'committed'))",
 				"CONSTRAINT chk_storage_copies_content_size CHECK (content_size >= 0)",
@@ -792,9 +828,7 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				"(storage_data_set_id, bucket_id, copy_index, provider_id) REFERENCES storage_data_sets (id, bucket_id, copy_index, provider_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"(active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
-			forwardForeignKeys: []initialForwardForeignKey{storageCopyConfirmedAttemptForeignKey2026090101()},
 		},
-		storageCommitAttemptTable2026090101(),
 		storagePullAttemptTable2026090101(),
 		storageReplacementTable2026090101(),
 		storageDataSetTerminationTable2026090101(),
@@ -806,51 +840,58 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 			return err
 		}
 	}
-	if err := createInitialIndexes(ctx, db, storageIndexes2026090101()...); err != nil {
-		return err
-	}
-	// storage_copies was created before storage_commit_attempts existed, so
-	// PostgreSQL takes the projection constraint here.
-	return addForwardForeignKey(ctx, db, "storage_copies", storageCopyConfirmedAttemptForeignKey2026090101())
+	return createInitialIndexes(ctx, db, storageIndexes2026090101()...)
 }
 
-// storageCopyConfirmedAttemptForeignKey2026090101 welds the copy's committed
-// state to the ledger row that proves it, made for this copy's content and data
-// set. storage_copies is created before storage_commit_attempts, so the
-// constraint is forward-declared.
-func storageCopyConfirmedAttemptForeignKey2026090101() initialForwardForeignKey {
-	return initialForwardForeignKey{
-		name:       "fk_storage_copies_confirmed_attempt",
-		definition: "(confirmed_attempt_id, confirmed_attempt_status, content_id, storage_data_set_id) REFERENCES storage_commit_attempts (attempt_id, status, content_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-	}
-}
-
-func storageCommitAttemptTable2026090101() initialTableSpec {
+func storageCommitRequestTable2026090101() initialTableSpec {
 	return initialTableSpec{
-		name:  "storage_commit_attempts",
-		model: (*storageCommitAttempt2026090101)(nil),
+		name:  "storage_commit_requests",
+		model: (*storageCommitRequest2026090101)(nil),
 		constraints: []string{
-			"CONSTRAINT chk_storage_commit_attempts_identity CHECK (attempt_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (submit_error IS NULL OR submit_error <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (attention_code IS NULL OR attention_code <> '') AND (release_reason IS NULL OR release_reason <> ''))",
-			"CONSTRAINT chk_storage_commit_attempts_status CHECK (status IN ('reserved', 'attempted', 'confirmed', 'released', 'rejected'))",
-			// Candidate key for the copy's confirmed-attempt projection.
-			"CONSTRAINT uq_storage_commit_attempts_projection UNIQUE (attempt_id, status, content_id, storage_data_set_id)",
-			"CONSTRAINT chk_storage_commit_attempts_resolution CHECK ((status IN ('reserved', 'attempted') AND resolved_at IS NULL) OR (status IN ('confirmed', 'released', 'rejected') AND resolved_at IS NOT NULL))",
-			`CONSTRAINT chk_storage_commit_attempts_evidence_shape CHECK (
-				(status = 'reserved' AND attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND status_url IS NULL AND confirmed_transaction_id IS NULL AND attention_code IS NULL AND attention_at IS NULL AND last_error IS NULL)
-				OR (status = 'attempted' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND confirmed_transaction_id IS NULL AND last_error IS NULL)
-				OR (status = 'confirmed' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND transaction_id IS NOT NULL AND confirmed_transaction_id IS NOT NULL AND last_error IS NULL)
-				OR (status = 'released' AND confirmed_transaction_id IS NULL AND last_error IS NULL AND ((attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND status_url IS NULL AND attention_code IS NULL AND attention_at IS NULL) OR (attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL)))
-				OR (status = 'rejected' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND confirmed_transaction_id IS NULL AND last_error IS NOT NULL AND last_error <> '')
+			// Candidate keys for the copy foreign keys: membership in the
+			// request's data set, and a committed copy's confirmed request.
+			"CONSTRAINT uq_storage_commit_requests_data_set UNIQUE (request_id, storage_data_set_id)",
+			"CONSTRAINT uq_storage_commit_requests_status UNIQUE (request_id, storage_data_set_id, status)",
+			"CONSTRAINT chk_storage_commit_requests_identity CHECK (request_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (submit_error IS NULL OR submit_error <> '') AND (first_piece_id IS NULL OR first_piece_id <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (last_error IS NULL OR last_error <> '') AND (attention_code IS NULL OR attention_code <> ''))",
+			"CONSTRAINT chk_storage_commit_requests_status CHECK (status IN ('collecting', 'ready', 'submitted', 'confirmed', 'abandoned'))",
+			"CONSTRAINT chk_storage_commit_requests_counts CHECK (piece_count >= 0 AND sends >= 0 AND refusals >= 0)",
+			// The task drives the request until it is settled, and is released
+			// then so task retention can delete it.
+			"CONSTRAINT chk_storage_commit_requests_task CHECK ((status IN ('confirmed', 'abandoned')) = (task_id IS NULL))",
+			`CONSTRAINT chk_storage_commit_requests_shape CHECK (
+				(status = 'collecting' AND piece_count = 0 AND extra_data_hex IS NULL AND sealed_at IS NULL AND first_sent_at IS NULL AND sends = 0 AND submitted_at IS NULL AND last_sent_at IS NULL AND transaction_id IS NULL AND first_piece_id IS NULL AND confirmed_transaction_id IS NULL AND confirmed_at IS NULL)
+				OR (status = 'ready' AND piece_count >= 1 AND extra_data_hex IS NOT NULL AND sealed_at IS NOT NULL AND sends = 0 AND submitted_at IS NULL AND transaction_id IS NULL AND first_piece_id IS NULL AND confirmed_transaction_id IS NULL AND confirmed_at IS NULL)
+				OR (status = 'submitted' AND piece_count >= 1 AND extra_data_hex IS NOT NULL AND sealed_at IS NOT NULL AND first_sent_at IS NOT NULL AND sends >= 1 AND submitted_at IS NOT NULL AND last_sent_at IS NOT NULL AND first_piece_id IS NULL AND confirmed_transaction_id IS NULL AND confirmed_at IS NULL)
+				OR (status = 'confirmed' AND piece_count >= 1 AND extra_data_hex IS NOT NULL AND sealed_at IS NOT NULL AND first_sent_at IS NOT NULL AND first_piece_id IS NOT NULL AND confirmed_at IS NOT NULL AND (confirmed_transaction_id IS NULL OR transaction_id IS NOT NULL))
+				OR (status = 'abandoned' AND last_error IS NOT NULL AND first_piece_id IS NULL AND confirmed_transaction_id IS NULL AND confirmed_at IS NULL)
 			)`,
-			"CONSTRAINT chk_storage_commit_attempts_submission_evidence CHECK ((transaction_id IS NULL AND status_url IS NULL) OR (transaction_id IS NOT NULL AND status_url IS NOT NULL))",
-			// Only an attempt that reached the provider can have failed there.
-			"CONSTRAINT chk_storage_commit_attempts_submit_error CHECK (submit_error IS NULL OR attempted_at IS NOT NULL)",
-			"CONSTRAINT chk_storage_commit_attempts_attention CHECK ((attention_code IS NULL AND attention_at IS NULL) OR (attention_code IS NOT NULL AND attention_at IS NOT NULL AND attempted_at IS NOT NULL))",
-			"CONSTRAINT chk_storage_commit_attempts_release CHECK ((status = 'released' AND release_reason IS NOT NULL) OR (status <> 'released' AND release_reason IS NULL))",
+			"CONSTRAINT chk_storage_commit_requests_submission_evidence CHECK ((transaction_id IS NULL AND status_url IS NULL) OR (transaction_id IS NOT NULL AND status_url IS NOT NULL))",
+			// Attention is raised only on a request that may already be on chain.
+			"CONSTRAINT chk_storage_commit_requests_attention CHECK ((attention_code IS NULL AND attention_at IS NULL) OR (attention_code IS NOT NULL AND attention_at IS NOT NULL AND status = 'submitted'))",
 		},
-		// The ledger outlives the copy it was made for: finishing a content's
-		// cleanup deletes the copy, and (content_id, storage_data_set_id) stays
-		// here as a value.
+		foreignKeys: []string{
+			"(storage_data_set_id) REFERENCES storage_data_sets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+			"(task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+		},
+	}
+}
+
+func storageCommitRequestPieceTable2026090101() initialTableSpec {
+	return initialTableSpec{
+		name:  "storage_commit_request_pieces",
+		model: (*storageCommitRequestPiece2026090101)(nil),
+		constraints: []string{
+			"CONSTRAINT uq_storage_commit_request_pieces_position UNIQUE (request_id, position)",
+			"CONSTRAINT uq_storage_commit_request_pieces_content UNIQUE (request_id, content_id, storage_data_set_id)",
+			// Candidate key for the sealed copy's foreign key.
+			"CONSTRAINT uq_storage_commit_request_pieces_member UNIQUE (request_id, position, content_id, storage_data_set_id)",
+			"CONSTRAINT chk_storage_commit_request_pieces_identity CHECK (position >= 0 AND piece_cid <> '')",
+		},
+		foreignKeys: []string{
+			"(request_id, storage_data_set_id) REFERENCES storage_commit_requests (request_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+		},
+		// Like the request, a piece names its content by value: finishing a
+		// content's cleanup deletes the copy and the content, not this row.
 	}
 }
 
@@ -866,7 +907,7 @@ func storagePullAttemptTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_pull_attempts_error CHECK (last_error IS NULL OR (status = 'abandoned' AND last_error <> ''))",
 			"CONSTRAINT chk_storage_pull_attempts_abandoned CHECK (status <> 'abandoned' OR resolved_at IS NOT NULL)",
 		},
-		// Like commit attempts, pull attempts keep the copy identity as values
+		// Like commit requests, pull attempts keep the copy identity as values
 		// once cleanup has deleted the copy.
 	}
 }
@@ -957,13 +998,14 @@ func storageIndexes2026090101() []initialIndexSpec {
 		{name: "idx_storage_copies_ingress_content", table: "storage_copies", columns: []string{"content_id"}, where: "transfer_method = 'ingress' AND status <> 'failed'", unique: true},
 		{name: "idx_storage_copies_status_data_set_content", table: "storage_copies", columns: []string{"status", "storage_data_set_id", "content_id"}},
 		{name: "idx_storage_copies_status_piece_identity_content", table: "storage_copies", columns: []string{"status", "provider_id", "piece_id", "content_id"}},
-		{name: "idx_storage_copies_commit_ready", table: "storage_copies", columns: []string{"storage_data_set_id", "commit_ready_at", "id"}, where: "status = 'piece_ready' AND commit_ready_at IS NOT NULL"},
+		// Members of one request; positions are unique once assigned.
+		{name: "idx_storage_copies_commit_request", table: "storage_copies", columns: []string{"commit_request_id", "commit_position"}, unique: true},
 		{name: "idx_storage_copies_active_task", table: "storage_copies", columns: []string{"active_task_id"}, where: "active_task_id IS NOT NULL", unique: true},
-		{name: "idx_storage_commit_attempts_unresolved_copy", table: "storage_commit_attempts", columns: []string{"content_id", "storage_data_set_id"}, where: "resolved_at IS NULL", unique: true},
-		{name: "idx_storage_commit_attempts_unresolved_data_set", table: "storage_commit_attempts", columns: []string{"storage_data_set_id", "created_at", "attempt_id"}, where: "resolved_at IS NULL"},
-		{name: "idx_storage_commit_attempts_copy_history", table: "storage_commit_attempts", columns: []string{"content_id", "storage_data_set_id", "created_at DESC", "attempt_id"}},
+		{name: "idx_storage_commit_requests_data_set_status", table: "storage_commit_requests", columns: []string{"storage_data_set_id", "status", "created_at", "request_id"}},
+		{name: "idx_storage_commit_requests_task", table: "storage_commit_requests", columns: []string{"task_id"}, where: "task_id IS NOT NULL", unique: true},
+		{name: "idx_storage_commit_requests_attention", table: "storage_commit_requests", columns: []string{"attention_at", "request_id"}, where: "attention_code IS NOT NULL"},
+		{name: "idx_storage_commit_request_pieces_member", table: "storage_commit_request_pieces", columns: []string{"content_id", "storage_data_set_id"}},
 		{name: "idx_storage_cleanup_copies_replica_slot", table: "storage_cleanup_copies", columns: []string{"bucket_id", "copy_index"}},
-		{name: "idx_storage_copies_confirmed_attempt", table: "storage_copies", columns: []string{"confirmed_attempt_id", "confirmed_attempt_status"}, where: "confirmed_attempt_id IS NOT NULL"},
 		{name: "idx_storage_copies_replica_slot", table: "storage_copies", columns: []string{"bucket_id", "copy_index"}},
 		// One unresolved attempt per copy: a second source can only be tried
 		// after the first is abandoned.

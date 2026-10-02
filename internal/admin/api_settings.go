@@ -281,6 +281,9 @@ func applyTaskWorkerUpdate(
 	setDuration("worker.tasks.retention", &target.Retention, req.Retention)
 	setInt("worker.tasks.provider_mutation_concurrency", &target.ProviderMutationConcurrency, req.ProviderMutationConcurrency)
 	setInt("worker.tasks.destructive_mutation_concurrency", &target.DestructiveMutationConcurrency, req.DestructiveMutationConcurrency)
+	setInt("worker.tasks.commit_max_pieces", &target.CommitMaxPieces, req.CommitMaxPieces)
+	setDuration("worker.tasks.commit_max_wait", &target.CommitMaxWait, req.CommitMaxWait)
+	setInt("worker.tasks.commit_max_backlog", &target.CommitMaxBacklog, req.CommitMaxBacklog)
 }
 
 func (s *SettingsService) snapshotLocked(writable bool) settingsResponse {
@@ -413,6 +416,9 @@ type settingsTaskWorkerConfig struct {
 	Retention                      string `json:"retention"`
 	ProviderMutationConcurrency    int    `json:"provider_mutation_concurrency"`
 	DestructiveMutationConcurrency int    `json:"destructive_mutation_concurrency"`
+	CommitMaxPieces                int    `json:"commit_max_pieces"`
+	CommitMaxWait                  string `json:"commit_max_wait"`
+	CommitMaxBacklog               int    `json:"commit_max_backlog"`
 }
 
 type settingsLoggingConfig struct {
@@ -521,6 +527,9 @@ type settingsTaskWorkerUpdate struct {
 	Retention                      *string `json:"retention,omitempty"`
 	ProviderMutationConcurrency    *int    `json:"provider_mutation_concurrency,omitempty"`
 	DestructiveMutationConcurrency *int    `json:"destructive_mutation_concurrency,omitempty"`
+	CommitMaxPieces                *int    `json:"commit_max_pieces,omitempty"`
+	CommitMaxWait                  *string `json:"commit_max_wait,omitempty"`
+	CommitMaxBacklog               *int    `json:"commit_max_backlog,omitempty"`
 }
 
 type settingsLoggingUpdate struct {
@@ -591,6 +600,9 @@ func toSettingsTaskWorkerConfig(cfg config.TaskWorkerConfig) settingsTaskWorkerC
 		Retention:                      cfg.Retention.String(),
 		ProviderMutationConcurrency:    cfg.ProviderMutationConcurrency,
 		DestructiveMutationConcurrency: cfg.DestructiveMutationConcurrency,
+		CommitMaxPieces:                cfg.CommitMaxPieces,
+		CommitMaxWait:                  cfg.CommitMaxWait.String(),
+		CommitMaxBacklog:               cfg.CommitMaxBacklog,
 	}
 }
 
@@ -646,6 +658,9 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"worker.tasks.retention":                        {},
 		"worker.tasks.provider_mutation_concurrency":    {},
 		"worker.tasks.destructive_mutation_concurrency": {},
+		"worker.tasks.commit_max_pieces":                {},
+		"worker.tasks.commit_max_wait":                  {},
+		"worker.tasks.commit_max_backlog":               {},
 		"logging.level":                                 {},
 		"logging.format":                                {},
 		"logging.s3_access.enabled":                     {},

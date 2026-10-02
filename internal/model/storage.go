@@ -141,14 +141,15 @@ type StorageCopy struct {
 	Status           StorageCopyStatus         `bun:"type:text,notnull,default:'pending'"`
 	RetrievalURL     *string                   `bun:"type:text,nullzero"`
 	// IsNewDataSet is derived by repository reads from the data set's creator.
-	IsNewDataSet       bool       `bun:",scanonly"`
-	CommitExtraDataHex *string    `bun:"type:text,nullzero"`
-	CommitReadyAt      *time.Time `bun:",nullzero"`
-	// ConfirmedAttemptID and ConfirmedAttemptStatus project the ledger row that
-	// proves this copy is committed. A composite foreign key requires the named
-	// attempt to actually be confirmed, so the projection cannot drift.
-	ConfirmedAttemptID      *string    `bun:"type:text,nullzero"`
-	ConfirmedAttemptStatus  *string    `bun:"type:text,nullzero"`
+	IsNewDataSet  bool       `bun:",scanonly"`
+	CommitReadyAt *time.Time `bun:",nullzero"`
+	// CommitRequestID names the commit request the copy belongs to, and
+	// CommitPosition its place once that request is signed. A committed copy
+	// repeats its request's confirmed status in CommitRequestStatus, which a
+	// composite foreign key ties to the request.
+	CommitRequestID         *string    `bun:"type:text,nullzero"`
+	CommitPosition          *int       `bun:"type:integer"`
+	CommitRequestStatus     *string    `bun:"type:text,nullzero"`
 	IngressBytesTransferred int64      `bun:",notnull,default:0"`
 	IngressStoreAttempt     int        `bun:"type:integer,notnull,default:0"`
 	ProgressUpdatedAt       *time.Time `bun:",nullzero"`
@@ -160,12 +161,13 @@ type StorageCopy struct {
 
 	DataSetID *types.OnChainID `bun:"type:text,scanonly"`
 
-	// Commit evidence is projected from storage_commit_attempts by repository
-	// reads. These fields are not columns on the copy table.
-	CommitAttemptID              *string    `bun:",scanonly"`
-	CommitAttemptedAt            *time.Time `bun:",scanonly"`
+	// The copy's commit request is projected by repository reads. These fields
+	// are not columns on the copy table.
+	CommitState                  *string    `bun:",scanonly"`
+	CommitTaskID                 *int64     `bun:",scanonly"`
+	CommitPieceCount             *int       `bun:",scanonly"`
+	CommitSentAt                 *time.Time `bun:",scanonly"`
 	CommitTransactionID          *string    `bun:",scanonly"`
-	CommitStatusURL              *string    `bun:",scanonly"`
 	CommitSubmitError            *string    `bun:",scanonly"`
 	CommitConfirmedTransactionID *string    `bun:",scanonly"`
 	CommitAttentionCode          *string    `bun:",scanonly"`
@@ -173,6 +175,42 @@ type StorageCopy struct {
 
 	Content    *StorageContent `bun:"rel:belongs-to,join:content_id=id"`
 	StorageSet *StorageDataSet `bun:"rel:belongs-to,join:storage_data_set_id=id"`
+}
+
+// CommitSealed reports whether the copy has a position in a signed commit
+// request.
+func (c StorageCopy) CommitSealed() bool { return c.CommitPosition != nil }
+
+// CommitPinned reports whether the copy belongs to a signed commit request that
+// is not settled. Until it is, only the request decides the copy's outcome: a
+// signed request can be sent whole or not at all.
+func (c StorageCopy) CommitPinned() bool {
+	return c.CommitSealed() &&
+		c.Status != StorageCopyStatusCommitted && c.Status != StorageCopyStatusFailed &&
+		(c.CommitState == nil || (*c.CommitState != "confirmed" && *c.CommitState != "abandoned"))
+}
+
+// CommitDecidedByRequest reports whether only the copy's request may settle
+// it. A Pull's single-piece request that was never sent can still be given up
+// with the copy; every other signed request decides its members.
+func (c StorageCopy) CommitDecidedByRequest() bool {
+	if !c.CommitPinned() {
+		return false
+	}
+	solo := c.CommitPieceCount != nil && *c.CommitPieceCount == 1
+	return c.CommitSentAt != nil || !solo
+}
+
+// WorkTaskID is the task currently responsible for the copy: its own transfer
+// task, or, while it waits in a commit request, that request's task.
+func (c StorageCopy) WorkTaskID() *int64 {
+	if c.ActiveTaskID != nil {
+		return c.ActiveTaskID
+	}
+	if c.CommitRequestID != nil && (c.Status == StorageCopyStatusPieceReady || c.Status == StorageCopyStatusCommitting) {
+		return c.CommitTaskID
+	}
+	return nil
 }
 
 var _ bun.BeforeAppendModelHook = (*StorageContent)(nil)

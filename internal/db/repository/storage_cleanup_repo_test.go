@@ -289,7 +289,7 @@ func TestStorageCleanupReferenceChecksIgnoreOwnUnacceptedCopy(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings(shared): %v", err)
 	}
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		ContentID: sharedContentID, CopyIndex: 0, PieceCID: "piece-cid", PieceID: &pieceID,
 		RetrievalURL: retrievalURL,
 	})
@@ -308,18 +308,14 @@ func TestStorageCleanupReferenceChecksIgnoreOwnUnacceptedCopy(t *testing.T) {
 }
 
 func TestStorageCleanupSnapshotsEveryCommittedCopy(t *testing.T) {
-	db, repos, version, secondCopy, identity := seedCleanupCopyCommitBoundary(t)
+	db, repos, version, secondCopy := seedCleanupCopyCommitBoundary(t)
 	ctx := t.Context()
-	attemptID := "late-copy-attempted"
-	if result, err := repos.Contents.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
-		Copy: identity, AttemptID: attemptID,
-	}); err != nil || result.State != storagecommit.ReservationAcquired {
-		t.Fatalf("ReserveCommitAttempt = %#v, %v", result, err)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
-		Copy: identity, AttemptID: attemptID, ExtraDataHex: "abcd",
+	requestID, taskID := collectCleanupBoundaryCopy(t, repos, secondCopy)
+	if _, err := repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
+		RequestID: requestID, TaskID: taskID, ExtraDataHex: "abcd",
+		Members: []repository.SealMember{{CopyID: secondCopy.ID, ContentID: *version.ContentID, PieceCID: "piece-cid"}},
 	}); err != nil {
-		t.Fatalf("MarkCommitAttempted: %v", err)
+		t.Fatalf("SealCommitRequest: %v", err)
 	}
 	deleteVersion := func() (*repository.StorageCleanupReservation, error) {
 		result, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
@@ -327,8 +323,16 @@ func TestStorageCleanupSnapshotsEveryCommittedCopy(t *testing.T) {
 		})
 		return result.StorageCleanup, err
 	}
+	// A signed member waits for its request: the request is sent whole or not
+	// at all.
 	if cleanup, err := deleteVersion(); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) || cleanup != nil {
-		t.Fatalf("delete during attempted commit = %#v, %v, want storage busy", cleanup, err)
+		t.Fatalf("delete with a signed registration = %#v, %v, want storage busy", cleanup, err)
+	}
+	if err := repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: requestID, TaskID: taskID}); err != nil {
+		t.Fatalf("BeginCommitSubmission: %v", err)
+	}
+	if cleanup, err := deleteVersion(); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) || cleanup != nil {
+		t.Fatalf("delete during submitted registration = %#v, %v, want storage busy", cleanup, err)
 	}
 	var cleanupRows int
 	if err := db.NewRaw("SELECT count(*) FROM storage_cleanup_copies WHERE content_id = ?", *version.ContentID).Scan(ctx, &cleanupRows); err != nil {
@@ -337,20 +341,19 @@ func TestStorageCleanupSnapshotsEveryCommittedCopy(t *testing.T) {
 	if cleanupRows != 0 {
 		t.Fatalf("cleanup copies before confirmation = %d, want 0", cleanupRows)
 	}
-	if err := repos.Contents.RecordCommitSubmission(ctx, storagecommit.EvidenceInput{
-		Copy: identity, AttemptID: attemptID, TransactionID: "tx-late-copy",
-		StatusURL: "https://provider.example/status/late-copy",
+	if err := repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
+		CommitSendInput: repository.CommitSendInput{RequestID: requestID, TaskID: taskID, Sends: 1},
+		TransactionID:   "tx-late-copy", StatusURL: "https://provider.example/status/late-copy",
 	}); err != nil {
 		t.Fatalf("RecordCommitSubmission: %v", err)
 	}
 	secondPieceID := onChainID(t, "902")
-	if err := repos.Contents.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		StorageCopyID: secondCopy.ID, ContentID: *version.ContentID, CopyIndex: secondCopy.CopyIndex,
-		PieceCID: "piece-cid", PieceID: &secondPieceID, RetrievalURL: "https://provider.example/second-piece",
-		CommitAttemptID: attemptID, CommitExtraDataHex: "abcd",
-		CommitTransactionID: "tx-late-copy", CommitConfirmedTransactionID: "tx-late-copy",
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	members, err := repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
+		RequestID: requestID, TaskID: taskID, ConfirmedTransactionID: "tx-late-copy",
+		FirstPieceID: secondPieceID, RetrievalURLs: []string{"https://provider.example/second-piece"},
+	})
+	if err != nil || len(members) != 1 || members[0].ID != secondCopy.ID {
+		t.Fatalf("ConfirmCommitRequest = %#v, %v", members, err)
 	}
 	cleanup, err := deleteVersion()
 	if err != nil || cleanup == nil {
@@ -372,45 +375,30 @@ func TestStorageCleanupSnapshotsEveryCommittedCopy(t *testing.T) {
 	}
 }
 
-func TestStorageCleanupCancelsUnattemptedCommitBeforeSnapshot(t *testing.T) {
-	db, repos, version, secondCopy, identity := seedCleanupCopyCommitBoundary(t)
+func TestStorageCleanupCancelsCollectingCommitBeforeSnapshot(t *testing.T) {
+	db, repos, version, secondCopy := seedCleanupCopyCommitBoundary(t)
 	ctx := t.Context()
-	attemptID := "late-copy-reserved"
-	if result, err := repos.Contents.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
-		Copy: identity, AttemptID: attemptID,
-	}); err != nil || result.State != storagecommit.ReservationAcquired {
-		t.Fatalf("ReserveCommitAttempt = %#v, %v", result, err)
-	}
+	requestID, taskID := collectCleanupBoundaryCopy(t, repos, secondCopy)
 	deleted, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
 		BucketID: version.BucketID, Key: version.Key, VersionID: version.VersionID,
 	})
 	if err != nil || deleted.StorageCleanup == nil {
-		t.Fatalf("delete with reserved commit = %#v, %v", deleted, err)
+		t.Fatalf("delete with a collecting registration = %#v, %v", deleted, err)
 	}
 	stored, err := repos.Contents.GetUploadCopyByID(ctx, secondCopy.ID)
-	if err != nil || stored == nil || stored.Status != model.StorageCopyStatusFailed {
-		t.Fatalf("second copy after delete = %#v, %v, want failed", stored, err)
+	if err != nil || stored == nil || stored.Status != model.StorageCopyStatusFailed || stored.CommitRequestID != nil {
+		t.Fatalf("second copy after delete = %#v, %v, want failed outside any request", stored, err)
 	}
-	attempt := new(storagecommit.Attempt)
-	if err := db.NewSelect().Model(attempt).Where("attempt_id = ?", attemptID).Scan(ctx); err != nil {
-		t.Fatalf("load reserved attempt after delete: %v", err)
+	// The request lost its only copy, so it can never be signed.
+	request, err := repos.Contents.GetCommitRequest(ctx, requestID)
+	if err != nil || request.Status != storagecommit.RequestStatusAbandoned || request.TaskID != nil {
+		t.Fatalf("collecting request after delete = %#v, %v, want abandoned", request, err)
 	}
-	if attempt.Status != storagecommit.AttemptStatusReleased || attempt.ResolvedAt == nil {
-		t.Fatalf("reserved attempt after delete = %#v, want released", attempt)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
-		Copy: identity, AttemptID: attemptID, ExtraDataHex: "abcd",
+	if _, err := repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
+		RequestID: requestID, TaskID: taskID, ExtraDataHex: "abcd",
+		Members: []repository.SealMember{{CopyID: secondCopy.ID, ContentID: *version.ContentID, PieceCID: "piece-cid"}},
 	}); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("MarkCommitAttempted after delete = %v, want conflict", err)
-	}
-	secondPieceID := onChainID(t, "902")
-	if err := repos.Contents.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		StorageCopyID: secondCopy.ID, ContentID: *version.ContentID, CopyIndex: secondCopy.CopyIndex,
-		PieceCID: "piece-cid", PieceID: &secondPieceID, RetrievalURL: "https://provider.example/second-piece",
-		CommitAttemptID: attemptID, CommitExtraDataHex: "abcd",
-		CommitTransactionID: "tx-late-copy", CommitConfirmedTransactionID: "tx-late-copy",
-	}); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("MarkUploadCopyCommitted after delete = %v, want conflict", err)
+		t.Fatalf("SealCommitRequest after delete = %v, want conflict", err)
 	}
 	var cleanupRows int
 	if err := db.NewRaw("SELECT count(*) FROM storage_cleanup_copies WHERE content_id = ?", *version.ContentID).Scan(ctx, &cleanupRows); err != nil {
@@ -421,7 +409,28 @@ func TestStorageCleanupCancelsUnattemptedCommitBeforeSnapshot(t *testing.T) {
 	}
 }
 
-func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositories, *model.ObjectVersion, *model.StorageCopy, storagecommit.CopyIdentity) {
+// collectCleanupBoundaryCopy puts the transferred copy into a collecting
+// request driven by a new task.
+func collectCleanupBoundaryCopy(t *testing.T, repos *repository.Repositories, copyRow *model.StorageCopy) (string, int64) {
+	t.Helper()
+	requestID := "cleanup-boundary-request"
+	taskRow, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		Type: model.TaskTypeStorageCommit, IdempotencyKey: "cleanup-boundary-commit", InputVersion: 1,
+		Input: []byte(`{"request_id":"cleanup-boundary-request"}`), InputHash: "cleanup-boundary-commit",
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue commit task: %v", err)
+	}
+	if err := repos.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
+		RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: copyRow.StorageDataSetID, CopyIDs: []int64{copyRow.ID},
+	}); err != nil {
+		t.Fatalf("CreateCollectingCommitRequest: %v", err)
+	}
+	return requestID, taskRow.ID
+}
+
+func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositories, *model.ObjectVersion, *model.StorageCopy) {
 	t.Helper()
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -470,15 +479,11 @@ func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositor
 	}
 	if err := repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
 		StorageCopyID: secondCopy.ID, ContentID: content.ID, CopyIndex: 1,
-		PieceCID: "piece-cid", CommitExtraDataHex: "abcd", RequireEligibleCopy: true,
+		PieceCID: "piece-cid", RequireEligibleCopy: true,
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady(second): %v", err)
 	}
-	identity := storagecommit.CopyIdentity{
-		StorageCopyID: secondCopy.ID, ContentID: content.ID, CopyIndex: 1,
-		StorageDataSetID: secondCopy.StorageDataSetID, RequireEligibleCopy: true,
-	}
-	return db, repos, version, secondCopy, identity
+	return db, repos, version, secondCopy
 }
 
 func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {

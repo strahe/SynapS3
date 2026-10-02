@@ -1028,12 +1028,12 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 					t.Fatalf("limit = %q, want 25", got)
 				}
 				writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
-					"copy_id": 42, "content_id": 7, "copy_index": 1,
-					"task_id": 12345, "submit_error": "provider returned HTTP 500:\n piece not found",
+					"request_id": "request-1", "task_id": 12345,
+					"submit_error":    "provider returned HTTP 500:\n piece not found",
 					"data_set_row_id": 9, "provider_id": "provider-1", "data_set_id": "dataset-1",
-					"piece_cid": "bafy-piece-1", "attempt_id": "attempt-1", "transaction_id": "0xcommit",
-					"reason_code":  "attempt_only_ambiguous",
-					"attempted_at": "2026-08-30T01:00:00Z", "attention_at": "2026-08-30T01:00:01Z",
+					"piece_count": 3, "piece_cids": []string{"bafy-piece-1", "bafy-piece-2", "bafy-piece-3"},
+					"transaction_id": "0xcommit", "reason_code": "confirmation_timeout",
+					"submitted_at": "2026-08-30T01:00:00Z", "attention_at": "2026-08-30T01:15:00Z",
 				}})
 			default:
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
@@ -1045,14 +1045,14 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 		if err != nil {
 			t.Fatalf("storage-confirmation list: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "CONTENT ID") || strings.Contains(out, "UPLOAD ID") ||
-			!strings.Contains(out, "PIECE CID") || !strings.Contains(out, "ATTEMPTED AT") ||
-			!strings.Contains(out, "bafy-piece-1") || !strings.Contains(out, "2026-08-30T01:00:00Z") ||
-			!strings.Contains(out, "attempt_only_ambiguous") || !strings.Contains(out, "provider-1") ||
-			!strings.Contains(out, "attempt-1") || !strings.Contains(out, "0xcommit") ||
-			!strings.Contains(out, "TASK ID") || !strings.Contains(out, "12345") ||
-			!strings.Contains(out, "PROVIDER RESPONSE") || !strings.Contains(out, "provider returned HTTP 500: piece not found") {
-			t.Fatalf("list output missing confirmation details:\n%s", out)
+		for _, want := range []string{
+			"REQUEST", "PIECES", "SUBMITTED AT", "TASK ID", "PROVIDER RESPONSE",
+			"request-1", "12345", "provider-1", "dataset-1", "0xcommit", "confirmation_timeout",
+			"2026-08-30T01:00:00Z", "2026-08-30T01:15:00Z", "provider returned HTTP 500: piece not found",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("list output missing %q:\n%s", want, out)
+			}
 		}
 		if !sawList {
 			t.Fatal("list request was not sent")
@@ -1121,6 +1121,9 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 					"retention":                        "168h0m0s",
 					"provider_mutation_concurrency":    4,
 					"destructive_mutation_concurrency": 2,
+					"commit_max_pieces":                32,
+					"commit_max_wait":                  "30s",
+					"commit_max_backlog":               256,
 				},
 			},
 			"logging": map[string]any{

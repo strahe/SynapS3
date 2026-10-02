@@ -38,8 +38,9 @@ const (
 // with these subjects derive them from the task input, so the subject always
 // names the row the input names.
 const (
-	TaskSubjectStorageContent = "storage_content"
-	TaskSubjectStorageCopy    = "storage_copy"
+	TaskSubjectStorageContent       = "storage_content"
+	TaskSubjectStorageCopy          = "storage_copy"
+	TaskSubjectStorageCommitRequest = "storage_commit_request"
 )
 
 // RecurringSystemTaskTypes returns the perpetual maintenance task types.

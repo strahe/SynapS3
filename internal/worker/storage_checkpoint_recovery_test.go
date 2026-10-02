@@ -286,57 +286,6 @@ func TestNewStoreTaskWithoutCheckpointChecksProviderBeforeUploading(t *testing.T
 	}
 }
 
-func TestNewStoreTaskKeepsRetryAfterReadyPiecePresignFailure(t *testing.T) {
-	payload := strings.Repeat("s", 128)
-	var presigns, stores atomic.Int64
-	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
-		return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: 128}, nil
-	}}
-	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
-		return synapse.ParkedPieceReady, nil
-	})
-	target := &testutil.MockStorageTarget{
-		ServiceURLValue: "https://store.example",
-		StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
-			stores.Add(1)
-			return nil, errors.New("unexpected upload")
-		},
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
-			if presigns.Add(1) == 1 {
-				return nil, errors.New("temporary presign failure")
-			}
-			return testutil.CommitExtraData(7), nil
-		},
-	}
-	runtime, pipeline, _ := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
-	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
-	if _, err := runtime.db.NewRaw(`UPDATE storage_copies SET ingress_store_attempt = 1 WHERE id = ?`, pipeline.target.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
-	var checkpoint struct {
-		IngressAttempt int `json:"ingress_attempt"`
-	}
-	if failed.FailureReason == nil || *failed.FailureReason != "commit_presign_failed" ||
-		!runtime.service.Retryable(failed) || json.Unmarshal(failed.Checkpoint, &checkpoint) != nil ||
-		checkpoint.IngressAttempt != 1 || failed.RetryCount != 0 || stores.Load() != 0 {
-		t.Fatalf("ready piece after presign failure = task:%#v checkpoint:%#v uploads:%d", failed, checkpoint, stores.Load())
-	}
-	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID {
-		t.Fatalf("ready piece copy after presign failure = %#v, err:%v", copyRow, err)
-	}
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatal(err)
-	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-	if presigns.Load() != 2 || stores.Load() != 0 {
-		t.Fatalf("manual retry = presigns:%d uploads:%d, want 2/0", presigns.Load(), stores.Load())
-	}
-}
-
 func TestNewStoreTaskWaitsForUnavailableProviderAfterEarlierUpload(t *testing.T) {
 	payload := strings.Repeat("u", 128)
 	var providerReady atomic.Bool
@@ -575,7 +524,7 @@ func TestPeerPullWaitsUntilStoreCopyIsReadable(t *testing.T) {
 		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "source"
 	})
 	pieceID := testOnChainID(t, 64001)
-	testutil.CommitStorageCopy(t, runtime.db, runtime.repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
 		StorageCopyID: copies[0].ID, ContentID: content.ID, CopyIndex: 0,
 		PieceCID: testPieceCID(t, "peer-source-wait").String(), PieceID: &pieceID, RetrievalURL: "https://source.example/piece",
 	})

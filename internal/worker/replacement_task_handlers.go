@@ -193,12 +193,16 @@ func (h *TaskHandlers) coordinateReplacementItem(
 			return h.enqueueInitialCopyTask(ctx, repos, copyRow.ID, model.TaskTypeStorageTransferPlan)
 		})
 	}
-	if copyRow.ActiveTaskID == nil {
+	workTaskID := copyRow.WorkTaskID()
+	if workTaskID == nil {
 		return taskengine.Suspend(model.TaskResumeModeRecover, 0, "copy_work", "Migrating stored content", func(ctx context.Context, repos *repository.Repositories) error {
+			if copyRow.Status != model.StorageCopyStatusPending {
+				return h.queueCommit(ctx, repos, copyRow.ID)
+			}
 			return h.enqueueInitialCopyTask(ctx, repos, copyRow.ID, model.TaskTypeStorageTransferPlan)
 		})
 	}
-	copyTask, err := h.deps.Repositories.Tasks.GetByID(ctx, *copyRow.ActiveTaskID)
+	copyTask, err := h.deps.Repositories.Tasks.GetByID(ctx, *workTaskID)
 	if err != nil {
 		return h.retryReplacement(execution, replacement.ID, err, "replacement_copy_task_load_failed")
 	}
@@ -214,7 +218,7 @@ func (h *TaskHandlers) coordinateReplacementItem(
 			message = *copyTask.LastError
 		}
 		return taskengine.Fail(errors.New(message), "replacement_copy_failed", func(ctx context.Context, repos *repository.Repositories) error {
-			if copyTask.FailureReason != nil && *copyTask.FailureReason == "migration_cache_missing" {
+			if copyTask.FailureReason != nil && *copyTask.FailureReason == "migration_cache_missing" && copyRow.ActiveTaskID != nil {
 				if err := repos.Contents.CompleteCopyTask(ctx, copyRow.ID, copyRow.WorkGeneration, copyTask.ID); err != nil {
 					return err
 				}
@@ -240,10 +244,11 @@ func (h *TaskHandlers) waitForSourceWrites(
 ) taskengine.Result {
 	waitingForRetry := false
 	for i := range incomplete {
-		if incomplete[i].ActiveTaskID == nil {
+		taskID := incomplete[i].WorkTaskID()
+		if taskID == nil {
 			continue
 		}
-		copyTask, err := h.deps.Repositories.Tasks.GetByID(ctx, *incomplete[i].ActiveTaskID)
+		copyTask, err := h.deps.Repositories.Tasks.GetByID(ctx, *taskID)
 		if err != nil {
 			return h.retryReplacement(execution, replacement.ID, err, "replacement_source_writes_failed")
 		}

@@ -25,6 +25,15 @@ import (
 const (
 	DefaultFilecoinCopies    = 3
 	MaxFilecoinDefaultCopies = model.StorageCopiesMax
+
+	// Registration batching. 200 pieces without metadata stay inside the
+	// add-pieces message size limit; legacy data sets are capped lower at run
+	// time.
+	DefaultCommitMaxPieces  = 32
+	MaxCommitMaxPieces      = 200
+	DefaultCommitMaxWait    = 30 * time.Second
+	MaxCommitMaxWait        = 10 * time.Minute
+	DefaultCommitMaxBacklog = 256
 )
 
 type Config struct {
@@ -98,6 +107,9 @@ type TaskWorkerConfig struct {
 	Retention                      time.Duration `koanf:"retention"`
 	ProviderMutationConcurrency    int           `koanf:"provider_mutation_concurrency"`
 	DestructiveMutationConcurrency int           `koanf:"destructive_mutation_concurrency"`
+	CommitMaxPieces                int           `koanf:"commit_max_pieces"`
+	CommitMaxWait                  time.Duration `koanf:"commit_max_wait"`
+	CommitMaxBacklog               int           `koanf:"commit_max_backlog"`
 }
 
 type LoggingConfig struct {
@@ -195,6 +207,9 @@ func defaultConfig() *Config {
 				Retention:                      7 * 24 * time.Hour,
 				ProviderMutationConcurrency:    4,
 				DestructiveMutationConcurrency: 2,
+				CommitMaxPieces:                DefaultCommitMaxPieces,
+				CommitMaxWait:                  DefaultCommitMaxWait,
+				CommitMaxBacklog:               DefaultCommitMaxBacklog,
 			},
 		},
 		Logging: LoggingConfig{
@@ -515,6 +530,15 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if tasks.DestructiveMutationConcurrency < 1 {
 		add("worker.tasks.destructive_mutation_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.DestructiveMutationConcurrency))
+	}
+	if tasks.CommitMaxPieces < 1 || tasks.CommitMaxPieces > MaxCommitMaxPieces {
+		add("worker.tasks.commit_max_pieces", fmt.Sprintf("must be between 1 and %d, got %d", MaxCommitMaxPieces, tasks.CommitMaxPieces))
+	}
+	if tasks.CommitMaxWait < 0 || tasks.CommitMaxWait > MaxCommitMaxWait {
+		add("worker.tasks.commit_max_wait", fmt.Sprintf("must be between 0s and %s, got %s", MaxCommitMaxWait, tasks.CommitMaxWait))
+	}
+	if tasks.CommitMaxBacklog < tasks.CommitMaxPieces {
+		add("worker.tasks.commit_max_backlog", fmt.Sprintf("must be >= worker.tasks.commit_max_pieces (%d), got %d", tasks.CommitMaxPieces, tasks.CommitMaxBacklog))
 	}
 
 	// Logging.

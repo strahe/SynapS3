@@ -92,22 +92,21 @@ func TestBaselineRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
 					ORDER BY available_at, id LIMIT 1`,
 			},
 			{
-				name: "commit FIFO",
-				indexNames: []string{
-					"idx_storage_copies_commit_ready",
-					"idx_storage_commit_attempts_unresolved_copy",
-				},
-				query: `SELECT storage_copy.id FROM storage_copies AS storage_copy
-					WHERE storage_copy.storage_data_set_id = 1
-					  AND storage_copy.status = 'piece_ready'
-					  AND storage_copy.commit_ready_at IS NOT NULL
-					  AND NOT EXISTS (
-						SELECT 1 FROM storage_commit_attempts AS active_attempt
-						WHERE active_attempt.content_id = storage_copy.content_id
-						  AND active_attempt.storage_data_set_id = storage_copy.storage_data_set_id
-						  AND active_attempt.resolved_at IS NULL
-					  )
-					ORDER BY storage_copy.commit_ready_at, storage_copy.id LIMIT 1`,
+				// The next request to send is found among the data set's open
+				// requests, not by scanning its settled history.
+				name:       "commit queue head",
+				indexNames: []string{"idx_storage_commit_requests_data_set_status"},
+				query: `SELECT request_id FROM storage_commit_requests
+					WHERE storage_data_set_id = 1 AND status = 'ready'
+					  AND (retry_at IS NULL OR retry_at <= '9999-12-31 00:00:00')
+					ORDER BY sealed_at ASC, request_id ASC LIMIT 1`,
+			},
+			{
+				name:       "commit request members",
+				indexNames: []string{"idx_storage_copies_commit_request"},
+				query: `SELECT id FROM storage_copies
+					WHERE commit_request_id = 'collecting-1'
+					ORDER BY commit_ready_at ASC, id ASC`,
 			},
 			{
 				name:       "replacement progress",
@@ -237,9 +236,9 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 		t.Fatalf("seed query-plan storage data set: %v", err)
 	}
 
-	// A representative history backlog makes the unresolved partial index
-	// materially cheaper than the broader copy-history index.
-	var insertCopies, insertHistory, insertUnresolved string
+	// A representative settled history makes the open-request lookups
+	// materially cheaper through the status index than by scanning.
+	var insertCopies, insertHistory string
 	if db.Dialect().Name() == dialect.PG {
 		insertCopies = `INSERT INTO storage_copies (
 			content_id, bucket_id, content_size, storage_data_set_id, copy_index,
@@ -249,19 +248,12 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 			       'query-plan-provider', 'piece-' || value, 'ingress', 'piece_ready',
 			       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
 			FROM generate_series(1, 512) AS series(value)`
-		insertHistory = `INSERT INTO storage_commit_attempts (
-			attempt_id, content_id, storage_data_set_id, status, release_reason,
-			resolved_at, created_at, updated_at)
-			SELECT 'history-' || content_id || '-' || generation, content_id, 1,
-			       'released', 'query_plan_history', CURRENT_TIMESTAMP,
-			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM generate_series(1, 512) AS contents(content_id)
-			CROSS JOIN generate_series(1, 8) AS generations(generation)`
-		insertUnresolved = `INSERT INTO storage_commit_attempts (
-			attempt_id, content_id, storage_data_set_id, status, created_at, updated_at)
-			SELECT 'unresolved-' || content_id, content_id, 1, 'reserved',
-			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM generate_series(8, 512, 8) AS contents(content_id)`
+		insertHistory = `INSERT INTO storage_commit_requests (
+			request_id, storage_data_set_id, status, piece_count, sends, refusals,
+			last_error, created_at, updated_at)
+			SELECT 'history-' || value, 1, 'abandoned', 0, 0, 0,
+			       'query plan history', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM generate_series(1, 4096) AS series(value)`
 	} else {
 		insertCopies = `WITH RECURSIVE contents(content_id) AS (
 			SELECT 1 UNION ALL SELECT content_id + 1 FROM contents WHERE content_id < 512
@@ -274,28 +266,15 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 			       'query-plan-provider', 'piece-' || content_id, 'ingress', 'piece_ready',
 			       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
 			FROM contents`
-		insertHistory = `WITH RECURSIVE
-			contents(content_id) AS (
-				SELECT 1 UNION ALL SELECT content_id + 1 FROM contents WHERE content_id < 512
-			),
-			generations(generation) AS (
-				SELECT 1 UNION ALL SELECT generation + 1 FROM generations WHERE generation < 8
-			)
-			INSERT INTO storage_commit_attempts (
-				attempt_id, content_id, storage_data_set_id, status, release_reason,
-				resolved_at, created_at, updated_at)
-			SELECT 'history-' || content_id || '-' || generation, content_id, 1,
-			       'released', 'query_plan_history', CURRENT_TIMESTAMP,
-			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM contents CROSS JOIN generations`
-		insertUnresolved = `WITH RECURSIVE contents(content_id) AS (
-			SELECT 8 UNION ALL SELECT content_id + 8 FROM contents WHERE content_id < 512
+		insertHistory = `WITH RECURSIVE requests(value) AS (
+			SELECT 1 UNION ALL SELECT value + 1 FROM requests WHERE value < 4096
 		)
-		INSERT INTO storage_commit_attempts (
-			attempt_id, content_id, storage_data_set_id, status, created_at, updated_at)
-			SELECT 'unresolved-' || content_id, content_id, 1, 'reserved',
-			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM contents`
+		INSERT INTO storage_commit_requests (
+			request_id, storage_data_set_id, status, piece_count, sends, refusals,
+			last_error, created_at, updated_at)
+			SELECT 'history-' || value, 1, 'abandoned', 0, 0, 0,
+			       'query plan history', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM requests`
 	}
 
 	statements := []struct {
@@ -304,14 +283,19 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 	}{
 		{"storage copies", insertCopies},
 		{"storage commit history", insertHistory},
-		{"unresolved commit attempts", insertUnresolved},
+		{"collecting request task", `INSERT INTO tasks (id, type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at)
+			VALUES (900001, 'storage_commit', 'query-plan-collecting', 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`},
+		{"collecting request", `INSERT INTO storage_commit_requests (
+			request_id, storage_data_set_id, status, task_id, piece_count, sends, refusals, created_at, updated_at)
+			VALUES ('collecting-1', 1, 'collecting', 900001, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`},
+		{"collecting members", `UPDATE storage_copies SET commit_request_id = 'collecting-1' WHERE content_id <= 32`},
 	}
 	for _, item := range statements {
 		if _, err := db.ExecContext(t.Context(), item.statement); err != nil {
 			t.Fatalf("seed query-plan %s: %v", item.name, err)
 		}
 	}
-	for _, table := range []string{"storage_copies", "storage_commit_attempts"} {
+	for _, table := range []string{"storage_copies", "storage_commit_requests"} {
 		if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
 			t.Fatalf("analyze query-plan table %s: %v", table, err)
 		}

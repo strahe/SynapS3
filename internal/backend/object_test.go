@@ -386,7 +386,7 @@ func acceptBackendVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repo
 	}}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}
-	synaps3testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	synaps3testutil.CommitStorageCopy(t, db, repos, synaps3testutil.CommitCopyInput{
 		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
@@ -453,7 +453,7 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, db *bun.DB, repos *reposito
 	}); err != nil {
 		t.Fatalf("mark primary piece ready: %v", err)
 	}
-	synaps3testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	synaps3testutil.CommitStorageCopy(t, db, repos, synaps3testutil.CommitCopyInput{
 		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,

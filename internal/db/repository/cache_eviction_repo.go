@@ -275,7 +275,8 @@ func (r *BunCacheEvictionRepo) AuthorizeDeletion(
 		if err := db.NewRaw(`SELECT COUNT(*) FROM storage_copies AS copy
 			WHERE copy.content_id = ? AND copy.status IN ('pending', 'piece_ready', 'committing')
 			AND copy.transfer_method IN ('ingress', 'cache_restore')
-			AND EXISTS (SELECT 1 FROM object_versions AS version WHERE version.content_id = copy.content_id)`, contentID).
+			AND (copy.commit_position IS NOT NULL
+			  OR EXISTS (SELECT 1 FROM object_versions AS version WHERE version.content_id = copy.content_id))`, contentID).
 			Scan(ctx, &pendingStore); err != nil {
 			return err
 		}
@@ -529,13 +530,17 @@ func noUnfinishedReplacementCacheDependencySQL(contentIDExpr string) string {
 	)`, contentIDExpr)
 }
 
+// noUnfinishedStoreCacheDependencySQL keeps the bytes of unfinished Store work.
+// A signed member must be able to send its piece again until its request
+// settles, even after the last version naming the bytes is gone.
 func noUnfinishedStoreCacheDependencySQL(contentIDExpr string) string {
 	return fmt.Sprintf(`NOT EXISTS (
 		SELECT 1 FROM storage_copies AS store_copy
 		WHERE store_copy.content_id = %s
 		AND store_copy.status IN ('pending', 'piece_ready', 'committing')
 		AND store_copy.transfer_method IN ('ingress', 'cache_restore')
-		AND EXISTS (SELECT 1 FROM object_versions AS version WHERE version.content_id = store_copy.content_id)
+		AND (store_copy.commit_position IS NOT NULL
+		  OR EXISTS (SELECT 1 FROM object_versions AS version WHERE version.content_id = store_copy.content_id))
 	)`, contentIDExpr)
 }
 

@@ -69,7 +69,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	// 0. Committing the source with it keeps this test on the boundary where a
 	// presence check that treats zero as unset would reject a usable source.
 	pieceID := onChainID(t, "0")
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		StorageCopyID: copies[1].ID, ContentID: content.ID, CopyIndex: 1,
 		PieceCID: "bafk2bzacecpiecerestore", PieceID: &pieceID, RetrievalURL: "https://provider.example/piece",
 	})
@@ -107,7 +107,8 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	if err := repos.Contents.ReservePullRequest(t.Context(), repository.ReservePullRequestInput{
 		CopyID: copies[0].ID, Generation: generation, TaskID: pullTask.ID, AttemptID: "zero-piece-attempt",
 		SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID,
-		SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL, CommitExtraDataHex: "ab",
+		SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL,
+		CommitRequest: repository.CreatePullCommitRequestInput{RequestID: "zero-piece-request", TaskID: pullTask.ID, ExtraDataHex: "ab"},
 	}); err != nil {
 		t.Fatalf("reserving a pull from a piece 0 source: %v", err)
 	}
@@ -189,7 +190,7 @@ func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 		t.Fatalf("source copy = %#v, err=%v", sourceCopy, err)
 	}
 	sourcePieceID := onChainID(t, "701")
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		StorageCopyID: sourceCopy.ID, ContentID: content.ID, CopyIndex: 0,
 		PieceCID: "bafk2bzacecmigrationcache", PieceID: &sourcePieceID,
 		RetrievalURL: "https://source.example/piece",

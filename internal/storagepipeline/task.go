@@ -36,6 +36,11 @@ type CopyGenerationInput struct {
 	Generation int64 `json:"generation"`
 }
 
+// CommitRequestInput names the commit request a storage_commit task drives.
+type CommitRequestInput struct {
+	RequestID string `json:"request_id"`
+}
+
 func UploadPlanKey(contentID int64) string {
 	return UploadPlanKeyPrefix + strconv.FormatInt(contentID, 10)
 }
@@ -56,8 +61,15 @@ func PullKey(copyID, generation int64) string {
 	return copyGenerationKey(PullKeyPrefix, copyID, generation)
 }
 
-func CommitKey(copyID, generation int64) string {
-	return copyGenerationKey(CommitKeyPrefix, copyID, generation)
+func CommitKey(requestID string) string {
+	return CommitKeyPrefix + requestID
+}
+
+func ValidateCommitRequestInput(input CommitRequestInput) error {
+	if input.RequestID == "" {
+		return errors.New("request_id is required")
+	}
+	return nil
 }
 
 func ValidateUploadPlanInput(input UploadPlanInput) error {

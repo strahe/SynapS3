@@ -79,7 +79,7 @@ func seedCommittedUploadCopies(t *testing.T, db *bun.DB, repos *repository.Repos
 		if copySeed.RetrievalURL != nil {
 			retrievalURL = *copySeed.RetrievalURL
 		}
-		testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 			ContentID:    contentID,
 			CopyIndex:    copySeed.CopyIndex,
 			PieceCID:     pieceCID,
