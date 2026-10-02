@@ -87,7 +87,6 @@ synaps3 admin task retry 42
 synaps3 admin task acknowledge 42
 synaps3 admin task acknowledge --type storage_store --yes
 synaps3 admin storage-confirmation list
-synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --yes
 ```
 
 没有受保护的密码文件时，在无回显提示中输入 Admin 密码。不要把密码直接写入 shell history。创建 S3 用户和轮换 secret key 时只显示一次 secret key，请保存到权限为 `0600` 的客户端凭据文件。
@@ -106,7 +105,7 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 
 `synaps3 admin task retry` 只恢复响应中标记为可重试的失败任务。存储提供方替换仍在 **Details** → **Storage** → **Data Sets** 中恢复。尚未发出广播、或因内部错误停止的钱包操作可以重试；只有从未广播过的交易才会在重试时发出，广播结果不确定时仍不可重试。因内部错误停止的存储传输任务也可以重试。Store 失败后，**Retry upload** 会先检查提供方；确认分片缺失才再次上传。远端副本删除超过 24 小时仍无法确认时，**Recover** 会先检查副本是否已删除或已排队删除；若仍存在且未排队，可能再次提交付费删除请求，而先前的请求仍可能成功。核对失败结果后，可用 `synaps3 admin task acknowledge <id>` 将任务标记为已处理；确认后开始计算保留期，到期后可能被清理。需要清理积压时，不带 ID 运行并用 `--yes` 确认：`--type` 限定某一种操作，`--before` 指定 RFC 3339 截止时刻（默认为当前时间），该时刻之后记录的失败仍然可见。
 
-`synaps3 admin storage-confirmation list` 会显示需要核对的存储确认。核对存储提供方、transaction 和当前 attempt 后，使用 `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes` 表示确认存储提供方可能已经接受该 piece，并允许正常恢复流程再次提交。过期的 attempt ID 会被拒绝。
+`synaps3 admin storage-confirmation list` 会显示需要处理的存储确认及其所属任务 ID。对已停止的确认，使用 `synaps3 admin task retry <task-id>` 重试：重试会先在链上核对该 piece 是否已登记，只有未登记时才再次提交原请求；链上只接受该请求一次。存在相互冲突的历史请求时，只有当前请求已登记，该 copy 才会完成。
 
 缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 
@@ -121,7 +120,6 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
 synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes
-synaps3 admin storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes
 ```
 
 保存设置后，重启 SynapS3，检查 `/healthz`，并运行 `synaps3 admin settings get` 确认实际生效值。

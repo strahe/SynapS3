@@ -18,10 +18,3 @@ type AttentionRecord struct {
 	AttemptedAt   time.Time
 	AttentionAt   time.Time
 }
-
-type ManualReleaseInput struct {
-	CopyID                       int64
-	ExpectedAttemptID            string
-	AcknowledgePossibleDuplicate bool
-	Now                          time.Time
-}

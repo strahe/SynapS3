@@ -70,7 +70,7 @@ After a restart, unfinished work becomes eligible to continue automatically.
 - A wallet operation can be retried from Tasks when no broadcast started, or when it stopped because of an internal error. Retry checks the operation first: it sends the transaction only if none was ever broadcast, and otherwise checks the transaction already sent. If a broadcast may have gone out without a recorded transaction, the operation is marked unknown and cannot be retried.
 - **Retry upload** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
 - `status=failed` lists unacknowledged failures. Use `status=dismissed` to list acknowledged failures.
-- Review unresolved storage confirmations in **Tasks** (Confirm storage, Failed) or with `synaps3 admin storage-confirmation list`. A stopped confirmation shows the provider's response. **Release** submits the piece again; if the provider already accepted it, the piece is stored twice.
+- When a provider does not confirm a storage registration, SynapS3 checks on chain whether the piece was registered and submits the original request again if it was not; that request can be registered only once. A piece the provider dropped before registration is uploaded again. A single earlier request is reused; conflicting earlier requests or a chain record that does not match keep the confirmation stopped: find it in **Tasks** (Confirm storage, Failed) or with `synaps3 admin storage-confirmation list`, with the provider's response, and use **Recover** to check the chain again. Recover completes it once its current request is registered; it does not choose between conflicting earlier requests.
 
 Useful commands:
 
@@ -94,7 +94,7 @@ Restore failed dependencies before retrying work. Use the dashboard, Admin API, 
 | Database full | Stop traffic, free space or scale the database, then verify health. |
 | Cache disk full | Increase disk or `cache.max_size_gb`, or restore remote storage and cache-cleanup progress. |
 | Provider must be evacuated | Open the bucket and use **Details** → **Storage** → **Data Sets**. Do not retry the replacement from Tasks. |
-| Process crash | Restart SynapS3, verify health and task statistics, then review any unresolved storage confirmation or wallet outcome. |
+| Process crash | Restart SynapS3, verify health and task statistics, then recover any stopped storage confirmation and review any wallet outcome. |
 | Startup reports an incompatible database | Stop the process, verify that the configured database is the intended one, and preserve it unchanged before using an empty replacement database. |
 
 ## Restore or Roll Back

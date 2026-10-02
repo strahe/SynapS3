@@ -9,6 +9,17 @@ import (
 
 const MaxActiveAttemptsPerDataSet = 4
 
+// MaxReadyCopiesPerDataSet bounds the transferred copies waiting to be
+// committed to one data set. A provider deletes an uploaded piece that has not
+// joined a data set within hours, so transfers wait instead of queueing more
+// pieces than the data set can commit in that time.
+const MaxReadyCopiesPerDataSet = 32
+
+// ProviderRejectedWaitReason is the wait reason of a commit task backing off
+// after the provider refused its submission. Freed commit capacity does not
+// wake it early.
+const ProviderRejectedWaitReason = "provider_rejected"
+
 type CopyIdentity struct {
 	StorageCopyID       int64
 	ContentID           int64
@@ -87,9 +98,15 @@ type ReleaseInput struct {
 	AttemptID         string
 	Reason            ReleaseReason
 	KnownNotSubmitted bool
-	ClearReadyAt      bool
-	ClearExtraData    bool
-	Now               time.Time
+	// Unacknowledged resolves an attempted request the provider never
+	// acknowledged although an earlier send of it may still land. The reason
+	// must keep that possibility visible to request history.
+	Unacknowledged bool
+	ClearReadyAt   bool
+	ClearExtraData bool
+	// SubmitError keeps the provider's reply to a submission it refused.
+	SubmitError string
+	Now         time.Time
 }
 
 type ReservationReleaseInput struct {
@@ -108,4 +125,8 @@ type Store interface {
 	ResetCommitAttempt(context.Context, ResetInput) error
 	ReleaseCommitAttempt(context.Context, ReleaseInput) error
 	ReleaseCommitReservation(context.Context, ReservationReleaseInput) error
+	ListCommitRequests(context.Context, CopyIdentity) ([]CommitRequestHistory, error)
+	// CountConsecutiveCommitRejections counts the copy's most recent resolved
+	// attempts the provider refused, up to the first one it did not.
+	CountConsecutiveCommitRejections(context.Context, CopyIdentity) (int, error)
 }

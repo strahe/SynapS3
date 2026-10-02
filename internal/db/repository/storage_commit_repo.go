@@ -203,8 +203,12 @@ func (r *BunStorageContentRepo) RecordCommitSubmission(ctx context.Context, inpu
 		return err
 	}
 	return r.mutateAttempt(ctx, input.Copy, "recording storage commit submission", func(db bun.IDB, _ int64) error {
+		// The first receipt answers whatever an earlier version flagged about
+		// an attempt the provider had not acknowledged.
 		res, err := db.NewUpdate().
 			Model((*storagecommit.Attempt)(nil)).
+			Set("attention_code = CASE WHEN transaction_id IS NULL THEN NULL ELSE attention_code END").
+			Set("attention_at = CASE WHEN transaction_id IS NULL THEN NULL ELSE attention_at END").
 			Set("transaction_id = COALESCE(transaction_id, ?)", input.TransactionID).
 			Set("status_url = COALESCE(status_url, ?)", input.StatusURL).
 			Set("updated_at = ?", commitInputTime(input.Now)).
@@ -298,7 +302,9 @@ func (r *BunStorageContentRepo) ResetCommitAttempt(ctx context.Context, input st
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, true, true, nullableString(input.LastError)); err != nil {
+		// The copy keeps its signed request, so whatever attempt comes next
+		// carries the same nonce the rejected one did.
+		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, true, false, nullableString(input.LastError)); err != nil {
 			return err
 		}
 		return wakeCommitFIFOHead(ctx, db, input.Copy.StorageDataSetID)
@@ -306,7 +312,8 @@ func (r *BunStorageContentRepo) ResetCommitAttempt(ctx context.Context, input st
 }
 
 func (r *BunStorageContentRepo) ReleaseCommitAttempt(ctx context.Context, input storagecommit.ReleaseInput) error {
-	if err := validateCommitCopyIdentity(input.Copy); err != nil || input.AttemptID == "" || !input.Reason.Valid() {
+	if err := validateCommitCopyIdentity(input.Copy); err != nil || input.AttemptID == "" || !input.Reason.Valid() ||
+		input.KnownNotSubmitted && input.Unacknowledged {
 		return fmt.Errorf("releasing storage commit attempt: %w", ErrInvalidInput)
 	}
 	now := commitInputTime(input.Now)
@@ -320,14 +327,22 @@ func (r *BunStorageContentRepo) ReleaseCommitAttempt(ctx context.Context, input 
 			Where("attempt_id = ?", input.AttemptID).
 			Where("content_id = ? AND storage_data_set_id = ?", input.Copy.ContentID, input.Copy.StorageDataSetID).
 			Where("resolved_at IS NULL")
-		if input.KnownNotSubmitted {
+		if input.SubmitError != "" {
+			q = q.Set("submit_error = ?", input.SubmitError)
+		}
+		switch {
+		case input.KnownNotSubmitted:
 			q = q.
 				Where("status IN (?)", bun.List([]storagecommit.AttemptStatus{
 					storagecommit.AttemptStatusReserved,
 					storagecommit.AttemptStatusAttempted,
 				})).
 				Where("transaction_id IS NULL AND status_url IS NULL")
-		} else {
+		case input.Unacknowledged:
+			q = q.
+				Where("status = ?", storagecommit.AttemptStatusAttempted).
+				Where("transaction_id IS NULL AND status_url IS NULL")
+		default:
 			q = q.Where("status = ?", storagecommit.AttemptStatusReserved)
 		}
 		res, err := q.Exec(ctx)
@@ -378,6 +393,84 @@ func (r *BunStorageContentRepo) ReleaseCommitReservation(
 		}
 		return wakeCommitFIFOHead(ctx, db, input.Copy.StorageDataSetID)
 	})
+}
+
+// ListCommitRequests retains the effect uncertainty of every attempt sharing
+// a request; a later refusal cannot erase an earlier possible submission.
+func (r *BunStorageContentRepo) ListCommitRequests(ctx context.Context, copyIdentity storagecommit.CopyIdentity) ([]storagecommit.CommitRequestHistory, error) {
+	if err := validateCommitCopyIdentity(copyIdentity); err != nil {
+		return nil, fmt.Errorf("listing storage commit extra data: %w", err)
+	}
+	var values []storagecommit.CommitRequestHistory
+	err := r.db.NewSelect().
+		Model((*storagecommit.Attempt)(nil)).
+		ColumnExpr("LOWER(extra_data_hex) AS extra_data_hex").
+		ColumnExpr(`MAX(CASE WHEN status = ? OR
+            (status = ? AND release_reason IN (?, ?, ?)) THEN 0 ELSE 1 END) <> 0 AS may_have_been_submitted`,
+			storagecommit.AttemptStatusReserved, storagecommit.AttemptStatusReleased,
+			storagecommit.ReleaseBeforeSubmitCanceled, storagecommit.ReleaseProviderRejected, storagecommit.ReleaseDataSetUnavailable).
+		ColumnExpr(`MAX(CASE WHEN status NOT IN (?, ?, ?, ?, ?) OR
+            (status = ? AND COALESCE(release_reason, '') NOT IN (?, ?, ?, ?, ?, ?)) THEN 1 ELSE 0 END) <> 0 AS unknown`,
+			storagecommit.AttemptStatusReserved, storagecommit.AttemptStatusAttempted, storagecommit.AttemptStatusConfirmed,
+			storagecommit.AttemptStatusReleased, storagecommit.AttemptStatusRejected, storagecommit.AttemptStatusReleased,
+			storagecommit.ReleaseBeforeSubmitCanceled, storagecommit.ReleaseDataSetUnavailable, storagecommit.ReleaseOwnerTerminal,
+			storagecommit.ReleaseProviderRejected, storagecommit.ReleaseProviderPieceMissing, storagecommit.ReleaseManualDuplicateAck).
+		Where("content_id = ? AND storage_data_set_id = ?", copyIdentity.ContentID, copyIdentity.StorageDataSetID).
+		Where("extra_data_hex IS NOT NULL").
+		GroupExpr("LOWER(extra_data_hex)").
+		OrderExpr("LOWER(extra_data_hex) ASC").
+		Scan(ctx, &values)
+	if err != nil {
+		return nil, fmt.Errorf("listing storage commit extra data: %w", err)
+	}
+	return values, nil
+}
+
+// consecutiveRejectionWindow bounds how far back CountConsecutiveCommitRejections
+// looks; the backoff it feeds stops growing well before that.
+const consecutiveRejectionWindow = 10
+
+func (r *BunStorageContentRepo) CountConsecutiveCommitRejections(ctx context.Context, copyIdentity storagecommit.CopyIdentity) (int, error) {
+	if err := validateCommitCopyIdentity(copyIdentity); err != nil {
+		return 0, fmt.Errorf("counting storage commit rejections: %w", err)
+	}
+	var reasons []string
+	err := r.db.NewSelect().
+		Model((*storagecommit.Attempt)(nil)).
+		ColumnExpr("COALESCE(release_reason, '')").
+		Where("content_id = ? AND storage_data_set_id = ?", copyIdentity.ContentID, copyIdentity.StorageDataSetID).
+		Where("resolved_at IS NOT NULL").
+		OrderExpr("created_at DESC").
+		OrderExpr("attempt_id DESC").
+		Limit(consecutiveRejectionWindow).
+		Scan(ctx, &reasons)
+	if err != nil {
+		return 0, fmt.Errorf("counting storage commit rejections: %w", err)
+	}
+	count := 0
+	for _, reason := range reasons {
+		if reason != string(storagecommit.ReleaseProviderRejected) {
+			break
+		}
+		count++
+	}
+	return count, nil
+}
+
+// CountReadyCopiesForDataSet counts the copies transferred to a data set and
+// waiting to be committed there.
+func (r *BunStorageContentRepo) CountReadyCopiesForDataSet(ctx context.Context, storageDataSetID int64) (int, error) {
+	if storageDataSetID <= 0 {
+		return 0, fmt.Errorf("counting ready storage copies: %w", ErrInvalidInput)
+	}
+	count, err := r.db.NewSelect().
+		Model((*model.StorageCopy)(nil)).
+		Where("status = ? AND storage_data_set_id = ?", model.StorageCopyStatusPieceReady, storageDataSetID).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting ready storage copies: %w", err)
+	}
+	return count, nil
 }
 
 func (r *BunStorageContentRepo) CountActiveCommitAttemptsForDataSet(ctx context.Context, storageDataSetID int64) (int, error) {
@@ -439,6 +532,18 @@ func wakeCommitFIFOHead(ctx context.Context, db bun.IDB, storageDataSetID int64)
 	if !taskID.Valid {
 		return nil
 	}
+	// A head backing off after the provider refused it keeps its delay; the
+	// copies behind it wait with it.
+	backingOff, err := db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("id = ? AND status = ? AND wait_reason = ?", taskID.Int64, model.TaskStatusPending, storagecommit.ProviderRejectedWaitReason).
+		Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("checking storage commit queue head: %w", err)
+	}
+	if backingOff {
+		return nil
+	}
 	if _, err := (&BunTaskRepo{db: db}).WakePending(ctx, []int64{taskID.Int64}); err != nil {
 		return fmt.Errorf("waking storage commit queue head: %w", err)
 	}
@@ -457,8 +562,8 @@ func countCommitAttentionAttemptsForDataSet(ctx context.Context, db bun.IDB, sto
 	return count, nil
 }
 
-// ListCommitAttention lists the unresolved storage confirmations waiting for
-// review, oldest first.
+// ListCommitAttention lists the unresolved storage confirmations flagged for
+// attention, oldest first.
 func (r *BunStorageContentRepo) ListCommitAttention(ctx context.Context, limit int) ([]storagecommit.AttentionRecord, error) {
 	q := commitAttentionQuery(r.db).
 		OrderExpr("commit_attempt.attention_at ASC").
@@ -469,8 +574,8 @@ func (r *BunStorageContentRepo) ListCommitAttention(ctx context.Context, limit i
 	return scanCommitAttention(ctx, q)
 }
 
-// ListCommitAttentionForTasks returns the storage confirmations waiting for
-// review that the given tasks own.
+// ListCommitAttentionForTasks returns the storage confirmations flagged for
+// attention that the given tasks own.
 func (r *BunStorageContentRepo) ListCommitAttentionForTasks(ctx context.Context, taskIDs []int64) ([]storagecommit.AttentionRecord, error) {
 	if len(taskIDs) == 0 {
 		return nil, nil
@@ -479,8 +584,9 @@ func (r *BunStorageContentRepo) ListCommitAttentionForTasks(ctx context.Context,
 }
 
 // CountStoppedCommitAttentionByDataSet counts, per data set row, the storage
-// confirmations waiting for review whose task has failed. Nothing advances them
-// until an operator releases them, and they keep holding commit capacity.
+// confirmations flagged for attention whose task has failed. Nothing advances
+// them until an operator retries the task, and they keep holding commit
+// capacity.
 func (r *BunStorageContentRepo) CountStoppedCommitAttentionByDataSet(ctx context.Context) (map[int64]int64, error) {
 	var rows []struct {
 		StorageDataSetID int64 `bun:"storage_data_set_id"`
@@ -563,124 +669,6 @@ func scanCommitAttention(ctx context.Context, q *bun.SelectQuery) ([]storagecomm
 		})
 	}
 	return out, nil
-}
-
-func (r *BunStorageContentRepo) ReleaseCommitAttention(ctx context.Context, input storagecommit.ManualReleaseInput) error {
-	if input.CopyID <= 0 || input.ExpectedAttemptID == "" || !input.AcknowledgePossibleDuplicate {
-		return fmt.Errorf("releasing storage confirmation attention: %w", ErrInvalidInput)
-	}
-	now := commitInputTime(input.Now)
-	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		initial := new(model.StorageCopy)
-		if err := db.NewSelect().Model(initial).Where("id = ?", input.CopyID).Scan(ctx); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrNotFound
-			}
-			return err
-		}
-		if initial.ActiveTaskID != nil {
-			res, err := db.NewUpdate().Model((*model.Task)(nil)).
-				Set("updated_at = updated_at").
-				Where("id = ? AND type = ?", *initial.ActiveTaskID, model.TaskTypeStorageCommit).
-				Exec(ctx)
-			if err != nil {
-				return fmt.Errorf("locking storage commit task: %w", err)
-			}
-			if rows, _ := res.RowsAffected(); rows != 1 {
-				return ErrConflict
-			}
-		}
-		identity := storagecommit.CopyIdentity{
-			StorageCopyID:    initial.ID,
-			ContentID:        initial.ContentID,
-			CopyIndex:        initial.CopyIndex,
-			StorageDataSetID: initial.StorageDataSetID,
-		}
-		copyID, _, err := lockCommitCopyFamily(ctx, db, identity)
-		if err != nil {
-			return err
-		}
-		res, err := db.NewUpdate().
-			Model((*storagecommit.Attempt)(nil)).
-			Set("status = ?", storagecommit.AttemptStatusReleased).
-			Set("release_reason = ?", string(storagecommit.ReleaseManualDuplicateAck)).
-			Set("resolved_at = ?", now).
-			Set("updated_at = ?", now).
-			Where("attempt_id = ?", input.ExpectedAttemptID).
-			Where("content_id = ? AND storage_data_set_id = ?", initial.ContentID, initial.StorageDataSetID).
-			Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-			Where("attention_at IS NOT NULL").
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("releasing storage confirmation attention: %w", err)
-		}
-		if rows, _ := res.RowsAffected(); rows != 1 {
-			return ErrConflict
-		}
-		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, true, true, nil); err != nil {
-			return fmt.Errorf("releasing storage confirmation attention: %w", err)
-		}
-		current := new(model.StorageCopy)
-		if err := db.NewSelect().Model(current).Where("id = ?", copyID).Scan(ctx); err != nil {
-			return err
-		}
-		if current.ContentID != initial.ContentID || current.StorageDataSetID != initial.StorageDataSetID ||
-			current.CopyIndex != initial.CopyIndex || current.WorkGeneration != initial.WorkGeneration ||
-			(current.ActiveTaskID == nil) != (initial.ActiveTaskID == nil) ||
-			(current.ActiveTaskID != nil && *current.ActiveTaskID != *initial.ActiveTaskID) {
-			return ErrConflict
-		}
-		if err := resumeCommitTaskAfterAttentionRelease(ctx, db, initial.ActiveTaskID); err != nil {
-			return err
-		}
-		return wakeCommitFIFOHead(ctx, db, initial.StorageDataSetID)
-	})
-}
-
-func resumeCommitTaskAfterAttentionRelease(ctx context.Context, db bun.IDB, taskID *int64) error {
-	if taskID == nil {
-		return nil
-	}
-	tasks := &BunTaskRepo{db: db}
-	taskRow, err := tasks.GetByID(ctx, *taskID)
-	if err != nil {
-		return fmt.Errorf("loading released storage commit task: %w", err)
-	}
-	if taskRow == nil || taskRow.Type != model.TaskTypeStorageCommit {
-		return fmt.Errorf("released storage commit has no matching task: %w", ErrConflict)
-	}
-	switch taskRow.Status {
-	case model.TaskStatusPending, model.TaskStatusRunning:
-		now := time.Now()
-		res, err := db.NewUpdate().Model((*model.Task)(nil)).
-			Set("status = ?", model.TaskStatusPending).
-			Set("resume_mode = ?", model.TaskResumeModeRecover).
-			Set("available_at = ?", now).
-			Set("retry_count = 0").
-			Set("claimed_at = NULL").
-			Set("lease_until = NULL").
-			Set("wait_reason = NULL").
-			Set("failure_reason = NULL").
-			Set("last_error = NULL").
-			Set("status_message = NULL").
-			Set("updated_at = ?", now).
-			Where("id = ? AND type = ? AND status = ? AND claim_generation = ?", taskRow.ID, model.TaskTypeStorageCommit, taskRow.Status, taskRow.ClaimGeneration).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("resuming released storage commit task: %w", err)
-		}
-		if rows, _ := res.RowsAffected(); rows != 1 {
-			return ErrConflict
-		}
-		return nil
-	case model.TaskStatusFailed:
-		if err := tasks.RetryFailed(ctx, taskRow.ID); err != nil {
-			return fmt.Errorf("resuming released storage commit task: %w", err)
-		}
-		return nil
-	default:
-		return fmt.Errorf("released storage commit task is terminal: %w", ErrConflict)
-	}
 }
 
 func (r *BunStorageContentRepo) mutateAttempt(

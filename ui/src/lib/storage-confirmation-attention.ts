@@ -10,10 +10,11 @@ const knownAttentionLabels = {
 
 const attentionLabels = new Map<string, string>(Object.entries(knownAttentionLabels))
 
-export const storageConfirmationReleaseWarning =
-  'Releasing it submits the piece again. If the provider already accepted the piece, it is stored twice and you pay for both copies.'
+/** What recovering a stopped storage confirmation does. */
+export const storageConfirmationRetryNote =
+  'Recovery checks whether the piece is already registered before continuing the original request.'
 
-/** Tasks page filter that lists storage confirmations stopped for review. */
+/** Tasks page filter that lists stopped storage confirmations. */
 export const storageConfirmationTasksSearch = { type: 'storage_commit', status: 'failed' } as const
 
 export interface StorageConfirmationAttentionView {

@@ -98,7 +98,7 @@ func TestInitialBaselineRepairsMissingMarker(t *testing.T) {
 		if _, err := migrator.Migrate(ctx); err != nil {
 			t.Fatalf("repair baseline marker: %v", err)
 		}
-		assertAppliedMigrationCount(t, ctx, migrator, 1)
+		assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))
 		if err := ValidateCurrentSchema(ctx, db); err != nil {
 			t.Fatalf("validate repaired schema: %v", err)
 		}

@@ -87,7 +87,6 @@ synaps3 admin task retry 42
 synaps3 admin task acknowledge 42
 synaps3 admin task acknowledge --type storage_store --yes
 synaps3 admin storage-confirmation list
-synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --yes
 ```
 
 If no protected password file is available, enter the Admin password at the no-echo prompt. Do not place the password directly in shell history. S3 user creation and secret rotation show the secret only once; store it in a client credential file protected with `0600`.
@@ -106,7 +105,7 @@ Task listing supports `--type`, `--status`, `--limit`, and ID-based `--cursor`. 
 
 `synaps3 admin task retry` recovers only tasks whose response says they are retryable. Provider replacement recovery remains under **Details** → **Storage** → **Data Sets**. A wallet operation can be retried when its broadcast never started, or when it stopped because of an internal error; the retry sends the transaction only if it was never broadcast, and an operation with an uncertain broadcast remains non-retryable. Storage transfer tasks that stopped because of an internal error are also retryable. For a failed Store, **Retry upload** checks the provider first and sends the piece again only if missing. For remote-copy removal that remains unconfirmed after 24 hours, Recover checks whether the copy is gone or already queued for removal; otherwise it may submit another paid request, even though the earlier request may still succeed. Use `synaps3 admin task acknowledge <id>` to dismiss a failed task after reviewing its outcome; acknowledgement starts its retention period, after which it may be cleaned up. To clear a backlog, run it without an ID and confirm with `--yes`: `--type` limits it to one operation, and `--before` sets an RFC 3339 cutoff that defaults to now, so failures recorded later stay visible.
 
-`synaps3 admin storage-confirmation list` shows storage confirmations that need review. Verify the piece CID, provider, current attempt ID, attempted time, and any available transaction evidence before running `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes`; release only if you accept that the provider may already store the piece and resubmission may create duplicate paid storage. A stale attempt ID is refused.
+`synaps3 admin storage-confirmation list` shows storage confirmations that need attention, with the owning task ID. Retry a stopped one with `synaps3 admin task retry <task-id>`: the retry checks on chain whether the piece was already registered and submits the original request again only if it was not; the chain accepts that request only once. A copy with conflicting earlier requests completes only once its current request is registered.
 
 Cache eviction policy accepts `lru`, `after_upload`, or `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
 
@@ -121,7 +120,6 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
 synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes
-synaps3 admin storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes
 ```
 
 After saving settings, restart SynapS3, check `/healthz`, and use `synaps3 admin settings get` to confirm the effective values.

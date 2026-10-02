@@ -46,6 +46,9 @@ type DataSetTarget interface {
 	SubmitCommit(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
 	GetCommitStatus(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)
+	// CheckWritable reads the data set's chain state and reports whether it
+	// still accepts new pieces. It contacts no provider.
+	CheckWritable(context.Context) error
 }
 
 // CleanupContext abstracts the SDK operations needed to remove PDP pieces.

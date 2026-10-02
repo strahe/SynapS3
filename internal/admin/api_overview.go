@@ -48,8 +48,8 @@ type objectAttentionOverview struct {
 
 type taskAttentionOverview struct {
 	Failed int64 `json:"failed"`
-	// StorageConfirmations counts stopped storage confirmations waiting for
-	// review; each holds its data set's commit capacity until released.
+	// StorageConfirmations counts stopped storage confirmations; each holds its
+	// data set's commit capacity until its task is retried.
 	StorageConfirmations int64 `json:"storage_confirmations"`
 }
 

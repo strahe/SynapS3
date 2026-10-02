@@ -41,8 +41,7 @@ type taskListItem struct {
 }
 
 // taskStorageConfirmation describes the storage confirmation a Confirm storage
-// task holds while it waits for review. Releasable is set only once the task has
-// stopped, because a confirmation still being observed may yet land.
+// task holds while it is flagged for attention.
 type taskStorageConfirmation struct {
 	CopyID        int64  `json:"copy_id"`
 	AttemptID     string `json:"attempt_id"`
@@ -54,7 +53,6 @@ type taskStorageConfirmation struct {
 	SubmitError   string `json:"submit_error,omitempty"`
 	AttemptedAt   string `json:"attempted_at"`
 	AttentionAt   string `json:"attention_at"`
-	Releasable    bool   `json:"releasable"`
 }
 
 type taskListResponse struct {
@@ -194,8 +192,8 @@ func (s *Server) taskListItem(row *model.Task) taskListItem {
 }
 
 // attachTaskStorageConfirmations adds the confirmation each Confirm storage
-// task holds for review. A failed lookup leaves the list without it; dismissal
-// is still refused by the repository.
+// task holds while it is flagged for attention. A failed lookup leaves the
+// list without it; dismissal is still refused by the repository.
 func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []model.Task, items []taskListItem) {
 	var commitTaskIDs []int64
 	for i := range rows {
@@ -229,7 +227,6 @@ func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []mode
 			TransactionID: record.TransactionID,
 			SubmitError:   record.SubmitError,
 			AttemptedAt:   record.AttemptedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
-			Releasable: rows[i].Status == model.TaskStatusFailed,
 		}
 	}
 }

@@ -44,7 +44,7 @@ test('attention rows show only nonzero attention items', () => {
     { key: 'unavailable', label: 'Unavailable objects', value: 1, tone: 'danger', target: 'buckets' },
     {
       key: 'storage_confirmations',
-      label: 'Storage confirmations to review',
+      label: 'Stopped storage confirmations',
       value: 4,
       tone: 'danger',
       target: 'tasks',

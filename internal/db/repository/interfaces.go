@@ -444,6 +444,18 @@ type MarkUploadCopyCommittedInput struct {
 	CommitTransactionID          string
 	CommitAttemptID              string
 	CommitConfirmedTransactionID string
+	// ProvenByNonce confirms the attempt from the FWSS nonce record. The
+	// attempt keeps any transaction it recorded, CommitTransactionID must
+	// repeat it, and no confirmed transaction is written.
+	ProvenByNonce bool
+}
+
+// ReturnPieceReadyCopyInput names a transferred copy, by its task fence, whose
+// piece the provider no longer holds.
+type ReturnPieceReadyCopyInput struct {
+	CopyID     int64
+	Generation int64
+	TaskID     int64
 }
 
 type BindReadableUploadInput struct {
@@ -532,6 +544,13 @@ type StorageContentRepository interface {
 	GetUploadCopyForDataSet(ctx context.Context, contentID, storageDataSetID int64) (*model.StorageCopy, error)
 	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
+	// ReturnPieceReadyCopyToTransfer sends a transferred copy back to transfer
+	// when its provider dropped the piece before it was committed. The copy
+	// keeps its signed commit request.
+	ReturnPieceReadyCopyToTransfer(ctx context.Context, input ReturnPieceReadyCopyInput) error
+	// CountReadyCopiesForDataSet counts the copies transferred to a data set
+	// and waiting to be committed.
+	CountReadyCopiesForDataSet(ctx context.Context, storageDataSetID int64) (int, error)
 	ReopenFailedUploadCopy(ctx context.Context, copyID int64) error
 	ReserveCommitAttempt(ctx context.Context, input storagecommit.ReserveInput) (storagecommit.ReserveResult, error)
 	MarkCommitAttempted(ctx context.Context, input storagecommit.AttemptInput) (storagecommit.AttemptResult, error)
@@ -541,11 +560,12 @@ type StorageContentRepository interface {
 	ResetCommitAttempt(ctx context.Context, input storagecommit.ResetInput) error
 	ReleaseCommitAttempt(ctx context.Context, input storagecommit.ReleaseInput) error
 	ReleaseCommitReservation(ctx context.Context, input storagecommit.ReservationReleaseInput) error
+	ListCommitRequests(ctx context.Context, copy storagecommit.CopyIdentity) ([]storagecommit.CommitRequestHistory, error)
+	CountConsecutiveCommitRejections(ctx context.Context, copy storagecommit.CopyIdentity) (int, error)
 	CountActiveCommitAttemptsForDataSet(ctx context.Context, storageDataSetID int64) (int, error)
 	ListCommitAttention(ctx context.Context, limit int) ([]storagecommit.AttentionRecord, error)
 	ListCommitAttentionForTasks(ctx context.Context, taskIDs []int64) ([]storagecommit.AttentionRecord, error)
 	CountStoppedCommitAttentionByDataSet(ctx context.Context) (map[int64]int64, error)
-	ReleaseCommitAttention(ctx context.Context, input storagecommit.ManualReleaseInput) error
 	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
 	MarkUploadCopyFailed(ctx context.Context, input MarkUploadCopyFailedInput) error
 	BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error)

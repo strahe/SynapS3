@@ -1015,8 +1015,8 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 func TestAdminStorageConfirmationCommands(t *testing.T) {
 	t.Setenv(configEnvVar, "")
 
-	t.Run("list and release", func(t *testing.T) {
-		var sawList, sawRelease bool
+	t.Run("list", func(t *testing.T) {
+		var sawList bool
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/storage-confirmations":
@@ -1035,16 +1035,6 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 					"reason_code":  "attempt_only_ambiguous",
 					"attempted_at": "2026-08-30T01:00:00Z", "attention_at": "2026-08-30T01:00:01Z",
 				}})
-			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/storage-confirmations/42/release":
-				sawRelease = true
-				var body map[string]any
-				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-					t.Fatalf("decode release body: %v", err)
-				}
-				if body["acknowledge_possible_duplicate"] != true || body["expected_attempt_id"] != "attempt-1" {
-					t.Fatal("release acknowledgement was not sent")
-				}
-				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"copy_id": 42, "status": "released"})
 			default:
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
@@ -1064,29 +1054,8 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 			!strings.Contains(out, "PROVIDER RESPONSE") || !strings.Contains(out, "provider returned HTTP 500: piece not found") {
 			t.Fatalf("list output missing confirmation details:\n%s", out)
 		}
-		out, err = runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42", "--attempt-id", "attempt-1", "--yes"})
-		if err != nil {
-			t.Fatalf("storage-confirmation release: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "released for copy 42") {
-			t.Fatalf("release output = %q", out)
-		}
-		if !sawList || !sawRelease {
-			t.Fatalf("sawList=%v sawRelease=%v", sawList, sawRelease)
-		}
-	})
-
-	t.Run("release requires explicit acknowledgement", func(t *testing.T) {
-		var called bool
-		ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
-		defer ts.Close()
-
-		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42", "--attempt-id", "attempt-1"})
-		if err == nil || !strings.Contains(err.Error(), "requires --yes") {
-			t.Fatalf("error = %v, output=%s", err, out)
-		}
-		if called {
-			t.Fatal("request was sent without --yes")
+		if !sawList {
+			t.Fatal("list request was not sent")
 		}
 	})
 }

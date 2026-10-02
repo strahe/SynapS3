@@ -119,6 +119,35 @@ func ClassifyPullError(err error) PullErrorDisposition {
 	return PullErrorUnknown
 }
 
+// CommitRejection classifies a SubmitCommit failure the provider answered with
+// a 4xx status.
+type CommitRejection uint8
+
+const (
+	CommitNotRejected CommitRejection = iota
+	// CommitRejectedDataSetUnavailable means the provider does not know the
+	// data set (404) or reports it terminated (409).
+	CommitRejectedDataSetUnavailable
+	// CommitRejectedByProvider covers every other 4xx, including a piece the
+	// provider no longer holds and rate limiting.
+	CommitRejectedByProvider
+)
+
+// ClassifyCommitRejection reports whether a SubmitCommit error is a provider
+// 4xx. AddPieces is the only provider call SubmitCommit makes, and Curio
+// answers every 4xx from it before sending a transaction, so a rejected
+// submission never reached the chain.
+func ClassifyCommitRejection(err error) CommitRejection {
+	httpErr, ok := errors.AsType[*pdp.HTTPError](err)
+	if !ok || httpErr.StatusCode < http.StatusBadRequest || httpErr.StatusCode >= http.StatusInternalServerError {
+		return CommitNotRejected
+	}
+	if httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusConflict {
+		return CommitRejectedDataSetUnavailable
+	}
+	return CommitRejectedByProvider
+}
+
 func providerOperationUnavailable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false

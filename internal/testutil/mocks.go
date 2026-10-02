@@ -206,6 +206,8 @@ type MockStorageTarget struct {
 	SubmitCommitFunc          func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
 	GetCommitStatusFunc       func(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatusFunc           func(context.Context, cid.Cid) (*storage.PieceStatus, error)
+	// CheckWritableFunc defaults to a writable data set.
+	CheckWritableFunc func(context.Context) error
 }
 
 func NewMockProviderTarget(providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) *MockStorageTarget {
@@ -333,6 +335,13 @@ func (m *MockStorageTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid) (
 		return m.PieceStatusFunc(ctx, pieceCID)
 	}
 	return nil, errors.New("MockStorageTarget.PieceStatus not configured")
+}
+
+func (m *MockStorageTarget) CheckWritable(ctx context.Context) error {
+	if m.CheckWritableFunc != nil {
+		return m.CheckWritableFunc(ctx)
+	}
+	return nil
 }
 
 func copySDKBigIntPtr(value *sdktypes.BigInt) *sdktypes.BigInt {

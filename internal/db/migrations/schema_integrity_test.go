@@ -373,7 +373,7 @@ func TestFreshBaselineIsIdempotentAndCannotRollback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("migrate fresh schema: %v", err)
 		}
-		if len(first.Migrations) != 1 || first.Migrations[0].Name != InitialSchemaName {
+		if len(first.Migrations) != len(Migrations.Sorted()) || first.Migrations[0].Name != InitialSchemaName {
 			t.Fatalf("first migration group = %#v", first.Migrations)
 		}
 		second, err := migrator.Migrate(ctx)

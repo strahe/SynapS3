@@ -181,7 +181,7 @@ import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import {
   storageConfirmationAttentionView,
-  storageConfirmationReleaseWarning,
+  storageConfirmationRetryNote,
   storageConfirmationTasksSearch,
 } from '@/lib/storage-confirmation-attention'
 import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
@@ -1091,11 +1091,11 @@ function CopyAttentionDetails({
           </div>
         )}
         <p>
-          Review it in{' '}
+          Use Recover in{' '}
           <Link to="/tasks" search={storageConfirmationTasksSearch} className="text-foreground underline">
             Tasks
           </Link>
-          . {storageConfirmationReleaseWarning}
+          . {storageConfirmationRetryNote}
         </p>
         {!attention.known && (
           <div className="space-y-1">

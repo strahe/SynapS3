@@ -130,7 +130,7 @@ export function attentionDisplayRows(attention: {
     },
     {
       key: 'storage_confirmations',
-      label: 'Storage confirmations to review',
+      label: 'Stopped storage confirmations',
       value: attention.tasks.storage_confirmations,
       tone: 'danger' as const,
       target: 'tasks' as const,
