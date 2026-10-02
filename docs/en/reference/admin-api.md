@@ -263,9 +263,9 @@ Manual confirmation does not check FWSS approval or whether the provider still r
 
 ### Storage confirmation attention
 
-When a provider does not confirm a storage registration, SynapS3 checks on chain whether the piece was registered. If it was not, SynapS3 submits the original request again; the chain accepts that request only once, so the piece is never stored twice. A provider that refuses the request is asked again later, and a piece it dropped before registration is uploaded again. A confirmation stops only when the chain does not match the copy.
+When a provider does not confirm a storage registration, SynapS3 checks on chain whether the piece was registered. If it was not, SynapS3 submits the original request again; the chain accepts that request only once. A provider that refuses the request is asked again later, and a piece it dropped before registration is uploaded again. A confirmation stops when the chain records its request somewhere other than this copy, or when the copy has conflicting earlier requests and its current one is not registered.
 
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists confirmations that need attention: the affected copy, owning task (`task_id`), data set, attempt, known transaction, the provider's reply when the submission failed (`submit_error`), timestamps, and stable `reason_code`. The Tasks page shows the same confirmations on their Confirm storage tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; the retry checks the chain again before submitting anything.
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists confirmations that need attention, including any still unregistered after 15 minutes while SynapS3 keeps trying: the affected copy, owning task (`task_id`), data set, attempt, known transaction, the provider's reply when the submission failed (`submit_error`), timestamps, and stable `reason_code`. The Tasks page shows the same confirmations on their Confirm storage tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; the retry checks the chain again before submitting anything and does not choose between conflicting earlier requests.
 
 ## Tasks
 

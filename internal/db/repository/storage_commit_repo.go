@@ -312,7 +312,8 @@ func (r *BunStorageContentRepo) ResetCommitAttempt(ctx context.Context, input st
 }
 
 func (r *BunStorageContentRepo) ReleaseCommitAttempt(ctx context.Context, input storagecommit.ReleaseInput) error {
-	if err := validateCommitCopyIdentity(input.Copy); err != nil || input.AttemptID == "" || !input.Reason.Valid() {
+	if err := validateCommitCopyIdentity(input.Copy); err != nil || input.AttemptID == "" || !input.Reason.Valid() ||
+		input.KnownNotSubmitted && input.Unacknowledged {
 		return fmt.Errorf("releasing storage commit attempt: %w", ErrInvalidInput)
 	}
 	now := commitInputTime(input.Now)
@@ -329,14 +330,19 @@ func (r *BunStorageContentRepo) ReleaseCommitAttempt(ctx context.Context, input 
 		if input.SubmitError != "" {
 			q = q.Set("submit_error = ?", input.SubmitError)
 		}
-		if input.KnownNotSubmitted {
+		switch {
+		case input.KnownNotSubmitted:
 			q = q.
 				Where("status IN (?)", bun.List([]storagecommit.AttemptStatus{
 					storagecommit.AttemptStatusReserved,
 					storagecommit.AttemptStatusAttempted,
 				})).
 				Where("transaction_id IS NULL AND status_url IS NULL")
-		} else {
+		case input.Unacknowledged:
+			q = q.
+				Where("status = ?", storagecommit.AttemptStatusAttempted).
+				Where("transaction_id IS NULL AND status_url IS NULL")
+		default:
 			q = q.Where("status = ?", storagecommit.AttemptStatusReserved)
 		}
 		res, err := q.Exec(ctx)
@@ -404,11 +410,11 @@ func (r *BunStorageContentRepo) ListCommitRequests(ctx context.Context, copyIden
 			storagecommit.AttemptStatusReserved, storagecommit.AttemptStatusReleased,
 			storagecommit.ReleaseBeforeSubmitCanceled, storagecommit.ReleaseProviderRejected, storagecommit.ReleaseDataSetUnavailable).
 		ColumnExpr(`MAX(CASE WHEN status NOT IN (?, ?, ?, ?, ?) OR
-            (status = ? AND COALESCE(release_reason, '') NOT IN (?, ?, ?, ?, ?)) THEN 1 ELSE 0 END) <> 0 AS unknown`,
+            (status = ? AND COALESCE(release_reason, '') NOT IN (?, ?, ?, ?, ?, ?)) THEN 1 ELSE 0 END) <> 0 AS unknown`,
 			storagecommit.AttemptStatusReserved, storagecommit.AttemptStatusAttempted, storagecommit.AttemptStatusConfirmed,
 			storagecommit.AttemptStatusReleased, storagecommit.AttemptStatusRejected, storagecommit.AttemptStatusReleased,
 			storagecommit.ReleaseBeforeSubmitCanceled, storagecommit.ReleaseDataSetUnavailable, storagecommit.ReleaseOwnerTerminal,
-			storagecommit.ReleaseProviderRejected, storagecommit.ReleaseManualDuplicateAck).
+			storagecommit.ReleaseProviderRejected, storagecommit.ReleaseProviderPieceMissing, storagecommit.ReleaseManualDuplicateAck).
 		Where("content_id = ? AND storage_data_set_id = ?", copyIdentity.ContentID, copyIdentity.StorageDataSetID).
 		Where("extra_data_hex IS NOT NULL").
 		GroupExpr("LOWER(extra_data_hex)").

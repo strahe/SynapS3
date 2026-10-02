@@ -23,6 +23,10 @@ const (
 	// AdvanceResendDue means the chain shows the attempt's request unused and
 	// long enough has passed for execute to send the same request again.
 	AdvanceResendDue AdvanceState = "resend_due"
+	// AdvanceResendRefused means the provider refused to send the attempt's
+	// request again. The attempt stays unresolved, because an earlier send may
+	// still land; Cause carries the refusal.
+	AdvanceResendRefused AdvanceState = "resend_refused"
 )
 
 // Valid reports whether the application can write this release reason. The
@@ -30,7 +34,8 @@ const (
 func (r ReleaseReason) Valid() bool {
 	//exhaustive:enforce
 	switch r {
-	case ReleaseBeforeSubmitCanceled, ReleaseDataSetUnavailable, ReleaseOwnerTerminal, ReleaseProviderRejected:
+	case ReleaseBeforeSubmitCanceled, ReleaseDataSetUnavailable, ReleaseOwnerTerminal, ReleaseProviderRejected,
+		ReleaseProviderPieceMissing:
 		return true
 	case ReleaseManualDuplicateAck:
 		return false
@@ -48,6 +53,11 @@ const (
 	// ReleaseProviderRejected means the provider refused the submission with a
 	// 4xx before sending any transaction.
 	ReleaseProviderRejected ReleaseReason = "provider_rejected"
+	// ReleaseProviderPieceMissing means the provider refused to send an
+	// unacknowledged attempt again because it no longer holds the piece. An
+	// earlier send may still land, so request history counts it as possibly
+	// submitted.
+	ReleaseProviderPieceMissing ReleaseReason = "provider_piece_missing"
 	// ReleaseManualDuplicateAck names attempts an operator released by hand in
 	// earlier versions. Nothing writes it any more.
 	ReleaseManualDuplicateAck ReleaseReason = "manual_duplicate_acknowledgement"
@@ -66,9 +76,10 @@ type AdvanceResult struct {
 	ProvenByNonce bool
 	AttentionCode AttentionCode
 	Continue      bool
-	// Cause carries the error behind a release so the caller can record why it
-	// happened instead of a generic sentinel. It is set on
-	// ReleaseDataSetUnavailable and AdvanceDeferred and is nil everywhere else.
+	// Cause carries the error behind a release, refusal, or rejection so the
+	// caller can record why it happened instead of a generic sentinel. It is set
+	// on ReleaseDataSetUnavailable, AdvanceDeferred, AdvanceResendRefused, and
+	// an AdvanceRejected produced from a provider receipt.
 	Cause error
 	// RetryAfter is how long to wait before advancing again. It is set on
 	// AdvanceDeferred, and on AdvancePending while a resend is not yet due or

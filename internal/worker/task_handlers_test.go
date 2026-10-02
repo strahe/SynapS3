@@ -1,6 +1,7 @@
 package worker_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -4021,51 +4022,181 @@ func TestCommitRefusedByProvider(t *testing.T) {
 	}
 }
 
-// A confirmation the chain contradicts stops for an operator, who can retry it
-// once the evidence is settled; the retry confirms from the chain without
-// sending anything.
-func TestStoppedCommitRetriesFromChainEvidence(t *testing.T) {
-	target := &testutil.MockStorageTarget{}
-	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
-		return nil, errors.New("the stopped confirmation sent a request")
-	}
-	nonces := &testutil.MockCommitNonces{}
-	runtime, pipeline := commitFixture(t, handlerRuntimeOptions{commitNonces: nonces}, target)
+// seedUnacknowledgedCommit records an attempt that sent the copy's signed
+// request at attemptedAt without any provider receipt.
+func seedUnacknowledgedCommit(t *testing.T, runtime handlerTestRuntime, pipeline seededCopyPipeline, attemptID string, attemptedAt time.Time) storagecommit.CopyIdentity {
+	t.Helper()
 	identity := storagecommit.CopyIdentity{
 		StorageCopyID: pipeline.target.ID, ContentID: pipeline.target.ContentID,
 		CopyIndex: pipeline.target.CopyIndex, StorageDataSetID: pipeline.target.StorageDataSetID,
 	}
-	if _, err := runtime.repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{Copy: identity, AttemptID: "stopped"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "stopped", ExtraDataHex: testutil.CommitExtraDataHex(11),
+	if _, err := runtime.repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: attemptID, Now: attemptedAt,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	pieceID := sdktypes.NewBigInt(8803)
-	nonces.Consume(11, sdktypes.NewBigInt(9999), pieceID, pipeline.pieceCID)
+	if _, err := runtime.repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: attemptID, ExtraDataHex: testutil.CommitExtraDataHex(11), Now: attemptedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
+// A confirmation the chain contradicts stops for an operator, who can retry it
+// once the evidence is settled; the retry confirms from the chain without
+// sending anything. It stops under whatever its attempt was flagged with first.
+func TestStoppedCommitRetriesFromChainEvidence(t *testing.T) {
+	for _, earlier := range []storagecommit.AttentionCode{
+		"", storagecommit.AttentionConfirmationTimeout, storagecommit.AttentionDataSetUnavailable,
+	} {
+		t.Run(cmp.Or(string(earlier), "unflagged"), func(t *testing.T) {
+			target := &testutil.MockStorageTarget{}
+			target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+				return nil, errors.New("the stopped confirmation sent a request")
+			}
+			nonces := &testutil.MockCommitNonces{}
+			runtime, pipeline := commitFixture(t, handlerRuntimeOptions{commitNonces: nonces}, target)
+			identity := seedUnacknowledgedCommit(t, runtime, pipeline, "stopped", time.Now())
+			if earlier != "" {
+				if err := runtime.repos.Contents.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
+					Copy: identity, AttemptID: "stopped", Code: earlier,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pieceID := sdktypes.NewBigInt(8803)
+			nonces.Consume(11, sdktypes.NewBigInt(9999), pieceID, pipeline.pieceCID)
+			taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+
+			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusFailed
+			})
+			want := cmp.Or(earlier, storagecommit.AttentionSubmissionMismatch)
+			if failed.FailureReason == nil || *failed.FailureReason != string(want) || !runtime.service.Retryable(failed) {
+				t.Fatalf("stopped task = %#v, want a retryable %s", failed, want)
+			}
+			nonces.Consume(11, pipeline.targetSet.DataSetID.SDK(), pieceID, pipeline.pieceCID)
+			if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+				t.Fatalf("retry stopped confirmation: %v", err)
+			}
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusCompleted
+			})
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || copyRow.Status != model.StorageCopyStatusCommitted || copyRow.PieceID == nil ||
+				!copyRow.PieceID.Equal(idtypes.OnChainIDFromSDK(pieceID)) {
+				t.Fatalf("copy = %#v err=%v, want it committed at the nonce's piece", copyRow, err)
+			}
+		})
+	}
+}
+
+// An unacknowledged request is sent again once due, and the send is recorded
+// before it goes out, so a failed resend paces the next one from that send.
+func TestCommitResendIsCheckpointedAndPaced(t *testing.T) {
+	var sends atomic.Int64
+	target := &testutil.MockStorageTarget{}
+	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+		sends.Add(1)
+		if string(request.ExtraData) != string(testutil.CommitExtraData(11)) {
+			t.Error("resend changed the signed request")
+		}
+		return nil, &pdp.HTTPError{StatusCode: http.StatusInternalServerError}
+	}
+	runtime, pipeline := commitFixture(t, handlerRuntimeOptions{commitNonces: &testutil.MockCommitNonces{}}, target)
+	seedUnacknowledgedCommit(t, runtime, pipeline, "unacknowledged", time.Now().Add(-10*time.Minute))
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusFailed
+	sentAt := time.Now()
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.LastError != nil && sends.Load() == 1
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != string(storagecommit.AttentionSubmissionMismatch) || !runtime.service.Retryable(failed) {
-		t.Fatalf("stopped task = %#v, want a retryable mismatch", failed)
+	wakeTask(t, runtime, taskRow.ID)
+	paced := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.AvailableAt.After(time.Now().Add(5*time.Minute))
+	})
+	if sends.Load() != 1 || paced.ResumeMode != model.TaskResumeModeRecover ||
+		paced.AvailableAt.Before(sentAt.Add(9*time.Minute)) {
+		t.Fatalf("task after a failed resend = %#v sends=%d, want one send and a ten-minute wait", paced, sends.Load())
 	}
-	nonces.Consume(11, pipeline.targetSet.DataSetID.SDK(), pieceID, pipeline.pieceCID)
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatalf("retry stopped confirmation: %v", err)
+	var raw string
+	if err := runtime.db.NewRaw(`SELECT checkpoint_json FROM task_payloads WHERE task_id = ?`, taskRow.ID).Scan(t.Context(), &raw); err != nil {
+		t.Fatal(err)
 	}
+	var checkpoint struct {
+		AttemptID  string    `json:"attempt_id"`
+		Sends      int       `json:"sends"`
+		LastSentAt time.Time `json:"last_sent_at"`
+	}
+	if err := json.Unmarshal([]byte(raw), &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.AttemptID != "unacknowledged" || checkpoint.Sends != 2 || checkpoint.LastSentAt.Before(sentAt.Add(-time.Minute)) {
+		t.Fatalf("checkpoint = %+v, want the second send of the attempt", checkpoint)
+	}
+}
+
+// A provider that refuses to send an unacknowledged request again because it
+// dropped the piece releases the attempt. The copy transfers again under the
+// same request, and the request's own nonce settles it.
+func TestCommitResendRefusedForDroppedPieceTransfersAgain(t *testing.T) {
+	var sends atomic.Int64
+	target := &testutil.MockStorageTarget{}
+	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+		sends.Add(1)
+		return nil, &pdp.HTTPError{StatusCode: http.StatusBadRequest, Body: "piece not found"}
+	}
+	var pulled atomic.Value
+	target.PullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+		pulled.Store(hex.EncodeToString(request.ExtraData))
+		return &storage.PullResult{Status: storage.PullStatusComplete}, nil
+	}
+	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+		return synapse.ParkedPieceMissing, nil
+	})
+	nonces := &testutil.MockCommitNonces{}
+	runtime, pipeline := commitFixture(t, handlerRuntimeOptions{parkedPieces: parked, commitNonces: nonces}, target)
+	seedUnacknowledgedCommit(t, runtime, pipeline, "refused", time.Now().Add(-10*time.Minute))
+	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageCommit)
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
 	})
-	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow.Status != model.StorageCopyStatusCommitted || copyRow.PieceID == nil ||
-		!copyRow.PieceID.Equal(idtypes.OnChainIDFromSDK(pieceID)) {
-		t.Fatalf("copy = %#v err=%v, want it committed at the nonce's piece", copyRow, err)
+	released := new(storagecommit.Attempt)
+	if err := runtime.db.NewSelect().Model(released).Where("attempt_id = ?", "refused").Scan(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if released.Status != storagecommit.AttemptStatusReleased || released.ReleaseReason == nil ||
+		*released.ReleaseReason != string(storagecommit.ReleaseProviderPieceMissing) || released.SubmitError == nil {
+		t.Fatalf("refused attempt = %#v, want it released with the provider's reply", released)
+	}
+	retried := waitForCopy(t, runtime, pipeline.target.ID, func(copyRow *model.StorageCopy) bool {
+		return copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "refused" && copyRow.CommitAttemptedAt != nil
+	})
+	if got, _ := pulled.Load().(string); got != testutil.CommitExtraDataHex(11) || sends.Load() != 1 {
+		t.Fatalf("pull = %q sends=%d, want one pull under the original request and no new send", got, sends.Load())
+	}
+	// The earlier send might still land, so the new attempt waits for the
+	// chain instead of sending at once.
+	waitForTask(t, runtime.repos, *retried.ActiveTaskID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.AvailableAt.After(time.Now().Add(time.Minute))
+	})
+	pieceID := sdktypes.NewBigInt(8804)
+	nonces.Consume(11, pipeline.targetSet.DataSetID.SDK(), pieceID, pipeline.pieceCID)
+	wakeTask(t, runtime, *retried.ActiveTaskID)
+	committed := waitForCopy(t, runtime, pipeline.target.ID, func(copyRow *model.StorageCopy) bool {
+		return copyRow.Status == model.StorageCopyStatusCommitted
+	})
+	if committed.CommitExtraDataHex == nil || *committed.CommitExtraDataHex != testutil.CommitExtraDataHex(11) ||
+		committed.PieceID == nil || !committed.PieceID.Equal(idtypes.OnChainIDFromSDK(pieceID)) || sends.Load() != 1 {
+		t.Fatalf("committed copy = %#v sends=%d, want it registered by the original request's nonce", committed, sends.Load())
 	}
 }
 

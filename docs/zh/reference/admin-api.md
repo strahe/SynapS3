@@ -263,9 +263,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 存储确认处理
 
-存储提供方没有确认存储登记时，SynapS3 会在链上核对该 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次，因此 piece 不会被重复存储。存储提供方拒绝该请求时会稍后再试，登记前已被存储提供方删除的 piece 会重新上传。只有链上记录与该 copy 不符时，确认才会停止。
+存储提供方没有确认存储登记时，SynapS3 会在链上核对该 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方拒绝该请求时会稍后再试，登记前已被存储提供方删除的 piece 会重新上传。链上记录显示该请求登记到了其他 copy，或该 copy 存在相互冲突的历史请求且当前请求未登记时，确认会停止。
 
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储确认：受影响的 copy、所属任务（`task_id`）、data set、attempt、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、时间和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的确认。对已停止的确认，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试会先重新核对链上记录，再决定是否提交。
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储确认，也包括超过 15 分钟仍未登记、SynapS3 仍在继续尝试的确认：受影响的 copy、所属任务（`task_id`）、data set、attempt、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、时间和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的确认。对已停止的确认，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试会先重新核对链上记录，再决定是否提交，但不会在相互冲突的历史请求之间做选择。
 
 ## 任务
 

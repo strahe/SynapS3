@@ -1581,22 +1581,12 @@ func (h *TaskHandlers) commitHandler() taskengine.Handler {
 	definition := copyDefinition(model.TaskTypeStorageCommit, h.retryLimit())
 	engineFailure := definition.CanManualRetry
 	// Retry runs in recover mode, which checks a stopped confirmation on chain
-	// again and sends nothing until the chain shows its request unused.
+	// again and sends nothing until the chain shows its request unused. A
+	// confirmation stops under the first attention code its attempt recorded,
+	// whatever stopped it later, so every known code must allow it.
 	definition.CanManualRetry = func(task *model.Task) bool {
-		if engineFailure(task) {
-			return true
-		}
-		if task == nil || task.FailureReason == nil {
-			return false
-		}
-		switch storagecommit.AttentionCode(*task.FailureReason) {
-		case storagecommit.AttentionAttemptOnlyAmbiguous,
-			storagecommit.AttentionUnattributedPiece,
-			storagecommit.AttentionSubmissionMismatch:
-			return true
-		default:
-			return false
-		}
+		return engineFailure(task) ||
+			task != nil && task.FailureReason != nil && storagecommit.AttentionCode(*task.FailureReason).Valid()
 	}
 	return taskHandler{
 		definition: definition,
@@ -1722,8 +1712,14 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Sending storage registration again", nil)
 	case storagecommit.AdvanceDeferred:
 		return h.deferCommit(ctx, execution, input, copyRow, target, pieceCID, advanced)
+	case storagecommit.AdvanceResendRefused:
+		return h.resendRefused(ctx, execution, input, copyRow, target, pieceCID, advanced)
 	case storagecommit.AdvanceRejected:
-		return h.retryResolvedCopyTask(execution, input, copyRow, synapse.ErrProviderTransactionRejected, "commit_rejected")
+		cause := advanced.Cause
+		if cause == nil {
+			cause = synapse.ErrProviderTransactionRejected
+		}
+		return h.retryResolvedCopyTask(execution, input, copyRow, cause, "commit_rejected")
 	case storagecommit.AdvanceNeedsAttention:
 		if advanced.Continue && advanced.AttentionCode.Valid() {
 			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
@@ -1804,19 +1800,8 @@ func (h *TaskHandlers) deferCommit(
 		return taskengine.SuspendWithError(model.TaskResumeModeExecute, advanced.RetryAfter, "dataset",
 			"Checking the storage service before registering", synapse.SummarizedError(advanced.Cause), nil)
 	}
-	if h.deps.ParkedPieces != nil {
-		state, err := h.deps.ParkedPieces.FindParkedPiece(ctx, target.ServiceURL(), pieceCID)
-		if err == nil && state == synapse.ParkedPieceMissing {
-			return taskengine.Complete("Storage provider no longer holds the piece; transferring it again",
-				func(ctx context.Context, repos *repository.Repositories) error {
-					if err := repos.Contents.ReturnPieceReadyCopyToTransfer(ctx, repository.ReturnPieceReadyCopyInput{
-						CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(),
-					}); err != nil {
-						return err
-					}
-					return h.enqueueSuccessorCopyTask(ctx, repos, input, execution.ID(), model.TaskTypeStorageTransferPlan)
-				})
-		}
+	if h.providerDroppedPiece(ctx, target, pieceCID) {
+		return h.transferAgain(execution, input, copyRow, nil)
 	}
 	h.deps.Logger.Warn("storage provider refused the registration",
 		"task_id", execution.ID(), "copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
@@ -1824,6 +1809,75 @@ func (h *TaskHandlers) deferCommit(
 		"error", synapse.ErrorSummary(advanced.Cause))
 	return taskengine.SuspendWithError(model.TaskResumeModeExecute, advanced.RetryAfter, storagecommit.ProviderRejectedWaitReason,
 		"Storage provider refused the registration; trying again later", synapse.SummarizedError(advanced.Cause), nil)
+}
+
+// resendRefused handles a provider that refused to send an unacknowledged
+// request again. Once the provider has dropped the piece, the request cannot
+// land from it, so the attempt is released and the piece transferred again
+// under the same request. Any earlier send can still land only with that
+// request's nonce, which the next attempt reads before sending.
+func (h *TaskHandlers) resendRefused(
+	ctx context.Context,
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	target synapse.DataSetTarget,
+	pieceCID cid.Cid,
+	advanced storagecommit.AdvanceResult,
+) taskengine.Result {
+	if h.providerDroppedPiece(ctx, target, pieceCID) {
+		return h.transferAgain(execution, input, copyRow, func(ctx context.Context, repos *repository.Repositories) error {
+			return repos.Contents.ReleaseCommitAttempt(ctx, storagecommit.ReleaseInput{
+				Copy: storagecommit.CopyIdentity{
+					StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID,
+					CopyIndex: copyRow.CopyIndex, StorageDataSetID: copyRow.StorageDataSetID,
+				},
+				AttemptID: advanced.AttemptID, Reason: storagecommit.ReleaseProviderPieceMissing,
+				Unacknowledged: true, Now: time.Now(),
+			})
+		})
+	}
+	h.deps.Logger.Warn("storage provider refused to resend the registration",
+		"task_id", execution.ID(), "copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
+		"storage_data_set_id", copyRow.StorageDataSetID, "attempt_id", advanced.AttemptID,
+		"error", synapse.ErrorSummary(advanced.Cause))
+	return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation",
+		"Checking storage registration", synapse.SummarizedError(advanced.Cause), nil)
+}
+
+// providerDroppedPiece reports whether the provider positively no longer holds
+// the piece, as Curio does with an upload that joins no data set within hours.
+func (h *TaskHandlers) providerDroppedPiece(ctx context.Context, target synapse.DataSetTarget, pieceCID cid.Cid) bool {
+	if h.deps.ParkedPieces == nil {
+		return false
+	}
+	state, err := h.deps.ParkedPieces.FindParkedPiece(ctx, target.ServiceURL(), pieceCID)
+	return err == nil && state == synapse.ParkedPieceMissing
+}
+
+// transferAgain sends a copy whose piece the provider dropped back to
+// transfer, keeping its signed request. release runs first in the same
+// settlement when an attempt still holds the copy.
+func (h *TaskHandlers) transferAgain(
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	release func(context.Context, *repository.Repositories) error,
+) taskengine.Result {
+	return taskengine.Complete("Storage provider no longer holds the piece; transferring it again",
+		func(ctx context.Context, repos *repository.Repositories) error {
+			if release != nil {
+				if err := release(ctx, repos); err != nil {
+					return err
+				}
+			}
+			if err := repos.Contents.ReturnPieceReadyCopyToTransfer(ctx, repository.ReturnPieceReadyCopyInput{
+				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(),
+			}); err != nil {
+				return err
+			}
+			return h.enqueueSuccessorCopyTask(ctx, repos, input, execution.ID(), model.TaskTypeStorageTransferPlan)
+		})
 }
 
 // commitPollDelay is how long a pending registration waits before it is

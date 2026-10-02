@@ -203,16 +203,14 @@ func (a *Advancer) submitReserved(
 		return AdvanceResult{}, requestErr
 	}
 	// Restored requests may already have an external effect. Establish their
-	// fence before checking writability, and let recovery decide from the nonce.
+	// fence before checking writability, and let recovery decide from the nonce;
+	// conflicting requests stop it there before anything is sent.
 	if request.MayHaveBeenSubmitted || requestErr != nil {
 		attempt, err := a.Store.MarkCommitAttempted(ctx, AttemptInput{
 			Copy: eligibleIdentity, AttemptID: attemptID, ExtraDataHex: request.ExtraDataHex, Now: a.now(),
 		})
 		if err != nil {
 			return AdvanceResult{}, err
-		}
-		if requestErr != nil {
-			return a.attentionForCopy(ctx, identity, attempt.Copy, attemptID, AttentionSubmissionMismatch, false)
 		}
 		return a.observe(ctx, input, attempt.Copy)
 	}
@@ -374,7 +372,12 @@ func (a *Advancer) settleSubmit(
 		})
 		cancel()
 		if recordErr != nil {
-			submitErr = errors.Join(submitErr, &SubmitFailureRecordError{Err: recordErr})
+			return pending, errors.Join(submitErr, &SubmitFailureRecordError{Err: recordErr})
+		}
+		// A refused resend may mean the provider no longer holds the piece,
+		// which only the caller can check and repair.
+		if previousSubmission && synapse.ClassifyCommitRejection(submitErr) == synapse.CommitRejectedByProvider {
+			return AdvanceResult{State: AdvanceResendRefused, AttemptID: attemptID, Cause: submitErr}, nil
 		}
 		return pending, submitErr
 	}
@@ -421,12 +424,6 @@ func (a *Advancer) observe(
 	if context.Cause(ctx) != nil {
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 	}
-	if _, err := selectCommitRequest(ctx, a.Store, copyRow); err != nil {
-		if errors.Is(err, ErrCommitRequestConflict) {
-			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
-		}
-		return AdvanceResult{State: AdvancePending, AttemptID: attemptID, RetryAfter: chainRetryDelay}, err
-	}
 	if copyRow.CommitStatusURL == nil || *copyRow.CommitStatusURL == "" {
 		return a.recoverUnobserved(ctx, input, identity, copyRow, attemptID)
 	}
@@ -437,14 +434,14 @@ func (a *Advancer) observe(
 		if context.Cause(ctx) != nil {
 			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 		}
+		if errors.Is(err, storage.ErrInvalidArgument) || errors.Is(err, pdp.ErrInvalidStatus) {
+			return a.rejectUnlessRegistered(ctx, input, identity, copyRow, attemptID, ErrCommitReceiptMismatch)
+		}
 		return a.settleByNonceOr(ctx, input, identity, copyRow, attemptID, func() (AdvanceResult, error) {
 			if errors.Is(err, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(err) {
 				return a.pendingOrAttentionWithCode(
 					ctx, identity, copyRow, attemptID, AttentionDataSetUnavailable,
 				)
-			}
-			if errors.Is(err, storage.ErrInvalidArgument) || errors.Is(err, pdp.ErrInvalidStatus) {
-				return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 			}
 			return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
 		})
@@ -460,8 +457,9 @@ func (a *Advancer) classifySDKStatus(
 	attemptID string,
 	status *storage.CommitStatus,
 ) (AdvanceResult, error) {
+	// A receipt that does not describe this attempt proves nothing about it.
 	mismatch := func() (AdvanceResult, error) {
-		return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
+		return a.rejectUnlessRegistered(ctx, input, identity, copyRow, attemptID, ErrCommitReceiptMismatch)
 	}
 	if status == nil {
 		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
@@ -470,7 +468,7 @@ func (a *Advancer) classifySDKStatus(
 	if !bound || status.DataSet == nil || status.Kind != storage.CommitKindAddPieces ||
 		copyRow.CommitTransactionID == nil || status.TransactionID != *copyRow.CommitTransactionID ||
 		!status.DataSet.Equal(ref) {
-		return a.settleByNonceOr(ctx, input, identity, copyRow, attemptID, mismatch)
+		return mismatch()
 	}
 	switch status.State {
 	case storage.CommitStatePending:
@@ -500,18 +498,35 @@ func (a *Advancer) classifySDKStatus(
 		}, nil
 	case storage.CommitStateRejected:
 		// The reported transaction failed, but another one carrying the same
-		// signed request may still have been included. Rejecting the attempt
-		// is safe even when the chain cannot be read: the copy keeps that
-		// request, so the next attempt can only land the same nonce.
-		return a.settleByNonceOr(ctx, input, identity, copyRow, attemptID, func() (AdvanceResult, error) {
-			if err := a.reset(ctx, identity, attemptID, pdp.ErrTxRejected); err != nil {
-				return AdvanceResult{}, err
-			}
-			return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
-		})
+		// signed request may still have been included.
+		return a.rejectUnlessRegistered(ctx, input, identity, copyRow, attemptID, pdp.ErrTxRejected)
 	default:
-		return a.settleByNonceOr(ctx, input, identity, copyRow, attemptID, mismatch)
+		return mismatch()
 	}
+}
+
+// ErrCommitReceiptMismatch records an attempt rejected because the provider's
+// receipt for it named another transaction, data set, kind, or piece count, or
+// could not be read as a receipt at all.
+var ErrCommitReceiptMismatch = errors.New("storage provider reported a registration that does not match this request")
+
+// rejectUnlessRegistered rejects the attempt unless its own nonce proves the
+// registration. Rejecting is safe even when the chain cannot be read: the copy
+// keeps its request, so the next attempt can only land the same nonce.
+func (a *Advancer) rejectUnlessRegistered(
+	ctx context.Context,
+	input AdvanceInput,
+	identity CopyIdentity,
+	copyRow model.StorageCopy,
+	attemptID string,
+	cause error,
+) (AdvanceResult, error) {
+	return a.settleByNonceOr(ctx, input, identity, copyRow, attemptID, func() (AdvanceResult, error) {
+		if err := a.reset(ctx, identity, attemptID, cause); err != nil {
+			return AdvanceResult{}, err
+		}
+		return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID, Cause: cause}, nil
+	})
 }
 
 // recoverUnobserved resolves an attempt the provider never acknowledged. The
@@ -535,6 +550,21 @@ func (a *Advancer) recoverUnobserved(
 		return a.confirmedByNonce(copyRow, attemptID, proof), nil
 	case nonceConflicts:
 		return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
+	}
+	// The copy's other requests cannot disprove this attempt's own nonce, but
+	// they decide whether sending it again could add the piece a second time.
+	if _, err := selectCommitRequest(ctx, a.Store, copyRow); err != nil {
+		if errors.Is(err, ErrCommitRequestConflict) {
+			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
+		}
+		return waitForChain, err
+	}
+	// Like a provider still reporting pending, a request unregistered past the
+	// attention threshold is flagged while recovery keeps sending it.
+	if copyRow.CommitAttentionAt == nil && a.now().Sub(*copyRow.CommitAttemptedAt) >= a.attentionAfter() {
+		if _, err := a.attention(ctx, identity, attemptID, AttentionConfirmationTimeout, true); err != nil {
+			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, err
+		}
 	}
 	sent := input.Sent
 	if sent.Sends < 1 || sent.LastSentAt.IsZero() {

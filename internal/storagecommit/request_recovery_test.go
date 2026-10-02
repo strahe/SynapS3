@@ -12,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/pdp"
@@ -47,7 +48,13 @@ func TestAdvancerResendRefusalPreservesEarlierSubmission(t *testing.T) {
 			}
 			at := c.attemptedAt.Add(6 * time.Minute)
 			result, err := c.advance(t, at, storagecommit.AdvanceInput{Resend: checkpointResend})
-			if result.State != storagecommit.AdvancePending || !errors.Is(err, refusal) || sends != 1 {
+			// Only a refusal the provider may have answered for a dropped piece is
+			// handed back for the caller to check.
+			refused := synapse.ClassifyCommitRejection(refusal) == synapse.CommitRejectedByProvider
+			switch {
+			case refused && (result.State != storagecommit.AdvanceResendRefused || err != nil || !errors.Is(result.Cause, refusal)),
+				!refused && (result.State != storagecommit.AdvancePending || !errors.Is(err, refusal)),
+				sends != 1:
 				t.Fatalf("refused resend = %#v err=%v sends=%d", result, err, sends)
 			}
 			copyRow := loadAdvancerCopy(t, c.repos, c.copyRow.ID)
@@ -254,6 +261,54 @@ func TestAdvancerObservedSubmissionCanBeConfirmedByNonce(t *testing.T) {
 			attempt := loadAdvancerAttempt(t, c.db, "unacknowledged")
 			if attempt.TransactionID == nil || *attempt.TransactionID != "0xsubmitted" || attempt.ConfirmedTransactionID != nil {
 				t.Fatalf("nonce confirmation changed transaction evidence: %#v", attempt)
+			}
+		})
+	}
+}
+
+// Another request in the copy's history cannot disprove the attempt's own
+// evidence; it only keeps recovery from sending the attempt's request again.
+func TestAdvancerConflictingRequestsSettleOnlyByOwnEvidence(t *testing.T) {
+	for _, scenario := range []string{"provider confirmed", "own nonce registered", "unregistered"} {
+		t.Run(scenario, func(t *testing.T) {
+			c := seedUnacknowledgedAttempt(t)
+			insertReleasedRequest(t, c, "earlier-request", testutil.CommitExtraDataHex(6), storagecommit.ReleaseManualDuplicateAck)
+			sends := 0
+			c.target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+				sends++
+				return nil, errors.New("conflicting history sent a request")
+			}
+			switch scenario {
+			case "provider confirmed":
+				if err := c.repos.Contents.RecordCommitSubmission(t.Context(), storagecommit.EvidenceInput{
+					Copy: advancerCopyIdentity(c.copyRow), AttemptID: "unacknowledged", TransactionID: "0xsubmitted",
+					StatusURL: "https://provider.example/status/original", Now: c.attemptedAt,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				c.target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
+					ref, _ := c.target.DataSetRef()
+					return &storage.CommitStatus{
+						Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: "0xsubmitted",
+						DataSet: &ref, PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(41)},
+					}, nil
+				}
+			case "own nonce registered":
+				c.nonces.Consume(unacknowledgedNonce, c.binding.DataSetID.SDK(), sdktypes.NewBigInt(41), c.pieceCID)
+			}
+			result, err := c.advance(t, c.attemptedAt.Add(time.Hour), storagecommit.AdvanceInput{Resend: checkpointResend})
+			switch {
+			case err != nil || sends != 0:
+				t.Fatalf("advance = %#v err=%v sends=%d", result, err, sends)
+			case scenario == "unregistered":
+				if result.State != storagecommit.AdvanceNeedsAttention || result.Continue ||
+					result.AttentionCode != storagecommit.AttentionSubmissionMismatch {
+					t.Fatalf("unregistered conflict = %#v, want a stopped mismatch", result)
+				}
+			case result.State != storagecommit.AdvanceConfirmed || result.ExtraDataHex != testutil.CommitExtraDataHex(unacknowledgedNonce):
+				t.Fatalf("%s = %#v, want the attempt confirmed by its own request", scenario, result)
+			case scenario == "own nonce registered":
+				settleNonceResult(t, c, result)
 			}
 		})
 	}

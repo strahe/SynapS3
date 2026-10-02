@@ -98,8 +98,12 @@ type ReleaseInput struct {
 	AttemptID         string
 	Reason            ReleaseReason
 	KnownNotSubmitted bool
-	ClearReadyAt      bool
-	ClearExtraData    bool
+	// Unacknowledged resolves an attempted request the provider never
+	// acknowledged although an earlier send of it may still land. The reason
+	// must keep that possibility visible to request history.
+	Unacknowledged bool
+	ClearReadyAt   bool
+	ClearExtraData bool
 	// SubmitError keeps the provider's reply to a submission it refused.
 	SubmitError string
 	Now         time.Time

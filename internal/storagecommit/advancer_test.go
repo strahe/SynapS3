@@ -147,8 +147,11 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 	}
 }
 
+// A receipt that does not describe the attempt rejects it unless the chain
+// already registered its request; the copy keeps that request for the next
+// attempt.
 func TestAdvancerRejectsMismatchedCommitStatus(t *testing.T) {
-	for _, mismatch := range []string{"transaction", "kind", "data set", "piece count", "rejected transaction"} {
+	for _, mismatch := range []string{"transaction", "kind", "data set", "piece count", "rejected transaction", "unknown state", "invalid status", "registered"} {
 		t.Run(mismatch, func(t *testing.T) {
 			db := testutil.NewTestDB(t)
 			repos := repository.NewRepositories(db)
@@ -197,20 +200,43 @@ func TestAdvancerRejectsMismatchedCommitStatus(t *testing.T) {
 			case "rejected transaction":
 				status.State = storage.CommitStateRejected
 				status.TransactionID = "0xother"
+			case "unknown state":
+				status.State = storage.CommitState("future")
+			case "registered":
+				status.TransactionID = "0xother"
+			}
+			nonces := &testutil.MockCommitNonces{}
+			if mismatch == "registered" {
+				nonces.Consume(7, binding.DataSetID.SDK(), sdktypes.NewBigInt(5002), pieceCID)
 			}
 			target.GetCommitStatusFunc = func(_ context.Context, gotURL string) (*storage.CommitStatus, error) {
 				if gotURL != statusURL {
 					t.Fatalf("status URL = %q, want %q", gotURL, statusURL)
 				}
+				if mismatch == "invalid status" {
+					return nil, fmt.Errorf("provider status identity: %w", pdp.ErrInvalidStatus)
+				}
 				return status, nil
 			}
-			result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
+			result, err := (&storagecommit.Advancer{Store: repos.Contents, Nonces: nonces}).Advance(t.Context(), storagecommit.AdvanceInput{
 				Copy: *loadAdvancerCopy(t, repos, copies[0].ID), Binding: *binding, Target: target,
 				Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
 			})
-			if err != nil || result.State != storagecommit.AdvanceNeedsAttention ||
-				result.AttentionCode != storagecommit.AttentionSubmissionMismatch || result.Confirmation != nil {
+			if mismatch == "registered" {
+				if err != nil || result.State != storagecommit.AdvanceConfirmed || !result.ProvenByNonce ||
+					!result.Confirmation.PieceIDs[0].Equal(sdktypes.NewBigInt(5002)) {
+					t.Fatalf("registered mismatch = %#v err=%v", result, err)
+				}
+				return
+			}
+			if err != nil || result.State != storagecommit.AdvanceRejected || result.Confirmation != nil ||
+				!errors.Is(result.Cause, storagecommit.ErrCommitReceiptMismatch) {
 				t.Fatalf("mismatched status = %#v err=%v", result, err)
+			}
+			copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+			if copyRow.Status != model.StorageCopyStatusPieceReady || copyRow.CommitAttemptID != nil ||
+				copyRow.CommitExtraDataHex == nil || *copyRow.CommitExtraDataHex != testutil.CommitExtraDataHex(7) {
+				t.Fatalf("copy after mismatched receipt = %#v, want piece-ready with its request", copyRow)
 			}
 		})
 	}
@@ -846,7 +872,9 @@ func TestAdvancerUnavailableContextPreservesCancellationAndUnknownAttention(t *t
 	}
 }
 
-func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *testing.T) {
+// A chain record that disagrees with the attempt stops it under one stable
+// attention write, which a later provider confirmation still resolves.
+func TestAdvancerChainConflictKeepsStableAttentionAndRecovers(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
@@ -891,7 +919,8 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 			return nil, nil
 		}
 	}
-	advancer := storagecommit.Advancer{Store: repos.Contents}
+	nonces := &testutil.MockCommitNonces{}
+	advancer := storagecommit.Advancer{Store: repos.Contents, Nonces: nonces}
 	result, err := advancer.Advance(t.Context(), storagecommit.AdvanceInput{
 		Copy: copies[0], Binding: *binding, Target: target,
 		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
@@ -899,6 +928,7 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 	if err != nil || result.State != storagecommit.AdvanceSubmitted {
 		t.Fatalf("submit = %#v err=%v", result, err)
 	}
+	nonces.Consume(7, sdktypes.NewBigInt(9999), sdktypes.NewBigInt(5001), pieceCID)
 
 	store := &attentionCountingStore{Store: repos.Contents}
 	advancer.Store = store
@@ -952,6 +982,7 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 	}
 
 	mode = "rejected"
+	nonces.Err = errors.New("chain unavailable")
 	copyRow = loadAdvancerCopy(t, repos, copies[0].ID)
 	result, err = advancer.Advance(t.Context(), storagecommit.AdvanceInput{
 		Copy: *copyRow, Binding: *binding, Target: target,
@@ -1124,11 +1155,13 @@ func TestAdvancerResendsUnusedNonceWithTheSameRequest(t *testing.T) {
 		t.Fatalf("recovery after a resend = %#v err=%v, want a one-minute wait", result, err)
 	}
 
-	// An earlier version flagged the attempt; the first receipt answers it.
-	if err := c.repos.Contents.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
-		Copy: advancerCopyIdentity(c.copyRow), AttemptID: "unacknowledged", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
-	}); err != nil {
-		t.Fatalf("flag attempt: %v", err)
+	// Unregistered past the attention threshold, the attempt is flagged but
+	// recovery keeps sending; the first receipt answers the flag.
+	result, err = c.advance(t, c.attemptedAt.Add(15*time.Minute), storagecommit.AdvanceInput{Sent: sent})
+	flagged := loadAdvancerCopy(t, c.repos, c.copyRow.ID)
+	if err != nil || result.State != storagecommit.AdvanceResendDue || flagged.CommitAttentionCode == nil ||
+		*flagged.CommitAttentionCode != string(storagecommit.AttentionConfirmationTimeout) {
+		t.Fatalf("overdue recovery = %#v err=%v copy=%#v, want a flagged resend", result, err, flagged)
 	}
 	ref, _ := c.target.DataSetRef()
 	var submitted []byte
