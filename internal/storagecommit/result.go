@@ -58,6 +58,9 @@ type AdvanceResult struct {
 	ReleaseReason ReleaseReason
 	AttemptID     string
 	Confirmation  *storage.CommitResult
+	// ExtraDataHex is the request that proved the confirmation, including one
+	// restored from history during this advance.
+	ExtraDataHex string
 	// ProvenByNonce marks a confirmation read from the FWSS nonce record rather
 	// than from the provider; it carries no confirmed transaction.
 	ProvenByNonce bool

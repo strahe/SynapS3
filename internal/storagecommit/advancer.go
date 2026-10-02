@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -189,15 +188,54 @@ func (a *Advancer) submitReserved(
 	if err := context.Cause(ctx); err != nil {
 		return a.release(ctx, copyRow, beforeSubmit)
 	}
-	extraHex, err := a.commitExtraData(ctx, input.Target, copyRow, input.Pieces)
-	if err != nil {
-		if dataSetRefusesWrites(err) {
-			return a.releaseUnavailable(ctx, identity, copyRow, err, false)
+	request, requestErr := PrepareCommitRequest(ctx, a.Store, input.Target, copyRow, input.Pieces)
+	if errors.Is(requestErr, ErrCommitRequestConflict) {
+		if request.ExtraDataHex == "" {
+			return AdvanceResult{}, requestErr
+		}
+	} else if requestErr != nil {
+		if dataSetRefusesWrites(requestErr) {
+			return a.releaseUnavailable(ctx, identity, copyRow, requestErr, false)
 		}
 		if _, releaseErr := a.release(ctx, copyRow, beforeSubmit); releaseErr != nil {
 			return AdvanceResult{}, releaseErr
 		}
-		return AdvanceResult{}, err
+		return AdvanceResult{}, requestErr
+	}
+	// Restored requests may already have an external effect. Establish their
+	// fence before checking writability, and let recovery decide from the nonce.
+	if request.MayHaveBeenSubmitted || requestErr != nil {
+		attempt, err := a.Store.MarkCommitAttempted(ctx, AttemptInput{
+			Copy: eligibleIdentity, AttemptID: attemptID, ExtraDataHex: request.ExtraDataHex, Now: a.now(),
+		})
+		if err != nil {
+			return AdvanceResult{}, err
+		}
+		if requestErr != nil {
+			return a.attentionForCopy(ctx, identity, attempt.Copy, attemptID, AttentionSubmissionMismatch, false)
+		}
+		return a.observe(ctx, input, attempt.Copy)
+	}
+	extraHex := request.ExtraDataHex
+	if request.HasHistory {
+		requestCopy := copyRow
+		requestCopy.CommitExtraDataHex = &extraHex
+		proof, readErr := a.checkNonce(ctx, input, requestCopy)
+		if readErr != nil || proof.outcome != nonceUnused {
+			attempt, err := a.Store.MarkCommitAttempted(ctx, AttemptInput{
+				Copy: eligibleIdentity, AttemptID: attemptID, ExtraDataHex: extraHex, Now: a.now(),
+			})
+			if err != nil {
+				return AdvanceResult{}, err
+			}
+			if readErr != nil {
+				return AdvanceResult{State: AdvancePending, AttemptID: attemptID, RetryAfter: chainRetryDelay}, readErr
+			}
+			if proof.outcome == nonceConflicts {
+				return a.attentionForCopy(ctx, identity, attempt.Copy, attemptID, AttentionSubmissionMismatch, false)
+			}
+			return a.confirmedByNonce(attempt.Copy, attemptID, proof), nil
+		}
 	}
 	// The SDK checks the data set again while submitting; checking first keeps
 	// a data set that persistently refuses writes, or a chain that cannot be
@@ -241,7 +279,7 @@ func (a *Advancer) submitReserved(
 		return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
 	}
 	sent := a.submit(ctx, input, identity, attemptID, extraData)
-	return a.settleSubmit(ctx, identity, attempt.Copy, attemptID, sent)
+	return a.settleSubmit(ctx, identity, attempt.Copy, attemptID, sent, false)
 }
 
 // submitOutcome is what one SubmitCommit call left behind.
@@ -298,14 +336,10 @@ func (a *Advancer) settleSubmit(
 	copyRow model.StorageCopy,
 	attemptID string,
 	sent submitOutcome,
+	previousSubmission bool,
 ) (AdvanceResult, error) {
 	pending := AdvanceResult{State: AdvancePending, AttemptID: attemptID}
 	if submitErr := sent.err; submitErr != nil {
-		// A write-blocked data set is refused while the SDK validates it, before
-		// the provider is contacted, so the attempt is safe to release here.
-		if dataSetRefusesWrites(submitErr) {
-			return a.releaseUnavailable(ctx, identity, copyRow, submitErr, true)
-		}
 		if context.Cause(ctx) != nil {
 			return pending, nil
 		}
@@ -315,11 +349,18 @@ func (a *Advancer) settleSubmit(
 			}
 			return pending, submitErr
 		}
-		switch synapse.ClassifyCommitRejection(submitErr) {
-		case synapse.CommitRejectedDataSetUnavailable:
-			return a.releaseUnavailable(ctx, identity, copyRow, submitErr, true)
-		case synapse.CommitRejectedByProvider:
-			return a.releaseRejected(ctx, identity, copyRow, submitErr)
+		// Refusal proves only this call did not submit. An earlier send of the
+		// request can still land, including after an SDK writability refusal.
+		if !previousSubmission {
+			if dataSetRefusesWrites(submitErr) {
+				return a.releaseUnavailable(ctx, identity, copyRow, submitErr, true)
+			}
+			switch synapse.ClassifyCommitRejection(submitErr) {
+			case synapse.CommitRejectedDataSetUnavailable:
+				return a.releaseUnavailable(ctx, identity, copyRow, submitErr, true)
+			case synapse.CommitRejectedByProvider:
+				return a.releaseRejected(ctx, identity, copyRow, submitErr)
+			}
 		}
 		// Any other failure may have reached the chain, so the attempt fence
 		// stays and recovery reads the nonce before anything is sent again. The
@@ -379,6 +420,12 @@ func (a *Advancer) observe(
 	attemptID := *copyRow.CommitAttemptID
 	if context.Cause(ctx) != nil {
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+	}
+	if _, err := selectCommitRequest(ctx, a.Store, copyRow); err != nil {
+		if errors.Is(err, ErrCommitRequestConflict) {
+			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
+		}
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID, RetryAfter: chainRetryDelay}, err
 	}
 	if copyRow.CommitStatusURL == nil || *copyRow.CommitStatusURL == "" {
 		return a.recoverUnobserved(ctx, input, identity, copyRow, attemptID)
@@ -441,8 +488,9 @@ func (a *Advancer) classifySDKStatus(
 			return mismatch()
 		}
 		return AdvanceResult{
-			State:     AdvanceConfirmed,
-			AttemptID: attemptID,
+			State:        AdvanceConfirmed,
+			AttemptID:    attemptID,
+			ExtraDataHex: taskDeref(copyRow.CommitExtraDataHex),
 			Confirmation: &storage.CommitResult{
 				TransactionID:          status.TransactionID,
 				ConfirmedTransactionID: confirmedTransactionID(status.TransactionID, status.ConfirmedTransactionID),
@@ -478,25 +526,6 @@ func (a *Advancer) recoverUnobserved(
 	attemptID string,
 ) (AdvanceResult, error) {
 	waitForChain := AdvanceResult{State: AdvancePending, AttemptID: attemptID, RetryAfter: chainRetryDelay}
-	// An attempt released by hand in an earlier version may have left another
-	// signed request for this copy, and only one of them may ever land.
-	signed, err := a.Store.ListCommitExtraData(ctx, identity)
-	if err != nil {
-		return waitForChain, err
-	}
-	current := strings.ToLower(taskDeref(copyRow.CommitExtraDataHex))
-	for _, other := range signed {
-		if strings.ToLower(other) == current {
-			continue
-		}
-		consumed, err := a.nonceConsumed(ctx, other)
-		if err != nil {
-			return waitForChain, err
-		}
-		if consumed {
-			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
-		}
-	}
 	proof, err := a.checkNonce(ctx, input, copyRow)
 	if err != nil {
 		return waitForChain, err
@@ -541,7 +570,7 @@ func (a *Advancer) resend(
 	if !attempted {
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, err
 	}
-	return a.settleSubmit(ctx, identity, copyRow, attemptID, outcome)
+	return a.settleSubmit(ctx, identity, copyRow, attemptID, outcome, true)
 }
 
 type nonceOutcome uint8
@@ -608,24 +637,6 @@ func (a *Advancer) checkNonce(ctx context.Context, input AdvanceInput, copyRow m
 	}, nil
 }
 
-func (a *Advancer) nonceConsumed(ctx context.Context, extraHex string) (bool, error) {
-	if a.Nonces == nil {
-		return false, errors.New("storage confirmation chain reader is unavailable")
-	}
-	extraData, err := hex.DecodeString(extraHex)
-	if err != nil {
-		return false, fmt.Errorf("decoding earlier storage commit extra data: %w", err)
-	}
-	nonce, err := ExtraDataNonce(extraData)
-	if err != nil {
-		return false, err
-	}
-	requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout())
-	defer cancel()
-	state, err := a.Nonces.ClientNonce(requestCtx, nonce)
-	return state.Consumed, err
-}
-
 // settleByNonceOr lets the chain settle an attempt the provider could not
 // confirm. When the chain shows nothing, or cannot be read, the provider's
 // answer decides through fallback.
@@ -660,6 +671,7 @@ func (a *Advancer) confirmedByNonce(copyRow model.StorageCopy, attemptID string,
 		State:         AdvanceConfirmed,
 		AttemptID:     attemptID,
 		Confirmation:  &confirmation,
+		ExtraDataHex:  taskDeref(copyRow.CommitExtraDataHex),
 		ProvenByNonce: true,
 	}
 }
@@ -866,25 +878,6 @@ func dataSetRefusesWrites(err error) bool {
 	return errors.Is(err, storage.ErrDataSetUnavailable) ||
 		synapse.IsDataSetServiceEnded(err) ||
 		synapse.IsDataSetWriteBlocked(err)
-}
-
-func (a *Advancer) commitExtraData(
-	ctx context.Context,
-	target synapse.DataSetTarget,
-	copyRow model.StorageCopy,
-	pieces []storage.PieceInput,
-) (string, error) {
-	if copyRow.CommitExtraDataHex != nil && *copyRow.CommitExtraDataHex != "" {
-		if _, err := hex.DecodeString(*copyRow.CommitExtraDataHex); err != nil {
-			return "", fmt.Errorf("decoding stored commit extra data: %w", err)
-		}
-		return strings.ToLower(*copyRow.CommitExtraDataHex), nil
-	}
-	extraData, err := target.PresignForCommit(ctx, pieces)
-	if err != nil {
-		return "", err
-	}
-	return strings.ToLower(hex.EncodeToString(extraData)), nil
 }
 
 func (a *Advancer) validateInput(input AdvanceInput) error {

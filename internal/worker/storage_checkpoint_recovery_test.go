@@ -209,7 +209,7 @@ func TestNewStoreTaskAdoptsPreviousCheckpoint(t *testing.T) {
 			storeCalls.Add(1)
 			return nil, errors.New("unexpected upload")
 		},
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 	}
 	runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, nil, target)
 	old := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
@@ -271,7 +271,7 @@ func TestNewStoreTaskWithoutCheckpointChecksProviderBeforeUploading(t *testing.T
 			stores.Add(1)
 			return &storage.StoreResult{PieceCID: options.PieceCID, Size: 128}, nil
 		},
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 	}
 	runtime, pipeline, _ := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
@@ -305,7 +305,7 @@ func TestNewStoreTaskKeepsRetryAfterReadyPiecePresignFailure(t *testing.T) {
 			if presigns.Add(1) == 1 {
 				return nil, errors.New("temporary presign failure")
 			}
-			return []byte{0xaa}, nil
+			return testutil.CommitExtraData(7), nil
 		},
 	}
 	runtime, pipeline, _ := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
@@ -348,7 +348,7 @@ func TestNewStoreTaskWaitsForUnavailableProviderAfterEarlierUpload(t *testing.T)
 	})
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue:      "https://store.example",
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 	}
 	runtime, pipeline, _ := storeRecoveryFixture(t, 0, payload, parked, cacheStore, target)
 	runtime.storage.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
@@ -396,7 +396,7 @@ func TestStoreDoesNotUseOldProviderPieceForChangedTarget(t *testing.T) {
 			stores.Add(1)
 			return &storage.StoreResult{PieceCID: options.PieceCID, Size: 128}, nil
 		},
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 	}
 	runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
@@ -477,7 +477,7 @@ func TestStoreRestartAfterRetryCheckpointOnlyQueriesProvider(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 	}
 	runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)

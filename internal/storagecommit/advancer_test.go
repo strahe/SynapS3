@@ -36,7 +36,7 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 	submittedTransactions := make(map[string]string)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
 		presignCalls++
-		return []byte{0xab, 0xcd}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		submissionCalls++
@@ -160,7 +160,7 @@ func TestAdvancerRejectsMismatchedCommitStatus(t *testing.T) {
 				t.Fatalf("reserve: %v", err)
 			}
 			if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-				Copy: identity, AttemptID: "status-mismatch", ExtraDataHex: "abcd",
+				Copy: identity, AttemptID: "status-mismatch", ExtraDataHex: testutil.CommitExtraDataHex(7),
 			}); err != nil {
 				t.Fatalf("mark attempted: %v", err)
 			}
@@ -227,7 +227,7 @@ func TestCommitEvidenceIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "atomic-evidence", ExtraDataHex: "abcd",
+		Copy: identity, AttemptID: "atomic-evidence", ExtraDataHex: testutil.CommitExtraDataHex(7),
 	}); err != nil {
 		t.Fatalf("mark attempted: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestAdvancerDataSetUnavailableSeparatesReservationFromAttempt(t *testing.T)
 		binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 		target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 		target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-			return []byte{0xab}, nil
+			return testutil.CommitExtraData(7), nil
 		}
 		target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
 			return nil, storage.ErrDataSetUnavailable
@@ -396,6 +396,7 @@ func TestAdvancerSubmitErrorFollowsProviderStatus(t *testing.T) {
 		{status: 500, wantState: storagecommit.AdvancePending},
 		{status: 400, wantState: storagecommit.AdvanceDeferred, wantReason: storagecommit.ReleaseProviderRejected},
 		{status: 429, wantState: storagecommit.AdvanceDeferred, wantReason: storagecommit.ReleaseProviderRejected},
+		{status: 404, wantState: storagecommit.AdvanceReleased, wantReason: storagecommit.ReleaseDataSetUnavailable},
 		{status: 409, wantState: storagecommit.AdvanceReleased, wantReason: storagecommit.ReleaseDataSetUnavailable},
 	} {
 		t.Run(fmt.Sprint(tt.status), func(t *testing.T) {
@@ -404,7 +405,7 @@ func TestAdvancerSubmitErrorFollowsProviderStatus(t *testing.T) {
 			binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 			target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 			target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-				return []byte{0xab}, nil
+				return testutil.CommitExtraData(7), nil
 			}
 			submitErr := fmt.Errorf("add pieces: %w", &pdp.HTTPError{
 				Method: "POST", URL: "https://provider.example/pdp/data-sets/1/pieces", StatusCode: tt.status, Body: "piece not found",
@@ -434,7 +435,7 @@ func TestAdvancerSubmitErrorFollowsProviderStatus(t *testing.T) {
 					result.RetryAfter != time.Minute || !errors.Is(result.Cause, submitErr) {
 					t.Fatalf("advance = %#v err=%v, want a deferred release", result, err)
 				}
-				if persisted.CommitReadyAt == nil || persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != "ab" {
+				if persisted.CommitReadyAt == nil || persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != testutil.CommitExtraDataHex(7) {
 					t.Fatalf("copy = %#v, want its queue place and signed request kept", persisted)
 				}
 			default:
@@ -470,12 +471,12 @@ func TestAdvancerConsecutiveRejectionsBackOffThenYieldQueueHead(t *testing.T) {
 	var signed int
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
 		signed++
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
 		return nil, &pdp.HTTPError{StatusCode: 429}
 	}
-	advancer := storagecommit.Advancer{Store: repos.Contents}
+	advancer := storagecommit.Advancer{Store: repos.Contents, Nonces: &testutil.MockCommitNonces{}}
 	for i, wantDelay := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute} {
 		result, err := advancer.Advance(t.Context(), storagecommit.AdvanceInput{
 			Copy: *loadAdvancerCopy(t, repos, copies[0].ID), Binding: *binding, Target: target,
@@ -502,7 +503,7 @@ func TestAdvancerWriteCheckFailureReleasesReservation(t *testing.T) {
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	readErr := errors.New("chain RPC unavailable")
 	target.CheckWritableFunc = func(context.Context) error { return readErr }
@@ -534,7 +535,7 @@ func TestAdvancerProviderUnavailableSubmitKeepsFenceAndSignalsDependency(t *test
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	providerErr := &synapse.ProviderUnavailableError{Cause: context.DeadlineExceeded}
 	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
@@ -560,7 +561,7 @@ func TestAdvancerReleasesReservationWhenMarkAttemptedFails(t *testing.T) {
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	injected := errors.New("injected mark-attempted failure")
 	store := &failingMarkAttemptedStore{Store: repos.Contents, err: injected}
@@ -584,7 +585,7 @@ func TestAdvancerSubmissionCallbackPreventsErrorBasedReset(t *testing.T) {
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab, 0xcd}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		request.OnSubmitted(storage.CommitSubmission{TransactionID: "0xcallback", StatusURL: "https://provider.example/status/callback"})
@@ -617,7 +618,7 @@ func TestAdvancerSurfacesDurableSubmissionEvidenceFailure(t *testing.T) {
 		t.Fatal("mock target has no data set ref")
 	}
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		request.OnSubmitted(storage.CommitSubmission{TransactionID: "0xevidence", StatusURL: "https://provider.example/status/evidence"})
@@ -657,7 +658,7 @@ func TestAdvancerUnavailableConfirmationWaitsThenRecoversFromAttention(t *testin
 	}
 	startedAt := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		const tx = "0xunavailable"
@@ -746,7 +747,7 @@ func TestAdvancerUnavailableContextMakesAttemptVisibleAfterThreshold(t *testing.
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "unavailable-context", ExtraDataHex: "abcd", Now: startedAt,
+		Copy: identity, AttemptID: "unavailable-context", ExtraDataHex: testutil.CommitExtraDataHex(7), Now: startedAt,
 	}); err != nil {
 		t.Fatalf("mark attempted: %v", err)
 	}
@@ -784,7 +785,7 @@ func TestCommitAttemptIdempotencyRejectsChangedExtraData(t *testing.T) {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "immutable-extra-data", ExtraDataHex: "abcd",
+		Copy: identity, AttemptID: "immutable-extra-data", ExtraDataHex: testutil.CommitExtraDataHex(7),
 	}); err != nil {
 		t.Fatalf("mark attempted: %v", err)
 	}
@@ -794,7 +795,7 @@ func TestCommitAttemptIdempotencyRejectsChangedExtraData(t *testing.T) {
 		t.Fatalf("changed extra data error = %v, want ErrConflict", err)
 	}
 	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
-	if persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != "abcd" {
+	if persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != testutil.CommitExtraDataHex(7) {
 		t.Fatalf("persisted extra data = %v, want immutable abcd", persisted.CommitExtraDataHex)
 	}
 }
@@ -811,7 +812,7 @@ func TestAdvancerUnavailableContextPreservesCancellationAndUnknownAttention(t *t
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "unavailable-canceled", ExtraDataHex: "abcd", Now: startedAt,
+		Copy: identity, AttemptID: "unavailable-canceled", ExtraDataHex: testutil.CommitExtraDataHex(7), Now: startedAt,
 	}); err != nil {
 		t.Fatalf("mark attempted: %v", err)
 	}
@@ -856,7 +857,7 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 		t.Fatal("mock target has no data set ref")
 	}
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		return []byte{0xab}, nil
+		return testutil.CommitExtraData(7), nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		const tx = "0x0000000000000000000000000000000000000000000000000000000000000101"
@@ -983,7 +984,11 @@ const unacknowledgedNonce = 7
 
 func seedUnacknowledgedAttempt(t *testing.T) nonceCase {
 	t.Helper()
-	db := testutil.NewTestDB(t)
+	return seedUnacknowledgedAttemptWithDB(t, testutil.NewTestDB(t))
+}
+
+func seedUnacknowledgedAttemptWithDB(t *testing.T, db *bun.DB) nonceCase {
+	t.Helper()
 	repos := repository.NewRepositories(db)
 	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 	attemptedAt := time.Date(2026, time.September, 30, 18, 0, 0, 0, time.UTC)
@@ -1374,7 +1379,7 @@ func TestCommitCapacityWakesOnlyTheQueueHead(t *testing.T) {
 	runnable("while every slot is taken")
 
 	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: advancerCopyIdentity(copies[0]), AttemptID: "queue-attempt-0", ExtraDataHex: "abcd",
+		Copy: advancerCopyIdentity(copies[0]), AttemptID: "queue-attempt-0", ExtraDataHex: testutil.CommitExtraDataHex(7),
 	}); err != nil {
 		t.Fatalf("mark copy 0 attempted: %v", err)
 	}
@@ -1382,7 +1387,7 @@ func TestCommitCapacityWakesOnlyTheQueueHead(t *testing.T) {
 	confirmation := repository.MarkUploadCopyCommittedInput{
 		StorageCopyID: copies[0].ID, ContentID: copies[0].ContentID, CopyIndex: 0,
 		PieceCID: pieceCID.String(), PieceID: &pieceID, RetrievalURL: "https://provider.example/piece",
-		CommitExtraDataHex: "abcd", CommitTransactionID: "0x01", CommitAttemptID: "queue-attempt-0",
+		CommitExtraDataHex: testutil.CommitExtraDataHex(7), CommitTransactionID: "0x01", CommitAttemptID: "queue-attempt-0",
 		CommitConfirmedTransactionID: "0x01",
 	}
 	if err := repos.Contents.MarkUploadCopyCommitted(t.Context(), confirmation); !errors.Is(err, repository.ErrConflict) {
@@ -1502,7 +1507,7 @@ func TestAdvancerWriteBlockedDataSetReleasesAttemptWithCause(t *testing.T) {
 		binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 		target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 		target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-			return []byte{0xab}, nil
+			return testutil.CommitExtraData(7), nil
 		}
 		target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
 			return nil, writeBlocked()
@@ -1533,7 +1538,7 @@ func TestAdvancerWriteBlockedDataSetReleasesAttemptWithCause(t *testing.T) {
 		binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
 		target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
 		target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-			return []byte{0xab}, nil
+			return testutil.CommitExtraData(7), nil
 		}
 		target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 			request.OnSubmitted(storage.CommitSubmission{TransactionID: "0xwriteblocked", StatusURL: "https://provider.example/status/writeblocked"})

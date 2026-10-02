@@ -10,9 +10,9 @@ const knownAttentionLabels = {
 
 const attentionLabels = new Map<string, string>(Object.entries(knownAttentionLabels))
 
-/** What retrying a stopped storage confirmation does. */
+/** What recovering a stopped storage confirmation does. */
 export const storageConfirmationRetryNote =
-  'Retrying checks whether the piece was already registered before submitting it again, so it is never stored twice.'
+  'Recovery checks whether the piece is already registered before continuing the original request.'
 
 /** Tasks page filter that lists stopped storage confirmations. */
 export const storageConfirmationTasksSearch = { type: 'storage_commit', status: 'failed' } as const

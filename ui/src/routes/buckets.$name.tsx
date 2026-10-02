@@ -1091,7 +1091,7 @@ function CopyAttentionDetails({
           </div>
         )}
         <p>
-          Retry it in{' '}
+          Use Recover in{' '}
           <Link to="/tasks" search={storageConfirmationTasksSearch} className="text-foreground underline">
             Tasks
           </Link>

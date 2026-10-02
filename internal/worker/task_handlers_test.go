@@ -2283,7 +2283,7 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 	if targetStatus == model.StorageCopyStatusPieceReady {
 		if err := runtime.repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
 			StorageCopyID: copies[1].ID, ContentID: upload.ID, CopyIndex: 1,
-			PieceCID: pieceCID.String(), RetrievalURL: "https://target.example/piece/" + pieceCID.String(), CommitExtraDataHex: "aabb",
+			PieceCID: pieceCID.String(), RetrievalURL: "https://target.example/piece/" + pieceCID.String(), CommitExtraDataHex: testutil.CommitExtraDataHex(7),
 		}); err != nil {
 			t.Fatalf("mark target piece ready: %v", err)
 		}
@@ -2431,7 +2431,7 @@ func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePr
 		DataSetIDValue:       &sdkDataSetID,
 		ClientDataSetIDValue: clientID.SDK(),
 		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
-			return []byte{0xaa}, nil
+			return testutil.CommitExtraData(7), nil
 		},
 	}
 	return copyRow, target, pipeline.source.StorageDataSetID
@@ -3178,7 +3178,7 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 			if len(pieces) != 1 || !pieces[0].PieceCID.Equals(info.CIDv2) {
 				return nil, errors.New("presign received the wrong piece")
 			}
-			return []byte{0xaa, 0xbb}, nil
+			return testutil.CommitExtraData(7), nil
 		},
 	}
 	storageClient := &testutil.MockStorageClient{}
@@ -3301,7 +3301,7 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 	var observedMu sync.Mutex
 	var observed []observedPull
 	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 		PullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 			call := pullCalls.Add(1)
 			observedMu.Lock()
@@ -3417,7 +3417,7 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 
 func TestPullProviderFailureAtomicallyAbandonsAttemptAndCopy(t *testing.T) {
 	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
 			return nil, fmt.Errorf("provider pull: %w", pdp.ErrPullFailed)
 		},
@@ -3488,7 +3488,7 @@ func newPullErrorTask(
 	t.Helper()
 	target := &testutil.MockStorageTarget{
 		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
-			return []byte{0xaa, 0xbb}, nil
+			return testutil.CommitExtraData(7), nil
 		},
 		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
 			pullCalls.Add(1)
@@ -3609,7 +3609,7 @@ func TestPullRecoverWithoutCheckpointReturnsToExecute(t *testing.T) {
 	target := &testutil.MockStorageTarget{
 		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
 			presignCalls.Add(1)
-			return []byte{0xaa, 0xbb}, nil
+			return testutil.CommitExtraData(7), nil
 		},
 		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
 			pullCalls.Add(1)
@@ -3667,7 +3667,7 @@ func TestPullRecoverWithoutCheckpointReturnsToExecute(t *testing.T) {
 func TestCommitRecoverWithoutAttemptCannotSubmit(t *testing.T) {
 	var submitCalls atomic.Int64
 	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
 		SubmitCommitFunc: func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
 			submitCalls.Add(1)
 			return nil, errors.New("unexpected submit")
@@ -3735,7 +3735,7 @@ func TestCommitRecoverableAttentionKeepsObserving(t *testing.T) {
 		t.Fatalf("reserve commit attempt: %v", err)
 	}
 	if _, err := runtime.repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "worker-recoverable-attention", ExtraDataHex: "aabb", Now: startedAt,
+		Copy: identity, AttemptID: "worker-recoverable-attention", ExtraDataHex: testutil.CommitExtraDataHex(7), Now: startedAt,
 	}); err != nil {
 		t.Fatalf("mark commit attempted: %v", err)
 	}

@@ -121,9 +121,7 @@ type Store interface {
 	ResetCommitAttempt(context.Context, ResetInput) error
 	ReleaseCommitAttempt(context.Context, ReleaseInput) error
 	ReleaseCommitReservation(context.Context, ReservationReleaseInput) error
-	// ListCommitExtraData returns the distinct signed requests any attempt of
-	// the copy carried.
-	ListCommitExtraData(context.Context, CopyIdentity) ([]string, error)
+	ListCommitRequests(context.Context, CopyIdentity) ([]CommitRequestHistory, error)
 	// CountConsecutiveCommitRejections counts the copy's most recent resolved
 	// attempts the provider refused, up to the first one it did not.
 	CountConsecutiveCommitRejections(context.Context, CopyIdentity) (int, error)

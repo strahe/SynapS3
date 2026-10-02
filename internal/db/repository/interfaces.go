@@ -560,7 +560,7 @@ type StorageContentRepository interface {
 	ResetCommitAttempt(ctx context.Context, input storagecommit.ResetInput) error
 	ReleaseCommitAttempt(ctx context.Context, input storagecommit.ReleaseInput) error
 	ReleaseCommitReservation(ctx context.Context, input storagecommit.ReservationReleaseInput) error
-	ListCommitExtraData(ctx context.Context, copy storagecommit.CopyIdentity) ([]string, error)
+	ListCommitRequests(ctx context.Context, copy storagecommit.CopyIdentity) ([]storagecommit.CommitRequestHistory, error)
 	CountConsecutiveCommitRejections(ctx context.Context, copy storagecommit.CopyIdentity) (int, error)
 	CountActiveCommitAttemptsForDataSet(ctx context.Context, storageDataSetID int64) (int, error)
 	ListCommitAttention(ctx context.Context, limit int) ([]storagecommit.AttentionRecord, error)

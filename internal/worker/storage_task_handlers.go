@@ -1504,6 +1504,9 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		}
 		extraHex, err := h.copyCommitExtraData(ctx, copyRow, target, pieceCID)
 		if err != nil {
+			if errors.Is(err, storagecommit.ErrCommitRequestConflict) {
+				return taskengine.Fail(err, "pull_presign_failed", nil)
+			}
 			return h.retryCopyTask(execution, input, copyRow, err, "pull_presign_failed")
 		}
 		attemptID, err := newAttemptID()
@@ -1737,7 +1740,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 		}
 		pieceID := idtypes.OnChainIDFromSDK(advanced.Confirmation.PieceIDs[0])
 		retrievalURL := target.PieceURL(pieceCID)
-		extraHex := taskDerefString(copyRow.CommitExtraDataHex)
+		extraHex := advanced.ExtraDataHex
 		return taskengine.Complete("Storage copy registered", func(ctx context.Context, repos *repository.Repositories) error {
 			if err := repos.Contents.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 				StorageCopyID: copyRow.ID, RequireEligibleCopy: true, ContentID: copyRow.ContentID,
@@ -2081,14 +2084,9 @@ func (h *TaskHandlers) copyCommitExtraData(
 	target synapse.DataSetTarget,
 	pieceCID cid.Cid,
 ) (string, error) {
-	if copyRow.CommitExtraDataHex != nil && *copyRow.CommitExtraDataHex != "" {
-		return strings.ToLower(*copyRow.CommitExtraDataHex), nil
-	}
-	extra, err := target.PresignForCommit(ctx, []storage.PieceInput{{PieceCID: pieceCID}})
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(extra), nil
+	request, err := storagecommit.PrepareCommitRequest(ctx, h.deps.Repositories.Contents, target, *copyRow,
+		[]storage.PieceInput{{PieceCID: pieceCID}})
+	return request.ExtraDataHex, err
 }
 
 // commitBacklogFull reports whether the copy's data set already holds as many

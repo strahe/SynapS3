@@ -389,19 +389,30 @@ func (r *BunStorageContentRepo) ReleaseCommitReservation(
 	})
 }
 
-// ListCommitExtraData returns the distinct signed requests the copy's attempts
-// carried, oldest attempt history included.
-func (r *BunStorageContentRepo) ListCommitExtraData(ctx context.Context, copyIdentity storagecommit.CopyIdentity) ([]string, error) {
+// ListCommitRequests retains the effect uncertainty of every attempt sharing
+// a request; a later refusal cannot erase an earlier possible submission.
+func (r *BunStorageContentRepo) ListCommitRequests(ctx context.Context, copyIdentity storagecommit.CopyIdentity) ([]storagecommit.CommitRequestHistory, error) {
 	if err := validateCommitCopyIdentity(copyIdentity); err != nil {
 		return nil, fmt.Errorf("listing storage commit extra data: %w", err)
 	}
-	var values []string
+	var values []storagecommit.CommitRequestHistory
 	err := r.db.NewSelect().
 		Model((*storagecommit.Attempt)(nil)).
-		ColumnExpr("DISTINCT extra_data_hex").
+		ColumnExpr("LOWER(extra_data_hex) AS extra_data_hex").
+		ColumnExpr(`MAX(CASE WHEN status = ? OR
+            (status = ? AND release_reason IN (?, ?, ?)) THEN 0 ELSE 1 END) <> 0 AS may_have_been_submitted`,
+			storagecommit.AttemptStatusReserved, storagecommit.AttemptStatusReleased,
+			storagecommit.ReleaseBeforeSubmitCanceled, storagecommit.ReleaseProviderRejected, storagecommit.ReleaseDataSetUnavailable).
+		ColumnExpr(`MAX(CASE WHEN status NOT IN (?, ?, ?, ?, ?) OR
+            (status = ? AND COALESCE(release_reason, '') NOT IN (?, ?, ?, ?, ?)) THEN 1 ELSE 0 END) <> 0 AS unknown`,
+			storagecommit.AttemptStatusReserved, storagecommit.AttemptStatusAttempted, storagecommit.AttemptStatusConfirmed,
+			storagecommit.AttemptStatusReleased, storagecommit.AttemptStatusRejected, storagecommit.AttemptStatusReleased,
+			storagecommit.ReleaseBeforeSubmitCanceled, storagecommit.ReleaseDataSetUnavailable, storagecommit.ReleaseOwnerTerminal,
+			storagecommit.ReleaseProviderRejected, storagecommit.ReleaseManualDuplicateAck).
 		Where("content_id = ? AND storage_data_set_id = ?", copyIdentity.ContentID, copyIdentity.StorageDataSetID).
 		Where("extra_data_hex IS NOT NULL").
-		OrderExpr("extra_data_hex ASC").
+		GroupExpr("LOWER(extra_data_hex)").
+		OrderExpr("LOWER(extra_data_hex) ASC").
 		Scan(ctx, &values)
 	if err != nil {
 		return nil, fmt.Errorf("listing storage commit extra data: %w", err)
