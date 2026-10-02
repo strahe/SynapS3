@@ -19,9 +19,8 @@ type commitFixture struct {
 	dataSetID int64
 }
 
-func newCommitFixture(t *testing.T) commitFixture {
+func newCommitFixture(t *testing.T, db *bun.DB) commitFixture {
 	t.Helper()
-	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "commit-requests")
 	anchor := seedContent(t, repos, bucket.ID, "commit-anchor", 10)
@@ -35,6 +34,27 @@ func newCommitFixture(t *testing.T) commitFixture {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	return commitFixture{db: db, repos: repos, bucket: bucket, dataSetID: binding.ID}
+}
+
+// commitLedgerCases run against every supported database.
+var commitLedgerCases = []struct {
+	name string
+	run  func(*testing.T, commitFixture)
+}{
+	{"CommitRequestCollectsUpToItsLimitAndSealsTheSignedSet", testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet},
+	{"CommitSubmissionTakesTheOldestEligibleRequestWithinCapacity", testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity},
+	{"CommitRefusalReturnsRequestToReadyUntilItsRetryIsDue", testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue},
+	{"CommitConfirmationCommitsMembersByPositionAndReplays", testCommitConfirmationCommitsMembersByPositionAndReplays},
+	{"SignedCommitMembersAreDecidedByTheirRequest", testSignedCommitMembersAreDecidedByTheirRequest},
+	{"RetainedCommitTaskIsKeptWhileItsRequestIsOpen", testRetainedCommitTaskIsKeptWhileItsRequestIsOpen},
+	{"UnsentSinglePieceRequestIsGivenUpWithItsCopy", testUnsentSinglePieceRequestIsGivenUpWithItsCopy},
+	{"StoppedRequestDoesNotHoldTheQueue", testStoppedRequestDoesNotHoldTheQueue},
+}
+
+func TestCommitRequestLedger(t *testing.T) {
+	for _, c := range commitLedgerCases {
+		t.Run(c.name, func(t *testing.T) { c.run(t, newCommitFixture(t, testDB(t))) })
+	}
 }
 
 // transferredCopy creates a content whose ingress copy finished transferring.
@@ -81,13 +101,18 @@ func (f commitFixture) request(t *testing.T, id string) *storagecommit.Request {
 	return request
 }
 
+// commitTask is the task row a request with the given ID is driven by.
+func commitTask(requestID string) *model.Task {
+	return &model.Task{
+		Type: model.TaskTypeStorageCommit, IdempotencyKey: requestID, InputVersion: 1,
+		Input: fmt.Appendf(nil, `{"request_id":%q}`, requestID), InputHash: requestID,
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	}
+}
+
 func (f commitFixture) task(t *testing.T, key string) int64 {
 	t.Helper()
-	row, _, err := f.repos.Tasks.Enqueue(t.Context(), &model.Task{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: key, InputVersion: 1,
-		Input: fmt.Appendf(nil, `{"request_id":%q}`, key), InputHash: key,
-		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	row, _, err := f.repos.Tasks.Enqueue(t.Context(), commitTask(key))
 	if err != nil {
 		t.Fatalf("Enqueue(%s): %v", key, err)
 	}
@@ -134,8 +159,7 @@ func (f commitFixture) sealedRequest(t *testing.T, id string) (int64, *model.Sto
 	return taskID, copyRow
 }
 
-func TestCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T) {
-	f := newCommitFixture(t)
+func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	first, second, third := f.transferredCopy(t, "first"), f.transferredCopy(t, "second"), f.transferredCopy(t, "third")
 	taskID := f.collecting(t, "collect", first)
@@ -181,8 +205,7 @@ func TestCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T) {
 	}
 }
 
-func TestCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.T) {
-	f := newCommitFixture(t)
+func testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	tasks := make([]int64, storagecommit.MaxSubmittedRequestsPerDataSet+1)
 	for i := range tasks {
@@ -211,7 +234,9 @@ func TestCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 		if err != nil {
 			t.Fatalf("GetByID: %v", err)
 		}
-		if woken := task.AvailableAt.Before(later); woken != wantWoken {
+		// Stored timestamps may be coarser than Go's clock, so the parked
+		// time is compared with a margin rather than exactly.
+		if woken := task.AvailableAt.Before(later.Add(-time.Minute)); woken != wantWoken {
 			t.Fatalf("request-%d woken = %v, want %v", i, woken, wantWoken)
 		}
 	}
@@ -233,8 +258,7 @@ func TestCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 	}
 }
 
-func TestCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue(t *testing.T) {
-	f := newCommitFixture(t)
+func testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	taskID, _ := f.sealedRequest(t, "refused")
 	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "refused", TaskID: taskID}); err != nil {
@@ -268,8 +292,7 @@ func TestCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue(t *testing.T) {
 	}
 }
 
-func TestCommitConfirmationCommitsMembersByPositionAndReplays(t *testing.T) {
-	f := newCommitFixture(t)
+func testCommitConfirmationCommitsMembersByPositionAndReplays(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	first, second := f.transferredCopy(t, "first"), f.transferredCopy(t, "second")
 	taskID := f.collecting(t, "batch", first, second)
@@ -316,8 +339,7 @@ func TestCommitConfirmationCommitsMembersByPositionAndReplays(t *testing.T) {
 	}
 }
 
-func TestSignedCommitMembersAreDecidedByTheirRequest(t *testing.T) {
-	f := newCommitFixture(t)
+func testSignedCommitMembersAreDecidedByTheirRequest(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	copyRow, other := f.transferredCopy(t, "pinned"), f.transferredCopy(t, "pinned-other")
 	taskID := f.collecting(t, "pinned", copyRow, other)
@@ -352,8 +374,7 @@ func TestSignedCommitMembersAreDecidedByTheirRequest(t *testing.T) {
 	}
 }
 
-func TestRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T) {
-	f := newCommitFixture(t)
+func testRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	taskID, _ := f.sealedRequest(t, "retained")
 	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).
@@ -367,8 +388,7 @@ func TestRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T) {
 	}
 }
 
-func TestUnsentSinglePieceRequestIsGivenUpWithItsCopy(t *testing.T) {
-	f := newCommitFixture(t)
+func testUnsentSinglePieceRequestIsGivenUpWithItsCopy(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	_, copyRow := f.sealedRequest(t, "solo")
 	if err := f.repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{
@@ -381,5 +401,29 @@ func TestUnsentSinglePieceRequestIsGivenUpWithItsCopy(t *testing.T) {
 	}
 	if failed := f.copy(t, copyRow.ID); failed.Status != model.StorageCopyStatusFailed || failed.CommitRequestID != nil {
 		t.Fatalf("failed copy = %#v", failed)
+	}
+}
+
+func testStoppedRequestDoesNotHoldTheQueue(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	stopped, _ := f.sealedRequest(t, "stopped")
+	next, _ := f.sealedRequest(t, "next")
+	// The older request's task failed before sending; it waits for an operator
+	// while the requests behind it still leave.
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).
+		Set("failure_reason = ?", "handler_panic").Set("last_error = ?", "handler panicked").
+		Where("id = ?", stopped).Exec(ctx); err != nil {
+		t.Fatalf("stop task: %v", err)
+	}
+	state, err := f.repos.Contents.CommitQueueState(ctx, f.dataSetID, time.Now())
+	if err != nil || state.ReadyHead != "next" {
+		t.Fatalf("queue = %#v, %v, want the live request next", state, err)
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "next", TaskID: next}); err != nil {
+		t.Fatalf("BeginCommitSubmission(next): %v", err)
+	}
+	if request := f.request(t, "stopped"); request.Status != storagecommit.RequestStatusReady || request.TaskID == nil || *request.TaskID != stopped {
+		t.Fatalf("stopped request = %#v, want it kept for its task", request)
 	}
 }

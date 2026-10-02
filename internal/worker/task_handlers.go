@@ -10,6 +10,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
@@ -55,13 +56,6 @@ type TaskHandlerDependencies struct {
 	Logger                    *slog.Logger
 }
 
-// Defaults for storage registration batching, used when a caller leaves the
-// dependency unset.
-const (
-	DefaultCommitMaxPieces  = 32
-	DefaultCommitMaxBacklog = 256
-)
-
 type EventPublisher interface {
 	Publish(topic string, payload map[string]any)
 }
@@ -97,10 +91,10 @@ func NewTaskHandlers(deps TaskHandlerDependencies) (*TaskHandlers, error) {
 		return nil, errors.New("LRU cache capacity requires valid size and watermarks")
 	}
 	if deps.CommitMaxPieces == 0 {
-		deps.CommitMaxPieces = DefaultCommitMaxPieces
+		deps.CommitMaxPieces = config.DefaultCommitMaxPieces
 	}
 	if deps.CommitMaxBacklog == 0 {
-		deps.CommitMaxBacklog = DefaultCommitMaxBacklog
+		deps.CommitMaxBacklog = config.DefaultCommitMaxBacklog
 	}
 	if deps.CommitMaxPieces < 1 || deps.CommitMaxWait < 0 || deps.CommitMaxBacklog < deps.CommitMaxPieces {
 		return nil, errors.New("storage registration limits are invalid")

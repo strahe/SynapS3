@@ -26,6 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/cacheeviction"
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
@@ -3690,7 +3691,7 @@ func TestTransfersWaitForCommitBacklog(t *testing.T) {
 			dataSetID := pipeline.targetSet.DataSetID.SDK()
 			target.DataSetIDValue = &dataSetID
 			target.ClientDataSetIDValue = pipeline.targetClient
-			runtime.repos.Contents = &readyCopyCountRepo{StorageContentRepository: runtime.repos.Contents, count: worker.DefaultCommitMaxBacklog}
+			runtime.repos.Contents = &readyCopyCountRepo{StorageContentRepository: runtime.repos.Contents, count: config.DefaultCommitMaxBacklog}
 			taskRow := bindCopyTask(t, runtime, pipeline.target, taskType)
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)

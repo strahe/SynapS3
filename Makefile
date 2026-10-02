@@ -53,7 +53,7 @@ test-race:
 	$(CGO) go test -race -count=1 ./cmd/... ./internal/...
 
 test-postgres:
-	$(CGO) go test -tags=postgres -count=1 ./internal/testpg ./internal/db/migrations ./internal/db/repository ./internal/task ./internal/storagecommit
+	$(CGO) go test -tags=postgres -count=1 ./internal/testpg ./internal/db/migrations ./internal/db/repository ./internal/task
 
 test-system:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./tests/testutil/... ./internal/systemtest ./tests/system

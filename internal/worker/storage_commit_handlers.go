@@ -20,10 +20,10 @@ import (
 	"github.com/strahe/synapse-go/storage"
 )
 
-// commitCheckpoint records the latest send of a commit request. The request
-// row holds the send history; the checkpoint only fences the send itself.
 const commitQueueMessage = "Waiting to register storage"
 
+// commitCheckpoint records the latest send of a commit request. The request
+// row holds the send history; the checkpoint only fences the send itself.
 type commitCheckpoint struct {
 	RequestID     string    `json:"request_id"`
 	Sends         int       `json:"sends"`
@@ -241,15 +241,8 @@ func (h *TaskHandlers) sealCommit(ctx context.Context, run commitRun, members []
 // its data set has room.
 func (h *TaskHandlers) runReadyCommit(ctx context.Context, run commitRun) taskengine.Result {
 	request := run.request
-	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, request.RequestID)
-	if err != nil {
-		return retryTask(err, "commit_members_load_failed")
-	}
-	for _, member := range members {
-		if member.Status != model.StorageCopyStatusCommitting {
-			return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "commit_members",
-				"Waiting for stored data to be transferred again", nil)
-		}
+	if result, waiting := h.waitForCommitMembers(ctx, run, nil); waiting {
+		return result
 	}
 	if request.RetryAt != nil && request.RetryAt.After(time.Now()) {
 		return taskengine.Suspend(model.TaskResumeModeExecute, time.Until(*request.RetryAt), storagecommit.ProviderRejectedWaitReason,
@@ -281,8 +274,7 @@ func (h *TaskHandlers) runReadyCommit(ctx context.Context, run commitRun) tasken
 	case storagecommit.PrepareConfirmed:
 		return h.confirmCommit(run, target, commit, storagecommit.Confirmation{FirstPieceID: prepared.Proof.FirstPieceID})
 	case storagecommit.PrepareConflict:
-		return taskengine.Fail(errors.New("storage registration requires attention: its request was used for other pieces"),
-			string(storagecommit.AttentionSubmissionMismatch), nil)
+		return h.resignCommit(run)
 	case storagecommit.PrepareAbandon:
 		return h.abandonCommit(run, prepared.Cause)
 	case storagecommit.PrepareSend:
@@ -366,6 +358,14 @@ func (h *TaskHandlers) settleFirstSend(
 // runSubmittedCommit resolves a request that may be on chain.
 func (h *TaskHandlers) runSubmittedCommit(ctx context.Context, run commitRun) taskengine.Result {
 	request := run.request
+	if request.AttentionCode != nil {
+		if _, err := storagecommit.ParseAttentionCode(*request.AttentionCode); err != nil {
+			// A code this version does not know may mean a later version found
+			// something it must not resend past; recovery stops until one that
+			// understands it, or an operator, resolves the request.
+			return taskengine.Fail(fmt.Errorf("storage registration requires attention: %w", err), "commit_attention_unknown", nil)
+		}
+	}
 	pieces, result, ok := h.loadCommitPieces(ctx, run)
 	if !ok {
 		return result
@@ -407,6 +407,11 @@ func (h *TaskHandlers) runSubmittedCommit(ctx context.Context, run commitRun) ta
 	case storagecommit.ObserveAbandon:
 		return h.abandonCommit(run, observation.Cause)
 	case storagecommit.ObserveResendDue:
+		// A member the provider dropped cannot be added until it is
+		// transferred again; sending before that is refused for nothing.
+		if result, waiting := h.waitForCommitMembers(ctx, run, noted); waiting {
+			return result
+		}
 		if !run.mayExec {
 			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Sending storage registration again", noted)
 		}
@@ -559,8 +564,8 @@ func (h *TaskHandlers) attentionSettlement(run commitRun, code storagecommit.Att
 	}
 }
 
-// confirmCommit settles a request the chain proved and finishes every member
-// content the way a single registration used to.
+// confirmCommit settles a request the chain proved and finishes every member's
+// content.
 func (h *TaskHandlers) confirmCommit(
 	run commitRun,
 	target synapse.DataSetTarget,
@@ -621,6 +626,50 @@ func (h *TaskHandlers) finishCommittedContent(ctx context.Context, repos *reposi
 
 // abandonCommit gives up a request its data set can never take and fails its
 // members. A member still being transferred settles first.
+// waitForCommitMembers holds a sealed request until every member is
+// transferred: it is only ever sent whole. A member is still transferring for
+// the first time while its Pull runs, or again after the provider dropped its
+// piece. settlement records what the caller observed meanwhile.
+func (h *TaskHandlers) waitForCommitMembers(ctx context.Context, run commitRun, settlement taskengine.Settlement) (taskengine.Result, bool) {
+	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, run.request.RequestID)
+	if err != nil {
+		return retryTask(err, "commit_members_load_failed"), true
+	}
+	for _, member := range members {
+		if member.Status != model.StorageCopyStatusCommitting {
+			return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "commit_members",
+				"Waiting for stored data to finish transferring", settlement), true
+		}
+	}
+	return taskengine.Result{}, false
+}
+
+// resignCommit gives up a request the provider never accepted whose nonce the
+// chain already spent on another signature. That request can never be added,
+// so its members are released to be signed again with a new nonce.
+func (h *TaskHandlers) resignCommit(run commitRun) taskengine.Result {
+	h.deps.Logger.Warn("storage registration nonce was used by another request; signing its pieces again",
+		"task_id", run.taskID(), "commit_request_id", run.request.RequestID, "storage_data_set_id", run.request.StorageDataSetID)
+	return taskengine.Complete("Storage registration is signed again", func(ctx context.Context, repos *repository.Repositories) error {
+		members, err := repos.Contents.AbandonCommitRequest(ctx, repository.AbandonCommitRequestInput{
+			RequestID: run.request.RequestID, TaskID: run.taskID(),
+			Reason: "its nonce was used by another request; its pieces are signed again",
+		})
+		if err != nil {
+			return err
+		}
+		for _, member := range members {
+			if member.Status != model.StorageCopyStatusCommitting && member.Status != model.StorageCopyStatusPieceReady {
+				continue
+			}
+			if err := h.queueCommit(ctx, repos, member.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (h *TaskHandlers) abandonCommit(run commitRun, cause error) taskengine.Result {
 	message := "the storage service no longer accepts new data"
 	if cause != nil {

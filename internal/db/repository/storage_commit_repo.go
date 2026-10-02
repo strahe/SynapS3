@@ -37,6 +37,12 @@ type JoinCommitRequestInput struct {
 // JoinCollectingCommitRequest adds the copy to the oldest collecting request of
 // its data set that has room and a live task. It returns the request and its
 // member count, or ErrNotFound when no such request exists.
+//
+// The data set stays locked until the caller's transaction ends, so a caller
+// that then creates a request on ErrNotFound does so before any other copy of
+// the data set looks for one: copies transferred together share a request.
+// The joining copy belongs to no request yet, so no holder of the data set
+// lock waits for it.
 func (r *BunStorageContentRepo) JoinCollectingCommitRequest(ctx context.Context, input JoinCommitRequestInput) (string, int, error) {
 	if input.CopyID <= 0 || input.StorageDataSetID <= 0 || input.MaxPieces < 1 {
 		return "", 0, fmt.Errorf("joining storage commit request: %w", ErrInvalidInput)
@@ -45,6 +51,9 @@ func (r *BunStorageContentRepo) JoinCollectingCommitRequest(ctx context.Context,
 	var requestID string
 	var members int
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if _, err := lockCommitDataSet(ctx, db, input.StorageDataSetID); err != nil {
+			return err
+		}
 		var candidates []string
 		if err := db.NewSelect().
 			TableExpr("storage_commit_requests AS commit_request").
@@ -910,7 +919,9 @@ func countSubmittedCommitRequests(ctx context.Context, db bun.IDB, storageDataSe
 }
 
 // eligibleReadyCommitRequest returns the oldest ready request of the data set
-// that may be sent now: it is not backing off and every member is transferred.
+// that may be sent now: it is not backing off, every member is transferred,
+// and its task can still run. A request whose task stopped waits for an
+// operator and must not hold up the requests behind it.
 func eligibleReadyCommitRequest(ctx context.Context, db bun.IDB, storageDataSetID int64, now time.Time) (string, error) {
 	var requestID string
 	err := db.NewSelect().
@@ -918,6 +929,11 @@ func eligibleReadyCommitRequest(ctx context.Context, db bun.IDB, storageDataSetI
 		Column("request_id").
 		Where("storage_data_set_id = ? AND status = ?", storageDataSetID, storagecommit.RequestStatusReady).
 		Where("retry_at IS NULL OR retry_at <= ?", now).
+		Where(`EXISTS (
+			SELECT 1 FROM tasks AS head_task
+			WHERE head_task.id = commit_request.task_id
+			  AND head_task.status IN (?)
+		)`, bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
 		Where(`piece_count = (
 			SELECT COUNT(*) FROM storage_copies AS transferred_member
 			WHERE transferred_member.commit_request_id = commit_request.request_id

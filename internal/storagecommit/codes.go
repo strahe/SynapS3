@@ -29,20 +29,6 @@ func (c AttentionCode) Valid() bool {
 	}
 }
 
-// Recoverable reports whether recovery keeps working on a request flagged with
-// the code rather than stopping it for an operator.
-func (c AttentionCode) Recoverable() bool {
-	//exhaustive:enforce
-	switch c {
-	case AttentionDataSetUnavailable, AttentionConfirmationTimeout:
-		return true
-	case AttentionSubmissionMismatch:
-		return false
-	default:
-		return false
-	}
-}
-
 func ParseAttentionCode(value string) (AttentionCode, error) {
 	code := AttentionCode(value)
 	if !code.Valid() {

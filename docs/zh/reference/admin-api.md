@@ -263,7 +263,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 存储确认处理
 
-一次存储登记用一个签名请求把写入同一 data set 的一个或多个 piece 登记上链。存储提供方没有确认登记时，SynapS3 会在链上核对这些 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方拒绝该请求时会稍后再试；登记前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求登记的是其他 piece 或其他 data set 时，确认会停止。
+一次存储登记用一个签名请求把写入同一 data set 的一个或多个 piece 登记上链。存储提供方没有确认登记时，SynapS3 会在链上核对这些 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方拒绝该请求时会稍后再试；登记前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他 data set 时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。
 
 `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储登记，也包括超过 15 分钟仍未登记、SynapS3 仍在继续尝试的登记：登记（`request_id`）、所属任务（`task_id`）、存储提供方和 data set、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的登记。对已停止的登记，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试会先重新核对链上记录，再决定是否提交。
 
