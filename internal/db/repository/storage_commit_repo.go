@@ -704,8 +704,8 @@ func (r *BunStorageContentRepo) ConfirmCommitRequest(ctx context.Context, input 
 // AbandonCommitRequestInput settles a request that can never land.
 type AbandonCommitRequestInput struct {
 	RequestID string
-	// TaskID names the request's own task; zero lets another owner abandon a
-	// request that was never sent.
+	// TaskID names the request's task. Zero is allowed only while collecting;
+	// a sealed request requires its owning task.
 	TaskID int64
 	Reason string
 	Now    time.Time

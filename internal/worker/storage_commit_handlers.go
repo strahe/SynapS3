@@ -643,9 +643,8 @@ func (h *TaskHandlers) finishCommittedContent(ctx context.Context, repos *reposi
 const commitMemberRetransferDelay = 5 * time.Minute
 
 // commitMemberProgress reports whether a member of a sealed request is still
-// being transferred, and which members' transfers gave up. A member is
-// transferred for the first time while its Pull runs, and again after the
-// provider dropped its piece.
+// being transferred, and which members' transfers gave up. Members transfer
+// again after the provider drops their pieces.
 func (h *TaskHandlers) commitMemberProgress(ctx context.Context, run commitRun) (transferring bool, stalled []int64, err error) {
 	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, run.request.RequestID)
 	if err != nil {
