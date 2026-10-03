@@ -13,7 +13,8 @@ const (
 	// reached while a send of it may still land. Recovery keeps checking.
 	AttentionDataSetUnavailable AttentionCode = "data_set_unavailable"
 	// AttentionConfirmationTimeout means the request is still unregistered past
-	// the attention threshold. Recovery keeps sending it.
+	// the attention threshold. Recovery keeps checking it, and sends it again
+	// whenever no reply from the provider can settle it.
 	AttentionConfirmationTimeout AttentionCode = "confirmation_timeout"
 )
 

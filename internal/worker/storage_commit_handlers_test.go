@@ -39,6 +39,8 @@ const (
 	// sendSpentElsewhere reports a transaction, but the chain spent the
 	// request's nonce on another data set.
 	sendSpentElsewhere
+	// sendAcceptUnlanded reports a transaction that never lands.
+	sendAcceptUnlanded
 )
 
 // registrationProvider is a provider that registers whole requests. Each send
@@ -59,8 +61,10 @@ type registrationProvider struct {
 	// maxSigned refuses to sign requests of more pieces, as the SDK does with
 	// one that does not fit an add-pieces message.
 	maxSigned int
-	signed    int
-	dataSet   sdktypes.BigInt
+	// statusDown makes the provider's status endpoint fail.
+	statusDown bool
+	signed     int
+	dataSet    sdktypes.BigInt
 }
 
 func newRegistrationProvider(t *testing.T, providerID, dataSetID, clientID sdktypes.BigInt, nonces *testutil.MockCommitNonces) *registrationProvider {
@@ -102,6 +106,7 @@ func newRegistrationProvider(t *testing.T, providerID, dataSetID, clientID sdkty
 			return nil, &pdp.HTTPError{StatusCode: 502, Body: "bad gateway"}
 		case sendSpentElsewhere:
 			p.nonces.ConsumeRequest(request.ExtraData, sdktypes.NewBigInt(9999), sdktypes.NewBigInt(1), pieces)
+		case sendAcceptUnlanded:
 		default:
 			p.nonces.ConsumeRequest(request.ExtraData, p.dataSet, sdktypes.NewBigInt(p.nextID), pieces)
 		}
@@ -126,6 +131,9 @@ func newRegistrationProvider(t *testing.T, providerID, dataSetID, clientID sdkty
 	p.target.GetCommitStatusFunc = func(_ context.Context, statusURL string) (*storage.CommitStatus, error) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		if p.statusDown {
+			return nil, &pdp.HTTPError{StatusCode: 503, Body: "unavailable"}
+		}
 		tx := statusURL[len("https://provider.example/status/"):]
 		ref, _ := p.target.DataSetRef()
 		return &storage.CommitStatus{
@@ -550,6 +558,28 @@ func TestLostSendThatLandedIsConfirmedWithoutSendingAgain(t *testing.T) {
 	// carried them.
 	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusConfirmed || request.ConfirmedTransactionID != nil {
 		t.Fatalf("request = %#v, want confirmed by its nonce", request)
+	}
+}
+
+func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
+	f := newRegistrationFixture(t, 2, nil)
+	f.provider.script = []sendOutcome{sendAcceptUnlanded}
+	f.provider.statusDown = true
+	requestID, taskID := f.collect(t)
+	cancel, done := runHandlerEngine(t, f.runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	waitForCommitTask(t, f.runtime, taskID, func(*model.Task) bool { return f.request(t, requestID).TransactionID != nil })
+	// The provider accepted the request but its transaction never landed, and
+	// its status endpoint stays down past the attention threshold.
+	if _, err := f.runtime.db.NewRaw(`UPDATE storage_commit_requests SET submitted_at = ?, last_sent_at = ? WHERE request_id = ?`,
+		time.Now().Add(-time.Hour), time.Now().Add(-time.Hour), requestID).Exec(t.Context()); err != nil {
+		t.Fatalf("age submission: %v", err)
+	}
+	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	waitForCommitted(t, f.runtime, f.copies)
+	if sends, extras := f.provider.sent(); len(sends) != 2 || !sameSends(sends, extras) {
+		t.Fatalf("submissions = %v, want the same request sent again", sends)
 	}
 }
 

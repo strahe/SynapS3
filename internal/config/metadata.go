@@ -196,11 +196,11 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", Editable: true,
 	},
 	"worker.tasks.commit_max_wait": {
-		Label: "Registration Wait", Description: "How long uploaded data waits for more uploads to register with it while others are still transferring. Restart required.",
+		Label: "Registration Wait", Description: "Longest a registration waits, once it could be sent, for uploads still transferring to the same storage service. It keeps collecting while sends are full. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", Editable: true,
 	},
 	"worker.tasks.commit_max_backlog": {
-		Label: "Registration Backlog", Description: "Maximum uploaded pieces waiting to be registered per storage service before further uploads to it wait. Restart required.",
+		Label: "Registration Backlog", Description: "Transferred pieces per storage service that may wait for an unsent registration before new uploads and replica copies to it wait. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", Editable: true,
 	},
 	"logging.level": {

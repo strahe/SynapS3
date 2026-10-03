@@ -170,6 +170,41 @@ func TestObserveResendsAnUnknownOutcomeUnchangedOnItsPace(t *testing.T) {
 	}
 }
 
+func TestObserveResendsOnceAnUnreadableProviderNeedsAttention(t *testing.T) {
+	ctx := t.Context()
+	c := newCommitCase(t, 1)
+	c.receipt(storage.CommitStatePending)
+	c.target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
+		return nil, &pdp.HTTPError{StatusCode: 503, Body: "unavailable"}
+	}
+	observation, err := c.advancer().Observe(ctx, c.commit())
+	if err != nil || observation.Kind != storagecommit.ObservePending || observation.Attention != "" {
+		t.Fatalf("recent submission = %#v, %v, want to wait for the provider", observation, err)
+	}
+	c.sentAt(c.now.Add(-20 * time.Minute))
+	observation, err = c.advancer().Observe(ctx, c.commit())
+	if err != nil || observation.Kind != storagecommit.ObservePending || observation.Attention != storagecommit.AttentionConfirmationTimeout {
+		t.Fatalf("long-unanswered submission = %#v, %v, want it flagged", observation, err)
+	}
+	// Once flagged, the provider's silence settles nothing: an unused nonce
+	// is sent again, keeping the submission in case it still lands.
+	flagged := c.now.Add(-time.Minute)
+	c.request.AttentionAt = &flagged
+	observation, err = c.advancer().Observe(ctx, c.commit())
+	if err != nil || observation.Kind != storagecommit.ObserveResendDue || observation.DropEvidence {
+		t.Fatalf("flagged unanswered submission = %#v, %v, want a resend", observation, err)
+	}
+	c.nonces.Err = errors.New("rpc unavailable")
+	if observation, err := c.advancer().Observe(ctx, c.commit()); err != nil || observation.Kind != storagecommit.ObservePending {
+		t.Fatalf("unreadable chain = %#v, %v, want no resend", observation, err)
+	}
+	c.nonces.Err = nil
+	c.land(40, c.pieces)
+	if observation, err := c.advancer().Observe(ctx, c.commit()); err != nil || observation.Kind != storagecommit.ObserveConfirmed {
+		t.Fatalf("landed request = %#v, %v, want confirmed", observation, err)
+	}
+}
+
 func TestPrepareReadsTheChainBeforeSending(t *testing.T) {
 	ctx := t.Context()
 	c := newCommitCase(t, 1)

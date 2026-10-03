@@ -23,7 +23,8 @@ import (
 // the request only from the status the caller observed. Locks are taken in one
 // order everywhere — member contents by ascending id, the data set, the
 // request, then its copies — so two writers never wait on each other in a
-// cycle.
+// cycle. A transaction that may go on to join or start a collecting request,
+// which locks the data set, therefore locks the data set before any request.
 
 // JoinCommitRequestInput adds one transferred copy to a collecting request of
 // its data set.
@@ -313,6 +314,11 @@ func (r *BunStorageContentRepo) SealCommitRequest(ctx context.Context, input Sea
 	var spilled []int64
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
 		if err := lockCommitMemberContents(ctx, db, input.RequestID); err != nil {
+			return err
+		}
+		// Copies that joined too late are queued again in the caller's
+		// transaction, which locks the data set.
+		if err := lockCommitRequestDataSet(ctx, db, input.RequestID); err != nil {
 			return err
 		}
 		request, err := lockOwnedCommitRequest(ctx, db, input.RequestID, input.TaskID, storagecommit.RequestStatusCollecting)
@@ -778,6 +784,10 @@ func abandonCommitRequest(ctx context.Context, db bun.IDB, input AbandonCommitRe
 	if err := lockCommitMemberContents(ctx, db, input.RequestID); err != nil {
 		return nil, err
 	}
+	// Released members may join another request in the caller's transaction.
+	if err := lockCommitRequestDataSet(ctx, db, input.RequestID); err != nil {
+		return nil, err
+	}
 	request, err := lockCommitRequest(ctx, db, input.RequestID, "")
 	if err != nil {
 		return nil, err
@@ -1190,6 +1200,21 @@ func lockCommitDataSet(ctx context.Context, db bun.IDB, storageDataSetID int64) 
 		return nil, fmt.Errorf("locking storage data set for commit: %w", err)
 	}
 	return dataSet, nil
+}
+
+// lockCommitRequestDataSet locks the data set a request belongs to.
+func lockCommitRequestDataSet(ctx context.Context, db bun.IDB, requestID string) error {
+	var storageDataSetID int64
+	err := db.NewSelect().Model((*storagecommit.Request)(nil)).Column("storage_data_set_id").
+		Where("request_id = ?", requestID).Scan(ctx, &storageDataSetID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("loading storage commit request data set: %w", err)
+	}
+	_, err = lockCommitDataSet(ctx, db, storageDataSetID)
+	return err
 }
 
 // lockCommitRequest locks the request row, requiring status when it is set.

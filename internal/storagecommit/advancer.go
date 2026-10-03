@@ -334,6 +334,12 @@ func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
 		if errors.Is(err, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(err) {
 			code = AttentionDataSetUnavailable
 		}
+		if req.AttentionAt != nil {
+			// A provider that still cannot answer once the request needs
+			// attention leaves no evidence at all: the chain decides, and an
+			// unused nonce is sent again as if no reply had come back.
+			return a.unobserved(ctx, c, false)
+		}
 		return a.byProof(ctx, c, func() (Observation, error) {
 			return a.pending(req, code), nil
 		})
