@@ -1,6 +1,7 @@
 package config
 
 import (
+	"maps"
 	"os"
 	"strings"
 )
@@ -196,7 +197,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", Editable: true,
 	},
 	"worker.tasks.commit_max_wait": {
-		Label: "Registration Wait", Description: "Longest a registration waits, once it could be sent, for uploads still transferring to the same storage service. It keeps collecting while sends are full. Restart required.",
+		Label: "Registration Wait", Description: "Time to combine pieces before signing a registration; 0s signs immediately. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", Editable: true,
 	},
 	"worker.tasks.commit_max_backlog": {
@@ -276,9 +277,7 @@ func buildEnvFieldByName() map[string]string {
 // FieldMetadataByPath returns metadata keyed by dotted config field path.
 func FieldMetadataByPath() map[string]FieldMetadata {
 	out := make(map[string]FieldMetadata, len(fieldMetadataByPath))
-	for field, meta := range fieldMetadataByPath {
-		out[field] = meta
-	}
+	maps.Copy(out, fieldMetadataByPath)
 	return out
 }
 

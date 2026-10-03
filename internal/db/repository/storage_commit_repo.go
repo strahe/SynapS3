@@ -195,13 +195,11 @@ func (r *BunStorageContentRepo) ListCommitRequestMembers(ctx context.Context, re
 	return members, nil
 }
 
-// CommitQueueState is what a collecting request needs to decide when to seal.
+// CommitQueueState reports submission capacity and the next ready request.
 type CommitQueueState struct {
 	Submitted int
 	// ReadyHead is the ready request that may be sent next, if any.
-	ReadyHead         string
-	TransfersInFlight bool
-	Draining          bool
+	ReadyHead string
 }
 
 // CommitQueueState reads the data set's registration queue at now.
@@ -217,23 +215,6 @@ func (r *BunStorageContentRepo) CommitQueueState(ctx context.Context, storageDat
 		return out, err
 	}
 	out.ReadyHead = head
-	inFlight, err := r.db.NewSelect().
-		Model((*model.StorageCopy)(nil)).
-		Join("JOIN tasks AS transfer_task ON transfer_task.id = storage_copy.active_task_id").
-		Where("storage_copy.storage_data_set_id = ?", storageDataSetID).
-		Where("storage_copy.status = ?", model.StorageCopyStatusPending).
-		Where("transfer_task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
-		Exists(ctx)
-	if err != nil {
-		return out, fmt.Errorf("checking storage transfers in flight: %w", err)
-	}
-	out.TransfersInFlight = inFlight
-	var status model.StorageDataSetStatus
-	if err := r.db.NewSelect().Model((*model.StorageDataSet)(nil)).Column("status").
-		Where("id = ?", storageDataSetID).Scan(ctx, &status); err != nil {
-		return out, fmt.Errorf("loading storage data set status: %w", err)
-	}
-	out.Draining = status == model.StorageDataSetStatusDraining
 	return out, nil
 }
 
@@ -906,31 +887,25 @@ func eligibleReadyCommitRequest(ctx context.Context, db bun.IDB, storageDataSetI
 	return requestID, nil
 }
 
-// wakeCommitQueue makes the data set's next request runnable once there is
-// room for it: the oldest eligible ready request, or failing that every
-// collecting request, which may now seal. A task another transaction holds is
-// running and needs no wake, so it is skipped rather than waited for.
+// wakeCommitQueue wakes the oldest eligible ready request when there is room
+// to submit it. Locked task rows are skipped to avoid waiting on another claim.
 func wakeCommitQueue(ctx context.Context, db bun.IDB, storageDataSetID int64, now time.Time) error {
 	submitted, err := countSubmittedCommitRequests(ctx, db, storageDataSetID)
 	if err != nil || submitted >= storagecommit.MaxSubmittedRequestsPerDataSet {
 		return err
 	}
 	head, err := eligibleReadyCommitRequest(ctx, db, storageDataSetID, now)
-	if err != nil {
+	if err != nil || head == "" {
 		return err
 	}
-	q := db.NewSelect().
+	var taskIDs []int64
+	if err := db.NewSelect().
 		Model((*storagecommit.Request)(nil)).
 		Column("task_id").
 		Where("storage_data_set_id = ?", storageDataSetID).
-		Where("task_id IS NOT NULL")
-	if head != "" {
-		q = q.Where("request_id = ?", head)
-	} else {
-		q = q.Where("status = ?", storagecommit.RequestStatusCollecting)
-	}
-	var taskIDs []int64
-	if err := q.Scan(ctx, &taskIDs); err != nil {
+		Where("task_id IS NOT NULL").
+		Where("request_id = ?", head).
+		Scan(ctx, &taskIDs); err != nil {
 		return fmt.Errorf("selecting storage commit tasks to wake: %w", err)
 	}
 	return wakeCommitTasks(ctx, db, taskIDs)

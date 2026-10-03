@@ -20,7 +20,10 @@ import (
 	"github.com/strahe/synapse-go/storage"
 )
 
-const commitQueueMessage = "Waiting to register storage"
+const (
+	commitQueueMessage           = "Waiting to register storage"
+	commitCollectionPollInterval = 30 * time.Second
+)
 
 // commitCheckpoint records the latest send of a commit request. The request
 // row holds the send history; the checkpoint only fences the send itself.
@@ -127,8 +130,8 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	}
 }
 
-// runCollectingCommit signs a collecting request once it is full, or once
-// there is room to send it and no more copies are about to join.
+// runCollectingCommit signs when the request is full, the data set is draining,
+// or the oldest member's collection window expires; zero wait signs immediately.
 func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) taskengine.Result {
 	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, run.request.RequestID)
 	if err != nil {
@@ -139,10 +142,6 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	}
 	maxPieces := h.commitMaxPieces(run.binding)
 	now := time.Now()
-	state, err := h.deps.Repositories.Contents.CommitQueueState(ctx, run.request.StorageDataSetID, now)
-	if err != nil {
-		return retryTask(err, "commit_queue_load_failed")
-	}
 	oldest := now
 	if members[0].CommitReadyAt != nil {
 		oldest = *members[0].CommitReadyAt
@@ -150,14 +149,11 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	seal, wait := storagecommit.ShouldSeal(storagecommit.SealInput{
 		Members: len(members), OldestJoinedAt: oldest, Now: now,
 		MaxPieces: maxPieces, MaxWait: h.deps.CommitMaxWait,
-		CapacityFree:      state.Submitted < storagecommit.MaxSubmittedRequestsPerDataSet,
-		ReadyWaiting:      state.ReadyHead != "",
-		TransfersInFlight: state.TransfersInFlight,
-		Draining:          state.Draining,
+		Draining: run.binding.Status == model.StorageDataSetStatusDraining,
 	})
 	if !seal {
-		if wait <= 0 || wait > storagePollInterval {
-			wait = storagePollInterval
+		if wait <= 0 || wait > commitCollectionPollInterval {
+			wait = commitCollectionPollInterval
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, wait, "collecting", "Waiting for more stored data to register together", nil)
 	}

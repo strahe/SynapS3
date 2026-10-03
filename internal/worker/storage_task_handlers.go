@@ -36,9 +36,10 @@ import (
 )
 
 const (
-	storageDependencyWait = time.Minute
-	storagePollInterval   = 5 * time.Second
-	storeAttentionAfter   = 30 * time.Minute
+	storageDependencyWait     = time.Minute
+	storagePollInterval       = 5 * time.Second
+	storageSourcePollInterval = 30 * time.Second
+	storeAttentionAfter       = 30 * time.Minute
 	// A request whose outcome was never observed is checked on chain, and sent
 	// again with the same identity, one minute after the first request,
 	// doubling with each further request up to 30 minutes.
@@ -949,7 +950,7 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 				return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
 			}
 			if !migration {
-				return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "source", "Waiting for a readable storage source", nil)
+				return taskengine.Suspend(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
 			}
 			available, err := h.copyCacheAvailable(ctx, copyRow)
 			if err != nil {
@@ -1007,7 +1008,7 @@ func (h *TaskHandlers) pullWithoutSource(ctx context.Context, execution taskengi
 		return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
 	}
 	if !migration {
-		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "source", "Waiting for a readable storage source", nil)
+		return taskengine.Suspend(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
 	}
 	available, err := h.copyCacheAvailable(ctx, copyRow)
 	if err != nil {

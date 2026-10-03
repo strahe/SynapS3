@@ -31,8 +31,8 @@ const (
 	// time.
 	DefaultCommitMaxPieces  = 32
 	MaxCommitMaxPieces      = 200
-	DefaultCommitMaxWait    = 30 * time.Second
-	MaxCommitMaxWait        = 10 * time.Minute
+	DefaultCommitMaxWait    = 30 * time.Minute
+	MaxCommitMaxWait        = 30 * time.Minute
 	DefaultCommitMaxBacklog = 256
 )
 

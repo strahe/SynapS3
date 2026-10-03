@@ -43,6 +43,7 @@ var commitLedgerCases = []struct {
 }{
 	{"CommitRequestCollectsUpToItsLimitAndSealsTheSignedSet", testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet},
 	{"CommitSubmissionTakesTheOldestEligibleRequestWithinCapacity", testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity},
+	{"CommitSubmissionKeepsTheCollectionWakeTime", testCommitSubmissionKeepsTheCollectionWakeTime},
 	{"CommitRefusalReturnsRequestToReadyUntilItsRetryIsDue", testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue},
 	{"CommitConfirmationCommitsMembersByPositionAndReplays", testCommitConfirmationCommitsMembersByPositionAndReplays},
 	{"SignedSingleMemberIsDecidedByItsRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 1) }},
@@ -122,6 +123,10 @@ func (f commitFixture) task(t *testing.T, key string) int64 {
 
 // collecting starts a collecting request holding the copies.
 func (f commitFixture) collecting(t *testing.T, id string, copies ...*model.StorageCopy) int64 {
+	return f.collectingAt(t, id, time.Time{}, copies...)
+}
+
+func (f commitFixture) collectingAt(t *testing.T, id string, now time.Time, copies ...*model.StorageCopy) int64 {
 	t.Helper()
 	taskID := f.task(t, id)
 	ids := make([]int64, len(copies))
@@ -129,7 +134,7 @@ func (f commitFixture) collecting(t *testing.T, id string, copies ...*model.Stor
 		ids[i] = copyRow.ID
 	}
 	if err := f.repos.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
-		RequestID: id, TaskID: taskID, StorageDataSetID: f.dataSetID, CopyIDs: ids,
+		RequestID: id, TaskID: taskID, StorageDataSetID: f.dataSetID, CopyIDs: ids, Now: now,
 	}); err != nil {
 		t.Fatalf("CreateCollectingCommitRequest(%s): %v", id, err)
 	}
@@ -163,12 +168,20 @@ func (f commitFixture) sealedRequest(t *testing.T, id string) (int64, *model.Sto
 func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	first, second, third := f.transferredCopy(t, "first"), f.transferredCopy(t, "second"), f.transferredCopy(t, "third")
-	taskID := f.collecting(t, "collect", first)
+	readyAt := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
+	taskID := f.collectingAt(t, "collect", readyAt, first)
 	requestID, members, err := f.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
-		CopyID: second.ID, StorageDataSetID: f.dataSetID, MaxPieces: 2,
+		CopyID: second.ID, StorageDataSetID: f.dataSetID, MaxPieces: 2, Now: readyAt.Add(time.Minute),
 	})
 	if err != nil || requestID != "collect" || members != 2 {
 		t.Fatalf("join second = %q, %d, %v", requestID, members, err)
+	}
+	joined, err := f.repos.Contents.ListCommitRequestMembers(ctx, "collect")
+	if err != nil || len(joined) != 2 {
+		t.Fatalf("members = %#v, %v, want two", joined, err)
+	}
+	if joined[0].ID != first.ID || joined[0].CommitReadyAt == nil || !joined[0].CommitReadyAt.Equal(readyAt) {
+		t.Fatalf("oldest member = %#v, want first ready at %s", joined[0], readyAt)
 	}
 	if _, _, err := f.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
 		CopyID: third.ID, StorageDataSetID: f.dataSetID, MaxPieces: 2,
@@ -191,6 +204,10 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 	}
 	if late := f.copy(t, second.ID); late.Status != model.StorageCopyStatusPieceReady || late.CommitRequestID != nil {
 		t.Fatalf("late copy = %#v, want piece_ready outside any request", late)
+	}
+	f.collectingAt(t, "spill", readyAt.Add(time.Hour), second)
+	if copyRow := f.copy(t, second.ID); copyRow.CommitReadyAt == nil || !copyRow.CommitReadyAt.Equal(readyAt.Add(time.Minute)) {
+		t.Fatalf("spilled member ready at = %v, want %s", copyRow.CommitReadyAt, readyAt.Add(time.Minute))
 	}
 	pieces, err := f.repos.Contents.ListCommitRequestPieces(ctx, "collect")
 	if err != nil || len(pieces) != 1 || pieces[0].ContentID != first.ContentID {
@@ -256,6 +273,33 @@ func testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 	// Another task cannot send a request it does not drive.
 	if err := f.repos.Contents.RecordCommitResend(ctx, repository.CommitSendInput{RequestID: "request-0", TaskID: tasks[1], Sends: 2}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("resend by another task = %v, want conflict", err)
+	}
+}
+
+func testCommitSubmissionKeepsTheCollectionWakeTime(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	collectingTask := f.collecting(t, "collecting", f.transferredCopy(t, "collecting"))
+	taskID, _ := f.sealedRequest(t, "ready")
+	later := time.Now().Add(time.Hour)
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
+		Where("id = ?", collectingTask).Exec(ctx); err != nil {
+		t.Fatalf("park collecting task: %v", err)
+	}
+	before, err := f.repos.Tasks.GetByID(ctx, collectingTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{
+		RequestID: "ready", TaskID: taskID,
+	}); err != nil {
+		t.Fatalf("begin submission: %v", err)
+	}
+	after, err := f.repos.Tasks.GetByID(ctx, collectingTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.AvailableAt.Equal(before.AvailableAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("collecting task changed after submission: before=%#v, after=%#v", before, after)
 	}
 }
 

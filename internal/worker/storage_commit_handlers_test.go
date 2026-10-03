@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -241,13 +242,14 @@ type registrationFixture struct {
 
 // newRegistrationFixture seeds a data set and n contents whose single copies
 // finished transferring to it.
-func newRegistrationFixture(t *testing.T, n int, parked synapse.ParkedPieceChecker) registrationFixture {
+func newRegistrationFixture(t *testing.T, n int, parked synapse.ParkedPieceChecker, maxWait time.Duration) registrationFixture {
 	t.Helper()
 	ctx := t.Context()
 	storageClient := &testutil.MockStorageClient{}
 	nonces := &testutil.MockCommitNonces{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: storageClient, policy: cache.EvictionPolicyNone, commitNonces: nonces, parkedPieces: parked,
+		commitMaxWait: maxWait,
 		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
 			return handlers.RegisterStorage(registry)
 		},
@@ -318,8 +320,11 @@ func newRegistrationFixture(t *testing.T, n int, parked synapse.ParkedPieceCheck
 // collect puts every seeded copy into one collecting request driven by a new
 // task.
 func (f registrationFixture) collect(t *testing.T) (string, int64) {
+	return f.collectAt(t, fmt.Sprintf("registration-%d", f.dataSet.ID), time.Time{}, f.copies...)
+}
+
+func (f registrationFixture) collectAt(t *testing.T, requestID string, now time.Time, copies ...*model.StorageCopy) (string, int64) {
 	t.Helper()
-	requestID := fmt.Sprintf("registration-%d", f.dataSet.ID)
 	taskRow, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
 		Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
 		Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
@@ -328,12 +333,12 @@ func (f registrationFixture) collect(t *testing.T) (string, int64) {
 	if err != nil {
 		t.Fatalf("enqueue commit task: %v", err)
 	}
-	ids := make([]int64, len(f.copies))
-	for i, copyRow := range f.copies {
+	ids := make([]int64, len(copies))
+	for i, copyRow := range copies {
 		ids[i] = copyRow.ID
 	}
 	if err := f.runtime.repos.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
-		RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: f.dataSet.ID, CopyIDs: ids,
+		RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: f.dataSet.ID, CopyIDs: ids, Now: now,
 	}); err != nil {
 		t.Fatalf("CreateCollectingCommitRequest: %v", err)
 	}
@@ -389,9 +394,151 @@ func (f registrationFixture) finishTransfer(t *testing.T, copyRow *model.Storage
 	}
 }
 
+func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
+	f := newRegistrationFixture(t, 3, nil, 30*time.Minute)
+	readyAt := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
+	requestID, taskID := f.collectAt(t, "collecting", readyAt, f.copies[0])
+	cancel, done := runHandlerEngine(t, f.runtime)
+	defer func() { stopHandlerEngine(t, cancel, done) }()
+	collecting := func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "collecting"
+	}
+	first := waitForCommitTask(t, f.runtime, taskID, collecting)
+	if first.RetryCount != 0 || first.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("collecting task = %#v, want recovery without retries", first)
+	}
+	if delay := first.AvailableAt.Sub(first.UpdatedAt); delay < 29*time.Second || delay > 31*time.Second {
+		t.Fatalf("collection check delay = %s, want 30s", delay)
+	}
+	for i, copyRow := range f.copies[1:] {
+		joined, _, err := f.runtime.repos.Contents.JoinCollectingCommitRequest(t.Context(), repository.JoinCommitRequestInput{
+			CopyID: copyRow.ID, StorageDataSetID: f.dataSet.ID, MaxPieces: 32,
+			Now: readyAt.Add(time.Duration(i+1) * time.Minute),
+		})
+		if err != nil || joined != requestID {
+			t.Fatalf("join member = %q, %v, want %s", joined, err, requestID)
+		}
+	}
+	stopHandlerEngine(t, cancel, done)
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+	}, f.runtime.repos, f.runtime.registry, slog.Default())
+	if err != nil {
+		t.Fatalf("restart engine: %v", err)
+	}
+	f.runtime.engine = engine
+	wakeCommitTasks(t, f.runtime)
+	cancel, done = runHandlerEngine(t, f.runtime)
+	recovered := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+		return collecting(task) && task.ClaimGeneration > first.ClaimGeneration
+	})
+	if recovered.RetryCount != 0 {
+		t.Fatalf("recovered retry count = %d, want 0", recovered.RetryCount)
+	}
+	members, err := f.runtime.repos.Contents.ListCommitRequestMembers(t.Context(), requestID)
+	if err != nil || len(members) != 3 {
+		t.Fatalf("recovered members = %#v, %v, want three", members, err)
+	}
+	if members[0].CommitReadyAt == nil || !members[0].CommitReadyAt.Equal(readyAt) {
+		t.Fatalf("oldest ready at = %v, want %s", members[0].CommitReadyAt, readyAt)
+	}
+	if sends, _ := f.provider.sent(); len(sends) != 0 || f.request(t, requestID).Status != storagecommit.RequestStatusCollecting {
+		t.Fatalf("submissions = %v, want the request still collecting", sends)
+	}
+}
+
+func TestCommitSealsWhileSubmissionSlotsAreFull(t *testing.T) {
+	f := newRegistrationFixture(t, 6, nil, 30*time.Minute)
+	ctx := t.Context()
+	readyAt := time.Now().Add(-31 * time.Minute)
+	var heldTaskID int64
+	for i, copyRow := range f.copies[:4] {
+		requestID, taskID := f.collectAt(t, fmt.Sprintf("held-%d", i), readyAt, copyRow)
+		claimed, err := f.runtime.repos.Tasks.ClaimNext(ctx, time.Minute)
+		if err != nil || claimed == nil || claimed.ID != taskID {
+			t.Fatalf("claim held task = %#v, %v, want %d", claimed, err, taskID)
+		}
+		if _, err := f.runtime.repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
+			RequestID: requestID, TaskID: taskID, ExtraDataHex: fmt.Sprintf("%x", testutil.CommitExtraData(uint64(i+1))),
+			Members: []repository.SealMember{{CopyID: copyRow.ID, ContentID: copyRow.ContentID, PieceCID: f.pieceCID(t, copyRow)}},
+		}); err != nil {
+			t.Fatalf("seal held request: %v", err)
+		}
+		if err := f.runtime.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: requestID, TaskID: taskID}); err != nil {
+			t.Fatalf("begin held submission: %v", err)
+		}
+		if err := f.runtime.repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
+			CommitSendInput: repository.CommitSendInput{RequestID: requestID, TaskID: taskID, Sends: 1},
+			TransactionID:   fmt.Sprintf("0xheld-%d", i), StatusURL: fmt.Sprintf("https://provider.example/status/held-%d", i),
+		}); err != nil {
+			t.Fatalf("record held submission: %v", err)
+		}
+		// A stopped submitted request still owns its in-flight slot.
+		failure := "handler_unavailable"
+		if err := f.runtime.repos.Tasks.Settle(ctx, taskID, claimed.ClaimGeneration, repository.TaskTransition{
+			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &failure,
+		}); err != nil {
+			t.Fatalf("stop held task: %v", err)
+		}
+		if i == 0 {
+			heldTaskID = taskID
+		}
+	}
+	requestID, taskID := f.collectAt(t, "waiting-to-send", readyAt, f.copies[4])
+	cancel, done := runHandlerEngine(t, f.runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waiting := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "resource"
+	})
+	sealed := f.request(t, requestID)
+	if sealed.Status != storagecommit.RequestStatusReady || sealed.PieceCount != 1 || sealed.ExtraDataHex == nil || waiting.RetryCount != 0 {
+		t.Fatalf("waiting request/task = %#v / %#v, want one sealed member without retries", sealed, waiting)
+	}
+	if sends, _ := f.provider.sent(); len(sends) != 0 {
+		t.Fatalf("submissions = %v, want none while slots are full", sends)
+	}
+	if _, _, err := f.runtime.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
+		CopyID: f.copies[5].ID, StorageDataSetID: f.dataSet.ID, MaxPieces: 32,
+	}); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("join sealed request = %v, want no collecting request", err)
+	}
+	nextID, nextTaskID := f.collectAt(t, "next", time.Now(), f.copies[5])
+	waitForCommitTask(t, f.runtime, nextTaskID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "collecting"
+	})
+	if backlog, err := f.runtime.repos.Contents.CountCommitBacklog(ctx, f.dataSet.ID); err != nil || backlog != 2 {
+		t.Fatalf("backlog = %d, %v, want two unsent members", backlog, err)
+	}
+	if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
+		RequestID: "held-0", TaskID: heldTaskID, FirstPieceID: testOnChainID(t, 50),
+		ConfirmedTransactionID: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
+	}); err != nil {
+		t.Fatalf("release submission slot: %v", err)
+	}
+	completed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	sends, extras := f.provider.sent()
+	if len(sends) != 1 || len(sends[0]) != 1 || sends[0][0].String() != f.pieceCID(t, f.copies[4]) || fmt.Sprintf("%x", extras[0]) != *sealed.ExtraDataHex {
+		t.Fatalf("submissions = %v, want the original signed member once", sends)
+	}
+	if completed.RetryCount != 0 || f.request(t, nextID).Status != storagecommit.RequestStatusCollecting {
+		t.Fatalf("completed task/next request = %#v / %#v", completed, f.request(t, nextID))
+	}
+}
+
 func TestCommitRequestRegistersEveryMemberInOneSubmission(t *testing.T) {
-	f := newRegistrationFixture(t, 3, nil)
-	requestID, taskID := f.collect(t)
+	f := newRegistrationFixture(t, 3, nil, 30*time.Minute)
+	readyAt := time.Now().Add(-31 * time.Minute)
+	requestID, taskID := f.collectAt(t, "expired", readyAt, f.copies[0])
+	for i, copyRow := range f.copies[1:] {
+		joined, _, err := f.runtime.repos.Contents.JoinCollectingCommitRequest(t.Context(), repository.JoinCommitRequestInput{
+			CopyID: copyRow.ID, StorageDataSetID: f.dataSet.ID, MaxPieces: 32,
+			Now: readyAt.Add(time.Duration(i+1) * time.Second),
+		})
+		if err != nil || joined != requestID {
+			t.Fatalf("join member = %q, %v, want %s", joined, err, requestID)
+		}
+	}
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
@@ -415,7 +562,7 @@ func TestCommitRequestRegistersEveryMemberInOneSubmission(t *testing.T) {
 }
 
 func TestRefusedCommitRequestBacksOffAndSendsTheSameRequest(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.script = []sendOutcome{sendRefuse}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -439,7 +586,7 @@ func TestRefusedCommitRequestBacksOffAndSendsTheSameRequest(t *testing.T) {
 
 func TestDroppedMemberIsTransferredAgainBeforeTheRequestIsResent(t *testing.T) {
 	parked := &droppedPieces{missing: map[string]bool{}}
-	f := newRegistrationFixture(t, 2, parked)
+	f := newRegistrationFixture(t, 2, parked, 0)
 	f.provider.script = []sendOutcome{sendRefuse}
 	parked.drop(f.pieceCID(t, f.copies[0]))
 	requestID, taskID := f.collect(t)
@@ -477,7 +624,7 @@ func TestDroppedMemberIsTransferredAgainBeforeTheRequestIsResent(t *testing.T) {
 
 func TestSubmittedRequestWaitsForADroppedMemberBeforeSendingAgain(t *testing.T) {
 	parked := &droppedPieces{missing: map[string]bool{}}
-	f := newRegistrationFixture(t, 2, parked)
+	f := newRegistrationFixture(t, 2, parked, 0)
 	f.provider.script = []sendOutcome{sendLost, sendRefuse}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -515,7 +662,7 @@ func TestSubmittedRequestWaitsForADroppedMemberBeforeSendingAgain(t *testing.T) 
 }
 
 func TestLostSendIsResentUnchangedOnceItsDelayPasses(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.script = []sendOutcome{sendLost}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -543,7 +690,7 @@ func TestLostSendIsResentUnchangedOnceItsDelayPasses(t *testing.T) {
 }
 
 func TestLostSendThatLandedIsConfirmedWithoutSendingAgain(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.script = []sendOutcome{sendLandedLost}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -562,7 +709,7 @@ func TestLostSendThatLandedIsConfirmedWithoutSendingAgain(t *testing.T) {
 }
 
 func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.script = []sendOutcome{sendAcceptUnlanded}
 	f.provider.statusDown = true
 	requestID, taskID := f.collect(t)
@@ -584,7 +731,7 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 }
 
 func TestReadyRequestWhoseNonceWasSpentIsSignedAgain(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.spendFirstNonce = true
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -612,7 +759,7 @@ func TestReadyRequestWhoseNonceWasSpentIsSignedAgain(t *testing.T) {
 }
 
 func TestSubmittedRequestWhoseNonceWasSpentStopsForReview(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.script = []sendOutcome{sendSpentElsewhere}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -636,7 +783,7 @@ func TestSubmittedRequestWhoseNonceWasSpentStopsForReview(t *testing.T) {
 }
 
 func TestRequestForADataSetThatRefusesWritesIsGivenUp(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil)
+	f := newRegistrationFixture(t, 2, nil, 0)
 	f.provider.target.CheckWritableFunc = func(context.Context) error { return storage.ErrDataSetUnavailable }
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -657,7 +804,7 @@ func TestRequestForADataSetThatRefusesWritesIsGivenUp(t *testing.T) {
 }
 
 func TestUnknownAttentionCodeStopsRecovery(t *testing.T) {
-	f := newRegistrationFixture(t, 1, nil)
+	f := newRegistrationFixture(t, 1, nil, 0)
 	f.provider.script = []sendOutcome{sendLost}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -682,7 +829,7 @@ func TestUnknownAttentionCodeStopsRecovery(t *testing.T) {
 }
 
 func TestRequestTooLargeToSignIsSplitInHalves(t *testing.T) {
-	f := newRegistrationFixture(t, 4, nil)
+	f := newRegistrationFixture(t, 4, nil, 0)
 	f.provider.maxSigned = 2
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
