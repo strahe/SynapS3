@@ -294,6 +294,9 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 				{Field: "worker.tasks.retention", Key: "retention", Value: quoteTOMLString(cfg.Worker.Tasks.Retention.String()), Enabled: saveMode},
 				{Field: "worker.tasks.provider_mutation_concurrency", Key: "provider_mutation_concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.ProviderMutationConcurrency), Enabled: saveMode},
 				{Field: "worker.tasks.destructive_mutation_concurrency", Key: "destructive_mutation_concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.DestructiveMutationConcurrency), Enabled: saveMode},
+				{Field: "worker.tasks.commit_max_pieces", Key: "commit_max_pieces", Value: strconv.Itoa(cfg.Worker.Tasks.CommitMaxPieces), Enabled: saveMode},
+				{Field: "worker.tasks.commit_max_wait", Key: "commit_max_wait", Value: quoteTOMLString(cfg.Worker.Tasks.CommitMaxWait.String()), Enabled: saveMode},
+				{Field: "worker.tasks.commit_max_backlog", Key: "commit_max_backlog", Value: strconv.Itoa(cfg.Worker.Tasks.CommitMaxBacklog), Enabled: saveMode},
 			},
 		},
 		{

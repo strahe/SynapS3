@@ -204,6 +204,15 @@ export function collectSettingsRiskChanges(
       'Increases concurrent remote cleanup and retirement requests.'
     )
   }
+  if (next.worker.tasks.commit_max_pieces > initial.worker.tasks.commit_max_pieces) {
+    addChanged(
+      'worker.tasks.commit_max_pieces',
+      initial.worker.tasks.commit_max_pieces,
+      next.worker.tasks.commit_max_pieces,
+      'medium',
+      'Registers more pieces in each signed storage request; providers may refuse requests that are too large.'
+    )
+  }
 
   return changes
 }

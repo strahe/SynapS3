@@ -15,72 +15,112 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
+	idtypes "github.com/strahe/synaps3/internal/types"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/uptrace/bun"
 )
 
-// CommitStorageCopy drives one copy to committed the way production does: a
-// commit attempt is recorded in the ledger first, and the copy then projects
-// that confirmed row. A committed copy without confirmed evidence is refused by
-// the schema, so tests cannot shortcut this.
-func CommitStorageCopy(
-	t *testing.T,
-	db bun.IDB,
-	repos *repository.Repositories,
-	input repository.MarkUploadCopyCommittedInput,
-) {
+// CommitCopyInput names a copy to commit and the evidence it ends with.
+type CommitCopyInput struct {
+	StorageCopyID int64
+	ContentID     int64
+	CopyIndex     int
+	PieceCID      string
+	PieceID       *idtypes.OnChainID
+	RetrievalURL  string
+	TransactionID string
+}
+
+// CommitStorageCopy commits one copy the way a confirmed registration leaves
+// it: a confirmed single-piece request is recorded first, and the copy then
+// names it. A committed copy without a confirmed request is refused by the
+// schema, so tests cannot shortcut this.
+func CommitStorageCopy(t *testing.T, db bun.IDB, _ *repository.Repositories, input CommitCopyInput) {
 	t.Helper()
 	ctx := context.Background()
-	if input.StorageCopyID == 0 {
-		copyRow := new(model.StorageCopy)
-		if err := db.NewSelect().
-			Model(copyRow).
-			Where("content_id = ? AND copy_index = ?", input.ContentID, input.CopyIndex).
-			Scan(ctx); err != nil {
-			t.Fatalf("loading copy for content %d slot %d: %v", input.ContentID, input.CopyIndex, err)
-		}
-		input.StorageCopyID = copyRow.ID
-	}
 	copyRow := new(model.StorageCopy)
-	if err := db.NewSelect().Model(copyRow).Where("id = ?", input.StorageCopyID).Scan(ctx); err != nil {
-		t.Fatalf("loading copy %d: %v", input.StorageCopyID, err)
+	q := db.NewSelect().Model(copyRow)
+	if input.StorageCopyID != 0 {
+		q = q.Where("id = ?", input.StorageCopyID)
+	} else {
+		q = q.Where("content_id = ? AND copy_index = ?", input.ContentID, input.CopyIndex)
 	}
-	if input.CommitExtraDataHex == "" {
-		input.CommitExtraDataHex = "abcd"
+	if err := q.Scan(ctx); err != nil {
+		t.Fatalf("loading copy for content %d slot %d: %v", input.ContentID, input.CopyIndex, err)
 	}
-	if input.CommitTransactionID == "" {
-		input.CommitTransactionID = fmt.Sprintf("tx-%d", input.StorageCopyID)
+	content := new(model.StorageContent)
+	if err := db.NewSelect().Model(content).Where("id = ?", copyRow.ContentID).Scan(ctx); err != nil {
+		t.Fatalf("loading content %d: %v", copyRow.ContentID, err)
 	}
-	if input.CommitConfirmedTransactionID == "" {
-		input.CommitConfirmedTransactionID = input.CommitTransactionID
+	pieceCID := input.PieceCID
+	if pieceCID == "" && content.PieceCID != nil {
+		pieceCID = *content.PieceCID
 	}
-	if input.CommitAttemptID == "" {
-		input.CommitAttemptID = fmt.Sprintf("attempt-%d-%d", input.ContentID, input.StorageCopyID)
+	if pieceCID == "" {
+		t.Fatalf("committing copy %d needs a piece CID", copyRow.ID)
+	}
+	pieceID := idtypes.NewOnChainID(uint64(copyRow.ID))
+	if input.PieceID != nil {
+		pieceID = *input.PieceID
+	} else if copyRow.PieceID != nil {
+		pieceID = *copyRow.PieceID
+	}
+	retrievalURL := input.RetrievalURL
+	if retrievalURL == "" && copyRow.RetrievalURL != nil {
+		retrievalURL = *copyRow.RetrievalURL
+	}
+	if retrievalURL == "" {
+		retrievalURL = "https://provider.example/piece/" + pieceCID
+	}
+	transactionID := input.TransactionID
+	if transactionID == "" {
+		transactionID = fmt.Sprintf("tx-%d", copyRow.ID)
 	}
 	now := time.Now()
-	statusURL := "https://provider.example/status/" + input.CommitAttemptID
-	attempt := &storagecommit.Attempt{
-		AttemptID: input.CommitAttemptID, ContentID: copyRow.ContentID,
-		StorageDataSetID: copyRow.StorageDataSetID, Status: storagecommit.AttemptStatusAttempted,
-		ExtraDataHex: &input.CommitExtraDataHex, TransactionID: &input.CommitTransactionID,
-		StatusURL:   &statusURL,
-		AttemptedAt: &now, CreatedAt: now, UpdatedAt: now,
+	requestID := fmt.Sprintf("request-%d-%d", copyRow.ContentID, copyRow.ID)
+	extra := CommitExtraDataHex(uint64(copyRow.ID))
+	statusURL := "https://provider.example/status/" + transactionID
+	request := &storagecommit.Request{
+		RequestID: requestID, StorageDataSetID: copyRow.StorageDataSetID, Status: storagecommit.RequestStatusConfirmed,
+		PieceCount: 1, ExtraDataHex: &extra, SealedAt: &now, FirstSentAt: &now, Sends: 1,
+		SubmittedAt: &now, LastSentAt: &now, TransactionID: &transactionID, StatusURL: &statusURL,
+		FirstPieceID: &pieceID, ConfirmedTransactionID: &transactionID, ConfirmedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
 	}
-	if _, err := db.NewInsert().Model(attempt).Exec(ctx); err != nil {
-		t.Fatalf("seeding commit attempt for copy %d: %v", input.StorageCopyID, err)
+	if _, err := db.NewInsert().Model(request).Exec(ctx); err != nil {
+		t.Fatalf("seeding commit request for copy %d: %v", copyRow.ID, err)
 	}
-	// Confirmation lands on a copy the coordinator already moved to committing.
+	piece := &storagecommit.RequestPiece{
+		RequestID: requestID, Position: 0, ContentID: copyRow.ContentID,
+		StorageDataSetID: copyRow.StorageDataSetID, PieceCID: pieceCID, CreatedAt: now,
+	}
+	if _, err := db.NewInsert().Model(piece).Exec(ctx); err != nil {
+		t.Fatalf("seeding commit request piece for copy %d: %v", copyRow.ID, err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.StorageContent)(nil)).
+		Set("piece_cid = COALESCE(piece_cid, ?)", pieceCID).
+		Set("error_message = NULL").
+		Set("updated_at = ?", now).
+		Where("id = ?", copyRow.ContentID).
+		Exec(ctx); err != nil {
+		t.Fatalf("recording piece CID for content %d: %v", copyRow.ContentID, err)
+	}
 	if _, err := db.NewUpdate().
 		Model((*model.StorageCopy)(nil)).
-		Set("status = ?", model.StorageCopyStatusCommitting).
-		Set("commit_extra_data_hex = ?", input.CommitExtraDataHex).
+		Set("status = ?", model.StorageCopyStatusCommitted).
+		Set("piece_id = ?", &pieceID).
+		Set("retrieval_url = ?", retrievalURL).
+		Set("commit_request_id = ?", requestID).
+		Set("commit_position = 0").
+		Set("commit_request_status = ?", string(storagecommit.RequestStatusConfirmed)).
+		Set("commit_ready_at = NULL").
+		Set("active_task_id = NULL").
+		Set("last_error = NULL").
 		Set("updated_at = ?", now).
-		Where("id = ?", input.StorageCopyID).
+		Where("id = ?", copyRow.ID).
 		Exec(ctx); err != nil {
-		t.Fatalf("moving copy %d to committing: %v", input.StorageCopyID, err)
-	}
-	if err := repos.Contents.MarkUploadCopyCommitted(ctx, input); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+		t.Fatalf("committing copy %d: %v", copyRow.ID, err)
 	}
 }
 
@@ -138,6 +178,31 @@ func (m *MockCommitNonces) Consume(nonce uint64, dataSetID, pieceID sdktypes.Big
 	}
 	m.nonces[new(big.Int).SetUint64(nonce).String()] = synapse.ClientNonceState{Consumed: true, DataSetID: dataSetID.Copy(), NextPieceID: next}
 	m.pieces[dataSetID.String()+"/"+pieceID.String()] = pieceCID
+}
+
+// ConsumeRequest records that the request signed into extraData added
+// pieceCIDs, in order, to the data set starting at firstPieceID.
+func (m *MockCommitNonces) ConsumeRequest(extraData []byte, dataSetID, firstPieceID sdktypes.BigInt, pieceCIDs []cid.Cid) {
+	nonce, err := storagecommit.ExtraDataNonce(extraData)
+	if err != nil {
+		panic(err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.nonces == nil {
+		m.nonces = make(map[string]synapse.ClientNonceState)
+		m.pieces = make(map[string]cid.Cid)
+	}
+	first := firstPieceID.Big()
+	for i, pieceCID := range pieceCIDs {
+		id := new(big.Int).Add(first, big.NewInt(int64(i)))
+		m.pieces[dataSetID.String()+"/"+id.String()] = pieceCID
+	}
+	next, err := sdktypes.BigIntFromBig(new(big.Int).Add(first, big.NewInt(int64(len(pieceCIDs)))))
+	if err != nil {
+		panic(err)
+	}
+	m.nonces[nonce.String()] = synapse.ClientNonceState{Consumed: true, DataSetID: dataSetID.Copy(), NextPieceID: next}
 }
 
 // ConsumeExtraData is Consume for the nonce signed into extraData.

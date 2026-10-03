@@ -242,13 +242,13 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	stopped := fixture.enqueue(t, model.TaskTypeStorageCommit, "stopped-commit", time.Now(), "", "")
 	fixture.transition(t, stopped.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: new("attempt_only_ambiguous"), LastError: new("storage registration requires attention"),
+		FailureReason: new("submission_mismatch"), LastError: new("storage registration requires attention"),
 	})
 	now := time.Date(2026, 9, 30, 19, 53, 39, 0, time.UTC)
 	fixture.repos.Contents = &commitAttentionTaskRepo{StorageContentRepository: fixture.repos.Contents, records: []storagecommit.AttentionRecord{{
-		CopyID: 447, TaskID: &stopped.ID, ProviderID: "32", DataSetID: "39911", PieceCID: "piece-1",
-		AttemptID: "attempt-1", TransactionID: "0xcommit", SubmitError: "provider returned HTTP 500: piece not found",
-		Code: storagecommit.AttentionAttemptOnlyAmbiguous, AttemptedAt: now.Add(-6 * time.Second), AttentionAt: now,
+		RequestID: "request-447", TaskID: &stopped.ID, ProviderID: "32", DataSetID: "39911", PieceCIDs: []string{"piece-1"},
+		TransactionID: "0xcommit", SubmitError: "provider returned HTTP 500: piece not found",
+		Code: storagecommit.AttentionSubmissionMismatch, SubmittedAt: now.Add(-6 * time.Second), AttentionAt: now,
 	}}}
 
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks?type=storage_commit&status=failed", nil)
@@ -260,10 +260,10 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	if len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || !page.Tasks[0].Retryable || page.Tasks[0].StorageConfirmation == nil {
 		t.Fatalf("page = %#v, want the stopped task with its confirmation, Retry, and no dismissal", page)
 	}
-	if confirmation := page.Tasks[0].StorageConfirmation; confirmation.CopyID != 447 || confirmation.AttemptID != "attempt-1" ||
+	if confirmation := page.Tasks[0].StorageConfirmation; confirmation.RequestID != "request-447" ||
 		confirmation.SubmitError != "provider returned HTTP 500: piece not found" ||
 		confirmation.ProviderID != "32" || confirmation.DataSetID != "39911" ||
-		confirmation.PieceCID != "piece-1" || confirmation.TransactionID != "0xcommit" {
+		confirmation.PieceCount != 1 || confirmation.PieceCIDs[0] != "piece-1" || confirmation.TransactionID != "0xcommit" {
 		t.Fatalf("confirmation = %#v, want the confirmation with the provider reply", confirmation)
 	}
 

@@ -151,37 +151,95 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		contentB := insertBaselineTestContent(t, db, bucketB, "upload-b")
 		source := insertBaselineTestDataSet(t, db, bucketA, "101", 0, 1, true)
 		copyID := insertBaselineTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
+		// A committed copy must name a confirmed request in its own data set,
+		// at a position recorded for its own content.
 		mustRejectStatement(t, db, `UPDATE storage_copies
-			SET confirmed_attempt_status = 'confirmed' WHERE id = ?`, copyID)
-		// Committed evidence must be the attempt made for this copy: a confirmed
-		// attempt for another content in the same data set cannot be borrowed.
-		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
-			(attempt_id, content_id, storage_data_set_id, status, extra_data_hex, transaction_id, status_url,
-			 confirmed_transaction_id, attempted_at, resolved_at, created_at, updated_at)
-			VALUES ('attempt-other-content', ?, ?, 'confirmed', 'abcd', '0xother', 'https://provider.example/status/other',
-			 '0xother', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA2, source); err != nil {
-			t.Fatalf("insert confirmed attempt for another content: %v", err)
+			SET commit_request_status = 'confirmed' WHERE id = ?`, copyID)
+		requestTask := insertBaselineTestTask(t, db, "commit-request-a")
+		if _, err := db.Exec(`INSERT INTO storage_commit_requests
+			(request_id, storage_data_set_id, status, task_id, piece_count, sends, refusals, created_at, updated_at)
+			VALUES ('request-a', ?, 'collecting', ?, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, source, requestTask); err != nil {
+			t.Fatalf("insert collecting request: %v", err)
+		}
+		// A request that is not settled keeps its task.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET task_id = NULL WHERE request_id = 'request-a'`)
+		// A collecting request carries no signature yet.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET extra_data_hex = 'abcd' WHERE request_id = 'request-a'`)
+		// Attention is raised only on a request that may be on chain.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests
+			SET attention_code = 'confirmation_timeout', attention_at = CURRENT_TIMESTAMP WHERE request_id = 'request-a'`)
+		if _, err := db.Exec(`UPDATE storage_copies SET status = 'piece_ready', commit_request_id = 'request-a' WHERE id = ?`, copyID); err != nil {
+			t.Fatalf("join collecting request: %v", err)
+		}
+		// A transferred copy waiting in a request has no position until signed.
+		mustRejectStatement(t, db, `UPDATE storage_copies SET commit_position = 0 WHERE id = ?`, copyID)
+		if _, err := db.Exec(`INSERT INTO storage_commit_request_pieces
+			(request_id, position, content_id, storage_data_set_id, piece_cid, created_at)
+			VALUES ('request-a', 0, ?, ?, 'baga-own', CURRENT_TIMESTAMP)`, contentA, source); err != nil {
+			t.Fatalf("insert request piece: %v", err)
+		}
+		mustRejectStatement(t, db, `INSERT INTO storage_commit_request_pieces
+			(request_id, position, content_id, storage_data_set_id, piece_cid, created_at)
+			VALUES ('request-a', 0, ?, ?, 'baga-other', CURRENT_TIMESTAMP)`, contentA2, source)
+		// The position belongs to its own content: another content's copy
+		// cannot name it.
+		otherCopy := insertBaselineTestCopy(t, db, contentA2, bucketA, source, 0, "101", "ingress")
+		mustRejectStatement(t, db, `UPDATE storage_copies
+			SET status = 'committing', commit_request_id = 'request-a', commit_position = 0 WHERE id = ?`, otherCopy)
+		if _, err := db.Exec(`UPDATE storage_commit_requests
+			SET status = 'ready', piece_count = 1, extra_data_hex = 'abcd', sealed_at = CURRENT_TIMESTAMP
+			WHERE request_id = 'request-a'`); err != nil {
+			t.Fatalf("seal request: %v", err)
+		}
+		if _, err := db.Exec(`UPDATE storage_copies SET status = 'committing', commit_position = 0 WHERE id = ?`, copyID); err != nil {
+			t.Fatalf("position sealed member: %v", err)
 		}
 		commitCopy := `UPDATE storage_copies
 			SET status = 'committed', piece_id = '1', retrieval_url = 'https://provider.example/piece',
-			    confirmed_attempt_id = ?, confirmed_attempt_status = 'confirmed'
+			    commit_request_status = 'confirmed'
 			WHERE id = ?`
-		mustRejectStatement(t, db, commitCopy, "attempt-other-content", copyID)
-		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
-			(attempt_id, content_id, storage_data_set_id, status, extra_data_hex, transaction_id, status_url,
-			 confirmed_transaction_id, attempted_at, resolved_at, created_at, updated_at)
-			VALUES ('attempt-own', ?, ?, 'confirmed', 'abcd', '0xown', 'https://provider.example/status/own',
-			 '0xown', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, source); err != nil {
-			t.Fatalf("insert confirmed attempt for the copy: %v", err)
+		// The request is not confirmed yet.
+		mustRejectStatement(t, db, commitCopy, copyID)
+		// A submitted request has been sent at least once.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET status = 'submitted' WHERE request_id = 'request-a'`)
+		if _, err := db.Exec(`UPDATE storage_commit_requests
+			SET status = 'submitted', first_sent_at = CURRENT_TIMESTAMP, submitted_at = CURRENT_TIMESTAMP,
+			    last_sent_at = CURRENT_TIMESTAMP, sends = 1
+			WHERE request_id = 'request-a'`); err != nil {
+			t.Fatalf("submit request: %v", err)
 		}
-		if _, err := db.Exec(commitCopy, "attempt-own", copyID); err != nil {
-			t.Fatalf("commit copy with its own attempt: %v", err)
+		// A receipt names its transaction and its status together.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET transaction_id = '0xown' WHERE request_id = 'request-a'`)
+		if _, err := db.Exec(`UPDATE storage_commit_requests
+			SET transaction_id = '0xown', status_url = 'https://provider.example/status/own',
+			    attention_code = 'confirmation_timeout', attention_at = CURRENT_TIMESTAMP
+			WHERE request_id = 'request-a'`); err != nil {
+			t.Fatalf("record submission evidence and attention: %v", err)
 		}
+		// A confirmation proven only by the nonce names no confirmed transaction.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests
+			SET status = 'confirmed', task_id = NULL, confirmed_at = CURRENT_TIMESTAMP, attention_code = NULL, attention_at = NULL
+			WHERE request_id = 'request-a'`)
+		if _, err := db.Exec(`UPDATE storage_commit_requests
+			SET status = 'confirmed', task_id = NULL, first_piece_id = '1', confirmed_at = CURRENT_TIMESTAMP,
+			    attention_code = NULL, attention_at = NULL
+			WHERE request_id = 'request-a'`); err != nil {
+			t.Fatalf("confirm request by nonce: %v", err)
+		}
+		if _, err := db.Exec(commitCopy, copyID); err != nil {
+			t.Fatalf("commit copy with its confirmed request: %v", err)
+		}
+		// A confirmed request stays confirmed while a copy names it.
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests
+			SET status = 'abandoned', last_error = 'x' WHERE request_id = 'request-a'`)
 		if _, err := db.Exec(`UPDATE storage_copies
 			SET status = 'pending', piece_id = NULL, retrieval_url = NULL,
-			    confirmed_attempt_id = NULL, confirmed_attempt_status = NULL
+			    commit_request_id = NULL, commit_position = NULL, commit_request_status = NULL
 			WHERE id = ?`, copyID); err != nil {
 			t.Fatalf("reopen copy: %v", err)
+		}
+		if _, err := db.Exec(`DELETE FROM storage_copies WHERE id = ?`, otherCopy); err != nil {
+			t.Fatalf("remove second copy: %v", err)
 		}
 
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
@@ -226,53 +284,6 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			t.Fatalf("insert created-by provenance: %v", err)
 		}
 		mustRejectStatement(t, db, `DELETE FROM storage_contents WHERE id = ?`, createdByContent)
-
-		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
-			(attempt_id, content_id, storage_data_set_id, created_at, updated_at)
-			VALUES ('attempt-1', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, source); err != nil {
-			t.Fatalf("insert first unresolved attempt: %v", err)
-		}
-		mustRejectStatement(t, db, `INSERT INTO storage_commit_attempts
-			(attempt_id, content_id, storage_data_set_id, created_at, updated_at)
-			VALUES ('attempt-2', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, source)
-		if _, err := db.Exec(`UPDATE storage_commit_attempts
-			SET status = 'released', release_reason = 'before_submit_canceled', resolved_at = current_timestamp
-			WHERE attempt_id = 'attempt-1'`); err != nil {
-			t.Fatalf("release reserved attempt: %v", err)
-		}
-		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
-			(attempt_id, content_id, storage_data_set_id, created_at, updated_at)
-			VALUES ('attempt-2', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, source); err != nil {
-			t.Fatalf("insert unresolved attempt after release: %v", err)
-		}
-		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
-			SET status = 'attempted', attempted_at = current_timestamp
-			WHERE attempt_id = 'attempt-2'`)
-		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
-			SET extra_data_hex = 'abcd'
-			WHERE attempt_id = 'attempt-2'`)
-		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
-			SET submit_error = 'provider returned HTTP 500'
-			WHERE attempt_id = 'attempt-2'`)
-		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
-			SET status = 'attempted', attempted_at = current_timestamp,
-			    extra_data_hex = 'abcd', submit_error = ''
-			WHERE attempt_id = 'attempt-2'`)
-		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
-			SET status = 'attempted', attempted_at = current_timestamp,
-			    extra_data_hex = 'abcd', status_url = 'https://provider.example/status'
-			WHERE attempt_id = 'attempt-2'`)
-		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
-			SET status = 'attempted', attempted_at = current_timestamp,
-			    extra_data_hex = 'abcd', transaction_id = '0xabc'
-			WHERE attempt_id = 'attempt-2'`)
-		if _, err := db.Exec(`UPDATE storage_commit_attempts
-			SET status = 'attempted', attempted_at = current_timestamp,
-			    extra_data_hex = 'abcd', transaction_id = '0xabc',
-			    status_url = 'https://provider.example/status'
-			WHERE attempt_id = 'attempt-2'`); err != nil {
-			t.Fatalf("record complete commit submission: %v", err)
-		}
 
 		target := insertBaselineTestDataSet(t, db, bucketA, "202", 0, 2, false)
 		var replacementID int64

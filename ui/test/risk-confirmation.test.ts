@@ -33,6 +33,9 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'worker.tasks.retention': meta('Finished Work Retention'),
   'worker.tasks.provider_mutation_concurrency': meta('Remote Storage Concurrency'),
   'worker.tasks.destructive_mutation_concurrency': meta('Remote Cleanup Concurrency'),
+  'worker.tasks.commit_max_pieces': meta('Registration Size'),
+  'worker.tasks.commit_max_wait': meta('Registration Wait'),
+  'worker.tasks.commit_max_backlog': meta('Registration Backlog'),
 }
 
 function meta(label: string): SettingsFieldMetadata {
@@ -78,6 +81,9 @@ function baseConfig(): SettingsEditableConfig {
         retention: '168h0m0s',
         provider_mutation_concurrency: 4,
         destructive_mutation_concurrency: 2,
+        commit_max_pieces: 32,
+        commit_max_wait: '30s',
+        commit_max_backlog: 256,
       },
     },
     logging: {
@@ -158,6 +164,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.worker.tasks.retention = '336h0m0s'
   next.worker.tasks.provider_mutation_concurrency = 6
   next.worker.tasks.destructive_mutation_concurrency = 3
+  next.worker.tasks.commit_max_pieces = 64
 
   const changes = collectSettingsRiskChanges(initial, next, {}, metadata)
 
@@ -191,6 +198,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['worker.tasks.retention', 'Finished Work Retention', '168h0m0s', '336h0m0s', 'medium'],
       ['worker.tasks.provider_mutation_concurrency', 'Remote Storage Concurrency', '4', '6', 'medium'],
       ['worker.tasks.destructive_mutation_concurrency', 'Remote Cleanup Concurrency', '2', '3', 'medium'],
+      ['worker.tasks.commit_max_pieces', 'Registration Size', '32', '64', 'medium'],
     ]
   )
   assert.deepEqual([...new Set(changes.map(classifySettingsRisk))], ['review'])

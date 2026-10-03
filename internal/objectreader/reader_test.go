@@ -234,7 +234,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	contentID := bindReaderPrimaryCommittedUpload(t, db, repos, version.VersionID, pieceCID, "https://primary.example/piece")
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		ContentID:    contentID,
 		CopyIndex:    1,
 		PieceCID:     pieceCID,
@@ -848,7 +848,7 @@ func acceptReaderVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repos
 	}}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
@@ -896,7 +896,7 @@ func bindReaderPrimaryCommittedUpload(t *testing.T, db *bun.DB, repos *repositor
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,

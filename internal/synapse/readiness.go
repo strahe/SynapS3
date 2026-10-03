@@ -635,3 +635,13 @@ func (c *sdkReadinessClient) Payments() readinessPayments { return c.client.Paym
 func (c *sdkReadinessClient) Storage() readinessStorage { return c.client.Storage() }
 
 func (c *sdkReadinessClient) Close() error { return c.client.Close() }
+
+// LegacyPieceStorageIDLimit returns the first data set ID of the network's
+// compact piece layout, or zero for a network without one.
+func LegacyPieceStorageIDLimit(network string) uint64 {
+	selected, ok := chainForReadinessNetwork(network)
+	if !ok {
+		return 0
+	}
+	return selected.LegacyPieceStorageIDLimit()
+}

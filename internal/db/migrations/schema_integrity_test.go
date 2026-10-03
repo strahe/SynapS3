@@ -66,7 +66,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 	for _, table := range []string{
 		"s3_accounts", "buckets", "bucket_replica_slots", "objects", "object_versions", "object_cache", "object_deletions",
 		"multipart_uploads", "multipart_parts", "storage_contents", "storage_data_sets",
-		"storage_copies", "storage_commit_attempts", "storage_replacements",
+		"storage_copies", "storage_commit_requests", "storage_commit_request_pieces", "storage_replacements",
 		"storage_pull_attempts", "storage_replacement_items", "storage_cleanup_copies", "wallet_operations", "tasks",
 		"observability_collection_states", "observability_provider_states", "observability_data_set_states", "provider_profiles", "provider_tier_snapshots", "provider_upload_speed_tests",
 		"task_payloads", "storage_data_set_terminations",
@@ -85,7 +85,11 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		{"storage_copies", "content_size"},
 		{"storage_copies", "storage_data_set_id"},
 		{"storage_copies", "ingress_bytes_transferred"},
-		{"storage_commit_attempts", "attempt_id"},
+		{"storage_commit_requests", "request_id"},
+		{"storage_commit_requests", "first_sent_at"},
+		{"storage_commit_request_pieces", "position"},
+		{"storage_copies", "commit_request_id"},
+		{"storage_copies", "commit_position"},
 		{"storage_pull_attempts", "attempt_id"},
 		{"storage_pull_attempts", "source_piece_cid"},
 		{"storage_contents", "content_size"},
@@ -105,8 +109,9 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		"idx_tasks_pending",
 		"idx_tasks_recovery",
 		"idx_tasks_gc",
-		"idx_storage_copies_commit_ready",
-		"idx_storage_commit_attempts_unresolved_copy",
+		"idx_storage_copies_commit_request",
+		"idx_storage_commit_requests_data_set_status",
+		"idx_storage_commit_requests_task",
 		"idx_storage_copies_ingress_content",
 		"idx_storage_data_sets_bucket_provider_active",
 		"idx_storage_replacements_active_bucket_slot",
@@ -120,6 +125,8 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 	for _, index := range []string{
 		"idx_storage_data_sets_replica_slot",
 		"idx_storage_replacements_replica_slot",
+		"idx_storage_copies_commit_ready",
+		"idx_storage_copies_confirmed_attempt",
 	} {
 		if exists, err := indexExists(t.Context(), db, index); err != nil || exists {
 			t.Errorf("removed index %s exists=%t err=%v", index, exists, err)
@@ -147,6 +154,9 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		{"storage_copies", "commit_attention_code"},
 		{"storage_copies", "commit_attention_at"},
 		{"storage_copies", "is_new_data_set"},
+		// A copy names its commit request; the signed request lives there.
+		{"storage_copies", "commit_extra_data_hex"},
+		{"storage_copies", "confirmed_attempt_id"},
 		// Pull identity is a ledger row now, not five nullable copy columns.
 		{"storage_copies", "pull_request_id"},
 		{"storage_copies", "pull_source_provider_id"},
@@ -207,13 +217,14 @@ func TestInitialSchemaTaskOwnerForeignKeysAreRestrictive(t *testing.T) {
 		t.Fatalf("create initial schema: %v", err)
 	}
 	want := map[string]map[string]bool{
-		"buckets":              {"durability_task_id": false},
-		"object_cache":         {"cache_active_task_id": false},
-		"storage_contents":     {"cleanup_task_id": false},
-		"storage_data_sets":    {"ensure_task_id": false, "retirement_task_id": false},
-		"storage_copies":       {"active_task_id": false},
-		"storage_replacements": {"task_id": false},
-		"wallet_operations":    {"task_id": false},
+		"buckets":                 {"durability_task_id": false},
+		"object_cache":            {"cache_active_task_id": false},
+		"storage_contents":        {"cleanup_task_id": false},
+		"storage_data_sets":       {"ensure_task_id": false, "retirement_task_id": false},
+		"storage_copies":          {"active_task_id": false},
+		"storage_commit_requests": {"task_id": false},
+		"storage_replacements":    {"task_id": false},
+		"wallet_operations":       {"task_id": false},
 	}
 	for table, columns := range want {
 		rows, err := db.Query(`SELECT "from", "table", on_delete FROM pragma_foreign_key_list(?)`, table)
@@ -405,7 +416,7 @@ func TestValidateCurrentSchemaRejectsObsoleteCommitLedgerShape(t *testing.T) {
 		if err := ValidateCurrentSchema(ctx, db); err != nil {
 			t.Fatalf("validate current schema: %v", err)
 		}
-		if _, err := db.ExecContext(ctx, `ALTER TABLE storage_commit_attempts RENAME COLUMN status_url TO submission_json`); err != nil {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE storage_commit_requests RENAME COLUMN status_url TO submission_json`); err != nil {
 			t.Fatalf("simulate obsolete commit ledger: %v", err)
 		}
 		if err := ValidateCurrentSchema(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {

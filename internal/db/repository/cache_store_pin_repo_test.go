@@ -65,7 +65,7 @@ func TestUnfinishedStoreProtectsCacheAfterMinimumDurability(t *testing.T) {
 		t.Fatalf("copies = %#v, err=%v", copies, err)
 	}
 	firstPieceID := onChainID(t, "71")
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		StorageCopyID: copies[0].ID, ContentID: content.ID, CopyIndex: 0,
 		PieceCID: "bafk2bzacecpinnedsource", PieceID: &firstPieceID, RetrievalURL: "https://source.example/piece",
 	})
@@ -95,7 +95,7 @@ func TestUnfinishedStoreProtectsCacheAfterMinimumDurability(t *testing.T) {
 		t.Fatalf("final deletion authorization = %v, want ineligible", err)
 	}
 	secondPieceID := onChainID(t, "72")
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		StorageCopyID: copies[1].ID, ContentID: content.ID, CopyIndex: 1,
 		PieceCID: "bafk2bzacecpinnedsource", PieceID: &secondPieceID, RetrievalURL: "https://target.example/piece",
 	})

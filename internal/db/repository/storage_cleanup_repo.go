@@ -330,8 +330,12 @@ func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool
 				WHERE cache_task.id = object_cache.cache_active_task_id
 				  AND cache_task.status IN (?, ?)
 			)`, true, model.TaskStatusPending, model.TaskStatusRunning)},
-		{"open commit attempts", db.NewSelect().Model((*storagecommit.Attempt)(nil)).
-			Where("content_id = ? AND resolved_at IS NULL", contentID)},
+		{"open storage registrations", db.NewSelect().Model((*model.StorageCopy)(nil)).
+			Join("JOIN storage_commit_requests AS commit_request ON commit_request.request_id = storage_copy.commit_request_id").
+			Where("storage_copy.content_id = ?", contentID).
+			Where("commit_request.status NOT IN (?)", bun.List([]storagecommit.RequestStatus{
+				storagecommit.RequestStatusConfirmed, storagecommit.RequestStatusAbandoned,
+			}))},
 		{"copy tasks", db.NewSelect().Model((*model.StorageCopy)(nil)).
 			Where("content_id = ?", contentID).
 			Where(`EXISTS (

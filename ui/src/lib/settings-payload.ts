@@ -54,6 +54,9 @@ export function buildSettingsPayload(
     tasks.provider_mutation_concurrency = form.worker.tasks.provider_mutation_concurrency
   if (include('worker.tasks.destructive_mutation_concurrency'))
     tasks.destructive_mutation_concurrency = form.worker.tasks.destructive_mutation_concurrency
+  if (include('worker.tasks.commit_max_pieces')) tasks.commit_max_pieces = form.worker.tasks.commit_max_pieces
+  if (include('worker.tasks.commit_max_wait')) tasks.commit_max_wait = form.worker.tasks.commit_max_wait
+  if (include('worker.tasks.commit_max_backlog')) tasks.commit_max_backlog = form.worker.tasks.commit_max_backlog
   payload.worker = { tasks }
 
   payload.logging = {}

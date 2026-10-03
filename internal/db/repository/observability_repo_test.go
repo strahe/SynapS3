@@ -248,7 +248,7 @@ func TestOverviewStorageStatesKeepsReadableOlderGenerationOnlyWhileReferenced(t 
 		t.Fatalf("copies = %#v, err=%v", copies, err)
 	}
 	pieceID := onChainID(t, "51")
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		StorageCopyID: copies[0].ID, ContentID: content.ID, CopyIndex: 0,
 		PieceCID: "bafk2bzacecoverviewold", PieceID: &pieceID, RetrievalURL: "https://old.example/piece",
 	})

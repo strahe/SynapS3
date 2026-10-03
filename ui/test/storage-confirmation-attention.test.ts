@@ -4,8 +4,6 @@ import { storageConfirmationAttentionView } from '../src/lib/storage-confirmatio
 
 test('known confirmation reasons use operator-facing labels', () => {
   const cases = [
-    ['attempt_only_ambiguous', 'Submission result unknown'],
-    ['unattributed_piece', 'Piece ownership unknown'],
     ['submission_mismatch', 'Confirmation does not match'],
     ['data_set_unavailable', 'Data set is unavailable'],
     ['confirmation_timeout', 'Confirmation timed out'],

@@ -43,6 +43,9 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | `SYNAPS3_WORKER_TASKS_RETENTION` | `worker.tasks.retention` |
 | `SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY` | `worker.tasks.provider_mutation_concurrency` |
 | `SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY` | `worker.tasks.destructive_mutation_concurrency` |
+| `SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES` | `worker.tasks.commit_max_pieces` |
+| `SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT` | `worker.tasks.commit_max_wait` |
+| `SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG` | `worker.tasks.commit_max_backlog` |
 | `SYNAPS3_LOGGING_LEVEL` | `logging.level` |
 | `SYNAPS3_LOGGING_FORMAT` | `logging.format` |
 | `SYNAPS3_LOGGING_S3_ACCESS_ENABLED` | `logging.s3_access.enabled` |

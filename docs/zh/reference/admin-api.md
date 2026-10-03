@@ -263,9 +263,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 存储确认处理
 
-存储提供方没有确认存储登记时，SynapS3 会在链上核对该 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方拒绝该请求时会稍后再试，登记前已被存储提供方删除的 piece 会重新上传。链上记录显示该请求登记到了其他 copy，或该 copy 存在相互冲突的历史请求且当前请求未登记时，确认会停止。
+一次存储登记用一个签名请求把写入同一 data set 的一个或多个 piece 登记上链。存储提供方拒绝该登记、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对这些 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方报告该请求仍在处理时，SynapS3 会继续等待。存储提供方拒绝该请求时会稍后再试；登记前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他 data set 时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。
 
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储确认，也包括超过 15 分钟仍未登记、SynapS3 仍在继续尝试的确认：受影响的 copy、所属任务（`task_id`）、data set、attempt、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、时间和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的确认。对已停止的确认，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试会先重新核对链上记录，再决定是否提交，但不会在相互冲突的历史请求之间做选择。
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储登记，也包括超过 15 分钟仍未登记、SynapS3 仍在继续尝试的登记：登记（`request_id`）、所属任务（`task_id`）、存储提供方和 data set、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的登记。对已停止的登记，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试只会重新核对链上记录，其中的 piece 已在链上时才完成该登记，不会发送任何请求。
 
 ## 任务
 
@@ -278,7 +278,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
 | `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。存储确认需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `copy_id`、`attempt_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_cid`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。登记需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
 `status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
 

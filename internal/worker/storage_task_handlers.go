@@ -42,9 +42,6 @@ const (
 	// doubling with each further request up to 30 minutes.
 	unobservedOutcomeBaseDelay = time.Minute
 	unobservedOutcomeMaxDelay  = 30 * time.Minute
-	// Resolving a commit attempt wakes the head of its data set's queue; this
-	// delay only covers a missed wake.
-	commitCapacityBackstop = 5 * time.Minute
 )
 
 type dataSetCreationCheckpoint struct {
@@ -69,16 +66,6 @@ type storeCheckpoint struct {
 	IngressAttempt     int       `json:"ingress_attempt,omitempty"`
 }
 
-// commitCheckpoint records the requests sent again for one commit attempt.
-// The first request is the attempt itself and needs no checkpoint.
-type commitCheckpoint struct {
-	AttemptID string `json:"attempt_id"`
-	// Sends counts every request carrying the attempt's signed extra data,
-	// the first one included.
-	Sends      int       `json:"sends"`
-	LastSentAt time.Time `json:"last_sent_at"`
-}
-
 type pullCheckpoint struct {
 	AttemptedAt time.Time `json:"attempted_at"`
 	// AttemptID names the ledger row this request was recorded in, so recovery
@@ -89,6 +76,9 @@ type pullCheckpoint struct {
 	SourceDataSetID    string `json:"source_data_set_id"`
 	SourcePieceID      string `json:"source_piece_id"`
 	SourceRetrievalURL string `json:"source_retrieval_url"`
+	// CommitRequestID names the signed request the Pull hands the provider,
+	// recorded with the pull attempt.
+	CommitRequestID    string `json:"commit_request_id"`
 	CommitExtraDataHex string `json:"commit_extra_data_hex"`
 }
 
@@ -253,7 +243,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 				if err != nil {
 					return err
 				}
-				if copyRow != nil && copyRow.ActiveTaskID == nil {
+				if copyRow != nil && copyRow.WorkTaskID() == nil && copyRow.Status == model.StorageCopyStatusPending {
 					if err := h.enqueueInitialCopyTask(ctx, repos, copyRow.ID, model.TaskTypeStorageTransferPlan); err != nil && !errors.Is(err, repository.ErrConflict) {
 						return err
 					}
@@ -861,8 +851,15 @@ func (h *TaskHandlers) continueDataSetCopies(ctx context.Context, repos *reposit
 	wakeIDs := make([]int64, 0, len(copies))
 	for i := range copies {
 		copyRow := &copies[i]
-		if copyRow.ActiveTaskID != nil {
-			wakeIDs = append(wakeIDs, *copyRow.ActiveTaskID)
+		if taskID := copyRow.WorkTaskID(); taskID != nil {
+			wakeIDs = append(wakeIDs, *taskID)
+			continue
+		}
+		if copyRow.Status != model.StorageCopyStatusPending {
+			// A transferred copy outside any request joins one.
+			if err := h.queueCommit(ctx, repos, copyRow.ID); err != nil {
+				return err
+			}
 			continue
 		}
 		if err := h.enqueueInitialCopyTask(ctx, repos, copyRow.ID, model.TaskTypeStorageTransferPlan); err != nil && !errors.Is(err, repository.ErrConflict) {
@@ -913,7 +910,7 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 			return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
 		}
 		if copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
-			return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageCommit, "Storage copy is ready to register")
+			return h.handOffToCommit(input, execution.ID())
 		}
 		binding, err := h.deps.Repositories.Contents.GetDataSetBindingByID(ctx, copyRow.StorageDataSetID)
 		if err != nil {
@@ -929,7 +926,9 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 		if err != nil {
 			return h.retryCopyTask(execution, input, copyRow, err, "copy_owner_load_failed")
 		}
-		if unreferenced {
+		// A signed member is transferred again whatever names its bytes: its
+		// request can only be sent whole.
+		if unreferenced && !copyRow.CommitSealed() {
 			return h.completeCopyTask(input, execution.ID(), "Storage copy is no longer required")
 		}
 		//exhaustive:enforce
@@ -1080,7 +1079,7 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 		return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
 	}
 	if copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
-		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageCommit, "Storage copy is ready to register")
+		return h.handOffToCommit(input, execution.ID())
 	}
 	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[storeCheckpoint](execution)
 	if err != nil {
@@ -1115,7 +1114,7 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 			return h.waitForStoreStatus(checkpoint, state, checkErr)
 		}
 		if state == synapse.ParkedPieceReady {
-			return h.finishPieceTransfer(ctx, execution, input, copyRow, target, pieceCID)
+			return h.finishPieceTransfer(execution, input, copyRow, target, pieceCID, "")
 		}
 		if execution.RetryWillFail() {
 			return taskengine.Fail(errors.New("storage transfer retry limit reached"), "store_retry_limit", nil)
@@ -1150,7 +1149,7 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking storage transfer", nil)
 		}
 	}
-	if !hasCheckpoint {
+	if !hasCheckpoint && !copyRow.CommitSealed() {
 		backlogged, err := h.commitBacklogFull(ctx, copyRow)
 		if err != nil {
 			return h.retryStoreNotStarted(execution, err)
@@ -1211,7 +1210,7 @@ func (h *TaskHandlers) storeWithProviderSlot(
 			return h.waitForStoreStatus(previous, state, checkErr)
 		}
 		if state == synapse.ParkedPieceReady {
-			return h.finishPieceTransfer(ctx, execution, input, copyRow, target, pieceCID)
+			return h.finishPieceTransfer(execution, input, copyRow, target, pieceCID, "")
 		}
 		if execution.RetryWillFail() {
 			return taskengine.Fail(errors.New("storage transfer retry limit reached"), "store_retry_limit", nil)
@@ -1264,7 +1263,7 @@ func (h *TaskHandlers) storeWithProviderSlot(
 			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 				return taskengine.Fail(err, "store_checkpoint_write_failed", nil)
 			}
-			return h.finishPieceTransfer(ctx, execution, input, copyRow, target, pieceInfo.CIDv2)
+			return h.finishPieceTransfer(execution, input, copyRow, target, pieceInfo.CIDv2, "")
 		}
 		if state != synapse.ParkedPieceMissing {
 			return h.retryStoreNotStarted(execution, fmt.Errorf("unexpected storage provider state %q", state))
@@ -1338,7 +1337,7 @@ func (h *TaskHandlers) storeWithProviderSlot(
 		return taskengine.Fail(err, "store_result_invalid", nil)
 	}
 	progress.Flush(content.ContentSize, true)
-	return h.finishPieceTransfer(ctx, execution, input, copyRow, target, stored.PieceCID)
+	return h.finishPieceTransfer(execution, input, copyRow, target, stored.PieceCID, "")
 }
 
 func (h *TaskHandlers) recoverStore(
@@ -1358,7 +1357,7 @@ func (h *TaskHandlers) recoverStore(
 	}
 	state, findErr := h.storePieceState(ctx, target, checkpoint, pieceCID)
 	if findErr == nil && state == synapse.ParkedPieceReady {
-		return h.finishPieceTransfer(ctx, execution, input, copyRow, target, pieceCID)
+		return h.finishPieceTransfer(execution, input, copyRow, target, pieceCID, "")
 	}
 	if findErr == nil && state == synapse.ParkedPieceMissing {
 		if execution.RetryWillFail() {
@@ -1466,7 +1465,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
 	}
 	if copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
-		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageCommit, "Storage copy is ready to register")
+		return h.handOffToCommit(input, execution.ID())
 	}
 	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[pullCheckpoint](execution)
 	if err != nil {
@@ -1483,12 +1482,14 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		return h.copyContextFailure(execution, input, copyRow, err, !hasCheckpoint)
 	}
 	if !hasCheckpoint {
-		backlogged, err := h.commitBacklogFull(ctx, copyRow)
-		if err != nil {
-			return h.retryCopyTask(execution, input, copyRow, err, "commit_backlog_check_failed")
-		}
-		if backlogged {
-			return waitForCommitBacklog()
+		if !copyRow.CommitSealed() {
+			backlogged, err := h.commitBacklogFull(ctx, copyRow)
+			if err != nil {
+				return h.retryCopyTask(execution, input, copyRow, err, "commit_backlog_check_failed")
+			}
+			if backlogged {
+				return waitForCommitBacklog()
+			}
 		}
 		sources, err := h.deps.Repositories.Contents.ListReadableCommittedCopies(ctx, copyRow.ContentID)
 		if err != nil {
@@ -1502,11 +1503,8 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		if err != nil {
 			return h.failCopyTask(execution, input, copyRow, err, "source_identity_invalid")
 		}
-		extraHex, err := h.copyCommitExtraData(ctx, copyRow, target, pieceCID)
+		requestID, extraHex, newRequest, err := h.pullCommitRequest(ctx, copyRow, target, pieceCID)
 		if err != nil {
-			if errors.Is(err, storagecommit.ErrCommitRequestConflict) {
-				return taskengine.Fail(err, "pull_presign_failed", nil)
-			}
 			return h.retryCopyTask(execution, input, copyRow, err, "pull_presign_failed")
 		}
 		attemptID, err := newAttemptID()
@@ -1517,15 +1515,26 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			AttemptedAt: time.Now().UTC(), AttemptID: attemptID, PieceCID: source.PieceCID,
 			SourceProviderID: source.ProviderID.String(), SourceDataSetID: source.DataSetID.String(),
 			SourcePieceID: source.PieceID.String(), SourceRetrievalURL: source.RetrievalURL,
-			CommitExtraDataHex: extraHex,
+			CommitRequestID: requestID, CommitExtraDataHex: extraHex,
 		}
 		if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+			commitRequest := repository.CreatePullCommitRequestInput{RequestID: requestID, PieceCID: source.PieceCID, ExtraDataHex: extraHex}
+			if newRequest {
+				// The Pull's result wakes the request's task. Running before
+				// then would only find its piece still in transfer, and a wake
+				// that arrives while it runs is lost until the next backstop.
+				taskID, err := h.enqueueCommitTask(ctx, repos, requestID, time.Now().Add(storageDependencyWait))
+				if err != nil {
+					return err
+				}
+				commitRequest.TaskID = taskID
+			}
 			return repos.Contents.ReservePullRequest(ctx, repository.ReservePullRequestInput{
 				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(),
 				AttemptID:        checkpoint.AttemptID,
 				SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID,
 				SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL,
-				CommitExtraDataHex: checkpoint.CommitExtraDataHex,
+				CommitRequest: commitRequest,
 			})
 		}); err != nil {
 			return h.retryCopyTask(execution, input, copyRow, err, "pull_checkpoint_failed")
@@ -1538,7 +1547,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		}
 		status, statusErr := target.PieceStatus(ctx, pieceCID)
 		if statusErr == nil && status != nil && status.Exists {
-			return h.finishPieceTransferWithExtra(execution, input, copyRow, target, pieceCID, checkpoint.CommitExtraDataHex, checkpoint.AttemptID)
+			return h.finishPieceTransfer(execution, input, copyRow, target, pieceCID, checkpoint.AttemptID)
 		}
 		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	}
@@ -1574,341 +1583,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			return h.retryPullTask(execution, input, copyRow, checkpoint.AttemptID, err, "pull_request_failed")
 		}
 	}
-	return h.finishPieceTransferWithExtra(execution, input, copyRow, target, pieceCID, checkpoint.CommitExtraDataHex, checkpoint.AttemptID)
-}
-
-func (h *TaskHandlers) commitHandler() taskengine.Handler {
-	definition := copyDefinition(model.TaskTypeStorageCommit, h.retryLimit())
-	engineFailure := definition.CanManualRetry
-	// Retry runs in recover mode, which checks a stopped confirmation on chain
-	// again and sends nothing until the chain shows its request unused. A
-	// confirmation stops under the first attention code its attempt recorded,
-	// whatever stopped it later, so every known code must allow it.
-	definition.CanManualRetry = func(task *model.Task) bool {
-		return engineFailure(task) ||
-			task != nil && task.FailureReason != nil && storagecommit.AttentionCode(*task.FailureReason).Valid()
-	}
-	return taskHandler{
-		definition: definition,
-		execute: func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
-			return h.runCommit(ctx, execution, true)
-		},
-		recover: func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
-			return h.runCommit(ctx, execution, false)
-		},
-	}
-}
-
-func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execution, maySubmit bool) taskengine.Result {
-	input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)
-	if handled {
-		return result
-	}
-	if copyRow.Status == model.StorageCopyStatusCommitted {
-		return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
-	}
-	if copyRow.Status != model.StorageCopyStatusPieceReady && copyRow.Status != model.StorageCopyStatusCommitting {
-		return h.failCopyTask(execution, input, copyRow, errors.New("storage copy has no transferable piece"), "piece_not_ready")
-	}
-	binding, err := h.deps.Repositories.Contents.GetDataSetBindingByID(ctx, copyRow.StorageDataSetID)
-	if err != nil || binding == nil {
-		if err == nil {
-			err = repository.ErrNotFound
-		}
-		return h.retryCopyTask(execution, input, copyRow, err, "dataset_load_failed")
-	}
-	upload, err := h.deps.Repositories.Contents.GetByID(ctx, copyRow.ContentID)
-	if err != nil || upload == nil {
-		if err == nil {
-			err = repository.ErrNotFound
-		}
-		return h.retryCopyTask(execution, input, copyRow, err, "upload_load_failed")
-	}
-	if upload.PieceCID == nil || *upload.PieceCID == "" {
-		return h.failCopyTask(execution, input, copyRow, errors.New("storage upload has no piece identity"), "piece_identity_missing")
-	}
-	if copyRow.CommitAttemptedAt == nil && !maySubmit {
-		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage registration is ready", nil)
-	}
-	pieceCID, err := cid.Parse(*upload.PieceCID)
-	if err != nil {
-		return h.failCopyTask(execution, input, copyRow, err, "piece_identity_invalid")
-	}
-	target, err := h.openReadyDataSet(ctx, binding)
-	if err != nil {
-		if copyRow.CommitAttemptedAt != nil && copyRow.CommitAttemptID != nil {
-			advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents}
-			advanced, advanceErr := advancer.AdvanceUnavailable(ctx, *copyRow, *binding)
-			if advanceErr != nil {
-				return h.retryCopyTask(execution, input, copyRow, advanceErr, "commit_recovery_failed")
-			}
-			if advanced.State == storagecommit.AdvanceNeedsAttention {
-				if advanced.Continue && advanced.AttentionCode.Valid() {
-					return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
-				}
-				return taskengine.Fail(commitAttentionError(copyRow), commitAttentionFailureReason(advanced.AttentionCode), nil)
-			}
-		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
-	}
-	advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents, Nonces: h.deps.CommitNonces}
-	advanceInput := storagecommit.AdvanceInput{
-		Copy: *copyRow, Binding: *binding, Target: target,
-		Pieces: []storage.PieceInput{{PieceCID: pieceCID}}, RequireEligibleCopy: true,
-	}
-	attemptID := taskDerefString(copyRow.CommitAttemptID)
-	// A checkpoint left by an earlier attempt of this copy says nothing about
-	// this one, and one that cannot be read only loses the resend pacing.
-	if checkpoint, ok, decodeErr := taskengine.DecodeCheckpoint[commitCheckpoint](execution); ok && decodeErr == nil &&
-		attemptID != "" && checkpoint.AttemptID == attemptID {
-		advanceInput.Sent = storagecommit.SendHistory{Sends: checkpoint.Sends, LastSentAt: checkpoint.LastSentAt}
-	}
-	// A first submission or a resend contacts the provider, and only execute
-	// may do either.
-	sending := maySubmit && (copyRow.CommitAttemptedAt == nil || copyRow.CommitStatusURL == nil)
-	if maySubmit && attemptID != "" {
-		advanceInput.Resend = func(ctx context.Context, next storagecommit.SendHistory, effect func(context.Context) error) (bool, error) {
-			return execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, commitCheckpoint{
-				AttemptID: attemptID, Sends: next.Sends, LastSentAt: next.LastSentAt.UTC(),
-			}, nil, effect)
-		}
-	}
-	var advanced storagecommit.AdvanceResult
-	if sending {
-		err = execution.WithResource(ctx, taskengine.ResourceProviderMutation, func(ctx context.Context) error {
-			var advanceErr error
-			advanced, advanceErr = advancer.Advance(ctx, advanceInput)
-			return advanceErr
-		})
-	} else {
-		advanced, err = advancer.Advance(ctx, advanceInput)
-	}
-	if errors.Is(err, taskengine.ErrResourceBusy) {
-		return taskengine.ResourceWait("Waiting for other storage operations to finish")
-	}
-	if err != nil {
-		if advanced.State == storagecommit.AdvancePending || advanced.State == storagecommit.AdvanceSubmitted {
-			if recordErr, ok := errors.AsType[*storagecommit.SubmitFailureRecordError](err); ok {
-				h.deps.Logger.Warn("storage registration submission reply could not be recorded",
-					"task_id", execution.ID(), "copy_id", copyRow.ID, "attempt_id", advanced.AttemptID,
-					"error", synapse.ErrorSummary(recordErr.Err))
-			}
-			h.deps.Logger.Warn("storage registration submission failed",
-				"task_id", execution.ID(), "copy_id", copyRow.ID, "content_id", copyRow.ContentID,
-				"provider_id", copyRow.ProviderID, "storage_data_set_id", copyRow.StorageDataSetID,
-				"attempt_id", advanced.AttemptID, "error", synapse.ErrorSummary(err))
-			return taskengine.SuspendWithError(model.TaskResumeModeRecover, commitPollDelay(advanced), "provider_confirmation",
-				"Checking storage registration", synapse.SummarizedError(err), nil)
-		}
-		return h.retryCopyTask(execution, input, copyRow, err, "commit_advance_failed")
-	}
-	//exhaustive:enforce
-	switch advanced.State {
-	case storagecommit.AdvanceWaitingCapacity:
-		return taskengine.Suspend(model.TaskResumeModeRecover, commitCapacityBackstop, "capacity", commitCapacityMessage(advanced.AttentionHeld), nil)
-	case storagecommit.AdvanceSubmitted, storagecommit.AdvancePending:
-		return taskengine.Suspend(model.TaskResumeModeRecover, commitPollDelay(advanced), "provider_confirmation", "Waiting for storage registration", nil)
-	case storagecommit.AdvanceResendDue:
-		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Sending storage registration again", nil)
-	case storagecommit.AdvanceDeferred:
-		return h.deferCommit(ctx, execution, input, copyRow, target, pieceCID, advanced)
-	case storagecommit.AdvanceResendRefused:
-		return h.resendRefused(ctx, execution, input, copyRow, target, pieceCID, advanced)
-	case storagecommit.AdvanceRejected:
-		cause := advanced.Cause
-		if cause == nil {
-			cause = synapse.ErrProviderTransactionRejected
-		}
-		return h.retryResolvedCopyTask(execution, input, copyRow, cause, "commit_rejected")
-	case storagecommit.AdvanceNeedsAttention:
-		if advanced.Continue && advanced.AttentionCode.Valid() {
-			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
-		}
-		return taskengine.Fail(commitAttentionError(copyRow), commitAttentionFailureReason(advanced.AttentionCode), nil)
-	case storagecommit.AdvanceReleased:
-		if !advanced.ReleaseReason.Valid() {
-			return taskengine.Fail(fmt.Errorf("storage registration was released with unknown reason %q", advanced.ReleaseReason), "commit_release_reason_unknown", nil)
-		}
-		return h.retryResolvedCopyTask(execution, input, copyRow, errors.New("storage registration was released"), string(advanced.ReleaseReason))
-	case storagecommit.AdvanceConfirmed:
-		if advanced.Confirmation == nil || len(advanced.Confirmation.PieceIDs) != 1 {
-			return taskengine.Fail(errors.New("storage confirmation has no unique piece identity"), "commit_confirmation_invalid", nil)
-		}
-		pieceID := idtypes.OnChainIDFromSDK(advanced.Confirmation.PieceIDs[0])
-		retrievalURL := target.PieceURL(pieceCID)
-		extraHex := advanced.ExtraDataHex
-		return taskengine.Complete("Storage copy registered", func(ctx context.Context, repos *repository.Repositories) error {
-			if err := repos.Contents.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-				StorageCopyID: copyRow.ID, RequireEligibleCopy: true, ContentID: copyRow.ContentID,
-				CopyIndex: copyRow.CopyIndex, PieceCID: pieceCID.String(), PieceID: &pieceID,
-				RetrievalURL: retrievalURL, CommitExtraDataHex: extraHex,
-				CommitTransactionID: advanced.Confirmation.TransactionID, CommitAttemptID: advanced.AttemptID,
-				CommitConfirmedTransactionID: advanced.Confirmation.ConfirmedTransactionID,
-				ProvenByNonce:                advanced.ProvenByNonce,
-			}); err != nil {
-				return err
-			}
-			if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, execution.ID()); err != nil {
-				return err
-			}
-			if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
-				failed, err := repos.Contents.ReopenFailedIngressForPull(ctx, copyRow.ContentID)
-				if err != nil {
-					return err
-				}
-				for _, failedCopy := range failed {
-					if err := h.enqueueInitialCopyTask(ctx, repos, failedCopy.ID, model.TaskTypeStorageTransferPlan); err != nil {
-						return err
-					}
-				}
-			}
-			// The content is readable once this copy commits, independently of
-			// which versions currently point at it.
-			if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-				ContentID: copyRow.ContentID, BucketID: copyRow.BucketID,
-			}); err != nil {
-				return err
-			}
-			if err := h.wakePeerPullPlans(ctx, repos, copyRow.ContentID); err != nil {
-				return err
-			}
-			_, refs, err := repos.Contents.FinalizeUploadIfTargetCopiesMet(ctx, repository.NewFinalizeUploadInput(copyRow.ContentID))
-			if err != nil {
-				return err
-			}
-			return h.enqueueAfterUploadEvictions(ctx, repos, refs)
-		})
-	default:
-		return taskengine.Fail(fmt.Errorf("unknown storage commit result %q", advanced.State), "commit_result_invalid", nil)
-	}
-}
-
-// deferCommit waits out a submission that provably never reached the chain.
-// A provider that refused it may have deleted the piece, as Curio does with an
-// upload that joins no data set within hours; the copy is then transferred
-// again under the request it already signed.
-func (h *TaskHandlers) deferCommit(
-	ctx context.Context,
-	execution taskengine.Execution,
-	input storagepipeline.CopyGenerationInput,
-	copyRow *model.StorageCopy,
-	target synapse.DataSetTarget,
-	pieceCID cid.Cid,
-	advanced storagecommit.AdvanceResult,
-) taskengine.Result {
-	if advanced.ReleaseReason != storagecommit.ReleaseProviderRejected {
-		return taskengine.SuspendWithError(model.TaskResumeModeExecute, advanced.RetryAfter, "dataset",
-			"Checking the storage service before registering", synapse.SummarizedError(advanced.Cause), nil)
-	}
-	if h.providerDroppedPiece(ctx, target, pieceCID) {
-		return h.transferAgain(execution, input, copyRow, nil)
-	}
-	h.deps.Logger.Warn("storage provider refused the registration",
-		"task_id", execution.ID(), "copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
-		"storage_data_set_id", copyRow.StorageDataSetID, "retry_after", advanced.RetryAfter,
-		"error", synapse.ErrorSummary(advanced.Cause))
-	return taskengine.SuspendWithError(model.TaskResumeModeExecute, advanced.RetryAfter, storagecommit.ProviderRejectedWaitReason,
-		"Storage provider refused the registration; trying again later", synapse.SummarizedError(advanced.Cause), nil)
-}
-
-// resendRefused handles a provider that refused to send an unacknowledged
-// request again. Once the provider has dropped the piece, the request cannot
-// land from it, so the attempt is released and the piece transferred again
-// under the same request. Any earlier send can still land only with that
-// request's nonce, which the next attempt reads before sending.
-func (h *TaskHandlers) resendRefused(
-	ctx context.Context,
-	execution taskengine.Execution,
-	input storagepipeline.CopyGenerationInput,
-	copyRow *model.StorageCopy,
-	target synapse.DataSetTarget,
-	pieceCID cid.Cid,
-	advanced storagecommit.AdvanceResult,
-) taskengine.Result {
-	if h.providerDroppedPiece(ctx, target, pieceCID) {
-		return h.transferAgain(execution, input, copyRow, func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Contents.ReleaseCommitAttempt(ctx, storagecommit.ReleaseInput{
-				Copy: storagecommit.CopyIdentity{
-					StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID,
-					CopyIndex: copyRow.CopyIndex, StorageDataSetID: copyRow.StorageDataSetID,
-				},
-				AttemptID: advanced.AttemptID, Reason: storagecommit.ReleaseProviderPieceMissing,
-				Unacknowledged: true, Now: time.Now(),
-			})
-		})
-	}
-	h.deps.Logger.Warn("storage provider refused to resend the registration",
-		"task_id", execution.ID(), "copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
-		"storage_data_set_id", copyRow.StorageDataSetID, "attempt_id", advanced.AttemptID,
-		"error", synapse.ErrorSummary(advanced.Cause))
-	return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation",
-		"Checking storage registration", synapse.SummarizedError(advanced.Cause), nil)
-}
-
-// providerDroppedPiece reports whether the provider positively no longer holds
-// the piece, as Curio does with an upload that joins no data set within hours.
-func (h *TaskHandlers) providerDroppedPiece(ctx context.Context, target synapse.DataSetTarget, pieceCID cid.Cid) bool {
-	if h.deps.ParkedPieces == nil {
-		return false
-	}
-	state, err := h.deps.ParkedPieces.FindParkedPiece(ctx, target.ServiceURL(), pieceCID)
-	return err == nil && state == synapse.ParkedPieceMissing
-}
-
-// transferAgain sends a copy whose piece the provider dropped back to
-// transfer, keeping its signed request. release runs first in the same
-// settlement when an attempt still holds the copy.
-func (h *TaskHandlers) transferAgain(
-	execution taskengine.Execution,
-	input storagepipeline.CopyGenerationInput,
-	copyRow *model.StorageCopy,
-	release func(context.Context, *repository.Repositories) error,
-) taskengine.Result {
-	return taskengine.Complete("Storage provider no longer holds the piece; transferring it again",
-		func(ctx context.Context, repos *repository.Repositories) error {
-			if release != nil {
-				if err := release(ctx, repos); err != nil {
-					return err
-				}
-			}
-			if err := repos.Contents.ReturnPieceReadyCopyToTransfer(ctx, repository.ReturnPieceReadyCopyInput{
-				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(),
-			}); err != nil {
-				return err
-			}
-			return h.enqueueSuccessorCopyTask(ctx, repos, input, execution.ID(), model.TaskTypeStorageTransferPlan)
-		})
-}
-
-// commitPollDelay is how long a pending registration waits before it is
-// checked again.
-func commitPollDelay(advanced storagecommit.AdvanceResult) time.Duration {
-	if advanced.RetryAfter > 0 {
-		return advanced.RetryAfter
-	}
-	return storagePollInterval
-}
-
-// commitAttentionError names why a storage registration stopped, including the
-// provider's reply when the submission failed there.
-func commitAttentionError(copyRow *model.StorageCopy) error {
-	if copyRow.CommitSubmitError != nil && *copyRow.CommitSubmitError != "" {
-		return fmt.Errorf("storage registration requires attention: %s", *copyRow.CommitSubmitError)
-	}
-	return errors.New("storage registration requires attention")
-}
-
-// commitCapacityMessage explains a registration waiting for its storage
-// service, naming earlier registrations that hold it while they are delayed.
-func commitCapacityMessage(attentionHeld int) string {
-	switch {
-	case attentionHeld == 1:
-		return "Waiting to register storage; 1 earlier registration for this storage service is delayed"
-	case attentionHeld > 1:
-		return fmt.Sprintf("Waiting to register storage; %d earlier registrations for this storage service are delayed", attentionHeld)
-	default:
-		return "Waiting to register storage"
-	}
+	return h.finishPieceTransfer(execution, input, copyRow, target, pieceCID, checkpoint.AttemptID)
 }
 
 func copyDefinition(taskType model.TaskType, retryLimit *int) taskengine.Definition {
@@ -1956,7 +1631,7 @@ func (h *TaskHandlers) authorizeCopyTask(
 				if authorizeErr != nil {
 					return authorizeErr
 				}
-				if copyRow.CommitAttemptedAt != nil {
+				if copyRow.CommitDecidedByRequest() {
 					return nil
 				}
 				return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
@@ -1985,6 +1660,12 @@ func (h *TaskHandlers) completeCopyTask(input storagepipeline.CopyGenerationInpu
 }
 
 func (h *TaskHandlers) enqueueInitialCopyTask(ctx context.Context, repos *repository.Repositories, copyID int64, taskType model.TaskType) error {
+	return h.enqueueCopyTaskAt(ctx, repos, copyID, taskType, time.Time{})
+}
+
+// enqueueCopyTaskAt starts a new generation of copy work, runnable from
+// availableAt (now when zero).
+func (h *TaskHandlers) enqueueCopyTaskAt(ctx context.Context, repos *repository.Repositories, copyID int64, taskType model.TaskType, availableAt time.Time) error {
 	if h.taskService == nil {
 		return errors.New("task service is unavailable")
 	}
@@ -1996,6 +1677,7 @@ func (h *TaskHandlers) enqueueInitialCopyTask(ctx context.Context, repos *reposi
 	taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 		Type: taskType, IdempotencyKey: copyTaskKey(taskType, copyID, generation), Input: input,
 		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyID, 10),
+		AvailableAt: availableAt,
 	})
 	if err != nil {
 		return err
@@ -2039,6 +1721,39 @@ func (h *TaskHandlers) enqueueDataSetEnsure(ctx context.Context, repos *reposito
 	return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, taskRow.ID)
 }
 
+// pullCommitRequest returns the signed request a Pull hands the target
+// provider. A signed member pulled again carries the request it already
+// belongs to; any other copy signs a new single-piece request.
+func (h *TaskHandlers) pullCommitRequest(
+	ctx context.Context,
+	copyRow *model.StorageCopy,
+	target synapse.DataSetTarget,
+	pieceCID cid.Cid,
+) (requestID, extraHex string, created bool, err error) {
+	if copyRow.CommitRequestID != nil {
+		request, err := h.deps.Repositories.Contents.GetCommitRequest(ctx, *copyRow.CommitRequestID)
+		if err != nil {
+			return "", "", false, err
+		}
+		if request.ExtraDataHex == nil || request.PieceCount != 1 || request.Status.Terminal() {
+			return "", "", false, errors.New("storage copy belongs to a registration a Pull cannot send")
+		}
+		return request.RequestID, *request.ExtraDataHex, false, nil
+	}
+	extraData, err := target.PresignForCommit(ctx, []storage.PieceInput{{PieceCID: pieceCID}})
+	if err != nil {
+		return "", "", false, err
+	}
+	if _, err := storagecommit.ExtraDataNonce(extraData); err != nil {
+		return "", "", false, fmt.Errorf("validating signed storage registration: %w", err)
+	}
+	requestID, err = storagecommit.NewRequestID()
+	if err != nil {
+		return "", "", false, err
+	}
+	return requestID, hex.EncodeToString(extraData), true, nil
+}
+
 func copyTaskKey(taskType model.TaskType, copyID, generation int64) string {
 	switch taskType {
 	case model.TaskTypeStorageTransferPlan:
@@ -2047,8 +1762,6 @@ func copyTaskKey(taskType model.TaskType, copyID, generation int64) string {
 		return storagepipeline.StoreKey(copyID, generation)
 	case model.TaskTypeStoragePull:
 		return storagepipeline.PullKey(copyID, generation)
-	case model.TaskTypeStorageCommit:
-		return storagepipeline.CommitKey(copyID, generation)
 	default:
 		panic(fmt.Sprintf("unsupported copy task type %q", taskType))
 	}
@@ -2114,76 +1827,60 @@ func (h *TaskHandlers) copyContextFailure(
 	return retryTask(err, "copy_context_failed")
 }
 
+// finishPieceTransfer settles a completed transfer and hands the copy to
+// registration. pullAttemptID is empty for a store, which sent no request to a
+// source provider.
 func (h *TaskHandlers) finishPieceTransfer(
-	ctx context.Context,
 	execution taskengine.Execution,
 	input storagepipeline.CopyGenerationInput,
 	copyRow *model.StorageCopy,
 	target synapse.DataSetTarget,
 	pieceCID cid.Cid,
+	pullAttemptID string,
 ) taskengine.Result {
-	extraHex, err := h.copyCommitExtraData(ctx, copyRow, target, pieceCID)
-	if err != nil {
-		return taskengine.Fail(err, "commit_presign_failed", nil)
-	}
-	return h.finishPieceTransferWithExtra(execution, input, copyRow, target, pieceCID, extraHex, "")
+	pieceCIDString := pieceCID.String()
+	retrievalURL := target.PieceURL(pieceCID)
+	return taskengine.Complete("Storage transfer completed", func(ctx context.Context, repos *repository.Repositories) error {
+		if err := repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+			StorageCopyID: copyRow.ID, RequireEligibleCopy: true, ContentID: copyRow.ContentID,
+			CopyIndex: copyRow.CopyIndex, PieceCID: pieceCIDString, RetrievalURL: retrievalURL,
+			PullAttemptID: pullAttemptID,
+		}); err != nil {
+			return err
+		}
+		if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, execution.ID()); err != nil {
+			return err
+		}
+		return h.queueCommit(ctx, repos, copyRow.ID)
+	})
 }
 
-// copyCommitExtraData returns the commit request the copy signs once for its
-// life. Transferring the same bytes again keeps the piece CID it covers, and a
-// second signed request could be added beside the first.
-func (h *TaskHandlers) copyCommitExtraData(
-	ctx context.Context,
-	copyRow *model.StorageCopy,
-	target synapse.DataSetTarget,
-	pieceCID cid.Cid,
-) (string, error) {
-	request, err := storagecommit.PrepareCommitRequest(ctx, h.deps.Repositories.Contents, target, *copyRow,
-		[]storage.PieceInput{{PieceCID: pieceCID}})
-	return request.ExtraDataHex, err
+// handOffToCommit ends a copy task that finds its copy already transferred:
+// only registration is left, and the copy's request drives it.
+func (h *TaskHandlers) handOffToCommit(input storagepipeline.CopyGenerationInput, taskID int64) taskengine.Result {
+	return taskengine.Complete("Storage copy is ready to register", func(ctx context.Context, repos *repository.Repositories) error {
+		if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, taskID); err != nil {
+			return err
+		}
+		return h.queueCommit(ctx, repos, input.CopyID)
+	})
 }
 
 // commitBacklogFull reports whether the copy's data set already holds as many
-// transferred copies waiting to be committed as it may. A provider deletes an
+// transferred copies waiting to be registered as it may. A provider deletes an
 // uploaded piece that joins no data set within hours, so a new transfer waits
-// rather than queue a piece the data set cannot commit in time.
+// rather than queue a piece the data set cannot register in time.
 func (h *TaskHandlers) commitBacklogFull(ctx context.Context, copyRow *model.StorageCopy) (bool, error) {
-	ready, err := h.deps.Repositories.Contents.CountReadyCopiesForDataSet(ctx, copyRow.StorageDataSetID)
+	waiting, err := h.deps.Repositories.Contents.CountCommitBacklog(ctx, copyRow.StorageDataSetID)
 	if err != nil {
 		return false, err
 	}
-	return ready >= storagecommit.MaxReadyCopiesPerDataSet, nil
+	return waiting >= h.deps.CommitMaxBacklog, nil
 }
 
 func waitForCommitBacklog() taskengine.Result {
 	return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "commit_backlog",
 		"Waiting for earlier transfers to this storage service to be registered", nil)
-}
-
-// finishPieceTransferWithExtra settles a completed transfer. pullAttemptID is
-// empty for a store, which sent no request to a source provider.
-func (h *TaskHandlers) finishPieceTransferWithExtra(
-	execution taskengine.Execution,
-	input storagepipeline.CopyGenerationInput,
-	copyRow *model.StorageCopy,
-	target synapse.DataSetTarget,
-	pieceCID cid.Cid,
-	extraHex string,
-	pullAttemptID string,
-) taskengine.Result {
-	pieceCIDString := pieceCID.String()
-	retrievalURL := target.PieceURL(pieceCID)
-	canonicalExtraHex := strings.ToLower(extraHex)
-	return taskengine.Complete("Storage transfer completed", func(ctx context.Context, repos *repository.Repositories) error {
-		if err := repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
-			StorageCopyID: copyRow.ID, RequireEligibleCopy: true, ContentID: copyRow.ContentID,
-			CopyIndex: copyRow.CopyIndex, PieceCID: pieceCIDString, RetrievalURL: retrievalURL,
-			CommitExtraDataHex: canonicalExtraHex, PullAttemptID: pullAttemptID,
-		}); err != nil {
-			return err
-		}
-		return h.enqueueSuccessorCopyTask(ctx, repos, input, execution.ID(), model.TaskTypeStorageCommit)
-	})
 }
 
 func (h *TaskHandlers) retryCopyTask(
@@ -2221,28 +1918,16 @@ func (h *TaskHandlers) failPullTask(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if copyRow == nil || copyRow.CommitAttemptedAt != nil {
+	if copyRow == nil {
 		return taskengine.Fail(err, reason, nil)
 	}
 	message := err.Error()
+	if copyRow.CommitDecidedByRequest() {
+		return taskengine.Fail(err, reason, h.releaseMemberTransfer(execution, input, copyRow, message, pullAttemptID))
+	}
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
 		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, pullAttemptID)
 	})
-}
-
-func (h *TaskHandlers) retryResolvedCopyTask(
-	execution taskengine.Execution,
-	input storagepipeline.CopyGenerationInput,
-	copyRow *model.StorageCopy,
-	err error,
-	reason string,
-) taskengine.Result {
-	if !execution.RetryWillFail() {
-		return retryTask(err, reason)
-	}
-	resolvedCopy := *copyRow
-	resolvedCopy.CommitAttemptedAt = nil
-	return h.failCopyTask(execution, input, &resolvedCopy, err, reason)
 }
 
 func (h *TaskHandlers) failCopyTask(
@@ -2252,13 +1937,33 @@ func (h *TaskHandlers) failCopyTask(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if copyRow == nil || copyRow.CommitAttemptedAt != nil {
+	if copyRow == nil {
 		return taskengine.Fail(err, reason, nil)
 	}
 	message := err.Error()
+	if copyRow.CommitDecidedByRequest() {
+		return taskengine.Fail(err, reason, h.releaseMemberTransfer(execution, input, copyRow, message, ""))
+	}
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
 		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
 	})
+}
+
+// releaseMemberTransfer settles a transfer that gave up on a signed member.
+// The copy cannot fail on its own while its request may still land; it stays
+// in the request, whose task decides its fate.
+func (h *TaskHandlers) releaseMemberTransfer(
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	message, pullAttemptID string,
+) taskengine.Settlement {
+	return func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.Contents.ReleaseMemberTransfer(ctx, repository.ReleaseMemberTransferInput{
+			StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, Generation: input.Generation,
+			TaskID: execution.ID(), LastError: message, PullAttemptID: pullAttemptID,
+		})
+	}
 }
 
 func (h *TaskHandlers) settleCopyFailure(
@@ -2284,6 +1989,28 @@ func (h *TaskHandlers) settleCopyFailure(
 	if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, execution.ID()); err != nil {
 		return err
 	}
+	return h.recoverIngressAfterFailure(ctx, repos, copyRow)
+}
+
+// failCopy fails a copy no task holds, such as a member of a registration that
+// can never land, and recovers its content's ingress as a failed transfer would.
+func (h *TaskHandlers) failCopy(ctx context.Context, repos *repository.Repositories, copyRow *model.StorageCopy, message, pullAttemptID string) error {
+	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{
+		StorageCopyID: copyRow.ID,
+		ContentID:     copyRow.ContentID,
+		CopyIndex:     copyRow.CopyIndex,
+		LastError:     message,
+		PullAttemptID: pullAttemptID,
+	}); err != nil {
+		return err
+	}
+	return h.recoverIngressAfterFailure(ctx, repos, copyRow)
+}
+
+// recoverIngressAfterFailure keeps a content's ingress moving after one of its
+// copies failed: a readable copy reopens failed ingress as peer pulls, and
+// otherwise a pending peer copy becomes ingress.
+func (h *TaskHandlers) recoverIngressAfterFailure(ctx context.Context, repos *repository.Repositories, copyRow *model.StorageCopy) error {
 	if copyRow.TransferMethod != model.StorageCopyTransferMethodIngress {
 		return nil
 	}
@@ -2312,13 +2039,6 @@ func (h *TaskHandlers) settleCopyFailure(
 		return err
 	}
 	return h.enqueueInitialCopyTask(ctx, repos, promoted.ID, model.TaskTypeStorageTransferPlan)
-}
-
-func commitAttentionFailureReason(code storagecommit.AttentionCode) string {
-	if code == "" {
-		return "commit_attention_unknown"
-	}
-	return string(code)
 }
 
 func (h *TaskHandlers) openBindingTarget(ctx context.Context, bucketName string, binding *model.StorageDataSet) (synapse.StorageTarget, error) {
@@ -2443,11 +2163,4 @@ func newAttemptID() (string, error) {
 		return "", fmt.Errorf("creating request identity: %w", err)
 	}
 	return hex.EncodeToString(value[:]), nil
-}
-
-func taskDerefString(value *string) string {
-	if value == nil {
-		return ""
-	}
-	return *value
 }

@@ -943,6 +943,9 @@ type adminSettingsTaskWorkerConfig struct {
 	Retention                      string `json:"retention"`
 	ProviderMutationConcurrency    int    `json:"provider_mutation_concurrency"`
 	DestructiveMutationConcurrency int    `json:"destructive_mutation_concurrency"`
+	CommitMaxPieces                int    `json:"commit_max_pieces"`
+	CommitMaxWait                  string `json:"commit_max_wait"`
+	CommitMaxBacklog               int    `json:"commit_max_backlog"`
 }
 
 type adminSettingsLoggingConfig struct {
@@ -992,20 +995,18 @@ type adminTaskStatusCount struct {
 }
 
 type adminStorageConfirmationAttention struct {
-	CopyID        int64  `json:"copy_id"`
-	TaskID        *int64 `json:"task_id,omitempty"`
-	ContentID     int64  `json:"content_id"`
-	CopyIndex     int    `json:"copy_index"`
-	DataSetRowID  int64  `json:"data_set_row_id"`
-	ProviderID    string `json:"provider_id"`
-	DataSetID     string `json:"data_set_id,omitempty"`
-	PieceCID      string `json:"piece_cid,omitempty"`
-	AttemptID     string `json:"attempt_id"`
-	TransactionID string `json:"transaction_id,omitempty"`
-	SubmitError   string `json:"submit_error,omitempty"`
-	ReasonCode    string `json:"reason_code"`
-	AttemptedAt   string `json:"attempted_at"`
-	AttentionAt   string `json:"attention_at"`
+	RequestID     string   `json:"request_id"`
+	TaskID        *int64   `json:"task_id,omitempty"`
+	DataSetRowID  int64    `json:"data_set_row_id"`
+	ProviderID    string   `json:"provider_id"`
+	DataSetID     string   `json:"data_set_id,omitempty"`
+	PieceCount    int      `json:"piece_count"`
+	PieceCIDs     []string `json:"piece_cids"`
+	TransactionID string   `json:"transaction_id,omitempty"`
+	SubmitError   string   `json:"submit_error,omitempty"`
+	ReasonCode    string   `json:"reason_code"`
+	SubmittedAt   string   `json:"submitted_at"`
+	AttentionAt   string   `json:"attention_at"`
 }
 
 type adminSettingKind int
@@ -1046,6 +1047,9 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"worker.tasks.retention":                        {path: []string{"worker", "tasks", "retention"}, kind: adminSettingString},
 	"worker.tasks.provider_mutation_concurrency":    {path: []string{"worker", "tasks", "provider_mutation_concurrency"}, kind: adminSettingInt},
 	"worker.tasks.destructive_mutation_concurrency": {path: []string{"worker", "tasks", "destructive_mutation_concurrency"}, kind: adminSettingInt},
+	"worker.tasks.commit_max_pieces":                {path: []string{"worker", "tasks", "commit_max_pieces"}, kind: adminSettingInt},
+	"worker.tasks.commit_max_wait":                  {path: []string{"worker", "tasks", "commit_max_wait"}, kind: adminSettingString},
+	"worker.tasks.commit_max_backlog":               {path: []string{"worker", "tasks", "commit_max_backlog"}, kind: adminSettingInt},
 	"logging.level":                                 {path: []string{"logging", "level"}, kind: adminSettingString},
 	"logging.format":                                {path: []string{"logging", "format"}, kind: adminSettingString},
 	"logging.s3_access.enabled":                     {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
@@ -1431,6 +1435,9 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "worker.tasks.retention", Value: settings.Config.Worker.Tasks.Retention},
 				{Name: "worker.tasks.provider_mutation_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.ProviderMutationConcurrency)},
 				{Name: "worker.tasks.destructive_mutation_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.DestructiveMutationConcurrency)},
+				{Name: "worker.tasks.commit_max_pieces", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxPieces)},
+				{Name: "worker.tasks.commit_max_wait", Value: settings.Config.Worker.Tasks.CommitMaxWait},
+				{Name: "worker.tasks.commit_max_backlog", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxBacklog)},
 			},
 		},
 		{
@@ -1508,7 +1515,7 @@ func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {
 
 func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStorageConfirmationAttention) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "COPY ID\tCONTENT ID\tCOPY\tPROVIDER\tDATA SET\tPIECE CID\tATTEMPT\tATTEMPTED AT\tTRANSACTION\tREASON\tATTENTION AT\tTASK ID\tPROVIDER RESPONSE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "REQUEST\tTASK ID\tPROVIDER\tDATA SET\tPIECES\tTRANSACTION\tREASON\tSUBMITTED AT\tATTENTION AT\tPROVIDER RESPONSE"); err != nil {
 		return err
 	}
 	for _, confirmation := range confirmations {
@@ -1518,19 +1525,16 @@ func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStora
 		}
 		if _, err := fmt.Fprintf(
 			tw,
-			"%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			confirmation.CopyID,
-			confirmation.ContentID,
-			confirmation.CopyIndex,
+			"%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			confirmation.RequestID,
+			taskID,
 			confirmation.ProviderID,
 			confirmation.DataSetID,
-			confirmation.PieceCID,
-			confirmation.AttemptID,
-			confirmation.AttemptedAt,
+			confirmation.PieceCount,
 			confirmation.TransactionID,
 			confirmation.ReasonCode,
+			confirmation.SubmittedAt,
 			confirmation.AttentionAt,
-			taskID,
 			strings.Join(strings.Fields(confirmation.SubmitError), " "),
 		); err != nil {
 			return err

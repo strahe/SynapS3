@@ -191,6 +191,18 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Label: "Removal Concurrency", Description: "Maximum concurrent remote cleanup and retirement requests. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", Editable: true,
 	},
+	"worker.tasks.commit_max_pieces": {
+		Label: "Registration Size", Description: "Maximum pieces registered on chain in one transaction for a storage service. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", Editable: true,
+	},
+	"worker.tasks.commit_max_wait": {
+		Label: "Registration Wait", Description: "Longest a registration waits, once it could be sent, for uploads still transferring to the same storage service. It keeps collecting while sends are full. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", Editable: true,
+	},
+	"worker.tasks.commit_max_backlog": {
+		Label: "Registration Backlog", Description: "Transferred pieces per storage service that may wait for an unsent registration before new uploads and replica copies to it wait. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", Editable: true,
+	},
 	"logging.level": {
 		Label:       "Level",
 		Description: "Minimum log level emitted by SynapS3.",

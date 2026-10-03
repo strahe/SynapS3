@@ -90,7 +90,9 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		LEFT JOIN storage_copies AS target_copy
 		       ON target_copy.content_id = item.content_id
 		      AND target_copy.storage_data_set_id = item.target_data_set_id
-		LEFT JOIN tasks AS copy_task ON copy_task.id = target_copy.active_task_id
+		LEFT JOIN storage_commit_requests AS target_request ON target_request.request_id = target_copy.commit_request_id
+		LEFT JOIN tasks AS copy_task ON copy_task.id = COALESCE(target_copy.active_task_id,
+		     CASE WHEN target_copy.status IN ('piece_ready', 'committing') THEN target_request.task_id END)
 		LEFT JOIN tasks AS coordinator ON coordinator.id = replacement.task_id
 		WHERE replacement.id IN (?)
 	)

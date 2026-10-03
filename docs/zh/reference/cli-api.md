@@ -105,7 +105,7 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 
 `synaps3 admin task retry` 只恢复响应中标记为可重试的失败任务。存储提供方替换仍在 **Details** → **Storage** → **Data Sets** 中恢复。尚未发出广播、或因内部错误停止的钱包操作可以重试；只有从未广播过的交易才会在重试时发出，广播结果不确定时仍不可重试。因内部错误停止的存储传输任务也可以重试。Store 失败后，**Retry upload** 会先检查提供方；确认分片缺失才再次上传。远端副本删除超过 24 小时仍无法确认时，**Recover** 会先检查副本是否已删除或已排队删除；若仍存在且未排队，可能再次提交付费删除请求，而先前的请求仍可能成功。核对失败结果后，可用 `synaps3 admin task acknowledge <id>` 将任务标记为已处理；确认后开始计算保留期，到期后可能被清理。需要清理积压时，不带 ID 运行并用 `--yes` 确认：`--type` 限定某一种操作，`--before` 指定 RFC 3339 截止时刻（默认为当前时间），该时刻之后记录的失败仍然可见。
 
-`synaps3 admin storage-confirmation list` 会显示需要处理的存储确认及其所属任务 ID。对已停止的确认，使用 `synaps3 admin task retry <task-id>` 重试：重试会先在链上核对该 piece 是否已登记，只有未登记时才再次提交原请求；链上只接受该请求一次。存在相互冲突的历史请求时，只有当前请求已登记，该 copy 才会完成。
+`synaps3 admin storage-confirmation list` 会显示需要处理的存储登记：每次登记一行，包括所属任务 ID、存储提供方、data set、piece 数量和存储提供方的回复。对已停止的登记，使用 `synaps3 admin task retry <task-id>` 重试：重试只会重新核对链上记录，其中的 piece 已在链上时才完成该登记，不会发送任何请求。
 
 缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 

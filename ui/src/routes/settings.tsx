@@ -105,6 +105,9 @@ const tabFields = {
     'worker.tasks.retention',
     'worker.tasks.provider_mutation_concurrency',
     'worker.tasks.destructive_mutation_concurrency',
+    'worker.tasks.commit_max_pieces',
+    'worker.tasks.commit_max_wait',
+    'worker.tasks.commit_max_backlog',
   ],
   logging: ['logging.level', 'logging.format', 'logging.s3_access.enabled', 'logging.s3_access.level'],
   runtime: ['database.driver', 'database.dsn', 'database.max_open_conns', 'database.max_idle_conns', 'admin.addr'],
@@ -971,6 +974,30 @@ function TaskWorkerSection({
           data={data}
           errors={errors}
           onChange={(next) => onChange({ ...value, destructive_mutation_concurrency: next })}
+        />
+        <NumberField
+          label="Registration Size"
+          field="worker.tasks.commit_max_pieces"
+          value={value.commit_max_pieces}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, commit_max_pieces: next })}
+        />
+        <TextField
+          label="Registration Wait"
+          field="worker.tasks.commit_max_wait"
+          value={value.commit_max_wait}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, commit_max_wait: next })}
+        />
+        <NumberField
+          label="Registration Backlog"
+          field="worker.tasks.commit_max_backlog"
+          value={value.commit_max_backlog}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, commit_max_backlog: next })}
         />
       </div>
     </Section>

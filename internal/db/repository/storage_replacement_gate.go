@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
@@ -222,12 +223,12 @@ func (r *BunStorageReplacementRepo) CompleteAbandonedTargetTermination(ctx conte
 		if err := lockReplacementDataSets(ctx, db, row.TargetDataSetID); err != nil {
 			return err
 		}
-		attempts, err := (&BunStorageContentRepo{db: db}).CountActiveCommitAttemptsForDataSet(ctx, row.TargetDataSetID)
+		attempts, err := countOpenCommitRequests(ctx, db, row.TargetDataSetID)
 		if err != nil {
 			return err
 		}
 		if attempts > 0 {
-			return fmt.Errorf("retiring abandoned target of replacement %d has %d active confirmation attempts: %w",
+			return fmt.Errorf("retiring abandoned target of replacement %d has %d unsettled storage registrations: %w",
 				replacementID, attempts, storagereplacement.ErrPrematureComplete)
 		}
 		sole, err := (&BunStorageReplacementRepo{db: db}).CountAbandonedTargetSoleCopies(ctx, row.TargetDataSetID)
@@ -307,12 +308,16 @@ func (r *BunStorageReplacementRepo) CompleteRetirement(ctx context.Context, repl
 	})
 }
 
+// countReplacementActiveCommitAttempts counts the replacement's target copies
+// whose request has been sent and may still land. A request signed but not
+// sent has no effect to wait for.
 func countReplacementActiveCommitAttempts(ctx context.Context, db bun.IDB, replacementID int64) (int, error) {
 	count, err := db.NewSelect().
 		Model((*model.StorageCopy)(nil)).
 		Join("JOIN storage_replacement_items AS replacement_item ON replacement_item.content_id = storage_copy.content_id AND replacement_item.target_data_set_id = storage_copy.storage_data_set_id").
+		Join("JOIN storage_commit_requests AS commit_request ON commit_request.request_id = storage_copy.commit_request_id").
 		Where("replacement_item.replacement_id = ?", replacementID).
-		Where(attemptedStorageCommitSQL("storage_copy")).
+		Where("commit_request.status = ?", storagecommit.RequestStatusSubmitted).
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting replacement confirmation attempts: %w", err)

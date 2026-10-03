@@ -37,6 +37,9 @@ function baseConfig(): SettingsEditableConfig {
         retention: '168h0m0s',
         provider_mutation_concurrency: 4,
         destructive_mutation_concurrency: 2,
+        commit_max_pieces: 32,
+        commit_max_wait: '30s',
+        commit_max_backlog: 256,
       },
     },
     logging: {
@@ -142,6 +145,9 @@ test('settings payload includes the unified task engine settings', () => {
     retention: '336h0m0s',
     provider_mutation_concurrency: 6,
     destructive_mutation_concurrency: 3,
+    commit_max_pieces: 16,
+    commit_max_wait: '5s',
+    commit_max_backlog: 64,
   }
 
   const payload = buildSettingsPayload(form, initial, {})
@@ -154,5 +160,8 @@ test('settings payload includes the unified task engine settings', () => {
     retention: '336h0m0s',
     provider_mutation_concurrency: 6,
     destructive_mutation_concurrency: 3,
+    commit_max_pieces: 16,
+    commit_max_wait: '5s',
+    commit_max_backlog: 64,
   })
 })

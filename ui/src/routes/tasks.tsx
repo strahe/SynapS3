@@ -497,6 +497,7 @@ function taskSubject(task: TaskItem) {
   const labels: Record<string, string> = {
     bucket: 'Bucket',
     provider: 'Registry',
+    storage_commit_request: 'Storage registration',
     storage_content: 'Stored content',
     storage_copy: 'Storage copy',
     storage_data_set: 'Storage service',

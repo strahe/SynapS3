@@ -576,17 +576,14 @@ func (r *BunTaskRepo) ReactivateTerminal(ctx context.Context, id int64) error {
 	})
 }
 
-// awaitingCommitReviewSQL matches a task whose storage copy has a confirmation
-// flagged for attention. Dismissing that task would hide the only sign that
-// the confirmation still holds its data set's commit capacity.
+// awaitingCommitReviewSQL matches a task whose storage registration is flagged
+// for attention. Dismissing that task would hide the only sign that the
+// registration still holds its data set's commit capacity.
 const awaitingCommitReviewSQL = `EXISTS (
-	SELECT 1 FROM storage_copies AS review_copy
-	JOIN storage_commit_attempts AS review_attempt
-	  ON review_attempt.content_id = review_copy.content_id
-	 AND review_attempt.storage_data_set_id = review_copy.storage_data_set_id
-	WHERE review_copy.active_task_id = ?TableAlias.id
-	  AND review_attempt.resolved_at IS NULL
-	  AND review_attempt.attention_at IS NOT NULL
+	SELECT 1 FROM storage_commit_requests AS review_request
+	WHERE review_request.task_id = ?TableAlias.id
+	  AND review_request.status = 'submitted'
+	  AND review_request.attention_at IS NOT NULL
 )`
 
 // AcknowledgeFailed dismisses one failure. A failure whose storage confirmation
@@ -697,6 +694,7 @@ func (r *BunTaskRepo) DeleteRetained(ctx context.Context, now time.Time, limit i
 		Where(`NOT EXISTS (SELECT 1 FROM buckets WHERE durability_task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM storage_contents WHERE cleanup_task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM storage_copies WHERE active_task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM storage_commit_requests WHERE task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM storage_data_sets WHERE ensure_task_id = task.id OR retirement_task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM wallet_operations WHERE task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM provider_upload_speed_tests WHERE active_task_id = task.id)`).

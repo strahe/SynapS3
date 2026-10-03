@@ -281,6 +281,27 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
+			name:  "worker commit max pieces",
+			field: "worker.tasks.commit_max_pieces",
+			mutate: func(cfg *Config) {
+				cfg.Worker.Tasks.CommitMaxPieces = MaxCommitMaxPieces + 1
+			},
+		},
+		{
+			name:  "worker commit max wait",
+			field: "worker.tasks.commit_max_wait",
+			mutate: func(cfg *Config) {
+				cfg.Worker.Tasks.CommitMaxWait = MaxCommitMaxWait + time.Second
+			},
+		},
+		{
+			name:  "worker commit backlog below registration size",
+			field: "worker.tasks.commit_max_backlog",
+			mutate: func(cfg *Config) {
+				cfg.Worker.Tasks.CommitMaxBacklog = cfg.Worker.Tasks.CommitMaxPieces - 1
+			},
+		},
+		{
 			name:  "filecoin default copies",
 			field: "filecoin.default_copies",
 			mutate: func(cfg *Config) {
@@ -516,6 +537,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_WORKER_TASKS_RETENTION", "96h")
 	t.Setenv("SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", "3")
 	t.Setenv("SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", "2")
+	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", "16")
+	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", "5s")
+	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", "64")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_LEVEL", "debug")
 	t.Setenv("SYNAPS3_ADMIN_AUTH_PASSWORD_HASH", "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W")
@@ -553,7 +577,10 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 		cfg.Worker.Tasks.MaxRetries != 8 ||
 		cfg.Worker.Tasks.Retention != 96*time.Hour ||
 		cfg.Worker.Tasks.ProviderMutationConcurrency != 3 ||
-		cfg.Worker.Tasks.DestructiveMutationConcurrency != 2 {
+		cfg.Worker.Tasks.DestructiveMutationConcurrency != 2 ||
+		cfg.Worker.Tasks.CommitMaxPieces != 16 ||
+		cfg.Worker.Tasks.CommitMaxWait != 5*time.Second ||
+		cfg.Worker.Tasks.CommitMaxBacklog != 64 {
 		t.Fatalf("task worker = %#v, want env values", cfg.Worker.Tasks)
 	}
 	if cfg.Logging.S3Access.Enabled || cfg.Logging.S3Access.Level != "debug" {

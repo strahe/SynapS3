@@ -101,6 +101,9 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `worker.tasks.retention` | `168h` |
 | `worker.tasks.provider_mutation_concurrency` | `4` |
 | `worker.tasks.destructive_mutation_concurrency` | `2` |
+| `worker.tasks.commit_max_pieces` | `32` |
+| `worker.tasks.commit_max_wait` | `30s` |
+| `worker.tasks.commit_max_backlog` | `256` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
@@ -108,6 +111,8 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `admin.auth.session_ttl` | `12h` |
 
 `worker.tasks.concurrency` limits all background operations. Remote storage creation, Store, Pull, and commit submission additionally share `provider_mutation_concurrency`; remote cleanup and service retirement share `destructive_mutation_concurrency`. Status and confirmation checks do not consume either mutation limit. Wallet mutations are serialized. An operation that finds its limit full steps aside and tries again shortly instead of holding a `concurrency` slot, so other background work keeps running. Task settings require a SynapS3 restart, and existing tasks retain the retry limit recorded when they were created.
+
+Uploads to the same storage service are registered on chain together, so one signed request and one transaction cover many pieces. `commit_max_pieces` (1–200) caps the pieces in one registration; storage services with a data set ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. A registration is signed as soon as it is full or its storage service stops taking new data. Otherwise it keeps collecting while its storage service already has four registrations in flight or another one waiting to be sent; once there is room, it waits up to `commit_max_wait` (0–10m) for uploads still transferring to the same storage service. Replicas copied from another provider are registered one piece at a time. Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one storage service for a registration that has not been sent, new uploads and replica copies to it wait. A registration that does not fit one add-pieces message is split and signed again with fewer pieces.
 
 ## Admin Session Lifetime
 

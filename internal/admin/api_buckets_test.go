@@ -456,7 +456,7 @@ func seedAdminCommittedCopies(t *testing.T, db *bun.DB, repos *repository.Reposi
 		t.Fatalf("create upload copies: %v", err)
 	}
 	for _, copySeed := range copies {
-		testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 			ContentID:    contentID,
 			CopyIndex:    copySeed.CopyIndex,
 			PieceCID:     pieceCID,
@@ -544,7 +544,7 @@ func acceptAdminVersionUpload(t *testing.T, db *bun.DB, repos *repository.Reposi
 		}}); err != nil {
 			t.Fatalf("create upload copy %d: %v", copyIndex, err)
 		}
-		testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 			ContentID:    upload.ID,
 			CopyIndex:    copyIndex,
 			PieceCID:     pieceCID,
@@ -593,7 +593,7 @@ func bindAdminPartialUpload(t *testing.T, db *bun.DB, repos *repository.Reposito
 		t.Fatalf("create upload copies: %v", err)
 	}
 	pieceCID := "piece-partial-" + versionID
-	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
 		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,

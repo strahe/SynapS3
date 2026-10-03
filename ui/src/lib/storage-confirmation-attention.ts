@@ -1,8 +1,6 @@
 import type { StorageCommitAttentionCode } from '@/api/client'
 
 const knownAttentionLabels = {
-  attempt_only_ambiguous: 'Submission result unknown',
-  unattributed_piece: 'Piece ownership unknown',
   submission_mismatch: 'Confirmation does not match',
   data_set_unavailable: 'Data set is unavailable',
   confirmation_timeout: 'Confirmation timed out',
@@ -12,7 +10,7 @@ const attentionLabels = new Map<string, string>(Object.entries(knownAttentionLab
 
 /** What recovering a stopped storage confirmation does. */
 export const storageConfirmationRetryNote =
-  'Recovery checks whether the piece is already registered before continuing the original request.'
+  'Recovery checks whether the pieces are already registered before continuing the original registration.'
 
 /** Tasks page filter that lists stopped storage confirmations. */
 export const storageConfirmationTasksSearch = { type: 'storage_commit', status: 'failed' } as const
