@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"os"
 	"sort"
@@ -131,7 +132,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 		plan, err := h.selectUploadBindings(ctx, bucket, upload)
 		if err != nil {
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
-				return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
+				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
 			return retryTask(err, "storage_selection_failed")
 		}
@@ -149,7 +150,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 		costs, err := h.deps.Storage.PrepareUpload(ctx, dataSize, targets)
 		if err != nil {
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
-				return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "funding", "Waiting for storage funding", nil)
+				return h.waitForStorageDependency(ctx, execution, "funding", "Waiting for storage funding", err)
 			}
 			return retryTask(err, "storage_funding_failed")
 		}
@@ -242,6 +243,17 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 		})
 	}
 	return taskHandler{definition: definition, execute: run, recover: run}
+}
+
+func (h *TaskHandlers) waitForStorageDependency(ctx context.Context, execution taskengine.Execution, reason, message string, err error) taskengine.Result {
+	summary := synapse.SummarizedError(err)
+	level := slog.LevelWarn
+	if execution.LastError() == summary.Error() {
+		level = slog.LevelDebug
+	}
+	h.deps.Logger.Log(ctx, level, "storage task waiting for dependency",
+		"task_id", execution.ID(), "task_type", execution.Type(), "wait_reason", reason, "error", summary)
+	return taskengine.SuspendWithError(model.TaskResumeModeExecute, storageDependencyWait, reason, message, summary, nil)
 }
 
 func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {

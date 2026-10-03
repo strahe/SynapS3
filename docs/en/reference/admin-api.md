@@ -273,6 +273,7 @@ A storage registration covers one or more pieces sent to the same data set in on
 | --- | --- | --- |
 | `GET` | `/api/v1/tasks` | List background tasks. Supports `type`, `status`, `limit`, and ID-based `cursor`. |
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
+| `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | Read one task subject and its known related information. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Recover a failed task when `retryable` is true. |
 | `POST` | `/api/v1/tasks/{id}/acknowledge` | Dismiss a failed task when `acknowledgeable` is true. Acknowledgement starts its retention period, after which it may be cleaned up. |
 | `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk dismissal would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
@@ -281,6 +282,10 @@ A storage registration covers one or more pieces sent to the same data set in on
 `status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. A Confirm storage task whose registration needs attention also includes `storage_confirmation` with `request_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
 
 The `status` filter also accepts `dismissed`. `status=failed` returns only unacknowledged failures, while `status=dismissed` returns acknowledged failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`.
+
+Subject lookup accepts `storage_content`, `storage_copy`, `storage_data_set`, `bucket`, `provider`, `storage_replacement`, `wallet_operation`, and `storage_commit_request`. Local resource keys are positive integer IDs, provider keys are decimal uint256 IDs, and registration keys are request IDs; encode each path segment separately. The response includes `subject_type`, `subject_key`, and available resource fields. `copy_index` starts at zero; `local_data_set_id` and string `data_set_id` distinguish local and on-chain datasets. A file sample has `key`, `source` (`current`, `historical`, or `deleted`), and `other_versions`. Wallet amounts remain strings in USDFC base units. Invalid parameters return `400`, unavailable subjects return `404`, and query failures return `500`. Lookup uses local records and may return partial information.
+
+`started_at` and `finished_at` retain fractional seconds. The Tasks page reads subjects only when their tooltip or popover opens. Took measures first start to finish, including waits, retries, and time awaiting recovery; pending and running tasks show no duration, and dismissal does not change it.
 
 Bulk dismissal takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
 

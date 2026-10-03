@@ -258,43 +258,43 @@ func taskPresentationStatus(row *model.Task, now time.Time) string {
 func taskOperationLabel(taskType model.TaskType) string {
 	switch taskType {
 	case model.TaskTypeBucketProvision:
-		return "Prepare bucket storage"
+		return "Prepare bucket"
 	case model.TaskTypeUploadPlan:
 		return "Prepare upload"
 	case model.TaskTypeStorageDataSetEnsure:
-		return "Prepare storage"
+		return "Create dataset"
 	case model.TaskTypeStorageTransferPlan:
-		return "Plan storage transfer"
+		return "Prepare copy"
 	case model.TaskTypeStorageStore:
-		return "Store content"
+		return "Upload data"
 	case model.TaskTypeStoragePull:
-		return "Transfer stored content"
+		return "Copy data"
 	case model.TaskTypeStorageCommit:
 		return "Confirm storage"
 	case model.TaskTypeProviderReplacementCoordinate:
-		return "Replace storage provider"
+		return "Replace provider"
 	case model.TaskTypeCacheCapacityReconcile:
-		return "Manage local cache capacity"
+		return "Manage cache"
 	case model.TaskTypeCacheEvict:
-		return "Remove local cached copy"
+		return "Clear cache"
 	case model.TaskTypeCacheReconcileDurability:
-		return "Review cache durability"
+		return "Apply cache policy"
 	case model.TaskTypeStorageCleanup:
-		return "Remove remote storage copy"
+		return "Delete remote copies"
 	case model.TaskTypeStorageDataSetRetire:
-		return "Retire storage service"
+		return "Close dataset"
 	case model.TaskTypeWalletOperation:
-		return "Process wallet request"
+		return "Wallet operation"
 	case model.TaskTypeObservabilityRefresh:
-		return "Refresh storage health"
+		return "Refresh health"
 	case model.TaskTypeApprovedProviderRefresh:
 		return "Refresh approved providers"
 	case model.TaskTypeEndorsedProviderRefresh:
 		return "Refresh endorsed providers"
 	case model.TaskTypeProviderUploadSpeedTest:
-		return "Test provider upload speed"
+		return "Test upload speed"
 	case model.TaskTypeGC:
-		return "Remove expired task records"
+		return "Clean task history"
 	default:
 		return "Background operation"
 	}
@@ -304,7 +304,7 @@ func formattedTime(value *time.Time) *string {
 	if value == nil {
 		return nil
 	}
-	formatted := value.Format(time.RFC3339)
+	formatted := value.Format(time.RFC3339Nano)
 	return &formatted
 }
 

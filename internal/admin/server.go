@@ -270,6 +270,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", s.handleAPIDownloadObject)
 		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", s.handleAPIUploadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
+		mux.HandleFunc("GET /api/v1/task-subjects/{subject_type}/{subject_key}", s.handleAPITaskSubject)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleAPITaskRetry)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/acknowledge", s.handleAPITaskAcknowledge)

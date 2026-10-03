@@ -273,6 +273,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | --- | --- | --- |
 | `GET` | `/api/v1/tasks` | 列出后台任务。支持 `type`、`status`、`limit` 和基于 ID 的 `cursor`。 |
 | `GET` | `/api/v1/tasks/stats` | 按状态统计任务。 |
+| `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | 读取一个任务主体及已知关联信息。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时恢复失败任务。 |
 | `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时把失败任务标记为已处理。确认后开始计算保留期，到期后可能被清理。 |
 | `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
@@ -281,6 +282,10 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 `status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。登记需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
 `status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
+
+主体查询支持 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 和 `storage_commit_request`。本地资源 key 为正整数 ID，Provider key 为十进制 uint256 ID，存储确认 key 为请求 ID；分别编码两个路径参数。响应包含 `subject_type`、`subject_key` 和可用资源信息。`copy_index` 从 0 开始；`local_data_set_id` 与字符串 `data_set_id` 分别表示本地和链上 Dataset ID。文件样例包含 `key`、`source`（`current`、`historical` 或 `deleted`）及 `other_versions`。钱包金额保留为 USDFC 最小单位字符串。参数无效返回 `400`，主体信息不可用返回 `404`，查询失败返回 `500`；接口读取本地记录，可能返回部分信息。
+
+`started_at` 和 `finished_at` 保留小数秒。Tasks 页面仅在打开主体弹层时查询信息。Took 计算首次开始至结束的耗时，包含等待、重试及等待手动恢复的时间；Pending、Running 不显示耗时，Dismiss 不改变耗时。
 
 批量处理接受 JSON 请求体，其中 `type` 和 RFC 3339 格式的 `failed_before` 都是可选的，`failed_before` 默认为服务端处理请求的时刻：
 

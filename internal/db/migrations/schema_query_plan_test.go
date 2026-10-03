@@ -69,6 +69,12 @@ func TestBaselineRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
 				query:      versionListQuery,
 			},
 			{
+				name:       "deleted content sample",
+				indexNames: []string{"idx_object_deletions_content_deleted"},
+				query: `SELECT key, size FROM object_deletions
+					WHERE content_id = 1 ORDER BY deleted_at DESC, id DESC LIMIT 1`,
+			},
+			{
 				// Residency is content-addressed, so the eviction scan reads
 				// object_cache and never touches object_versions.
 				name:       "cache LRU",
@@ -219,7 +225,12 @@ func seedObjectPlanBacklog(t *testing.T, db *bun.DB) {
 	if _, err := db.ExecContext(t.Context(), insertHistory); err != nil {
 		t.Fatalf("seed query-plan version history: %v", err)
 	}
-	for _, table := range []string{"objects", "object_versions", "object_cache"} {
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO object_deletions
+		(bucket_id, object_id, key, version_id, content_id, size, deleted_at)
+		SELECT bucket_id, id, key, 'deleted-' || id, id, 1, CURRENT_TIMESTAMP FROM objects`); err != nil {
+		t.Fatalf("seed query-plan deletions: %v", err)
+	}
+	for _, table := range []string{"objects", "object_versions", "object_cache", "object_deletions"} {
 		if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
 			t.Fatalf("analyze query-plan table %s: %v", table, err)
 		}

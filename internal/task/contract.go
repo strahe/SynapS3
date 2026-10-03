@@ -258,6 +258,7 @@ func (e Execution) InputVersion() int          { return e.task.InputVersion }
 func (e Execution) ClaimGeneration() int64     { return e.task.ClaimGeneration }
 func (e Execution) Mode() model.TaskResumeMode { return e.task.ResumeMode }
 func (e Execution) RetryCount() int            { return e.task.RetryCount }
+func (e Execution) LastError() string          { return dereference(e.task.LastError) }
 func (e Execution) RetryLimit() (int, bool) {
 	if e.task.RetryLimit == nil {
 		return 0, false

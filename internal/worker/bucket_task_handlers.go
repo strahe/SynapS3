@@ -76,7 +76,7 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 		selected, err := h.selectBucketBindings(ctx, bucket, required)
 		if err != nil {
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
-				return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
+				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
 			return retryTask(err, "storage_selection_failed")
 		}
@@ -90,7 +90,7 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 		costs, err := h.deps.Storage.PrepareUpload(ctx, uint64(objectlimits.MinFOCUploadSize), targets)
 		if err != nil {
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
-				return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "funding", "Waiting for storage funding", nil)
+				return h.waitForStorageDependency(ctx, execution, "funding", "Waiting for storage funding", err)
 			}
 			return retryTask(err, "storage_funding_failed")
 		}

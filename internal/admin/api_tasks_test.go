@@ -132,6 +132,43 @@ func TestAPITasksUsesCursorAndServerPresentation(t *testing.T) {
 	}
 }
 
+func TestAPITasksPreservesDurationPrecision(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	row := fixture.enqueue(t, model.TaskTypeStorageStore, "short-store", time.Now(), "storage_copy", "447")
+	fixture.transition(t, row.ID, repository.TaskTransition{
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute,
+		RetentionUntil: new(time.Now().Add(time.Hour)),
+	})
+	started := time.Date(2026, 10, 3, 0, 0, 0, 900_000_000, time.UTC)
+	finished := started.Add(200 * time.Millisecond)
+	if _, err := fixture.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("started_at = ?", started).Set("finished_at = ?", finished).
+		Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	rr := fixture.request(http.MethodGet, "/api/v1/tasks?type=storage_store", nil)
+	var response taskListResponse
+	decodeJSON(t, rr, &response)
+	if rr.Code != http.StatusOK || len(response.Tasks) != 1 {
+		t.Fatalf("response = %d %s", rr.Code, rr.Body.String())
+	}
+	item := response.Tasks[0]
+	if item.StartedAt == nil || item.FinishedAt == nil {
+		t.Fatalf("missing task times: %#v", item)
+	}
+	wireStart, err := time.Parse(time.RFC3339Nano, *item.StartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireFinish, err := time.Parse(time.RFC3339Nano, *item.FinishedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := wireFinish.Sub(wireStart); elapsed != 200*time.Millisecond {
+		t.Fatalf("serialized duration = %s, want 200ms: %s", elapsed, rr.Body.String())
+	}
+}
+
 func TestAPITasksRejectsRemovedAndInvalidFilters(t *testing.T) {
 	fixture := newAdminTaskFixture(t)
 	for _, path := range []string{
@@ -624,6 +661,7 @@ func (f *adminTaskFixture) request(method, path string, body io.Reader) *httptes
 	f.t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", f.server.handleAPITasks)
+	mux.HandleFunc("GET /api/v1/task-subjects/{subject_type}/{subject_key}", f.server.handleAPITaskSubject)
 	mux.HandleFunc("GET /api/v1/tasks/stats", f.server.handleAPITaskStats)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", f.server.handleAPITaskRetry)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/acknowledge", f.server.handleAPITaskAcknowledge)

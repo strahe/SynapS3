@@ -10,6 +10,7 @@ import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
+import { TaskSubject } from '@/components/tasks/TaskSubject'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
@@ -21,26 +22,27 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTasks } from '@/hooks/queries'
 import { storageConfirmationAttentionView } from '@/lib/storage-confirmation-attention'
+import { taskOperationLabel, taskTook } from '@/lib/tasks'
 import { timeAgo } from '@/lib/utils'
 
 const PAGE_SIZE = 20
 
 const taskOperations = [
   { value: 'all', label: 'All operations' },
-  { value: 'bucket_provision', label: 'Prepare bucket storage' },
-  { value: 'upload_plan', label: 'Prepare upload' },
-  { value: 'storage_dataset_ensure', label: 'Prepare storage' },
-  { value: 'storage_transfer_plan', label: 'Plan storage transfer' },
-  { value: 'storage_store', label: 'Store content' },
-  { value: 'storage_pull', label: 'Transfer stored content' },
-  { value: 'storage_commit', label: 'Confirm storage' },
-  { value: 'provider_replacement_coordinate', label: 'Replace storage provider' },
-  { value: 'cache_evict', label: 'Remove local cached copy' },
-  { value: 'cache_reconcile_durability', label: 'Review cache durability' },
-  { value: 'storage_cleanup', label: 'Remove remote storage copy' },
-  { value: 'storage_dataset_retire', label: 'Retire storage service' },
-  { value: 'wallet_operation', label: 'Process wallet request' },
-  { value: 'provider_upload_speed_test', label: 'Test provider upload speed' },
+  { value: 'bucket_provision', label: taskOperationLabel('bucket_provision') },
+  { value: 'upload_plan', label: taskOperationLabel('upload_plan') },
+  { value: 'storage_dataset_ensure', label: taskOperationLabel('storage_dataset_ensure') },
+  { value: 'storage_transfer_plan', label: taskOperationLabel('storage_transfer_plan') },
+  { value: 'storage_store', label: taskOperationLabel('storage_store') },
+  { value: 'storage_pull', label: taskOperationLabel('storage_pull') },
+  { value: 'storage_commit', label: taskOperationLabel('storage_commit') },
+  { value: 'provider_replacement_coordinate', label: taskOperationLabel('provider_replacement_coordinate') },
+  { value: 'cache_evict', label: taskOperationLabel('cache_evict') },
+  { value: 'cache_reconcile_durability', label: taskOperationLabel('cache_reconcile_durability') },
+  { value: 'storage_cleanup', label: taskOperationLabel('storage_cleanup') },
+  { value: 'storage_dataset_retire', label: taskOperationLabel('storage_dataset_retire') },
+  { value: 'wallet_operation', label: taskOperationLabel('wallet_operation') },
+  { value: 'provider_upload_speed_test', label: taskOperationLabel('provider_upload_speed_test') },
 ] as const
 
 const taskStatuses = [
@@ -348,6 +350,16 @@ function TaskTable({
             <TableHead className="px-4">Status</TableHead>
             <TableHead className="px-4">Subject</TableHead>
             <TableHead className="w-28 px-4">Created</TableHead>
+            <TableHead className="w-20 px-4">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button type="button">Took</button>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-72">
+                  Time from first start to finish, including waits, retries, and time awaiting recovery.
+                </TooltipContent>
+              </Tooltip>
+            </TableHead>
             <TableHead className="min-w-64 px-4">Details</TableHead>
             <TableHead className="px-4 text-right">Actions</TableHead>
           </TableRow>
@@ -369,9 +381,14 @@ function TaskTable({
                   )}
                 </div>
               </TableCell>
-              <TableCell className="px-4">{taskSubject(task)}</TableCell>
+              <TableCell className="px-4">
+                <TaskSubject task={task} />
+              </TableCell>
               <TableCell className="px-4 text-muted-foreground">
                 <TaskCreatedTime task={task} />
+              </TableCell>
+              <TableCell className="w-20 whitespace-nowrap px-4 tabular-nums text-muted-foreground">
+                {taskTook(task)}
               </TableCell>
               <TableCell className="max-w-96 px-4">
                 <TaskDetails task={task} />
@@ -490,22 +507,6 @@ function TaskCreatedTime({ task }: { task: TaskItem }) {
 function taskRetriesLabel(task: TaskItem) {
   if (task.retry_limit !== undefined) return `${task.retry_count}/${task.retry_limit} retries`
   return task.retry_count === 1 ? '1 retry' : `${task.retry_count} retries`
-}
-
-function taskSubject(task: TaskItem) {
-  if (!task.subject_type || !task.subject_key) return 'System'
-  const labels: Record<string, string> = {
-    bucket: 'Bucket',
-    provider: 'Registry',
-    storage_commit_request: 'Storage registration',
-    storage_content: 'Stored content',
-    storage_copy: 'Storage copy',
-    storage_data_set: 'Storage service',
-    storage_replacement: 'Provider replacement',
-    wallet_operation: 'Wallet request',
-    system: 'System',
-  }
-  return `${labels[task.subject_type] ?? 'Resource'} ${task.subject_key}`
 }
 
 function TaskTableSkeleton() {
