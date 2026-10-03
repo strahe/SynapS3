@@ -28,7 +28,7 @@ flowchart TD
 | --- | --- |
 | `cached` | Object is durable locally and queued for upload. |
 | `uploading` | A background task is preparing remote storage or uploading bytes. |
-| `committing` | The provider has the piece, and it is being registered on chain, together with other uploads to the same storage service when they arrive close together. |
+| `committing` | The provider has the piece, which is waiting for or undergoing on-chain registration; uploads to the same storage service are combined within the configured `commit_max_wait` window. |
 | `replicating` | At least one readable committed copy exists, but the bucket's minimum durable copies are not yet met. |
 | `stored` | The bucket's minimum durable copies are readable and committed; remaining target copies may still be syncing. |
 | `failed` | The active lifecycle step failed and may be retried. |

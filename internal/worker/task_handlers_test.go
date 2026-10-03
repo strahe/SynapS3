@@ -2305,39 +2305,54 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 }
 
 func TestInitialPeerPullWaitsForCommittedSourceEvenWithCache(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		cache:  &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return true }},
-		policy: cache.EvictionPolicyNone,
-		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
-			return handlers.RegisterStorage(registry)
-		},
-	})
-	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
-	version := &model.ObjectVersion{
-		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "wait-for-source.bin",
-		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
-		ETag: "wait-for-source", ContentType: "application/octet-stream",
-	}
-	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
-		Set("status = ?", model.StorageDataSetStatusRetired).Set("is_current = ?", false).
-		Where("id = ?", pipeline.source.StorageDataSetID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	plan := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, plan.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "source"
-	})
-	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != plan.ID {
-		t.Fatalf("peer copy after source wait = %#v, err=%v", copyRow, err)
+	for _, taskType := range []model.TaskType{model.TaskTypeStorageTransferPlan, model.TaskTypeStoragePull} {
+		t.Run(string(taskType), func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				cache:  &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return true }},
+				policy: cache.EvictionPolicyNone,
+				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+					return handlers.RegisterStorage(registry)
+				},
+			})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+			version := &model.ObjectVersion{
+				VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "wait-for-source.bin",
+				ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+				ETag: "wait-for-source", ContentType: "application/octet-stream",
+			}
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+				Set("status = ?", model.StorageDataSetStatusRetired).Set("is_current = ?", false).
+				Where("id = ?", pipeline.source.StorageDataSetID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			target := &testutil.MockStorageTarget{
+				ProviderIDValue: pipeline.targetSet.ProviderID.SDK(), ClientDataSetIDValue: pipeline.targetClient,
+			}
+			dataSetID := pipeline.targetSet.DataSetID.SDK()
+			target.DataSetIDValue = &dataSetID
+			runtime.storage.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				return target, nil
+			}
+			plan := bindCopyTask(t, runtime, pipeline.target, taskType)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waiting := waitForTask(t, runtime.repos, plan.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "source"
+			})
+			if delay := waiting.AvailableAt.Sub(waiting.UpdatedAt); delay < 29*time.Second || delay > 31*time.Second {
+				t.Fatalf("source check delay = %s, want 30s", delay)
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != plan.ID {
+				t.Fatalf("peer copy after source wait = %#v, err=%v", copyRow, err)
+			}
+		})
 	}
 }
 

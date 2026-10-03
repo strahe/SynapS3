@@ -407,6 +407,9 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	if first.RetryCount != 0 || first.ResumeMode != model.TaskResumeModeRecover {
 		t.Fatalf("collecting task = %#v, want recovery without retries", first)
 	}
+	if delay := first.AvailableAt.Sub(first.UpdatedAt); delay < 29*time.Second || delay > 31*time.Second {
+		t.Fatalf("collection check delay = %s, want 30s", delay)
+	}
 	for i, copyRow := range f.copies[1:] {
 		joined, _, err := f.runtime.repos.Contents.JoinCollectingCommitRequest(t.Context(), repository.JoinCommitRequestInput{
 			CopyID: copyRow.ID, StorageDataSetID: f.dataSet.ID, MaxPieces: 32,

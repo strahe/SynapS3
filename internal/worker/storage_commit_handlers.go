@@ -20,7 +20,10 @@ import (
 	"github.com/strahe/synapse-go/storage"
 )
 
-const commitQueueMessage = "Waiting to register storage"
+const (
+	commitQueueMessage           = "Waiting to register storage"
+	commitCollectionPollInterval = 30 * time.Second
+)
 
 // commitCheckpoint records the latest send of a commit request. The request
 // row holds the send history; the checkpoint only fences the send itself.
@@ -127,8 +130,8 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	}
 }
 
-// runCollectingCommit signs a collecting request once it is full, or once
-// there is room to send it and no more copies are about to join.
+// runCollectingCommit signs when the request is full, the data set is draining,
+// or the oldest member's collection window expires; zero wait signs immediately.
 func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) taskengine.Result {
 	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, run.request.RequestID)
 	if err != nil {
@@ -149,8 +152,8 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 		Draining: run.binding.Status == model.StorageDataSetStatusDraining,
 	})
 	if !seal {
-		if wait <= 0 || wait > storagePollInterval {
-			wait = storagePollInterval
+		if wait <= 0 || wait > commitCollectionPollInterval {
+			wait = commitCollectionPollInterval
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, wait, "collecting", "Waiting for more stored data to register together", nil)
 	}

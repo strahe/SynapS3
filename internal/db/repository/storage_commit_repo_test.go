@@ -43,6 +43,7 @@ var commitLedgerCases = []struct {
 }{
 	{"CommitRequestCollectsUpToItsLimitAndSealsTheSignedSet", testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet},
 	{"CommitSubmissionTakesTheOldestEligibleRequestWithinCapacity", testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity},
+	{"CommitSubmissionKeepsTheCollectionWakeTime", testCommitSubmissionKeepsTheCollectionWakeTime},
 	{"CommitRefusalReturnsRequestToReadyUntilItsRetryIsDue", testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue},
 	{"CommitConfirmationCommitsMembersByPositionAndReplays", testCommitConfirmationCommitsMembersByPositionAndReplays},
 	{"SignedSingleMemberIsDecidedByItsRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 1) }},
@@ -272,6 +273,33 @@ func testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 	// Another task cannot send a request it does not drive.
 	if err := f.repos.Contents.RecordCommitResend(ctx, repository.CommitSendInput{RequestID: "request-0", TaskID: tasks[1], Sends: 2}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("resend by another task = %v, want conflict", err)
+	}
+}
+
+func testCommitSubmissionKeepsTheCollectionWakeTime(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	collectingTask := f.collecting(t, "collecting", f.transferredCopy(t, "collecting"))
+	taskID, _ := f.sealedRequest(t, "ready")
+	later := time.Now().Add(time.Hour)
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
+		Where("id = ?", collectingTask).Exec(ctx); err != nil {
+		t.Fatalf("park collecting task: %v", err)
+	}
+	before, err := f.repos.Tasks.GetByID(ctx, collectingTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{
+		RequestID: "ready", TaskID: taskID,
+	}); err != nil {
+		t.Fatalf("begin submission: %v", err)
+	}
+	after, err := f.repos.Tasks.GetByID(ctx, collectingTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.AvailableAt.Equal(before.AvailableAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("collecting task changed after submission: before=%#v, after=%#v", before, after)
 	}
 }
 
