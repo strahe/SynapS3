@@ -73,6 +73,7 @@ type handlerRuntimeOptions struct {
 	receipts               worker.WalletReceiptChecker
 	walletBroadcastTimeout time.Duration
 	walletReceiptTimeout   time.Duration
+	commitMaxWait          time.Duration
 	terminator             synapse.ServiceTerminator
 	epochs                 synapse.ChainEpochReader
 	parkedPieces           synapse.ParkedPieceChecker
@@ -142,6 +143,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 		DefaultCopies: 2, MaxRetries: maxRetries, Logger: logger,
+		CommitMaxWait: options.commitMaxWait,
 	})
 	if err != nil {
 		t.Fatalf("new task handlers: %v", err)

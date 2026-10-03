@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -288,6 +289,13 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
+			name:  "worker commit max wait negative",
+			field: "worker.tasks.commit_max_wait",
+			mutate: func(cfg *Config) {
+				cfg.Worker.Tasks.CommitMaxWait = -time.Second
+			},
+		},
+		{
 			name:  "worker commit max wait",
 			field: "worker.tasks.commit_max_wait",
 			mutate: func(cfg *Config) {
@@ -447,6 +455,9 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Worker.Tasks.PollInterval != def.Worker.Tasks.PollInterval {
 		t.Errorf("Worker.Tasks.PollInterval = %s, want %s", cfg.Worker.Tasks.PollInterval, def.Worker.Tasks.PollInterval)
 	}
+	if cfg.Worker.Tasks.CommitMaxWait != 30*time.Minute {
+		t.Errorf("Worker.Tasks.CommitMaxWait = %s, want 30m", cfg.Worker.Tasks.CommitMaxWait)
+	}
 	if cfg.Filecoin.DefaultCopies != 3 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
 	}
@@ -473,6 +484,45 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
 	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
+	}
+}
+
+func TestLoad_CommitMaxWait(t *testing.T) {
+	withUserHomeDir(t, t.TempDir())
+	for _, source := range []string{"toml", "env"} {
+		for _, tt := range []struct {
+			value string
+			want  time.Duration
+		}{
+			{"0s", 0},
+			{"30s", 30 * time.Second},
+			{"30m", 30 * time.Minute},
+		} {
+			t.Run(source+"/"+tt.value, func(t *testing.T) {
+				var path string
+				if source == "env" {
+					t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", tt.value)
+				} else {
+					path = filepath.Join(t.TempDir(), "config.toml")
+					data := []byte("[worker.tasks]\ncommit_max_wait = " + strconv.Quote(tt.value) + "\n")
+					if err := os.WriteFile(path, data, 0o600); err != nil {
+						t.Fatalf("write config: %v", err)
+					}
+				}
+				cfg, err := Load(path)
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				if cfg.Worker.Tasks.CommitMaxWait != tt.want {
+					t.Fatalf("CommitMaxWait = %s, want %s", cfg.Worker.Tasks.CommitMaxWait, tt.want)
+				}
+				validationCfg := validConfig()
+				validationCfg.Worker.Tasks.CommitMaxWait = cfg.Worker.Tasks.CommitMaxWait
+				if err := validationCfg.Validate(); err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+			})
+		}
 	}
 }
 

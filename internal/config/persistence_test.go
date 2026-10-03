@@ -364,6 +364,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"concurrency = 8",
 		"[worker.tasks]",
 		"poll_interval = \"7s\"",
+		"commit_max_wait = \"30m0s\"",
 		"[cache]",
 		"eviction_policy = \"none\"",
 		"lru_high_watermark_percent = 87",
@@ -393,6 +394,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	}
 	if loaded.Worker.Tasks.LeaseDuration != cfg.Worker.Tasks.LeaseDuration {
 		t.Fatalf("Task lease duration = %s, want %s", loaded.Worker.Tasks.LeaseDuration, cfg.Worker.Tasks.LeaseDuration)
+	}
+	if loaded.Worker.Tasks.CommitMaxWait != 30*time.Minute {
+		t.Fatalf("CommitMaxWait = %s, want 30m", loaded.Worker.Tasks.CommitMaxWait)
 	}
 	if loaded.Cache.EvictionPolicy != "none" ||
 		loaded.Cache.LRUHighWatermarkPercent != 87 ||

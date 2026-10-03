@@ -139,10 +139,6 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	}
 	maxPieces := h.commitMaxPieces(run.binding)
 	now := time.Now()
-	state, err := h.deps.Repositories.Contents.CommitQueueState(ctx, run.request.StorageDataSetID, now)
-	if err != nil {
-		return retryTask(err, "commit_queue_load_failed")
-	}
 	oldest := now
 	if members[0].CommitReadyAt != nil {
 		oldest = *members[0].CommitReadyAt
@@ -150,10 +146,7 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	seal, wait := storagecommit.ShouldSeal(storagecommit.SealInput{
 		Members: len(members), OldestJoinedAt: oldest, Now: now,
 		MaxPieces: maxPieces, MaxWait: h.deps.CommitMaxWait,
-		CapacityFree:      state.Submitted < storagecommit.MaxSubmittedRequestsPerDataSet,
-		ReadyWaiting:      state.ReadyHead != "",
-		TransfersInFlight: state.TransfersInFlight,
-		Draining:          state.Draining,
+		Draining: run.binding.Status == model.StorageDataSetStatusDraining,
 	})
 	if !seal {
 		if wait <= 0 || wait > storagePollInterval {

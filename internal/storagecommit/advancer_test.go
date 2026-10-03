@@ -270,31 +270,34 @@ func TestSendTellsRefusalsFromUnknownOutcomes(t *testing.T) {
 	}
 }
 
-func TestShouldSealWaitsForRoomAndStragglers(t *testing.T) {
-	now := time.Now()
+func TestShouldSealHonorsCollectionWindow(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	base := storagecommit.SealInput{
-		Members: 3, OldestJoinedAt: now.Add(-10 * time.Second), Now: now, MaxPieces: 4, MaxWait: 30 * time.Second,
-		CapacityFree: true, TransfersInFlight: true,
+		Members: 1, OldestJoinedAt: now.Add(-10 * time.Minute), Now: now, MaxPieces: 4, MaxWait: 30 * time.Minute,
 	}
 	for _, tt := range []struct {
 		name string
 		edit func(*storagecommit.SealInput)
 		seal bool
+		wait time.Duration
 	}{
-		{"more copies may still join", func(*storagecommit.SealInput) {}, false},
-		{"full", func(in *storagecommit.SealInput) { in.Members = 4 }, true},
-		{"nothing else is transferring", func(in *storagecommit.SealInput) { in.TransfersInFlight = false }, true},
-		{"waited long enough", func(in *storagecommit.SealInput) { in.OldestJoinedAt = now.Add(-time.Minute) }, true},
-		{"no room to send it", func(in *storagecommit.SealInput) { in.TransfersInFlight, in.CapacityFree = false, false }, false},
-		{"an older request goes first", func(in *storagecommit.SealInput) { in.TransfersInFlight, in.ReadyWaiting = false, true }, false},
-		{"draining", func(in *storagecommit.SealInput) { in.CapacityFree, in.Draining = false, true }, true},
-		{"empty", func(in *storagecommit.SealInput) { in.Members = 0 }, false},
+		{"one member", func(*storagecommit.SealInput) {}, false, 20 * time.Minute},
+		{"more members", func(in *storagecommit.SealInput) { in.Members = 3 }, false, 20 * time.Minute},
+		{"later poll", func(in *storagecommit.SealInput) { in.Now = now.Add(5 * time.Minute) }, false, 15 * time.Minute},
+		{"just before deadline", func(in *storagecommit.SealInput) { in.Now = in.OldestJoinedAt.Add(in.MaxWait - time.Nanosecond) }, false, time.Nanosecond},
+		{"at deadline", func(in *storagecommit.SealInput) { in.Now = in.OldestJoinedAt.Add(in.MaxWait) }, true, 0},
+		{"past deadline", func(in *storagecommit.SealInput) { in.Now = in.OldestJoinedAt.Add(in.MaxWait + time.Second) }, true, 0},
+		{"full", func(in *storagecommit.SealInput) { in.Members = 4 }, true, 0},
+		{"draining", func(in *storagecommit.SealInput) { in.Draining = true }, true, 0},
+		{"zero wait", func(in *storagecommit.SealInput) { in.MaxWait = 0 }, true, 0},
+		{"zero wait after clock moved back", func(in *storagecommit.SealInput) { in.MaxWait, in.Now = 0, in.OldestJoinedAt.Add(-time.Second) }, true, 0},
+		{"empty", func(in *storagecommit.SealInput) { in.Members = 0 }, false, 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			in := base
 			tt.edit(&in)
-			if seal, _ := storagecommit.ShouldSeal(in); seal != tt.seal {
-				t.Fatalf("ShouldSeal = %t, want %t", seal, tt.seal)
+			if seal, wait := storagecommit.ShouldSeal(in); seal != tt.seal || wait != tt.wait {
+				t.Fatalf("ShouldSeal = %t, %s, want %t, %s", seal, wait, tt.seal, tt.wait)
 			}
 		})
 	}

@@ -16,14 +16,6 @@ type SealInput struct {
 	Now            time.Time
 	MaxPieces      int
 	MaxWait        time.Duration
-	// CapacityFree reports that the data set has room for another submitted
-	// request.
-	CapacityFree bool
-	// ReadyWaiting reports that a signed request of the data set is waiting
-	// for that room already.
-	ReadyWaiting bool
-	// TransfersInFlight reports that more copies of the data set may join soon.
-	TransfersInFlight bool
 	// Draining means the data set takes no new copies.
 	Draining bool
 }
@@ -35,13 +27,7 @@ func ShouldSeal(in SealInput) (bool, time.Duration) {
 	switch {
 	case in.Members <= 0:
 		return false, 0
-	case in.Members >= in.MaxPieces, in.Draining:
-		return true, 0
-	case !in.CapacityFree || in.ReadyWaiting:
-		// A request signed now could not be sent before the copies arriving
-		// meanwhile, so it keeps collecting until there is room.
-		return false, 0
-	case !in.TransfersInFlight:
+	case in.Members >= in.MaxPieces, in.Draining, in.MaxWait == 0:
 		return true, 0
 	}
 	if waited := in.Now.Sub(in.OldestJoinedAt); waited < in.MaxWait {

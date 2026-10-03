@@ -199,9 +199,7 @@ func (r *BunStorageContentRepo) ListCommitRequestMembers(ctx context.Context, re
 type CommitQueueState struct {
 	Submitted int
 	// ReadyHead is the ready request that may be sent next, if any.
-	ReadyHead         string
-	TransfersInFlight bool
-	Draining          bool
+	ReadyHead string
 }
 
 // CommitQueueState reads the data set's registration queue at now.
@@ -217,23 +215,6 @@ func (r *BunStorageContentRepo) CommitQueueState(ctx context.Context, storageDat
 		return out, err
 	}
 	out.ReadyHead = head
-	inFlight, err := r.db.NewSelect().
-		Model((*model.StorageCopy)(nil)).
-		Join("JOIN tasks AS transfer_task ON transfer_task.id = storage_copy.active_task_id").
-		Where("storage_copy.storage_data_set_id = ?", storageDataSetID).
-		Where("storage_copy.status = ?", model.StorageCopyStatusPending).
-		Where("transfer_task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
-		Exists(ctx)
-	if err != nil {
-		return out, fmt.Errorf("checking storage transfers in flight: %w", err)
-	}
-	out.TransfersInFlight = inFlight
-	var status model.StorageDataSetStatus
-	if err := r.db.NewSelect().Model((*model.StorageDataSet)(nil)).Column("status").
-		Where("id = ?", storageDataSetID).Scan(ctx, &status); err != nil {
-		return out, fmt.Errorf("loading storage data set status: %w", err)
-	}
-	out.Draining = status == model.StorageDataSetStatusDraining
 	return out, nil
 }
 
