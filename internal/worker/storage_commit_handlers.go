@@ -835,7 +835,7 @@ func (h *TaskHandlers) queueCommit(ctx context.Context, repos *repository.Reposi
 	if err != nil {
 		return err
 	}
-	taskID, err := h.enqueueCommitTask(ctx, repos, requestID)
+	taskID, err := h.enqueueCommitTask(ctx, repos, requestID, time.Time{})
 	if err != nil {
 		return err
 	}
@@ -844,7 +844,9 @@ func (h *TaskHandlers) queueCommit(ctx context.Context, repos *repository.Reposi
 	})
 }
 
-func (h *TaskHandlers) enqueueCommitTask(ctx context.Context, repos *repository.Repositories, requestID string) (int64, error) {
+// enqueueCommitTask creates the task that drives a request, runnable from
+// availableAt (now when zero).
+func (h *TaskHandlers) enqueueCommitTask(ctx context.Context, repos *repository.Repositories, requestID string, availableAt time.Time) (int64, error) {
 	if h.taskService == nil {
 		return 0, errors.New("task service is unavailable")
 	}
@@ -852,6 +854,7 @@ func (h *TaskHandlers) enqueueCommitTask(ctx context.Context, repos *repository.
 		Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
 		Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
 		SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: requestID,
+		AvailableAt: availableAt,
 	})
 	if err != nil {
 		return 0, err

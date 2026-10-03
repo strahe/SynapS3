@@ -1520,7 +1520,10 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 			commitRequest := repository.CreatePullCommitRequestInput{RequestID: requestID, PieceCID: source.PieceCID, ExtraDataHex: extraHex}
 			if newRequest {
-				taskID, err := h.enqueueCommitTask(ctx, repos, requestID)
+				// The Pull's result wakes the request's task. Running before
+				// then would only find its piece still in transfer, and a wake
+				// that arrives while it runs is lost until the next backstop.
+				taskID, err := h.enqueueCommitTask(ctx, repos, requestID, time.Now().Add(storageDependencyWait))
 				if err != nil {
 					return err
 				}
