@@ -1,6 +1,6 @@
 // Package storagepull owns the ledger of provider-side copy attempts. A pull
 // asks a target provider to fetch one piece from a source provider. The target
-// request is idempotent through its commit extra data, while AttemptID identifies
+// request is idempotent through its authorization extra data; AttemptID names
 // the internal ledger row across recovery.
 package storagepull
 
@@ -12,12 +12,9 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// AttemptStatus is deliberately two-valued. A commit needs five states because
-// its effect is an on-chain transaction that can hang and cost gas; a pull's
-// effect is a transfer request the target can be asked about directly, and
-// success is recorded on the copy reaching piece_ready. Termination is
-// resolved_at, so a resolved attempt is a success and a resolved abandoned one
-// is a request nobody will observe again.
+// AttemptStatus distinguishes replayable requests from abandoned ones.
+// ResolvedAt records completion: a resolved attempted row succeeded, while a
+// resolved abandoned row will no longer be observed or replayed.
 type AttemptStatus string
 
 const (
@@ -25,9 +22,8 @@ const (
 	AttemptStatusAbandoned AttemptStatus = "abandoned"
 )
 
-// Attempt is one request sent to a target provider. Every source field is NOT
-// NULL: an attempt that exists is fully identified, which is what the old
-// all-or-nothing check constraint tried to express across nullable columns.
+// Attempt records the source and authorization before a request reaches the
+// target provider. Recovery replays this request without changing its identity.
 type Attempt struct {
 	bun.BaseModel `bun:"table:storage_pull_attempts,alias:storage_pull_attempt"`
 
@@ -43,6 +39,7 @@ type Attempt struct {
 	// SourcePieceCID names the piece itself, distinct from the content's own CID.
 	SourcePieceCID     string     `bun:"type:text,notnull"`
 	SourceRetrievalURL string     `bun:"type:text,notnull"`
+	ExtraDataHex       string     `bun:"type:text,notnull"`
 	LastError          *string    `bun:"type:text,nullzero"`
 	AttemptedAt        time.Time  `bun:",nullzero,notnull"`
 	ResolvedAt         *time.Time `bun:",nullzero"`

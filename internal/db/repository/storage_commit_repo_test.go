@@ -45,9 +45,9 @@ var commitLedgerCases = []struct {
 	{"CommitSubmissionTakesTheOldestEligibleRequestWithinCapacity", testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity},
 	{"CommitRefusalReturnsRequestToReadyUntilItsRetryIsDue", testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue},
 	{"CommitConfirmationCommitsMembersByPositionAndReplays", testCommitConfirmationCommitsMembersByPositionAndReplays},
-	{"SignedCommitMembersAreDecidedByTheirRequest", testSignedCommitMembersAreDecidedByTheirRequest},
+	{"SignedSingleMemberIsDecidedByItsRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 1) }},
+	{"SignedBatchMembersAreDecidedByTheirRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 2) }},
 	{"RetainedCommitTaskIsKeptWhileItsRequestIsOpen", testRetainedCommitTaskIsKeptWhileItsRequestIsOpen},
-	{"UnsentSinglePieceRequestIsGivenUpWithItsCopy", testUnsentSinglePieceRequestIsGivenUpWithItsCopy},
 	{"StoppedRequestDoesNotHoldTheQueue", testStoppedRequestDoesNotHoldTheQueue},
 	{"LateTransferOfACommittedMemberCompletes", testLateTransferOfACommittedMemberCompletes},
 }
@@ -340,11 +340,15 @@ func testCommitConfirmationCommitsMembersByPositionAndReplays(t *testing.T, f co
 	}
 }
 
-func testSignedCommitMembersAreDecidedByTheirRequest(t *testing.T, f commitFixture) {
+func testSignedCommitMembersAreDecidedByTheirRequest(t *testing.T, f commitFixture, count int) {
 	ctx := t.Context()
-	copyRow, other := f.transferredCopy(t, "pinned"), f.transferredCopy(t, "pinned-other")
-	taskID := f.collecting(t, "pinned", copyRow, other)
-	f.seal(t, "pinned", taskID, copyRow, other)
+	copyRow := f.transferredCopy(t, "pinned")
+	copies := []*model.StorageCopy{copyRow}
+	if count == 2 {
+		copies = append(copies, f.transferredCopy(t, "pinned-other"))
+	}
+	taskID := f.collecting(t, "pinned", copies...)
+	f.seal(t, "pinned", taskID, copies...)
 	fail := func() error {
 		return f.repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{
 			StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: "stop",
@@ -353,13 +357,16 @@ func testSignedCommitMembersAreDecidedByTheirRequest(t *testing.T, f commitFixtu
 	if err := fail(); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("failing a signed member = %v, want conflict", err)
 	}
-	if backlog, err := f.repos.Contents.CountCommitBacklog(ctx, f.dataSetID); err != nil || backlog != 2 {
+	if _, err := f.repos.Contents.AbandonCommitRequest(ctx, repository.AbandonCommitRequestInput{RequestID: "pinned", Reason: "stop"}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("abandoning a sealed request without its task = %v, want conflict", err)
+	}
+	if backlog, err := f.repos.Contents.CountCommitBacklog(ctx, f.dataSetID); err != nil || backlog != count {
 		t.Fatalf("backlog = %d, %v, want the unsent members", backlog, err)
 	}
 	members, err := f.repos.Contents.AbandonCommitRequest(ctx, repository.AbandonCommitRequestInput{
 		RequestID: "pinned", TaskID: taskID, Reason: "the storage service ended",
 	})
-	if err != nil || len(members) != 2 {
+	if err != nil || len(members) != count {
 		t.Fatalf("AbandonCommitRequest = %#v, %v", members, err)
 	}
 	released := f.copy(t, copyRow.ID)
@@ -386,22 +393,6 @@ func testRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T, f commitFix
 	}
 	if deleted, err := f.repos.Tasks.DeleteRetained(ctx, time.Now(), 10); err != nil || deleted != 0 {
 		t.Fatalf("DeleteRetained = %d, %v, want the request's task kept", deleted, err)
-	}
-}
-
-func testUnsentSinglePieceRequestIsGivenUpWithItsCopy(t *testing.T, f commitFixture) {
-	ctx := t.Context()
-	_, copyRow := f.sealedRequest(t, "solo")
-	if err := f.repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{
-		StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: "pull failed",
-	}); err != nil {
-		t.Fatalf("failing the copy of an unsent single-piece request: %v", err)
-	}
-	if request := f.request(t, "solo"); request.Status != storagecommit.RequestStatusAbandoned {
-		t.Fatalf("request after its copy failed = %#v, want abandoned", request)
-	}
-	if failed := f.copy(t, copyRow.ID); failed.Status != model.StorageCopyStatusFailed || failed.CommitRequestID != nil {
-		t.Fatalf("failed copy = %#v", failed)
 	}
 }
 

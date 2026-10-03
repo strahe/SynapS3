@@ -190,15 +190,9 @@ func (c StorageCopy) CommitPinned() bool {
 		(c.CommitState == nil || (*c.CommitState != "confirmed" && *c.CommitState != "abandoned"))
 }
 
-// CommitDecidedByRequest reports whether only the copy's request may settle
-// it. A Pull's single-piece request that was never sent can still be given up
-// with the copy; every other signed request decides its members.
+// CommitDecidedByRequest reports whether only the copy's request may settle it.
 func (c StorageCopy) CommitDecidedByRequest() bool {
-	if !c.CommitPinned() {
-		return false
-	}
-	solo := c.CommitPieceCount != nil && *c.CommitPieceCount == 1
-	return c.CommitSentAt != nil || !solo
+	return c.CommitPinned()
 }
 
 // WorkTaskID is the task currently responsible for the copy: its own transfer
@@ -207,7 +201,7 @@ func (c StorageCopy) WorkTaskID() *int64 {
 	if c.ActiveTaskID != nil {
 		return c.ActiveTaskID
 	}
-	if c.CommitRequestID != nil && (c.Status == StorageCopyStatusPieceReady || c.Status == StorageCopyStatusCommitting) {
+	if c.CommitRequestID != nil && (c.CommitPinned() || c.Status == StorageCopyStatusPieceReady || c.Status == StorageCopyStatusCommitting) {
 		return c.CommitTaskID
 	}
 	return nil

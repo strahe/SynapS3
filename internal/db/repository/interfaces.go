@@ -9,6 +9,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
@@ -389,9 +390,7 @@ type ReservePullRequestInput struct {
 	SourcePieceID      *types.OnChainID
 	SourcePieceCID     string
 	SourceRetrievalURL string
-	// CommitRequest is the single-piece request the Pull sends. It is recorded
-	// with the pull attempt, before the provider receives it.
-	CommitRequest CreatePullCommitRequestInput
+	ExtraDataHex       string
 }
 
 // StorageCopyID names the exact copy row to write. A task that was
@@ -503,6 +502,8 @@ type StorageContentRepository interface {
 	BindCopyTask(ctx context.Context, copyID, generation, taskID int64) error
 	AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error)
 	ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error
+	GetPullAttempt(ctx context.Context, attemptID string, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
+	GetUnresolvedPullAttempt(ctx context.Context, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
 	SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error
 	AbandonMigrationPull(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error
 	PromotePendingIngress(ctx context.Context, contentID int64) (*model.StorageCopy, error)

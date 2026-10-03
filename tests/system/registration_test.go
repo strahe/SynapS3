@@ -99,8 +99,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 		t.Fatalf("committed copies = %d, want %d", copies, objects*config.DefaultFilecoinCopies)
 	}
 
-	// Pull replicas register one piece each, so only the primary copies can
-	// share a registration.
+	// Uploads and Pull replicas share the same batching policy.
 	registrations := 0
 	path := "/api/v1/tasks?type=storage_commit&limit=100"
 	for {
@@ -120,9 +119,8 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 		}
 		path = "/api/v1/tasks?type=storage_commit&limit=100&cursor=" + strconv.FormatInt(*tasks.NextCursor, 10)
 	}
-	pulled := objects * (config.DefaultFilecoinCopies - 1)
-	if primary := registrations - pulled; primary < 1 || primary > objects/2 {
-		t.Fatalf("registrations = %d for %d pulled and %d primary copies, want the primary copies registered at least two at a time",
-			registrations, pulled, objects)
+	if registrations < config.DefaultFilecoinCopies || registrations > copies/2 {
+		t.Fatalf("registrations = %d for %d copies, want at least two copies per registration on average",
+			registrations, copies)
 	}
 }

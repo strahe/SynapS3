@@ -71,9 +71,9 @@ func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID,
 				return ErrConflict
 			}
 		}
-		// The Pull's request named a piece the target never received; a Store
-		// from cache registers through a request of its own.
-		if err := abandonUnsentPullCommitRequest(ctx, db, copyID, "pull failed; recovering from cache", now); err != nil {
+		// Unsealed membership can change; a sealed request keeps its members
+		// and authorization while Store restores the missing piece.
+		if err := releaseCollectingCommitMembership(ctx, db, copyID, now); err != nil {
 			return err
 		}
 		result, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
@@ -83,7 +83,7 @@ func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID,
 			Set("updated_at = ?", now).
 			Where("id = ? AND work_generation = ? AND active_task_id = ?", copyID, generation, taskID).
 			Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodPeerPull).
-			Where("commit_request_id IS NULL").Exec(ctx)
+			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("setting cache restore transfer: %w", err)
 		}
@@ -103,6 +103,7 @@ func (r *BunStorageContentRepo) AbandonMigrationPull(ctx context.Context, copyID
 		if err := db.NewSelect().Model(copyRow).
 			Where("id = ? AND work_generation = ? AND active_task_id = ?", copyID, generation, taskID).
 			Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodPeerPull).
+			Where("commit_position IS NULL").
 			Scan(ctx); err != nil {
 			return err
 		}
@@ -123,7 +124,7 @@ func (r *BunStorageContentRepo) AbandonMigrationPull(ctx context.Context, copyID
 		if rows, _ := result.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		return abandonUnsentPullCommitRequest(ctx, db, copyID, "pull failed; local cache unavailable", now)
+		return releaseCollectingCommitMembership(ctx, db, copyID, now)
 	})
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -64,11 +65,16 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
-	for _, uploadContext := range contexts[1:] {
+	pullAuthorizations := make([][]byte, len(contexts)-1)
+	for i, uploadContext := range contexts[1:] {
+		pullAuthorizations[i], err = uploadContext.PresignForCommit(ctx, []storage.PieceInput{piece})
+		if err != nil {
+			t.Fatal(err)
+		}
 		wg.Go(func() {
 			_, pullErr := uploadContext.Pull(ctx, storage.PullRequest{
-				Pieces: []cid.Cid{stored.PieceCID},
-				From:   contexts[0].PieceURL,
+				Pieces: []cid.Cid{stored.PieceCID}, ExtraData: pullAuthorizations[i],
+				From: contexts[0].PieceURL,
 			})
 			errCh <- pullErr
 		})
@@ -92,6 +98,21 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 		status, err := uploadContext.GetCommitStatus(ctx, submission.StatusURL)
 		if err != nil || status == nil || status.State != storage.CommitStateConfirmed || len(status.PieceIDs) != 1 {
 			t.Fatalf("GetCommitStatus provider %s: status=%#v err=%v", uploadContext.ProviderID().String(), status, err)
+		}
+	}
+
+	for i, authorization := range pullAuthorizations {
+		nonce, err := storagecommit.ExtraDataNonce(authorization)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, err := filecoin.ClientNonce(ctx, nonce)
+		if err != nil || state.Consumed {
+			t.Fatalf("Pull authorization after Commit = %#v, %v, want unconsumed", state, err)
+		}
+		// B does not revoke A or prevent another registration of the same CID.
+		if _, err := contexts[i+1].SubmitCommit(ctx, storage.CommitRequest{Pieces: []storage.PieceInput{piece}, ExtraData: authorization}); err != nil {
+			t.Fatalf("residual Pull authorization: %v", err)
 		}
 	}
 
@@ -160,5 +181,70 @@ func TestMemoryFilecoinRejectsInvalidSequenceAndCancellation(t *testing.T) {
 	cancel()
 	if _, err := filecoin.SelectUploadTargets(cancelled, storage.SelectUploadContextsOptions{Copies: 1}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("SelectUploadTargets cancelled error = %v, want context.Canceled", err)
+	}
+}
+
+func TestMemoryFilecoinAuthorizationBindsTargetAndOrderedPieces(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	filecoin := NewMemoryFilecoin()
+	selected, err := filecoin.SelectUploadTargets(ctx, storage.SelectUploadContextsOptions{Copies: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targets []synapse.DataSetTarget
+	for _, provider := range selected {
+		created, err := provider.(synapse.ProviderTarget).CreateDataSet(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		providerID := created.DataSet.ProviderID()
+		target, err := filecoin.OpenDataSetTarget(ctx, created.DataSet.DataSetID(), storage.NewDataSetContextOptions{ProviderID: &providerID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets = append(targets, target)
+	}
+	var inputs []storage.PieceInput
+	for _, data := range []string{"first piece", "second piece"} {
+		stored, err := targets[0].Store(ctx, bytes.NewReader(bytes.Repeat([]byte(data), 128)), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inputs = append(inputs, storage.PieceInput{PieceCID: stored.PieceCID})
+	}
+	extra, err := targets[1].PresignForCommit(ctx, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered := []cid.Cid{inputs[0].PieceCID, inputs[1].PieceCID}
+	reversed := []cid.Cid{inputs[1].PieceCID, inputs[0].PieceCID}
+	for _, mismatch := range []struct {
+		name   string
+		target synapse.DataSetTarget
+		pieces []cid.Cid
+	}{
+		{"target", targets[0], ordered},
+		{"order", targets[1], reversed},
+		{"membership", targets[1], ordered[:1]},
+	} {
+		t.Run(mismatch.name, func(t *testing.T) {
+			if _, err := mismatch.target.Pull(ctx, storage.PullRequest{Pieces: mismatch.pieces, ExtraData: extra, From: targets[0].PieceURL}); !errors.Is(err, errInvalidFilecoinSequence) {
+				t.Fatalf("mismatched Pull = %v", err)
+			}
+			pieces := make([]storage.PieceInput, len(mismatch.pieces))
+			for i, pieceCID := range mismatch.pieces {
+				pieces[i] = storage.PieceInput{PieceCID: pieceCID}
+			}
+			if _, err := mismatch.target.SubmitCommit(ctx, storage.CommitRequest{Pieces: pieces, ExtraData: extra}); !errors.Is(err, errInvalidFilecoinSequence) {
+				t.Fatalf("mismatched Commit = %v", err)
+			}
+		})
+	}
+	if _, err := targets[1].Pull(ctx, storage.PullRequest{Pieces: ordered, ExtraData: extra, From: targets[0].PieceURL}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := targets[1].SubmitCommit(ctx, storage.CommitRequest{Pieces: inputs, ExtraData: extra}); err != nil {
+		t.Fatal(err)
 	}
 }

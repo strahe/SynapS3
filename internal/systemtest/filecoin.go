@@ -40,7 +40,12 @@ type memoryDataSet struct {
 	provider sdktypes.BigInt
 	metadata map[string]string
 	withCDN  bool
-	pieces   map[string]sdktypes.BigInt
+	pieces   map[string]cid.Cid
+}
+
+type memoryAuthorization struct {
+	dataSetID string
+	pieces    []string
 }
 
 type memoryPiece struct {
@@ -53,11 +58,14 @@ type memoryPiece struct {
 type MemoryFilecoin struct {
 	mu sync.RWMutex
 
-	providers         []sdktypes.BigInt
-	dataSets          map[string]*memoryDataSet
-	pendingDataSets   map[string]sdktypes.BigInt
-	submissions       map[string]sdktypes.BigInt
-	commitSubmissions map[string]storage.CommitSubmission
+	providers              []sdktypes.BigInt
+	dataSets               map[string]*memoryDataSet
+	pendingDataSets        map[string]sdktypes.BigInt
+	submissions            map[string]sdktypes.BigInt
+	commitSubmissions      map[string]storage.CommitSubmission
+	commitPieceIDs         map[string][]sdktypes.BigInt
+	authorizations         map[string]memoryAuthorization
+	commitsByAuthorization map[string]storage.CommitSubmission
 	// clientNonces records, by add-pieces nonce, what FWSS would: the data set
 	// the pieces joined and the piece ID it assigns next.
 	clientNonces map[string]synapse.ClientNonceState
@@ -90,16 +98,19 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 			sdktypes.NewBigInt(103),
 			sdktypes.NewBigInt(104),
 		},
-		dataSets:          make(map[string]*memoryDataSet),
-		pendingDataSets:   make(map[string]sdktypes.BigInt),
-		submissions:       make(map[string]sdktypes.BigInt),
-		commitSubmissions: make(map[string]storage.CommitSubmission),
-		clientNonces:      make(map[string]synapse.ClientNonceState),
-		pieces:            make(map[string]*memoryPiece),
-		nextDataSet:       make(map[string]uint64),
-		nextPiece:         1,
-		terminated:        make(map[string]int64),
-		epoch:             1000,
+		dataSets:               make(map[string]*memoryDataSet),
+		pendingDataSets:        make(map[string]sdktypes.BigInt),
+		submissions:            make(map[string]sdktypes.BigInt),
+		commitSubmissions:      make(map[string]storage.CommitSubmission),
+		commitPieceIDs:         make(map[string][]sdktypes.BigInt),
+		authorizations:         make(map[string]memoryAuthorization),
+		commitsByAuthorization: make(map[string]storage.CommitSubmission),
+		clientNonces:           make(map[string]synapse.ClientNonceState),
+		pieces:                 make(map[string]*memoryPiece),
+		nextDataSet:            make(map[string]uint64),
+		nextPiece:              1,
+		terminated:             make(map[string]int64),
+		epoch:                  1000,
 	}
 }
 
@@ -367,7 +378,7 @@ func (c *memoryProviderTarget) CreateDataSet(ctx context.Context, opts *storage.
 	dataSet := &memoryDataSet{
 		id: id.Copy(), clientID: clientID.Copy(), provider: c.provider.Copy(),
 		metadata: cloneMemoryMetadata(c.metadata), withCDN: c.withCDN,
-		pieces: make(map[string]sdktypes.BigInt),
+		pieces: make(map[string]cid.Cid),
 	}
 	m.dataSets[id.String()] = dataSet
 	delete(m.pendingDataSets, providerKey)
@@ -492,7 +503,33 @@ func (c *memoryDataSetTarget) PresignForCommit(ctx context.Context, pieces []sto
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
-	return memoryAddPiecesExtraData.Pack(new(big.Int).SetBytes(nonce[:]), [][]string{}, [][]string{}, []byte("commit-"+c.provider.String()))
+	extra, err := memoryAddPiecesExtraData.Pack(new(big.Int).SetBytes(nonce[:]), [][]string{}, [][]string{}, []byte("commit-"+c.provider.String()))
+	if err != nil {
+		return nil, err
+	}
+	ordered := make([]string, len(pieces))
+	for i, input := range pieces {
+		ordered[i] = input.PieceCID.String()
+	}
+	c.filecoin.mu.Lock()
+	c.filecoin.authorizations[string(extra)] = memoryAuthorization{dataSetID: c.DataSetID().String(), pieces: ordered}
+	c.filecoin.mu.Unlock()
+	return extra, nil
+}
+
+// validateAuthorization runs with the Filecoin lock held and checks the signed
+// target and ordered CID list for both transfer and registration.
+func (c *memoryDataSetTarget) validateAuthorization(extra []byte, pieces []cid.Cid) error {
+	authorization, ok := c.filecoin.authorizations[string(extra)]
+	if !ok || authorization.dataSetID != c.DataSetID().String() || len(authorization.pieces) != len(pieces) {
+		return fmt.Errorf("%w: authorization does not match target and pieces", errInvalidFilecoinSequence)
+	}
+	for i, pieceCID := range pieces {
+		if authorization.pieces[i] != pieceCID.String() {
+			return fmt.Errorf("%w: authorization does not match ordered pieces", errInvalidFilecoinSequence)
+		}
+	}
+	return nil
 }
 
 // memoryAddPiecesExtraData encodes extra data the way the SDK signs an
@@ -515,6 +552,19 @@ func (c *memoryDataSetTarget) Pull(ctx context.Context, request storage.PullRequ
 	}
 	if c.DataSetID() == nil || len(request.Pieces) == 0 {
 		return nil, fmt.Errorf("%w: pull requires a dataset and pieces", errInvalidFilecoinSequence)
+	}
+	c.filecoin.mu.RLock()
+	err := c.validateAuthorization(request.ExtraData, request.Pieces)
+	if err == nil {
+		nonce, parseErr := storagecommit.ExtraDataNonce(request.ExtraData)
+		err = parseErr
+		if err == nil && c.filecoin.clientNonces[nonce.String()].Consumed {
+			err = fmt.Errorf("%w: pull authorization nonce was consumed", errInvalidFilecoinSequence)
+		}
+	}
+	c.filecoin.mu.RUnlock()
+	if err != nil {
+		return nil, err
 	}
 	results := make([]storage.PullPieceResult, 0, len(request.Pieces))
 	for _, pieceCID := range request.Pieces {
@@ -550,6 +600,21 @@ func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.
 		return nil, fmt.Errorf("%w: %w", errInvalidFilecoinSequence, err)
 	}
 	c.filecoin.mu.Lock()
+	if err := c.validateAuthorization(request.ExtraData, pieceCIDs(request.Pieces)); err != nil {
+		c.filecoin.mu.Unlock()
+		return nil, err
+	}
+	if previous, ok := c.filecoin.commitsByAuthorization[string(request.ExtraData)]; ok {
+		c.filecoin.mu.Unlock()
+		if request.OnSubmitted != nil {
+			request.OnSubmitted(previous)
+		}
+		return &previous, nil
+	}
+	if c.filecoin.clientNonces[nonce.String()].Consumed {
+		c.filecoin.mu.Unlock()
+		return nil, fmt.Errorf("%w: authorization nonce was consumed", errInvalidFilecoinSequence)
+	}
 	dataSet := c.filecoin.dataSets[dataSetID.String()]
 	if dataSet == nil || !dataSet.provider.Equal(c.provider) {
 		c.filecoin.mu.Unlock()
@@ -566,12 +631,12 @@ func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.
 			c.filecoin.mu.Unlock()
 			return nil, fmt.Errorf("%w: provider %s has not stored %s", errInvalidFilecoinSequence, c.provider.String(), input.PieceCID)
 		}
-		pieceID, exists := dataSet.pieces[input.PieceCID.String()]
-		if !exists {
-			pieceID = sdktypes.NewBigInt(c.filecoin.nextPiece)
-			c.filecoin.nextPiece++
-			dataSet.pieces[input.PieceCID.String()] = pieceID.Copy()
-		}
+	}
+	for _, input := range request.Pieces {
+		piece := c.filecoin.pieces[input.PieceCID.String()]
+		pieceID := sdktypes.NewBigInt(c.filecoin.nextPiece)
+		c.filecoin.nextPiece++
+		dataSet.pieces[pieceID.String()] = input.PieceCID
 		pieceIDs = append(pieceIDs, pieceID.Copy())
 		piece.committedDataSets[dataSetID.String()] = struct{}{}
 	}
@@ -586,15 +651,15 @@ func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.
 		}
 	}
 	txID := fmt.Sprintf("commit-%s-%s", dataSetID.String(), pieceIDs[0].String())
-	c.filecoin.mu.Unlock()
 	submission := storage.CommitSubmission{
 		Kind: storage.CommitKindAddPieces, TransactionID: txID,
 		StatusURL:  c.ServiceURL() + "/status/" + txID,
 		ProviderID: c.provider.Copy(), DataSet: &c.ref,
 		PieceCIDs: append([]cid.Cid(nil), pieceCIDs(request.Pieces)...),
 	}
-	c.filecoin.mu.Lock()
 	c.filecoin.commitSubmissions[submission.StatusURL] = submission
+	c.filecoin.commitPieceIDs[submission.StatusURL] = pieceIDs
+	c.filecoin.commitsByAuthorization[string(request.ExtraData)] = submission
 	c.filecoin.mu.Unlock()
 	if request.OnSubmitted != nil {
 		request.OnSubmitted(submission)
@@ -620,16 +685,9 @@ func (c *memoryDataSetTarget) GetCommitStatus(ctx context.Context, statusURL str
 	if dataSet == nil || !dataSet.provider.Equal(c.provider) {
 		return nil, fmt.Errorf("%w: dataset %s is unavailable", errInvalidFilecoinSequence, dataSetID.String())
 	}
-	pieceIDs := make([]sdktypes.BigInt, 0, len(submission.PieceCIDs))
-	for _, pieceCID := range submission.PieceCIDs {
-		pieceID, ok := dataSet.pieces[pieceCID.String()]
-		if !ok {
-			return &storage.CommitStatus{
-				Kind: storage.CommitKindAddPieces, State: storage.CommitStatePending,
-				TransactionID: submission.TransactionID, DataSet: &c.ref,
-			}, nil
-		}
-		pieceIDs = append(pieceIDs, pieceID.Copy())
+	pieceIDs := c.filecoin.commitPieceIDs[statusURL]
+	if len(pieceIDs) != len(submission.PieceCIDs) {
+		return nil, fmt.Errorf("%w: commit piece IDs are missing", errInvalidFilecoinSequence)
 	}
 	expectedTxID := fmt.Sprintf("commit-%s-%s", dataSetID.String(), pieceIDs[0].String())
 	if submission.TransactionID != expectedTxID {
@@ -679,12 +737,7 @@ func (m *MemoryFilecoin) PieceCIDAt(ctx context.Context, dataSetID, pieceID sdkt
 	if dataSet == nil {
 		return cid.Undef, nil
 	}
-	for pieceCID, storedID := range dataSet.pieces {
-		if storedID.Equal(pieceID) {
-			return cid.Parse(pieceCID)
-		}
-	}
-	return cid.Undef, nil
+	return dataSet.pieces[pieceID.String()], nil
 }
 
 func pieceCIDs(pieces []storage.PieceInput) []cid.Cid {
@@ -709,16 +762,22 @@ func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdkty
 	if dataSet == nil {
 		return nil, fmt.Errorf("memory filecoin: unknown dataset %s", dataSetID.String())
 	}
-	for pieceCID, storedID := range dataSet.pieces {
-		if storedID.Equal(pieceID) {
-			delete(dataSet.pieces, pieceCID)
-			if piece := c.filecoin.pieces[pieceCID]; piece != nil {
-				delete(piece.committedDataSets, dataSetID.String())
-			}
-			return &sdktypes.WriteResult{Hash: common.HexToHash(pieceID.String())}, nil
+	pieceCID, found := dataSet.pieces[pieceID.String()]
+	if !found {
+		return nil, fmt.Errorf("memory filecoin: unknown piece ID %s", pieceID.String())
+	}
+	delete(dataSet.pieces, pieceID.String())
+	stillRegistered := false
+	for _, other := range dataSet.pieces {
+		if other.Equals(pieceCID) {
+			stillRegistered = true
+			break
 		}
 	}
-	return nil, fmt.Errorf("memory filecoin: unknown piece ID %s", pieceID.String())
+	if !stillRegistered {
+		delete(c.filecoin.pieces[pieceCID.String()].committedDataSets, dataSetID.String())
+	}
+	return &sdktypes.WriteResult{Hash: common.HexToHash(pieceID.String())}, nil
 }
 
 func (m *MemoryFilecoin) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {
@@ -731,10 +790,8 @@ func (m *MemoryFilecoin) DeletionState(ctx context.Context, dataSetID, pieceID s
 	if dataSet == nil {
 		return synapse.CleanupPieceState{BlockNumber: uint64(m.epoch)}, nil
 	}
-	for _, storedID := range dataSet.pieces {
-		if storedID.Equal(pieceID) {
-			return synapse.CleanupPieceState{Live: true, BlockNumber: uint64(m.epoch)}, nil
-		}
+	if _, found := dataSet.pieces[pieceID.String()]; found {
+		return synapse.CleanupPieceState{Live: true, BlockNumber: uint64(m.epoch)}, nil
 	}
 	return synapse.CleanupPieceState{BlockNumber: uint64(m.epoch)}, nil
 }
@@ -753,16 +810,19 @@ func (c *memoryDataSetTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid)
 	if dataSet == nil {
 		return nil, fmt.Errorf("memory filecoin: unknown dataset %s", dataSetID.String())
 	}
-	pieceID, ok := dataSet.pieces[pieceCID.String()]
+	var pieceID sdktypes.BigInt
+	ok := false
+	for id, storedCID := range dataSet.pieces {
+		if storedCID.Equals(pieceCID) {
+			pieceID, _ = sdktypes.ParseBigInt(id)
+			ok = true
+			break
+		}
+	}
 	if !ok {
 		return nil, fmt.Errorf("memory filecoin: unknown CID %s", pieceCID)
 	}
 	return &storage.PieceStatus{Exists: true, PieceID: pieceID.Copy(), RetrievalURL: c.PieceURL(pieceCID)}, nil
-}
-
-func copyBigIntPtr(value sdktypes.BigInt) *sdktypes.BigInt {
-	copy := value.Copy()
-	return &copy
 }
 
 // GetWalletInfo returns a complete, funded wallet snapshot.

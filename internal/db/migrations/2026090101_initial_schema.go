@@ -625,6 +625,7 @@ type storagePullAttempt2026090101 struct {
 	SourcePieceID      string    `bun:"type:text,notnull"`
 	SourcePieceCID     string    `bun:"type:text,notnull"`
 	SourceRetrievalURL string    `bun:"type:text,notnull"`
+	ExtraDataHex       string    `bun:"type:text,notnull"`
 	LastError          *string   `bun:"type:text"`
 	AttemptedAt        time.Time `bun:",notnull"`
 	ResolvedAt         *time.Time
@@ -901,6 +902,7 @@ func storagePullAttemptTable2026090101() initialTableSpec {
 		model: (*storagePullAttempt2026090101)(nil),
 		constraints: []string{
 			"CONSTRAINT chk_storage_pull_attempts_identity CHECK (attempt_id <> '' AND source_provider_id <> '' AND source_data_set_id <> '' AND source_piece_id <> '' AND source_piece_cid <> '' AND source_retrieval_url <> '')",
+			"CONSTRAINT chk_storage_pull_attempts_authorization CHECK (extra_data_hex <> '')",
 			"CONSTRAINT chk_storage_pull_attempts_status CHECK (status IN ('attempted', 'abandoned'))",
 			// An error only makes sense on a request nobody will observe again;
 			// reopening a copy carries no error string.
