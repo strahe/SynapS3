@@ -1,5 +1,6 @@
 import type { ObservabilityFreshness, OverviewData } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
+import { taskOperationLabels } from './tasks.ts'
 import { timeAgo, titleCaseEnum } from './utils.ts'
 
 export type AttentionTone = 'warning' | 'danger'
@@ -73,28 +74,6 @@ const filecoinStorageHealthLevelStyles: Record<FilecoinStorageHealthLevel, Filec
 const workerOrder = ['tasks']
 const workerLabels: Record<string, string> = {
   tasks: 'Task Engine',
-}
-
-const taskOperationLabels: Record<string, string> = {
-  bucket_provision: 'Prepare bucket storage',
-  upload_plan: 'Prepare upload',
-  storage_dataset_ensure: 'Prepare storage',
-  storage_transfer_plan: 'Plan transfer',
-  storage_store: 'Store content',
-  storage_pull: 'Transfer content',
-  storage_commit: 'Confirm storage',
-  provider_replacement_coordinate: 'Replace provider',
-  cache_capacity_reconcile: 'Manage local cache capacity',
-  cache_evict: 'Remove cached copy',
-  cache_reconcile_durability: 'Review durability',
-  storage_cleanup: 'Remove remote copy',
-  storage_dataset_retire: 'Retire service',
-  wallet_operation: 'Wallet request',
-  observability_refresh: 'Refresh health',
-  approved_provider_refresh: 'Refresh approved providers',
-  endorsed_provider_refresh: 'Refresh endorsed providers',
-  provider_upload_speed_test: 'Test provider upload speed',
-  task_gc: 'Remove expired task records',
 }
 
 export function workerHealthRows(workers: Record<string, boolean>) {

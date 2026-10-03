@@ -703,6 +703,36 @@ export interface TaskItem {
   storage_confirmation?: TaskStorageConfirmation
 }
 
+export interface TaskSubjectProvider {
+  id: string
+  name?: string
+  service_url?: string
+}
+
+export interface TaskSubjectInfo {
+  subject_type:
+    | 'storage_content'
+    | 'storage_copy'
+    | 'storage_data_set'
+    | 'bucket'
+    | 'provider'
+    | 'storage_replacement'
+    | 'wallet_operation'
+    | 'storage_commit_request'
+  subject_key: string
+  bucket?: string
+  file?: { key: string; source: 'current' | 'historical' | 'deleted'; other_versions: number }
+  size?: number
+  copy_index?: number
+  local_data_set_id?: number
+  data_set_id?: string
+  provider?: TaskSubjectProvider
+  source_provider?: TaskSubjectProvider
+  target_provider?: TaskSubjectProvider
+  wallet?: { operation: 'fund' | 'withdraw' | 'approve'; amount?: string }
+  content_count?: number
+}
+
 /** The storage registration a Confirm storage task holds while it is flagged for attention. */
 export interface TaskStorageConfirmation {
   request_id: string
@@ -1241,6 +1271,8 @@ export const api = {
     return fetchJSON<TaskListResponse>(`/tasks${qs ? `?${qs}` : ''}`)
   },
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
+  getTaskSubject: (type: TaskSubjectInfo['subject_type'], key: string, signal?: AbortSignal) =>
+    fetchJSON<TaskSubjectInfo>(`/task-subjects/${encodeURIComponent(type)}/${encodeURIComponent(key)}`, { signal }),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
   acknowledgeTask: (id: number) => fetchJSON(`/tasks/${id}/acknowledge`, { method: 'POST' }),
   previewAcknowledgeTasks: (payload: { type?: string }) => {

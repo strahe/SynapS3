@@ -62,8 +62,8 @@ test('pipeline rows use task types and the five-state active breakdown', () => {
   ])
 
   assert.deepEqual(rows, [
+    { key: 'storage_pull', label: 'Copy data', total: 5, pending: 2, running: 3 },
     { key: 'upload_plan', label: 'Prepare upload', total: 1, pending: 0, running: 1 },
-    { key: 'storage_pull', label: 'Transfer content', total: 5, pending: 2, running: 3 },
   ])
 })
 

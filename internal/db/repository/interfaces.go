@@ -151,6 +151,7 @@ type DeleteDeletedObjectResult struct {
 
 // ObjectRepository defines persistence operations for object identities and versions.
 type ObjectRepository interface {
+	GetContentFileSample(ctx context.Context, contentID int64) (*ContentFileSample, error)
 	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
 	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
 	// CreateRestoredVersionAndSetCurrent creates a new current data version only
@@ -450,6 +451,10 @@ func NewFinalizeUploadInput(contentID int64) FinalizeUploadInput {
 }
 
 type StorageContentRepository interface {
+	GetContentSubject(ctx context.Context, id int64) (*StorageSubject, error)
+	GetCopySubject(ctx context.Context, id int64) (*StorageSubject, error)
+	GetDataSetSubject(ctx context.Context, id int64) (*StorageSubject, error)
+	GetCommitSubject(ctx context.Context, requestID string) (*StorageSubject, error)
 	EnsureContent(ctx context.Context, input EnsureContentInput) (*model.StorageContent, error)
 	// ListOrphanedContents and DiscardOrphanedContent find and delete content
 	// no object version has ever named, left by a write whose version
@@ -570,6 +575,7 @@ type BucketACLSnapshot struct {
 // gate. Every state change is a compare-and-set so a superseded or stale caller
 // is refused rather than silently applied.
 type StorageReplacementRepository interface {
+	GetReplacementSubject(ctx context.Context, id int64) (*ReplacementSubject, error)
 	// Authorize records one confirmed replacement, creates the target data set
 	// generation, supersedes any earlier replacement of the same source, and
 	// queues the migration coordinator, all in one transaction.
@@ -752,6 +758,7 @@ type TaskPage struct {
 }
 
 type WalletOperationRepository interface {
+	GetOperationSubject(ctx context.Context, id int64) (*model.WalletOperation, error)
 	CreateOrGet(ctx context.Context, input CreateWalletOperationInput) (*model.WalletOperation, bool, error)
 	GetByID(ctx context.Context, id int64) (*model.WalletOperation, error)
 	BindTask(ctx context.Context, id, taskID int64) error
@@ -765,6 +772,7 @@ type WalletOperationRepository interface {
 }
 
 type ObservabilityRepository interface {
+	GetProviderSubject(ctx context.Context, id types.OnChainID) (*ProviderSubject, error)
 	// RecordApprovedProviders and RecordEndorsedProviders return the collection
 	// time the stored tier snapshot carries after the write.
 	RecordApprovedProviders(context.Context, time.Time, []types.OnChainID) (time.Time, error)

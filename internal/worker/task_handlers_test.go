@@ -42,6 +42,7 @@ import (
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synaps3/internal/walletoperation"
 	"github.com/strahe/synaps3/internal/worker"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
@@ -2655,6 +2656,174 @@ func TestBucketProvisionCreatesDataSetsBeforeMarkingReady(t *testing.T) {
 	for i := range bindings {
 		if !bindings[i].IsCurrent || bindings[i].CopyIndex != i || bindings[i].Status != model.StorageDataSetStatusReady || bindings[i].DataSetID == nil {
 			t.Fatalf("binding[%d] = %#v", i, bindings[i])
+		}
+	}
+}
+
+func TestStoragePlanningWaitsKeepErrors(t *testing.T) {
+	selectionErr := &synapse.NoProviderCandidatesError{Cause: errors.Join(
+		storage.ErrNoHealthyProviders,
+		fmt.Errorf("provider 2: GET https://provider.example/pdp/ping?token=secret-token: %w: provider.example resolves to 198.18.0.1", storage.ErrPrivateNetwork),
+	)}
+	fundingErr := &synapse.ProviderUnavailableError{Cause: fmt.Errorf(
+		"reading upload costs: Post https://rpc.example/v1/secret-key?token=secret-token: %w", context.DeadlineExceeded,
+	)}
+	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
+		for _, phase := range []struct {
+			reason string
+			err    error
+		}{{"providers", selectionErr}, {"funding", fundingErr}} {
+			t.Run(string(taskType)+"/"+phase.reason, func(t *testing.T) {
+				logFile, err := os.CreateTemp(t.TempDir(), "storage-wait-*.log")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = logFile.Close() })
+				var dependencyStage atomic.Int32
+				changedErr := fmt.Errorf("dependency changed: %w", phase.err)
+				dependencyError := func() error {
+					switch dependencyStage.Load() {
+					case 0:
+						return phase.err
+					case 1:
+						return changedErr
+					default:
+						return nil
+					}
+				}
+				sequence := storedObjectSequence.Add(1)
+				providerID := testOnChainID(t, 12000+sequence).SDK()
+				dataSetID := testOnChainID(t, 13000+sequence).SDK()
+				target := &testutil.MockStorageTarget{
+					ProviderIDValue: providerID, DataSetIDValue: &dataSetID,
+					ClientDataSetIDValue: testOnChainID(t, 14000+sequence).SDK(),
+				}
+				runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+					logger: slog.New(slog.NewJSONHandler(logFile, nil)),
+					storage: &testutil.MockStorageClient{
+						SelectUploadTargetsFunc: func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+							if err := dependencyError(); err != nil && phase.reason == "providers" {
+								return nil, err
+							}
+							return []synapse.StorageTarget{target}, nil
+						},
+						PrepareUploadFunc: func(context.Context, uint64, []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error) {
+							if err := dependencyError(); err != nil && phase.reason == "funding" {
+								return nil, err
+							}
+							return &sdkcosts.MultiContextCosts{Ready: true}, nil
+						},
+					},
+					register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+						return handlers.RegisterStorage(registry)
+					},
+				})
+				bucket := &model.Bucket{
+					Name: fmt.Sprintf("planning-wait-%d", sequence), Status: model.BucketStatusProvisioning,
+					DefaultCopies: 1, MinimumDurableCopies: 1,
+				}
+				if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
+					t.Fatal(err)
+				}
+				request := taskengine.EnqueueRequest{
+					Type: taskType, IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, 1),
+					Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+				}
+				if taskType == model.TaskTypeUploadPlan {
+					content, err := runtime.repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
+						BucketID: bucket.ID, ContentSize: 11, RequestedCopies: 1,
+						Checksum: testutil.StorageChecksum(fmt.Sprintf("planning-wait-%d", sequence)),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{
+						VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "object.bin", ContentID: &content.ID, Size: 11,
+						ETag: "etag", ContentType: "application/octet-stream",
+					}); err != nil {
+						t.Fatal(err)
+					}
+					request.IdempotencyKey = storagepipeline.UploadPlanKey(content.ID)
+					request.Input = storagepipeline.UploadPlanInput{ContentID: content.ID}
+					request.SubjectType, request.SubjectKey = "storage_content", fmt.Sprint(content.ID)
+				}
+				taskRow, _, err := runtime.service.Enqueue(t.Context(), request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 4}
+				cancel, done := runHandlerEngine(t, runtime)
+				defer stopHandlerEngine(t, cancel, done)
+				waiting := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == phase.reason
+				})
+				wantError := synapse.ErrorSummary(phase.err)
+				if waiting.LastError == nil || *waiting.LastError != wantError {
+					t.Fatalf("waiting task last_error = %v, want %q", waiting.LastError, wantError)
+				}
+				if waiting.RetryCount != 0 || waiting.ResumeMode != model.TaskResumeModeExecute || waiting.AvailableAt.Before(time.Now().Add(45*time.Second)) {
+					t.Fatalf("waiting task changed retry behavior: %#v", waiting)
+				}
+				logged, err := os.ReadFile(logFile.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var entry struct {
+					TaskID     int64          `json:"task_id"`
+					TaskType   model.TaskType `json:"task_type"`
+					WaitReason string         `json:"wait_reason"`
+					Error      string         `json:"error"`
+				}
+				if err := json.Unmarshal(logged, &entry); err != nil {
+					t.Fatalf("read wait diagnostic: %v", err)
+				}
+				if entry.TaskID != taskRow.ID || entry.TaskType != taskType || entry.WaitReason != phase.reason || entry.Error != wantError {
+					t.Fatalf("wait diagnostic = %#v", entry)
+				}
+				if strings.Contains(wantError, "secret") || strings.Contains(string(logged), "secret") {
+					t.Fatal("waiting task or log exposed endpoint credentials")
+				}
+				if phase.reason == "providers" && !strings.Contains(wantError, "provider.example resolves to 198.18.0.1") {
+					t.Fatal("waiting task omitted the blocked provider address")
+				}
+				wakeTask(t, runtime, taskRow.ID)
+				waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.ClaimGeneration == 2 && task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == wantError
+				})
+				repeated, err := os.ReadFile(logFile.Name())
+				if err != nil || string(repeated) != string(logged) {
+					t.Fatalf("unchanged dependency produced another warning: %s, err=%v", repeated, err)
+				}
+				dependencyStage.Store(1)
+				wakeTask(t, runtime, taskRow.ID)
+				wantChangedError := synapse.ErrorSummary(changedErr)
+				waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.ClaimGeneration == 3 && task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == wantChangedError
+				})
+				changed, err := os.ReadFile(logFile.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				entries := strings.Split(strings.TrimSpace(string(changed)), "\n")
+				if len(entries) != 2 {
+					t.Fatalf("changed dependency warnings = %d, want 2: %s", len(entries), changed)
+				}
+				if err := json.Unmarshal([]byte(entries[1]), &entry); err != nil || entry.Error != wantChangedError || entry.TaskID != taskRow.ID {
+					t.Fatalf("changed dependency diagnostic = %#v, err=%v", entry, err)
+				}
+				if strings.Contains(string(changed), "secret") {
+					t.Fatal("changed dependency exposed endpoint credentials")
+				}
+				dependencyStage.Store(2)
+				wakeTask(t, runtime, taskRow.ID)
+				waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.ClaimGeneration == 4 && task.Status != model.TaskStatusRunning && task.LastError == nil
+				})
+				bindings, err := runtime.repos.Contents.ListDataSetBindings(t.Context(), bucket.ID)
+				if err != nil || len(bindings) != 1 {
+					t.Fatalf("planning did not resume after dependency recovered: bindings=%d err=%v", len(bindings), err)
+				}
+			})
 		}
 	}
 }

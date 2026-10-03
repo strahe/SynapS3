@@ -10,6 +10,23 @@ import {
   validateFOCUploadSize,
 } from '../src/api/client.ts'
 
+test('task subject lookup encodes its identity and forwards cancellation', async () => {
+  const originalFetch = globalThis.fetch
+  const controller = new AbortController()
+  let request: { url?: string; signal?: AbortSignal | null } = {}
+  globalThis.fetch = (async (input, init) => {
+    request = { url: String(input), signal: init?.signal }
+    return new Response(JSON.stringify({ subject_type: 'storage_commit_request', subject_key: 'request:a/b' }))
+  }) as typeof fetch
+  try {
+    await api.getTaskSubject('storage_commit_request', 'request:a/b', controller.signal)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(request.url, '/api/v1/task-subjects/storage_commit_request/request%3Aa%2Fb')
+  assert.equal(request.signal, controller.signal)
+})
+
 class FakeXMLHttpRequest {
   static instances: FakeXMLHttpRequest[] = []
 

@@ -450,6 +450,7 @@ func createObjectLifecycleSchema(ctx context.Context, db bun.IDB) error {
 		{name: "idx_object_cache_active_task", table: "object_cache", columns: []string{"cache_active_task_id"}, where: "cache_active_task_id IS NOT NULL", unique: true},
 		{name: "idx_object_deletions_bucket_key_deleted", table: "object_deletions", columns: []string{"bucket_id", "key", "deleted_at"}},
 		{name: "idx_object_deletions_bucket_deleted", table: "object_deletions", columns: []string{"bucket_id", "deleted_at DESC", "id DESC"}},
+		{name: "idx_object_deletions_content_deleted", table: "object_deletions", columns: []string{"content_id", "deleted_at DESC", "id DESC"}},
 	}
 	if db.Dialect().Name() != dialect.PG {
 		indexes = append(indexes, initialIndexSpec{name: "idx_object_versions_bucket_key_created", table: "object_versions", columns: []string{"bucket_id", "key", "created_at DESC", "version_id DESC"}})

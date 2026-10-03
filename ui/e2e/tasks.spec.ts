@@ -1,0 +1,287 @@
+import type { Page } from '@playwright/test'
+import type { TaskItem, TaskSubjectInfo } from '../src/api/client'
+import { expect, test } from './fixtures'
+
+const fileKey = 'projects/archive/2026/october/reports/a-complete-and-long-object-key.txt'
+const subject: TaskSubjectInfo = {
+  subject_type: 'storage_content',
+  subject_key: '128',
+  bucket: 'files',
+  size: 1024,
+  file: { key: fileKey, source: 'current', other_versions: 2 },
+}
+
+function task(id: number, key = '128'): TaskItem {
+  return {
+    id,
+    type: 'storage_store',
+    operation: 'Upload data',
+    status: 'completed',
+    presentation_status: 'completed',
+    subject_type: 'storage_content',
+    subject_key: key,
+    retry_count: 0,
+    retryable: false,
+    acknowledgeable: false,
+    available_at: '2026-10-03T00:00:00Z',
+    created_at: '2026-10-03T00:00:00Z',
+    updated_at: '2026-10-03T00:02:13Z',
+    started_at: '2026-10-03T00:00:00Z',
+    finished_at: '2026-10-03T00:02:13Z',
+  }
+}
+
+async function openTasks(page: Page, adminURL: string, rows = [task(201), task(200), task(199, '129')]) {
+  await page.route('**/api/v1/tasks?*', (route) =>
+    route.fulfill({
+      json: route.request().url().includes('cursor=100') ? { tasks: [task(100)] } : { tasks: rows, next_cursor: 100 },
+    })
+  )
+  await page.goto(adminURL)
+  await page.getByLabel('Username').fill('admin')
+  await page.getByLabel('Password').fill('system-test-admin-password')
+  await page.getByRole('button', { name: 'Sign In' }).click()
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
+  await page.getByRole('link', { name: 'Tasks', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Content #128', exact: true }).first()).toBeVisible()
+}
+
+async function pauseClock(page: Page) {
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000))
+}
+
+test('subject popovers close on the next mouse or keyboard click after dragging away', async ({
+  page,
+  systemServer,
+}) => {
+  await page.route('**/api/v1/task-subjects/**', (route) => route.fulfill({ json: subject }))
+  await openTasks(page, systemServer.adminURL, [task(201)])
+  const trigger = page.getByRole('button', { name: 'Content #128', exact: true })
+  const heading = page.getByRole('heading', { name: 'Tasks', exact: true })
+  for (const closeWith of ['mouse', 'keyboard'] as const) {
+    await heading.hover()
+    await trigger.hover()
+    await expect(page.getByRole('tooltip').getByText(fileKey)).toBeVisible()
+    await page.mouse.down()
+    await expect(page.getByRole('dialog').getByText(fileKey)).toBeVisible()
+    await heading.hover()
+    await page.mouse.up()
+    await expect(page.getByRole('dialog')).toBeVisible()
+    if (closeWith === 'mouse') {
+      await trigger.click()
+    } else {
+      await trigger.focus()
+      await page.keyboard.press('Enter')
+    }
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page.getByRole('tooltip')).toHaveCount(0)
+  }
+})
+
+test('task subjects load on demand and reuse data across overlays, refreshes, and pages', async ({
+  page,
+  systemServer,
+}) => {
+  await page.clock.install()
+  const requests: string[] = []
+  let failed = false
+  await page.route('**/api/v1/task-subjects/**', async (route) => {
+    const key = route.request().url().split('/').at(-1) ?? ''
+    requests.push(key)
+    if (key === '129' && !failed) {
+      failed = true
+      await route.fulfill({ status: 500, json: { error: 'internal' } })
+    } else {
+      await route.fulfill({
+        json: {
+          ...subject,
+          subject_key: key,
+          file: {
+            ...subject.file,
+            other_versions: key === '128' && requests.filter((value) => value === key).length > 1 ? 3 : 2,
+          },
+        },
+      })
+    }
+  })
+  await openTasks(page, systemServer.adminURL)
+  expect(requests).toEqual([])
+  await expect(page.getByText('2m 13s', { exact: true })).toHaveCount(3)
+  await pauseClock(page)
+  const first = page.getByRole('button', { name: 'Content #128', exact: true }).first()
+  const second = page.getByRole('button', { name: 'Content #128', exact: true }).nth(1)
+  await first.hover()
+  await page.clock.runFor(199)
+  await page.mouse.move(0, 0)
+  expect(requests).toEqual([])
+  await second.hover()
+  await page.clock.runFor(199)
+  await page.getByRole('button', { name: 'Content #129', exact: true }).hover()
+  await page.clock.runFor(199)
+  await page.mouse.move(0, 0)
+  expect(requests).toEqual([])
+  await first.hover()
+  await page.clock.runFor(201)
+  await page.clock.resume()
+  await expect(page.getByRole('tooltip').getByText(fileKey)).toBeVisible()
+  expect(requests).toEqual(['128'])
+  await first.click()
+  await expect(page.getByRole('dialog').getByText(fileKey)).toBeVisible()
+  await expect(page.getByRole('tooltip')).toHaveCount(0)
+  expect(requests).toEqual(['128'])
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await page.clock.runFor(201)
+  await expect(page.getByRole('tooltip')).toHaveCount(0)
+  await second.click()
+  await expect(page.getByRole('dialog').getByText('2 other linked versions', { exact: true })).toBeVisible()
+  expect(requests).toEqual(['128'])
+  await page.keyboard.press('Escape')
+  await pauseClock(page)
+  await page.getByRole('button', { name: 'Content #129', exact: true }).hover()
+  await page.clock.runFor(199)
+  await page.mouse.move(0, 0)
+  expect(requests).toEqual(['128'])
+  await page.clock.resume()
+  const third = page.getByRole('button', { name: 'Content #129', exact: true })
+  await third.focus()
+  await expect(
+    page.getByText('Unable to load information. Close and reopen to try again.', { exact: true })
+  ).toBeVisible()
+  expect(requests).toEqual(['128', '129'])
+  await page.getByRole('button', { name: 'Refresh', exact: true }).focus()
+  await third.focus()
+  await expect(page.getByRole('tooltip').getByText(fileKey)).toBeVisible()
+  expect(requests).toEqual(['128', '129', '129'])
+  await page.getByRole('button', { name: 'Refresh', exact: true }).focus()
+  await page.clock.runFor(60_001)
+  expect(requests).toEqual(['128', '129', '129'])
+  await first.click()
+  await expect.poll(() => requests.length).toBe(4)
+  await expect(page.getByRole('dialog').getByText('3 other linked versions', { exact: true })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Next', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Content #128', exact: true })).toHaveCount(1)
+  await page.getByRole('button', { name: 'Content #128', exact: true }).click()
+  await expect(page.getByRole('dialog').getByText(fileKey)).toBeVisible()
+  expect(requests.length).toBe(4)
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await page.clock.runFor(10_001)
+  expect(requests.length).toBe(4)
+  const row = await page.getByRole('row').nth(1).boundingBox()
+  expect(row?.height).toBeLessThan(80)
+})
+
+test('an unfinished subject read survives overlay switching and cancels after its final viewer closes', async ({
+  page,
+  systemServer,
+}) => {
+  await page.clock.install()
+  await page.addInitScript(() => {
+    const state = { requests: 0, aborted: 0 }
+    Object.assign(window, { taskSubjectFetchState: state })
+    const original = window.fetch.bind(window)
+    window.fetch = (input, init) => {
+      if (!String(input).includes('/task-subjects/')) return original(input, init)
+      state.requests++
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            state.aborted++
+            reject(new DOMException('Aborted', 'AbortError'))
+          },
+          { once: true }
+        )
+      })
+    }
+  })
+  const state = () =>
+    page.evaluate(
+      () =>
+        (window as typeof window & { taskSubjectFetchState: { requests: number; aborted: number } })
+          .taskSubjectFetchState
+    )
+  await openTasks(page, systemServer.adminURL, [
+    task(205),
+    task(204, '129'),
+    task(203, '129'),
+    task(202, '129'),
+    task(201, '129'),
+    task(200),
+  ])
+  await pauseClock(page)
+  const first = page.getByRole('button', { name: 'Content #128', exact: true }).first()
+  const second = page.getByRole('button', { name: 'Content #128', exact: true }).nth(1)
+  await first.hover()
+  await page.clock.runFor(201)
+  await page.clock.resume()
+  await expect(page.getByRole('tooltip').getByText('Loading…', { exact: true })).toBeVisible()
+  await first.click()
+  await expect(page.getByRole('dialog').getByText('Loading…', { exact: true })).toBeVisible()
+  expect(await state()).toEqual({ requests: 1, aborted: 0 })
+  await second.hover()
+  await page.clock.runFor(201)
+  await expect(page.getByRole('tooltip')).toHaveCount(1)
+  await expect(page.getByRole('tooltip').getByText('Loading…', { exact: true })).toBeVisible()
+  expect(await state()).toEqual({ requests: 1, aborted: 0 })
+  await page.mouse.move(1000, 100, { steps: 5 })
+  await expect(page.getByRole('tooltip')).toHaveCount(0)
+  expect(await state()).toEqual({ requests: 1, aborted: 0 })
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect.poll(state).toEqual({ requests: 1, aborted: 1 })
+  await page.clock.runFor(201)
+  expect(await state()).toEqual({ requests: 1, aborted: 1 })
+  await first.click()
+  await expect.poll(state).toEqual({ requests: 2, aborted: 1 })
+  await page.getByRole('button', { name: 'Next', exact: true }).click()
+  await expect.poll(state).toEqual({ requests: 2, aborted: 2 })
+  const pagedSubject = page.getByRole('button', { name: 'Content #128', exact: true })
+  await expect(pagedSubject).toHaveCount(1)
+  await pagedSubject.click()
+  await expect.poll(state).toEqual({ requests: 3, aborted: 2 })
+  await page.getByRole('link', { name: 'Wallet', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Wallet', exact: true })).toBeVisible()
+  await expect.poll(state).toEqual({ requests: 3, aborted: 3 })
+})
+
+test('touch opens the same subject information and Took follows recovery and dismissal', async ({
+  browser,
+  systemServer,
+}) => {
+  const context = await browser.newContext({ hasTouch: true })
+  const page = await context.newPage()
+  try {
+    let requests = 0
+    await page.route('**/api/v1/task-subjects/**', async (route) => {
+      requests++
+      await route.fulfill({ json: subject })
+    })
+    const row = task(201)
+    await openTasks(page, systemServer.adminURL, [row])
+    await page.getByRole('button', { name: 'Content #128', exact: true }).tap()
+    await expect(page.getByRole('dialog').getByText(fileKey)).toBeVisible()
+    expect(requests).toBe(1)
+    await page.keyboard.press('Escape')
+    row.status = 'pending'
+    row.presentation_status = 'waiting'
+    row.finished_at = undefined
+    await page.getByRole('button', { name: 'Refresh', exact: true }).tap()
+    await expect(page.getByText('2m 13s', { exact: true })).toHaveCount(0)
+    row.status = 'failed'
+    row.presentation_status = 'failed'
+    row.finished_at = '2026-10-03T01:04:00Z'
+    await page.getByRole('button', { name: 'Refresh', exact: true }).tap()
+    await expect(page.getByText('1h 4m', { exact: true })).toBeVisible()
+    row.presentation_status = 'dismissed'
+    row.acknowledged_at = '2026-10-04T00:00:00Z'
+    await page.getByRole('button', { name: 'Refresh', exact: true }).tap()
+    await expect(page.getByText('Dismissed', { exact: true })).toBeVisible()
+    await expect(page.getByText('1h 4m', { exact: true })).toBeVisible()
+    expect(requests).toBe(1)
+  } finally {
+    await context.close()
+  }
+})

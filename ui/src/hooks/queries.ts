@@ -378,6 +378,19 @@ export function useTaskStats() {
   })
 }
 
+export function useTaskSubject(type: Parameters<typeof api.getTaskSubject>[0], key: string) {
+  return useQuery({
+    queryKey: ['taskSubjectInfo', type, key],
+    queryFn: ({ signal }) => api.getTaskSubject(type, key, signal),
+    staleTime: 60_000,
+    gcTime: 300_000,
+    retry: false,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+}
+
 export function useWallet() {
   return useQuery({
     queryKey: ['wallet'],
