@@ -1210,7 +1210,7 @@ func (r *BunStorageContentRepo) MarkUploadCopyPieceReady(ctx context.Context, in
 			switch status {
 			case model.StorageCopyStatusPieceReady, model.StorageCopyStatusCommitting, model.StorageCopyStatusCommitted:
 				if status == model.StorageCopyStatusCommitted && !input.RequireEligibleCopy {
-					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, now)
+					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, input.ContentID, copyID, now)
 				}
 				compatible := db.NewSelect().
 					Model((*model.StorageCopy)(nil)).
@@ -1230,7 +1230,7 @@ func (r *BunStorageContentRepo) MarkUploadCopyPieceReady(ctx context.Context, in
 					return fmt.Errorf("checking idempotent piece evidence: %w", err)
 				}
 				if count == 1 {
-					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, now)
+					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, input.ContentID, copyID, now)
 				}
 			}
 			return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)
@@ -1256,34 +1256,37 @@ func (r *BunStorageContentRepo) MarkUploadCopyPieceReady(ctx context.Context, in
 		// A pull that produced this piece is finished. Resolving it here, in the
 		// same transaction, is what frees the copy's unresolved slot so a later
 		// retry can ask a different source.
-		return resolvePieceReadyPull(ctx, db, input.PullAttemptID, now)
+		return resolvePieceReadyPull(ctx, db, input.PullAttemptID, input.ContentID, copyID, now)
 	})
 }
 
-func resolvePieceReadyPull(ctx context.Context, db bun.IDB, attemptID string, now time.Time) error {
+func resolvePieceReadyPull(ctx context.Context, db bun.IDB, attemptID string, contentID, copyID int64, now time.Time) error {
 	if attemptID == "" {
 		return nil
 	}
 	var resolved int
 	err := db.NewSelect().Model((*storagepull.Attempt)(nil)).ColumnExpr("COUNT(*)").
-		Where("attempt_id = ? AND resolved_at IS NOT NULL", attemptID).Scan(ctx, &resolved)
+		Where("attempt_id = ? AND content_id = ? AND resolved_at IS NOT NULL", attemptID, contentID).
+		Where("storage_data_set_id = (SELECT storage_data_set_id FROM storage_copies WHERE id = ?)", copyID).
+		Scan(ctx, &resolved)
 	if err != nil {
 		return fmt.Errorf("checking storage pull attempt: %w", err)
 	}
 	if resolved > 0 {
 		return nil
 	}
-	return resolvePullAttempt(ctx, db, attemptID, now)
+	return resolvePullAttempt(ctx, db, attemptID, contentID, copyID, now)
 }
 
 // resolvePullAttempt marks one request finished without changing its status: a
 // resolved "attempted" row is the record of a request that succeeded.
-func resolvePullAttempt(ctx context.Context, db bun.IDB, attemptID string, now time.Time) error {
+func resolvePullAttempt(ctx context.Context, db bun.IDB, attemptID string, contentID, copyID int64, now time.Time) error {
 	res, err := db.NewUpdate().
 		Model((*storagepull.Attempt)(nil)).
 		Set("resolved_at = COALESCE(resolved_at, ?)", now).
 		Set("updated_at = ?", now).
-		Where("attempt_id = ? AND status = ?", attemptID, storagepull.AttemptStatusAttempted).
+		Where("attempt_id = ? AND content_id = ? AND status = ?", attemptID, contentID, storagepull.AttemptStatusAttempted).
+		Where("storage_data_set_id = (SELECT storage_data_set_id FROM storage_copies WHERE id = ?)", copyID).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("resolving storage pull attempt: %w", err)
@@ -1362,13 +1365,7 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 		if err := abandonCopyPullAttempt(ctx, db, input.PullAttemptID, contentID, copyID, lastError, now); err != nil {
 			return err
 		}
-		// A copy waiting in a collecting request leaves it, and a Pull's request
-		// that was never sent is given up with the Pull. A copy signed into
-		// any other request is decided by that request alone.
-		if err := abandonUnsentPullCommitRequest(ctx, db, copyID, lastError, now); err != nil {
-			if errors.Is(err, ErrConflict) {
-				return fmt.Errorf("marking storage upload copy failed: a signed storage registration is still pending: %w", ErrConflict)
-			}
+		if err := releaseCollectingCommitMembership(ctx, db, copyID, now); err != nil {
 			return err
 		}
 		res, err := db.NewUpdate().

@@ -31,6 +31,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagecleanup"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -3291,6 +3292,14 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 }
 
 func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
+	for _, lostCheckpoint := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost checkpoint=%v", lostCheckpoint), func(t *testing.T) {
+			testPullRequestReplay(t, lostCheckpoint)
+		})
+	}
+}
+
+func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	var pullCalls, statusCalls atomic.Int64
 	statusObserved := make(chan struct{})
 	type observedPull struct {
@@ -3348,7 +3357,7 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 	}
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
 	limitedRepos := *runtime.repos
-	// The Pull's registration task runs beside it; only Pull claims count.
+	// Stop before the new Commit task is claimed.
 	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3, countType: model.TaskTypeStoragePull}
 	limitedRepos.Tasks = limited
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
@@ -3380,6 +3389,17 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 	if err := runtime.db.NewSelect().Model(attempt).Where("attempt_id = ?", checkpoint.AttemptID).Scan(t.Context()); err != nil {
 		t.Fatalf("load pull attempt %q: %v", checkpoint.AttemptID, err)
 	}
+	if attempt.ExtraDataHex == "" || attempt.ResolvedAt != nil {
+		t.Fatalf("attempt before replay = %#v", attempt)
+	}
+	if count, err := runtime.db.NewSelect().Model((*storagecommit.Request)(nil)).Where("storage_data_set_id = ?", pipeline.targetSet.ID).Count(t.Context()); err != nil || count != 0 {
+		t.Fatalf("Commit requests before Pull completes = %d, %v", count, err)
+	}
+	if lostCheckpoint {
+		if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("checkpoint_json = NULL").Where("task_id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("make pull recovery ready: %v", err)
 	}
@@ -3400,15 +3420,19 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 	if pullCalls.Load() != 2 {
 		t.Fatalf("pull calls = %d, want 2", pullCalls.Load())
 	}
-	// A finished transfer hands the copy to the request its Pull signed.
+	// A finished transfer joins an unsigned collecting request.
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 	if err != nil || copyRow == nil || copyRow.CommitRequestID == nil || copyRow.WorkTaskID() == nil ||
-		copyRow.Status != model.StorageCopyStatusCommitting {
+		copyRow.Status != model.StorageCopyStatusPieceReady || copyRow.CommitSealed() {
 		t.Fatalf("target copy after pull = %#v, err=%v", copyRow, err)
 	}
 	next, err := runtime.repos.Tasks.GetByID(t.Context(), *copyRow.WorkTaskID())
 	if err != nil || next == nil || next.Type != model.TaskTypeStorageCommit {
 		t.Fatalf("task after pull = %#v, err=%v, want storage_commit", next, err)
+	}
+	settled, err := runtime.repos.Contents.GetPullAttempt(t.Context(), attempt.AttemptID, pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+	if err != nil || settled.ResolvedAt == nil || settled.ExtraDataHex != attempt.ExtraDataHex {
+		t.Fatalf("settled attempt = %#v, %v", settled, err)
 	}
 	observedMu.Lock()
 	defer observedMu.Unlock()

@@ -92,6 +92,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		{"storage_copies", "commit_position"},
 		{"storage_pull_attempts", "attempt_id"},
 		{"storage_pull_attempts", "source_piece_cid"},
+		{"storage_pull_attempts", "extra_data_hex"},
 		{"storage_contents", "content_size"},
 		{"storage_data_sets", "ensure_task_id"},
 		{"storage_replacement_items", "target_data_set_id"},

@@ -178,9 +178,8 @@ type Prepared struct {
 	RetryAfter time.Duration
 }
 
-// Prepare checks a ready request before it is sent. The nonce is read first: a
-// request that was sent before, or disclosed to the provider by a Pull, may
-// already be on chain, and FWSS refuses its nonce again.
+// Prepare checks a ready request before it is sent. The nonce is read first:
+// an earlier send may already be on chain, and FWSS rejects a reused nonce.
 func (a *Advancer) Prepare(ctx context.Context, c Commit) Prepared {
 	proof, err := a.Prove(ctx, c)
 	if err != nil {

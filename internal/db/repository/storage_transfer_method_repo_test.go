@@ -108,7 +108,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 		CopyID: copies[0].ID, Generation: generation, TaskID: pullTask.ID, AttemptID: "zero-piece-attempt",
 		SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID,
 		SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL,
-		CommitRequest: repository.CreatePullCommitRequestInput{RequestID: "zero-piece-request", TaskID: pullTask.ID, ExtraDataHex: "ab"},
+		ExtraDataHex: "ab",
 	}); err != nil {
 		t.Fatalf("reserving a pull from a piece 0 source: %v", err)
 	}

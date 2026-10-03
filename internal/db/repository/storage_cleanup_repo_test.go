@@ -101,7 +101,7 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 			AttemptID: attemptID, ContentID: contentID, StorageDataSetID: source.ID,
 			Status:           storagepull.AttemptStatusAttempted,
 			SourceProviderID: onChainID(t, "303"), SourceDataSetID: onChainID(t, "3003"), SourcePieceID: onChainID(t, "7"),
-			SourcePieceCID: "source-piece", SourceRetrievalURL: "https://source.example/piece",
+			SourcePieceCID: "source-piece", SourceRetrievalURL: "https://source.example/piece", ExtraDataHex: "abcd",
 			AttemptedAt: time.Now(), ResolvedAt: resolvedAt,
 		}
 	}
@@ -165,10 +165,10 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	for _, row := range pullRows {
 		pulls[row.AttemptID] = row
 	}
-	if got := pulls["open-pull"]; got.Status != storagepull.AttemptStatusAbandoned || got.ResolvedAt == nil || got.LastError == nil {
+	if got := pulls["open-pull"]; got.Status != storagepull.AttemptStatusAbandoned || got.ResolvedAt == nil || got.LastError == nil || got.ExtraDataHex != openPull.ExtraDataHex {
 		t.Fatalf("open pull after finalizing = %#v, want it abandoned", got)
 	}
-	if got := pulls["resolved-pull"]; got.Status != storagepull.AttemptStatusAttempted || got.ResolvedAt == nil || !got.ResolvedAt.Equal(earlier) {
+	if got := pulls["resolved-pull"]; got.Status != storagepull.AttemptStatusAttempted || got.ResolvedAt == nil || !got.ResolvedAt.Equal(earlier) || got.ExtraDataHex != resolvedPull.ExtraDataHex {
 		t.Fatalf("resolved pull after finalizing = %#v, want it unchanged", got)
 	}
 	// A write that resolved the content before it was finalized is refused the

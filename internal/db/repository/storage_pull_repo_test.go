@@ -1,0 +1,135 @@
+package repository_test
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepull"
+)
+
+func TestPullAuthorizationLedger(t *testing.T) {
+	testPullAuthorizationLedger(t, newCommitFixture(t, testDB(t)))
+}
+
+func testPullAuthorizationLedger(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	copyRow := f.transferredCopy(t, "pull-ledger")
+	if _, err := f.db.NewUpdate().Model((*model.StorageCopy)(nil)).
+		Set("status = ?", model.StorageCopyStatusPending).
+		Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
+		Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := f.repos.Contents.NextCopyWorkGeneration(ctx, copyRow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := commitTask("pull-ledger")
+	row.Type = model.TaskTypeStoragePull
+	row, _, err = f.repos.Tasks.Enqueue(ctx, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.BindCopyTask(ctx, copyRow.ID, generation, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != row.ID {
+		t.Fatalf("claim = %#v, %v", claimed, err)
+	}
+	sourceProvider, sourceSet, sourcePiece := onChainID(t, "901"), onChainID(t, "902"), onChainID(t, "0")
+	input := repository.ReservePullRequestInput{
+		CopyID: copyRow.ID, Generation: generation, TaskID: row.ID, AttemptID: "pull-attempt",
+		SourceProviderID: &sourceProvider, SourceDataSetID: &sourceSet, SourcePieceID: &sourcePiece,
+		SourcePieceCID: "piece-pull-ledger", SourceRetrievalURL: "https://source.example/piece", ExtraDataHex: "abcd",
+	}
+	write := func(tx *repository.Repositories) error {
+		if err := tx.Contents.ReservePullRequest(ctx, input); err != nil {
+			return err
+		}
+		return tx.Tasks.WriteCheckpoint(ctx, row.ID, claimed.ClaimGeneration, []byte(`{"attempt_id":"pull-attempt"}`))
+	}
+	rollback := errors.New("rollback")
+	if err := f.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+		if err := write(tx); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("rolled back reservation = %v", err)
+	}
+	if _, err := f.repos.Contents.GetUnresolvedPullAttempt(ctx, copyRow.ContentID, copyRow.StorageDataSetID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("attempt after rollback = %v", err)
+	}
+	if task, err := f.repos.Tasks.GetByID(ctx, row.ID); err != nil || len(task.Checkpoint) != 0 || task.ResumeMode != model.TaskResumeModeExecute {
+		t.Fatalf("checkpoint after rollback = %#v, %v", task, err)
+	}
+	if err := f.repos.WithTx(ctx, func(tx *repository.Repositories) error { return write(tx) }); err != nil {
+		t.Fatal(err)
+	}
+	original, err := f.repos.Contents.GetPullAttempt(ctx, input.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID)
+	if err != nil || original.ExtraDataHex != input.ExtraDataHex {
+		t.Fatalf("reserved attempt = %#v, %v", original, err)
+	}
+	if err := f.repos.Contents.ReservePullRequest(ctx, input); err != nil {
+		t.Fatalf("identical reservation: %v", err)
+	}
+	otherID := onChainID(t, "999")
+	for _, change := range []struct {
+		name  string
+		apply func(*repository.ReservePullRequestInput)
+	}{
+		{"attempt", func(i *repository.ReservePullRequestInput) { i.AttemptID = "another-attempt" }},
+		{"provider", func(i *repository.ReservePullRequestInput) { i.SourceProviderID = &otherID }},
+		{"data set", func(i *repository.ReservePullRequestInput) { i.SourceDataSetID = &otherID }},
+		{"piece id", func(i *repository.ReservePullRequestInput) { i.SourcePieceID = &otherID }},
+		{"CID", func(i *repository.ReservePullRequestInput) { i.SourcePieceCID = "other-piece" }},
+		{"URL", func(i *repository.ReservePullRequestInput) { i.SourceRetrievalURL += "/changed" }},
+		{"authorization", func(i *repository.ReservePullRequestInput) { i.ExtraDataHex = "ef" }},
+		{"generation", func(i *repository.ReservePullRequestInput) { i.Generation++ }},
+		{"task", func(i *repository.ReservePullRequestInput) { i.TaskID++ }},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			changed := input
+			change.apply(&changed)
+			if err := f.repos.Contents.ReservePullRequest(ctx, changed); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("conflicting reservation = %v", err)
+			}
+		})
+	}
+	if _, err := f.repos.Contents.GetPullAttempt(ctx, input.AttemptID, copyRow.ContentID+1, copyRow.StorageDataSetID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("foreign content lookup = %v", err)
+	}
+	if _, err := f.repos.Contents.GetPullAttempt(ctx, input.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID+1); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("foreign data set lookup = %v", err)
+	}
+	if err := f.repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: input.SourcePieceCID, PullAttemptID: input.AttemptID, RequireEligibleCopy: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.ReservePullRequest(ctx, input); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("resolved reservation = %v", err)
+	}
+	if err := f.repos.Contents.CompleteCopyTask(ctx, copyRow.ID, generation, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	retentionUntil := time.Now().Add(-time.Hour)
+	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: &retentionUntil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := f.repos.Tasks.DeleteRetained(ctx, time.Now(), 10); err != nil || deleted != 1 {
+		t.Fatalf("task GC = %d, %v", deleted, err)
+	}
+	history, err := f.repos.Contents.GetPullAttempt(ctx, input.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID)
+	if err != nil || history.Status != storagepull.AttemptStatusAttempted || history.ResolvedAt == nil ||
+		history.ExtraDataHex != original.ExtraDataHex || !history.AttemptedAt.Equal(original.AttemptedAt) {
+		t.Fatalf("authorization history after task GC = %#v, %v", history, err)
+	}
+}

@@ -702,6 +702,7 @@ func TestRequestTooLargeToSignIsSplitInHalves(t *testing.T) {
 // fails for good. Its provider answers sends from script, and has dropped the
 // pulled piece once it refuses one.
 type pullRegistration struct {
+	nonce    uint64
 	runtime  handlerTestRuntime
 	pipeline seededCopyPipeline
 	mu       sync.Mutex
@@ -715,7 +716,12 @@ func newPullRegistration(t *testing.T, script ...sendOutcome) *pullRegistration 
 	r := &pullRegistration{script: script}
 	parked := &droppedPieces{missing: map[string]bool{}}
 	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.nonce++
+			return testutil.CommitExtraData(r.nonce), nil
+		},
 		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -745,6 +751,14 @@ func newPullRegistration(t *testing.T, script ...sendOutcome) *pullRegistration 
 		},
 	})
 	r.pipeline = seedCopyPipeline(t, r.runtime, model.StorageCopyStatusPending)
+	version := &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: r.pipeline.upload.BucketID, Key: "pull-registration.bin",
+		ContentID: &r.pipeline.upload.ID, Size: r.pipeline.upload.ContentSize, ETag: "pull-registration",
+		ContentType: "application/octet-stream",
+	}
+	if _, err := r.runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+		t.Fatal(err)
+	}
 	target.ProviderIDValue = r.pipeline.targetSet.ProviderID.SDK()
 	dataSetID := r.pipeline.targetSet.DataSetID.SDK()
 	target.DataSetIDValue = &dataSetID

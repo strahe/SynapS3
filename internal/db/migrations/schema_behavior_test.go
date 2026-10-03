@@ -343,16 +343,18 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		// be tried only after the first attempt is abandoned.
 		if _, err := db.Exec(`INSERT INTO storage_pull_attempts
 			(attempt_id, content_id, storage_data_set_id, status,
-			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, attempted_at, created_at, updated_at)
-			VALUES ('pull-1', ?, ?, 'attempted', '301', '3001', '4001', 'bafk2bzacepull', 'https://source.example/piece', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
+			VALUES ('pull-1', ?, ?, 'attempted', '301', '3001', '4001', 'bafk2bzacepull', 'https://source.example/piece', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source); err != nil {
 			t.Fatalf("insert first pull attempt: %v", err)
 		}
 		mustRejectStatement(t, db, `INSERT INTO storage_pull_attempts
 			(attempt_id, content_id, storage_data_set_id, status,
-			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, attempted_at, created_at, updated_at)
-			VALUES ('pull-2', ?, ?, 'attempted', '302', '3002', '4002', 'bafk2bzacepull2', 'https://source.example/other', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
+			VALUES ('pull-2', ?, ?, 'attempted', '302', '3002', '4002', 'bafk2bzacepull2', 'https://source.example/other', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source)
+		mustRejectRequiredColumn(t, db, `UPDATE storage_pull_attempts SET extra_data_hex = NULL WHERE attempt_id = 'pull-1'`)
+		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET extra_data_hex = '' WHERE attempt_id = 'pull-1'`)
 		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET status = 'abandoned' WHERE attempt_id = 'pull-1'`)
 		if _, err := db.Exec(`UPDATE storage_pull_attempts
 			SET status = 'abandoned', resolved_at = current_timestamp WHERE attempt_id = 'pull-1'`); err != nil {
@@ -360,8 +362,8 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		}
 		if _, err := db.Exec(`INSERT INTO storage_pull_attempts
 			(attempt_id, content_id, storage_data_set_id, status,
-			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, attempted_at, created_at, updated_at)
-			VALUES ('pull-2', ?, ?, 'attempted', '302', '3002', '4002', 'bafk2bzacepull2', 'https://source.example/other', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
+			VALUES ('pull-2', ?, ?, 'attempted', '302', '3002', '4002', 'bafk2bzacepull2', 'https://source.example/other', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source); err != nil {
 			t.Fatalf("insert second pull attempt after abandon: %v", err)
 		}
@@ -373,8 +375,8 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		}
 		mustRejectStatement(t, db, `INSERT INTO storage_pull_attempts
 			(attempt_id, content_id, storage_data_set_id, status,
-			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, attempted_at, created_at, updated_at)
-			VALUES ('', ?, ?, 'attempted', '303', '3003', '4003', 'bafk2bzacepull3', 'https://source.example/third', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
+			VALUES ('', ?, ?, 'attempted', '303', '3003', '4003', 'bafk2bzacepull3', 'https://source.example/third', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source)
 
 		taskID := insertBaselineTestTask(t, db, "owner-unique")

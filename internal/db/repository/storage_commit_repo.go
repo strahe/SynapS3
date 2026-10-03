@@ -146,54 +146,6 @@ func attachCopyToCommitRequest(ctx context.Context, db bun.IDB, copyID, storageD
 	return requireCommitRows(res, err, "adding storage copy to commit request")
 }
 
-// CreatePullCommitRequestInput records the single-piece request a Pull sends
-// to its target provider. It is signed, so it starts ready.
-type CreatePullCommitRequestInput struct {
-	RequestID        string
-	TaskID           int64
-	CopyID           int64
-	ContentID        int64
-	StorageDataSetID int64
-	PieceCID         string
-	ExtraDataHex     string
-	Now              time.Time
-}
-
-func createPullCommitRequest(ctx context.Context, db bun.IDB, input CreatePullCommitRequestInput) error {
-	if input.RequestID == "" || input.TaskID <= 0 || input.CopyID <= 0 || input.ContentID <= 0 ||
-		input.StorageDataSetID <= 0 || input.PieceCID == "" || input.ExtraDataHex == "" {
-		return fmt.Errorf("recording pull commit request: %w", ErrInvalidInput)
-	}
-	now := commitInputTime(input.Now)
-	taskID, extra := input.TaskID, input.ExtraDataHex
-	request := &storagecommit.Request{
-		RequestID: input.RequestID, StorageDataSetID: input.StorageDataSetID,
-		Status: storagecommit.RequestStatusReady, TaskID: &taskID,
-		PieceCount: 1, ExtraDataHex: &extra, SealedAt: &now,
-		CreatedAt: now, UpdatedAt: now,
-	}
-	if _, err := db.NewInsert().Model(request).Exec(ctx); err != nil {
-		return fmt.Errorf("recording pull commit request: %w", err)
-	}
-	piece := &storagecommit.RequestPiece{
-		RequestID: input.RequestID, Position: 0, ContentID: input.ContentID,
-		StorageDataSetID: input.StorageDataSetID, PieceCID: input.PieceCID, CreatedAt: now,
-	}
-	if _, err := db.NewInsert().Model(piece).Exec(ctx); err != nil {
-		return fmt.Errorf("recording pull commit request piece: %w", err)
-	}
-	res, err := db.NewUpdate().
-		Model((*model.StorageCopy)(nil)).
-		Set("commit_request_id = ?", input.RequestID).
-		Set("commit_position = 0").
-		Set("updated_at = ?", now).
-		Where("id = ? AND content_id = ? AND storage_data_set_id = ?", input.CopyID, input.ContentID, input.StorageDataSetID).
-		Where("status = ?", model.StorageCopyStatusPending).
-		Where("commit_request_id IS NULL").
-		Exec(ctx)
-	return requireCommitRows(res, err, "binding pull commit request")
-}
-
 // GetCommitRequest loads one request.
 func (r *BunStorageContentRepo) GetCommitRequest(ctx context.Context, requestID string) (*storagecommit.Request, error) {
 	request := new(storagecommit.Request)
@@ -677,8 +629,8 @@ func (r *BunStorageContentRepo) ConfirmCommitRequest(ctx context.Context, input 
 			}
 			return nil
 		}
-		// A ready request is confirmed when the chain shows an earlier send, or
-		// the provider a Pull disclosed it to, already landed it.
+		// Chain evidence can confirm an earlier send even after a refusal
+		// returned its request to ready.
 		if (request.Status != storagecommit.RequestStatusSubmitted && request.Status != storagecommit.RequestStatusReady) ||
 			request.TaskID == nil || *request.TaskID != input.TaskID {
 			return ErrConflict
@@ -752,8 +704,8 @@ func (r *BunStorageContentRepo) ConfirmCommitRequest(ctx context.Context, input 
 // AbandonCommitRequestInput settles a request that can never land.
 type AbandonCommitRequestInput struct {
 	RequestID string
-	// TaskID names the request's own task; zero lets another owner abandon a
-	// request that was never sent.
+	// TaskID names the request's task. Zero is allowed only while collecting;
+	// a sealed request requires its owning task.
 	TaskID int64
 	Reason string
 	Now    time.Time
@@ -799,9 +751,8 @@ func abandonCommitRequest(ctx context.Context, db bun.IDB, input AbandonCommitRe
 		if request.TaskID == nil || *request.TaskID != input.TaskID {
 			return nil, ErrConflict
 		}
-	} else if request.Sent() || request.Status == storagecommit.RequestStatusSubmitted {
-		// Only a request that never left the process, or a Pull's single-piece
-		// request that was never sent, can be given up by someone else.
+	} else if request.Status != storagecommit.RequestStatusCollecting {
+		// Only the owning task may settle a sealed request.
 		return nil, ErrConflict
 	}
 	var members []model.StorageCopy
@@ -1123,35 +1074,6 @@ func releaseCollectingCommitMembership(ctx context.Context, db bun.IDB, copyID i
 		return wakeCommitTasks(ctx, db, []int64{*request.TaskID})
 	}
 	return nil
-}
-
-// abandonUnsentPullCommitRequest gives up the single-piece request a Pull
-// signed for the copy when it was never sent, so the copy can fail, switch to
-// Store, or be pulled again under a new request.
-func abandonUnsentPullCommitRequest(ctx context.Context, db bun.IDB, copyID int64, reason string, now time.Time) error {
-	var copyRow model.StorageCopy
-	if err := db.NewSelect().Model(&copyRow).Column("commit_request_id", "commit_position").
-		Where("id = ?", copyID).Scan(ctx); err != nil {
-		return fmt.Errorf("loading storage copy commit request: %w", err)
-	}
-	if copyRow.CommitRequestID == nil {
-		return nil
-	}
-	if copyRow.CommitPosition == nil {
-		return releaseCollectingCommitMembership(ctx, db, copyID, now)
-	}
-	request := new(storagecommit.Request)
-	if err := db.NewSelect().Model(request).Where("request_id = ?", *copyRow.CommitRequestID).Scan(ctx); err != nil {
-		return fmt.Errorf("loading storage commit request: %w", err)
-	}
-	if request.Status.Terminal() {
-		return nil
-	}
-	if request.PieceCount != 1 || request.Sent() {
-		return ErrConflict
-	}
-	_, err := abandonCommitRequest(ctx, db, AbandonCommitRequestInput{RequestID: request.RequestID, Reason: reason, Now: now})
-	return err
 }
 
 // pinnedCommitMemberSQL matches a copy that belongs to a signed request that is

@@ -88,7 +88,7 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 ||
 		input.AttemptID == "" || input.SourcePieceCID == "" ||
 		input.SourceProviderID == nil || input.SourceDataSetID == nil || input.SourcePieceID == nil ||
-		input.SourceRetrievalURL == "" || input.CommitRequest.RequestID == "" {
+		input.SourceRetrievalURL == "" || input.ExtraDataHex == "" {
 		return ErrInvalidInput
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
@@ -96,7 +96,7 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 		copyRow := new(model.StorageCopy)
 		if err := db.NewSelect().
 			Model(copyRow).
-			Column("content_id", "storage_data_set_id", "commit_request_id").
+			Column("content_id", "storage_data_set_id").
 			Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
 			Scan(ctx); err != nil {
 			if err == sql.ErrNoRows {
@@ -107,14 +107,15 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 		existing := new(storagepull.Attempt)
 		err := db.NewSelect().
 			Model(existing).
-			Where("content_id = ? AND storage_data_set_id = ?", copyRow.ContentID, copyRow.StorageDataSetID).
-			Where("resolved_at IS NULL").
+			Where("attempt_id = ?", input.AttemptID).
 			Scan(ctx)
 		switch {
 		case err == nil:
-			// Recovery re-reserving the same attempt is a no-op; a different one
-			// would mean two live requests for one copy.
-			if existing.AttemptID != input.AttemptID {
+			if existing.ResolvedAt != nil || existing.Status != storagepull.AttemptStatusAttempted ||
+				existing.ContentID != copyRow.ContentID || existing.StorageDataSetID != copyRow.StorageDataSetID ||
+				!existing.SourceProviderID.Equal(*input.SourceProviderID) || !existing.SourceDataSetID.Equal(*input.SourceDataSetID) ||
+				!existing.SourcePieceID.Equal(*input.SourcePieceID) || existing.SourcePieceCID != input.SourcePieceCID ||
+				existing.SourceRetrievalURL != input.SourceRetrievalURL || existing.ExtraDataHex != input.ExtraDataHex {
 				return fmt.Errorf("reserving storage pull request: %w", ErrConflict)
 			}
 			return nil
@@ -128,7 +129,8 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 			SourceProviderID: *input.SourceProviderID,
 			SourceDataSetID:  *input.SourceDataSetID, SourcePieceID: *input.SourcePieceID,
 			SourcePieceCID: input.SourcePieceCID, SourceRetrievalURL: input.SourceRetrievalURL,
-			AttemptedAt: now, CreatedAt: now, UpdatedAt: now,
+			ExtraDataHex: input.ExtraDataHex,
+			AttemptedAt:  now, CreatedAt: now, UpdatedAt: now,
 		}
 		if _, err := db.NewInsert().Model(attempt).Exec(ctx); err != nil {
 			if isUniqueViolation(err) {
@@ -136,22 +138,36 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 			}
 			return fmt.Errorf("reserving storage pull request: %w", err)
 		}
-		// The Pull hands the provider a signed add-pieces request, so that
-		// request is on record before it leaves this process. A signed member
-		// pulled again sends the request it already belongs to.
-		if copyRow.CommitRequestID != nil {
-			if *copyRow.CommitRequestID != input.CommitRequest.RequestID {
-				return fmt.Errorf("reserving storage pull request: %w", ErrConflict)
-			}
-			return nil
-		}
-		request := input.CommitRequest
-		request.CopyID, request.ContentID, request.StorageDataSetID, request.Now = input.CopyID, copyRow.ContentID, copyRow.StorageDataSetID, now
-		if request.PieceCID == "" {
-			request.PieceCID = input.SourcePieceCID
-		}
-		return createPullCommitRequest(ctx, db, request)
+		return nil
 	})
+}
+
+// GetPullAttempt requires the copy identity as well as the checkpoint's ID.
+func (r *BunStorageContentRepo) GetPullAttempt(ctx context.Context, attemptID string, contentID, storageDataSetID int64) (*storagepull.Attempt, error) {
+	attempt := new(storagepull.Attempt)
+	if err := r.db.NewSelect().Model(attempt).
+		Where("attempt_id = ? AND content_id = ? AND storage_data_set_id = ?", attemptID, contentID, storageDataSetID).
+		Scan(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("loading storage pull attempt: %w", err)
+	}
+	return attempt, nil
+}
+
+// GetUnresolvedPullAttempt recovers evidence retained independently of a task.
+func (r *BunStorageContentRepo) GetUnresolvedPullAttempt(ctx context.Context, contentID, storageDataSetID int64) (*storagepull.Attempt, error) {
+	attempt := new(storagepull.Attempt)
+	if err := r.db.NewSelect().Model(attempt).
+		Where("content_id = ? AND storage_data_set_id = ? AND resolved_at IS NULL", contentID, storageDataSetID).
+		Scan(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("loading unresolved storage pull attempt: %w", err)
+	}
+	return attempt, nil
 }
 
 func (r *BunStorageContentRepo) ReplaceCopyTask(ctx context.Context, copyID, generation, taskID, nextGeneration, nextTaskID int64) error {
