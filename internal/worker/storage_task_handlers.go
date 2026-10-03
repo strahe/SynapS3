@@ -1660,6 +1660,12 @@ func (h *TaskHandlers) completeCopyTask(input storagepipeline.CopyGenerationInpu
 }
 
 func (h *TaskHandlers) enqueueInitialCopyTask(ctx context.Context, repos *repository.Repositories, copyID int64, taskType model.TaskType) error {
+	return h.enqueueCopyTaskAt(ctx, repos, copyID, taskType, time.Time{})
+}
+
+// enqueueCopyTaskAt starts a new generation of copy work, runnable from
+// availableAt (now when zero).
+func (h *TaskHandlers) enqueueCopyTaskAt(ctx context.Context, repos *repository.Repositories, copyID int64, taskType model.TaskType, availableAt time.Time) error {
 	if h.taskService == nil {
 		return errors.New("task service is unavailable")
 	}
@@ -1671,6 +1677,7 @@ func (h *TaskHandlers) enqueueInitialCopyTask(ctx context.Context, repos *reposi
 	taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 		Type: taskType, IdempotencyKey: copyTaskKey(taskType, copyID, generation), Input: input,
 		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyID, 10),
+		AvailableAt: availableAt,
 	})
 	if err != nil {
 		return err
@@ -1911,10 +1918,13 @@ func (h *TaskHandlers) failPullTask(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if copyRow == nil || copyRow.CommitDecidedByRequest() {
+	if copyRow == nil {
 		return taskengine.Fail(err, reason, nil)
 	}
 	message := err.Error()
+	if copyRow.CommitDecidedByRequest() {
+		return taskengine.Fail(err, reason, h.releaseMemberTransfer(execution, input, copyRow, message, pullAttemptID))
+	}
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
 		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, pullAttemptID)
 	})
@@ -1927,13 +1937,33 @@ func (h *TaskHandlers) failCopyTask(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if copyRow == nil || copyRow.CommitDecidedByRequest() {
+	if copyRow == nil {
 		return taskengine.Fail(err, reason, nil)
 	}
 	message := err.Error()
+	if copyRow.CommitDecidedByRequest() {
+		return taskengine.Fail(err, reason, h.releaseMemberTransfer(execution, input, copyRow, message, ""))
+	}
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
 		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
 	})
+}
+
+// releaseMemberTransfer settles a transfer that gave up on a signed member.
+// The copy cannot fail on its own while its request may still land; it stays
+// in the request, whose task decides its fate.
+func (h *TaskHandlers) releaseMemberTransfer(
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	message, pullAttemptID string,
+) taskengine.Settlement {
+	return func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.Contents.ReleaseMemberTransfer(ctx, repository.ReleaseMemberTransferInput{
+			StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, Generation: input.Generation,
+			TaskID: execution.ID(), LastError: message, PullAttemptID: pullAttemptID,
+		})
+	}
 }
 
 func (h *TaskHandlers) settleCopyFailure(

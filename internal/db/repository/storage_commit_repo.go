@@ -889,12 +889,6 @@ func (r *BunStorageContentRepo) CountCommitBacklog(ctx context.Context, storageD
 	return count, nil
 }
 
-// CountOpenCommitRequestsForDataSet counts the data set's requests that are not
-// settled.
-func (r *BunStorageContentRepo) CountOpenCommitRequestsForDataSet(ctx context.Context, storageDataSetID int64) (int, error) {
-	return countOpenCommitRequests(ctx, r.db, storageDataSetID)
-}
-
 func countOpenCommitRequests(ctx context.Context, db bun.IDB, storageDataSetID int64) (int, error) {
 	count, err := db.NewSelect().
 		Model((*storagecommit.Request)(nil)).
@@ -983,8 +977,12 @@ func wakeCommitQueue(ctx context.Context, db bun.IDB, storageDataSetID int64, no
 
 // WakeCommitRequestTask makes one request's task runnable.
 func (r *BunStorageContentRepo) WakeCommitRequestTask(ctx context.Context, requestID string) error {
+	return wakeCommitRequestTask(ctx, r.db, requestID)
+}
+
+func wakeCommitRequestTask(ctx context.Context, db bun.IDB, requestID string) error {
 	var taskID sql.NullInt64
-	err := r.db.NewSelect().Model((*storagecommit.Request)(nil)).Column("task_id").
+	err := db.NewSelect().Model((*storagecommit.Request)(nil)).Column("task_id").
 		Where("request_id = ?", requestID).Scan(ctx, &taskID)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && !taskID.Valid {
 		return nil
@@ -992,7 +990,58 @@ func (r *BunStorageContentRepo) WakeCommitRequestTask(ctx context.Context, reque
 	if err != nil {
 		return fmt.Errorf("loading storage commit request task: %w", err)
 	}
-	return wakeCommitTasks(ctx, r.db, []int64{taskID.Int64})
+	return wakeCommitTasks(ctx, db, []int64{taskID.Int64})
+}
+
+// ReleaseMemberTransferInput names the transfer task of a signed member that
+// gave up.
+type ReleaseMemberTransferInput struct {
+	StorageCopyID int64
+	ContentID     int64
+	Generation    int64
+	TaskID        int64
+	LastError     string
+	PullAttemptID string
+}
+
+// ReleaseMemberTransfer ends the transfer task of a signed member that could
+// not be transferred again. The member keeps its place in its request, whose
+// task can read the chain and decides what becomes of it, so that task is
+// woken.
+func (r *BunStorageContentRepo) ReleaseMemberTransfer(ctx context.Context, input ReleaseMemberTransferInput) error {
+	if input.StorageCopyID <= 0 || input.ContentID <= 0 || input.Generation <= 0 || input.TaskID <= 0 || strings.TrimSpace(input.LastError) == "" {
+		return fmt.Errorf("releasing storage commit member transfer: %w", ErrInvalidInput)
+	}
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockStorageContentForCopyMutation(ctx, db, input.ContentID); err != nil {
+			return err
+		}
+		now := time.Now()
+		if err := abandonCopyPullAttempt(ctx, db, input.PullAttemptID, input.ContentID, input.StorageCopyID, input.LastError, now); err != nil {
+			return err
+		}
+		var requestID string
+		err := db.NewRaw(`UPDATE storage_copies
+			SET active_task_id = NULL,
+			    last_error = CASE WHEN status = ? THEN last_error ELSE ? END,
+			    updated_at = ?
+			WHERE id = ? AND content_id = ? AND work_generation = ? AND active_task_id = ?
+			  AND commit_position IS NOT NULL
+			RETURNING commit_request_id`,
+			model.StorageCopyStatusCommitted, input.LastError, now,
+			input.StorageCopyID, input.ContentID, input.Generation, input.TaskID).Scan(ctx, &requestID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrConflict
+		}
+		if err != nil {
+			return err
+		}
+		return wakeCommitRequestTask(ctx, db, requestID)
+	})
+	if err != nil {
+		return fmt.Errorf("releasing storage commit member transfer: %w", err)
+	}
+	return nil
 }
 
 func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64) error {

@@ -27,8 +27,10 @@ type ClientNonceState struct {
 	NextPieceID sdktypes.BigInt
 }
 
-// PieceIDs returns the IDs a consumed nonce assigned to count pieces. FWSS
-// numbers the pieces of one request consecutively, ending at NextPieceID-1.
+// PieceIDs returns the IDs a consumed nonce assigned to count pieces. PDPVerifier
+// numbers the pieces of one request consecutively from firstAdded, and FWSS
+// piecesAdded records firstAdded + count as the next piece ID, so they end at
+// NextPieceID-1.
 func (s ClientNonceState) PieceIDs(count int) ([]sdktypes.BigInt, error) {
 	if !s.Consumed || count <= 0 {
 		return nil, errors.New("client nonce assigned no pieces")

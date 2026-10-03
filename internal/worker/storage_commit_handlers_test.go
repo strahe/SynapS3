@@ -56,8 +56,11 @@ type registrationProvider struct {
 	// spendFirstNonce makes the chain spend the first signed nonce on another
 	// data set before it is ever sent.
 	spendFirstNonce bool
-	signed          int
-	dataSet         sdktypes.BigInt
+	// maxSigned refuses to sign requests of more pieces, as the SDK does with
+	// one that does not fit an add-pieces message.
+	maxSigned int
+	signed    int
+	dataSet   sdktypes.BigInt
 }
 
 func newRegistrationProvider(t *testing.T, providerID, dataSetID, clientID sdktypes.BigInt, nonces *testutil.MockCommitNonces) *registrationProvider {
@@ -71,6 +74,9 @@ func newRegistrationProvider(t *testing.T, providerID, dataSetID, clientID sdkty
 	p.target.PresignForCommitFunc = func(_ context.Context, pieces []storage.PieceInput) ([]byte, error) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		if p.maxSigned > 0 && len(pieces) > p.maxSigned {
+			return nil, fmt.Errorf("%w: %d pieces do not fit one request", storage.ErrInvalidArgument, len(pieces))
+		}
 		nonce++
 		extra := testutil.CommitExtraData(nonce)
 		p.signed++
@@ -643,6 +649,183 @@ func TestUnknownAttentionCodeStopsRecovery(t *testing.T) {
 	if sends, _ := f.provider.sent(); len(sends) != 1 {
 		t.Fatalf("submissions = %d, want only the lost one", len(sends))
 	}
+}
+
+func TestRequestTooLargeToSignIsSplitInHalves(t *testing.T) {
+	f := newRegistrationFixture(t, 4, nil)
+	f.provider.maxSigned = 2
+	requestID, taskID := f.collect(t)
+	cancel, done := runHandlerEngine(t, f.runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	waitForCommitted(t, f.runtime, f.copies)
+	if request := f.request(t, requestID); request.PieceCount != 2 || request.Status != storagecommit.RequestStatusConfirmed {
+		t.Fatalf("first request = %#v, want the half that fits", request)
+	}
+	if sends, _ := f.provider.sent(); len(sends) != 2 || len(sends[0]) != 2 || len(sends[1]) != 2 {
+		t.Fatalf("submissions = %v, want two requests of two pieces", sends)
+	}
+}
+
+// pullRegistration is a peer copy whose first Pull succeeds and every later one
+// fails for good. Its provider answers sends from script, and has dropped the
+// pulled piece once it refuses one.
+type pullRegistration struct {
+	runtime  handlerTestRuntime
+	pipeline seededCopyPipeline
+	mu       sync.Mutex
+	script   []sendOutcome
+	sends    int
+	pulls    int
+}
+
+func newPullRegistration(t *testing.T, script ...sendOutcome) *pullRegistration {
+	t.Helper()
+	r := &pullRegistration{script: script}
+	parked := &droppedPieces{missing: map[string]bool{}}
+	target := &testutil.MockStorageTarget{
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
+		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.pulls++
+			if r.pulls == 1 {
+				return &storage.PullResult{}, nil
+			}
+			return nil, fmt.Errorf("provider pull: %w", pdp.ErrPullFailed)
+		},
+		SubmitCommitFunc: func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.sends++
+			parked.drop(request.Pieces[0].PieceCID.String())
+			if r.sends > len(r.script) || r.script[r.sends-1] == sendRefuse {
+				return nil, &pdp.HTTPError{StatusCode: 400, Body: "piece not found"}
+			}
+			return nil, &pdp.HTTPError{StatusCode: 502, Body: "bad gateway"}
+		},
+	}
+	storageClient := &testutil.MockStorageClient{}
+	r.runtime = newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: storageClient, policy: cache.EvictionPolicyNone,
+		commitNonces: &testutil.MockCommitNonces{}, parkedPieces: parked,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	r.pipeline = seedCopyPipeline(t, r.runtime, model.StorageCopyStatusPending)
+	target.ProviderIDValue = r.pipeline.targetSet.ProviderID.SDK()
+	dataSetID := r.pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &dataSetID
+	target.ClientDataSetIDValue = r.pipeline.targetClient
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	bindCopyTask(t, r.runtime, r.pipeline.target, model.TaskTypeStoragePull)
+	return r
+}
+
+func (r *pullRegistration) sent() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sends
+}
+
+// copyRow waits for the peer copy to satisfy predicate, waking registration
+// tasks meanwhile.
+func (r *pullRegistration) copyRow(t *testing.T, predicate func(*model.StorageCopy) bool) *model.StorageCopy {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		copyRow, err := r.runtime.repos.Contents.GetUploadCopyByID(t.Context(), r.pipeline.target.ID)
+		if err != nil {
+			t.Fatalf("load copy: %v", err)
+		}
+		if predicate(copyRow) {
+			return copyRow
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("copy did not reach the expected state: %#v", copyRow)
+		}
+		wakeCommitTasks(t, r.runtime)
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestUnacceptedRequestFailsAMemberThatCannotBeTransferredAgain(t *testing.T) {
+	r := newPullRegistration(t, sendRefuse)
+	cancel, done := runHandlerEngine(t, r.runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	// The provider refused the request and had dropped the piece; pulling it
+	// again fails for good. The request was never accepted, so it is given up
+	// and the copy fails as any other copy would.
+	failed := r.copyRow(t, func(c *model.StorageCopy) bool { return c.Status == model.StorageCopyStatusFailed })
+	if failed.CommitRequestID != nil || failed.ActiveTaskID != nil || failed.LastError == nil {
+		t.Fatalf("failed copy = %#v, want released with its transfer error", failed)
+	}
+	var requests []storagecommit.Request
+	if err := r.runtime.db.NewSelect().Model(&requests).Where("storage_data_set_id = ?", r.pipeline.targetSet.ID).Scan(t.Context()); err != nil {
+		t.Fatalf("load requests: %v", err)
+	}
+	if len(requests) != 1 || requests[0].Status != storagecommit.RequestStatusAbandoned {
+		t.Fatalf("requests = %#v, want the refused request given up", requests)
+	}
+	if r.sent() != 1 {
+		t.Fatalf("submissions = %d, want 1", r.sent())
+	}
+	// The source still holds a readable copy, so the content itself is fine.
+	if content, err := r.runtime.repos.Contents.GetByID(t.Context(), r.pipeline.upload.ID); err != nil || content.ErrorMessage != nil {
+		t.Fatalf("content = %#v, %v, want it not flagged", content, err)
+	}
+}
+
+func TestSubmittedRequestTransfersAGivenUpMemberAgainLater(t *testing.T) {
+	r := newPullRegistration(t, sendLost, sendRefuse)
+	cancel, done := runHandlerEngine(t, r.runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	member := r.copyRow(t, func(c *model.StorageCopy) bool {
+		return c.CommitRequestID != nil && c.Status == model.StorageCopyStatusCommitting
+	})
+	requestID := *member.CommitRequestID
+	waitForCommitTask(t, r.runtime, requestTaskID(t, r.runtime, requestID), func(*model.Task) bool { return r.sent() == 1 })
+	if _, err := r.runtime.db.NewRaw(`UPDATE storage_commit_requests SET last_sent_at = ? WHERE request_id = ?`,
+		time.Now().Add(-time.Hour), requestID).Exec(t.Context()); err != nil {
+		t.Fatalf("age latest send: %v", err)
+	}
+
+	// The resend is refused for a dropped piece that cannot be pulled again.
+	// The first send may still land, so the copy stays in its request and is
+	// transferred again later.
+	retried := r.copyRow(t, func(c *model.StorageCopy) bool {
+		if c.Status != model.StorageCopyStatusPending || c.ActiveTaskID == nil || c.LastError == nil {
+			return false
+		}
+		task, err := r.runtime.repos.Tasks.GetByID(t.Context(), *c.ActiveTaskID)
+		return err == nil && task.Type == model.TaskTypeStorageTransferPlan && task.AvailableAt.After(time.Now().Add(time.Minute))
+	})
+	if retried.CommitRequestID == nil || *retried.CommitRequestID != requestID || retried.CommitPosition == nil {
+		t.Fatalf("copy = %#v, want it kept at its position", retried)
+	}
+	var request storagecommit.Request
+	if err := r.runtime.db.NewSelect().Model(&request).Where("request_id = ?", requestID).Scan(t.Context()); err != nil ||
+		request.Status != storagecommit.RequestStatusSubmitted {
+		t.Fatalf("request = %#v, %v, want still submitted", request, err)
+	}
+	if r.sent() != 2 {
+		t.Fatalf("submissions = %d, want 2", r.sent())
+	}
+}
+
+func requestTaskID(t *testing.T, runtime handlerTestRuntime, requestID string) int64 {
+	t.Helper()
+	request, err := runtime.repos.Contents.GetCommitRequest(t.Context(), requestID)
+	if err != nil || request.TaskID == nil {
+		t.Fatalf("request %s = %#v, %v", requestID, request, err)
+	}
+	return *request.TaskID
 }
 
 type droppedPieces struct {

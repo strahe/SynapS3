@@ -241,8 +241,15 @@ func (h *TaskHandlers) sealCommit(ctx context.Context, run commitRun, members []
 // its data set has room.
 func (h *TaskHandlers) runReadyCommit(ctx context.Context, run commitRun) taskengine.Result {
 	request := run.request
-	if result, waiting := h.waitForCommitMembers(ctx, run, nil); waiting {
-		return result
+	transferring, stalled, err := h.commitMemberProgress(ctx, run)
+	if err != nil {
+		return retryTask(err, "commit_members_load_failed")
+	}
+	if len(stalled) > 0 {
+		return h.giveUpUnacceptedCommit(ctx, run)
+	}
+	if transferring {
+		return waitForCommitMembers(nil)
 	}
 	if request.RetryAt != nil && request.RetryAt.After(time.Now()) {
 		return taskengine.Suspend(model.TaskResumeModeExecute, time.Until(*request.RetryAt), storagecommit.ProviderRejectedWaitReason,
@@ -274,7 +281,7 @@ func (h *TaskHandlers) runReadyCommit(ctx context.Context, run commitRun) tasken
 	case storagecommit.PrepareConfirmed:
 		return h.confirmCommit(run, target, commit, storagecommit.Confirmation{FirstPieceID: prepared.Proof.FirstPieceID})
 	case storagecommit.PrepareConflict:
-		return h.resignCommit(run)
+		return h.resignCommit(run, "its nonce was used by another request; its pieces are signed again")
 	case storagecommit.PrepareAbandon:
 		return h.abandonCommit(run, prepared.Cause)
 	case storagecommit.PrepareSend:
@@ -388,6 +395,12 @@ func (h *TaskHandlers) runSubmittedCommit(ctx context.Context, run commitRun) ta
 			"Checking storage registration", synapse.SummarizedError(err), nil)
 	}
 	noted := h.observationSettlement(run, observation)
+	transferring, stalled := false, []int64(nil)
+	if observation.Kind == storagecommit.ObservePending || observation.Kind == storagecommit.ObserveResendDue {
+		if transferring, stalled, err = h.commitMemberProgress(ctx, run); err != nil {
+			return retryTask(err, "commit_members_load_failed")
+		}
+	}
 	//exhaustive:enforce
 	switch observation.Kind {
 	case storagecommit.ObservePending:
@@ -395,11 +408,12 @@ func (h *TaskHandlers) runSubmittedCommit(ctx context.Context, run commitRun) ta
 		if delay <= 0 {
 			delay = storagePollInterval
 		}
+		settlement := h.retransferStalledMembers(run, stalled, noted)
 		if observation.Cause != nil {
 			return taskengine.SuspendWithError(model.TaskResumeModeRecover, delay, "provider_confirmation",
-				"Waiting for storage registration", synapse.SummarizedError(observation.Cause), noted)
+				"Waiting for storage registration", synapse.SummarizedError(observation.Cause), settlement)
 		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, delay, "provider_confirmation", "Waiting for storage registration", noted)
+		return taskengine.Suspend(model.TaskResumeModeRecover, delay, "provider_confirmation", "Waiting for storage registration", settlement)
 	case storagecommit.ObserveConfirmed:
 		return h.confirmCommit(run, target, commit, *observation.Confirmation)
 	case storagecommit.ObserveStop:
@@ -409,8 +423,8 @@ func (h *TaskHandlers) runSubmittedCommit(ctx context.Context, run commitRun) ta
 	case storagecommit.ObserveResendDue:
 		// A member the provider dropped cannot be added until it is
 		// transferred again; sending before that is refused for nothing.
-		if result, waiting := h.waitForCommitMembers(ctx, run, noted); waiting {
-			return result
+		if transferring || len(stalled) > 0 {
+			return waitForCommitMembers(h.retransferStalledMembers(run, stalled, noted))
 		}
 		if !run.mayExec {
 			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Sending storage registration again", noted)
@@ -624,52 +638,130 @@ func (h *TaskHandlers) finishCommittedContent(ctx context.Context, repos *reposi
 	return h.enqueueAfterUploadEvictions(ctx, repos, refs)
 }
 
-// abandonCommit gives up a request its data set can never take and fails its
-// members. A member still being transferred settles first.
-// waitForCommitMembers holds a sealed request until every member is
-// transferred: it is only ever sent whole. A member is still transferring for
-// the first time while its Pull runs, or again after the provider dropped its
-// piece. settlement records what the caller observed meanwhile.
-func (h *TaskHandlers) waitForCommitMembers(ctx context.Context, run commitRun, settlement taskengine.Settlement) (taskengine.Result, bool) {
+// commitMemberRetransferDelay is how long a submitted request waits before
+// transferring again a member whose transfer gave up.
+const commitMemberRetransferDelay = 5 * time.Minute
+
+// commitMemberProgress reports whether a member of a sealed request is still
+// being transferred, and which members' transfers gave up. A member is
+// transferred for the first time while its Pull runs, and again after the
+// provider dropped its piece.
+func (h *TaskHandlers) commitMemberProgress(ctx context.Context, run commitRun) (transferring bool, stalled []int64, err error) {
 	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, run.request.RequestID)
 	if err != nil {
-		return retryTask(err, "commit_members_load_failed"), true
+		return false, nil, err
 	}
 	for _, member := range members {
-		if member.Status != model.StorageCopyStatusCommitting {
-			return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "commit_members",
-				"Waiting for stored data to finish transferring", settlement), true
+		switch {
+		case member.Status == model.StorageCopyStatusCommitting:
+		case member.Status == model.StorageCopyStatusPending && member.ActiveTaskID == nil:
+			stalled = append(stalled, member.ID)
+		default:
+			transferring = true
 		}
 	}
-	return taskengine.Result{}, false
+	return transferring, stalled, nil
 }
 
-// resignCommit gives up a request the provider never accepted whose nonce the
-// chain already spent on another signature. That request can never be added,
-// so its members are released to be signed again with a new nonce.
-func (h *TaskHandlers) resignCommit(run commitRun) taskengine.Result {
-	h.deps.Logger.Warn("storage registration nonce was used by another request; signing its pieces again",
-		"task_id", run.taskID(), "commit_request_id", run.request.RequestID, "storage_data_set_id", run.request.StorageDataSetID)
+// waitForCommitMembers holds a request, which is only ever sent whole, until
+// every member is transferred. settlement records what the caller observed
+// meanwhile.
+func waitForCommitMembers(settlement taskengine.Settlement) taskengine.Result {
+	return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "commit_members",
+		"Waiting for stored data to finish transferring", settlement)
+}
+
+// retransferStalledMembers schedules another transfer for each member whose
+// transfer gave up. A submitted request may still land, so its members stay
+// with it until the chain decides; then runs first.
+func (h *TaskHandlers) retransferStalledMembers(run commitRun, stalled []int64, then taskengine.Settlement) taskengine.Settlement {
+	if len(stalled) == 0 {
+		return then
+	}
+	return func(ctx context.Context, repos *repository.Repositories) error {
+		if then != nil {
+			if err := then(ctx, repos); err != nil {
+				return err
+			}
+		}
+		at := time.Now().Add(commitMemberRetransferDelay)
+		for _, copyID := range stalled {
+			copyRow, err := repos.Contents.GetUploadCopyByID(ctx, copyID)
+			if err != nil {
+				return err
+			}
+			if copyRow == nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID != nil ||
+				copyRow.CommitRequestID == nil || *copyRow.CommitRequestID != run.request.RequestID {
+				continue
+			}
+			h.deps.Logger.Warn("storage registration member could not be transferred again; trying later",
+				"task_id", run.taskID(), "commit_request_id", run.request.RequestID, "copy_id", copyID, "retry_after", commitMemberRetransferDelay)
+			if err := h.enqueueCopyTaskAt(ctx, repos, copyID, model.TaskTypeStorageTransferPlan, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// giveUpUnacceptedCommit settles a request the provider never accepted once a
+// member can no longer be transferred. The chain decides: pieces already added
+// confirm it. Otherwise no send of it can land, so the other members are
+// signed again without the member that gave up, which fails as a lone copy
+// would.
+func (h *TaskHandlers) giveUpUnacceptedCommit(ctx context.Context, run commitRun) taskengine.Result {
+	target, commit, result, ok := h.loadCommit(ctx, run)
+	if !ok {
+		return result
+	}
+	proof, err := run.advancer.Prove(ctx, commit)
+	if err != nil {
+		return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagecommit.ChainRetryDelay, "provider_confirmation",
+			"Checking storage registration", synapse.SummarizedError(err), nil)
+	}
+	if proof.Outcome == storagecommit.ProofLanded {
+		return h.confirmCommit(run, target, commit, storagecommit.Confirmation{FirstPieceID: proof.FirstPieceID})
+	}
+	return h.resignCommit(run, "a member could not be transferred again; the other pieces are signed again")
+}
+
+// resignCommit gives up a request the provider never accepted and that can
+// never be sent as signed. Its transferred members are signed again with a new
+// nonce; a member whose transfer gave up fails as a lone copy would.
+func (h *TaskHandlers) resignCommit(run commitRun, reason string) taskengine.Result {
+	h.deps.Logger.Warn("storage registration is given up and its pieces signed again",
+		"task_id", run.taskID(), "commit_request_id", run.request.RequestID, "storage_data_set_id", run.request.StorageDataSetID,
+		"reason", reason)
 	return taskengine.Complete("Storage registration is signed again", func(ctx context.Context, repos *repository.Repositories) error {
 		members, err := repos.Contents.AbandonCommitRequest(ctx, repository.AbandonCommitRequestInput{
-			RequestID: run.request.RequestID, TaskID: run.taskID(),
-			Reason: "its nonce was used by another request; its pieces are signed again",
+			RequestID: run.request.RequestID, TaskID: run.taskID(), Reason: reason,
 		})
 		if err != nil {
 			return err
 		}
-		for _, member := range members {
-			if member.Status != model.StorageCopyStatusCommitting && member.Status != model.StorageCopyStatusPieceReady {
-				continue
-			}
-			if err := h.queueCommit(ctx, repos, member.ID); err != nil {
-				return err
+		for i := range members {
+			member := &members[i]
+			switch {
+			case member.Status == model.StorageCopyStatusCommitting || member.Status == model.StorageCopyStatusPieceReady:
+				if err := h.queueCommit(ctx, repos, member.ID); err != nil {
+					return err
+				}
+			case member.Status == model.StorageCopyStatusPending && member.ActiveTaskID == nil:
+				message := reason
+				if member.LastError != nil && *member.LastError != "" {
+					message = *member.LastError
+				}
+				if err := h.failCopy(ctx, repos, member, message, ""); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	})
 }
 
+// abandonCommit gives up a request its data set can never take and fails its
+// members. A member still being transferred settles first.
 func (h *TaskHandlers) abandonCommit(run commitRun, cause error) taskengine.Result {
 	message := "the storage service no longer accepts new data"
 	if cause != nil {

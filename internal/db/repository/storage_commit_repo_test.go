@@ -49,6 +49,7 @@ var commitLedgerCases = []struct {
 	{"RetainedCommitTaskIsKeptWhileItsRequestIsOpen", testRetainedCommitTaskIsKeptWhileItsRequestIsOpen},
 	{"UnsentSinglePieceRequestIsGivenUpWithItsCopy", testUnsentSinglePieceRequestIsGivenUpWithItsCopy},
 	{"StoppedRequestDoesNotHoldTheQueue", testStoppedRequestDoesNotHoldTheQueue},
+	{"LateTransferOfACommittedMemberCompletes", testLateTransferOfACommittedMemberCompletes},
 }
 
 func TestCommitRequestLedger(t *testing.T) {
@@ -425,5 +426,46 @@ func testStoppedRequestDoesNotHoldTheQueue(t *testing.T, f commitFixture) {
 	}
 	if request := f.request(t, "stopped"); request.Status != storagecommit.RequestStatusReady || request.TaskID == nil || *request.TaskID != stopped {
 		t.Fatalf("stopped request = %#v, want it kept for its task", request)
+	}
+}
+
+func testLateTransferOfACommittedMemberCompletes(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	first, second := f.transferredCopy(t, "first"), f.transferredCopy(t, "second")
+	taskID := f.collecting(t, "late", first, second)
+	f.seal(t, "late", taskID, first, second)
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "late", TaskID: taskID}); err != nil {
+		t.Fatalf("BeginCommitSubmission: %v", err)
+	}
+	// The provider dropped the first piece, so it is transferred again; an
+	// earlier send lands meanwhile and commits it anyway.
+	if err := f.repos.Contents.ReturnCommitMembersToTransfer(ctx, "late", taskID, []int64{first.ID}, time.Now()); err != nil {
+		t.Fatalf("ReturnCommitMembersToTransfer: %v", err)
+	}
+	firstURL := "https://provider.example/piece/first"
+	if _, err := f.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
+		RequestID: "late", TaskID: taskID, FirstPieceID: onChainID(t, "50"),
+		RetrievalURLs: []string{firstURL, "https://provider.example/piece/second"},
+	}); err != nil {
+		t.Fatalf("ConfirmCommitRequest: %v", err)
+	}
+	finish := func(pieceCID string) error {
+		return f.repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+			StorageCopyID: first.ID, ContentID: first.ContentID, CopyIndex: first.CopyIndex,
+			PieceCID: pieceCID, RetrievalURL: firstURL, RequireEligibleCopy: true,
+		})
+	}
+	content, err := f.repos.Contents.GetByID(ctx, first.ContentID)
+	if err != nil || content.PieceCID == nil {
+		t.Fatalf("content = %#v, %v", content, err)
+	}
+	if err := finish(*content.PieceCID); err != nil {
+		t.Fatalf("late transfer with the same evidence = %v, want it to complete", err)
+	}
+	if committed := f.copy(t, first.ID); committed.Status != model.StorageCopyStatusCommitted || committed.PieceID == nil || committed.PieceID.String() != "50" {
+		t.Fatalf("member after its late transfer = %#v, want it still committed", committed)
+	}
+	if err := finish("piece-other"); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("late transfer of other bytes = %v, want conflict", err)
 	}
 }

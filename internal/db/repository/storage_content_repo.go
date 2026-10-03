@@ -1204,8 +1204,14 @@ func (r *BunStorageContentRepo) MarkUploadCopyPieceReady(ctx context.Context, in
 			}
 			// A repeated or late transfer result never moves a copy back: one
 			// already transferred, registering, or committed keeps its state.
+			// A signed member can be committed while it is transferred again,
+			// when an earlier send of its request lands, so a late result with
+			// the same evidence completes too.
 			switch status {
-			case model.StorageCopyStatusPieceReady, model.StorageCopyStatusCommitting:
+			case model.StorageCopyStatusPieceReady, model.StorageCopyStatusCommitting, model.StorageCopyStatusCommitted:
+				if status == model.StorageCopyStatusCommitted && !input.RequireEligibleCopy {
+					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, now)
+				}
 				compatible := db.NewSelect().
 					Model((*model.StorageCopy)(nil)).
 					Where("id = ?", copyID)
@@ -1224,10 +1230,6 @@ func (r *BunStorageContentRepo) MarkUploadCopyPieceReady(ctx context.Context, in
 					return fmt.Errorf("checking idempotent piece evidence: %w", err)
 				}
 				if count == 1 {
-					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, now)
-				}
-			case model.StorageCopyStatusCommitted:
-				if !input.RequireEligibleCopy {
 					return resolvePieceReadyPull(ctx, db, input.PullAttemptID, now)
 				}
 			}
@@ -1303,6 +1305,49 @@ func liveObjectVersionExistsForUploadSQL() string {
 	)`
 }
 
+// abandonCopyPullAttempt settles the copy's unresolved Pull as abandoned. A
+// replay finds it already abandoned; any other state is a conflict.
+func abandonCopyPullAttempt(ctx context.Context, db bun.IDB, attemptID string, contentID, copyID int64, lastError string, now time.Time) error {
+	if attemptID == "" {
+		return nil
+	}
+	result, err := db.NewUpdate().
+		Model((*storagepull.Attempt)(nil)).
+		Set("status = ?", storagepull.AttemptStatusAbandoned).
+		Set("last_error = ?", lastError).
+		Set("resolved_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("attempt_id = ?", attemptID).
+		Where("content_id = ?", contentID).
+		Where(`storage_data_set_id = (
+			SELECT storage_data_set_id FROM storage_copies WHERE id = ?
+		)`, copyID).
+		Where("status = ? AND resolved_at IS NULL", storagepull.AttemptStatusAttempted).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("abandoning failed storage pull: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows > 0 {
+		return nil
+	}
+	count, err := db.NewSelect().
+		Model((*storagepull.Attempt)(nil)).
+		Where("attempt_id = ?", attemptID).
+		Where("content_id = ?", contentID).
+		Where(`storage_data_set_id = (
+			SELECT storage_data_set_id FROM storage_copies WHERE id = ?
+		)`, copyID).
+		Where("status = ? AND resolved_at IS NOT NULL", storagepull.AttemptStatusAbandoned).
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("checking abandoned storage pull: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("abandoning failed storage pull: %w", ErrConflict)
+	}
+	return nil
+}
+
 func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input MarkUploadCopyFailedInput) error {
 	contentID, copyIndex, lastError := input.ContentID, input.CopyIndex, input.LastError
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
@@ -1314,41 +1359,8 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 			return err
 		}
 		now := time.Now()
-		if input.PullAttemptID != "" {
-			result, err := db.NewUpdate().
-				Model((*storagepull.Attempt)(nil)).
-				Set("status = ?", storagepull.AttemptStatusAbandoned).
-				Set("last_error = ?", lastError).
-				Set("resolved_at = ?", now).
-				Set("updated_at = ?", now).
-				Where("attempt_id = ?", input.PullAttemptID).
-				Where("content_id = ?", contentID).
-				Where(`storage_data_set_id = (
-					SELECT storage_data_set_id FROM storage_copies WHERE id = ?
-				)`, copyID).
-				Where("status = ? AND resolved_at IS NULL", storagepull.AttemptStatusAttempted).
-				Exec(ctx)
-			if err != nil {
-				return fmt.Errorf("abandoning failed storage pull: %w", err)
-			}
-			rows, _ := result.RowsAffected()
-			if rows == 0 {
-				count, err := db.NewSelect().
-					Model((*storagepull.Attempt)(nil)).
-					Where("attempt_id = ?", input.PullAttemptID).
-					Where("content_id = ?", contentID).
-					Where(`storage_data_set_id = (
-						SELECT storage_data_set_id FROM storage_copies WHERE id = ?
-					)`, copyID).
-					Where("status = ? AND resolved_at IS NOT NULL", storagepull.AttemptStatusAbandoned).
-					Count(ctx)
-				if err != nil {
-					return fmt.Errorf("checking abandoned storage pull: %w", err)
-				}
-				if count != 1 {
-					return fmt.Errorf("abandoning failed storage pull: %w", ErrConflict)
-				}
-			}
+		if err := abandonCopyPullAttempt(ctx, db, input.PullAttemptID, contentID, copyID, lastError, now); err != nil {
+			return err
 		}
 		// A copy waiting in a collecting request leaves it, and a Pull's request
 		// that was never sent is given up with the Pull. A copy signed into
