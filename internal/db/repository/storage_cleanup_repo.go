@@ -253,9 +253,8 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 // FinalizeContent deletes the current-state rows of content whose remote
 // cleanup finished: its cache record, its copies, and the content row. Commit,
 // pull, replacement, cleanup, and deletion ledgers keep their rows and name the
-// content by value; a pull still open for it is abandoned, since nothing can
-// commit it anymore. It returns ErrContentCleanupNotReady while anything could
-// still need those rows, and must run in the caller's transaction.
+// content by value. Unresolved pulls or other unfinished work return
+// ErrContentCleanupNotReady. It must run in the caller's transaction.
 func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, generation, taskID int64) error {
 	if contentID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput

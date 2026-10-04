@@ -2564,7 +2564,7 @@ func TestDeleteObject_DataVersionPermanentDeleteReportsActiveStorageWork(t *test
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("DeleteObject error = %T %v, want s3 API error", err, err)
 	}
-	if apiErr.Code != "InvalidRequest" || apiErr.Description != "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later." {
+	if apiErr.Code != "InvalidRequest" || apiErr.Description != "Storage work must be resolved before this object version can be deleted. Check the related storage tasks for pending confirmation or required recovery before trying again." {
 		t.Fatalf("DeleteObject API error = %#v, want actionable storage-work conflict", apiErr)
 	}
 }
@@ -2593,7 +2593,7 @@ func TestDeleteObjects_DataVersionReportsActiveStorageWorkPerEntry(t *testing.T)
 	if entryErr.Code == nil || *entryErr.Code != "InvalidRequest" {
 		t.Fatalf("entry code = %v, want InvalidRequest", entryErr.Code)
 	}
-	wantMessage := "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later."
+	wantMessage := "Storage work must be resolved before this object version can be deleted. Check the related storage tasks for pending confirmation or required recovery before trying again."
 	if entryErr.Message == nil || *entryErr.Message != wantMessage {
 		t.Fatalf("entry message = %v, want %q", entryErr.Message, wantMessage)
 	}

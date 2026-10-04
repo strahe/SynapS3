@@ -27,6 +27,7 @@ const (
 const (
 	FailureOutcomeUnknown       = "pull_outcome_unknown"
 	FailureCancelOutcomeUnknown = "pull_cancel_outcome_unknown"
+	FailureRecoveryBlocked      = "pull_recovery_blocked"
 	WaitQueueFull               = "pull_queue_full"
 )
 

@@ -181,6 +181,163 @@ func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestPullPendingMissingPieceStillObservesProviderFailure(t *testing.T) {
+	limit := 0
+	var calls, queries atomic.Int64
+	var firstExtra, firstSource, firstCID string
+	runtime, pipeline, row := newPullTask(t, func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			firstExtra, firstSource, firstCID = hex.EncodeToString(request.ExtraData), request.From(request.Pieces[0]), request.Pieces[0].String()
+		} else if firstExtra != hex.EncodeToString(request.ExtraData) || firstSource != request.From(request.Pieces[0]) || firstCID != request.Pieces[0].String() {
+			t.Error("pending pull replay changed the request")
+		}
+		status := storage.PullStatusPending
+		if call == 3 {
+			status = storage.PullStatusFailed
+		}
+		return pullStatusResult(request, status), nil
+	}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+		queries.Add(1)
+		return synapse.ParkedPieceMissing, nil
+	}), &limit)
+	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+	attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for step := range 4 {
+		if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		status := model.TaskStatusPending
+		if step == 3 {
+			status = model.TaskStatusFailed
+		}
+		row = runOneStorageTask(t, runtime, row, status)
+		if row.RetryCount != 0 {
+			t.Fatalf("provider waiting consumed retries: %#v", row)
+		}
+		if step%2 == 0 && (row.ResumeMode != model.TaskResumeModeExecute || calls.Load() != int64(1+step/2)) {
+			t.Fatalf("recovery submitted a request: %#v, calls=%d", row, calls.Load())
+		}
+	}
+	resolved, err := runtime.repos.Contents.GetPullAttempt(t.Context(), attempt.AttemptID, attempt.ContentID, attempt.StorageDataSetID)
+	if err != nil || resolved.ResolvedAt == nil || resolved.Status != storagepull.AttemptStatusAbandoned ||
+		row.FailureReason == nil || *row.FailureReason != "pull_failed" || calls.Load() != 3 || queries.Load() != 2 {
+		t.Fatalf("pending pull did not settle its confirmed failure: %#v, %#v, %v; calls=%d, queries=%d", row, resolved, err, calls.Load(), queries.Load())
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.ActiveTaskID != nil || copyRow.Status != model.StorageCopyStatusFailed {
+		t.Fatalf("confirmed failure retained the transfer owner: %#v, %v", copyRow, err)
+	}
+}
+
+type pullEvidenceFailureRepository struct {
+	repository.StorageContentRepository
+	stage     string
+	remaining atomic.Int64
+}
+
+func (r *pullEvidenceFailureRepository) fail(stage string) error {
+	if r.stage == stage && r.remaining.Add(-1) >= 0 {
+		return errors.New("injected pull evidence read failure")
+	}
+	return nil
+}
+
+func (r *pullEvidenceFailureRepository) AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error) {
+	if err := r.fail("authorization"); err != nil {
+		return nil, err
+	}
+	return r.StorageContentRepository.AuthorizeCopyTask(ctx, copyID, generation, taskID, claimGeneration)
+}
+
+func (r *pullEvidenceFailureRepository) GetPullAttempt(ctx context.Context, attemptID string, contentID, dataSetID int64) (*storagepull.Attempt, error) {
+	if err := r.fail("attempt"); err != nil {
+		return nil, err
+	}
+	return r.StorageContentRepository.GetPullAttempt(ctx, attemptID, contentID, dataSetID)
+}
+
+func (r *pullEvidenceFailureRepository) GetUnresolvedPullAttempt(ctx context.Context, contentID, dataSetID int64) (*storagepull.Attempt, error) {
+	if err := r.fail("attempt"); err != nil {
+		return nil, err
+	}
+	return r.StorageContentRepository.GetUnresolvedPullAttempt(ctx, contentID, dataSetID)
+}
+
+func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
+	for _, stage := range []string{"authorization", "attempt"} {
+		for _, attempted := range []bool{false, true} {
+			for _, exhausted := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/attempted=%v/exhausted=%v", stage, attempted, exhausted), func(t *testing.T) {
+					limit := 1
+					var calls, queries atomic.Int64
+					runtime, pipeline, row := newPullTask(t, func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+						calls.Add(1)
+						return pullStatusResult(request, storage.PullStatusPending), nil
+					}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+						queries.Add(1)
+						return synapse.ParkedPieceMissing, nil
+					}), &limit)
+					if attempted {
+						row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+					}
+					faults := &pullEvidenceFailureRepository{StorageContentRepository: runtime.repos.Contents, stage: stage}
+					failures := int64(1)
+					if exhausted {
+						failures++
+					}
+					faults.remaining.Store(failures)
+					runtime.repos.Contents = faults
+					if err := runtime.repos.Tasks.RequestCancellation(t.Context(), row.ID, "cancel pull"); err != nil {
+						t.Fatal(err)
+					}
+					row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+					if row.RetryCount != 1 || !row.CancellationRequested() || row.ResumeMode != model.TaskResumeModeRecover {
+						t.Fatalf("evidence failure did not retry cancellation: %#v", row)
+					}
+					if exhausted {
+						row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+						if row.FailureReason == nil || *row.FailureReason != storagepull.FailureRecoveryBlocked || !runtime.service.Retryable(row) {
+							t.Fatalf("blocked cancellation = %#v", row)
+						}
+						copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+						if err != nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.Status != model.StorageCopyStatusPending {
+							t.Fatalf("blocked cancellation lost its owner: %#v, %v", copyRow, err)
+						}
+						if err := runtime.service.Retry(t.Context(), row.ID); err != nil {
+							t.Fatal(err)
+						}
+						retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+						if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" ||
+							retried.RetryCount != 0 || retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, row.Checkpoint) {
+							t.Fatalf("manual retry lost cancellation intent: %#v, %v", retried, err)
+						}
+						row = retried
+					}
+					wantCalls := int64(0)
+					if attempted {
+						wantCalls = 1
+					}
+					if calls.Load() != wantCalls || queries.Load() != 0 {
+						t.Fatalf("blocked recovery reached provider: calls=%d, queries=%d", calls.Load(), queries.Load())
+					}
+					status := model.TaskStatusCancelled
+					if attempted {
+						status = model.TaskStatusFailed
+					}
+					row = runOneStorageTask(t, runtime, row, status)
+					if !row.CancellationRequested() || calls.Load() != wantCalls || (attempted && (queries.Load() != 1 || row.FailureReason == nil || *row.FailureReason != storagepull.FailureCancelOutcomeUnknown)) {
+						t.Fatalf("recovered cancellation = %#v, calls=%d, queries=%d", row, calls.Load(), queries.Load())
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestPullCancellationPreservesUnresolvedOutcome(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
@@ -470,15 +627,20 @@ func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 }
 
 func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
-	for _, scenario := range []string{"missing ledger", "foreign content", "foreign data set", "invalid authorization", "invalid CID", "resolved attempt", "reservation rollback"} {
+	for _, scenario := range []string{"missing ledger", "foreign content", "foreign data set", "invalid authorization", "invalid CID", "resolved attempt", "reservation rollback", "reservation rollback exhausted"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int64
-			runtime, pipeline, row := newPullErrorTask(t, nil, nil, &calls)
+			var retryLimit *int
+			if scenario == "reservation rollback exhausted" {
+				retryLimit = new(0)
+			}
+			rollback := scenario == "reservation rollback" || scenario == "reservation rollback exhausted"
+			runtime, pipeline, row := newPullErrorTask(t, nil, retryLimit, &calls)
 			var input storagepipeline.CopyGenerationInput
 			if err := json.Unmarshal(row.Input, &input); err != nil {
 				t.Fatal(err)
 			}
-			if scenario == "reservation rollback" {
+			if rollback {
 				if _, err := runtime.db.Exec(`CREATE TRIGGER reject_pull BEFORE INSERT ON storage_pull_attempts BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END`); err != nil {
 					t.Fatal(err)
 				}
@@ -531,10 +693,17 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 			if calls.Load() != 0 {
 				t.Fatalf("provider calls = %d", calls.Load())
 			}
-			if scenario == "reservation rollback" {
+			if rollback {
 				count, err := runtime.db.NewSelect().Model((*storagepull.Attempt)(nil)).Count(t.Context())
 				if err != nil || count != 0 || len(result.Checkpoint) != 0 {
 					t.Fatalf("rollback evidence = %d, %s, %v", count, result.Checkpoint, err)
+				}
+				if retryLimit != nil {
+					copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+					if err != nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil ||
+						result.FailureReason == nil || *result.FailureReason != "pull_checkpoint_failed" || runtime.service.Retryable(result) {
+						t.Fatalf("unsubmitted failure retained ownership or reported an unknown outcome: %#v, %#v, %v", result, copyRow, err)
+					}
 				}
 			} else if result.FailureReason == nil || *result.FailureReason != storagepull.FailureOutcomeUnknown {
 				t.Fatalf("invalid evidence result = %#v", result)

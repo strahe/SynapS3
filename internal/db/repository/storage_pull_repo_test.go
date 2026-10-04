@@ -74,7 +74,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 		t.Fatalf("cancel did not wake recovery: %#v, %v", claimed, err)
 	}
 	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: new(storagepull.FailureCancelOutcomeUnknown),
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: new(storagepull.FailureRecoveryBlocked),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +91,23 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 		t.Fatal(err)
 	}
 	retried, err := f.repos.Tasks.GetByID(ctx, row.ID)
+	if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" ||
+		retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
+		t.Fatalf("dependency retry lost cancellation or evidence: %#v, %v", retried, err)
+	}
+	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != row.ID || !claimed.CancellationRequested() {
+		t.Fatalf("retry did not resume cancellation recovery: %#v, %v", claimed, err)
+	}
+	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: new(storagepull.FailureCancelOutcomeUnknown),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Tasks.RetryFailed(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err = f.repos.Tasks.GetByID(ctx, row.ID)
 	if err != nil || retried.Status != model.TaskStatusPending || retried.ResumeMode != model.TaskResumeModeRecover ||
 		retried.CancellationRequestedAt != nil || retried.CancellationReason != nil || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
 		t.Fatalf("manual retry lost evidence or cancellation persists: %#v, %v", retried, err)

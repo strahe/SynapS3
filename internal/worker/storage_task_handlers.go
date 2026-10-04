@@ -1491,7 +1491,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		if errors.Is(err, repository.ErrNotFound) {
 			return failPullOutcome(execution, err)
 		}
-		return retryPullOutcome(execution, err, "pull_attempt_load_failed")
+		return retryPullDependency(execution, err, "pull_attempt_load_failed")
 	}
 	var pieceCID cid.Cid
 	var extra []byte
@@ -1505,7 +1505,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Contents.ReservePullRequest(ctx, pullReservation(input, execution.ID(), attempt))
 			}); err != nil {
-				return retryPullOutcome(execution, err, "pull_checkpoint_failed")
+				return retryPullDependency(execution, err, "pull_checkpoint_failed")
 			}
 		}
 	}
@@ -1546,7 +1546,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			if errors.Is(err, repository.ErrNotFound) {
 				return failPullOutcome(execution, err)
 			}
-			return retryPullOutcome(execution, err, "copy_context_failed")
+			return retryPullDependency(execution, err, "copy_context_failed")
 		}
 		return h.copyContextFailure(execution, input, copyRow, err, true)
 	}
@@ -1597,6 +1597,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		return h.observePullPiece(ctx, execution, input, copyRow, target, attempt, pieceCID, false)
 	}
 	var submitted *storage.PullResult
+	var attempted bool
 	submit := func(ctx context.Context) error {
 		submitCtx, cancel := context.WithTimeout(ctx, pullSubmitTimeout)
 		defer cancel()
@@ -1607,7 +1608,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		return err
 	}
 	if freshAttempt {
-		_, err = execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint,
+		attempted, err = execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint,
 			func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Contents.ReservePullRequest(ctx, pullReservation(input, execution.ID(), attempt))
 			}, submit)
@@ -1616,6 +1617,9 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 	}
 	if errors.Is(err, taskengine.ErrResourceBusy) {
 		return taskengine.ResourceWait("Waiting for other storage operations to finish")
+	}
+	if freshAttempt && !attempted && err != nil {
+		return h.retryUnsubmittedPull(execution, input, copyRow, attempt, err)
 	}
 	if errors.Is(err, pdp.ErrPullQueueFull) {
 		delay := time.Minute
@@ -1735,6 +1739,42 @@ func (h *TaskHandlers) failConfirmedPull(ctx context.Context, execution taskengi
 	return h.failPullTask(execution, input, copyRow, attemptID, err, "pull_failed")
 }
 
+func (h *TaskHandlers) retryUnsubmittedPull(
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	attempt *storagepull.Attempt,
+	err error,
+) taskengine.Result {
+	if !execution.RetryWillFail() {
+		return retryTask(err, "pull_checkpoint_failed")
+	}
+	return taskengine.Fail(err, "pull_checkpoint_failed", func(ctx context.Context, repos *repository.Repositories) error {
+		attemptID := attempt.AttemptID
+		// A commit error can leave the reservation durable even though the
+		// effect was never called. Resolve it in the copy's settlement.
+		if _, loadErr := repos.Contents.GetPullAttempt(ctx, attemptID, copyRow.ContentID, copyRow.StorageDataSetID); errors.Is(loadErr, repository.ErrNotFound) {
+			attemptID = ""
+		} else if loadErr != nil {
+			return loadErr
+		}
+		if copyRow.CommitDecidedByRequest() {
+			return h.releaseMemberTransfer(execution, input, copyRow, err.Error(), attemptID)(ctx, repos)
+		}
+		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, err.Error(), attemptID)
+	})
+}
+
+func retryPullDependency(execution taskengine.Execution, err error, reason string) taskengine.Result {
+	if !execution.RetryWillFail() {
+		return retryTask(err, reason)
+	}
+	if execution.CancellationRequested() {
+		return taskengine.Fail(err, storagepull.FailureRecoveryBlocked, nil)
+	}
+	return failPullOutcome(execution, err)
+}
+
 func retryPullOutcome(execution taskengine.Execution, err error, reason string) taskengine.Result {
 	if execution.CancellationRequested() || execution.RetryWillFail() {
 		return failPullOutcome(execution, err)
@@ -1788,7 +1828,7 @@ func copyDefinition(taskType model.TaskType, retryLimit *int) taskengine.Definit
 				return false
 			}
 			return taskengine.RecoverableEngineFailure(*task.FailureReason) ||
-				(task.Type == model.TaskTypeStoragePull && (*task.FailureReason == storagepull.FailureOutcomeUnknown || *task.FailureReason == storagepull.FailureCancelOutcomeUnknown))
+				(task.Type == model.TaskTypeStoragePull && (*task.FailureReason == storagepull.FailureOutcomeUnknown || *task.FailureReason == storagepull.FailureCancelOutcomeUnknown || *task.FailureReason == storagepull.FailureRecoveryBlocked))
 		},
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
 			return input.CopyID
@@ -1810,7 +1850,7 @@ func (h *TaskHandlers) authorizeCopyTask(
 	}
 	if err != nil {
 		if execution.Type() == model.TaskTypeStoragePull {
-			return input, nil, true, retryPullOutcome(execution, err, "copy_authorization_failed")
+			return input, nil, true, retryPullDependency(execution, err, "copy_authorization_failed")
 		}
 		if execution.Type() == model.TaskTypeStorageStore && execution.RetryWillFail() {
 			return input, nil, true, taskengine.Fail(err, "copy_authorization_failed", nil)
