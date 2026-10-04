@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
@@ -47,9 +48,10 @@ type TaskHandlerDependencies struct {
 	MaxRetries             int
 	// CommitMaxPieces, CommitMaxWait and CommitMaxBacklog shape how transferred
 	// copies of one data set are registered together.
-	CommitMaxPieces  int
-	CommitMaxWait    time.Duration
-	CommitMaxBacklog int
+	CommitMaxPieces           int
+	CommitMaxWait             time.Duration
+	CommitMaxBacklog          int
+	CommitSealOnCachePressure bool
 	// LegacyPieceStorageIDLimit is the first data set ID of the deployment's
 	// compact piece layout; zero applies no legacy piece limit.
 	LegacyPieceStorageIDLimit uint64
@@ -61,8 +63,9 @@ type EventPublisher interface {
 }
 
 type TaskHandlers struct {
-	deps        TaskHandlerDependencies
-	taskService *taskengine.Service
+	deps          TaskHandlerDependencies
+	taskService   *taskengine.Service
+	cachePressure atomic.Pointer[cachePressureState]
 
 	lruCapacityMu      sync.Mutex
 	lruProjectedBytes  int64

@@ -108,6 +108,7 @@ Recovery options:
 
 - Confirm the host has free disk space, then increase `cache.max_size_gb` if capacity allows.
 - Restore storage provider connectivity and background task progress so queued uploads can complete and cache eviction can run.
+- If batches are waiting to fill, open **Batches** and choose **Submit batch**, or enable [automatic early submission](../configuration/model.md) in Settings and restart.
 - Use the default `lru` policy for capacity-based cleanup. Lower the high watermark to leave more write headroom, and keep `0 <= low < high <= 100`.
 - Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable copies commit.
 - Use `none` when automatic removal must be disabled.

@@ -57,6 +57,8 @@ export function buildSettingsPayload(
   if (include('worker.tasks.commit_max_pieces')) tasks.commit_max_pieces = form.worker.tasks.commit_max_pieces
   if (include('worker.tasks.commit_max_wait')) tasks.commit_max_wait = form.worker.tasks.commit_max_wait
   if (include('worker.tasks.commit_max_backlog')) tasks.commit_max_backlog = form.worker.tasks.commit_max_backlog
+  if (include('worker.tasks.commit_seal_on_cache_pressure'))
+    tasks.commit_seal_on_cache_pressure = form.worker.tasks.commit_seal_on_cache_pressure
   payload.worker = { tasks }
 
   payload.logging = {}

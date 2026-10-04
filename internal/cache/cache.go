@@ -48,6 +48,15 @@ func (s *StagedObject) CommitAs(bucket, key string) error { return s.commitAs(bu
 // Safe to call multiple times and after Commit (no-op if already committed).
 func (s *StagedObject) Rollback() error { return s.rollback() }
 
+// CapacitySnapshot uses the same committed and reserved bytes as write admission.
+type CapacitySnapshot struct {
+	UsedBytes     int64
+	ReservedBytes int64
+	MaxBytes      int64
+}
+
+func (s CapacitySnapshot) OccupiedBytes() int64 { return s.UsedBytes + s.ReservedBytes }
+
 // Cache defines the interface for local object caching.
 // Implementations must be safe for concurrent use.
 type Cache interface {
@@ -83,9 +92,11 @@ type Cache interface {
 	// UsedBytes returns the total bytes consumed by committed cached objects.
 	UsedBytes() int64
 
-	// ConsumeWriteRefusal reports whether a write was refused with
-	// ErrCacheFull since the previous call, and clears that record.
-	ConsumeWriteRefusal() bool
+	CapacitySnapshot() CapacitySnapshot
+
+	// ConsumeRefusedWriteBytes returns the largest capacity reservation refused
+	// since the previous call and clears the record. The capacity task owns it.
+	ConsumeRefusedWriteBytes() int64
 
 	// CreateBucketDir ensures the directory for a bucket exists.
 	// Returns ErrInvalidPath if bucket would escape the cache root.

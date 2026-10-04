@@ -110,6 +110,7 @@ type TaskWorkerConfig struct {
 	CommitMaxPieces                int           `koanf:"commit_max_pieces"`
 	CommitMaxWait                  time.Duration `koanf:"commit_max_wait"`
 	CommitMaxBacklog               int           `koanf:"commit_max_backlog"`
+	CommitSealOnCachePressure      bool          `koanf:"commit_seal_on_cache_pressure"`
 }
 
 type LoggingConfig struct {
@@ -210,6 +211,7 @@ func defaultConfig() *Config {
 				CommitMaxPieces:                DefaultCommitMaxPieces,
 				CommitMaxWait:                  DefaultCommitMaxWait,
 				CommitMaxBacklog:               DefaultCommitMaxBacklog,
+				CommitSealOnCachePressure:      false,
 			},
 		},
 		Logging: LoggingConfig{

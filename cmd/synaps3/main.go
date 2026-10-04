@@ -467,6 +467,7 @@ func setupModeAllowedField(field string) bool {
 		"worker.tasks.commit_max_pieces",
 		"worker.tasks.commit_max_wait",
 		"worker.tasks.commit_max_backlog",
+		"worker.tasks.commit_seal_on_cache_pressure",
 		"logging.level",
 		"logging.format",
 		"logging.s3_access.enabled",

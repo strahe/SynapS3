@@ -46,7 +46,7 @@ type Filesystem struct {
 	// committed and in-progress bytes together never exceed maxBytes.
 	capacityMu    sync.Mutex
 	reservedBytes int64
-	writeRefused  atomic.Bool
+	refusedBytes  int64
 }
 
 // capacityReservation is the capacity one write holds until it commits or
@@ -70,7 +70,7 @@ func (f *Filesystem) reserve(size int64) (*capacityReservation, error) {
 	defer f.capacityMu.Unlock()
 	// Compared as remaining room so a huge size cannot overflow the sum.
 	if size > f.maxBytes-f.usedBytes.Load()-f.reservedBytes {
-		f.writeRefused.Store(true)
+		f.refusedBytes = max(f.refusedBytes, size)
 		return nil, ErrCacheFull
 	}
 	f.reservedBytes += size
@@ -445,8 +445,18 @@ func (f *Filesystem) UsedBytes() int64 {
 	return f.usedBytes.Load()
 }
 
-func (f *Filesystem) ConsumeWriteRefusal() bool {
-	return f.writeRefused.Swap(false)
+func (f *Filesystem) CapacitySnapshot() CapacitySnapshot {
+	f.capacityMu.Lock()
+	defer f.capacityMu.Unlock()
+	return CapacitySnapshot{UsedBytes: f.usedBytes.Load(), ReservedBytes: f.reservedBytes, MaxBytes: f.maxBytes}
+}
+
+func (f *Filesystem) ConsumeRefusedWriteBytes() int64 {
+	f.capacityMu.Lock()
+	defer f.capacityMu.Unlock()
+	size := f.refusedBytes
+	f.refusedBytes = 0
+	return size
 }
 
 func (f *Filesystem) CreateBucketDir(_ context.Context, bucket string) error {

@@ -40,8 +40,12 @@ func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
 			t.Fatalf("runtime model registry tables = %v, AST-discovered tables = %v", registeredTables, runtimeTablesFromAST)
 		}
 
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
+		migrator := NewMigrator(db)
+		if err := migrator.Init(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migrator.Migrate(t.Context()); err != nil {
+			t.Fatal(err)
 		}
 		appliedTables := applicationSchemaTables(t, db)
 		if !slices.Equal(appliedTables, registeredTables) {

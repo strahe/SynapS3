@@ -39,6 +39,7 @@ function baseConfig(): SettingsEditableConfig {
         destructive_mutation_concurrency: 2,
         commit_max_pieces: 32,
         commit_max_wait: '30s',
+        commit_seal_on_cache_pressure: false,
         commit_max_backlog: 256,
       },
     },
@@ -147,6 +148,7 @@ test('settings payload includes the unified task engine settings', () => {
     destructive_mutation_concurrency: 3,
     commit_max_pieces: 16,
     commit_max_wait: '5s',
+    commit_seal_on_cache_pressure: true,
     commit_max_backlog: 64,
   }
 
@@ -162,6 +164,7 @@ test('settings payload includes the unified task engine settings', () => {
     destructive_mutation_concurrency: 3,
     commit_max_pieces: 16,
     commit_max_wait: '5s',
+    commit_seal_on_cache_pressure: true,
     commit_max_backlog: 64,
   })
 })

@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as BucketsRouteImport } from './routes/buckets'
+import { Route as CommitBatchesRouteImport } from './routes/commit-batches'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as StorageTopologyRouteImport } from './routes/storage-topology'
 import { Route as TasksRouteImport } from './routes/tasks'
@@ -26,6 +27,11 @@ const IndexRoute = IndexRouteImport.update({
 const BucketsRoute = BucketsRouteImport.update({
   id: '/buckets',
   path: '/buckets',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CommitBatchesRoute = CommitBatchesRouteImport.update({
+  id: '/commit-batches',
+  path: '/commit-batches',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsRoute = SettingsRouteImport.update({
@@ -62,6 +68,7 @@ const BucketsNameRoute = BucketsNameRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
+  '/commit-batches': typeof CommitBatchesRoute
   '/settings': typeof SettingsRoute
   '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
@@ -71,6 +78,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/commit-batches': typeof CommitBatchesRoute
   '/settings': typeof SettingsRoute
   '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
@@ -82,6 +90,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
+  '/commit-batches': typeof CommitBatchesRoute
   '/settings': typeof SettingsRoute
   '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
@@ -94,6 +103,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/buckets'
+    | '/commit-batches'
     | '/settings'
     | '/storage-topology'
     | '/tasks'
@@ -103,6 +113,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/commit-batches'
     | '/settings'
     | '/storage-topology'
     | '/tasks'
@@ -113,6 +124,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/buckets'
+    | '/commit-batches'
     | '/settings'
     | '/storage-topology'
     | '/tasks'
@@ -124,6 +136,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   BucketsRoute: typeof BucketsRouteWithChildren
+  CommitBatchesRoute: typeof CommitBatchesRoute
   SettingsRoute: typeof SettingsRoute
   StorageTopologyRoute: typeof StorageTopologyRoute
   TasksRoute: typeof TasksRoute
@@ -144,6 +157,13 @@ declare module '@tanstack/react-router' {
       path: '/buckets'
       fullPath: '/buckets'
       preLoaderRoute: typeof BucketsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/commit-batches': {
+      id: '/commit-batches'
+      path: '/commit-batches'
+      fullPath: '/commit-batches'
+      preLoaderRoute: typeof CommitBatchesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/settings': {
@@ -207,6 +227,7 @@ const BucketsRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   BucketsRoute: BucketsRouteWithChildren,
+  CommitBatchesRoute: CommitBatchesRoute,
   SettingsRoute: SettingsRoute,
   StorageTopologyRoute: StorageTopologyRoute,
   TasksRoute: TasksRoute,

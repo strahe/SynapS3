@@ -103,6 +103,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `worker.tasks.destructive_mutation_concurrency` | `2` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
+| `worker.tasks.commit_seal_on_cache_pressure` | `false` |
 | `worker.tasks.commit_max_backlog` | `256` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
@@ -112,9 +113,13 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 
 `worker.tasks.concurrency` limits all background operations. Remote storage creation, Store, Pull, and commit submission additionally share `provider_mutation_concurrency`; remote cleanup and service retirement share `destructive_mutation_concurrency`. Status and confirmation checks do not consume either mutation limit. Wallet mutations are serialized. An operation that finds its limit full steps aside and tries again shortly instead of holding a `concurrency` slot, so other background work keeps running. Task settings require a SynapS3 restart, and existing tasks retain the retry limit recorded when they were created.
 
-Uploads and replicas copied to the same storage service are registered on chain together, so one signed request and one transaction cover many pieces. `commit_max_pieces` (1–200) caps the pieces in one registration; storage services with a data set ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. A registration is signed as soon as it is full or its storage service stops taking new data. Otherwise, `commit_max_wait` (0–30m) gives later uploads and replicas time to join, starting when the oldest piece became ready; `0s` signs immediately. New pieces and restarts do not reset that time. Once signed, membership stays fixed while the registration waits for an earlier registration or one of the storage service's four in-flight slots. Unregistered upload data stays in the local cache. Longer windows delay registration, replica copies that need a committed source, and local cache eviction.
+Uploads and replicas copied to the same storage service share on-chain batch submissions, so one signed request and one transaction cover many pieces. `commit_max_pieces` (1–200) caps the pieces in one batch; storage services with a data set ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. A batch is signed as soon as it is full or its storage service stops taking new data. Otherwise, `commit_max_wait` (0–30m) gives later uploads and replicas time to join, starting when the oldest piece became ready; `0s` signs immediately. New pieces and restarts do not reset that time. Once signed, membership stays fixed while the batch waits for an earlier submission or one of the storage service's four in-flight slots. Upload data awaiting submission stays in the local cache. Longer windows delay submission, replica copies that need a committed source, and local cache eviction.
 
-Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one storage service for a registration that has not been sent, new uploads and replica copies to it wait. A registration that does not fit one add-pieces message is split and signed again with fewer pieces.
+Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one storage service for an unsent batch, new uploads and replica copies to it wait. A batch that does not fit one add-pieces message is split and signed again with fewer pieces.
+
+Enable **Submit batches early to free cache space** in Settings (`worker.tasks.commit_seal_on_cache_pressure`) to submit batches early when safe automatic cleanup cannot free enough space. It is off by default and requires restart. With `lru`, it follows the effective cleanup target; with `after_upload`, a refused write supplies the required space. It has no automatic effect under `none`. Smaller batches can increase transaction costs. Confirmation and the bucket's durability requirements still apply before cache removal.
+
+Open **Batches** and choose **Submit batch** for a batch waiting to submit. This works independently of the automatic option and cache policy. Open **Details** to inspect members, submission times, transaction ID, and errors; stopped tasks use **Recover** when available. Each member shows a related object and the number of other versions sharing its data. Missing historical object information and sizes are shown as unavailable.
 
 ## Admin Session Lifetime
 

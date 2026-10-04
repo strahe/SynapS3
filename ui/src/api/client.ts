@@ -670,6 +670,49 @@ export interface ObjectProvenance {
   updated_at: string
 }
 
+export type CommitBatchStatus = 'collecting' | 'ready' | 'submitted' | 'confirmed' | 'abandoned'
+
+export interface CommitBatch {
+  request_id: string
+  status: CommitBatchStatus
+  bucket_name: string
+  provider_id: string
+  provider_name: string | null
+  data_set_id: string | null
+  data_set_row_id: number
+  member_count: number
+  max_pieces: number
+  total_bytes: number | null
+  oldest_ready_at: string | null
+  collection_deadline: string | null
+  seal_requested_at: string | null
+  sealed_at: string | null
+  submitted_at: string | null
+  confirmed_at: string | null
+  created_at: string
+  can_seal: boolean
+  task_id: number | null
+  task_status: TaskItem['status'] | null
+  status_message: string | null
+  last_error: string | null
+  transaction_id: string | null
+  task?: TaskItem
+}
+
+export interface CommitBatchListResponse {
+  batches: CommitBatch[]
+  next_cursor?: string
+}
+
+export interface CommitBatchDetails extends CommitBatch {
+  members: {
+    content_id: number
+    piece_cid: string
+    size: number | null
+    file: { key: string; source: 'current' | 'historical' | 'deleted'; other_versions: number } | null
+  }[]
+}
+
 export interface TaskItem {
   id: number
   type: string
@@ -955,6 +998,7 @@ export interface SettingsTaskWorkerConfig {
   commit_max_pieces: number
   commit_max_wait: string
   commit_max_backlog: number
+  commit_seal_on_cache_pressure: boolean
 }
 
 export interface SettingsLoggingConfig {
@@ -1261,6 +1305,17 @@ export const api = {
     if (versionId) params.push(`version_id=${encodeURIComponent(versionId)}`)
     return `${BASE}/buckets/${encodeURIComponent(name)}/objects/download?${params.join('&')}`
   },
+  getCommitBatches: (params: { status?: CommitBatchStatus; limit?: number; cursor?: string }, signal?: AbortSignal) => {
+    const sp = new URLSearchParams()
+    if (params.status) sp.set('status', params.status)
+    if (params.limit) sp.set('limit', params.limit.toString())
+    if (params.cursor) sp.set('cursor', params.cursor)
+    return fetchJSON<CommitBatchListResponse>(`/commit-batches?${sp.toString()}`, { signal })
+  },
+  getCommitBatch: (id: string, signal?: AbortSignal) =>
+    fetchJSON<CommitBatchDetails>(`/commit-batches/${encodeURIComponent(id)}`, { signal }),
+  sealCommitBatch: (id: string) =>
+    fetchJSON<CommitBatch>(`/commit-batches/${encodeURIComponent(id)}/seal`, { method: 'POST' }),
   getTasks: (params: { type?: string; status?: string; limit?: number; cursor?: number }) => {
     const sp = new URLSearchParams()
     if (params.type) sp.set('type', params.type)

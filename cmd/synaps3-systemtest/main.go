@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,12 +25,17 @@ func main() {
 }
 
 func run() error {
+	flags := flag.NewFlagSet("synaps3-systemtest", flag.ContinueOnError)
+	commitMaxWait := flags.Duration("commit-max-wait", time.Second, "Registration collection window")
+	if err := flags.Parse(os.Args[1:]); err != nil {
+		return err
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	harness, err := systemtest.NewHarness(ctx, logger)
+	harness, err := systemtest.NewHarness(ctx, logger, systemtest.HarnessOptions{CommitMaxWait: commitMaxWait})
 	if err != nil {
 		return err
 	}

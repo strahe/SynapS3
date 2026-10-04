@@ -544,6 +544,12 @@ type StorageContentRepository interface {
 	AbandonCommitRequest(ctx context.Context, input AbandonCommitRequestInput) ([]model.StorageCopy, error)
 	ReturnCommitMembersToTransfer(ctx context.Context, requestID string, taskID int64, copyIDs []int64, now time.Time) error
 	WakeCommitRequestTask(ctx context.Context, requestID string) error
+	HasCacheDependentCommitMembers(ctx context.Context, requestID string) (bool, error)
+	WakeCacheDependentCommitTasks(ctx context.Context) error
+	RequestCommitSeal(ctx context.Context, requestID string) (*storagecommit.Request, error)
+	ListCommitBatches(ctx context.Context, filter CommitBatchFilter) ([]CommitBatch, error)
+	GetCommitBatch(ctx context.Context, requestID string) (*CommitBatch, error)
+	ListCommitBatchMembers(ctx context.Context, requestID string) ([]CommitBatchMember, error)
 	ReleaseMemberTransfer(ctx context.Context, input ReleaseMemberTransferInput) error
 	// CountCommitBacklog counts the copies transferred to a data set that wait
 	// for a request that has not been sent.

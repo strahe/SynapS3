@@ -53,12 +53,16 @@ type Harness struct {
 	cleanupErr  error
 }
 
-// NewHarness creates and starts an isolated production runtime.
-func NewHarness(ctx context.Context, logger *slog.Logger) (_ *Harness, err error) {
-	return newHarness(ctx, logger, "")
+type HarnessOptions struct {
+	CommitMaxWait *time.Duration
 }
 
-func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *Harness, err error) {
+// NewHarness creates and starts an isolated production runtime.
+func NewHarness(ctx context.Context, logger *slog.Logger, options ...HarnessOptions) (_ *Harness, err error) {
+	return newHarness(ctx, logger, "", options...)
+}
+
+func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, options ...HarnessOptions) (_ *Harness, err error) {
 	if logger == nil {
 		return nil, errors.New("systemtest logger is required")
 	}
@@ -124,6 +128,9 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 		// production wait for stragglers.
 		CommitMaxWait:    time.Second,
 		CommitMaxBacklog: config.DefaultCommitMaxBacklog,
+	}
+	if len(options) > 0 && options[0].CommitMaxWait != nil {
+		cfg.Worker.Tasks.CommitMaxWait = *options[0].CommitMaxWait
 	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(AdminPassword), bcrypt.MinCost)
 	if err != nil {

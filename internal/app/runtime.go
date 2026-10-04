@@ -167,6 +167,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		CommitMaxPieces:           cfg.Worker.Tasks.CommitMaxPieces,
 		CommitMaxWait:             cfg.Worker.Tasks.CommitMaxWait,
 		CommitMaxBacklog:          cfg.Worker.Tasks.CommitMaxBacklog,
+		CommitSealOnCachePressure: cfg.Worker.Tasks.CommitSealOnCachePressure,
 		LegacyPieceStorageIDLimit: synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network),
 		Logger:                    logger,
 	})
@@ -275,6 +276,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithObjectVersionRestorer(appBackend).
 		WithObjectStorage(opts.Filecoin.Storage).
 		WithSettings(opts.Settings).
+		WithCommitPolicy(cfg.Worker.Tasks, synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network)).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
 		WithObservability(observabilityService).
 		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).

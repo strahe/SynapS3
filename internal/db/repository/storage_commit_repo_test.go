@@ -51,6 +51,9 @@ var commitLedgerCases = []struct {
 	{"RetainedCommitTaskIsKeptWhileItsRequestIsOpen", testRetainedCommitTaskIsKeptWhileItsRequestIsOpen},
 	{"StoppedRequestDoesNotHoldTheQueue", testStoppedRequestDoesNotHoldTheQueue},
 	{"LateTransferOfACommittedMemberCompletes", testLateTransferOfACommittedMemberCompletes},
+	{"ManualSealIsDurableAndIdempotent", testManualSealIsDurableAndIdempotent},
+	{"BatchListUsesStablePagingAndSignedMembership", testBatchListUsesStablePagingAndSignedMembership},
+	{"CacheDependentCommitsAndSafeCleanupAccounting", testCacheDependentCommitsAndSafeCleanupAccounting},
 }
 
 func TestCommitRequestLedger(t *testing.T) {
@@ -170,6 +173,9 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 	first, second, third := f.transferredCopy(t, "first"), f.transferredCopy(t, "second"), f.transferredCopy(t, "third")
 	readyAt := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
 	taskID := f.collectingAt(t, "collect", readyAt, first)
+	if _, err := f.repos.Contents.RequestCommitSeal(ctx, "collect"); err != nil {
+		t.Fatal(err)
+	}
 	requestID, members, err := f.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
 		CopyID: second.ID, StorageDataSetID: f.dataSetID, MaxPieces: 2, Now: readyAt.Add(time.Minute),
 	})
@@ -196,7 +202,7 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 		t.Fatalf("spilled = %v, want the late copy", spilled)
 	}
 	request := f.request(t, "collect")
-	if request.Status != storagecommit.RequestStatusReady || request.PieceCount != 1 || request.SealedAt == nil {
+	if request.Status != storagecommit.RequestStatusReady || request.PieceCount != 1 || request.SealedAt == nil || request.SealRequestedAt != nil {
 		t.Fatalf("sealed request = %#v", request)
 	}
 	if sealed := f.copy(t, first.ID); sealed.Status != model.StorageCopyStatusCommitting || sealed.CommitPosition == nil || *sealed.CommitPosition != 0 {
@@ -206,6 +212,9 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 		t.Fatalf("late copy = %#v, want piece_ready outside any request", late)
 	}
 	f.collectingAt(t, "spill", readyAt.Add(time.Hour), second)
+	if f.request(t, "spill").SealRequestedAt != nil {
+		t.Fatal("spilled members inherited manual intent")
+	}
 	if copyRow := f.copy(t, second.ID); copyRow.CommitReadyAt == nil || !copyRow.CommitReadyAt.Equal(readyAt.Add(time.Minute)) {
 		t.Fatalf("spilled member ready at = %v, want %s", copyRow.CommitReadyAt, readyAt.Add(time.Minute))
 	}

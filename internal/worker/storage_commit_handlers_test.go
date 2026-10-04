@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/systemtask"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
@@ -242,18 +243,22 @@ type registrationFixture struct {
 
 // newRegistrationFixture seeds a data set and n contents whose single copies
 // finished transferring to it.
-func newRegistrationFixture(t *testing.T, n int, parked synapse.ParkedPieceChecker, maxWait time.Duration) registrationFixture {
+func newRegistrationFixture(t *testing.T, n int, parked synapse.ParkedPieceChecker, maxWait time.Duration, configure ...func(*handlerRuntimeOptions)) registrationFixture {
 	t.Helper()
 	ctx := t.Context()
 	storageClient := &testutil.MockStorageClient{}
 	nonces := &testutil.MockCommitNonces{}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+	options := handlerRuntimeOptions{
 		storage: storageClient, policy: cache.EvictionPolicyNone, commitNonces: nonces, parkedPieces: parked,
 		commitMaxWait: maxWait,
 		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
 			return handlers.RegisterStorage(registry)
 		},
-	})
+	}
+	for _, configure := range configure {
+		configure(&options)
+	}
+	runtime := newHandlerTestRuntime(t, options)
 	sequence := storedObjectSequence.Add(1)
 	bucket := &model.Bucket{Name: fmt.Sprintf("registration-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
@@ -448,6 +453,126 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	}
 }
 
+func TestCachePressureSealsAndRecoversWriteCapacity(t *testing.T) {
+	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyAfterUpload} {
+		t.Run(string(policy), func(t *testing.T) {
+			fs, err := cache.NewFilesystem(t.TempDir(), 384)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := newRegistrationFixture(t, 2, nil, 30*time.Minute, func(options *handlerRuntimeOptions) {
+				options.cache, options.policy, options.maxBytes, options.maxWriteBytes = fs, policy, 384, 256
+				options.highPercent, options.lowPercent, options.commitSealOnCachePressure = 90, 50, true
+				options.register = func(h *worker.TaskHandlers, registry *taskengine.Registry) error {
+					if err := h.RegisterCore(registry); err != nil {
+						return err
+					}
+					return h.RegisterStorage(registry)
+				}
+			})
+			bucket, err := f.runtime.repos.Buckets.GetByID(t.Context(), f.copies[0].BucketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, copyRow := range f.copies {
+				if _, err := fs.Put(t.Context(), bucket.Name, model.ContentCacheKey(copyRow.ContentID), bytes.NewReader(make([]byte, 128)), 128); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.runtime.repos.Objects.RecordContentCacheCommit(t.Context(), copyRow.ContentID, time.Now().Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			requestID, taskID := f.collect(t)
+			if _, err := fs.Put(t.Context(), bucket.Name, "next", bytes.NewReader(make([]byte, 256)), 256); !errors.Is(err, cache.ErrCacheFull) {
+				t.Fatalf("admission = %v", err)
+			}
+			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runHandlerEngine(t, f.runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			if f.request(t, requestID).Status != storagecommit.RequestStatusConfirmed {
+				t.Fatal("partial batch was not confirmed")
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for fs.UsedBytes() > 128 && time.Now().Before(deadline) {
+				wakeTask(t, f.runtime, planner.ID)
+				time.Sleep(20 * time.Millisecond)
+			}
+			if fs.UsedBytes() > 128 {
+				t.Fatalf("confirmed data wasn't safely cleaned up, cache = %d", fs.UsedBytes())
+			}
+			if _, err := fs.Put(t.Context(), bucket.Name, "next", bytes.NewReader(make([]byte, 256)), 256); err != nil {
+				t.Fatalf("retry write: %v", err)
+			}
+		})
+	}
+}
+
+func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T) {
+	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyNone} {
+		t.Run(string(policy), func(t *testing.T) {
+			fs, err := cache.NewFilesystem(t.TempDir(), 384)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := newRegistrationFixture(t, 1, nil, 30*time.Minute, func(options *handlerRuntimeOptions) {
+				options.cache, options.policy, options.maxBytes, options.maxWriteBytes = fs, policy, 384, 128
+				options.highPercent, options.lowPercent, options.commitSealOnCachePressure = 90, 50, true
+				options.register = func(h *worker.TaskHandlers, registry *taskengine.Registry) error {
+					if err := h.RegisterCore(registry); err != nil {
+						return err
+					}
+					return h.RegisterStorage(registry)
+				}
+			})
+			copyRow := f.copies[0]
+			bucket, err := f.runtime.repos.Buckets.GetByID(t.Context(), copyRow.BucketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fs.Put(t.Context(), bucket.Name, model.ContentCacheKey(copyRow.ContentID), bytes.NewReader(make([]byte, 128)), 128); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.runtime.repos.Objects.RecordContentCacheCommit(t.Context(), copyRow.ContentID, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			safe := seedStoredCacheObject(t, f.runtime, 256, time.Now().Add(-time.Hour))
+			safeBucket, err := f.runtime.repos.Buckets.GetByID(t.Context(), safe.BucketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fs.Put(t.Context(), safeBucket.Name, safe.CacheKey(), bytes.NewReader(make([]byte, 256)), 256); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.runtime.repos.Objects.RecordContentCacheCommit(t.Context(), *safe.ContentID, time.Now().Add(-time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			requestID, taskID := f.collect(t)
+			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runHandlerEngine(t, f.runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForTask(t, f.runtime.repos, planner.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusPending && task.ClaimGeneration > 0 })
+			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.WaitReason != nil && *task.WaitReason == "collecting" })
+			if f.request(t, requestID).Status != storagecommit.RequestStatusCollecting {
+				t.Fatal("safe cleanup unexpectedly ended collection")
+			}
+			if _, err := f.runtime.repos.Contents.RequestCommitSeal(t.Context(), requestID); err != nil {
+				t.Fatal(err)
+			}
+			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			if f.request(t, requestID).SealRequestedAt != nil {
+				t.Fatal("confirmed request retained manual intent")
+			}
+		})
+	}
+}
+
 func TestCommitSealsWhileSubmissionSlotsAreFull(t *testing.T) {
 	f := newRegistrationFixture(t, 6, nil, 30*time.Minute)
 	ctx := t.Context()
@@ -485,7 +610,10 @@ func TestCommitSealsWhileSubmissionSlotsAreFull(t *testing.T) {
 			heldTaskID = taskID
 		}
 	}
-	requestID, taskID := f.collectAt(t, "waiting-to-send", readyAt, f.copies[4])
+	requestID, taskID := f.collectAt(t, "waiting-to-send", time.Now(), f.copies[4])
+	if _, err := f.runtime.repos.Contents.RequestCommitSeal(ctx, requestID); err != nil {
+		t.Fatal(err)
+	}
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waiting := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
@@ -829,13 +957,23 @@ func TestUnknownAttentionCodeStopsRecovery(t *testing.T) {
 }
 
 func TestRequestTooLargeToSignIsSplitInHalves(t *testing.T) {
-	f := newRegistrationFixture(t, 4, nil, 0)
+	f := newRegistrationFixture(t, 4, nil, 30*time.Minute)
 	f.provider.maxSigned = 2
 	requestID, taskID := f.collect(t)
+	if _, err := f.runtime.repos.Contents.RequestCommitSeal(t.Context(), requestID); err != nil {
+		t.Fatal(err)
+	}
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
 	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	spilled, err := f.runtime.repos.Contents.ListCommitBatches(t.Context(), repository.CommitBatchFilter{Status: storagecommit.RequestStatusCollecting, Limit: 20})
+	if err != nil || len(spilled) != 1 || spilled[0].SealRequestedAt != nil {
+		t.Fatalf("spilled requests = %#v, %v", spilled, err)
+	}
+	if _, err := f.runtime.repos.Contents.RequestCommitSeal(t.Context(), spilled[0].RequestID); err != nil {
+		t.Fatal(err)
+	}
 	waitForCommitted(t, f.runtime, f.copies)
 	if request := f.request(t, requestID); request.PieceCount != 2 || request.Status != storagecommit.RequestStatusConfirmed {
 		t.Fatalf("first request = %#v, want the half that fits", request)

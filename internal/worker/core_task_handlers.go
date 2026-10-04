@@ -46,7 +46,8 @@ type cleanupCheckpoint struct {
 }
 
 type cacheCapacityCheckpoint struct {
-	CycleActive bool `json:"cycle_active"`
+	CycleActive       bool  `json:"cycle_active"`
+	RefusedWriteBytes int64 `json:"refused_write_bytes,omitempty"`
 }
 
 type cacheEvictionCheckpoint struct {
@@ -59,9 +60,11 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}
-	var pendingWriteRefusal atomic.Bool
+	var pendingWriteRefusal atomic.Int64
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
-		if h.deps.EvictionPolicy != cache.EvictionPolicyLRU {
+		previousPressure := h.cachePressure.Swap(nil)
+		if h.deps.EvictionPolicy == cache.EvictionPolicyNone ||
+			(h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload && !h.deps.CommitSealOnCachePressure) {
 			return taskengine.Suspend(model.TaskResumeModeExecute, taskGCInterval, "scheduled", "Automatic cache cleanup is disabled", nil)
 		}
 		if h.deps.Cache == nil || h.deps.CacheTracker == nil || h.taskService == nil || h.deps.MaxCacheBytes <= 0 {
@@ -71,32 +74,40 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		if err != nil {
 			return taskengine.Fail(err, "invalid_checkpoint", nil)
 		}
-		if !h.deps.CacheTracker.SafeForLRU() {
+		if h.deps.EvictionPolicy == cache.EvictionPolicyLRU && !h.deps.CacheTracker.SafeForLRU() {
 			return taskengine.Suspend(model.TaskResumeModeRecover, dependencyWait, "cache_access", "Waiting for reliable cache access records", nil)
 		}
-		usedBytes := h.deps.Cache.UsedBytes()
+		usedBytes := h.deps.Cache.CapacitySnapshot().OccupiedBytes()
 		highBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRUHighPercent)
 		lowBytes := h.lruLowBytes()
 		// A refused write starts a cycle below the high watermark too: when the
 		// headroom above it is smaller than the write, usage would otherwise never
 		// reach the watermark and the write would be refused indefinitely.
-		writeRefused := pendingWriteRefusal.Swap(false)
-		writeRefused = h.deps.Cache.ConsumeWriteRefusal() || writeRefused
-		cycleActive := checkpoint.CycleActive
-		switch {
-		case usedBytes <= lowBytes:
-			cycleActive = false
-		case usedBytes >= highBytes, writeRefused:
-			cycleActive = true
+		writeRefused := max(pendingWriteRefusal.Swap(0), h.deps.Cache.ConsumeRefusedWriteBytes())
+		next := checkpoint
+		next.RefusedWriteBytes = max(next.RefusedWriteBytes, writeRefused)
+		if h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload {
+			lowBytes = max(0, h.deps.MaxCacheBytes-next.RefusedWriteBytes)
+			if usedBytes <= lowBytes {
+				next.RefusedWriteBytes = 0
+			}
+		} else {
+			switch {
+			case usedBytes <= lowBytes:
+				next.CycleActive, next.RefusedWriteBytes = false, 0
+			case usedBytes >= highBytes, next.RefusedWriteBytes > 0:
+				next.CycleActive = true
+			}
 		}
-		if cycleActive != checkpoint.CycleActive {
-			checkpoint.CycleActive = cycleActive
-			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-				if writeRefused {
-					pendingWriteRefusal.Store(true)
-				}
+		if next != checkpoint {
+			if err := execution.WriteCheckpoint(ctx, next); err != nil {
+				pendingWriteRefusal.Store(max(writeRefused, next.RefusedWriteBytes))
 				return retryTask(err, "cache_capacity_checkpoint_failed")
 			}
+		}
+		cycleActive := next.CycleActive
+		if h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload {
+			cycleActive = next.RefusedWriteBytes > 0
 		}
 		if !cycleActive {
 			return taskengine.Suspend(model.TaskResumeModeExecute, externalPollInterval, "scheduled", "Local cache usage is within its target", nil)
@@ -106,14 +117,23 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 			return retryTask(err, "cache_capacity_scan_failed")
 		}
 		bytesToPlan := usedBytes - lowBytes - activeBytes
-		if bytesToPlan <= 0 {
-			return taskengine.Suspend(model.TaskResumeModeExecute, externalPollInterval, "cache_cleanup", "Local cache cleanup is in progress", nil)
+		var plannedBytes int64
+		var plannedTasks int
+		if bytesToPlan > 0 && h.deps.EvictionPolicy == cache.EvictionPolicyLRU {
+			plannedBytes, plannedTasks, err = h.planLRUEvictions(ctx, bytesToPlan)
+			if err != nil {
+				return retryTask(err, "cache_capacity_plan_failed")
+			}
 		}
-		plannedBytes, plannedTasks, err := h.planLRUEvictions(ctx, bytesToPlan)
-		if err != nil {
-			return retryTask(err, "cache_capacity_plan_failed")
+		if h.deps.CommitSealOnCachePressure {
+			if err := h.updateCachePressure(ctx, lowBytes, previousPressure); err != nil {
+				return retryTask(err, "cache_pressure_scan_failed")
+			}
 		}
 		message := "Waiting for remotely safe cached data"
+		if bytesToPlan <= 0 {
+			message = "Local cache cleanup is in progress"
+		}
 		if plannedTasks > 0 {
 			message = fmt.Sprintf("Scheduled cleanup for %d cached items (%d bytes)", plannedTasks, plannedBytes)
 		}
@@ -238,7 +258,7 @@ func (h *TaskHandlers) runCacheEviction(
 				result = h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
 				return
 			}
-			if h.deps.Cache.UsedBytes() <= h.lruLowBytes() {
+			if h.deps.Cache.CapacitySnapshot().OccupiedBytes() <= h.lruLowBytes() {
 				result = h.cancelCacheEviction(input, execution.ID(), "Local cache usage reached its target")
 				return
 			}
@@ -409,7 +429,7 @@ func (h *TaskHandlers) reserveLRUDeletion(size int64) bool {
 	h.lruCapacityMu.Lock()
 	defer h.lruCapacityMu.Unlock()
 	if h.lruInFlightDeletes == 0 {
-		h.lruProjectedBytes = h.deps.Cache.UsedBytes()
+		h.lruProjectedBytes = h.deps.Cache.CapacitySnapshot().OccupiedBytes()
 	}
 	if h.lruProjectedBytes <= h.lruLowBytes() {
 		return false
