@@ -3,7 +3,10 @@ import { expect, test } from './fixtures'
 
 test.use({ commitMaxWait: '30m' })
 
-test('manual submission bypasses a long batch wait and keeps details open', async ({ page, systemServer }) => {
+test('manual submission keeps the list open and exposes batch contents and confirmation history', async ({
+  page,
+  systemServer,
+}) => {
   test.setTimeout(120_000)
   await page.goto(systemServer.adminURL)
   await page.getByLabel('Username').fill('admin')
@@ -45,22 +48,41 @@ test('manual submission bypasses a long batch wait and keeps details open', asyn
     .click()
   await expect(detail).toBeVisible()
   await expect(detail.getByRole('heading', { name: 'Batch details' })).toBeFocused()
+  await expect(detail.getByRole('note', { name: 'Object key: manual.bin', exact: true })).toBeVisible()
+  await expect(detail.getByRole('note', { name: /^Piece CID:/ })).toBeVisible()
   await expect(detail.getByText(/Smaller batches may increase transaction costs\./)).toBeVisible()
   await page.keyboard.press('Escape')
-  await page.getByRole('button', { name: 'Submit batch', exact: true }).first().click()
-  await expect(detail).toBeVisible()
-  await expect(detail.getByRole('note', { name: /^Batch ID:/ })).toBeVisible()
-  await expect(detail.getByText('Completed', { exact: true })).toBeVisible({ timeout: 30_000 })
-  await expect(detail.getByRole('button', { name: 'Submit batch', exact: true })).toHaveCount(0)
-  await page.keyboard.press('Escape')
   // Each of the default three replicas collects independently.
-  for (let replica = 1; replica < 3; replica++) {
+  for (let replica = 0; replica < 3; replica++) {
     await page.getByRole('button', { name: 'Refresh', exact: true }).click()
-    await expect(page.getByRole('button', { name: 'Submit batch', exact: true }).first()).toBeVisible({
+    const row = page
+      .getByRole('row')
+      .filter({ has: page.getByRole('button', { name: 'Submit batch', exact: true }) })
+      .first()
+    await expect(row).toBeVisible({
       timeout: 30_000,
     })
-    await page.getByRole('button', { name: 'Submit batch', exact: true }).first().click()
+    const detailsLabel =
+      (await row.getByRole('button', { name: /^Details for batch / }).getAttribute('aria-label')) ?? ''
+    expect(detailsLabel).toMatch(/^Details for batch /)
+    const batchID = detailsLabel.replace('Details for batch ', '')
+    await row.getByRole('button', { name: 'Submit batch', exact: true }).click()
+    await expect(
+      page.getByRole('alert').filter({ has: page.getByRole('note', { name: `Batch ID: ${batchID}`, exact: true }) })
+    ).toBeVisible()
+    await expect(detail).not.toBeVisible()
+    if (replica === 0) {
+      await page.getByRole('combobox', { name: 'Status' }).click()
+      await page.getByRole('option', { name: 'All statuses', exact: true }).click()
+    }
+    await page.getByRole('button', { name: detailsLabel, exact: true }).click()
+    await expect(detail.getByRole('heading', { name: 'Batch details' })).toBeFocused()
+    await expect(detail.getByRole('note', { name: `Batch ID: ${batchID}`, exact: true })).toBeVisible()
+    await expect(detail.getByRole('note', { name: 'Object key: manual.bin', exact: true })).toBeVisible()
     await expect(detail.getByText('Completed', { exact: true })).toBeVisible({ timeout: 30_000 })
+    await expect(detail.getByRole('note', { name: /^Transaction:/ })).toBeVisible()
+    await expect(detail.locator('time[datetime]')).toHaveCount(3)
+    await expect(detail.getByRole('button', { name: 'Submit batch', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
   }
   await page.getByRole('combobox', { name: 'Status' }).click()

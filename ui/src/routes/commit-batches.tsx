@@ -3,7 +3,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { ChevronLeft, ChevronRight, Eye, Layers, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
 import { type ReactNode, useRef, useState } from 'react'
 
-import { api, type CommitBatch, type CommitBatchStatus } from '@/api/client'
+import { api, type CommitBatch, type CommitBatchDetails, type CommitBatchStatus } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
@@ -64,18 +64,13 @@ function CommitBatchesPage() {
   }
   const seal = useMutation({
     mutationFn: api.sealCommitBatch,
-    onSuccess: async (batch) => {
-      queryClient.setQueryData(['commitBatch', batch.request_id], batch)
-      await refresh()
-    },
+    onSuccess: refresh,
     onError: () => {
       void refresh()
     },
   })
   const recover = useMutation({ mutationFn: api.retryTask, onSuccess: refresh })
   const requestSeal = (batch: CommitBatch) => {
-    setSelected(batch.request_id)
-    seal.reset()
     seal.mutate(batch.request_id)
   }
   const sealButton = (batch: CommitBatch) =>
@@ -130,6 +125,20 @@ function CommitBatchesPage() {
           <AlertDescription>
             Submit a batch before it fills or its wait ends. Smaller batches may increase transaction costs.
           </AlertDescription>
+        </Alert>
+      )}
+      {selected === null && seal.isSuccess && (
+        <Alert>
+          <AlertTitle>Submission requested</AlertTitle>
+          <AlertDescription>
+            <CopyableValue label="Batch ID" value={seal.data.request_id} monospace />
+          </AlertDescription>
+        </Alert>
+      )}
+      {selected === null && seal.isError && (
+        <Alert variant="destructive">
+          <AlertTitle>Couldn't submit the batch</AlertTitle>
+          <AlertDescription>{seal.error.message}</AlertDescription>
         </Alert>
       )}
       {batches.isError ? (
@@ -193,7 +202,6 @@ function CommitBatchesPage() {
                         aria-label={`Details for batch ${batch.request_id}`}
                         onClick={() => {
                           setSelected(batch.request_id)
-                          seal.reset()
                           recover.reset()
                         }}
                       >
@@ -248,7 +256,6 @@ function CommitBatchesPage() {
         onOpenChange={(open) => {
           if (!open) {
             setSelected(null)
-            seal.reset()
             recover.reset()
           }
         }}
@@ -264,7 +271,7 @@ function CommitBatchesPage() {
             <SheetTitle ref={detailTitle} tabIndex={-1} className="outline-none">
               Batch details
             </SheetTitle>
-            <SheetDescription>Track batch submission and confirmation.</SheetDescription>
+            <SheetDescription>Batch contents and submission history.</SheetDescription>
             {detail.data && (
               <div className="pr-8 text-muted-foreground">
                 <CopyableValue label="Batch ID" value={detail.data.request_id} monospace />
@@ -280,51 +287,56 @@ function CommitBatchesPage() {
               ) : (
                 detail.data && (
                   <>
+                    <dl className="grid min-w-0 gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
+                      <BatchDetailField label="Bucket">
+                        <CopyableValue label="Bucket" value={detail.data.bucket_name} maxLength={28} />
+                      </BatchDetailField>
+                      <BatchDetailField label="Storage service">
+                        <CopyableValue
+                          label="Storage service"
+                          value={detail.data.provider_id}
+                          displayValue={detail.data.provider_name ?? detail.data.provider_id}
+                          maxLength={28}
+                        />
+                      </BatchDetailField>
+                    </dl>
+                    <BatchMembers members={detail.data.members} />
                     <section className="flex min-w-0 max-w-full flex-col gap-3">
-                      <h3 className="text-sm font-medium">Overview</h3>
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="text-sm font-medium">Submission</h3>
+                        <BatchStatus batch={detail.data} />
+                      </div>
                       <dl className="grid min-w-0 gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
-                        <BatchDetailField label="Bucket">
-                          <CopyableValue label="Bucket" value={detail.data.bucket_name} maxLength={28} />
-                        </BatchDetailField>
-                        <BatchDetailField label="Storage service">
-                          <CopyableValue
-                            label="Storage service"
-                            value={detail.data.provider_id}
-                            displayValue={detail.data.provider_name ?? detail.data.provider_id}
-                            maxLength={28}
-                          />
-                        </BatchDetailField>
-                        <BatchDetailField label="Data set">
-                          {detail.data.data_set_id === null ? (
-                            '—'
-                          ) : (
+                        {detail.data.seal_requested_at && (
+                          <BatchDetailField label="Requested at">
+                            <BatchTimestamp value={detail.data.seal_requested_at} />
+                          </BatchDetailField>
+                        )}
+                        {detail.data.sealed_at && (
+                          <BatchDetailField label="Queued at">
+                            <BatchTimestamp value={detail.data.sealed_at} />
+                          </BatchDetailField>
+                        )}
+                        {detail.data.submitted_at && (
+                          <BatchDetailField label="Submitted at">
+                            <BatchTimestamp value={detail.data.submitted_at} />
+                          </BatchDetailField>
+                        )}
+                        {detail.data.confirmed_at && (
+                          <BatchDetailField label="Confirmed at">
+                            <BatchTimestamp value={detail.data.confirmed_at} />
+                          </BatchDetailField>
+                        )}
+                        {detail.data.data_set_id !== null && (
+                          <BatchDetailField label="Data set">
                             <CopyableValue label="Data set ID" value={detail.data.data_set_id} monospace />
-                          )}
-                        </BatchDetailField>
-                        <BatchDetailField label="Members">
-                          {detail.data.member_count} / {detail.data.max_pieces}
-                        </BatchDetailField>
-                        <BatchDetailField label="Size">
-                          {detail.data.total_bytes === null ? '—' : formatBytes(detail.data.total_bytes)}
-                        </BatchDetailField>
-                        <BatchDetailField label="Status">
-                          <BatchStatus batch={detail.data} />
-                        </BatchDetailField>
-                      </dl>
-                    </section>
-                    <section className="flex min-w-0 max-w-full flex-col gap-3">
-                      <h3 className="text-sm font-medium">Progress</h3>
-                      <dl className="grid min-w-0 gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
-                        <BatchDetailField label="Wait remaining">
-                          {remainingTime(detail.data.collection_deadline)}
-                        </BatchDetailField>
-                        <BatchDetailField label="Task">
-                          {detail.data.task_id === null ? (
-                            '—'
-                          ) : (
+                          </BatchDetailField>
+                        )}
+                        {detail.data.task_id !== null && (
+                          <BatchDetailField label="Task">
                             <CopyableValue label="Task ID" value={String(detail.data.task_id)} monospace />
-                          )}
-                        </BatchDetailField>
+                          </BatchDetailField>
+                        )}
                         {detail.data.transaction_id && (
                           <BatchDetailField label="Transaction">
                             <CopyableValue
@@ -389,11 +401,11 @@ function CommitBatchesPage() {
                   </>
                 )
               )}
-              {(seal.isError || recover.isError) && (
+              {((seal.isError && seal.variables === selected) || recover.isError) && (
                 <Alert variant="destructive">
                   <AlertTitle>Couldn't complete the action</AlertTitle>
                   <AlertDescription>
-                    {(seal.error ?? recover.error)?.message ?? 'Refresh and try again.'}
+                    {(recover.error ?? seal.error)?.message ?? 'Refresh and try again.'}
                   </AlertDescription>
                 </Alert>
               )}
@@ -403,6 +415,70 @@ function CommitBatchesPage() {
       </Sheet>
     </div>
   )
+}
+
+function BatchMembers({ members }: { members: CommitBatchDetails['members'] }) {
+  return (
+    <section className="flex min-w-0 flex-col gap-3">
+      <h3 className="text-sm font-medium">Members</h3>
+      {members.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No members in this batch.</p>
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow className="bg-muted/50">
+                <TableHead>Related object</TableHead>
+                <TableHead className="text-right">Size</TableHead>
+                <TableHead>Piece CID</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {members.map((member) => (
+                <TableRow key={member.content_id}>
+                  <TableCell>
+                    {member.file ? (
+                      <div className="flex flex-col gap-1">
+                        <CopyableValue label="Object key" value={member.file.key} maxLength={24} />
+                        {(member.file.source !== 'current' || member.file.other_versions > 0) && (
+                          <span className="text-xs text-muted-foreground">
+                            {member.file.source === 'deleted'
+                              ? 'Deleted object'
+                              : member.file.source === 'historical'
+                                ? 'Previous version'
+                                : null}
+                            {member.file.other_versions > 0 && (
+                              <>
+                                {member.file.source !== 'current' && ' · '}
+                                {member.file.other_versions} other{' '}
+                                {member.file.other_versions === 1 ? 'version' : 'versions'}
+                              </>
+                            )}
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-muted-foreground">Object unavailable</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {member.size === null ? '—' : formatBytes(member.size)}
+                  </TableCell>
+                  <TableCell>
+                    <CopyableValue label="Piece CID" value={member.piece_cid} monospace maxLength={20} />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function BatchTimestamp({ value }: { value: string }) {
+  return <time dateTime={value}>{new Date(value).toLocaleString()}</time>
 }
 
 function BatchDetailField({ label, children }: { label: string; children: ReactNode }) {

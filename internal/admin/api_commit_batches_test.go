@@ -74,6 +74,9 @@ func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := f.repos.Objects.CreateVersionAndSetCurrent(t.Context(), &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: copyRow.BucketID, Key: "c-alias", ContentID: &copyRow.ContentID, Size: 10, ETag: "c", ContentType: "application/octet-stream", CreatedAt: created.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
 	var page struct {
 		Batches    []commitBatchResponse `json:"batches"`
 		NextCursor string                `json:"next_cursor"`
@@ -93,6 +96,12 @@ func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 			t.Fatalf("%s = %d", query, rr.Code)
 		}
 	}
+	rr = request(http.MethodGet, "/api/v1/commit-batches/c", nil)
+	var detail commitBatchDetailResponse
+	decodeJSON(t, rr, &detail)
+	if rr.Code != 200 || len(detail.Members) != 1 || detail.Members[0].ContentID != copyRow.ContentID || detail.Members[0].PieceCID != "piece-c" || detail.Members[0].Size == nil || *detail.Members[0].Size != 10 || detail.Members[0].File == nil || detail.Members[0].File.Key != "c-alias" || detail.Members[0].File.Source != "current" || detail.Members[0].File.OtherVersions != 1 {
+		t.Fatalf("member detail = %#v (%d)", detail, rr.Code)
+	}
 	for range 2 {
 		rr := request(http.MethodPost, "/api/v1/commit-batches/c/seal", nil)
 		var batch commitBatchResponse
@@ -106,6 +115,14 @@ func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 	}
 	if rr := request(http.MethodPost, "/api/v1/commit-batches/c/seal", nil); rr.Code != 200 {
 		t.Fatalf("sealed replay = %d: %s", rr.Code, rr.Body.String())
+	}
+	if _, err := f.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", "changed-live-cid").Where("id = ?", copyRow.ContentID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	rr = request(http.MethodGet, "/api/v1/commit-batches/c", nil)
+	decodeJSON(t, rr, &detail)
+	if rr.Code != 200 || len(detail.Members) != 1 || detail.Members[0].PieceCID != "piece-c" || detail.SealedAt == nil {
+		t.Fatalf("signed member detail = %#v (%d)", detail, rr.Code)
 	}
 	if rr := request(http.MethodPost, "/api/v1/commit-batches/c/seal", strings.NewReader("{}")); rr.Code != 400 {
 		t.Fatal(rr.Code)

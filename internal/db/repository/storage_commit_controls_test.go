@@ -188,8 +188,17 @@ func testBatchListUsesStablePagingAndSignedMembership(t *testing.T, f commitFixt
 	if err != nil || before.MemberCount != 2 || before.TotalBytes == nil || *before.TotalBytes != 20 || before.OldestReadyAt == nil {
 		t.Fatalf("collecting batch = %#v, %v", before, err)
 	}
+	members, err := f.repos.Contents.ListCommitBatchMembers(ctx, "a")
+	if err != nil || len(members) != 2 || members[0].ContentID != a.ContentID || members[0].PieceCID != "piece-page-a" || members[0].Size == nil || *members[0].Size != 10 {
+		t.Fatalf("collecting members = %#v, %v", members, err)
+	}
 	f.seal(t, "a", taskID, a)
 	f.collectingAt(t, "b", created, b)
+	members, err = f.repos.Contents.ListCommitBatchMembers(ctx, "a")
+	signedCID := "piece-" + strconv.FormatInt(a.ContentID, 10)
+	if err != nil || len(members) != 1 || members[0].ContentID != a.ContentID || members[0].PieceCID != signedCID {
+		t.Fatalf("signed members included spilled copies or live CID: %#v, %v", members, err)
+	}
 	first, err := f.repos.Contents.ListCommitBatches(ctx, repository.CommitBatchFilter{Limit: 1})
 	if err != nil || len(first) != 1 || first[0].RequestID != "b" {
 		t.Fatalf("first page = %#v, %v", first, err)
@@ -224,5 +233,9 @@ func testBatchListUsesStablePagingAndSignedMembership(t *testing.T, f commitFixt
 	history, err := f.repos.Contents.GetCommitBatch(ctx, "a")
 	if err != nil || history.MemberCount != 1 || history.TotalBytes != nil {
 		t.Fatalf("historical batch = %#v, %v", history, err)
+	}
+	members, err = f.repos.Contents.ListCommitBatchMembers(ctx, "a")
+	if err != nil || len(members) != 1 || members[0].PieceCID != signedCID || members[0].Size != nil {
+		t.Fatalf("historical member identity or missing size lost: %#v, %v", members, err)
 	}
 }

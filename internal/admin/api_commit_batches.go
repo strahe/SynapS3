@@ -52,6 +52,18 @@ type commitBatchCursor struct {
 	RequestID string    `json:"request_id"`
 }
 
+type commitBatchMemberResponse struct {
+	ContentID int64            `json:"content_id"`
+	PieceCID  string           `json:"piece_cid"`
+	Size      *int64           `json:"size"`
+	File      *taskSubjectFile `json:"file"`
+}
+
+type commitBatchDetailResponse struct {
+	commitBatchResponse
+	Members []commitBatchMemberResponse `json:"members"`
+}
+
 func (s *Server) commitBatchResponse(row *repository.CommitBatch) commitBatchResponse {
 	maxPieces, maxWait := s.commitMaxPieces, s.commitMaxWait
 	if maxPieces <= 0 {
@@ -179,6 +191,28 @@ func (s *Server) writeCommitBatch(w http.ResponseWriter, r *http.Request, status
 			s.attachTaskStorageConfirmations(r.Context(), []model.Task{*task}, items)
 			response.Task = &items[0]
 		}
+	}
+	if r.Method == http.MethodGet {
+		members, err := s.repos.Contents.ListCommitBatchMembers(r.Context(), row.RequestID)
+		if err != nil {
+			s.commitBatchError(w, err)
+			return
+		}
+		detail := commitBatchDetailResponse{commitBatchResponse: response, Members: make([]commitBatchMemberResponse, 0, len(members))}
+		for _, member := range members {
+			item := commitBatchMemberResponse{ContentID: member.ContentID, PieceCID: member.PieceCID, Size: member.Size}
+			file, err := s.repos.Objects.GetContentFileSample(r.Context(), member.ContentID)
+			if err != nil && !errors.Is(err, repository.ErrNotFound) {
+				s.commitBatchError(w, err)
+				return
+			}
+			if err == nil {
+				item.File = &taskSubjectFile{Key: file.Key, Source: file.Source, OtherVersions: file.OtherVersions}
+			}
+			detail.Members = append(detail.Members, item)
+		}
+		writeJSON(w, status, detail)
+		return
 	}
 	writeJSON(w, status, response)
 }

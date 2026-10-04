@@ -119,7 +119,7 @@ Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), fro
 
 Enable **Submit batches early to free cache space** in Settings (`worker.tasks.commit_seal_on_cache_pressure`) to submit batches early when safe automatic cleanup cannot free enough space. It is off by default and requires restart. With `lru`, it follows the effective cleanup target; with `after_upload`, a refused write supplies the required space. It has no automatic effect under `none`. Smaller batches can increase transaction costs. Confirmation and the bucket's durability requirements still apply before cache removal.
 
-Open **Batches** and choose **Submit batch** for a batch waiting to submit. This works independently of the automatic option and cache policy. The details panel follows progress after submission is requested; stopped tasks use **Recover** when available. Historical size is left blank when some data has already been deleted.
+Open **Batches** and choose **Submit batch** for a batch waiting to submit. This works independently of the automatic option and cache policy. Open **Details** to inspect members, submission times, transaction ID, and errors; stopped tasks use **Recover** when available. Each member shows a related object and the number of other versions sharing its data. Missing historical object information and sizes are shown as unavailable.
 
 ## Admin Session Lifetime
 

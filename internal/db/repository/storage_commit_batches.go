@@ -32,6 +32,12 @@ type CommitBatch struct {
 	TaskError     *string
 }
 
+type CommitBatchMember struct {
+	ContentID int64
+	PieceCID  string
+	Size      *int64
+}
+
 func commitBatchQuery(db bun.IDB, dest any) *bun.SelectQuery {
 	return db.NewSelect().Model(dest).ModelTableExpr("storage_commit_requests AS commit_request").
 		ColumnExpr("commit_request.*").
@@ -81,4 +87,28 @@ func (r *BunStorageContentRepo) GetCommitBatch(ctx context.Context, requestID st
 		return nil, mapNotFound(err)
 	}
 	return row, nil
+}
+
+func (r *BunStorageContentRepo) ListCommitBatchMembers(ctx context.Context, requestID string) ([]CommitBatchMember, error) {
+	rows := make([]CommitBatchMember, 0)
+	// Signed identities outlive the copies and content rows they describe.
+	err := r.db.NewRaw(`SELECT member.content_id, member.piece_cid, member.size FROM (
+		SELECT copy.content_id, COALESCE(content.piece_cid, '') AS piece_cid, content.content_size AS size,
+			copy.commit_ready_at AS ready_at, copy.id AS position
+		FROM storage_copies AS copy
+		JOIN storage_contents AS content ON content.id = copy.content_id
+		JOIN storage_commit_requests AS request ON request.request_id = copy.commit_request_id
+		WHERE request.request_id = ? AND request.status = 'collecting'
+		UNION ALL
+		SELECT piece.content_id, piece.piece_cid, content.content_size AS size,
+			NULL AS ready_at, piece.position
+		FROM storage_commit_request_pieces AS piece
+		LEFT JOIN storage_contents AS content ON content.id = piece.content_id
+		JOIN storage_commit_requests AS request ON request.request_id = piece.request_id
+		WHERE request.request_id = ? AND request.status <> 'collecting'
+	) AS member ORDER BY member.ready_at, member.position`, requestID, requestID).Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("listing batch members: %w", err)
+	}
+	return rows, nil
 }

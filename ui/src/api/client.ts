@@ -704,6 +704,15 @@ export interface CommitBatchListResponse {
   next_cursor?: string
 }
 
+export interface CommitBatchDetails extends CommitBatch {
+  members: {
+    content_id: number
+    piece_cid: string
+    size: number | null
+    file: { key: string; source: 'current' | 'historical' | 'deleted'; other_versions: number } | null
+  }[]
+}
+
 export interface TaskItem {
   id: number
   type: string
@@ -1304,7 +1313,7 @@ export const api = {
     return fetchJSON<CommitBatchListResponse>(`/commit-batches?${sp.toString()}`, { signal })
   },
   getCommitBatch: (id: string, signal?: AbortSignal) =>
-    fetchJSON<CommitBatch>(`/commit-batches/${encodeURIComponent(id)}`, { signal }),
+    fetchJSON<CommitBatchDetails>(`/commit-batches/${encodeURIComponent(id)}`, { signal }),
   sealCommitBatch: (id: string) =>
     fetchJSON<CommitBatch>(`/commit-batches/${encodeURIComponent(id)}/seal`, { method: 'POST' }),
   getTasks: (params: { type?: string; status?: string; limit?: number; cursor?: number }) => {

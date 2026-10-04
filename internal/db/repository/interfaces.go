@@ -549,6 +549,7 @@ type StorageContentRepository interface {
 	RequestCommitSeal(ctx context.Context, requestID string) (*storagecommit.Request, error)
 	ListCommitBatches(ctx context.Context, filter CommitBatchFilter) ([]CommitBatch, error)
 	GetCommitBatch(ctx context.Context, requestID string) (*CommitBatch, error)
+	ListCommitBatchMembers(ctx context.Context, requestID string) ([]CommitBatchMember, error)
 	ReleaseMemberTransfer(ctx context.Context, input ReleaseMemberTransferInput) error
 	// CountCommitBacklog counts the copies transferred to a data set that wait
 	// for a request that has not been sent.
