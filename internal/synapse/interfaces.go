@@ -42,7 +42,7 @@ type DataSetTarget interface {
 	StorageTarget
 	Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
 	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
-	Pull(context.Context, storage.PullRequest) (*storage.PullResult, error)
+	SubmitPull(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommit(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
 	GetCommitStatus(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)

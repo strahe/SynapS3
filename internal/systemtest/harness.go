@@ -173,7 +173,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314, USDFCAddress: memoryUSDFCAddress.Hex(),
 			Storage: filecoin, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,
-			Terminator: filecoin, Epochs: filecoin, CommitNonces: filecoin,
+			Terminator: filecoin, Epochs: filecoin, CommitNonces: filecoin, ParkedPieces: filecoin,
 		},
 		S3Addresses: []string{socketPath}, ShutdownTimeout: 5 * time.Second,
 	})

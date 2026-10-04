@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
@@ -386,9 +387,14 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		query = query.Set("retry_count = retry_count + 1")
 	}
 	if transition.Status == model.TaskStatusPending {
+		availableAt := "CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END"
+		if r.db.Dialect().Name() == dialect.PG {
+			// PostgreSQL infers a CASE of untyped timestamp literals as text.
+			availableAt = "CASE WHEN cancellation_requested_at IS NOT NULL THEN CAST(? AS TIMESTAMPTZ) ELSE CAST(? AS TIMESTAMPTZ) END"
+		}
 		query = query.
 			Set("resume_mode = CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END", model.TaskResumeModeRecover, transition.ResumeMode).
-			Set("available_at = CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END", now, transition.AvailableAt).
+			Set("available_at = "+availableAt, now, transition.AvailableAt).
 			Set("finished_at = NULL").
 			Set("retention_until = NULL").
 			Set("acknowledged_at = NULL")
@@ -467,6 +473,7 @@ func (r *BunTaskRepo) WakePending(ctx context.Context, ids []int64) (int, error)
 		Where("id IN (?)", bun.List(ids)).
 		Where("status = ?", model.TaskStatusPending).
 		Where("available_at > ?", now).
+		Where("type != ? OR wait_reason IS NULL OR wait_reason != ?", model.TaskTypeStoragePull, storagepull.WaitQueueFull).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("waking pending tasks: %w", err)
@@ -505,6 +512,8 @@ func (r *BunTaskRepo) RetryFailed(ctx context.Context, id int64) error {
 		Set("available_at = ?", now).
 		Set("retry_count = 0").
 		Set("retry_limit = CASE WHEN type = ? AND retry_limit = 0 THEN 1 ELSE retry_limit END", model.TaskTypeStorageStore).
+		Set("cancellation_requested_at = CASE WHEN type = ? AND failure_reason = ? THEN NULL ELSE cancellation_requested_at END", model.TaskTypeStoragePull, storagepull.FailureCancelOutcomeUnknown).
+		Set("cancellation_reason = CASE WHEN type = ? AND failure_reason = ? THEN NULL ELSE cancellation_reason END", model.TaskTypeStoragePull, storagepull.FailureCancelOutcomeUnknown).
 		Set("failure_reason = NULL").
 		Set("last_error = NULL").
 		Set("status_message = NULL").

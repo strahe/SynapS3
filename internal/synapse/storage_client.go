@@ -294,8 +294,8 @@ func (c *dataSetTargetAdapter) PresignForCommit(ctx context.Context, pieces []st
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 
-func (c *dataSetTargetAdapter) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
-	result, err := c.dataSet.Pull(ctx, request)
+func (c *dataSetTargetAdapter) SubmitPull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+	result, err := c.dataSet.SubmitPull(ctx, request)
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 

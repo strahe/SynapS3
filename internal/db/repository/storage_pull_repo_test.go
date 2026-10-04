@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -9,6 +10,107 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepull"
 )
+
+func TestPullTaskRecoveryProtection(t *testing.T) {
+	testPullTaskRecoveryProtection(t, newCommitFixture(t, testDB(t)))
+}
+
+func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	copyRow := f.transferredCopy(t, "protected-pull")
+	if _, err := f.db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("status = ?", model.StorageCopyStatusPending).
+		Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := f.repos.Contents.NextCopyWorkGeneration(ctx, copyRow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := commitTask("protected-pull")
+	row.Type = model.TaskTypeStoragePull
+	row, _, err = f.repos.Tasks.Enqueue(ctx, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.BindCopyTask(ctx, copyRow.ID, generation, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != row.ID {
+		t.Fatalf("claim = %#v, %v", claimed, err)
+	}
+	sourceProvider, sourceSet, sourcePiece := onChainID(t, "901"), onChainID(t, "902"), onChainID(t, "0")
+	checkpoint := []byte(`{"attempt_id":"protected-pull"}`)
+	if err := f.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+		if err := tx.Contents.ReservePullRequest(ctx, repository.ReservePullRequestInput{
+			CopyID: copyRow.ID, Generation: generation, TaskID: row.ID, AttemptID: "protected-pull",
+			SourceProviderID: &sourceProvider, SourceDataSetID: &sourceSet, SourcePieceID: &sourcePiece,
+			SourcePieceCID: "piece-protected-pull", SourceRetrievalURL: "https://source.example/piece", ExtraDataHex: "abcd",
+		}); err != nil {
+			return err
+		}
+		return tx.Tasks.WriteCheckpoint(ctx, row.ID, claimed.ClaimGeneration, checkpoint)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	due := time.Now().Add(2 * time.Minute).UTC().Truncate(time.Microsecond)
+	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: due, WaitReason: new(storagepull.WaitQueueFull),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if woken, err := f.repos.Tasks.WakePending(ctx, []int64{row.ID}); err != nil || woken != 0 {
+		t.Fatalf("early wake = %d, %v", woken, err)
+	}
+	waiting, err := f.repos.Tasks.GetByID(ctx, row.ID)
+	if err != nil || !waiting.AvailableAt.Equal(due) {
+		t.Fatalf("queue-full deadline changed: %#v, %v", waiting, err)
+	}
+	if err := f.repos.Tasks.RequestCancellation(ctx, row.ID, "cancel pull"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != row.ID || !claimed.CancellationRequested() {
+		t.Fatalf("cancel did not wake recovery: %#v, %v", claimed, err)
+	}
+	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: new(storagepull.FailureCancelOutcomeUnknown),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	version := new(model.ObjectVersion)
+	if err := f.db.NewSelect().Model(version).Where("content_id = ?", copyRow.ContentID).Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: f.bucket.ID, Key: version.Key, VersionID: version.VersionID,
+	}); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+		t.Fatalf("delete unresolved pull's last reference = %v", err)
+	}
+	if err := f.repos.Tasks.RetryFailed(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := f.repos.Tasks.GetByID(ctx, row.ID)
+	if err != nil || retried.Status != model.TaskStatusPending || retried.ResumeMode != model.TaskResumeModeRecover ||
+		retried.CancellationRequestedAt != nil || retried.CancellationReason != nil || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
+		t.Fatalf("manual retry lost evidence or cancellation persists: %#v, %v", retried, err)
+	}
+	if _, err := f.repos.Contents.GetUnresolvedPullAttempt(ctx, copyRow.ContentID, copyRow.StorageDataSetID); err != nil {
+		t.Fatalf("protected retry lost its attempt: %v", err)
+	}
+	if _, err := f.repos.Contents.NextCopyWorkGeneration(ctx, copyRow.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("new generation replaced protected owner: %v", err)
+	}
+	normal := commitTask("ordinary-wake")
+	normal.AvailableAt = due
+	normal, _, err = f.repos.Tasks.Enqueue(ctx, normal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if woken, err := f.repos.Tasks.WakePending(ctx, []int64{normal.ID}); err != nil || woken != 1 {
+		t.Fatalf("ordinary wake = %d, %v", woken, err)
+	}
+}
 
 func TestPullAuthorizationLedger(t *testing.T) {
 	testPullAuthorizationLedger(t, newCommitFixture(t, testDB(t)))

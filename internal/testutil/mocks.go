@@ -202,7 +202,7 @@ type MockStorageTarget struct {
 	FindDataSetByClientIDFunc func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error)
 	StoreFunc                 func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
 	PresignForCommitFunc      func(context.Context, []storage.PieceInput) ([]byte, error)
-	PullFunc                  func(context.Context, storage.PullRequest) (*storage.PullResult, error)
+	SubmitPullFunc            func(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommitFunc          func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
 	GetCommitStatusFunc       func(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatusFunc           func(context.Context, cid.Cid) (*storage.PieceStatus, error)
@@ -309,11 +309,11 @@ func (m *MockStorageTarget) PresignForCommit(ctx context.Context, pieces []stora
 	return nil, errors.New("MockStorageTarget.PresignForCommit not configured")
 }
 
-func (m *MockStorageTarget) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
-	if m.PullFunc != nil {
-		return m.PullFunc(ctx, request)
+func (m *MockStorageTarget) SubmitPull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+	if m.SubmitPullFunc != nil {
+		return m.SubmitPullFunc(ctx, request)
 	}
-	return nil, errors.New("MockStorageTarget.Pull not configured")
+	return nil, errors.New("MockStorageTarget.SubmitPull not configured")
 }
 
 func (m *MockStorageTarget) SubmitCommit(ctx context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {

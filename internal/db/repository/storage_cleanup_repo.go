@@ -275,17 +275,6 @@ func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, 
 	if !ready {
 		return ErrContentCleanupNotReady
 	}
-	now := time.Now()
-	if _, err := r.db.NewUpdate().
-		Model((*storagepull.Attempt)(nil)).
-		Set("status = ?", storagepull.AttemptStatusAbandoned).
-		Set("last_error = ?", "stored data was removed").
-		Set("resolved_at = ?", now).
-		Set("updated_at = ?", now).
-		Where("content_id = ? AND resolved_at IS NULL", contentID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("finalizing storage cleanup: abandoning open pulls: %w", err)
-	}
 	if _, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("created_by_content_id = NULL").
@@ -323,6 +312,8 @@ func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool
 		what  string
 		query *bun.SelectQuery
 	}{
+		{"unresolved pulls", db.NewSelect().Model((*storagepull.Attempt)(nil)).
+			Where("content_id = ? AND resolved_at IS NULL", contentID)},
 		{"cache residency", db.NewSelect().Model((*model.ObjectCache)(nil)).
 			Where("content_id = ?", contentID).
 			Where(`in_cache = ? OR EXISTS (

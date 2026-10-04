@@ -869,14 +869,14 @@ func newPullRegistration(t *testing.T, script ...sendOutcome) *pullRegistration 
 			r.nonce++
 			return testutil.CommitExtraData(r.nonce), nil
 		},
-		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+		SubmitPullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.pulls++
 			if r.pulls == 1 {
-				return &storage.PullResult{}, nil
+				return pullStatusResult(request, storage.PullStatusComplete), nil
 			}
-			return nil, fmt.Errorf("provider pull: %w", pdp.ErrPullFailed)
+			return pullStatusResult(request, storage.PullStatusFailed), nil
 		},
 		SubmitCommitFunc: func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 			r.mu.Lock()
