@@ -26,6 +26,7 @@ type CacheEvictionRepository interface {
 	BindEvictionTask(ctx context.Context, contentID, generation, taskID int64) error
 	ListLRUCandidates(ctx context.Context, limit int) ([]cacheeviction.Candidate, error)
 	ActiveEvictionBytes(ctx context.Context) (int64, error)
+	ReclaimableLRUBytes(ctx context.Context) (int64, error)
 	AuthorizeDeletion(ctx context.Context, contentID, generation, taskID int64, expectedAccess *time.Time) (*cacheeviction.AuthorizedDeletion, error)
 	RecordDeletion(ctx context.Context, contentID, generation, taskID int64) error
 	DeletionRecorded(ctx context.Context, contentID, generation int64) (bool, error)
@@ -182,25 +183,13 @@ func (r *BunCacheEvictionRepo) BindEvictionTask(ctx context.Context, contentID, 
 
 func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int) ([]cacheeviction.Candidate, error) {
 	var candidates []cacheeviction.Candidate
-	query := r.db.NewSelect().
-		TableExpr("object_cache AS object_cache").
+	query := safeCacheEvictionQuery(r.db).
 		ColumnExpr("object_cache.content_id").
 		ColumnExpr("storage_content.bucket_id").
 		ColumnExpr("storage_content.content_size").
 		ColumnExpr("object_cache.cache_accessed_at").
-		Join("JOIN storage_contents AS storage_content ON storage_content.id = object_cache.content_id").
-		Join("JOIN buckets AS durability_bucket ON durability_bucket.id = storage_content.bucket_id").
 		Where("object_cache.cache_active_task_id IS NULL").
-		Where("object_cache.in_cache = ?", true).
-		Where("storage_content.content_size > 0").
 		Where("object_cache.cache_accessed_at IS NOT NULL").
-		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
-		Where(noUnfinishedStoreCacheDependencySQL("storage_content.id")).
-		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
-			storagereplacement.ItemStatusPending,
-			storagereplacement.ItemStatusAttention,
-			storagereplacement.StatusCompleted,
-			storagereplacement.StatusSuperseded).
 		OrderExpr("object_cache.cache_accessed_at, object_cache.content_id")
 	if limit > 0 {
 		query = query.Limit(limit)
@@ -212,18 +201,68 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int)
 }
 
 func (r *BunCacheEvictionRepo) ActiveEvictionBytes(ctx context.Context) (int64, error) {
-	var total int64
-	err := r.db.NewSelect().
-		TableExpr("object_cache AS object_cache").
-		ColumnExpr("COALESCE(SUM(storage_content.content_size), 0)").
-		Join("JOIN storage_contents AS storage_content ON storage_content.id = object_cache.content_id").
-		Where("object_cache.in_cache = ?", true).
-		Where("object_cache.cache_active_task_id IS NOT NULL").
-		Scan(ctx, &total)
+	var rows []struct {
+		ContentID      int64
+		ContentSize    int64
+		Generation     int64
+		AccessedAt     time.Time
+		IdempotencyKey string
+		Input          []byte
+	}
+	err := safeCacheEvictionQuery(r.db).
+		ColumnExpr("storage_content.id AS content_id, storage_content.content_size").
+		ColumnExpr("object_cache.cache_operation_generation AS generation").
+		ColumnExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at) AS accessed_at").
+		ColumnExpr("eviction_task.idempotency_key, eviction_payload.input_json AS input").
+		Join("JOIN tasks AS eviction_task ON eviction_task.id = object_cache.cache_active_task_id").
+		Join("JOIN task_payloads AS eviction_payload ON eviction_payload.task_id = eviction_task.id").
+		Where("eviction_task.type = ? AND eviction_task.input_version = 1", model.TaskTypeCacheEvict).
+		Where("eviction_task.subject_type = ? AND eviction_task.subject_key = CAST(storage_content.id AS TEXT)", model.TaskSubjectStorageContent).
+		Where("eviction_task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
+		Scan(ctx, &rows)
 	if err != nil {
 		return 0, fmt.Errorf("summing active cache eviction bytes: %w", err)
 	}
+	var total int64
+	for _, row := range rows {
+		var input cacheeviction.EvictInput
+		if json.Unmarshal(row.Input, &input) != nil || cacheeviction.ValidateEvictInput(&input) != nil ||
+			input.ContentID != row.ContentID || input.Generation != row.Generation ||
+			row.IdempotencyKey != cacheeviction.EvictTaskKey(row.ContentID, row.Generation) {
+			continue
+		}
+		if input.AccessedAt != nil && !input.AccessedAt.Equal(cacheeviction.NormalizeAccessTime(row.AccessedAt)) {
+			continue
+		}
+		total += row.ContentSize
+	}
 	return total, nil
+}
+
+func (r *BunCacheEvictionRepo) ReclaimableLRUBytes(ctx context.Context) (int64, error) {
+	var total int64
+	err := safeCacheEvictionQuery(r.db).
+		ColumnExpr("COALESCE(SUM(storage_content.content_size), 0)").
+		Where("object_cache.cache_active_task_id IS NULL").
+		Where("object_cache.cache_accessed_at IS NOT NULL").
+		Scan(ctx, &total)
+	if err != nil {
+		return 0, fmt.Errorf("summing reclaimable cache bytes: %w", err)
+	}
+	return total, nil
+}
+
+func safeCacheEvictionQuery(db bun.IDB) *bun.SelectQuery {
+	return db.NewSelect().TableExpr("object_cache AS object_cache").
+		Join("JOIN storage_contents AS storage_content ON storage_content.id = object_cache.content_id").
+		Join("JOIN buckets AS durability_bucket ON durability_bucket.id = storage_content.bucket_id").
+		Where("object_cache.in_cache = ?", true).
+		Where("storage_content.content_size > 0").
+		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
+		Where(noUnfinishedStoreCacheDependencySQL("storage_content.id")).
+		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
+			storagereplacement.ItemStatusPending, storagereplacement.ItemStatusAttention,
+			storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded)
 }
 
 func (r *BunCacheEvictionRepo) AuthorizeDeletion(

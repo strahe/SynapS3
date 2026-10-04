@@ -107,6 +107,7 @@ const tabFields = {
     'worker.tasks.destructive_mutation_concurrency',
     'worker.tasks.commit_max_pieces',
     'worker.tasks.commit_max_wait',
+    'worker.tasks.commit_seal_on_cache_pressure',
     'worker.tasks.commit_max_backlog',
   ],
   logging: ['logging.level', 'logging.format', 'logging.s3_access.enabled', 'logging.s3_access.level'],
@@ -998,6 +999,14 @@ function TaskWorkerSection({
           data={data}
           errors={errors}
           onChange={(next) => onChange({ ...value, commit_max_backlog: next })}
+        />
+        <CheckboxField
+          label="Submit batches early to free cache space"
+          field="worker.tasks.commit_seal_on_cache_pressure"
+          checked={value.commit_seal_on_cache_pressure}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, commit_seal_on_cache_pressure: next })}
         />
       </div>
     </Section>

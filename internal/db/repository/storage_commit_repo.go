@@ -317,6 +317,7 @@ func (r *BunStorageContentRepo) SealCommitRequest(ctx context.Context, input Sea
 			Set("piece_count = ?", len(input.Members)).
 			Set("extra_data_hex = ?", extra).
 			Set("sealed_at = ?", now).
+			Set("seal_requested_at = NULL").
 			Set("updated_at = ?", now).
 			Where("request_id = ? AND task_id = ? AND status = ?", input.RequestID, input.TaskID, storagecommit.RequestStatusCollecting).
 			Exec(ctx)
@@ -744,6 +745,7 @@ func abandonCommitRequest(ctx context.Context, db bun.IDB, input AbandonCommitRe
 	res, err := db.NewUpdate().
 		Model((*storagecommit.Request)(nil)).
 		Set("status = ?", storagecommit.RequestStatusAbandoned).
+		Set("seal_requested_at = NULL").
 		Set("task_id = NULL").
 		Set("last_error = ?", input.Reason).
 		Set("attention_code = NULL").
@@ -1040,6 +1042,7 @@ func releaseCollectingCommitMembership(ctx context.Context, db bun.IDB, copyID i
 		Set("status = ?", storagecommit.RequestStatusAbandoned).
 		Set("task_id = NULL").
 		Set("last_error = ?", "no storage copies are left to register").
+		Set("seal_requested_at = NULL").
 		Set("updated_at = ?", now).
 		Where("request_id = ? AND status = ?", requestID, storagecommit.RequestStatusCollecting).
 		Exec(ctx); err != nil {

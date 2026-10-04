@@ -146,10 +146,15 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	if members[0].CommitReadyAt != nil {
 		oldest = *members[0].CommitReadyAt
 	}
+	pressure, err := h.commitCachePressure(ctx, run.request.RequestID)
+	if err != nil {
+		return retryTask(err, "cache_pressure_load_failed")
+	}
 	seal, wait := storagecommit.ShouldSeal(storagecommit.SealInput{
 		Members: len(members), OldestJoinedAt: oldest, Now: now,
 		MaxPieces: maxPieces, MaxWait: h.deps.CommitMaxWait,
-		Draining: run.binding.Status == model.StorageDataSetStatusDraining,
+		Draining:      run.binding.Status == model.StorageDataSetStatusDraining,
+		CachePressure: pressure, ManualRequested: run.request.SealRequestedAt != nil,
 	})
 	if !seal {
 		if wait <= 0 || wait > commitCollectionPollInterval {
@@ -910,7 +915,7 @@ func (h *TaskHandlers) queueCommit(ctx context.Context, repos *repository.Reposi
 		CopyID: copyRow.ID, StorageDataSetID: copyRow.StorageDataSetID, MaxPieces: maxPieces,
 	})
 	if err == nil {
-		if members >= maxPieces {
+		if members >= maxPieces || (h.deps.CommitSealOnCachePressure && h.cachePressure.Load() != nil) {
 			return repos.Contents.WakeCommitRequestTask(ctx, requestID)
 		}
 		return nil

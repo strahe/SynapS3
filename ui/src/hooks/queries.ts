@@ -1,11 +1,33 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { FilecoinReadinessPreflightPayload, ObservabilityListParams, S3UserRole } from '@/api/client'
+import type {
+  CommitBatchStatus,
+  FilecoinReadinessPreflightPayload,
+  ObservabilityListParams,
+  S3UserRole,
+} from '@/api/client'
 import { api } from '@/api/client'
 
 export function useOverview() {
   return useQuery({
     queryKey: ['overview'],
     queryFn: api.getOverview,
+    refetchInterval: 10_000,
+  })
+}
+
+export function useCommitBatches(status: CommitBatchStatus | undefined, cursor: string | undefined) {
+  return useQuery({
+    queryKey: ['commitBatches', status, cursor],
+    queryFn: ({ signal }) => api.getCommitBatches({ status, cursor, limit: 20 }, signal),
+    refetchInterval: 10_000,
+  })
+}
+
+export function useCommitBatch(id: string | null) {
+  return useQuery({
+    queryKey: ['commitBatch', id],
+    queryFn: ({ signal }) => api.getCommitBatch(id ?? '', signal),
+    enabled: id !== null,
     refetchInterval: 10_000,
   })
 }

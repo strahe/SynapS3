@@ -946,6 +946,7 @@ type adminSettingsTaskWorkerConfig struct {
 	CommitMaxPieces                int    `json:"commit_max_pieces"`
 	CommitMaxWait                  string `json:"commit_max_wait"`
 	CommitMaxBacklog               int    `json:"commit_max_backlog"`
+	CommitSealOnCachePressure      bool   `json:"commit_seal_on_cache_pressure"`
 }
 
 type adminSettingsLoggingConfig struct {
@@ -1050,6 +1051,7 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"worker.tasks.commit_max_pieces":                {path: []string{"worker", "tasks", "commit_max_pieces"}, kind: adminSettingInt},
 	"worker.tasks.commit_max_wait":                  {path: []string{"worker", "tasks", "commit_max_wait"}, kind: adminSettingString},
 	"worker.tasks.commit_max_backlog":               {path: []string{"worker", "tasks", "commit_max_backlog"}, kind: adminSettingInt},
+	"worker.tasks.commit_seal_on_cache_pressure":    {path: []string{"worker", "tasks", "commit_seal_on_cache_pressure"}, kind: adminSettingBool},
 	"logging.level":                                 {path: []string{"logging", "level"}, kind: adminSettingString},
 	"logging.format":                                {path: []string{"logging", "format"}, kind: adminSettingString},
 	"logging.s3_access.enabled":                     {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
@@ -1438,6 +1440,7 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "worker.tasks.commit_max_pieces", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxPieces)},
 				{Name: "worker.tasks.commit_max_wait", Value: settings.Config.Worker.Tasks.CommitMaxWait},
 				{Name: "worker.tasks.commit_max_backlog", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxBacklog)},
+				{Name: "worker.tasks.commit_seal_on_cache_pressure", Value: strconv.FormatBool(settings.Config.Worker.Tasks.CommitSealOnCachePressure)},
 			},
 		},
 		{

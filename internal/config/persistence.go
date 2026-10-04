@@ -297,6 +297,7 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 				{Field: "worker.tasks.commit_max_pieces", Key: "commit_max_pieces", Value: strconv.Itoa(cfg.Worker.Tasks.CommitMaxPieces), Enabled: saveMode},
 				{Field: "worker.tasks.commit_max_wait", Key: "commit_max_wait", Value: quoteTOMLString(cfg.Worker.Tasks.CommitMaxWait.String()), Enabled: saveMode},
 				{Field: "worker.tasks.commit_max_backlog", Key: "commit_max_backlog", Value: strconv.Itoa(cfg.Worker.Tasks.CommitMaxBacklog), Enabled: saveMode},
+				{Field: "worker.tasks.commit_seal_on_cache_pressure", Key: "commit_seal_on_cache_pressure", Value: strconv.FormatBool(cfg.Worker.Tasks.CommitSealOnCachePressure), Enabled: saveMode},
 			},
 		},
 		{

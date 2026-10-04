@@ -755,6 +755,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "destructive mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"destructive_mutation_concurrency":2}}}`, field: "worker.tasks.destructive_mutation_concurrency"},
 		{name: "commit max pieces", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", payload: `{"worker":{"tasks":{"commit_max_pieces":16}}}`, field: "worker.tasks.commit_max_pieces"},
 		{name: "commit max wait", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", payload: `{"worker":{"tasks":{"commit_max_wait":"5s"}}}`, field: "worker.tasks.commit_max_wait"},
+		{name: "pressure sealing", envName: "SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", payload: `{"worker":{"tasks":{"commit_seal_on_cache_pressure":true}}}`, field: "worker.tasks.commit_seal_on_cache_pressure", envValue: "false"},
 		{name: "commit max backlog", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", payload: `{"worker":{"tasks":{"commit_max_backlog":64}}}`, field: "worker.tasks.commit_max_backlog"},
 		{name: "logging level", envName: "SYNAPS3_LOGGING_LEVEL", payload: `{"logging":{"level":"debug"}}`, field: "logging.level"},
 		{name: "logging format", envName: "SYNAPS3_LOGGING_FORMAT", payload: `{"logging":{"format":"text"}}`, field: "logging.format"},

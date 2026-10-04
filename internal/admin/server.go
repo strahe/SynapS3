@@ -18,6 +18,7 @@ import (
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -36,34 +37,37 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr                  string
-	db                    *bun.DB
-	cache                 cache.Cache
-	objectReader          *objectreader.Reader
-	objectStorage         synapse.StorageClient
-	cacheGate             *cacheaccess.Gate
-	cacheAccessTracker    *cacheaccess.Tracker
-	objectUploader        objectUploader
-	objectVersionRestorer objectVersionRestorer
-	cacheMaxBytes         int64
-	repos                 *repository.Repositories
-	taskService           *taskengine.Service
-	bucketLifecycle       *bucketlifecycle.Service
-	workerHealth          WorkerHealthChecker
-	wallet                synapse.WalletQuerier
-	filecoinReadiness     filecoinReadinessProbe
-	observability         *observability.Service
-	warmStorageMarket     WarmStorageMarket
-	marketChainID         uint64
-	usdfcAddress          string
-	providerIdentity      providerIdentityLookup
-	events                *EventHub
-	settings              *SettingsService
-	auth                  *authService
-	trustedProxies        []netip.Prefix
-	s3IAM                 auth.IAMService
-	s3RootAccess          string
-	filecoinDefaultCopies int
+	addr                    string
+	db                      *bun.DB
+	cache                   cache.Cache
+	objectReader            *objectreader.Reader
+	objectStorage           synapse.StorageClient
+	cacheGate               *cacheaccess.Gate
+	cacheAccessTracker      *cacheaccess.Tracker
+	objectUploader          objectUploader
+	objectVersionRestorer   objectVersionRestorer
+	cacheMaxBytes           int64
+	repos                   *repository.Repositories
+	taskService             *taskengine.Service
+	bucketLifecycle         *bucketlifecycle.Service
+	workerHealth            WorkerHealthChecker
+	wallet                  synapse.WalletQuerier
+	filecoinReadiness       filecoinReadinessProbe
+	observability           *observability.Service
+	warmStorageMarket       WarmStorageMarket
+	marketChainID           uint64
+	usdfcAddress            string
+	providerIdentity        providerIdentityLookup
+	events                  *EventHub
+	settings                *SettingsService
+	auth                    *authService
+	trustedProxies          []netip.Prefix
+	s3IAM                   auth.IAMService
+	s3RootAccess            string
+	filecoinDefaultCopies   int
+	commitMaxPieces         int
+	commitMaxWait           time.Duration
+	legacyPieceStorageLimit uint64
 	// replacementSelector resolves an automatic replacement provider. Nil means
 	// only an explicit Provider ID can be confirmed.
 	replacementSelector providerReplacementSelector
@@ -116,6 +120,8 @@ func New(
 		wallet:                newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
 		events:                newAdminEventHub(),
 		filecoinDefaultCopies: boundedBucketCopies(filecoinDefaultCopies),
+		commitMaxPieces:       config.DefaultCommitMaxPieces,
+		commitMaxWait:         config.DefaultCommitMaxWait,
 		logger:                logger,
 		startedAt:             time.Now(),
 	}
@@ -254,6 +260,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", s.handleAPIListDataSetReplacementProviders)
 		mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", s.handleAPIRetryStorageReplacement)
 		mux.HandleFunc("GET /api/v1/storage-confirmations", s.handleAPIListStorageConfirmations)
+		mux.HandleFunc("GET /api/v1/commit-batches", s.handleAPIListCommitBatches)
+		mux.HandleFunc("GET /api/v1/commit-batches/{id}", s.handleAPIGetCommitBatch)
+		mux.HandleFunc("POST /api/v1/commit-batches/{id}/seal", s.handleAPISealCommitBatch)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", s.handleAPIDeleteBucketObject)

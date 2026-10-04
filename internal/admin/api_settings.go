@@ -175,7 +175,7 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 		setInt("cache.lru_low_watermark_percent", &next.Cache.LRULowWatermarkPercent, req.Cache.LRULowWatermarkPercent)
 	}
 	if req.Worker != nil {
-		applyTaskWorkerUpdate(req.Worker.Tasks, &next.Worker.Tasks, setInt, setDuration)
+		applyTaskWorkerUpdate(req.Worker.Tasks, &next.Worker.Tasks, setInt, setDuration, setBool)
 	}
 	if req.Logging != nil {
 		setString("logging.level", &next.Logging.Level, req.Logging.Level)
@@ -270,6 +270,7 @@ func applyTaskWorkerUpdate(
 	target *config.TaskWorkerConfig,
 	setInt func(string, *int, *int),
 	setDuration func(string, *time.Duration, *string),
+	setBool func(string, *bool, *bool),
 ) {
 	if req == nil {
 		return
@@ -284,6 +285,7 @@ func applyTaskWorkerUpdate(
 	setInt("worker.tasks.commit_max_pieces", &target.CommitMaxPieces, req.CommitMaxPieces)
 	setDuration("worker.tasks.commit_max_wait", &target.CommitMaxWait, req.CommitMaxWait)
 	setInt("worker.tasks.commit_max_backlog", &target.CommitMaxBacklog, req.CommitMaxBacklog)
+	setBool("worker.tasks.commit_seal_on_cache_pressure", &target.CommitSealOnCachePressure, req.CommitSealOnCachePressure)
 }
 
 func (s *SettingsService) snapshotLocked(writable bool) settingsResponse {
@@ -419,6 +421,7 @@ type settingsTaskWorkerConfig struct {
 	CommitMaxPieces                int    `json:"commit_max_pieces"`
 	CommitMaxWait                  string `json:"commit_max_wait"`
 	CommitMaxBacklog               int    `json:"commit_max_backlog"`
+	CommitSealOnCachePressure      bool   `json:"commit_seal_on_cache_pressure"`
 }
 
 type settingsLoggingConfig struct {
@@ -530,6 +533,7 @@ type settingsTaskWorkerUpdate struct {
 	CommitMaxPieces                *int    `json:"commit_max_pieces,omitempty"`
 	CommitMaxWait                  *string `json:"commit_max_wait,omitempty"`
 	CommitMaxBacklog               *int    `json:"commit_max_backlog,omitempty"`
+	CommitSealOnCachePressure      *bool   `json:"commit_seal_on_cache_pressure,omitempty"`
 }
 
 type settingsLoggingUpdate struct {
@@ -603,6 +607,7 @@ func toSettingsTaskWorkerConfig(cfg config.TaskWorkerConfig) settingsTaskWorkerC
 		CommitMaxPieces:                cfg.CommitMaxPieces,
 		CommitMaxWait:                  cfg.CommitMaxWait.String(),
 		CommitMaxBacklog:               cfg.CommitMaxBacklog,
+		CommitSealOnCachePressure:      cfg.CommitSealOnCachePressure,
 	}
 }
 
@@ -661,6 +666,7 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"worker.tasks.commit_max_pieces":                {},
 		"worker.tasks.commit_max_wait":                  {},
 		"worker.tasks.commit_max_backlog":               {},
+		"worker.tasks.commit_seal_on_cache_pressure":    {},
 		"logging.level":                                 {},
 		"logging.format":                                {},
 		"logging.s3_access.enabled":                     {},

@@ -83,6 +83,7 @@ function baseConfig(): SettingsEditableConfig {
         destructive_mutation_concurrency: 2,
         commit_max_pieces: 32,
         commit_max_wait: '30s',
+        commit_seal_on_cache_pressure: false,
         commit_max_backlog: 256,
       },
     },

@@ -35,6 +35,16 @@ func (s RequestStatus) Terminal() bool {
 	return s == RequestStatusConfirmed || s == RequestStatusAbandoned
 }
 
+func (s RequestStatus) Valid() bool {
+	//exhaustive:enforce
+	switch s {
+	case RequestStatusCollecting, RequestStatusReady, RequestStatusSubmitted, RequestStatusConfirmed, RequestStatusAbandoned:
+		return true
+	default:
+		return false
+	}
+}
+
 // MaxSubmittedRequestsPerDataSet bounds the requests of one data set that may
 // be on chain without a known outcome.
 const MaxSubmittedRequestsPerDataSet = 4
@@ -69,6 +79,7 @@ type Request struct {
 	AttentionAt            *time.Time         `bun:"attention_at,nullzero"`
 	CreatedAt              time.Time          `bun:"created_at,nullzero,notnull"`
 	UpdatedAt              time.Time          `bun:"updated_at,nullzero,notnull"`
+	SealRequestedAt        *time.Time         `bun:"seal_requested_at,nullzero"`
 }
 
 var _ bun.BeforeAppendModelHook = (*Request)(nil)

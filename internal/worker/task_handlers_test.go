@@ -65,21 +65,22 @@ type handlerTestRuntime struct {
 }
 
 type handlerRuntimeOptions struct {
-	logger                 *slog.Logger
-	cache                  cache.Cache
-	events                 worker.EventPublisher
-	storage                *testutil.MockStorageClient
-	deletionState          func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error)
-	wallet                 synapse.WalletOperator
-	receipts               worker.WalletReceiptChecker
-	walletBroadcastTimeout time.Duration
-	walletReceiptTimeout   time.Duration
-	commitMaxWait          time.Duration
-	terminator             synapse.ServiceTerminator
-	epochs                 synapse.ChainEpochReader
-	parkedPieces           synapse.ParkedPieceChecker
-	commitNonces           synapse.CommitNonceReader
-	uploadSpeedProbe       interface {
+	logger                    *slog.Logger
+	cache                     cache.Cache
+	events                    worker.EventPublisher
+	storage                   *testutil.MockStorageClient
+	deletionState             func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error)
+	wallet                    synapse.WalletOperator
+	receipts                  worker.WalletReceiptChecker
+	walletBroadcastTimeout    time.Duration
+	walletReceiptTimeout      time.Duration
+	commitMaxWait             time.Duration
+	commitSealOnCachePressure bool
+	terminator                synapse.ServiceTerminator
+	epochs                    synapse.ChainEpochReader
+	parkedPieces              synapse.ParkedPieceChecker
+	commitNonces              synapse.CommitNonceReader
+	uploadSpeedProbe          interface {
 		Probe(context.Context, string) (time.Duration, error)
 	}
 	policy               cache.EvictionPolicy
@@ -144,7 +145,8 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 		DefaultCopies: 2, MaxRetries: maxRetries, Logger: logger,
-		CommitMaxWait: options.commitMaxWait,
+		CommitMaxWait:             options.commitMaxWait,
+		CommitSealOnCachePressure: options.commitSealOnCachePressure,
 	})
 	if err != nil {
 		t.Fatalf("new task handlers: %v", err)
@@ -1826,12 +1828,14 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 	tests := []struct {
 		name           string
 		used           int64
+		reserved       int64
 		writeRefused   bool
 		failCheckpoint bool
 		maxWriteBytes  int64
 		wantEvicted    int
 	}{
 		{name: "usage at high watermark", used: 33, wantEvicted: 2},
+		{name: "reservations reach high watermark", used: 22, reserved: 6, wantEvicted: 1},
 		{name: "write refused below high watermark", used: 22, writeRefused: true, wantEvicted: 1},
 		{name: "write refusal survives checkpoint failure", used: 22, writeRefused: true, failCheckpoint: true, wantEvicted: 1},
 		// A 25-byte write leaves room for only 5 bytes of cached data, below the
@@ -1847,8 +1851,16 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 			var deletedMu sync.Mutex
 			var deleted []string
 			cacheStore := &testutil.MockCache{
-				UsedBytesFunc:           used.Load,
-				ConsumeWriteRefusalFunc: func() bool { return refused.Swap(false) },
+				UsedBytesFunc: used.Load,
+				CapacitySnapshotFunc: func() cache.CapacitySnapshot {
+					return cache.CapacitySnapshot{UsedBytes: used.Load(), ReservedBytes: tt.reserved, MaxBytes: 30}
+				},
+				ConsumeRefusedWriteBytesFunc: func() int64 {
+					if refused.Swap(false) {
+						return max(tt.maxWriteBytes, 10)
+					}
+					return 0
+				},
 				DeleteFunc: func(_ context.Context, _, key string) error {
 					deletedMu.Lock()
 					deleted = append(deleted, key)

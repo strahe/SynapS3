@@ -543,14 +543,19 @@ func TestPutStagedHoldsCapacityUntilCommitOrRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutStaged first: %v", err)
 	}
-	if _, err := fs.PutStaged(ctx, "bkt", "second", unreadBody{t}, 5); err != ErrCacheFull {
-		t.Fatalf("PutStaged beside held capacity err = %v, want ErrCacheFull", err)
+	if got := fs.CapacitySnapshot(); got != (CapacitySnapshot{ReservedBytes: 6, MaxBytes: 10}) {
+		t.Fatalf("staged capacity = %+v", got)
 	}
-	if !fs.ConsumeWriteRefusal() {
-		t.Fatal("ConsumeWriteRefusal = false after a refused write")
+	for _, size := range []int64{5, 8, 7} {
+		if _, err := fs.PutStaged(ctx, "bkt", "second", unreadBody{t}, size); err != ErrCacheFull {
+			t.Fatalf("PutStaged beside held capacity err = %v, want ErrCacheFull", err)
+		}
 	}
-	if fs.ConsumeWriteRefusal() {
-		t.Fatal("ConsumeWriteRefusal reported the same refusal twice")
+	if got := fs.ConsumeRefusedWriteBytes(); got != 8 {
+		t.Fatalf("ConsumeRefusedWriteBytes = %d, want 8", got)
+	}
+	if fs.ConsumeRefusedWriteBytes() != 0 {
+		t.Fatal("ConsumeRefusedWriteBytes reported the same refusal twice")
 	}
 
 	// Commit charges the bytes written and releases the rest of the hold.
@@ -559,6 +564,9 @@ func TestPutStagedHoldsCapacityUntilCommitOrRollback(t *testing.T) {
 	}
 	if fs.UsedBytes() != 4 {
 		t.Fatalf("UsedBytes after commit = %d, want 4", fs.UsedBytes())
+	}
+	if got := fs.CapacitySnapshot(); got != (CapacitySnapshot{UsedBytes: 4, MaxBytes: 10}) {
+		t.Fatalf("committed capacity = %+v", got)
 	}
 
 	second, err := fs.PutStaged(ctx, "bkt", "second", strings.NewReader("123456"), 6)

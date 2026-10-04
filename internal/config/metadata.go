@@ -200,6 +200,10 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Label: "Registration Wait", Description: "Time to combine pieces before signing a registration; 0s signs immediately. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", Editable: true,
 	},
+	"worker.tasks.commit_seal_on_cache_pressure": {
+		Label: "Submit batches early to free cache space", Description: "Submit batches early when automatic cache cleanup cannot free enough space. May increase transaction costs. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", Editable: true,
+	},
 	"worker.tasks.commit_max_backlog": {
 		Label: "Registration Backlog", Description: "Transferred pieces per storage service that may wait for an unsent registration before new uploads and replica copies to it wait. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", Editable: true,

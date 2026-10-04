@@ -458,6 +458,9 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Worker.Tasks.CommitMaxWait != 30*time.Minute {
 		t.Errorf("Worker.Tasks.CommitMaxWait = %s, want 30m", cfg.Worker.Tasks.CommitMaxWait)
 	}
+	if cfg.Worker.Tasks.CommitSealOnCachePressure {
+		t.Error("cache pressure sealing must default to disabled")
+	}
 	if cfg.Filecoin.DefaultCopies != 3 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
 	}
@@ -589,6 +592,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", "2")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", "16")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", "5s")
+	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", "true")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", "64")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_LEVEL", "debug")
@@ -630,6 +634,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 		cfg.Worker.Tasks.DestructiveMutationConcurrency != 2 ||
 		cfg.Worker.Tasks.CommitMaxPieces != 16 ||
 		cfg.Worker.Tasks.CommitMaxWait != 5*time.Second ||
+		!cfg.Worker.Tasks.CommitSealOnCachePressure ||
 		cfg.Worker.Tasks.CommitMaxBacklog != 64 {
 		t.Fatalf("task worker = %#v, want env values", cfg.Worker.Tasks)
 	}

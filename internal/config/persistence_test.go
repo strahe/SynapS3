@@ -329,6 +329,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Cache.LRULowWatermarkPercent = 72
 	cfg.Worker.Tasks.PollInterval = 7 * time.Second
 	cfg.Worker.Tasks.LeaseDuration = 2 * time.Minute
+	cfg.Worker.Tasks.CommitSealOnCachePressure = true
 	cfg.Logging.S3Access.Enabled = false
 	cfg.Logging.S3Access.Level = "debug"
 
@@ -365,6 +366,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"[worker.tasks]",
 		"poll_interval = \"7s\"",
 		"commit_max_wait = \"30m0s\"",
+		"commit_seal_on_cache_pressure = true",
 		"[cache]",
 		"eviction_policy = \"none\"",
 		"lru_high_watermark_percent = 87",
@@ -397,6 +399,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	}
 	if loaded.Worker.Tasks.CommitMaxWait != 30*time.Minute {
 		t.Fatalf("CommitMaxWait = %s, want 30m", loaded.Worker.Tasks.CommitMaxWait)
+	}
+	if !loaded.Worker.Tasks.CommitSealOnCachePressure {
+		t.Fatal("cache pressure setting wasn't saved")
 	}
 	if loaded.Cache.EvictionPolicy != "none" ||
 		loaded.Cache.LRUHighWatermarkPercent != 87 ||

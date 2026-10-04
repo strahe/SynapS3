@@ -367,18 +367,19 @@ func (m *MockWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.WalletI
 // MockCache is a configurable test double for cache.Cache.
 // Use for fault injection tests; for happy-path tests prefer real cache.NewFilesystem.
 type MockCache struct {
-	PutFunc                 func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.ObjectInfo, error)
-	PutStagedFunc           func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.StagedObject, error)
-	GetFunc                 func(ctx context.Context, bucket, key string) (io.ReadCloser, *cache.ObjectInfo, error)
-	DeleteFunc              func(ctx context.Context, bucket, key string) error
-	ExistsFunc              func(ctx context.Context, bucket, key string) bool
-	UsedBytesFunc           func() int64
-	ConsumeWriteRefusalFunc func() bool
-	CreateBucketDirFunc     func(ctx context.Context, bucket string) error
-	DeleteBucketDirFunc     func(ctx context.Context, bucket string) error
-	PutPartFunc             func(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.ObjectInfo, error)
-	AssemblePartsFunc       func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error)
-	DeleteUploadFunc        func(ctx context.Context, uploadID string) error
+	PutFunc                      func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.ObjectInfo, error)
+	PutStagedFunc                func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.StagedObject, error)
+	GetFunc                      func(ctx context.Context, bucket, key string) (io.ReadCloser, *cache.ObjectInfo, error)
+	DeleteFunc                   func(ctx context.Context, bucket, key string) error
+	ExistsFunc                   func(ctx context.Context, bucket, key string) bool
+	UsedBytesFunc                func() int64
+	CapacitySnapshotFunc         func() cache.CapacitySnapshot
+	ConsumeRefusedWriteBytesFunc func() int64
+	CreateBucketDirFunc          func(ctx context.Context, bucket string) error
+	DeleteBucketDirFunc          func(ctx context.Context, bucket string) error
+	PutPartFunc                  func(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.ObjectInfo, error)
+	AssemblePartsFunc            func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error)
+	DeleteUploadFunc             func(ctx context.Context, uploadID string) error
 }
 
 func (m *MockCache) Put(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.ObjectInfo, error) {
@@ -423,11 +424,18 @@ func (m *MockCache) UsedBytes() int64 {
 	return 0
 }
 
-func (m *MockCache) ConsumeWriteRefusal() bool {
-	if m.ConsumeWriteRefusalFunc != nil {
-		return m.ConsumeWriteRefusalFunc()
+func (m *MockCache) CapacitySnapshot() cache.CapacitySnapshot {
+	if m.CapacitySnapshotFunc != nil {
+		return m.CapacitySnapshotFunc()
 	}
-	return false
+	return cache.CapacitySnapshot{UsedBytes: m.UsedBytes()}
+}
+
+func (m *MockCache) ConsumeRefusedWriteBytes() int64 {
+	if m.ConsumeRefusedWriteBytesFunc != nil {
+		return m.ConsumeRefusedWriteBytesFunc()
+	}
+	return 0
 }
 
 func (m *MockCache) CreateBucketDir(ctx context.Context, bucket string) error {

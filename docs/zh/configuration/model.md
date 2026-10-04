@@ -103,6 +103,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `worker.tasks.destructive_mutation_concurrency` | `2` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
+| `worker.tasks.commit_seal_on_cache_pressure` | `false` |
 | `worker.tasks.commit_max_backlog` | `256` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
@@ -112,9 +113,13 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 
 `worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。操作遇到对应额度已满时会先让出、稍后自动再试，不占用 `concurrency` 名额，其他后台任务照常运行。任务设置修改后必须重启 SynapS3，已经创建的任务保留创建时记录的重试上限。
 
-写入同一存储服务的上传和复制副本会合并在链上登记，一次签名请求和一笔交易即可覆盖多个 piece。`commit_max_pieces`（1–200）限制一次登记包含的 piece 数；Mainnet 上 data set ID 小于 1,559、Calibration 上小于 32,331 的存储服务每次最多 80 个。登记攒满，或存储服务不再接受新数据时，会立即签名。否则，`commit_max_wait`（0–30m）从最早的 piece 准备好时开始计时，让后续上传和复制副本加入；`0s` 表示立即签名。新数据加入和重启不会重置计时。签名后成员固定，等待更早的登记发送或该存储服务的 4 个在途名额空出。尚未登记的上传数据保留在本地缓存。更长的窗口会推迟登记、需要已登记来源的副本复制及本地缓存淘汰。
+写入同一存储服务的上传和复制副本会合并为批次提交，一次签名请求和一笔链上交易即可覆盖多个 piece。`commit_max_pieces`（1–200）限制每个批次包含的 piece 数；Mainnet 上 data set ID 小于 1,559、Calibration 上小于 32,331 的存储服务每次最多 80 个。批次攒满，或存储服务不再接受新数据时，会立即签名。否则，`commit_max_wait`（0–30m）从最早的 piece 准备好时开始计时，让后续上传和复制副本加入；`0s` 表示立即签名。新数据加入和重启不会重置计时。签名后成员固定，等待更早的批次提交或该存储服务的 4 个在途名额空出。等待批次提交的上传数据保留在本地缓存。更长的窗口会推迟批次提交、需要已登记来源的副本复制及本地缓存淘汰。
 
-某个存储服务上等待未发送登记的已传输 piece（包括上传和复制的副本）达到 `commit_max_backlog`（不小于 `commit_max_pieces`）后，写入该存储服务的新上传和新复制都会等待。一次登记超出单条 add-pieces 消息大小时，会拆分后用更少的 piece 重新签名。
+某个存储服务上等待未提交批次的已传输 piece（包括上传和复制的副本）达到 `commit_max_backlog`（不小于 `commit_max_pieces`）后，写入该存储服务的新上传和新复制都会等待。一个批次超出单条 add-pieces 消息大小时，会拆分后用更少的 piece 重新签名。
+
+在 Settings 启用 **Submit batches early to free cache space**（`worker.tasks.commit_seal_on_cache_pressure`），可在安全自动清理无法腾出足够空间时提前提交未满批次。默认关闭，修改后需要重启。`lru` 按实际清理目标判断；`after_upload` 按被拒绝写入所需的容量判断；`none` 不自动提前提交。更小的批次可能增加交易成本。缓存删除仍需等待确认并满足存储桶的耐久要求。
+
+打开 **Batches** 查看等待提交的批次，点击 **Submit batch** 手动提交。手动操作独立于自动开关和缓存策略，详情面板会持续跟踪进度；停止的任务在允许恢复时显示 **Recover**。历史数据已删除、无法完整计算大小时，大小显示为空。
 
 ## Admin 会话时长
 

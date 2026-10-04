@@ -45,6 +45,7 @@ Configuration environment variables use the `SYNAPS3_` prefix and map underscore
 | `SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY` | `worker.tasks.destructive_mutation_concurrency` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES` | `worker.tasks.commit_max_pieces` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT` | `worker.tasks.commit_max_wait` |
+| `SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE` | `worker.tasks.commit_seal_on_cache_pressure` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG` | `worker.tasks.commit_max_backlog` |
 | `SYNAPS3_LOGGING_LEVEL` | `logging.level` |
 | `SYNAPS3_LOGGING_FORMAT` | `logging.format` |

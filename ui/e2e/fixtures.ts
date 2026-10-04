@@ -36,8 +36,8 @@ async function stopProcess(child: ChildProcessWithoutNullStreams, timeout: numbe
   }
 }
 
-async function startServer() {
-  const child = spawn(serverBinary, [], { stdio: ['ignore', 'pipe', 'pipe'] })
+async function startServer(commitMaxWait: string) {
+  const child = spawn(serverBinary, ['--commit-max-wait', commitMaxWait], { stdio: ['ignore', 'pipe', 'pipe'] })
   child.stderr.on('data', (chunk) => {
     process.stderr.write(chunk)
   })
@@ -73,7 +73,8 @@ async function startServer() {
   }
 }
 
-export const test = base.extend<object, { systemServer: SystemServer }>({
+export const test = base.extend<object, { systemServer: SystemServer; commitMaxWait: string }>({
+  commitMaxWait: ['1s', { scope: 'worker', option: true }],
   browser: [
     async ({ playwright, browserName }, use) => {
       const attempts = process.env.CI ? 2 : 1
@@ -97,9 +98,9 @@ export const test = base.extend<object, { systemServer: SystemServer }>({
     { scope: 'worker' },
   ],
   systemServer: [
-    async ({ playwright }, use) => {
+    async ({ playwright, commitMaxWait }, use) => {
       void playwright
-      const server = await startServer()
+      const server = await startServer(commitMaxWait)
       let cleanupError: Error | undefined
       try {
         await use(server)
