@@ -132,6 +132,19 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	if err := finalize(taskRow.ID + 1); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("finalize by another task = %v, want ErrConflict", err)
 	}
+	if err := finalize(taskRow.ID); !errors.Is(err, repository.ErrContentCleanupNotReady) {
+		t.Fatalf("finalize with an unresolved pull = %v, want ErrContentCleanupNotReady", err)
+	}
+	unchanged, err := repos.Contents.GetUnresolvedPullAttempt(ctx, contentID, source.ID)
+	if err != nil || unchanged.ResolvedAt != nil || unchanged.ExtraDataHex != openPull.ExtraDataHex {
+		t.Fatalf("blocked cleanup changed pull evidence: %#v, %v", unchanged, err)
+	}
+	if _, err := db.NewUpdate().Model((*storagepull.Attempt)(nil)).
+		Set("status = ?", storagepull.AttemptStatusAbandoned).
+		Set("resolved_at = ?", now).Set("last_error = ?", "provider confirmed failure").
+		Where("attempt_id = ?", openPull.AttemptID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := finalize(taskRow.ID); err != nil {
 		t.Fatalf("FinalizeContent: %v", err)
 	}
@@ -155,8 +168,7 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 			t.Fatalf("%s rows naming the content = %d, want %d", rows.table, count, rows.want)
 		}
 	}
-	// Nothing can commit a pull for finalized content, so an open one is
-	// abandoned; a pull that already resolved keeps its evidence unchanged.
+	// Cleanup preserves the ledger's confirmed outcomes.
 	pulls := map[string]storagepull.Attempt{}
 	var pullRows []storagepull.Attempt
 	if err := db.NewSelect().Model(&pullRows).Where("content_id = ?", contentID).Scan(ctx); err != nil {

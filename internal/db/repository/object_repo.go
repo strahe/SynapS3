@@ -13,6 +13,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
@@ -1155,6 +1156,14 @@ func prepareObjectVersionsForPermanentDelete(
 		}
 		if liveVersion != nil {
 			continue
+		}
+		openPull, err := db.NewSelect().Model((*storagepull.Attempt)(nil)).
+			Where("content_id = ? AND resolved_at IS NULL", contentID).Exists(ctx)
+		if err != nil {
+			return fmt.Errorf("checking pull requests for permanent delete: %w", err)
+		}
+		if openPull {
+			return ErrPermanentDeleteStorageBusy
 		}
 		for _, copyRow := range copiesByContentID[contentID] {
 			if storageUploadCopyAwaitsRegistration(copyRow) {

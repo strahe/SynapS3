@@ -550,7 +550,7 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 			case errors.Is(err, repository.ErrPermanentDeleteStorageBusy):
 				return nil, s3err.APIError{
 					Code:           "InvalidRequest",
-					Description:    "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later.",
+					Description:    "Storage work must be resolved before this object version can be deleted. Check the related storage tasks for pending confirmation or required recovery before trying again.",
 					HTTPStatusCode: http.StatusBadRequest,
 				}
 			case errors.Is(err, repository.ErrConflict):

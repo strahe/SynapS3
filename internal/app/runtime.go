@@ -69,6 +69,7 @@ type FilecoinServices struct {
 	// CommitNonces reads the chain record that settles a storage commit the
 	// provider never confirmed.
 	CommitNonces synapse.CommitNonceReader
+	ParkedPieces synapse.ParkedPieceChecker
 }
 
 // RuntimeOptions configures the application composition root. Database,
@@ -133,10 +134,13 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	if uploadSpeedProbe == nil {
 		uploadSpeedProbe = synapse.NewPDPBatchUploadProbe(cfg.Filecoin.AllowPrivateNetworks)
 	}
-	pdpStatusChecker := synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
-		Timeout:              15 * time.Second,
-		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-	})
+	parkedPieces := opts.Filecoin.ParkedPieces
+	if parkedPieces == nil {
+		parkedPieces = synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+			Timeout:              15 * time.Second,
+			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+		})
+	}
 	registry := taskengine.NewRegistry()
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
 		Repositories:              repos,
@@ -151,7 +155,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		Epochs:                    opts.Filecoin.Epochs,
 		Observability:             observabilityService,
 		UploadSpeedProbe:          uploadSpeedProbe,
-		ParkedPieces:              pdpStatusChecker,
+		ParkedPieces:              parkedPieces,
 		CommitNonces:              opts.Filecoin.CommitNonces,
 		EvictionPolicy:            evictionPolicy,
 		MaxCacheBytes:             maxCacheBytes,

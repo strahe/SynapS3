@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -30,11 +31,485 @@ import (
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
+func pullStatusResult(request storage.PullRequest, status storage.PullStatus) *storage.PullResult {
+	result := &storage.PullResult{Status: status}
+	for _, pieceCID := range request.Pieces {
+		result.Pieces = append(result.Pieces, storage.PullPieceResult{PieceCID: pieceCID, Status: status})
+	}
+	return result
+}
+
+func TestPullSubmissionOutcomes(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		status      storage.PullStatus
+		overall     storage.PullStatus
+		state       synapse.ParkedPieceState
+		nilResult   bool
+		omitPiece   bool
+		wrongPiece  bool
+		statusError bool
+		wantStatus  model.TaskStatus
+		wantFailure string
+	}{
+		{name: "pending", status: storage.PullStatusPending, wantStatus: model.TaskStatusPending},
+		{name: "in progress", status: storage.PullStatusInProgress, wantStatus: model.TaskStatusPending},
+		{name: "retrying", status: storage.PullStatusRetrying, wantStatus: model.TaskStatusPending},
+		{name: "complete but processing", status: storage.PullStatusComplete, state: synapse.ParkedPieceProcessing, wantStatus: model.TaskStatusPending},
+		{name: "complete after piece GC", status: storage.PullStatusComplete, state: synapse.ParkedPieceMissing, wantStatus: model.TaskStatusFailed, wantFailure: "pull_failed"},
+		{name: "overall complete with requested piece failed", status: storage.PullStatusFailed, overall: storage.PullStatusComplete, wantStatus: model.TaskStatusFailed, wantFailure: "pull_failed"},
+		{name: "nil result", nilResult: true, wantStatus: model.TaskStatusFailed, wantFailure: storagepull.FailureOutcomeUnknown},
+		{name: "terminal without requested piece", status: storage.PullStatusComplete, omitPiece: true, wantStatus: model.TaskStatusFailed, wantFailure: storagepull.FailureOutcomeUnknown},
+		{name: "wrong piece", status: storage.PullStatusComplete, wrongPiece: true, wantStatus: model.TaskStatusFailed, wantFailure: storagepull.FailureOutcomeUnknown},
+		{name: "conflicting terminal statuses", status: storage.PullStatusComplete, overall: storage.PullStatusFailed, wantStatus: model.TaskStatusFailed, wantFailure: storagepull.FailureOutcomeUnknown},
+		{name: "piece query failed", status: storage.PullStatusComplete, statusError: true, wantStatus: model.TaskStatusFailed, wantFailure: storagepull.FailureOutcomeUnknown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			limit := 0
+			var queries atomic.Int64
+			var submissionContext context.Context
+			otherCID := testPieceCID(t, "other pull piece")
+			runtime, pipeline, row := newPullTask(t, func(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				submissionContext = ctx
+				if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 30*time.Second {
+					t.Errorf("pull submission has no 30-second bound")
+				}
+				if tt.nilResult {
+					return nil, nil
+				}
+				result := pullStatusResult(request, tt.status)
+				if tt.overall != "" {
+					result.Status = tt.overall
+				}
+				if tt.omitPiece {
+					result.Pieces = nil
+				}
+				if tt.wrongPiece {
+					result.Pieces[0].PieceCID = otherCID
+				}
+				return result, nil
+			}, parkedPieceCheckerFunc(func(ctx context.Context, _ string, _ cid.Cid) (synapse.ParkedPieceState, error) {
+				queries.Add(1)
+				if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 4*time.Second || ctx.Err() != nil || submissionContext.Err() == nil {
+					t.Errorf("piece query did not use a fresh 4-second context")
+				}
+				if tt.statusError {
+					return "", errors.New("piece query disconnected")
+				}
+				return tt.state, nil
+			}), &limit)
+			result := runOneStorageTask(t, runtime, row, tt.wantStatus)
+			if tt.wantFailure != "" && (result.FailureReason == nil || *result.FailureReason != tt.wantFailure) {
+				t.Fatalf("failure = %#v, want %s", result, tt.wantFailure)
+			}
+			if tt.wantStatus == model.TaskStatusPending && (result.ResumeMode != model.TaskResumeModeRecover || result.RetryCount != 0) {
+				t.Fatalf("pending pull = %#v, want recovery without retry consumption", result)
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			protected := tt.wantStatus == model.TaskStatusPending || tt.wantFailure == storagepull.FailureOutcomeUnknown
+			attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+			if protected {
+				if err != nil || attempt.ResolvedAt != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID {
+					t.Fatalf("protected outcome = %#v, %#v, %v", copyRow, attempt, err)
+				}
+			} else if !errors.Is(err, repository.ErrNotFound) || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil {
+				t.Fatalf("confirmed failure = %#v, %#v, %v", copyRow, attempt, err)
+			}
+			wantQueries := int64(0)
+			if tt.state != "" || tt.statusError {
+				wantQueries = 1
+			}
+			if queries.Load() != wantQueries {
+				t.Fatalf("piece queries = %d, want %d", queries.Load(), wantQueries)
+			}
+			if count, err := runtime.db.NewSelect().Model((*storagecommit.Request)(nil)).Where("storage_data_set_id = ?", pipeline.targetSet.ID).Count(t.Context()); err != nil || count != 0 {
+				t.Fatalf("Commit requests before readiness = %d, %v", count, err)
+			}
+		})
+	}
+}
+
+func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
+	for _, retryAfter := range []time.Duration{2 * time.Minute, 0, -time.Second} {
+		t.Run(retryAfter.String(), func(t *testing.T) {
+			limit := 0
+			var calls atomic.Int64
+			var firstExtra, firstSource, firstCID string
+			runtime, pipeline, row := newPullTask(t, func(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				if calls.Add(1) == 1 {
+					firstExtra, firstSource, firstCID = hex.EncodeToString(request.ExtraData), request.From(request.Pieces[0]), request.Pieces[0].String()
+				} else if firstExtra != hex.EncodeToString(request.ExtraData) || firstSource != request.From(request.Pieces[0]) || firstCID != request.Pieces[0].String() {
+					t.Error("queue-full replay changed the request")
+				}
+				err := fmt.Errorf("submit pull: %w", errors.Join(pdp.ErrPullQueueFull, &pdp.HTTPError{StatusCode: 429, RetryAfter: retryAfter}, io.ErrUnexpectedEOF))
+				return nil, synapse.NormalizeProviderOperationError(ctx, err)
+			}, nil, &limit)
+			before := time.Now()
+			waiting := runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+			delay := retryAfter
+			if delay <= 0 {
+				delay = time.Minute
+			}
+			if waiting.WaitReason == nil || *waiting.WaitReason != storagepull.WaitQueueFull || waiting.RetryCount != 0 || waiting.ResumeMode != model.TaskResumeModeRecover ||
+				waiting.AvailableAt.Before(before.Add(delay)) || waiting.AvailableAt.After(time.Now().Add(delay)) {
+				t.Fatalf("queue-full wait = %#v", waiting)
+			}
+			attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if woken, err := runtime.repos.Tasks.WakePending(t.Context(), []int64{row.ID}); err != nil || woken != 0 {
+				t.Fatalf("early queue-full wake = %d, %v", woken, err)
+			}
+			for step := range 2 {
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				waiting = runOneStorageTask(t, runtime, waiting, model.TaskStatusPending)
+				if step == 0 && (waiting.ResumeMode != model.TaskResumeModeExecute || calls.Load() != 1) {
+					t.Fatalf("queue-full recovery sent a request: %#v", waiting)
+				}
+			}
+			replayed, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+			if err != nil || calls.Load() != 2 || replayed.AttemptID != attempt.AttemptID || !replayed.AttemptedAt.Equal(attempt.AttemptedAt) || waiting.RetryCount != 0 {
+				t.Fatalf("queue-full replay = %#v, %#v, %v; calls=%d", attempt, replayed, err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestPullPendingMissingPieceStillObservesProviderFailure(t *testing.T) {
+	limit := 0
+	var calls, queries atomic.Int64
+	var firstExtra, firstSource, firstCID string
+	runtime, pipeline, row := newPullTask(t, func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			firstExtra, firstSource, firstCID = hex.EncodeToString(request.ExtraData), request.From(request.Pieces[0]), request.Pieces[0].String()
+		} else if firstExtra != hex.EncodeToString(request.ExtraData) || firstSource != request.From(request.Pieces[0]) || firstCID != request.Pieces[0].String() {
+			t.Error("pending pull replay changed the request")
+		}
+		status := storage.PullStatusPending
+		if call == 3 {
+			status = storage.PullStatusFailed
+		}
+		return pullStatusResult(request, status), nil
+	}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+		queries.Add(1)
+		return synapse.ParkedPieceMissing, nil
+	}), &limit)
+	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+	attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for step := range 4 {
+		if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		status := model.TaskStatusPending
+		if step == 3 {
+			status = model.TaskStatusFailed
+		}
+		row = runOneStorageTask(t, runtime, row, status)
+		if row.RetryCount != 0 {
+			t.Fatalf("provider waiting consumed retries: %#v", row)
+		}
+		if step%2 == 0 && (row.ResumeMode != model.TaskResumeModeExecute || calls.Load() != int64(1+step/2)) {
+			t.Fatalf("recovery submitted a request: %#v, calls=%d", row, calls.Load())
+		}
+	}
+	resolved, err := runtime.repos.Contents.GetPullAttempt(t.Context(), attempt.AttemptID, attempt.ContentID, attempt.StorageDataSetID)
+	if err != nil || resolved.ResolvedAt == nil || resolved.Status != storagepull.AttemptStatusAbandoned ||
+		row.FailureReason == nil || *row.FailureReason != "pull_failed" || calls.Load() != 3 || queries.Load() != 2 {
+		t.Fatalf("pending pull did not settle its confirmed failure: %#v, %#v, %v; calls=%d, queries=%d", row, resolved, err, calls.Load(), queries.Load())
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.ActiveTaskID != nil || copyRow.Status != model.StorageCopyStatusFailed {
+		t.Fatalf("confirmed failure retained the transfer owner: %#v, %v", copyRow, err)
+	}
+}
+
+type pullEvidenceFailureRepository struct {
+	repository.StorageContentRepository
+	stage     string
+	remaining atomic.Int64
+}
+
+func (r *pullEvidenceFailureRepository) fail(stage string) error {
+	if r.stage == stage && r.remaining.Add(-1) >= 0 {
+		return errors.New("injected pull evidence read failure")
+	}
+	return nil
+}
+
+func (r *pullEvidenceFailureRepository) AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error) {
+	if err := r.fail("authorization"); err != nil {
+		return nil, err
+	}
+	return r.StorageContentRepository.AuthorizeCopyTask(ctx, copyID, generation, taskID, claimGeneration)
+}
+
+func (r *pullEvidenceFailureRepository) GetPullAttempt(ctx context.Context, attemptID string, contentID, dataSetID int64) (*storagepull.Attempt, error) {
+	if err := r.fail("attempt"); err != nil {
+		return nil, err
+	}
+	return r.StorageContentRepository.GetPullAttempt(ctx, attemptID, contentID, dataSetID)
+}
+
+func (r *pullEvidenceFailureRepository) GetUnresolvedPullAttempt(ctx context.Context, contentID, dataSetID int64) (*storagepull.Attempt, error) {
+	if err := r.fail("attempt"); err != nil {
+		return nil, err
+	}
+	return r.StorageContentRepository.GetUnresolvedPullAttempt(ctx, contentID, dataSetID)
+}
+
+func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
+	for _, stage := range []string{"authorization", "attempt"} {
+		for _, attempted := range []bool{false, true} {
+			for _, exhausted := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/attempted=%v/exhausted=%v", stage, attempted, exhausted), func(t *testing.T) {
+					limit := 1
+					var calls, queries atomic.Int64
+					runtime, pipeline, row := newPullTask(t, func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+						calls.Add(1)
+						return pullStatusResult(request, storage.PullStatusPending), nil
+					}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+						queries.Add(1)
+						return synapse.ParkedPieceMissing, nil
+					}), &limit)
+					if attempted {
+						row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+					}
+					faults := &pullEvidenceFailureRepository{StorageContentRepository: runtime.repos.Contents, stage: stage}
+					failures := int64(1)
+					if exhausted {
+						failures++
+					}
+					faults.remaining.Store(failures)
+					runtime.repos.Contents = faults
+					if err := runtime.repos.Tasks.RequestCancellation(t.Context(), row.ID, "cancel pull"); err != nil {
+						t.Fatal(err)
+					}
+					row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+					if row.RetryCount != 1 || !row.CancellationRequested() || row.ResumeMode != model.TaskResumeModeRecover {
+						t.Fatalf("evidence failure did not retry cancellation: %#v", row)
+					}
+					if exhausted {
+						row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+						if row.FailureReason == nil || *row.FailureReason != storagepull.FailureRecoveryBlocked || !runtime.service.Retryable(row) {
+							t.Fatalf("blocked cancellation = %#v", row)
+						}
+						copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+						if err != nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.Status != model.StorageCopyStatusPending {
+							t.Fatalf("blocked cancellation lost its owner: %#v, %v", copyRow, err)
+						}
+						if err := runtime.service.Retry(t.Context(), row.ID); err != nil {
+							t.Fatal(err)
+						}
+						retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+						if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" ||
+							retried.RetryCount != 0 || retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, row.Checkpoint) {
+							t.Fatalf("manual retry lost cancellation intent: %#v, %v", retried, err)
+						}
+						row = retried
+					}
+					wantCalls := int64(0)
+					if attempted {
+						wantCalls = 1
+					}
+					if calls.Load() != wantCalls || queries.Load() != 0 {
+						t.Fatalf("blocked recovery reached provider: calls=%d, queries=%d", calls.Load(), queries.Load())
+					}
+					status := model.TaskStatusCancelled
+					if attempted {
+						status = model.TaskStatusFailed
+					}
+					row = runOneStorageTask(t, runtime, row, status)
+					if !row.CancellationRequested() || calls.Load() != wantCalls || (attempted && (queries.Load() != 1 || row.FailureReason == nil || *row.FailureReason != storagepull.FailureCancelOutcomeUnknown)) {
+						t.Fatalf("recovered cancellation = %#v, calls=%d, queries=%d", row, calls.Load(), queries.Load())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPullCancellationPreservesUnresolvedOutcome(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		attempted  bool
+		state      synapse.ParkedPieceState
+		queryError bool
+		wantStatus model.TaskStatus
+	}{
+		{name: "not attempted", wantStatus: model.TaskStatusCancelled},
+		{name: "ready", attempted: true, state: synapse.ParkedPieceReady, wantStatus: model.TaskStatusCompleted},
+		{name: "processing", attempted: true, state: synapse.ParkedPieceProcessing, wantStatus: model.TaskStatusFailed},
+		{name: "missing", attempted: true, state: synapse.ParkedPieceMissing, wantStatus: model.TaskStatusFailed},
+		{name: "query failed", attempted: true, queryError: true, wantStatus: model.TaskStatusFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			limit := 0
+			var calls atomic.Int64
+			runtime, pipeline, row := newPullTask(t, func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+				calls.Add(1)
+				return nil, errors.Join(pdp.ErrPullQueueFull, &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour})
+			}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+				if tt.queryError {
+					return "", errors.New("provider unavailable during cancellation")
+				}
+				return tt.state, nil
+			}), &limit)
+			if tt.attempted {
+				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+			}
+			if tt.state == synapse.ParkedPieceReady {
+				version := &model.ObjectVersion{
+					VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID,
+					Key: "cancelled-ready-pull", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+					ETag: "cancelled-ready-pull", ContentType: "application/octet-stream",
+				}
+				if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := runtime.repos.Tasks.RequestCancellation(t.Context(), row.ID, "cancel pull"); err != nil {
+				t.Fatal(err)
+			}
+			result := runOneStorageTask(t, runtime, row, tt.wantStatus)
+			wantCalls := int64(0)
+			if tt.attempted {
+				wantCalls = 1
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("cancellation submitted %d requests, want %d", calls.Load(), wantCalls)
+			}
+			if tt.wantStatus != model.TaskStatusFailed {
+				if _, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID); !errors.Is(err, repository.ErrNotFound) {
+					t.Fatalf("settled cancellation retains unresolved pull: %v", err)
+				}
+				return
+			}
+			if result.FailureReason == nil || *result.FailureReason != storagepull.FailureCancelOutcomeUnknown || !runtime.service.Retryable(result) {
+				t.Fatalf("cancelled outcome = %#v", result)
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.Status != model.StorageCopyStatusPending {
+				t.Fatalf("cancelled pull owner = %#v, %v", copyRow, err)
+			}
+			if err := runtime.service.Retry(t.Context(), row.ID); err != nil {
+				t.Fatal(err)
+			}
+			retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+			if err != nil || retried.CancellationRequestedAt != nil || retried.CancellationReason != nil || retried.RetryCount != 0 ||
+				retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, result.Checkpoint) {
+				t.Fatalf("cancelled pull retry = %#v, %v", retried, err)
+			}
+			status := model.TaskStatusPending
+			if tt.queryError {
+				status = model.TaskStatusFailed
+			}
+			afterRetry := runOneStorageTask(t, runtime, retried, status)
+			if afterRetry.CancellationRequestedAt != nil || calls.Load() != 1 {
+				t.Fatalf("manual recovery repeated cancellation or POST: %#v, calls=%d", afterRetry, calls.Load())
+			}
+			if _, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID); err != nil {
+				t.Fatalf("manual recovery lost pull evidence: %v", err)
+			}
+		})
+	}
+}
+
+type pullSlotProbe struct {
+	called chan struct{}
+}
+
+func (p *pullSlotProbe) Definition() taskengine.Definition {
+	return taskengine.Definition{Type: "pull_slot_probe", InputVersion: 1, Codec: taskengine.StrictJSONCodec(func(*struct{}) error { return nil })}
+}
+
+func (p *pullSlotProbe) Execute(ctx context.Context, execution taskengine.Execution) taskengine.Result {
+	err := execution.WithResource(ctx, taskengine.ResourceProviderMutation, func(context.Context) error {
+		close(p.called)
+		return nil
+	})
+	if err != nil {
+		return taskengine.Fail(err, "probe_failed", nil)
+	}
+	return taskengine.Complete("", nil)
+}
+
+func (p *pullSlotProbe) Recover(context.Context, taskengine.Execution) taskengine.Result {
+	return taskengine.Fail(errors.New("probe unexpectedly recovered"), "probe_failed", nil)
+}
+
+func TestPullWaitReleasesWorkerAndMutationSlot(t *testing.T) {
+	for _, queueFull := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queue full=%v", queueFull), func(t *testing.T) {
+			probe := &pullSlotProbe{called: make(chan struct{})}
+			client := &testutil.MockStorageClient{}
+			target := &testutil.MockStorageTarget{
+				PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
+				SubmitPullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+					if queueFull {
+						return nil, pdp.ErrPullQueueFull
+					}
+					return pullStatusResult(request, storage.PullStatusPending), nil
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: client, policy: cache.EvictionPolicyNone,
+				register: func(h *worker.TaskHandlers, registry *taskengine.Registry) error {
+					if err := h.RegisterStorage(registry); err != nil {
+						return err
+					}
+					return registry.Register(probe)
+				},
+			})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+			target.ProviderIDValue, target.ClientDataSetIDValue = pipeline.targetSet.ProviderID.SDK(), pipeline.targetClient
+			dataSetID := pipeline.targetSet.DataSetID.SDK()
+			target.DataSetIDValue = &dataSetID
+			client.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				return target, nil
+			}
+			row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+				Concurrency: 1, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+				PollInterval: 5 * time.Millisecond, LeaseDuration: time.Second, Retention: time.Hour,
+			}, runtime.repos, runtime.registry, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runEngine(t, engine)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusPending && row.WaitReason != nil })
+			probeTask, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: "pull_slot_probe", IdempotencyKey: "probe", Input: struct{}{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-probe.called:
+			case <-time.After(3 * time.Second):
+				t.Fatal("waiting pull retained the sole worker or provider mutation slot")
+			}
+			waitForTask(t, runtime.repos, probeTask.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+		})
+	}
+}
+
 func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 	client := &testutil.MockStorageClient{}
 	nonces := &testutil.MockCommitNonces{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: client, policy: cache.EvictionPolicyNone, commitNonces: nonces,
+		parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+			return synapse.ParkedPieceReady, nil
+		}),
 		register: func(h *worker.TaskHandlers, registry *taskengine.Registry) error { return h.RegisterStorage(registry) },
 	})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
@@ -78,7 +553,7 @@ func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 	}
 	provider := newRegistrationProvider(t, pipeline.targetSet.ProviderID.SDK(), pipeline.targetSet.DataSetID.SDK(), pipeline.targetClient, nonces)
 	var pulls [][]byte
-	provider.target.PullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+	provider.target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 		if len(request.Pieces) != 1 {
 			t.Errorf("Pull members = %d, want 1", len(request.Pieces))
 		}
@@ -87,7 +562,7 @@ func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 			t.Errorf("copy before Pull = %#v, %v, want no Commit membership", copyRow, err)
 		}
 		pulls = append(pulls, append([]byte(nil), request.ExtraData...))
-		return &storage.PullResult{}, nil
+		return pullStatusResult(request, storage.PullStatusComplete), nil
 	}
 	client.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
 		return provider.target, nil
@@ -152,15 +627,20 @@ func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 }
 
 func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
-	for _, scenario := range []string{"missing ledger", "foreign content", "foreign data set", "invalid authorization", "invalid CID", "resolved attempt", "reservation rollback"} {
+	for _, scenario := range []string{"missing ledger", "foreign content", "foreign data set", "invalid authorization", "invalid CID", "resolved attempt", "reservation rollback", "reservation rollback exhausted"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int64
-			runtime, pipeline, row := newPullErrorTask(t, nil, nil, &calls)
+			var retryLimit *int
+			if scenario == "reservation rollback exhausted" {
+				retryLimit = new(0)
+			}
+			rollback := scenario == "reservation rollback" || scenario == "reservation rollback exhausted"
+			runtime, pipeline, row := newPullErrorTask(t, nil, retryLimit, &calls)
 			var input storagepipeline.CopyGenerationInput
 			if err := json.Unmarshal(row.Input, &input); err != nil {
 				t.Fatal(err)
 			}
-			if scenario == "reservation rollback" {
+			if rollback {
 				if _, err := runtime.db.Exec(`CREATE TRIGGER reject_pull BEFORE INSERT ON storage_pull_attempts BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END`); err != nil {
 					t.Fatal(err)
 				}
@@ -213,12 +693,19 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 			if calls.Load() != 0 {
 				t.Fatalf("provider calls = %d", calls.Load())
 			}
-			if scenario == "reservation rollback" {
+			if rollback {
 				count, err := runtime.db.NewSelect().Model((*storagepull.Attempt)(nil)).Count(t.Context())
 				if err != nil || count != 0 || len(result.Checkpoint) != 0 {
 					t.Fatalf("rollback evidence = %d, %s, %v", count, result.Checkpoint, err)
 				}
-			} else if result.FailureReason == nil || *result.FailureReason != "invalid_pull_attempt" {
+				if retryLimit != nil {
+					copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+					if err != nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil ||
+						result.FailureReason == nil || *result.FailureReason != "pull_checkpoint_failed" || runtime.service.Retryable(result) {
+						t.Fatalf("unsubmitted failure retained ownership or reported an unknown outcome: %#v, %#v, %v", result, copyRow, err)
+					}
+				}
+			} else if result.FailureReason == nil || *result.FailureReason != storagepull.FailureOutcomeUnknown {
 				t.Fatalf("invalid evidence result = %#v", result)
 			}
 		})
@@ -303,7 +790,9 @@ func runOneStorageTask(t *testing.T, runtime handlerTestRuntime, row *model.Task
 	}
 	cancel, done := runEngine(t, engine)
 	defer stopHandlerEngine(t, cancel, done)
-	return waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == status })
+	return waitForTask(t, runtime.repos, row.ID, func(current *model.Task) bool {
+		return current.ClaimGeneration > row.ClaimGeneration && current.Status == status
+	})
 }
 
 func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
@@ -319,13 +808,19 @@ func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 							return io.NopCloser(bytes.NewReader(local)), &cache.ObjectInfo{Size: int64(len(local))}, nil
 						},
 					}
-					runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{cache: cacheStore, storage: client, policy: cache.EvictionPolicyNone, register: func(h *worker.TaskHandlers, r *taskengine.Registry) error { return h.RegisterStorage(r) }})
+					runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+						cache: cacheStore, storage: client, policy: cache.EvictionPolicyNone,
+						parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+							return synapse.ParkedPieceReady, nil
+						}),
+						register: func(h *worker.TaskHandlers, r *taskengine.Registry) error { return h.RegisterStorage(r) },
+					})
 					copyRow, target, original := seedSealedReplacementBatch(t, runtime, members, phase)
-					target.PullFunc = func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+					target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 						if cacheRestore {
-							return nil, &pdp.HTTPError{StatusCode: 400}
+							return pullStatusResult(request, storage.PullStatusFailed), nil
 						}
-						return &storage.PullResult{}, nil
+						return pullStatusResult(request, storage.PullStatusComplete), nil
 					}
 					target.StoreFunc = func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 						data, err := io.ReadAll(reader)
@@ -417,8 +912,8 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 				},
 			})
 			copyRow, target, original := seedSealedReplacementBatch(t, runtime, 2, phase)
-			target.PullFunc = func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
-				return nil, &pdp.HTTPError{StatusCode: 400}
+			target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				return pullStatusResult(request, storage.PullStatusFailed), nil
 			}
 			client.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
 				return target, nil

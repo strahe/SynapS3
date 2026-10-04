@@ -190,3 +190,7 @@ func TestPostgresSealThatQueuesLateCopiesDoesNotDeadlockAJoin(t *testing.T) {
 func TestPostgresPullAuthorizationLedger(t *testing.T) {
 	testPullAuthorizationLedger(t, newCommitFixture(t, migratedPostgresDB(t)))
 }
+
+func TestPostgresPullTaskRecoveryProtection(t *testing.T) {
+	testPullTaskRecoveryProtection(t, newCommitFixture(t, migratedPostgresDB(t)))
+}

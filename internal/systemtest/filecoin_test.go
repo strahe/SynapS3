@@ -51,6 +51,22 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Store: %v", err)
 	}
+	for i, target := range contexts {
+		state, err := filecoin.FindParkedPiece(ctx, target.ServiceURL(), stored.PieceCID)
+		want := synapse.ParkedPieceMissing
+		if i == 0 {
+			want = synapse.ParkedPieceReady
+		}
+		if err != nil || state != want {
+			t.Fatalf("provider %s local piece before Pull = %s, %v; want %s", target.ProviderID(), state, err, want)
+		}
+		if i == 0 {
+			status, err := target.PieceStatus(ctx, stored.PieceCID)
+			if err == nil {
+				t.Fatalf("piece registered before Commit = %#v, %v", status, err)
+			}
+		}
+	}
 	if _, err := filecoin.Download(ctx, stored.PieceCID, nil); !errors.Is(err, errInvalidFilecoinSequence) {
 		t.Fatalf("Download before Commit error = %v, want invalid sequence", err)
 	}
@@ -72,7 +88,7 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 		wg.Go(func() {
-			_, pullErr := uploadContext.Pull(ctx, storage.PullRequest{
+			_, pullErr := uploadContext.SubmitPull(ctx, storage.PullRequest{
 				Pieces: []cid.Cid{stored.PieceCID}, ExtraData: pullAuthorizations[i],
 				From: contexts[0].PieceURL,
 			})
@@ -87,6 +103,9 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 		}
 	}
 	for _, uploadContext := range contexts {
+		if state, err := filecoin.FindParkedPiece(ctx, uploadContext.ServiceURL(), stored.PieceCID); err != nil || state != synapse.ParkedPieceReady {
+			t.Fatalf("provider-local piece after Pull = %s, %v", state, err)
+		}
 		extra, err := uploadContext.PresignForCommit(ctx, []storage.PieceInput{piece})
 		if err != nil {
 			t.Fatalf("PresignForCommit provider %s: %v", uploadContext.ProviderID().String(), err)
@@ -229,7 +248,7 @@ func TestMemoryFilecoinAuthorizationBindsTargetAndOrderedPieces(t *testing.T) {
 		{"membership", targets[1], ordered[:1]},
 	} {
 		t.Run(mismatch.name, func(t *testing.T) {
-			if _, err := mismatch.target.Pull(ctx, storage.PullRequest{Pieces: mismatch.pieces, ExtraData: extra, From: targets[0].PieceURL}); !errors.Is(err, errInvalidFilecoinSequence) {
+			if _, err := mismatch.target.SubmitPull(ctx, storage.PullRequest{Pieces: mismatch.pieces, ExtraData: extra, From: targets[0].PieceURL}); !errors.Is(err, errInvalidFilecoinSequence) {
 				t.Fatalf("mismatched Pull = %v", err)
 			}
 			pieces := make([]storage.PieceInput, len(mismatch.pieces))
@@ -241,7 +260,7 @@ func TestMemoryFilecoinAuthorizationBindsTargetAndOrderedPieces(t *testing.T) {
 			}
 		})
 	}
-	if _, err := targets[1].Pull(ctx, storage.PullRequest{Pieces: ordered, ExtraData: extra, From: targets[0].PieceURL}); err != nil {
+	if _, err := targets[1].SubmitPull(ctx, storage.PullRequest{Pieces: ordered, ExtraData: extra, From: targets[0].PieceURL}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := targets[1].SubmitCommit(ctx, storage.CommitRequest{Pieces: inputs, ExtraData: extra}); err != nil {

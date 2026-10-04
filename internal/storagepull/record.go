@@ -22,6 +22,15 @@ const (
 	AttemptStatusAbandoned AttemptStatus = "abandoned"
 )
 
+// These task reasons preserve the request and copy owner until recovery can
+// establish the provider's outcome.
+const (
+	FailureOutcomeUnknown       = "pull_outcome_unknown"
+	FailureCancelOutcomeUnknown = "pull_cancel_outcome_unknown"
+	FailureRecoveryBlocked      = "pull_recovery_blocked"
+	WaitQueueFull               = "pull_queue_full"
+)
+
 // Attempt records the source and authorization before a request reaches the
 // target provider. Recovery replays this request without changing its identity.
 type Attempt struct {

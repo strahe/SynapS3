@@ -1,6 +1,7 @@
 package worker_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -2468,9 +2469,9 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 		wantStatus   model.TaskStatus
 		wantReason   string
 	}{
-		{name: "terminal pull with cache", cachePresent: true, pullErr: &pdp.HTTPError{StatusCode: http.StatusBadRequest}, wantMethod: model.StorageCopyTransferMethodCacheRestore, wantStatus: model.TaskStatusCompleted},
-		{name: "terminal pull without cache", pullErr: &pdp.HTTPError{StatusCode: http.StatusBadRequest}, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
-		{name: "temporary pull failure", cachePresent: true, pullErr: &pdp.HTTPError{StatusCode: http.StatusServiceUnavailable}, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusPending, wantReason: "provider_confirmation"},
+		{name: "terminal pull with cache", cachePresent: true, wantMethod: model.StorageCopyTransferMethodCacheRestore, wantStatus: model.TaskStatusCompleted},
+		{name: "terminal pull without cache", wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
+		{name: "temporary pull failure", cachePresent: true, pullErr: &pdp.HTTPError{StatusCode: http.StatusServiceUnavailable}, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusPending, wantReason: "pull_request_failed"},
 		{name: "no source with cache", cachePresent: true, noSource: true, wantMethod: model.StorageCopyTransferMethodCacheRestore, wantStatus: model.TaskStatusCompleted},
 		{name: "no source without cache", noSource: true, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
 	} {
@@ -2491,11 +2492,14 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			target.PullFunc = func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+			target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 				if tt.noSource {
 					t.Error("Pull was called without a source")
 				}
-				return nil, tt.pullErr
+				if tt.pullErr != nil {
+					return nil, tt.pullErr
+				}
+				return pullStatusResult(request, storage.PullStatusFailed), nil
 			}
 			storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
 				return target, nil
@@ -2521,7 +2525,7 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 					return false
 				}
 				if tt.wantStatus == model.TaskStatusPending {
-					return task.WaitReason != nil && *task.WaitReason == tt.wantReason
+					return task.RetryCount > 0 && task.ResumeMode == model.TaskResumeModeRecover
 				}
 				return true
 			})
@@ -3486,7 +3490,7 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 }
 
 func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
-	var pullCalls, statusCalls atomic.Int64
+	var pullCalls, statusCalls, presignCalls atomic.Int64
 	statusObserved := make(chan struct{})
 	type observedPull struct {
 		piece string
@@ -3496,8 +3500,11 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	var observedMu sync.Mutex
 	var observed []observedPull
 	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
-		PullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
+			presignCalls.Add(1)
+			return testutil.CommitExtraData(7), nil
+		},
+		SubmitPullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 			call := pullCalls.Add(1)
 			observedMu.Lock()
 			observed = append(observed, observedPull{
@@ -3509,18 +3516,21 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 			if call == 1 {
 				return nil, errors.New("ambiguous provider disconnect")
 			}
-			return &storage.PullResult{}, nil
-		},
-		PieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-			if statusCalls.Add(1) == 1 {
-				close(statusObserved)
-			}
-			return &storage.PieceStatus{Exists: false}, nil
+			return pullStatusResult(request, storage.PullStatusComplete), nil
 		},
 	}
 	storageClient := &testutil.MockStorageClient{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: storageClient, policy: cache.EvictionPolicyNone,
+		parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+			if statusCalls.Add(1) == 1 {
+				close(statusObserved)
+			}
+			if pullCalls.Load() >= 2 {
+				return synapse.ParkedPieceReady, nil
+			}
+			return synapse.ParkedPieceMissing, nil
+		}),
 		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
 			return handlers.RegisterStorage(registry)
 		},
@@ -3603,8 +3613,8 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
 	})
-	if pullCalls.Load() != 2 {
-		t.Fatalf("pull calls = %d, want 2", pullCalls.Load())
+	if pullCalls.Load() != 2 || presignCalls.Load() != 1 {
+		t.Fatalf("pull calls = %d, presign calls = %d; want 2 pulls with one authorization", pullCalls.Load(), presignCalls.Load())
 	}
 	// A finished transfer joins an unsigned collecting request.
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -3630,8 +3640,8 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 func TestPullProviderFailureAtomicallyAbandonsAttemptAndCopy(t *testing.T) {
 	target := &testutil.MockStorageTarget{
 		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
-		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
-			return nil, fmt.Errorf("provider pull: %w", pdp.ErrPullFailed)
+		SubmitPullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+			return pullStatusResult(request, storage.PullStatusFailed), nil
 		},
 	}
 	storageClient := &testutil.MockStorageClient{}
@@ -3698,18 +3708,33 @@ func newPullErrorTask(
 	pullCalls *atomic.Int64,
 ) (handlerTestRuntime, seededCopyPipeline, *model.Task) {
 	t.Helper()
+	return newPullTask(t, func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+		pullCalls.Add(1)
+		return nil, pullErr
+	}, nil, maxRetries)
+}
+
+func newPullTask(
+	t *testing.T,
+	submit func(context.Context, storage.PullRequest) (*storage.PullResult, error),
+	parked synapse.ParkedPieceChecker,
+	maxRetries *int,
+) (handlerTestRuntime, seededCopyPipeline, *model.Task) {
+	t.Helper()
 	target := &testutil.MockStorageTarget{
 		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
 			return testutil.CommitExtraData(7), nil
 		},
-		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
-			pullCalls.Add(1)
-			return nil, pullErr
-		},
+		SubmitPullFunc: submit,
+	}
+	if parked == nil {
+		parked = parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+			return synapse.ParkedPieceMissing, nil
+		})
 	}
 	storageClient := &testutil.MockStorageClient{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: storageClient, policy: cache.EvictionPolicyNone, maxRetries: maxRetries,
+		storage: storageClient, policy: cache.EvictionPolicyNone, maxRetries: maxRetries, parkedPieces: parked,
 		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
 			return handlers.RegisterStorage(registry)
 		},
@@ -3725,36 +3750,34 @@ func newPullErrorTask(
 	return runtime, pipeline, bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
 }
 
-func assertFailedPullSettlement(
+func assertProtectedPullFailure(
 	t *testing.T,
 	runtime handlerTestRuntime,
 	pipeline seededCopyPipeline,
 	taskRow *model.Task,
 	wantReason string,
-) {
+) *model.Task {
 	t.Helper()
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusFailed
-	})
-	if failed.FailureReason == nil || *failed.FailureReason != wantReason {
-		t.Fatalf("pull task failure = %#v, want %s", failed, wantReason)
+	failed := runOneStorageTask(t, runtime, taskRow, model.TaskStatusFailed)
+	if failed.FailureReason == nil || *failed.FailureReason != wantReason || !runtime.service.Retryable(failed) {
+		t.Fatalf("pull task failure = %#v, want retryable %s", failed, wantReason)
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow == nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil {
-		t.Fatalf("failed pull copy = %#v, err=%v", copyRow, err)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageCopyStatusPending ||
+		copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID {
+		t.Fatalf("protected pull copy = %#v, err=%v", copyRow, err)
 	}
 	var attempts []storagepull.Attempt
 	if err := runtime.db.NewSelect().Model(&attempts).Where("content_id = ?", pipeline.target.ContentID).Scan(t.Context()); err != nil {
 		t.Fatalf("load pull attempts: %v", err)
 	}
-	if len(attempts) != 1 || attempts[0].Status != storagepull.AttemptStatusAbandoned || attempts[0].ResolvedAt == nil {
-		t.Fatalf("pull attempts = %#v, want one resolved abandoned attempt", attempts)
+	if len(attempts) != 1 || attempts[0].Status != storagepull.AttemptStatusAttempted || attempts[0].ResolvedAt != nil {
+		t.Fatalf("pull attempts = %#v, want one unresolved attempt", attempts)
 	}
+	return failed
 }
 
-func TestPullTerminalClientErrorsSettleAttemptAndCopy(t *testing.T) {
+func TestPullClientErrorsRetainAttemptAndCopy(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -3766,7 +3789,7 @@ func TestPullTerminalClientErrorsSettleAttemptAndCopy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var pullCalls atomic.Int64
 			runtime, pipeline, taskRow := newPullErrorTask(t, tt.err, nil, &pullCalls)
-			assertFailedPullSettlement(t, runtime, pipeline, taskRow, "pull_failed")
+			assertProtectedPullFailure(t, runtime, pipeline, taskRow, storagepull.FailureOutcomeUnknown)
 			if pullCalls.Load() != 1 {
 				t.Fatalf("pull calls = %d, want 1", pullCalls.Load())
 			}
@@ -3775,7 +3798,7 @@ func TestPullTerminalClientErrorsSettleAttemptAndCopy(t *testing.T) {
 }
 
 func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
-	limit := 0
+	limit := 1
 	var pullCalls atomic.Int64
 	runtime, pipeline, taskRow := newPullErrorTask(
 		t,
@@ -3795,10 +3818,10 @@ func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
 	cancel, done := runEngine(t, engine)
 	defer stopHandlerEngine(t, cancel, done)
 	pending := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return pullCalls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+		return pullCalls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
-	if pending.RetryCount != 0 {
-		t.Fatalf("retry count = %d, want 0 for retryable provider failure", pending.RetryCount)
+	if pending.RetryCount != 1 {
+		t.Fatalf("retry count = %d, want 1 for retryable provider failure", pending.RetryCount)
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 	if err != nil || copyRow == nil || copyRow.Status == model.StorageCopyStatusFailed || copyRow.ActiveTaskID == nil {
@@ -3810,9 +3833,39 @@ func TestPullUnknownErrorFailsWhenRetryBudgetIsExhausted(t *testing.T) {
 	limit := 0
 	var pullCalls atomic.Int64
 	runtime, pipeline, taskRow := newPullErrorTask(t, errors.New("new sdk pull failure"), &limit, &pullCalls)
-	assertFailedPullSettlement(t, runtime, pipeline, taskRow, "pull_request_failed")
+	failed := assertProtectedPullFailure(t, runtime, pipeline, taskRow, storagepull.FailureOutcomeUnknown)
 	if pullCalls.Load() != 1 {
 		t.Fatalf("pull calls = %d, want 1", pullCalls.Load())
+	}
+	versions := make([]*model.ObjectVersion, 2)
+	for i := range versions {
+		versions[i] = &model.ObjectVersion{
+			VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID,
+			Key: fmt.Sprintf("protected-pull-%d", i), ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+			ETag: "protected-pull", ContentType: "application/octet-stream",
+		}
+		if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), versions[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, version := range versions {
+		_, err := runtime.repos.Objects.DeleteObjectVersionPermanently(t.Context(), repository.DeleteObjectVersionInput{
+			BucketID: version.BucketID, Key: version.Key, VersionID: version.VersionID,
+		})
+		if i == 0 && err != nil {
+			t.Fatalf("delete shared reference: %v", err)
+		}
+		if i == 1 && !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+			t.Fatalf("delete last reference to an unresolved pull = %v", err)
+		}
+	}
+	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID)
+	if err != nil || retried.Status != model.TaskStatusPending || retried.ResumeMode != model.TaskResumeModeRecover ||
+		retried.RetryCount != 0 || !bytes.Equal(retried.Checkpoint, failed.Checkpoint) {
+		t.Fatalf("manual pull retry = %#v, %v", retried, err)
 	}
 }
 
@@ -3823,7 +3876,7 @@ func TestPullRecoverWithoutCheckpointReturnsToExecute(t *testing.T) {
 			presignCalls.Add(1)
 			return testutil.CommitExtraData(7), nil
 		},
-		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+		SubmitPullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
 			pullCalls.Add(1)
 			return nil, errors.New("unexpected pull")
 		},

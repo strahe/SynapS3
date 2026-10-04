@@ -333,6 +333,27 @@ func (c *memoryTarget) PieceURL(pieceCID cid.Cid) string {
 	return c.ServiceURL() + "/piece/" + pieceCID.String()
 }
 
+// FindParkedPiece observes provider-local bytes independently of registration.
+func (m *MemoryFilecoin) FindParkedPiece(ctx context.Context, serviceURL string, pieceCID cid.Cid) (synapse.ParkedPieceState, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, provider := range m.providers {
+		if strings.TrimSuffix(serviceURL, "/") != fmt.Sprintf("https://provider-%s.system.invalid", provider.String()) {
+			continue
+		}
+		if piece := m.pieces[pieceCID.String()]; piece != nil {
+			if _, exists := piece.storedProviders[provider.String()]; exists {
+				return synapse.ParkedPieceReady, nil
+			}
+		}
+		return synapse.ParkedPieceMissing, nil
+	}
+	return "", fmt.Errorf("%w: unknown provider service URL", errInvalidFilecoinSequence)
+}
+
 type memoryProviderTarget struct {
 	memoryTarget
 	metadata map[string]string
@@ -546,7 +567,7 @@ var memoryAddPiecesExtraData = func() abi.Arguments {
 	return arguments
 }()
 
-func (c *memoryDataSetTarget) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+func (c *memoryDataSetTarget) SubmitPull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

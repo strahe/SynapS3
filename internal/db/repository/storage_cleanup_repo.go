@@ -253,9 +253,8 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 // FinalizeContent deletes the current-state rows of content whose remote
 // cleanup finished: its cache record, its copies, and the content row. Commit,
 // pull, replacement, cleanup, and deletion ledgers keep their rows and name the
-// content by value; a pull still open for it is abandoned, since nothing can
-// commit it anymore. It returns ErrContentCleanupNotReady while anything could
-// still need those rows, and must run in the caller's transaction.
+// content by value. Unresolved pulls or other unfinished work return
+// ErrContentCleanupNotReady. It must run in the caller's transaction.
 func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, generation, taskID int64) error {
 	if contentID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput
@@ -274,17 +273,6 @@ func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, 
 	}
 	if !ready {
 		return ErrContentCleanupNotReady
-	}
-	now := time.Now()
-	if _, err := r.db.NewUpdate().
-		Model((*storagepull.Attempt)(nil)).
-		Set("status = ?", storagepull.AttemptStatusAbandoned).
-		Set("last_error = ?", "stored data was removed").
-		Set("resolved_at = ?", now).
-		Set("updated_at = ?", now).
-		Where("content_id = ? AND resolved_at IS NULL", contentID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("finalizing storage cleanup: abandoning open pulls: %w", err)
 	}
 	if _, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
@@ -323,6 +311,8 @@ func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool
 		what  string
 		query *bun.SelectQuery
 	}{
+		{"unresolved pulls", db.NewSelect().Model((*storagepull.Attempt)(nil)).
+			Where("content_id = ? AND resolved_at IS NULL", contentID)},
 		{"cache residency", db.NewSelect().Model((*model.ObjectCache)(nil)).
 			Where("content_id = ?", contentID).
 			Where(`in_cache = ? OR EXISTS (
