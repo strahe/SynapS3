@@ -31,12 +31,11 @@ import (
 type JoinCommitRequestInput struct {
 	CopyID           int64
 	StorageDataSetID int64
-	MaxPieces        int
 	Now              time.Time
 }
 
 // JoinCollectingCommitRequest adds the copy to the oldest collecting request of
-// its data set that has room and a live task. It returns the request and its
+// its data set with a live task. It returns the request and its
 // member count, or ErrNotFound when no such request exists.
 //
 // The data set stays locked until the caller's transaction ends, so a caller
@@ -45,7 +44,7 @@ type JoinCommitRequestInput struct {
 // The joining copy belongs to no request yet, so no holder of the data set
 // lock waits for it.
 func (r *BunStorageContentRepo) JoinCollectingCommitRequest(ctx context.Context, input JoinCommitRequestInput) (string, int, error) {
-	if input.CopyID <= 0 || input.StorageDataSetID <= 0 || input.MaxPieces < 1 {
+	if input.CopyID <= 0 || input.StorageDataSetID <= 0 {
 		return "", 0, fmt.Errorf("joining storage commit request: %w", ErrInvalidInput)
 	}
 	now := commitInputTime(input.Now)
@@ -77,9 +76,6 @@ func (r *BunStorageContentRepo) JoinCollectingCommitRequest(ctx context.Context,
 			count, err := countCommitMembers(ctx, db, candidate)
 			if err != nil {
 				return err
-			}
-			if count >= input.MaxPieces {
-				continue
 			}
 			if err := attachCopyToCommitRequest(ctx, db, input.CopyID, input.StorageDataSetID, candidate, now); err != nil {
 				return err
@@ -124,12 +120,16 @@ func (r *BunStorageContentRepo) CreateCollectingCommitRequest(ctx context.Contex
 			}
 			return fmt.Errorf("creating storage commit request: %w", err)
 		}
-		for _, copyID := range input.CopyIDs {
-			if err := attachCopyToCommitRequest(ctx, db, copyID, input.StorageDataSetID, input.RequestID, now); err != nil {
-				return fmt.Errorf("creating storage commit request: %w", err)
-			}
-		}
-		return nil
+		res, err := db.NewUpdate().
+			Model((*model.StorageCopy)(nil)).
+			Set("commit_request_id = ?", input.RequestID).
+			Set("commit_ready_at = COALESCE(commit_ready_at, ?)", now).
+			Set("updated_at = ?", now).
+			Where("id IN (?) AND storage_data_set_id = ?", bun.List(input.CopyIDs), input.StorageDataSetID).
+			Where("status = ?", model.StorageCopyStatusPieceReady).
+			Where("commit_request_id IS NULL AND commit_position IS NULL").
+			Exec(ctx)
+		return requireCommitRowCount(res, err, len(input.CopyIDs), "adding storage copies to commit request")
 	})
 }
 
@@ -296,19 +296,20 @@ func (r *BunStorageContentRepo) SealCommitRequest(ctx context.Context, input Sea
 			}
 		}
 		for _, copyRow := range current {
-			if signed[copyRow.ID] {
-				continue
+			if !signed[copyRow.ID] {
+				spilled = append(spilled, copyRow.ID)
 			}
+		}
+		if len(spilled) > 0 {
 			res, err := db.NewUpdate().
 				Model((*model.StorageCopy)(nil)).
 				Set("commit_request_id = NULL").
 				Set("updated_at = ?", now).
-				Where("id = ? AND commit_request_id = ? AND commit_position IS NULL", copyRow.ID, input.RequestID).
+				Where("id IN (?) AND commit_request_id = ? AND commit_position IS NULL", bun.List(spilled), input.RequestID).
 				Exec(ctx)
-			if err := requireCommitRows(res, err, "moving a late storage copy out of a sealed request"); err != nil {
+			if err := requireCommitRowCount(res, err, len(spilled), "moving unsigned storage copies out of a sealed request"); err != nil {
 				return err
 			}
-			spilled = append(spilled, copyRow.ID)
 		}
 		extra := input.ExtraDataHex
 		res, err := db.NewUpdate().
@@ -889,7 +890,7 @@ func eligibleReadyCommitRequest(ctx context.Context, db bun.IDB, storageDataSetI
 	return requestID, nil
 }
 
-// wakeCommitQueue prefers ready work, then collection blocked by cache pressure.
+// wakeCommitQueue prefers ready work, then collection blocked by the queue.
 // Locked task rows are skipped to avoid waiting on another claim.
 func wakeCommitQueue(ctx context.Context, db bun.IDB, storageDataSetID int64, now time.Time) error {
 	submitted, err := countSubmittedCommitRequests(ctx, db, storageDataSetID)
@@ -912,7 +913,7 @@ func wakeCommitQueue(ctx context.Context, db bun.IDB, storageDataSetID int64, no
 		query = query.
 			Join("JOIN tasks AS collecting_task ON collecting_task.id = commit_request.task_id").
 			Where("commit_request.status = ?", storagecommit.RequestStatusCollecting).
-			Where("collecting_task.status = ? AND collecting_task.wait_reason = ?", model.TaskStatusPending, storagecommit.PressureQueueWaitReason).
+			Where("collecting_task.status = ? AND collecting_task.wait_reason = ?", model.TaskStatusPending, storagecommit.CommitQueueWaitReason).
 			Where(`EXISTS (
 				SELECT 1 FROM storage_copies AS collecting_member
 				WHERE collecting_member.commit_request_id = commit_request.request_id
@@ -931,9 +932,9 @@ func (r *BunStorageContentRepo) WakeCommitRequestTask(ctx context.Context, reque
 	return wakeCommitRequestTask(ctx, r.db, requestID)
 }
 
-// WakeCommitRequestTaskOnCachePressure leaves queue-blocked collection asleep.
-func (r *BunStorageContentRepo) WakeCommitRequestTaskOnCachePressure(ctx context.Context, requestID string) error {
-	return wakeCommitRequestTask(ctx, r.db, requestID, storagecommit.PressureQueueWaitReason)
+// WakeCollectingCommitTask wakes collection after a join unless the queue is blocked.
+func (r *BunStorageContentRepo) WakeCollectingCommitTask(ctx context.Context, requestID string) error {
+	return wakeCommitRequestTask(ctx, r.db, requestID, storagecommit.CommitQueueWaitReason)
 }
 
 func wakeCommitRequestTask(ctx context.Context, db bun.IDB, requestID string, excludedWaitReasons ...string) error {
@@ -1321,6 +1322,20 @@ func requireCommitRows(res sql.Result, err error, action string) error {
 		return fmt.Errorf("%s: reading row count: %w", action, err)
 	}
 	if affected == 0 {
+		return fmt.Errorf("%s: %w", action, ErrConflict)
+	}
+	return nil
+}
+
+func requireCommitRowCount(res sql.Result, err error, expected int, action string) error {
+	if err != nil {
+		return fmt.Errorf("%s: %w", action, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s: reading row count: %w", action, err)
+	}
+	if affected != int64(expected) {
 		return fmt.Errorf("%s: %w", action, ErrConflict)
 	}
 	return nil

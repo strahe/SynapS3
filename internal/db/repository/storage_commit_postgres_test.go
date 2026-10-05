@@ -29,7 +29,7 @@ func queueTransferredCopy(ctx context.Context, f commitFixture, copyRow *model.S
 
 func joinOrStartCommitRequest(ctx context.Context, tx *repository.Repositories, f commitFixture, copyID int64, newRequestID string) error {
 	_, _, err := tx.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
-		CopyID: copyID, StorageDataSetID: f.dataSetID, MaxPieces: 32,
+		CopyID: copyID, StorageDataSetID: f.dataSetID,
 	})
 	if !errors.Is(err, repository.ErrNotFound) {
 		return err

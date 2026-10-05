@@ -544,7 +544,7 @@ type StorageContentRepository interface {
 	AbandonCommitRequest(ctx context.Context, input AbandonCommitRequestInput) ([]model.StorageCopy, error)
 	ReturnCommitMembersToTransfer(ctx context.Context, requestID string, taskID int64, copyIDs []int64, now time.Time) error
 	WakeCommitRequestTask(ctx context.Context, requestID string) error
-	WakeCommitRequestTaskOnCachePressure(ctx context.Context, requestID string) error
+	WakeCollectingCommitTask(ctx context.Context, requestID string) error
 	HasCacheDependentCommitMembers(ctx context.Context, requestID string) (bool, error)
 	WakeCacheDependentCommitTasks(ctx context.Context) error
 	RequestCommitSeal(ctx context.Context, requestID string) (*storagecommit.Request, error)

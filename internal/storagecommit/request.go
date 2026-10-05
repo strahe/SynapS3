@@ -145,5 +145,5 @@ var ErrNotEligible = errors.New("storage commit request cannot be sent yet")
 // the provider refused it.
 const ProviderRejectedWaitReason = "provider_rejected"
 
-// PressureQueueWaitReason marks collection waiting for the submission queue.
-const PressureQueueWaitReason = "commit_queue"
+// CommitQueueWaitReason marks collection waiting for the submission queue.
+const CommitQueueWaitReason = "commit_queue"

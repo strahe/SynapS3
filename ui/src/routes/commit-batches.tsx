@@ -24,8 +24,8 @@ import { cn, formatBytes, timeAgo } from '@/lib/utils'
 export const Route = createFileRoute('/commit-batches')({ component: CommitBatchesPage })
 
 const statuses: { value: CommitBatchStatus | 'all'; label: string; tone: StatusTone }[] = [
-  { value: 'collecting', label: 'Waiting to submit', tone: 'neutral' },
-  { value: 'ready', label: 'Queued', tone: 'info' },
+  { value: 'collecting', label: 'Collecting data', tone: 'neutral' },
+  { value: 'ready', label: 'Ready to submit', tone: 'info' },
   { value: 'submitted', label: 'Awaiting confirmation', tone: 'info' },
   { value: 'confirmed', label: 'Completed', tone: 'success' },
   { value: 'abandoned', label: 'Stopped', tone: 'warning' },
@@ -79,7 +79,7 @@ function CommitBatchesPage() {
         {seal.isPending && seal.variables === batch.request_id && (
           <Loader2 className="animate-spin" data-icon="inline-start" />
         )}
-        Submit batch
+        Submit next batch
       </Button>
     )
 
@@ -122,9 +122,7 @@ function CommitBatchesPage() {
       </div>
       {batches.data?.batches.some((batch) => batch.can_seal) && (
         <Alert>
-          <AlertDescription>
-            Submit a batch before it fills or its wait ends. Smaller batches may increase transaction costs.
-          </AlertDescription>
+          <AlertDescription>Submit the next batch; remaining data stays waiting.</AlertDescription>
         </Alert>
       )}
       {selected === null && seal.isSuccess && (
@@ -179,9 +177,7 @@ function CommitBatchesPage() {
                   </TableCell>
                   <TableCell className="px-4 font-medium">{batch.bucket_name}</TableCell>
                   <TableCell className="px-4">{batch.provider_name ?? batch.provider_id}</TableCell>
-                  <TableCell className="px-4 text-right tabular-nums">
-                    {batch.member_count} / {batch.max_pieces}
-                  </TableCell>
+                  <TableCell className="px-4 text-right tabular-nums">{batch.member_count}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">
                     {batch.total_bytes === null ? '—' : formatBytes(batch.total_bytes)}
                   </TableCell>
@@ -310,11 +306,6 @@ function CommitBatchesPage() {
                         {detail.data.seal_requested_at && (
                           <BatchDetailField label="Requested at">
                             <BatchTimestamp value={detail.data.seal_requested_at} />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.sealed_at && (
-                          <BatchDetailField label="Queued at">
-                            <BatchTimestamp value={detail.data.sealed_at} />
                           </BatchDetailField>
                         )}
                         {detail.data.submitted_at && (
