@@ -41,9 +41,12 @@ var commitLedgerCases = []struct {
 	name string
 	run  func(*testing.T, commitFixture)
 }{
-	{"CommitRequestCollectsUpToItsLimitAndSealsTheSignedSet", testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet},
+	{"CommitRequestCollectsAndSealsOnlyTheSignedSet", testCommitRequestCollectsAndSealsOnlyTheSignedSet},
+	{"CommitRequestBulkMembershipRollsBackOnConflict", testCommitRequestBulkMembershipRollsBackOnConflict},
 	{"CommitSubmissionTakesTheOldestEligibleRequestWithinCapacity", testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity},
 	{"CommitSubmissionKeepsTheCollectionWakeTime", testCommitSubmissionKeepsTheCollectionWakeTime},
+	{"CommitQueueWakesOldestBlockedCollection", testCommitQueueWakesOldestBlockedCollection},
+	{"CollectingCommitWakePreservesQueueWait", testCollectingCommitWakePreservesQueueWait},
 	{"CommitRefusalReturnsRequestToReadyUntilItsRetryIsDue", testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue},
 	{"CommitConfirmationCommitsMembersByPositionAndReplays", testCommitConfirmationCommitsMembersByPositionAndReplays},
 	{"SignedSingleMemberIsDecidedByItsRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 1) }},
@@ -168,7 +171,7 @@ func (f commitFixture) sealedRequest(t *testing.T, id string) (int64, *model.Sto
 	return taskID, copyRow
 }
 
-func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f commitFixture) {
+func testCommitRequestCollectsAndSealsOnlyTheSignedSet(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	first, second, third := f.transferredCopy(t, "first"), f.transferredCopy(t, "second"), f.transferredCopy(t, "third")
 	readyAt := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
@@ -177,7 +180,7 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 		t.Fatal(err)
 	}
 	requestID, members, err := f.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
-		CopyID: second.ID, StorageDataSetID: f.dataSetID, MaxPieces: 2, Now: readyAt.Add(time.Minute),
+		CopyID: second.ID, StorageDataSetID: f.dataSetID, Now: readyAt.Add(time.Minute),
 	})
 	if err != nil || requestID != "collect" || members != 2 {
 		t.Fatalf("join second = %q, %d, %v", requestID, members, err)
@@ -189,17 +192,16 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 	if joined[0].ID != first.ID || joined[0].CommitReadyAt == nil || !joined[0].CommitReadyAt.Equal(readyAt) {
 		t.Fatalf("oldest member = %#v, want first ready at %s", joined[0], readyAt)
 	}
-	if _, _, err := f.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
-		CopyID: third.ID, StorageDataSetID: f.dataSetID, MaxPieces: 2,
-	}); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("join a full request = %v, want not found", err)
+	if id, count, err := f.repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
+		CopyID: third.ID, StorageDataSetID: f.dataSetID, Now: readyAt.Add(2 * time.Minute),
+	}); err != nil || id != "collect" || count != 3 {
+		t.Fatalf("join third = %q, %d, %v, want the same collection", id, count, err)
 	}
 
-	// The request was signed for the first copy only; the second joined after
-	// its members were read and waits for the next request.
+	// Only the signed prefix is frozen; the remaining members return together.
 	spilled := f.seal(t, "collect", taskID, first)
-	if len(spilled) != 1 || spilled[0] != second.ID {
-		t.Fatalf("spilled = %v, want the late copy", spilled)
+	if len(spilled) != 2 || spilled[0] != second.ID || spilled[1] != third.ID {
+		t.Fatalf("spilled = %v, want both unsigned copies", spilled)
 	}
 	request := f.request(t, "collect")
 	if request.Status != storagecommit.RequestStatusReady || request.PieceCount != 1 || request.SealedAt == nil || request.SealRequestedAt != nil {
@@ -211,7 +213,7 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 	if late := f.copy(t, second.ID); late.Status != model.StorageCopyStatusPieceReady || late.CommitRequestID != nil {
 		t.Fatalf("late copy = %#v, want piece_ready outside any request", late)
 	}
-	f.collectingAt(t, "spill", readyAt.Add(time.Hour), second)
+	f.collectingAt(t, "spill", readyAt.Add(time.Hour), second, third)
 	if f.request(t, "spill").SealRequestedAt != nil {
 		t.Fatal("spilled members inherited manual intent")
 	}
@@ -223,12 +225,40 @@ func testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet(t *testing.T, f c
 		t.Fatalf("pieces = %#v, %v", pieces, err)
 	}
 	// A signature names its members exactly: a member that left refuses it.
-	other := f.collecting(t, "other", third)
+	other := f.collecting(t, "other", f.transferredCopy(t, "fourth"))
 	if _, err := f.repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
 		RequestID: "other", TaskID: other, ExtraDataHex: "abcd",
 		Members: []repository.SealMember{{CopyID: second.ID, ContentID: second.ContentID, PieceCID: "piece"}},
 	}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("seal naming a copy outside the request = %v, want conflict", err)
+	}
+}
+
+func testCommitRequestBulkMembershipRollsBackOnConflict(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	owned := f.transferredCopy(t, "owned")
+	f.collecting(t, "owner", owned)
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate-%t", duplicate), func(t *testing.T) {
+			free := f.transferredCopy(t, fmt.Sprintf("free-%t", duplicate))
+			id := fmt.Sprintf("conflict-%t", duplicate)
+			taskID := f.task(t, id)
+			copyIDs := []int64{free.ID, owned.ID}
+			if duplicate {
+				copyIDs[1] = free.ID
+			}
+			if err := f.repos.Contents.CreateCollectingCommitRequest(ctx, repository.CreateCommitRequestInput{
+				RequestID: id, TaskID: taskID, StorageDataSetID: f.dataSetID, CopyIDs: copyIDs,
+			}); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("bulk attachment = %v, want conflict", err)
+			}
+			if _, err := f.repos.Contents.GetCommitRequest(ctx, id); !errors.Is(err, repository.ErrNotFound) {
+				t.Fatalf("rolled-back request = %v, want not found", err)
+			}
+			if copyRow := f.copy(t, free.ID); copyRow.CommitRequestID != nil || copyRow.CommitReadyAt != nil {
+				t.Fatalf("partial attachment survived rollback: %#v", copyRow)
+			}
+		})
 	}
 }
 
@@ -282,6 +312,98 @@ func testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 	// Another task cannot send a request it does not drive.
 	if err := f.repos.Contents.RecordCommitResend(ctx, repository.CommitSendInput{RequestID: "request-0", TaskID: tasks[1], Sends: 2}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("resend by another task = %v, want conflict", err)
+	}
+}
+
+func testCommitQueueWakesOldestBlockedCollection(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	later := time.Now().Add(time.Hour)
+	oldest := time.Now().Add(-time.Minute)
+	tasks := make(map[string]int64)
+	for i, id := range []string{"ordinary", "empty", "blocked-old", "blocked-new"} {
+		copyRow := f.transferredCopy(t, id)
+		taskID := f.collectingAt(t, id, oldest.Add(time.Duration(i)*time.Second), copyRow)
+		reason := storagecommit.CommitQueueWaitReason
+		if id == "ordinary" {
+			reason = "collecting"
+		}
+		if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
+			Set("wait_reason = ?", reason).Where("id = ?", taskID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if id == "empty" {
+			if _, err := f.db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("commit_request_id = NULL").
+				Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tasks[id] = taskID
+	}
+	first, _ := f.sealedRequest(t, "ready-first")
+	second, _ := f.sealedRequest(t, "ready-second")
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
+		Where("id = ?", second).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertWoken := func(taskID int64, want bool) {
+		t.Helper()
+		task, err := f.repos.Tasks.GetByID(ctx, taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := task.AvailableAt.Before(later.Add(-time.Minute)); got != want {
+			t.Fatalf("task %d woken = %v, want %v", taskID, got, want)
+		}
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "ready-first", TaskID: first}); err != nil {
+		t.Fatal(err)
+	}
+	assertWoken(second, true)
+	for _, taskID := range tasks {
+		assertWoken(taskID, false)
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "ready-second", TaskID: second}); err != nil {
+		t.Fatal(err)
+	}
+	for id, taskID := range tasks {
+		assertWoken(taskID, id == "blocked-old")
+	}
+}
+
+func testCollectingCommitWakePreservesQueueWait(t *testing.T, f commitFixture) {
+	for _, reason := range []string{"", "collecting", storagecommit.CommitQueueWaitReason} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := t.Context()
+			id := "collecting-wake-" + reason
+			taskID := f.collecting(t, id, f.transferredCopy(t, id))
+			later := time.Now().Add(time.Hour)
+			update := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).Where("id = ?", taskID)
+			if reason != "" {
+				update = update.Set("wait_reason = ?", reason)
+			}
+			if _, err := update.Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.repos.Contents.WakeCollectingCommitTask(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			task, err := f.repos.Tasks.GetByID(ctx, taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if woken := task.AvailableAt.Before(later.Add(-time.Minute)); woken != (reason != storagecommit.CommitQueueWaitReason) {
+				t.Fatalf("collection wake with reason %q: task = %#v", reason, task)
+			}
+			if reason == storagecommit.CommitQueueWaitReason {
+				if err := f.repos.Contents.WakeCommitRequestTask(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				task, err = f.repos.Tasks.GetByID(ctx, taskID)
+				if err != nil || !task.AvailableAt.Before(later.Add(-time.Minute)) {
+					t.Fatalf("normal wake did not resume blocked collection: task = %#v, error = %v", task, err)
+				}
+			}
+		})
 	}
 }
 

@@ -197,7 +197,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", Editable: true,
 	},
 	"worker.tasks.commit_max_wait": {
-		Label: "Registration Wait", Description: "Time to combine pieces before signing a registration; 0s signs immediately. Restart required.",
+		Label: "Registration Wait", Description: "Time to collect pieces for a batch; 0s skips the collection delay. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", Editable: true,
 	},
 	"worker.tasks.commit_seal_on_cache_pressure": {

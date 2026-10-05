@@ -75,6 +75,7 @@ type handlerRuntimeOptions struct {
 	walletBroadcastTimeout    time.Duration
 	walletReceiptTimeout      time.Duration
 	commitMaxWait             time.Duration
+	commitMaxPieces           int
 	commitSealOnCachePressure bool
 	terminator                synapse.ServiceTerminator
 	epochs                    synapse.ChainEpochReader
@@ -146,6 +147,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 		DefaultCopies: 2, MaxRetries: maxRetries, Logger: logger,
 		CommitMaxWait:             options.commitMaxWait,
+		CommitMaxPieces:           options.commitMaxPieces,
 		CommitSealOnCachePressure: options.commitSealOnCachePressure,
 	})
 	if err != nil {

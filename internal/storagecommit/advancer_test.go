@@ -290,6 +290,7 @@ func TestShouldSealHonorsCollectionWindow(t *testing.T) {
 		{"full", func(in *storagecommit.SealInput) { in.Members = 4 }, true, 0},
 		{"draining", func(in *storagecommit.SealInput) { in.Draining = true }, true, 0},
 		{"cache pressure", func(in *storagecommit.SealInput) { in.CachePressure = true }, true, 0},
+		{"more than a batch", func(in *storagecommit.SealInput) { in.Members = 6 }, true, 0},
 		{"manual request", func(in *storagecommit.SealInput) { in.ManualRequested = true }, true, 0},
 		{"empty under pressure and manual request", func(in *storagecommit.SealInput) { in.Members = 0; in.CachePressure = true; in.ManualRequested = true }, false, 0},
 		{"zero wait", func(in *storagecommit.SealInput) { in.MaxWait = 0 }, true, 0},

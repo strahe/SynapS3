@@ -114,7 +114,7 @@ synaps3 admin settings get cache.lru_low_watermark_percent
 
 LRU 无法清理 multipart 暂存数据、未达到存储桶最低耐久副本数的版本，或没有可读已提交远端副本的版本。使用 `lru` 时，如果缓存使用量高于实际低水位，被拒绝的写入会请求后台清理。写入不会等待清理完成，因此在清理追赶完成或出现安全候选前，仍可能继续返回 `503 SlowDown`。S3 客户端默认的重试可能更早放弃；请稍后重新上传。
 
-如果批次仍在等待提交，打开 **Batches** 点击 **Submit batch**，或在 Settings 启用[自动提前提交批次](../configuration/model.md)并重启。请求提交后，仍需等待远端确认和耐久条件满足才能释放缓存。
+如果批次仍在等待提交，打开 **Batches** 点击 **Submit next batch**，或在 Settings 启用[自动提前提交批次](../configuration/model.md)并重启。请求提交后，仍需等待远端确认和耐久条件满足才能释放缓存。
 
 LRU 删除失败后，任务仍会作为 failed 工作保留。先修复任务中报告的文件系统或数据库问题；任务标记为可重试时，可运行 `synaps3 admin task retry <id>`。
 

@@ -24,8 +24,8 @@ import { cn, formatBytes, timeAgo } from '@/lib/utils'
 export const Route = createFileRoute('/commit-batches')({ component: CommitBatchesPage })
 
 const statuses: { value: CommitBatchStatus | 'all'; label: string; tone: StatusTone }[] = [
-  { value: 'collecting', label: 'Waiting to submit', tone: 'neutral' },
-  { value: 'ready', label: 'Queued', tone: 'info' },
+  { value: 'collecting', label: 'Collecting data', tone: 'neutral' },
+  { value: 'ready', label: 'Ready to submit', tone: 'info' },
   { value: 'submitted', label: 'Awaiting confirmation', tone: 'info' },
   { value: 'confirmed', label: 'Completed', tone: 'success' },
   { value: 'abandoned', label: 'Stopped', tone: 'warning' },
@@ -37,13 +37,6 @@ function BatchStatus({ batch }: { batch: CommitBatch }) {
   if (batch.seal_requested_at) return <StatusBadge tone="info">Submission requested</StatusBadge>
   const status = statuses.find((entry) => entry.value === batch.status)
   return <StatusBadge tone={status?.tone}>{status?.label ?? batch.status}</StatusBadge>
-}
-
-function remainingTime(deadline: string | null) {
-  if (!deadline) return '—'
-  const seconds = Math.max(0, Math.ceil((new Date(deadline).getTime() - Date.now()) / 1000))
-  if (seconds === 0) return 'Due now'
-  return seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`
 }
 
 function CommitBatchesPage() {
@@ -79,7 +72,7 @@ function CommitBatchesPage() {
         {seal.isPending && seal.variables === batch.request_id && (
           <Loader2 className="animate-spin" data-icon="inline-start" />
         )}
-        Submit batch
+        Submit next batch
       </Button>
     )
 
@@ -122,9 +115,7 @@ function CommitBatchesPage() {
       </div>
       {batches.data?.batches.some((batch) => batch.can_seal) && (
         <Alert>
-          <AlertDescription>
-            Submit a batch before it fills or its wait ends. Smaller batches may increase transaction costs.
-          </AlertDescription>
+          <AlertDescription>Submit the next batch; remaining data stays waiting.</AlertDescription>
         </Alert>
       )}
       {selected === null && seal.isSuccess && (
@@ -165,8 +156,8 @@ function CommitBatchesPage() {
                 <TableHead className="px-4">Storage service</TableHead>
                 <TableHead className="px-4 text-right">Members</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
-                <TableHead className="px-4">Oldest wait</TableHead>
-                <TableHead className="px-4">Wait remaining</TableHead>
+                <TableHead className="px-4">Waiting since</TableHead>
+                <TableHead className="px-4">Submitted</TableHead>
                 <TableHead className="px-4">Status</TableHead>
                 <TableHead className="px-4 text-right">Actions</TableHead>
               </TableRow>
@@ -179,17 +170,21 @@ function CommitBatchesPage() {
                   </TableCell>
                   <TableCell className="px-4 font-medium">{batch.bucket_name}</TableCell>
                   <TableCell className="px-4">{batch.provider_name ?? batch.provider_id}</TableCell>
-                  <TableCell className="px-4 text-right tabular-nums">
-                    {batch.member_count} / {batch.max_pieces}
-                  </TableCell>
+                  <TableCell className="px-4 text-right tabular-nums">{batch.member_count}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">
                     {batch.total_bytes === null ? '—' : formatBytes(batch.total_bytes)}
                   </TableCell>
                   <TableCell className="px-4 text-muted-foreground">
                     {batch.status === 'collecting' && batch.oldest_ready_at ? timeAgo(batch.oldest_ready_at) : '—'}
                   </TableCell>
-                  <TableCell className="px-4 tabular-nums text-muted-foreground">
-                    {remainingTime(batch.collection_deadline)}
+                  <TableCell className="px-4 text-muted-foreground">
+                    {batch.submitted_at ? (
+                      <time dateTime={batch.submitted_at} title={new Date(batch.submitted_at).toLocaleString()}>
+                        {timeAgo(batch.submitted_at)}
+                      </time>
+                    ) : (
+                      '—'
+                    )}
                   </TableCell>
                   <TableCell className="px-4">
                     <BatchStatus batch={batch} />
@@ -310,11 +305,6 @@ function CommitBatchesPage() {
                         {detail.data.seal_requested_at && (
                           <BatchDetailField label="Requested at">
                             <BatchTimestamp value={detail.data.seal_requested_at} />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.sealed_at && (
-                          <BatchDetailField label="Queued at">
-                            <BatchTimestamp value={detail.data.sealed_at} />
                           </BatchDetailField>
                         )}
                         {detail.data.submitted_at && (

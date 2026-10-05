@@ -133,8 +133,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	}
 }
 
-// runCollectingCommit signs when the request is full, the data set is draining,
-// or the oldest member's collection window expires; zero wait signs immediately.
+// runCollectingCommit seals the next batch only when the data set can submit it.
 func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) taskengine.Result {
 	members, err := h.deps.Repositories.Contents.ListCommitRequestMembers(ctx, run.request.RequestID)
 	if err != nil {
@@ -149,22 +148,47 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	if members[0].CommitReadyAt != nil {
 		oldest = *members[0].CommitReadyAt
 	}
-	pressure, err := h.commitCachePressure(ctx, run.request.RequestID)
-	if err != nil {
-		return retryTask(err, "cache_pressure_load_failed")
-	}
-	seal, wait := storagecommit.ShouldSeal(storagecommit.SealInput{
+	input := storagecommit.SealInput{
 		Members: len(members), OldestJoinedAt: oldest, Now: now,
 		MaxPieces: maxPieces, MaxWait: h.deps.CommitMaxWait,
-		Draining:      run.binding.Status == model.StorageDataSetStatusDraining,
-		CachePressure: pressure, ManualRequested: run.request.SealRequestedAt != nil,
-	})
+		Draining:        run.binding.Status == model.StorageDataSetStatusDraining,
+		ManualRequested: run.request.SealRequestedAt != nil,
+	}
+	seal, wait := storagecommit.ShouldSeal(input)
+	waitReason, message := "collecting", "Waiting for more stored data to register together"
+	if !seal {
+		input.CachePressure, err = h.commitCachePressure(ctx, run.request.RequestID)
+		if err != nil {
+			return retryTask(err, "cache_pressure_load_failed")
+		}
+		seal, wait = storagecommit.ShouldSeal(input)
+	}
+	if seal {
+		queue, err := h.deps.Repositories.Contents.CommitQueueState(ctx, run.request.StorageDataSetID, now)
+		if err != nil {
+			return retryTask(err, "commit_queue_load_failed")
+		}
+		seal = queue.Submitted < storagecommit.MaxSubmittedRequestsPerDataSet && queue.ReadyHead == ""
+		if !seal {
+			waitReason, message = storagecommit.CommitQueueWaitReason, "Collecting more data; waiting for earlier batches"
+			wait = input.MaxWait - now.Sub(oldest)
+		}
+		h.deps.Logger.DebugContext(ctx, "commit batch scheduling",
+			"request_id", run.request.RequestID, "storage_data_set_id", run.request.StorageDataSetID,
+			"members", len(members), "selected_members", min(len(members), maxPieces),
+			"cache_pressure", input.CachePressure, "submitted_requests", queue.Submitted,
+			"ready_head", queue.ReadyHead, "seal", seal)
+	}
 	if !seal {
 		if wait <= 0 || wait > commitCollectionPollInterval {
 			wait = commitCollectionPollInterval
 		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, wait, "collecting", "Waiting for more stored data to register together", nil)
+		return taskengine.Suspend(model.TaskResumeModeRecover, wait, waitReason, message, nil)
 	}
+	if !run.mayExec {
+		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage registration is ready", nil)
+	}
+
 	target, err := h.openReadyDataSet(ctx, run.binding)
 	if err != nil {
 		return h.commitTargetUnavailable(err)
@@ -189,7 +213,11 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	if err != nil {
 		return retryTask(err, "commit_seal_failed")
 	}
-	return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage registration is ready", nil)
+	run.request, err = h.deps.Repositories.Contents.GetCommitRequest(ctx, run.request.RequestID)
+	if err != nil {
+		return retryTask(err, "commit_request_load_failed")
+	}
+	return h.runReadyCommit(ctx, run)
 }
 
 func (h *TaskHandlers) signCommitMembers(ctx context.Context, target synapse.DataSetTarget, members []repository.CommitRequestMember) (string, error) {
@@ -232,12 +260,20 @@ func (h *TaskHandlers) sealCommit(ctx context.Context, run commitRun, members []
 		if err != nil {
 			return err
 		}
-		for _, copyID := range spilled {
-			if err := h.queueCommit(ctx, repos, copyID); err != nil {
-				return err
-			}
+		if len(spilled) == 0 {
+			return nil
 		}
-		return nil
+		requestID, err := storagecommit.NewRequestID()
+		if err != nil {
+			return err
+		}
+		taskID, err := h.enqueueCommitTask(ctx, repos, requestID, time.Time{})
+		if err != nil {
+			return err
+		}
+		return repos.Contents.CreateCollectingCommitRequest(ctx, repository.CreateCommitRequestInput{
+			RequestID: requestID, TaskID: taskID, StorageDataSetID: run.request.StorageDataSetID, CopyIDs: spilled,
+		})
 	})
 }
 
@@ -903,7 +939,7 @@ func (h *TaskHandlers) commitMaxPieces(binding *model.StorageDataSet) int {
 
 // queueCommit hands a transferred copy to registration: a signed member wakes
 // its request, and any other transferred copy joins a collecting request of its
-// data set, starting one when none has room.
+// data set, starting one when none exists.
 func (h *TaskHandlers) queueCommit(ctx context.Context, repos *repository.Repositories, copyID int64) error {
 	if h.taskService == nil {
 		return errors.New("task service is unavailable")
@@ -927,11 +963,14 @@ func (h *TaskHandlers) queueCommit(ctx context.Context, repos *repository.Reposi
 	}
 	maxPieces := h.commitMaxPieces(binding)
 	requestID, members, err := repos.Contents.JoinCollectingCommitRequest(ctx, repository.JoinCommitRequestInput{
-		CopyID: copyRow.ID, StorageDataSetID: copyRow.StorageDataSetID, MaxPieces: maxPieces,
+		CopyID: copyRow.ID, StorageDataSetID: copyRow.StorageDataSetID,
 	})
 	if err == nil {
-		if members >= maxPieces || (h.deps.CommitSealOnCachePressure && h.cachePressure.Load() != nil) {
-			return repos.Contents.WakeCommitRequestTask(ctx, requestID)
+		if members >= maxPieces {
+			return repos.Contents.WakeCollectingCommitTask(ctx, requestID)
+		}
+		if h.deps.CommitSealOnCachePressure && h.cachePressure.Load() != nil {
+			return repos.Contents.WakeCollectingCommitTask(ctx, requestID)
 		}
 		return nil
 	}

@@ -8,7 +8,7 @@ import (
 	"github.com/strahe/synapse-go/pdp"
 )
 
-// SealInput is what decides whether a collecting request is signed now.
+// SealInput is what decides whether a collecting request is eligible to be signed.
 type SealInput struct {
 	Members int
 	// OldestJoinedAt is when the longest-waiting member became ready.
@@ -22,7 +22,7 @@ type SealInput struct {
 	ManualRequested bool
 }
 
-// ShouldSeal reports whether a collecting request should be signed now and,
+// ShouldSeal reports whether a collecting request is eligible to be signed and,
 // when it should not, how long it may wait before asking again. A zero wait
 // means wait to be woken.
 func ShouldSeal(in SealInput) (bool, time.Duration) {

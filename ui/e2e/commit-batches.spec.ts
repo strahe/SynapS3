@@ -31,16 +31,16 @@ test('manual submission keeps the list open and exposes batch contents and confi
   await page.keyboard.press('Escape')
   await page.getByRole('link', { name: 'Batches', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Batches', exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Submit batch', exact: true }).first()).toBeVisible({
+  await expect(page.getByRole('button', { name: 'Submit next batch', exact: true }).first()).toBeVisible({
     timeout: 30_000,
   })
   await expect(
-    page.getByText('Submit a batch before it fills or its wait ends. Smaller batches may increase transaction costs.', {
+    page.getByText('Submit the next batch; remaining data stays waiting.', {
       exact: true,
     })
   ).toBeVisible()
-  await expect(page.getByRole('cell', { name: 'Waiting to submit', exact: true }).first()).toBeVisible()
-  await expect(page.getByRole('cell', { name: '1 / 32', exact: true }).first()).toBeVisible()
+  await expect(page.getByRole('cell', { name: 'Collecting data', exact: true }).first()).toBeVisible()
+  await expect(page.getByRole('cell', { name: '1', exact: true }).first()).toBeVisible()
   const detail = page.getByRole('dialog', { name: 'Batch details' })
   await page
     .getByRole('button', { name: /^Details for batch / })
@@ -57,7 +57,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
     await page.getByRole('button', { name: 'Refresh', exact: true }).click()
     const row = page
       .getByRole('row')
-      .filter({ has: page.getByRole('button', { name: 'Submit batch', exact: true }) })
+      .filter({ has: page.getByRole('button', { name: 'Submit next batch', exact: true }) })
       .first()
     await expect(row).toBeVisible({
       timeout: 30_000,
@@ -66,7 +66,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
       (await row.getByRole('button', { name: /^Details for batch / }).getAttribute('aria-label')) ?? ''
     expect(detailsLabel).toMatch(/^Details for batch /)
     const batchID = detailsLabel.replace('Details for batch ', '')
-    await row.getByRole('button', { name: 'Submit batch', exact: true }).click()
+    await row.getByRole('button', { name: 'Submit next batch', exact: true }).click()
     await expect(
       page.getByRole('alert').filter({ has: page.getByRole('note', { name: `Batch ID: ${batchID}`, exact: true }) })
     ).toBeVisible()
@@ -81,8 +81,8 @@ test('manual submission keeps the list open and exposes batch contents and confi
     await expect(detail.getByRole('note', { name: 'Object key: manual.bin', exact: true })).toBeVisible()
     await expect(detail.getByText('Completed', { exact: true })).toBeVisible({ timeout: 30_000 })
     await expect(detail.getByRole('note', { name: /^Transaction:/ })).toBeVisible()
-    await expect(detail.locator('time[datetime]')).toHaveCount(3)
-    await expect(detail.getByRole('button', { name: 'Submit batch', exact: true })).toHaveCount(0)
+    await expect(detail.locator('time[datetime]')).toHaveCount(2)
+    await expect(detail.getByRole('button', { name: 'Submit next batch', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
   }
   await page.getByRole('combobox', { name: 'Status' }).click()
@@ -94,7 +94,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
     .click()
   await expect(detail.getByRole('heading', { name: 'Batch details' })).toBeFocused()
   await expect(detail.getByText('Completed', { exact: true })).toBeVisible()
-  await expect(detail.getByRole('button', { name: 'Submit batch', exact: true })).toHaveCount(0)
+  await expect(detail.getByRole('button', { name: 'Submit next batch', exact: true })).toHaveCount(0)
   await page.keyboard.press('Escape')
   await page.getByRole('link', { name: 'Settings', exact: true }).click()
   await page.getByRole('tab', { name: 'Workers', exact: true }).click()
