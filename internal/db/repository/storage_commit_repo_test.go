@@ -44,6 +44,8 @@ var commitLedgerCases = []struct {
 	{"CommitRequestCollectsUpToItsLimitAndSealsTheSignedSet", testCommitRequestCollectsUpToItsLimitAndSealsTheSignedSet},
 	{"CommitSubmissionTakesTheOldestEligibleRequestWithinCapacity", testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity},
 	{"CommitSubmissionKeepsTheCollectionWakeTime", testCommitSubmissionKeepsTheCollectionWakeTime},
+	{"CommitQueueWakesOldestPressureBlockedCollection", testCommitQueueWakesOldestPressureBlockedCollection},
+	{"CommitPressureWakePreservesQueueWait", testCommitPressureWakePreservesQueueWait},
 	{"CommitRefusalReturnsRequestToReadyUntilItsRetryIsDue", testCommitRefusalReturnsRequestToReadyUntilItsRetryIsDue},
 	{"CommitConfirmationCommitsMembersByPositionAndReplays", testCommitConfirmationCommitsMembersByPositionAndReplays},
 	{"SignedSingleMemberIsDecidedByItsRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 1) }},
@@ -282,6 +284,98 @@ func testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 	// Another task cannot send a request it does not drive.
 	if err := f.repos.Contents.RecordCommitResend(ctx, repository.CommitSendInput{RequestID: "request-0", TaskID: tasks[1], Sends: 2}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("resend by another task = %v, want conflict", err)
+	}
+}
+
+func testCommitQueueWakesOldestPressureBlockedCollection(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	later := time.Now().Add(time.Hour)
+	oldest := time.Now().Add(-time.Minute)
+	tasks := make(map[string]int64)
+	for i, id := range []string{"ordinary", "empty", "blocked-old", "blocked-new"} {
+		copyRow := f.transferredCopy(t, id)
+		taskID := f.collectingAt(t, id, oldest.Add(time.Duration(i)*time.Second), copyRow)
+		reason := storagecommit.PressureQueueWaitReason
+		if id == "ordinary" {
+			reason = "collecting"
+		}
+		if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
+			Set("wait_reason = ?", reason).Where("id = ?", taskID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if id == "empty" {
+			if _, err := f.db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("commit_request_id = NULL").
+				Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tasks[id] = taskID
+	}
+	first, _ := f.sealedRequest(t, "ready-first")
+	second, _ := f.sealedRequest(t, "ready-second")
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
+		Where("id = ?", second).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertWoken := func(taskID int64, want bool) {
+		t.Helper()
+		task, err := f.repos.Tasks.GetByID(ctx, taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := task.AvailableAt.Before(later.Add(-time.Minute)); got != want {
+			t.Fatalf("task %d woken = %v, want %v", taskID, got, want)
+		}
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "ready-first", TaskID: first}); err != nil {
+		t.Fatal(err)
+	}
+	assertWoken(second, true)
+	for _, taskID := range tasks {
+		assertWoken(taskID, false)
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{RequestID: "ready-second", TaskID: second}); err != nil {
+		t.Fatal(err)
+	}
+	for id, taskID := range tasks {
+		assertWoken(taskID, id == "blocked-old")
+	}
+}
+
+func testCommitPressureWakePreservesQueueWait(t *testing.T, f commitFixture) {
+	for _, reason := range []string{"", "collecting", storagecommit.PressureQueueWaitReason} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := t.Context()
+			id := "pressure-wake-" + reason
+			taskID := f.collecting(t, id, f.transferredCopy(t, id))
+			later := time.Now().Add(time.Hour)
+			update := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).Where("id = ?", taskID)
+			if reason != "" {
+				update = update.Set("wait_reason = ?", reason)
+			}
+			if _, err := update.Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.repos.Contents.WakeCommitRequestTaskOnCachePressure(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			task, err := f.repos.Tasks.GetByID(ctx, taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if woken := task.AvailableAt.Before(later.Add(-time.Minute)); woken != (reason != storagecommit.PressureQueueWaitReason) {
+				t.Fatalf("pressure wake with reason %q: task = %#v", reason, task)
+			}
+			if reason == storagecommit.PressureQueueWaitReason {
+				if err := f.repos.Contents.WakeCommitRequestTask(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				task, err = f.repos.Tasks.GetByID(ctx, taskID)
+				if err != nil || !task.AvailableAt.Before(later.Add(-time.Minute)) {
+					t.Fatalf("normal wake did not resume blocked collection: task = %#v, error = %v", task, err)
+				}
+			}
+		})
 	}
 }
 

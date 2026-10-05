@@ -17,9 +17,10 @@ type SealInput struct {
 	MaxPieces      int
 	MaxWait        time.Duration
 	// Draining means the data set takes no new copies.
-	Draining        bool
-	CachePressure   bool
-	ManualRequested bool
+	Draining            bool
+	CachePressure       bool
+	PressureSealAllowed bool
+	ManualRequested     bool
 }
 
 // ShouldSeal reports whether a collecting request should be signed now and,
@@ -29,7 +30,7 @@ func ShouldSeal(in SealInput) (bool, time.Duration) {
 	switch {
 	case in.Members <= 0:
 		return false, 0
-	case in.Members >= in.MaxPieces, in.Draining, in.MaxWait == 0, in.CachePressure, in.ManualRequested:
+	case in.Members >= in.MaxPieces, in.Draining, in.MaxWait == 0, in.CachePressure && in.PressureSealAllowed, in.ManualRequested:
 		return true, 0
 	}
 	if waited := in.Now.Sub(in.OldestJoinedAt); waited < in.MaxWait {

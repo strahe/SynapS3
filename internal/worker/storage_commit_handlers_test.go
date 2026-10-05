@@ -575,8 +575,8 @@ func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T
 	}
 }
 
-func TestCommitSealsWhileSubmissionSlotsAreFull(t *testing.T) {
-	f := newRegistrationFixture(t, 6, nil, 30*time.Minute)
+func (f registrationFixture) holdSubmissionSlots(t *testing.T) int64 {
+	t.Helper()
 	ctx := t.Context()
 	readyAt := time.Now().Add(-31 * time.Minute)
 	var heldTaskID int64
@@ -612,6 +612,151 @@ func TestCommitSealsWhileSubmissionSlotsAreFull(t *testing.T) {
 			heldTaskID = taskID
 		}
 	}
+	return heldTaskID
+}
+
+func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
+	for _, limit := range []int{32, 3} {
+		t.Run(fmt.Sprintf("max-pieces-%d", limit), func(t *testing.T) {
+			ctx := t.Context()
+			fs, err := cache.NewFilesystem(t.TempDir(), 384)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := newRegistrationFixture(t, 8, nil, 30*time.Minute, func(options *handlerRuntimeOptions) {
+				options.cache, options.policy, options.maxBytes = fs, cache.EvictionPolicyLRU, 384
+				options.highPercent, options.lowPercent, options.commitSealOnCachePressure = 90, 50, true
+				options.commitMaxPieces = limit
+				options.register = func(h *worker.TaskHandlers, registry *taskengine.Registry) error {
+					if err := h.RegisterCore(registry); err != nil {
+						return err
+					}
+					return h.RegisterStorage(registry)
+				}
+			})
+			heldTaskID := f.holdSubmissionSlots(t)
+			readyID, readyTaskID := f.collectAt(t, "earlier-ready", time.Now().Add(-time.Second), f.copies[4])
+			if _, err := f.runtime.repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
+				RequestID: readyID, TaskID: readyTaskID, ExtraDataHex: fmt.Sprintf("%x", testutil.CommitExtraData(5)),
+				Members: []repository.SealMember{{CopyID: f.copies[4].ID, ContentID: f.copies[4].ContentID, PieceCID: f.pieceCID(t, f.copies[4])}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			bucket, err := f.runtime.repos.Buckets.GetByID(ctx, f.copies[5].BucketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, copyRow := range f.copies[5:] {
+				if _, err := fs.Put(ctx, bucket.Name, model.ContentCacheKey(copyRow.ContentID), bytes.NewReader(make([]byte, 128)), 128); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.runtime.repos.Objects.RecordContentCacheCommit(ctx, copyRow.ContentID, time.Now().Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			requestID, taskID := f.collectAt(t, "pressure-collecting", time.Now(), f.copies[5])
+			if _, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
+				Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
+				Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runHandlerEngine(t, f.runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			blocked := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == storagecommit.PressureQueueWaitReason
+			})
+			original, err := f.runtime.repos.Contents.GetUploadCopy(ctx, f.copies[5].ContentID, 0)
+			if err != nil || original == nil || original.CommitReadyAt == nil {
+				t.Fatalf("load original member: %#v, %v", original, err)
+			}
+			for i, copyRow := range f.copies[6:] {
+				var transferTaskID int64
+				if err := f.runtime.repos.WithTx(ctx, func(repos *repository.Repositories) error {
+					generation, err := repos.Contents.NextCopyWorkGeneration(ctx, copyRow.ID)
+					if err != nil {
+						return err
+					}
+					task, _, err := f.runtime.service.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+						Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(copyRow.ID, generation),
+						Input:       storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation},
+						SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID),
+					})
+					if err != nil {
+						return err
+					}
+					transferTaskID = task.ID
+					return repos.Contents.BindCopyTask(ctx, copyRow.ID, generation, task.ID)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				waitForTask(t, f.runtime.repos, transferTaskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+				joined, err := f.runtime.repos.Contents.GetUploadCopy(ctx, copyRow.ContentID, 0)
+				if err != nil || joined == nil || joined.CommitRequestID == nil || *joined.CommitRequestID != requestID {
+					t.Fatalf("member joined a different batch: copy = %#v, error = %v", joined, err)
+				}
+				if limit == 3 && i == 1 {
+					waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
+						return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "resource"
+					})
+					if sealed := f.request(t, requestID); sealed.Status != storagecommit.RequestStatusReady || sealed.PieceCount != 3 {
+						t.Fatalf("full batch did not wake and seal: %#v", sealed)
+					}
+				} else {
+					after, err := f.runtime.repos.Tasks.GetByID(ctx, taskID)
+					if err != nil || !after.AvailableAt.Equal(blocked.AvailableAt) || !after.UpdatedAt.Equal(blocked.UpdatedAt) {
+						t.Fatalf("partial member woke blocked collection: before = %#v, after = %#v, error = %v", blocked, after, err)
+					}
+					if f.request(t, requestID).Status != storagecommit.RequestStatusCollecting {
+						t.Fatal("pressure split a partial batch while submission slots were full")
+					}
+				}
+			}
+			firstMember, err := f.runtime.repos.Contents.GetUploadCopy(ctx, f.copies[5].ContentID, 0)
+			if err != nil || firstMember == nil || firstMember.CommitReadyAt == nil || !firstMember.CommitReadyAt.Equal(*original.CommitReadyAt) {
+				t.Fatalf("member arrivals reset the collection window: before = %#v, after = %#v, error = %v", original, firstMember, err)
+			}
+			if sends, _ := f.provider.sent(); len(sends) != 0 {
+				t.Fatalf("sent with all submission slots occupied: %v", sends)
+			}
+			if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
+				RequestID: "held-0", TaskID: heldTaskID, FirstPieceID: testOnChainID(t, 50),
+				ConfirmedTransactionID: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// Advance only confirmation polling; collection must wake through the queue.
+			for _, id := range []int64{readyTaskID, taskID} {
+				waiting := waitForTask(t, f.runtime.repos, id, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusCompleted || task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+				})
+				if waiting.Status != model.TaskStatusCompleted {
+					wakeTask(t, f.runtime, id)
+				}
+				waitForTask(t, f.runtime.repos, id, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			}
+			completed := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			sends, _ := f.provider.sent()
+			if len(sends) != 2 || len(sends[0]) != 1 || sends[0][0].String() != f.pieceCID(t, f.copies[4]) || len(sends[1]) != 3 {
+				t.Fatalf("submissions = %v, want earlier ready followed by the three-member batch", sends)
+			}
+			for i, piece := range sends[1] {
+				if piece.String() != f.pieceCID(t, f.copies[i+5]) {
+					t.Fatalf("sent member %d = %s", i, piece)
+				}
+			}
+			final := f.request(t, requestID)
+			if completed.RetryCount != 0 || final.Status != storagecommit.RequestStatusConfirmed {
+				t.Fatalf("completed batch = %#v, task = %#v", final, completed)
+			}
+		})
+	}
+}
+
+func TestCommitSealsWhileSubmissionSlotsAreFull(t *testing.T) {
+	f := newRegistrationFixture(t, 6, nil, 30*time.Minute)
+	ctx := t.Context()
+	heldTaskID := f.holdSubmissionSlots(t)
 	requestID, taskID := f.collectAt(t, "waiting-to-send", time.Now(), f.copies[4])
 	if _, err := f.runtime.repos.Contents.RequestCommitSeal(ctx, requestID); err != nil {
 		t.Fatal(err)

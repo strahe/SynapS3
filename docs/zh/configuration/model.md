@@ -117,7 +117,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 
 某个存储服务上等待未提交批次的已传输 piece（包括上传和复制的副本）达到 `commit_max_backlog`（不小于 `commit_max_pieces`）后，写入该存储服务的新上传和新复制都会等待。一个批次超出单条 add-pieces 消息大小时，会拆分后用更少的 piece 重新签名。
 
-在 Settings 启用 **Submit batches early to free cache space**（`worker.tasks.commit_seal_on_cache_pressure`），可在安全自动清理无法腾出足够空间时提前提交未满批次。默认关闭，修改后需要重启。`lru` 按实际清理目标判断；`after_upload` 按被拒绝写入所需的容量判断；`none` 不自动提前提交。更小的批次可能增加交易成本。缓存删除仍需等待确认并满足存储桶的耐久要求。
+在 Settings 启用 **Submit batches early to free cache space**（`worker.tasks.commit_seal_on_cache_pressure`），可在安全自动清理无法腾出足够空间时提前提交未满批次。提前提交需要有空闲的在途名额，且没有更早的已签名批次可以提交；否则继续收集数据。名额空出后，先推进已签名批次，再恢复提前提交。批次攒满、达到最长等待时间或手动提交时仍按原规则处理。默认关闭，修改后需要重启。`lru` 按实际清理目标判断；`after_upload` 按被拒绝写入所需的容量判断；`none` 不自动提前提交。更小的批次可能增加交易成本。缓存删除仍需等待确认并满足存储桶的耐久要求。
 
 打开 **Batches** 查看等待提交的批次，点击 **Submit batch** 手动提交。手动操作独立于自动开关和缓存策略。点击 **Details** 查看成员、提交时间、交易 ID 和错误；停止的任务在允许恢复时显示 **Recover**。每个成员展示一个关联对象，以及共享该数据的其他版本数量。历史对象信息或大小缺失时会标明不可用。
 

@@ -889,25 +889,38 @@ func eligibleReadyCommitRequest(ctx context.Context, db bun.IDB, storageDataSetI
 	return requestID, nil
 }
 
-// wakeCommitQueue wakes the oldest eligible ready request when there is room
-// to submit it. Locked task rows are skipped to avoid waiting on another claim.
+// wakeCommitQueue prefers ready work, then collection blocked by cache pressure.
+// Locked task rows are skipped to avoid waiting on another claim.
 func wakeCommitQueue(ctx context.Context, db bun.IDB, storageDataSetID int64, now time.Time) error {
 	submitted, err := countSubmittedCommitRequests(ctx, db, storageDataSetID)
 	if err != nil || submitted >= storagecommit.MaxSubmittedRequestsPerDataSet {
 		return err
 	}
 	head, err := eligibleReadyCommitRequest(ctx, db, storageDataSetID, now)
-	if err != nil || head == "" {
+	if err != nil {
 		return err
 	}
 	var taskIDs []int64
-	if err := db.NewSelect().
+	query := db.NewSelect().
 		Model((*storagecommit.Request)(nil)).
-		Column("task_id").
-		Where("storage_data_set_id = ?", storageDataSetID).
-		Where("task_id IS NOT NULL").
-		Where("request_id = ?", head).
-		Scan(ctx, &taskIDs); err != nil {
+		Column("commit_request.task_id").
+		Where("commit_request.storage_data_set_id = ?", storageDataSetID).
+		Where("commit_request.task_id IS NOT NULL")
+	if head != "" {
+		query = query.Where("commit_request.request_id = ?", head)
+	} else {
+		query = query.
+			Join("JOIN tasks AS collecting_task ON collecting_task.id = commit_request.task_id").
+			Where("commit_request.status = ?", storagecommit.RequestStatusCollecting).
+			Where("collecting_task.status = ? AND collecting_task.wait_reason = ?", model.TaskStatusPending, storagecommit.PressureQueueWaitReason).
+			Where(`EXISTS (
+				SELECT 1 FROM storage_copies AS collecting_member
+				WHERE collecting_member.commit_request_id = commit_request.request_id
+			)`).
+			OrderExpr("commit_request.created_at ASC, commit_request.request_id ASC").
+			Limit(1)
+	}
+	if err := query.Scan(ctx, &taskIDs); err != nil {
 		return fmt.Errorf("selecting storage commit tasks to wake: %w", err)
 	}
 	return wakeCommitTasks(ctx, db, taskIDs)
@@ -918,7 +931,12 @@ func (r *BunStorageContentRepo) WakeCommitRequestTask(ctx context.Context, reque
 	return wakeCommitRequestTask(ctx, r.db, requestID)
 }
 
-func wakeCommitRequestTask(ctx context.Context, db bun.IDB, requestID string) error {
+// WakeCommitRequestTaskOnCachePressure leaves queue-blocked collection asleep.
+func (r *BunStorageContentRepo) WakeCommitRequestTaskOnCachePressure(ctx context.Context, requestID string) error {
+	return wakeCommitRequestTask(ctx, r.db, requestID, storagecommit.PressureQueueWaitReason)
+}
+
+func wakeCommitRequestTask(ctx context.Context, db bun.IDB, requestID string, excludedWaitReasons ...string) error {
 	var taskID sql.NullInt64
 	err := db.NewSelect().Model((*storagecommit.Request)(nil)).Column("task_id").
 		Where("request_id = ?", requestID).Scan(ctx, &taskID)
@@ -928,7 +946,7 @@ func wakeCommitRequestTask(ctx context.Context, db bun.IDB, requestID string) er
 	if err != nil {
 		return fmt.Errorf("loading storage commit request task: %w", err)
 	}
-	return wakeCommitTasks(ctx, db, []int64{taskID.Int64})
+	return wakeCommitTasks(ctx, db, []int64{taskID.Int64}, excludedWaitReasons...)
 }
 
 // ReleaseMemberTransferInput names the transfer task of a signed member that
@@ -982,7 +1000,7 @@ func (r *BunStorageContentRepo) ReleaseMemberTransfer(ctx context.Context, input
 	return nil
 }
 
-func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64) error {
+func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64, excludedWaitReasons ...string) error {
 	if len(taskIDs) == 0 {
 		return nil
 	}
@@ -993,6 +1011,9 @@ func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64) error {
 		Where("id IN (?)", bun.List(taskIDs)).
 		Where("status = ?", model.TaskStatusPending).
 		Where("available_at > ?", now)
+	if len(excludedWaitReasons) > 0 {
+		ids = ids.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(excludedWaitReasons))
+	}
 	if db.Dialect().Name() == dialect.PG {
 		ids = ids.For("UPDATE SKIP LOCKED")
 	}

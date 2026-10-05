@@ -149,21 +149,41 @@ func (h *TaskHandlers) runCollectingCommit(ctx context.Context, run commitRun) t
 	if members[0].CommitReadyAt != nil {
 		oldest = *members[0].CommitReadyAt
 	}
-	pressure, err := h.commitCachePressure(ctx, run.request.RequestID)
-	if err != nil {
-		return retryTask(err, "cache_pressure_load_failed")
-	}
-	seal, wait := storagecommit.ShouldSeal(storagecommit.SealInput{
+	input := storagecommit.SealInput{
 		Members: len(members), OldestJoinedAt: oldest, Now: now,
 		MaxPieces: maxPieces, MaxWait: h.deps.CommitMaxWait,
-		Draining:      run.binding.Status == model.StorageDataSetStatusDraining,
-		CachePressure: pressure, ManualRequested: run.request.SealRequestedAt != nil,
-	})
+		Draining:        run.binding.Status == model.StorageDataSetStatusDraining,
+		ManualRequested: run.request.SealRequestedAt != nil,
+	}
+	seal, wait := storagecommit.ShouldSeal(input)
+	waitReason, message := "collecting", "Waiting for more stored data to register together"
+	if !seal {
+		pressure, err := h.commitCachePressure(ctx, run.request.RequestID)
+		if err != nil {
+			return retryTask(err, "cache_pressure_load_failed")
+		}
+		if pressure {
+			queue, err := h.deps.Repositories.Contents.CommitQueueState(ctx, run.request.StorageDataSetID, now)
+			if err != nil {
+				return retryTask(err, "commit_queue_load_failed")
+			}
+			input.CachePressure = true
+			input.PressureSealAllowed = queue.Submitted < storagecommit.MaxSubmittedRequestsPerDataSet && queue.ReadyHead == ""
+			seal, wait = storagecommit.ShouldSeal(input)
+			if !seal {
+				waitReason, message = storagecommit.PressureQueueWaitReason, "Collecting more data; waiting for earlier batches"
+			}
+			h.deps.Logger.DebugContext(ctx, "cache pressure batch sealing",
+				"request_id", run.request.RequestID, "storage_data_set_id", run.request.StorageDataSetID,
+				"cache_pressure", pressure, "submitted_requests", queue.Submitted,
+				"ready_head", queue.ReadyHead, "seal", seal)
+		}
+	}
 	if !seal {
 		if wait <= 0 || wait > commitCollectionPollInterval {
 			wait = commitCollectionPollInterval
 		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, wait, "collecting", "Waiting for more stored data to register together", nil)
+		return taskengine.Suspend(model.TaskResumeModeRecover, wait, waitReason, message, nil)
 	}
 	target, err := h.openReadyDataSet(ctx, run.binding)
 	if err != nil {
@@ -930,8 +950,11 @@ func (h *TaskHandlers) queueCommit(ctx context.Context, repos *repository.Reposi
 		CopyID: copyRow.ID, StorageDataSetID: copyRow.StorageDataSetID, MaxPieces: maxPieces,
 	})
 	if err == nil {
-		if members >= maxPieces || (h.deps.CommitSealOnCachePressure && h.cachePressure.Load() != nil) {
+		if members >= maxPieces {
 			return repos.Contents.WakeCommitRequestTask(ctx, requestID)
+		}
+		if h.deps.CommitSealOnCachePressure && h.cachePressure.Load() != nil {
+			return repos.Contents.WakeCommitRequestTaskOnCachePressure(ctx, requestID)
 		}
 		return nil
 	}
