@@ -440,7 +440,13 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 			return taskengine.Fail(err, reason, nil)
 		}
 		if checkpoint.TransactionID != "" {
-			return h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+			result := h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+			// AttemptedAt tracks the latest send; only one submitted request
+			// under the validated identity proves when work first started.
+			if checkpoint.Sends == 1 {
+				result = result.WithWorkStartedAt(checkpoint.AttemptedAt)
+			}
+			return result
 		}
 		// The request went out without its submission being recorded, so it may
 		// or may not have created the data set. Only the chain can tell.

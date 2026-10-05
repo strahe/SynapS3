@@ -285,7 +285,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 主体查询支持 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 和 `storage_commit_request`。本地资源 key 为正整数 ID，Provider key 为十进制 uint256 ID，存储确认 key 为请求 ID；分别编码两个路径参数。响应包含 `subject_type`、`subject_key` 和可用资源信息。`copy_index` 从 0 开始；`local_data_set_id` 与字符串 `data_set_id` 分别表示本地和链上 Dataset ID。文件样例包含 `key`、`source`（`current`、`historical` 或 `deleted`）及 `other_versions`。钱包金额保留为 USDFC 最小单位字符串。参数无效返回 `400`，主体信息不可用返回 `404`，查询失败返回 `500`；接口读取本地记录，可能返回部分信息。
 
-`started_at` 和 `finished_at` 保留小数秒。Tasks 页面仅在打开主体弹层时查询信息。Took 计算首次开始至结束的耗时，包含等待、重试及等待手动恢复的时间；Pending、Running 不显示耗时，Dismiss 不改变耗时。
+`started_at` 表示任务首次实际开始工作的时间。上传在存储资源等待和数据哈希完成后、即将传输时开始计时。尚未开始工作或无法可靠确定开始时间时省略该字段，包括无需实际工作就结束的任务。接管已有操作的任务，其开始时间可以早于 `created_at`。`started_at` 和 `finished_at` 保留小数秒。
+
+Took 计算实际开始至结束的耗时，包含开始后的等待、重试和恢复间隔。Pending、Running 及开始时间未知的任务不显示耗时；Dismiss 不改变耗时。Tasks 页面仅在打开主体弹层时查询信息。
 
 批量处理接受 JSON 请求体，其中 `type` 和 RFC 3339 格式的 `failed_before` 都是可选的，`failed_before` 默认为服务端处理请求的时刻：
 

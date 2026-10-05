@@ -29,6 +29,7 @@ const (
 //
 // The deletion gate is held on the content key for the same reason: two
 // versions of identical bytes contend for one file, not one file each.
+//
 // beforeDelete runs inside the authorized release transaction and must not
 // perform repository writes or wait for locks.
 func ReleaseContentCache(

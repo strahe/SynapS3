@@ -5802,6 +5802,122 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	}
 }
 
+func TestDataSetCreationRecoveryRestoresFirstWorkStart(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		sends         int
+		unknownTime   bool
+		existingStart bool
+	}{
+		{name: "first submission", sends: 1},
+		{name: "existing start", sends: 1, existingStart: true},
+		{name: "resubmitted request", sends: 2},
+		{name: "unknown send count"},
+		{name: "unknown attempted time", sends: 1, unknownTime: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sequence := storedObjectSequence.Add(1)
+			providerID := testOnChainID(t, 51000+sequence)
+			clientID := testOnChainID(t, 52000+sequence)
+			createdID := testOnChainID(t, 53000+sequence)
+			ref, err := storage.NewDataSetRef(providerID.SDK(), createdID.SDK(), clientID.SDK())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ready atomic.Bool
+			var sends atomic.Int64
+			target := &testutil.MockStorageTarget{
+				ProviderIDValue: providerID.SDK(),
+				CreateDataSetFunc: func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+					sends.Add(1)
+					return nil, errors.New("unexpected create request")
+				},
+				WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+					if !ready.Load() {
+						return nil, errors.New("submission status is temporarily unavailable")
+					}
+					return &storage.CreateDataSetResult{DataSet: ref}, nil
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: &testutil.MockStorageClient{
+					OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+						return target, nil
+					},
+				},
+				policy: cache.EvictionPolicyNone,
+				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+					return handlers.RegisterStorage(registry)
+				},
+			})
+			ctx := t.Context()
+			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("restore-start-%d", sequence))
+			const transactionID, statusURL = "0xsubmitted", "https://provider.example/status"
+			if err := runtime.repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+				ID: fixture.binding.ID, TransactionID: transactionID, StatusURL: statusURL, ClientDataSetID: &clientID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			baseTime := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+			attemptedAt := baseTime
+			if tc.unknownTime {
+				attemptedAt = time.Time{}
+			}
+			checkpoint, err := json.Marshal(map[string]any{
+				"attempted_at": attemptedAt, "client_data_set_id": clientID.String(),
+				"identity": testutil.DefaultContextIdentity, "sends": tc.sends,
+				"transaction_id": transactionID, "status_url": statusURL,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var existingStart, expectedStart *time.Time
+			if tc.sends == 1 && !tc.unknownTime {
+				expectedStart = &attemptedAt
+			}
+			if tc.existingStart {
+				knownStart := baseTime.Add(-time.Minute)
+				existingStart, expectedStart = &knownStart, &knownStart
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ?, work_started_at = ?, created_at = ? WHERE id = ?`,
+				model.TaskResumeModeRecover, existingStart, baseTime.Add(-30*time.Minute), fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertStart := func(row *model.Task) {
+				t.Helper()
+				if expectedStart == nil {
+					if row.WorkStartedAt != nil {
+						t.Fatalf("unverifiable first start was inferred as %v", row.WorkStartedAt)
+					}
+				} else if row.WorkStartedAt == nil || !row.WorkStartedAt.Equal(*expectedStart) {
+					t.Fatalf("work start = %v, want %v", row.WorkStartedAt, expectedStart)
+				}
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			pending := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(row *model.Task) bool {
+				return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "provider_confirmation"
+			})
+			assertStart(pending)
+			ready.Store(true)
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			completed := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(row *model.Task) bool {
+				return row.Status == model.TaskStatusCompleted
+			})
+			assertStart(completed)
+			if sends.Load() != 0 {
+				t.Fatalf("recovery sent %d duplicate create requests", sends.Load())
+			}
+		})
+	}
+}
+
 // A request is only looked up, waited on, or resent under the identity it was
 // signed for, and an ID the chain resolves to some other data set is never used
 // again. Both stop the task; only the conflict, which the chain settled, gives
@@ -5922,6 +6038,9 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			}
 			if runtime.service.Retryable(failed) != tt.retryable {
 				t.Fatalf("retryable = %v, want %v", runtime.service.Retryable(failed), tt.retryable)
+			}
+			if failed.WorkStartedAt != nil {
+				t.Fatalf("invalid request identity restored work start %v", failed.WorkStartedAt)
 			}
 			kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
 			if err != nil || kept.Status != tt.status || (kept.EnsureTaskID != nil) != tt.fenceHeld {

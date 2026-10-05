@@ -109,7 +109,10 @@ type Definition struct {
 type WorkStartPolicy uint8
 
 const (
+	// WorkStartOnHandler records work start before invoking the handler.
 	WorkStartOnHandler WorkStartPolicy = iota + 1
+	// WorkStartOnEffect leaves timing to WithCheckpointedEffect or validated
+	// handler evidence saved with checkpoint or Result.WithWorkStartedAt settlement.
 	WorkStartOnEffect
 )
 
