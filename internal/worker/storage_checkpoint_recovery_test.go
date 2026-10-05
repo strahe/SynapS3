@@ -87,6 +87,45 @@ func seedStoreCheckpoint(t *testing.T, runtime handlerTestRuntime, taskID, copyI
 	}
 }
 
+func TestStoreWorkStartsAfterHashPreparation(t *testing.T) {
+	payload := strings.Repeat("h", 128)
+	var runtime handlerTestRuntime
+	var taskID int64
+	var opens int
+	var readyAt time.Time
+	cacheStore := &testutil.MockCache{GetFunc: func(ctx context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+		opens++
+		stored, err := runtime.repos.Tasks.GetByID(ctx, taskID)
+		if err != nil || stored.WorkStartedAt != nil {
+			t.Fatalf("upload started while preparing cached bytes: %#v, err=%v", stored, err)
+		}
+		if opens == 2 {
+			readyAt = time.Now()
+		}
+		return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
+	}}
+	target := &testutil.MockStorageTarget{
+		ServiceURLValue: "https://store.example",
+		StoreFunc: func(ctx context.Context, _ io.Reader, _ *storage.StoreOptions) (*storage.StoreResult, error) {
+			stored, err := runtime.repos.Tasks.GetByID(ctx, taskID)
+			if err != nil || stored.WorkStartedAt == nil || readyAt.IsZero() || stored.WorkStartedAt.Before(readyAt) {
+				t.Fatalf("actual upload start = %#v, ready=%v, err=%v", stored, readyAt, err)
+			}
+			return nil, errors.New("upload awaiting recovery")
+		},
+	}
+	var pipeline seededCopyPipeline
+	runtime, pipeline, _ = storeRecoveryFixture(t, 1, payload, nil, cacheStore, target)
+	row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+	taskID = row.ID
+	runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskID, func(row *model.Task) bool {
+		return row.Status == model.TaskStatusPending && row.ResumeMode == model.TaskResumeModeRecover
+	})
+}
+
 func TestStoreProcessingAndQueryFailureLeaveRetryableCheckpoint(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
@@ -198,41 +237,80 @@ func TestStoreStopsAfterConfiguredAutomaticRetransmissions(t *testing.T) {
 }
 
 func TestNewStoreTaskAdoptsPreviousCheckpoint(t *testing.T) {
-	payload := strings.Repeat("a", 128)
-	var storeCalls atomic.Int64
-	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
-		return synapse.ParkedPieceReady, nil
-	})
-	target := &testutil.MockStorageTarget{
-		ServiceURLValue: "https://store.example",
-		StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
-			storeCalls.Add(1)
-			return nil, errors.New("unexpected upload")
-		},
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
-	}
-	runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, nil, target)
-	old := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
-	seedStoreCheckpoint(t, runtime, old.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), time.Now())
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET status = 'failed', finished_at = ?, resume_mode = 'recover' WHERE id = ?`, time.Now(), old.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.db.NewRaw(`UPDATE storage_copies SET status = 'failed', active_task_id = NULL WHERE id = ?`, pipeline.target.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.repos.Contents.ReopenFailedUploadCopy(t.Context(), pipeline.target.ID); err != nil {
-		t.Fatal(err)
-	}
-	newTask := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	completed := waitForTask(t, runtime.repos, newTask.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-	if len(completed.Checkpoint) == 0 {
-		t.Fatal("new Store task did not retain the previous checkpoint")
-	}
-	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow.Status == model.StorageCopyStatusPending || copyRow.Status == model.StorageCopyStatusFailed || storeCalls.Load() != 0 {
-		t.Fatalf("adopted Store copy = %#v, uploads:%d, err:%v", copyRow, storeCalls.Load(), err)
+	for _, tc := range []struct {
+		name             string
+		knownStart       bool
+		identityConflict bool
+	}{
+		{name: "known start", knownStart: true},
+		{name: "unknown start"},
+		{name: "identity conflict", knownStart: true, identityConflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := strings.Repeat("a", 128)
+			var storeCalls atomic.Int64
+			parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+				return synapse.ParkedPieceReady, nil
+			})
+			target := &testutil.MockStorageTarget{
+				ServiceURLValue: "https://store.example",
+				StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+					storeCalls.Add(1)
+					return nil, errors.New("unexpected upload")
+				},
+				PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return testutil.CommitExtraData(7), nil },
+			}
+			runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, nil, target)
+			old := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+			seedStoreCheckpoint(t, runtime, old.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), time.Now())
+			startedAt := time.Now().UTC().Add(-30 * time.Minute).Truncate(time.Microsecond)
+			var historicalStart *time.Time
+			if tc.knownStart {
+				historicalStart = &startedAt
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET status = 'failed', finished_at = ?, resume_mode = 'recover', work_started_at = ? WHERE id = ?`, time.Now(), historicalStart, old.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE storage_copies SET status = 'failed', active_task_id = NULL WHERE id = ?`, pipeline.target.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Contents.ReopenFailedUploadCopy(t.Context(), pipeline.target.ID); err != nil {
+				t.Fatal(err)
+			}
+			newTask := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+			if tc.identityConflict {
+				if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET input_json = ? WHERE task_id = ?`, newTask.Input, old.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			completed := waitForTask(t, runtime.repos, newTask.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusCompleted || task.Status == model.TaskStatusFailed
+			})
+			if tc.identityConflict {
+				if completed.Status != model.TaskStatusFailed || completed.LastError == nil || !strings.Contains(*completed.LastError, "identity conflicts") || completed.WorkStartedAt != nil || len(completed.Checkpoint) != 0 || storeCalls.Load() != 0 {
+					t.Fatalf("conflicting Store adoption = %#v, uploads:%d", completed, storeCalls.Load())
+				}
+				return
+			}
+			if completed.Status != model.TaskStatusCompleted {
+				t.Fatalf("adopted Store status = %s, error:%v", completed.Status, completed.LastError)
+			}
+			if len(completed.Checkpoint) == 0 {
+				t.Fatal("new Store task did not retain the previous checkpoint")
+			}
+			if tc.knownStart && (completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(startedAt)) {
+				t.Fatalf("adopted operation start = %v, want %v", completed.WorkStartedAt, startedAt)
+			}
+			if !tc.knownStart && completed.WorkStartedAt != nil {
+				t.Fatalf("unknown operation start was inferred as %v", completed.WorkStartedAt)
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || copyRow.Status == model.StorageCopyStatusPending || copyRow.Status == model.StorageCopyStatusFailed || storeCalls.Load() != 0 {
+				t.Fatalf("adopted Store copy = %#v, uploads:%d, err:%v", copyRow, storeCalls.Load(), err)
+			}
+		})
 	}
 }
 

@@ -22,6 +22,7 @@ test('a stopped storage registration shows its identity and offers Retry instead
     available_at: '2026-10-01T00:00:00Z',
     created_at: '2026-10-01T00:00:00Z',
     updated_at: '2026-10-01T00:00:00Z',
+    last_error: 'Storage confirmation failed',
     storage_confirmation: {
       request_id: 'request-1',
       reason_code: 'submission_mismatch',
@@ -47,6 +48,7 @@ test('a stopped storage registration shows its identity and offers Retry instead
   await page.getByRole('button', { name: 'Sign In' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
   await page.getByRole('link', { name: 'Tasks', exact: true }).click()
+  await expect(page.getByText('Storage confirmation failed', { exact: true })).toBeVisible()
   await expect(page.getByText('Confirmation does not match')).toBeVisible()
   await page.getByText('Confirmation details', { exact: true }).click()
   for (const identity of [

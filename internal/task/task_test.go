@@ -54,6 +54,7 @@ func (h scriptedHandler) Recover(ctx context.Context, execution Execution) Resul
 func testDefinition(retryLimit *int, allowRetry bool) Definition {
 	return Definition{
 		Type:         testTaskType,
+		WorkStart:    WorkStartOnEffect,
 		InputVersion: 1,
 		Codec: StrictJSONCodec(func(input *testInput) error {
 			if input.Value == "" {
@@ -242,7 +243,7 @@ func TestEngineConstructionFreezesRegistry(t *testing.T) {
 	limit := 5
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
 	err := harness.registry.Register(scriptedHandler{definition: Definition{
-		Type: "late_operation", InputVersion: 1,
+		Type: "late_operation", InputVersion: 1, WorkStart: WorkStartOnEffect,
 		Codec: StrictJSONCodec(func(input *testInput) error { return nil }),
 	}})
 	if !errors.Is(err, ErrRegistryFrozen) {
@@ -613,6 +614,9 @@ func TestExpiredClaimIsRecoveredAndStaleGenerationIsFenced(t *testing.T) {
 	if err := harness.repos.Tasks.WriteCheckpoint(t.Context(), stale.ID, stale.ClaimGeneration, []byte(`{"stale":true}`)); !errors.Is(err, repository.ErrTaskLeaseLost) {
 		t.Fatalf("stale checkpoint error = %v", err)
 	}
+	if err := harness.repos.Tasks.MarkWorkStarted(t.Context(), stale.ID, stale.ClaimGeneration, time.Now()); !errors.Is(err, repository.ErrTaskLeaseLost) {
+		t.Fatalf("stale work start error = %v", err)
+	}
 	if err := harness.repos.Tasks.Settle(t.Context(), stale.ID, stale.ClaimGeneration, repository.TaskTransition{
 		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
 	}); !errors.Is(err, repository.ErrTaskLeaseLost) {
@@ -842,7 +846,7 @@ func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
 		{
 			name: "resource admission fails", mode: model.TaskResumeModeExecute,
 			resource: func(context.Context, Resource, func(context.Context) error) error { return context.Canceled },
-			checkpoint: func(context.Context, any, Settlement) error {
+			checkpoint: func(context.Context, any, Settlement, bool) error {
 				t.Fatal("checkpoint ran before resource admission")
 				return nil
 			},
@@ -851,7 +855,7 @@ func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
 		{
 			name: "checkpoint fails", mode: model.TaskResumeModeExecute,
 			resource: func(ctx context.Context, _ Resource, fn func(context.Context) error) error { return fn(ctx) },
-			checkpoint: func(context.Context, any, Settlement) error {
+			checkpoint: func(context.Context, any, Settlement, bool) error {
 				return injected
 			},
 			wantError: injected,
@@ -859,7 +863,7 @@ func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
 		{
 			name: "effect fails", mode: model.TaskResumeModeExecute,
 			resource: func(ctx context.Context, _ Resource, fn func(context.Context) error) error { return fn(ctx) },
-			checkpoint: func(ctx context.Context, _ any, settlement Settlement) error {
+			checkpoint: func(ctx context.Context, _ any, settlement Settlement, _ bool) error {
 				return settlement(ctx, nil)
 			},
 			wantAttempted: true, wantEffectCalls: 1, wantError: injected,
@@ -870,7 +874,7 @@ func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
 				t.Fatal("recovery reached resource runner")
 				return nil
 			},
-			checkpoint: func(context.Context, any, Settlement) error {
+			checkpoint: func(context.Context, any, Settlement, bool) error {
 				t.Fatal("recovery wrote checkpoint")
 				return nil
 			},
@@ -920,7 +924,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 	row := enqueueTestTask(t, harness, "checkpoint-rollback", "checkpoint-rollback")
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "effect_not_started" || stored.CancellationRequestedAt != nil || len(stored.Checkpoint) != 0 {
+	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "effect_not_started" || stored.CancellationRequestedAt != nil || len(stored.Checkpoint) != 0 || stored.WorkStartedAt != nil {
 		t.Fatalf("rolled-back task = %#v, err=%v", stored, err)
 	}
 	if effectCalled.Load() {
@@ -949,6 +953,9 @@ func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun
 					return err
 				}
 				duringEffect = stored.Checkpoint
+				if stored.WorkStartedAt == nil {
+					return errors.New("work start was not committed before the effect")
+				}
 				return nil
 			})
 			if !attempted || err != nil {

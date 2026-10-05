@@ -132,6 +132,7 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 		repos.Objects,
 		bucket.Name,
 		*deletion.ContentID,
+		nil,
 	)
 	if releaseErr != nil || outcome != objectdeletion.CacheReleaseReleased {
 		t.Fatalf("ReleaseContentCache = %q, %v, want released", outcome, releaseErr)

@@ -429,7 +429,7 @@ type pullSlotProbe struct {
 }
 
 func (p *pullSlotProbe) Definition() taskengine.Definition {
-	return taskengine.Definition{Type: "pull_slot_probe", InputVersion: 1, Codec: taskengine.StrictJSONCodec(func(*struct{}) error { return nil })}
+	return taskengine.Definition{Type: "pull_slot_probe", InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect, Codec: taskengine.StrictJSONCodec(func(*struct{}) error { return nil })}
 }
 
 func (p *pullSlotProbe) Execute(ctx context.Context, execution taskengine.Execution) taskengine.Result {

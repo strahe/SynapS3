@@ -224,7 +224,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 
 	execution := Execution{
 		task: *claimed,
-		checkpoint: func(ctx context.Context, value any, settlement Settlement) error {
+		checkpoint: func(ctx context.Context, value any, settlement Settlement, startWork bool) error {
 			if !leaseSafe.Load() {
 				return repository.ErrTaskLeaseLost
 			}
@@ -241,7 +241,13 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 						return err
 					}
 				}
-				return txRepos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, checkpoint)
+				if err := txRepos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, checkpoint); err != nil {
+					return err
+				}
+				if startWork {
+					return txRepos.Tasks.MarkWorkStarted(ctx, claimed.ID, claimed.ClaimGeneration, time.Now())
+				}
+				return nil
 			})
 		},
 		resource: func(ctx context.Context, resource Resource, fn func(context.Context) error) error {
@@ -263,6 +269,19 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 		},
 	}
 
+	if definition.WorkStart == WorkStartOnHandler {
+		if !leaseSafe.Load() {
+			stopLeaseRenewal()
+			e.abandonClaim(claimed)
+			return
+		}
+		if err := e.repos.Tasks.MarkWorkStarted(handlerCtx, claimed.ID, claimed.ClaimGeneration, time.Now()); err != nil {
+			logger.Error("recording task work start", "error", err)
+			stopLeaseRenewal()
+			e.abandonClaim(claimed)
+			return
+		}
+	}
 	result, panicked := invokeHandler(handlerCtx, handler, execution)
 	if panicked != nil {
 		logger.Error("task handler panicked", "error", panicked, "stack", string(debug.Stack()))
@@ -458,6 +477,7 @@ func invokeSettlement(ctx context.Context, settlement Settlement, repos *reposit
 func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.TaskTransition {
 	now := time.Now()
 	transition := repository.TaskTransition{
+		WorkStartedAt: result.workStartedAt,
 		ResumeMode:    model.TaskResumeModeRecover,
 		WaitReason:    textPointer(result.waitReason),
 		FailureReason: textPointer(result.failureReason),
@@ -470,6 +490,7 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.Status = model.TaskStatusCompleted
 		transition.RetentionUntil = &retention
 	case resultSuspend:
+		transition.ClearWorkStartedAt = claimed.Type.IsRecurringSystem() && result.waitReason == "scheduled" && result.err == nil
 		delay := result.delay
 		if result.resourceWait {
 			delay = e.resourceWaitDelay(e.consecutiveResourceWaits(claimed.ID))

@@ -22,7 +22,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTasks } from '@/hooks/queries'
 import { storageConfirmationAttentionView } from '@/lib/storage-confirmation-attention'
-import { taskOperationLabel, taskTook } from '@/lib/tasks'
+import { taskDetailsView, taskOperationLabel, taskTook } from '@/lib/tasks'
 import { timeAgo } from '@/lib/utils'
 
 const PAGE_SIZE = 20
@@ -356,7 +356,7 @@ function TaskTable({
                   <button type="button">Took</button>
                 </TooltipTrigger>
                 <TooltipContent className="max-w-72">
-                  Time from first start to finish, including waits, retries, and time awaiting recovery.
+                  Time from start to finish, including later waits, retries, and recovery.
                 </TooltipContent>
               </Tooltip>
             </TableHead>
@@ -436,38 +436,51 @@ function TaskTable({
 }
 
 function TaskDetails({ task }: { task: TaskItem }) {
+  const details = taskDetailsView(task)
   const confirmation = task.storage_confirmation
-  if (confirmation) {
-    const attention = storageConfirmationAttentionView(confirmation.reason_code)
-    return (
-      <div className="flex flex-col gap-1">
-        <span className="text-sm text-status-warning">{attention.label}</span>
-        {confirmation.submit_error && (
-          <CopyableValue
-            value={confirmation.submit_error}
-            label="Provider response"
-            displayValue={confirmation.submit_error}
-            maxLength={80}
-          />
-        )}
+  const attention = confirmation ? storageConfirmationAttentionView(confirmation.reason_code) : undefined
+  return (
+    <div className="flex flex-col gap-1">
+      {details.value ? (
+        <CopyableValue value={details.value} label={details.label} displayValue={details.value} maxLength={80} />
+      ) : !confirmation ? (
+        <span className="text-muted-foreground">—</span>
+      ) : null}
+      {confirmation && (
+        <>
+          {attention && attention.label !== details.value && (
+            <span className="text-sm text-status-warning">{attention.label}</span>
+          )}
+          {confirmation.submit_error && (
+            <CopyableValue
+              value={confirmation.submit_error}
+              label="Provider response"
+              displayValue={confirmation.submit_error}
+              maxLength={80}
+            />
+          )}
+          <details className="text-sm">
+            <summary className="cursor-pointer text-muted-foreground">Confirmation details</summary>
+            <div className="mt-2">
+              <StorageConfirmationDetails confirmation={confirmation} />
+            </div>
+          </details>
+        </>
+      )}
+      {details.lastError && (
         <details className="text-sm">
-          <summary className="cursor-pointer text-muted-foreground">Confirmation details</summary>
+          <summary className="cursor-pointer text-muted-foreground">Last error</summary>
           <div className="mt-2">
-            <StorageConfirmationDetails confirmation={confirmation} />
+            <CopyableValue
+              value={details.lastError}
+              label="Last error"
+              displayValue={details.lastError}
+              maxLength={80}
+            />
           </div>
         </details>
-      </div>
-    )
-  }
-  const value = task.last_error || task.status_message || '—'
-  if (value === '—') return <span className="text-muted-foreground">—</span>
-  return (
-    <CopyableValue
-      value={value}
-      label={task.last_error ? 'Task error' : 'Task details'}
-      displayValue={value}
-      maxLength={80}
-    />
+      )}
+    </div>
   )
 }
 
@@ -476,7 +489,7 @@ function TaskDetails({ task }: { task: TaskItem }) {
 function TaskCreatedTime({ task }: { task: TaskItem }) {
   const lifecycle: Array<[label: string, time: string | undefined]> = [
     ['Created', task.created_at],
-    ['Started', task.started_at],
+    [task.type === 'storage_store' ? 'Upload started' : 'Started', task.started_at],
     ['Finished', task.finished_at],
     [
       'Next attempt',

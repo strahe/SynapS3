@@ -50,6 +50,68 @@ async function pauseClock(page: Page) {
   await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000))
 }
 
+test('task details keep historical errors separate and show the actual upload start', async ({
+  page,
+  systemServer,
+}) => {
+  const row = task(201)
+  row.created_at = '2026-10-02T23:30:00Z'
+  row.status_message = 'Checking storage transfer'
+  row.last_error = 'Previous request failed'
+  await openTasks(page, systemServer.adminURL, [row])
+  const tableRow = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: 'Content #128', exact: true }) })
+  await expect(tableRow.getByText('Checking storage transfer', { exact: true })).toBeVisible()
+  await expect(tableRow.getByText('Previous request failed', { exact: true })).not.toBeVisible()
+  await tableRow.getByText('Last error', { exact: true }).click()
+  await expect(tableRow.getByText('Previous request failed', { exact: true })).toBeVisible()
+  await tableRow.getByRole('cell').nth(4).locator('span').hover()
+  await expect(page.getByRole('tooltip').getByText('Created', { exact: true })).toBeVisible()
+  await expect(page.getByRole('tooltip').getByText('Upload started', { exact: true })).toBeVisible()
+  await expect(tableRow.getByText('2m 13s', { exact: true })).toBeVisible()
+  await tableRow.getByText('Last error', { exact: true }).click()
+  row.status = 'running'
+  row.presentation_status = 'running'
+  row.started_at = undefined
+  row.finished_at = undefined
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await expect(tableRow.getByText('Checking storage transfer', { exact: true })).toBeVisible()
+  await expect(tableRow.getByText('Previous request failed', { exact: true })).not.toBeVisible()
+  await expect(tableRow.getByText('2m 13s', { exact: true })).toHaveCount(0)
+  row.status = 'failed'
+  row.presentation_status = 'failed'
+  row.started_at = '2026-10-03T00:00:00Z'
+  row.finished_at = '2026-10-03T00:02:13Z'
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await expect(tableRow.getByText('Previous request failed', { exact: true })).toBeVisible()
+  await expect(tableRow.getByText('Last error', { exact: true })).toHaveCount(0)
+})
+
+test('tasks without an actual start hide the start time and duration', async ({ page, systemServer }) => {
+  const running = task(201)
+  running.status = 'running'
+  running.presentation_status = 'running'
+  running.started_at = undefined
+  running.finished_at = undefined
+  const completed = task(200, '129')
+  completed.started_at = undefined
+  await openTasks(page, systemServer.adminURL, [running, completed])
+  const rows = page.getByRole('row')
+  for (const key of ['128', '129']) {
+    const row = rows.filter({ has: page.getByRole('button', { name: `Content #${key}`, exact: true }) })
+    await expect(row.getByRole('cell').nth(5)).toHaveText('—')
+  }
+  await rows
+    .filter({ has: page.getByRole('button', { name: 'Content #128', exact: true }) })
+    .getByRole('cell')
+    .nth(4)
+    .locator('span')
+    .hover()
+  await expect(page.getByRole('tooltip').getByText('Created', { exact: true })).toBeVisible()
+  await expect(page.getByRole('tooltip').getByText('Upload started', { exact: true })).toHaveCount(0)
+})
+
 test('subject popovers close on the next mouse or keyboard click after dragging away', async ({
   page,
   systemServer,

@@ -81,6 +81,7 @@ func TestReleaseContentCacheDeletesTheContentKeyAndClearsPresence(t *testing.T) 
 
 	outcome, err := objectdeletion.ReleaseContentCache(
 		context.Background(), mockCache, gate, tracker, recorder, "bucket", 41,
+		nil,
 	)
 	if err != nil || outcome != objectdeletion.CacheReleaseReleased {
 		t.Fatalf("ReleaseContentCache = %q, %v, want released", outcome, err)
@@ -99,6 +100,7 @@ func TestReleaseContentCacheReportsFailureWithoutClearingPresence(t *testing.T) 
 
 	outcome, err := objectdeletion.ReleaseContentCache(
 		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder, "bucket", 41,
+		nil,
 	)
 	if err == nil || outcome != objectdeletion.CacheReleaseRetained {
 		t.Fatalf("ReleaseContentCache = %q, %v, want retained with an error", outcome, err)
@@ -116,6 +118,7 @@ func TestReleaseContentCacheRetainsReferencedContent(t *testing.T) {
 
 	outcome, err := objectdeletion.ReleaseContentCache(
 		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder, "bucket", 41,
+		nil,
 	)
 	if err != nil || outcome != objectdeletion.CacheReleaseRetained {
 		t.Fatalf("ReleaseContentCache = %q, %v, want retained", outcome, err)

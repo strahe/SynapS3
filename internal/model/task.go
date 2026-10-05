@@ -112,6 +112,7 @@ type Task struct {
 	RetentionUntil          *time.Time `bun:",nullzero"`
 	CreatedAt               time.Time  `bun:",nullzero,notnull"`
 	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
+	WorkStartedAt           *time.Time `bun:",nullzero"`
 }
 
 // TaskPayload carries a task's input and checkpoint JSON. It is a separate row

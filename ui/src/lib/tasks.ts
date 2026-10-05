@@ -61,6 +61,16 @@ export function taskSystemDescription(type: string) {
   return descriptions[type] ?? 'Runs maintenance for this node.'
 }
 
+export function taskDetailsView(task: Pick<TaskItem, 'status' | 'last_error' | 'status_message'>) {
+  const failed = task.status === 'failed'
+  const value = failed ? task.last_error || task.status_message : task.status_message
+  return {
+    value,
+    label: failed && task.last_error ? 'Task error' : 'Task details',
+    lastError: !failed && task.last_error !== value ? task.last_error : undefined,
+  }
+}
+
 export function taskTook(task: Pick<TaskItem, 'status' | 'started_at' | 'finished_at'>) {
   if (task.status === 'pending' || task.status === 'running' || !task.started_at || !task.finished_at) return '—'
   const milliseconds = Date.parse(task.finished_at) - Date.parse(task.started_at)

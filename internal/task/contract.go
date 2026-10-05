@@ -88,6 +88,7 @@ func StrictJSONCodec[T any](validate func(*T) error) Codec {
 // Definition is the complete persistent contract for a task type.
 type Definition struct {
 	Type         model.TaskType
+	WorkStart    WorkStartPolicy
 	InputVersion int
 	Codec        Codec
 	RetryLimit   *int
@@ -103,6 +104,14 @@ type Definition struct {
 	// the subject and refuses one that names a different row.
 	Subject SubjectFunc
 }
+
+// WorkStartPolicy identifies when a task begins its own work.
+type WorkStartPolicy uint8
+
+const (
+	WorkStartOnHandler WorkStartPolicy = iota + 1
+	WorkStartOnEffect
+)
 
 // Subject names the domain row a task works on.
 type Subject struct {
@@ -139,6 +148,9 @@ func (d Definition) validate() error {
 	}
 	if d.RetryLimit != nil && *d.RetryLimit < 0 {
 		return fmt.Errorf("negative retry limit for %q", d.Type)
+	}
+	if d.WorkStart != WorkStartOnHandler && d.WorkStart != WorkStartOnEffect {
+		return fmt.Errorf("work start policy is required for %q", d.Type)
 	}
 	return nil
 }
@@ -177,6 +189,17 @@ type Result struct {
 	err           error
 	message       string
 	settlement    Settlement
+	workStartedAt *time.Time
+}
+
+// WithWorkStartedAt carries observed operation timing into fenced settlement.
+// Zero means no operation was observed; existing first-start evidence is kept.
+func (r Result) WithWorkStartedAt(startedAt time.Time) Result {
+	if !startedAt.IsZero() {
+		startedAt = startedAt.UTC()
+		r.workStartedAt = &startedAt
+	}
+	return r
 }
 
 func Complete(message string, settlement Settlement) Result {
@@ -241,7 +264,7 @@ const (
 )
 
 type (
-	checkpointWriter func(context.Context, any, Settlement) error
+	checkpointWriter func(context.Context, any, Settlement, bool) error
 	resourceRunner   func(context.Context, Resource, func(context.Context) error) error
 )
 
@@ -285,7 +308,7 @@ func (e Execution) WriteCheckpointWith(ctx context.Context, value any, settlemen
 	if e.checkpoint == nil {
 		return errors.New("checkpoint writer is unavailable")
 	}
-	return e.checkpoint(ctx, value, settlement)
+	return e.checkpoint(ctx, value, settlement, false)
 }
 
 // WithResource runs fn while holding one slot of resource. It never waits for a
@@ -317,7 +340,10 @@ func (e Execution) WithCheckpointedEffect(
 		return false, errors.New("external effect is required")
 	}
 	err = e.WithResource(ctx, resource, func(ctx context.Context) error {
-		if err := e.WriteCheckpointWith(ctx, checkpoint, settlement); err != nil {
+		if e.checkpoint == nil {
+			return errors.New("checkpoint writer is unavailable")
+		}
+		if err := e.checkpoint(ctx, checkpoint, settlement, true); err != nil {
 			return err
 		}
 		attempted = true

@@ -56,7 +56,7 @@ type cacheEvictionCheckpoint struct {
 
 func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeCacheCapacityReconcile, InputVersion: 1,
+		Type: model.TaskTypeCacheCapacityReconcile, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}
@@ -208,7 +208,7 @@ func (h *TaskHandlers) planLRUEvictions(ctx context.Context, bytesToPlan int64) 
 
 func (h *TaskHandlers) cacheEvictHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeCacheEvict, InputVersion: 1,
+		Type: model.TaskTypeCacheEvict, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec:      taskengine.StrictJSONCodec(cacheeviction.ValidateEvictInput),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) int64 {
@@ -273,7 +273,9 @@ func (h *TaskHandlers) deleteAuthorizedCacheEntry(
 	execution taskengine.Execution,
 	input cacheeviction.EvictInput,
 	allowDelete bool,
-) taskengine.Result {
+) (result taskengine.Result) {
+	var workStartedAt time.Time
+	defer func() { result = result.WithWorkStartedAt(workStartedAt) }()
 	deletionSucceeded := false
 	if input.AccessedAt != nil && allowDelete {
 		if !h.deps.CacheTracker.SafeForLRU() {
@@ -364,6 +366,7 @@ func (h *TaskHandlers) deleteAuthorizedCacheEntry(
 		if err != nil {
 			return err
 		}
+		workStartedAt = time.Now().UTC()
 		if err := h.deps.Cache.Delete(ctx, authorized.BucketName, model.ContentCacheKey(authorized.Content.ID)); err != nil {
 			return fmt.Errorf("deleting cache file: %w", err)
 		}
@@ -471,7 +474,7 @@ func cacheWatermarkBytes(maxBytes int64, percent int) int64 {
 
 func (h *TaskHandlers) cacheDurabilityHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeCacheReconcileDurability, InputVersion: 1,
+		Type: model.TaskTypeCacheReconcileDurability, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec:      taskengine.StrictJSONCodec(cacheeviction.ValidateDurabilityInput),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
 	}
@@ -523,7 +526,7 @@ func (h *TaskHandlers) cacheDurabilityHandler() taskengine.Handler {
 
 func (h *TaskHandlers) storageCleanupHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeStorageCleanup, InputVersion: 1,
+		Type: model.TaskTypeStorageCleanup, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec:      taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) int64 {
@@ -717,7 +720,9 @@ func waitForStorageCleanupOutcome(copyRow model.StorageCleanupCopy, checkpoint c
 // finishStorageCleanup releases the content's cached bytes and then deletes its
 // current-state rows, so writing the same bytes again starts new content. The
 // ledgers keep their rows, including any remote deletion left unsupported.
-func (h *TaskHandlers) finishStorageCleanup(ctx context.Context, execution taskengine.Execution, input storagecleanup.Input) taskengine.Result {
+func (h *TaskHandlers) finishStorageCleanup(ctx context.Context, execution taskengine.Execution, input storagecleanup.Input) (result taskengine.Result) {
+	var workStartedAt time.Time
+	defer func() { result = result.WithWorkStartedAt(workStartedAt) }()
 	if h.deps.Cache == nil || h.deps.CacheGate == nil || h.deps.CacheTracker == nil {
 		return taskengine.Fail(errors.New("cache dependencies are unavailable"), "dependency_unavailable", nil)
 	}
@@ -731,6 +736,7 @@ func (h *TaskHandlers) finishStorageCleanup(ctx context.Context, execution taske
 	}
 	if _, err := objectdeletion.ReleaseContentCache(
 		ctx, h.deps.Cache, h.deps.CacheGate, h.deps.CacheTracker, h.deps.Repositories.Objects, bucket.Name, input.ContentID,
+		func() { workStartedAt = time.Now().UTC() },
 	); err != nil {
 		return retryTask(err, "cleanup_cache_release_failed")
 	}
@@ -749,7 +755,7 @@ func (h *TaskHandlers) finishStorageCleanup(ctx context.Context, execution taske
 
 func (h *TaskHandlers) walletHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeWalletOperation, InputVersion: 1,
+		Type: model.TaskTypeWalletOperation, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec:      taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
 		// Recovery never broadcasts without proof that nothing was sent, so a
@@ -841,7 +847,7 @@ func (h *TaskHandlers) executeWalletOperation(ctx context.Context, execution tas
 	return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", nil)
 }
 
-func (h *TaskHandlers) recoverWalletOperation(ctx context.Context, execution taskengine.Execution) taskengine.Result {
+func (h *TaskHandlers) recoverWalletOperation(ctx context.Context, execution taskengine.Execution) (result taskengine.Result) {
 	input, err := taskengine.DecodeInput[walletoperation.Input](execution)
 	if err != nil {
 		return decodeFailure(string(model.TaskTypeWalletOperation), err)
@@ -849,6 +855,9 @@ func (h *TaskHandlers) recoverWalletOperation(ctx context.Context, execution tas
 	op, err := h.deps.Repositories.WalletOperations.GetByID(ctx, input.OperationID)
 	if err != nil {
 		return h.retryWalletOperation(execution, input.OperationID, err, "wallet_load_failed")
+	}
+	if op != nil && op.TaskID != nil && *op.TaskID == execution.ID() && op.BroadcastAttemptedAt != nil {
+		defer func() { result = result.WithWorkStartedAt(*op.BroadcastAttemptedAt) }()
 	}
 	if result, done := h.walletTerminalResult(op, execution.ID()); done {
 		return result
@@ -965,7 +974,7 @@ func broadcastWalletOperation(ctx context.Context, operator synapse.WalletOperat
 
 func (h *TaskHandlers) observabilityHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeObservabilityRefresh, InputVersion: 1,
+		Type: model.TaskTypeObservabilityRefresh, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}
@@ -991,7 +1000,7 @@ func (h *TaskHandlers) observabilityHandler() taskengine.Handler {
 
 func (h *TaskHandlers) providerTierHandler(taskType model.TaskType, tier string) taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: taskType, InputVersion: 1,
+		Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}
@@ -1021,7 +1030,7 @@ func (h *TaskHandlers) providerTierHandler(taskType model.TaskType, tier string)
 
 func (h *TaskHandlers) gcHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeGC, InputVersion: 1,
+		Type: model.TaskTypeGC, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}

@@ -15,7 +15,7 @@ import (
 func (h *TaskHandlers) providerUploadSpeedHandler() taskengine.Handler {
 	return taskHandler{
 		definition: taskengine.Definition{
-			Type: model.TaskTypeProviderUploadSpeedTest, InputVersion: 1,
+			Type: model.TaskTypeProviderUploadSpeedTest, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 			Codec: taskengine.StrictJSONCodec(func(input *providerbenchmark.Input) error {
 				if input.ProviderID == "" || len(input.ServiceURLHash) != 64 {
 					return errors.New("invalid provider upload speed input")
