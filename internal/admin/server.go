@@ -23,6 +23,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/ui"
@@ -64,6 +65,7 @@ type Server struct {
 	trustedProxies          []netip.Prefix
 	s3IAM                   auth.IAMService
 	s3RootAccess            string
+	anchorProviderTier      providerselect.Tier
 	filecoinDefaultCopies   int
 	commitMaxPieces         int
 	commitMaxWait           time.Duration
@@ -107,6 +109,7 @@ func New(
 		panic("admin server requires a cache access tracker")
 	}
 	s := &Server{
+		anchorProviderTier:    providerselect.TierApproved,
 		addr:                  addr,
 		db:                    db,
 		cache:                 c,
@@ -205,6 +208,11 @@ func (s *Server) WithSettings(settings *SettingsService) *Server {
 // WithFilecoinReadiness enables Filecoin readiness API routes.
 func (s *Server) WithFilecoinReadiness(probe filecoinReadinessProbe) *Server {
 	s.filecoinReadiness = probe
+	return s
+}
+
+func (s *Server) WithProviderTier(tier providerselect.Tier) *Server {
+	s.anchorProviderTier = tier
 	return s
 }
 

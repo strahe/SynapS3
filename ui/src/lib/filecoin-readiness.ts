@@ -51,6 +51,7 @@ const filecoinPayloadKeys = [
   'with_cdn',
   'allow_private_networks',
   'default_copies',
+  'anchor_provider_tier',
 ] as const satisfies Array<keyof SettingsFilecoinConfig>
 
 const filecoinPayloadFieldPaths: Record<(typeof filecoinPayloadKeys)[number], string> = {
@@ -59,6 +60,7 @@ const filecoinPayloadFieldPaths: Record<(typeof filecoinPayloadKeys)[number], st
   with_cdn: 'filecoin.with_cdn',
   allow_private_networks: 'filecoin.allow_private_networks',
   default_copies: 'filecoin.default_copies',
+  anchor_provider_tier: 'filecoin.anchor_provider_tier',
 }
 
 const filecoinObservabilityPayloadKeys = ['interval', 'timeout', 'concurrency'] as const satisfies Array<
@@ -76,6 +78,7 @@ const checkTitles: Record<string, string> = {
   config_rpc_url: 'RPC URL',
   config_network: 'Network selection',
   config_default_copies: 'Default copy count',
+  config_provider_requirement: 'Provider requirement',
   private_networks: 'Private network access',
   sdk_client: 'Filecoin SDK client',
   network_match: 'RPC network',

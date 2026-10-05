@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -171,7 +173,7 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "price list changed", "code": "price_list_changed"})
 		return
 	}
-	targetProvider, err := s.resolveReplacementProvider(ctx, bucket, source, mode, req.ProviderID)
+	targetProvider, admission, err := s.resolveReplacementProvider(ctx, bucket, source, mode, req.ProviderID)
 	if err != nil {
 		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
 			return
@@ -191,6 +193,18 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 	created := false
 	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 		var authorizeErr error
+		if err := txRepos.Buckets.LockByID(ctx, bucket.ID); err != nil {
+			return err
+		}
+		existing, err := txRepos.Replacements.GetByClientRequestID(ctx, bucket.ID, req.ClientRequestID)
+		if err != nil {
+			return err
+		}
+		if existing == nil {
+			if err := txRepos.ValidateProviderSelection(ctx, bucket.ID, source.ID, admission, []idtypes.OnChainID{targetProvider}); err != nil {
+				return err
+			}
+		}
 		row, created, authorizeErr = txRepos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 			BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: mode,
 			TargetProviderID: targetProvider, ClientRequestID: req.ClientRequestID,
@@ -272,81 +286,72 @@ func replacementReplayMatches(
 }
 
 // resolveReplacementProvider turns the operator's choice into one provider.
-// Automatic selection excludes every provider the bucket has used, including
-// retired generations, and confirms FWSS approval on chain.
-func (s *Server) resolveReplacementProvider(
-	ctx context.Context,
-	bucket *model.Bucket,
-	source *model.StorageDataSet,
-	mode storagereplacement.SelectionMode,
-	requested string,
-) (idtypes.OnChainID, error) {
-	switch mode {
-	case storagereplacement.SelectionModeManual:
-		providerID, err := idtypes.ParseOnChainID("provider_id", requested)
-		if err != nil || providerID.IsZero() {
-			return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
+// Automatic selection ranks eligible providers using the bucket preference.
+func (s *Server) resolveReplacementProvider(ctx context.Context, bucket *model.Bucket, source *model.StorageDataSet, mode storagereplacement.SelectionMode, requested string) (idtypes.OnChainID, providerselect.Admission, error) {
+	var admission providerselect.Admission
+	var requestedID *idtypes.OnChainID
+	if mode == storagereplacement.SelectionModeManual {
+		id, err := idtypes.ParseOnChainID("provider_id", requested)
+		if err != nil || id.IsZero() || id.Equal(source.ProviderID) {
+			return idtypes.OnChainID{}, admission, storagereplacement.ErrInvalidTarget
 		}
-		if providerID.Equal(source.ProviderID) {
-			return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
-		}
-		candidates, err := s.replacementProviderCandidatesFor(ctx, bucket, source, &providerID)
-		if err != nil {
-			return idtypes.OnChainID{}, err
-		}
-		for _, candidate := range candidates {
-			if !candidate.ProviderID.Equal(providerID) {
-				continue
-			}
-			if candidate.Eligible {
-				return providerID, nil
-			}
-			if candidate.IneligibleReason == providerIneligibleServesBucket {
-				return idtypes.OnChainID{}, storagereplacement.ErrTargetInUse
-			}
-			return idtypes.OnChainID{}, storagereplacement.ErrTargetUnavailable
-		}
-		return idtypes.OnChainID{}, storagereplacement.ErrTargetUnavailable
-	case storagereplacement.SelectionModeAutomatic:
-		if s.warmStorageMarket == nil {
-			return idtypes.OnChainID{}, errApprovalCheckUnavailable
-		}
-		approvalCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if requested != "" {
-			return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
-		}
-		candidates, err := s.replacementProviderCandidates(ctx, bucket, source)
-		if err != nil {
-			return idtypes.OnChainID{}, err
-		}
-		for _, candidate := range candidates {
-			if !candidate.Eligible || candidate.PreviouslyUsed {
-				continue
-			}
-			if !candidate.ApprovedFresh || candidate.Profile == nil {
-				continue
-			}
-			if !candidate.Profile.Approved {
-				continue
-			}
-			approved, checkErr := s.warmStorageMarket.IsProviderApproved(approvalCtx, candidate.ProviderID.SDK())
-			if checkErr != nil {
-				return idtypes.OnChainID{}, fmt.Errorf("%w: %v", errApprovalCheckUnavailable, checkErr)
-			}
-			if approved {
-				return candidate.ProviderID, nil
-			}
-		}
-		return idtypes.OnChainID{}, storagereplacement.ErrNoEligibleProvider
-	default:
-		return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
+		requestedID = &id
+	} else if mode != storagereplacement.SelectionModeAutomatic || requested != "" {
+		return idtypes.OnChainID{}, admission, storagereplacement.ErrInvalidTarget
 	}
+	candidates, err := s.replacementProviderCandidatesFor(ctx, bucket, source, requestedID)
+	if err != nil {
+		return idtypes.OnChainID{}, admission, err
+	}
+	if requestedID != nil {
+		valid := false
+		for _, candidate := range candidates {
+			if candidate.ProviderID.Equal(*requestedID) {
+				if candidate.IneligibleReason == providerIneligibleServesBucket {
+					return idtypes.OnChainID{}, admission, storagereplacement.ErrTargetInUse
+				}
+				valid = candidate.Eligible
+			}
+		}
+		if !valid {
+			return idtypes.OnChainID{}, admission, storagereplacement.ErrTargetUnavailable
+		}
+	}
+	admission, err = s.observability.SelectionAdmission(ctx, s.anchorProviderTier)
+	if err != nil {
+		return idtypes.OnChainID{}, admission, fmt.Errorf("%w: %v", errApprovalCheckUnavailable, err)
+	}
+	excluded, hasTrusted, err := s.repos.ProviderSelectionState(ctx, bucket.ID, source.ID, admission)
+	if err != nil {
+		return idtypes.OnChainID{}, admission, err
+	}
+	if requestedID != nil {
+		if !admission.Satisfied(hasTrusted, *requestedID) {
+			return idtypes.OnChainID{}, admission, providerselect.ErrNoTrustedProvider
+		}
+		return *requestedID, admission, nil
+	}
+	in := providerselect.Inventory{Admission: admission}
+	for _, candidate := range candidates {
+		if candidate.Eligible && candidate.Profile != nil {
+			in.Candidates = append(in.Candidates, providerselect.Candidate{ID: candidate.ProviderID, Active: true, HasPDP: true, HasProfile: true, Fresh: true, Healthy: true, ServiceURL: candidate.Profile.ServiceURL, ProfileURL: candidate.Profile.ServiceURL, TieBreak: rand.Uint64()})
+		}
+	}
+	if err := s.repos.EnrichProviderCandidates(ctx, &in); err != nil {
+		return idtypes.OnChainID{}, admission, err
+	}
+	selected, err := providerselect.Select(in, bucket.ProviderSelectionStrategy, 1, excluded, hasTrusted)
+	if err != nil {
+		return idtypes.OnChainID{}, admission, err
+	}
+	if len(selected) == 0 {
+		return idtypes.OnChainID{}, admission, storagereplacement.ErrNoEligibleProvider
+	}
+	return selected[0].ID, admission, nil
 }
 
 // replacementProviderCandidates lists every observed provider together with
-// whether this replica can move to it. Automatic selection applies the
-// separate approval requirement after the shared availability checks.
+// whether this replica can move to it under the shared availability checks.
 func (s *Server) replacementProviderCandidates(
 	ctx context.Context,
 	bucket *model.Bucket,
@@ -399,31 +404,22 @@ func (s *Server) replacementProviderCandidatesFor(
 		if !candidates[i].Eligible {
 			continue
 		}
-		profileURLChanged := hasProfile && item.Facts.ServiceURL != nil && profile.ServiceURL != *item.Facts.ServiceURL
-		switch {
-		case hasProfile && !profile.Active:
-			candidates[i].Eligible = false
-			candidates[i].IneligibleReason = "provider_unavailable"
-		case item.Signal.Freshness.Stale:
-			candidates[i].Eligible = false
-			candidates[i].IneligibleReason = "observation_stale"
-		case item.Signal.Status != observability.StatusAvailable || item.Facts.Active == nil || !*item.Facts.Active || item.Facts.HasPDP == nil || !*item.Facts.HasPDP || item.Facts.ServiceURL == nil || *item.Facts.ServiceURL == "":
-			candidates[i].Eligible = false
-			candidates[i].IneligibleReason = "provider_unavailable"
-		case !hasProfile:
-			candidates[i].Eligible = false
-			candidates[i].IneligibleReason = "profile_missing"
-		case profileURLChanged:
-			candidates[i].Eligible = false
-			candidates[i].IneligibleReason = "profile_url_changed"
+		c := providerselect.Candidate{ID: candidates[i].ProviderID, Active: hasProfile && profile.Active && item.Facts.Active != nil && *item.Facts.Active, HasPDP: item.Facts.HasPDP != nil && *item.Facts.HasPDP, HasProfile: hasProfile, Healthy: item.Signal.Status == observability.StatusAvailable, Fresh: !item.Signal.Freshness.Stale, ProfileURL: profile.ServiceURL}
+		if item.Facts.ServiceURL != nil {
+			c.ServiceURL = *item.Facts.ServiceURL
 		}
+		if reason := c.IneligibleReason(); reason != "" {
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = reason
+		}
+
 	}
 	return candidates, nil
 }
 
 var (
 	errReplacementUnavailable   = errors.New("storage service is unavailable")
-	errApprovalCheckUnavailable = errors.New("provider approval check is unavailable")
+	errApprovalCheckUnavailable = errors.New("provider requirement check is unavailable")
 )
 
 // handleAPIRetryStorageReplacement resumes work an operator owns. Choosing a
@@ -484,9 +480,11 @@ func (s *Server) handleAPIRetryStorageReplacement(w http.ResponseWriter, r *http
 func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketName string) {
 	code := storagereplacement.Code(err)
 	switch {
+	case errors.Is(err, providerselect.ErrNoTrustedProvider):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Replacement must retain a provider that meets the configured requirement", "code": "required_provider_unavailable"})
 	case errors.Is(err, errApprovalCheckUnavailable):
-		s.logger.Warn("api: provider approval check failed", "error", err)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Could not confirm provider approval. Try again.", "code": "approval_check_unavailable"})
+		s.logger.Warn("api: provider requirement check failed", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Could not confirm the provider requirement. Try again.", "code": "approval_check_unavailable"})
 	case errors.Is(err, errReplacementUnavailable):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage service is unavailable"})
 	case errors.Is(err, storagereplacement.ErrInvalidTarget):
@@ -770,6 +768,22 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 	if err != nil {
 		s.writeReplacementError(w, err, name)
 		return
+	}
+	admission, err := s.observability.SelectionAdmission(ctx, s.anchorProviderTier)
+	if err != nil {
+		s.writeReplacementError(w, fmt.Errorf("%w: %v", errApprovalCheckUnavailable, err), name)
+		return
+	}
+	_, hasTrusted, err := s.repos.ProviderSelectionState(ctx, bucket.ID, source.ID, admission)
+	if err != nil {
+		s.writeReplacementError(w, err, name)
+		return
+	}
+	for i := range candidates {
+		if candidates[i].Eligible && !admission.Satisfied(hasTrusted, candidates[i].ProviderID) {
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = "required_provider_unavailable"
+		}
 	}
 
 	providerIDs := make([]idtypes.OnChainID, 0, len(candidates))

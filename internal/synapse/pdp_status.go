@@ -59,7 +59,7 @@ func NewPDPStatusChecker(opts PDPStatusCheckerOptions) *PDPStatusChecker {
 	return &PDPStatusChecker{
 		timeout:              timeout,
 		allowPrivateNetworks: opts.AllowPrivateNetworks,
-		httpClient:           newPDPStatusHTTPClient(timeout, opts.AllowPrivateNetworks),
+		httpClient:           NewProviderHTTPClient(timeout, opts.AllowPrivateNetworks),
 	}
 }
 
@@ -187,7 +187,7 @@ func (c *PDPStatusChecker) newPDPClient(baseURL string) (*pdp.Client, error) {
 		if timeout <= 0 {
 			timeout = defaultPDPStatusTimeout
 		}
-		httpClient = newPDPStatusHTTPClient(timeout, c.allowPrivateNetworks)
+		httpClient = NewProviderHTTPClient(timeout, c.allowPrivateNetworks)
 	}
 	return pdp.New(baseURL,
 		pdp.WithHTTPClient(httpClient),
@@ -239,7 +239,8 @@ func classifyCreationStatus(txStatus string, dataSetCreated bool) PDPStatusState
 	}
 }
 
-func newPDPStatusHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
+// NewProviderHTTPClient applies the configured provider URL policy to HTTP requests.
+func NewProviderHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	base := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,

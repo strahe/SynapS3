@@ -91,6 +91,7 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		{field: "s3.region", env: "SYNAPS3_S3_REGION"},
 		{field: "filecoin.private_key", env: "SYNAPS3_FILECOIN_PRIVATE_KEY", secret: true},
 		{field: "filecoin.default_copies", env: "SYNAPS3_FILECOIN_DEFAULT_COPIES"},
+		{field: "filecoin.anchor_provider_tier", env: "SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER"},
 		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
 	}
 	for _, tt := range tests {
@@ -441,7 +442,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":":8088"},
-		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3},
+		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3,"anchor_provider_tier":"endorsed"},
 		"cache":{
 			"max_size_gb":8,
 			"eviction_policy":"After_Upload",
@@ -487,6 +488,9 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("saved filecoin.default_copies = %d, want 3", loaded.Filecoin.DefaultCopies)
+	}
+	if loaded.Filecoin.AnchorProviderTier != "endorsed" || resp.Config.Filecoin.AnchorProviderTier != "endorsed" {
+		t.Fatalf("saved provider requirement = %q, response=%q", loaded.Filecoin.AnchorProviderTier, resp.Config.Filecoin.AnchorProviderTier)
 	}
 	if loaded.Cache.EvictionPolicy != "after_upload" ||
 		loaded.Cache.LRUHighWatermarkPercent != 86 ||

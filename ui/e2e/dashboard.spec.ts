@@ -1,6 +1,11 @@
 import { Buffer } from 'node:buffer'
 import type { Page, Request } from '@playwright/test'
-import type { ObservabilityProviderObservation, TaskItem } from '../src/api/client'
+import type {
+  BucketDetail,
+  ObservabilityProviderObservation,
+  ReplacementProviderCandidate,
+  TaskItem,
+} from '../src/api/client'
 import { expect, test } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
@@ -107,10 +112,15 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await page.getByRole('button', { name: 'Create Bucket' }).click()
   const createDialog = page.getByRole('dialog', { name: 'Create Bucket' })
   await createDialog.getByLabel('Bucket name').fill('dashboard-e2e')
+  await expect(createDialog.getByLabel('Provider preference')).toHaveText('Distribution first')
+  await createDialog.getByLabel('Provider preference').click()
+  await page.getByRole('option', { name: 'Speed first' }).click()
   await createDialog.getByLabel('Owner').click()
   await page.getByRole('option', { name: 'SYSTEMTESTOWNER (userplus)' }).click()
   await createDialog.getByRole('button', { name: 'Create', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'dashboard-e2e' })).toBeVisible()
+  const savedBucket = await page.request.get(new URL('/api/v1/buckets/dashboard-e2e', page.url()).toString())
+  expect(await savedBucket.json()).toMatchObject({ provider_selection_strategy: 'speed' })
 
   await page.getByRole('button', { name: 'Upload', exact: true }).click()
   const uploadDialog = page.getByRole('dialog', { name: 'Upload objects' })
@@ -147,25 +157,36 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
 
   await page.getByRole('button', { name: 'Details', exact: true }).click()
   const bucketDetails = page.getByRole('dialog', { name: 'Bucket details' })
+  const currentBucketResponse = await page.request.get(new URL('/api/v1/buckets/dashboard-e2e', page.url()).toString())
+  const currentBucket = (await currentBucketResponse.json()) as BucketDetail
+  const source = currentBucket.data_sets.find((dataSet) => dataSet.is_current && dataSet.copy_index === 0)
+  if (!source) throw new Error('Replica 1 is missing')
+  const candidatesResponse = await page.request.get(
+    new URL(`/api/v1/buckets/dashboard-e2e/data-sets/${source.id}/replacement/providers`, page.url()).toString()
+  )
+  const candidates = (await candidatesResponse.json()) as { providers: ReplacementProviderCandidate[] }
+  const target = candidates.providers.find((candidate) => candidate.manual_selectable)
+  const otherTarget = candidates.providers.find((candidate) => candidate.provider_id !== target?.provider_id)
+  if (!target || !otherTarget) throw new Error('Replacement choices are missing')
   await bucketDetails.getByRole('button', { name: 'Replace provider for Replica 1' }).click()
   const replacement = page.getByRole('alertdialog', { name: 'Replace provider' })
   await replacement.getByRole('combobox', { name: 'New provider' }).click()
   await page.getByRole('option', { name: 'Choose a provider' }).click()
   const providerPicker = replacement.locator('#replacement-provider')
   await providerPicker.click()
-  await page.getByRole('button', { name: /System provider 104/ }).click()
+  await page.getByRole('button', { name: new RegExp(`System provider ${target.provider_id}`) }).click()
   await replacement.getByRole('button', { name: 'Select this provider' }).click()
   await expect(replacement.getByText(/Storage rate:/)).toBeVisible()
   const confirmation = replacement.getByRole('textbox', { name: /Type to confirm/ })
   await confirmation.fill('replace')
   await expect(replacement.getByRole('button', { name: 'Replace provider' })).toBeEnabled()
-  const refreshURL = '**/api/v1/observability/providers/104/refresh'
+  const refreshURL = `**/api/v1/observability/providers/${target.provider_id}/refresh`
   await page.route(refreshURL, (route) => route.fulfill({ status: 503, body: '{"error":"unavailable"}' }))
   await replacement.getByRole('button', { name: 'Refresh provider' }).click()
   await expect(replacement.getByText('Could not refresh this provider. Try again.')).toBeVisible()
   await page.unroute(refreshURL)
   await providerPicker.click()
-  await page.getByRole('button', { name: /System provider 102/ }).click()
+  await page.getByRole('button', { name: new RegExp(`System provider ${otherTarget.provider_id}`) }).click()
   await expect(providerPicker).toHaveText('Review a provider')
   await expect(confirmation).toHaveValue('')
   await expect(replacement.getByText('Could not refresh this provider. Try again.')).toHaveCount(0)

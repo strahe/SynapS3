@@ -12,6 +12,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synaps3/internal/objectlimits"
+	"github.com/strahe/synaps3/internal/providerselect"
+	idtypes "github.com/strahe/synaps3/internal/types"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	sdkcosts "github.com/strahe/synapse-go/costs"
@@ -55,7 +57,7 @@ func TestReadinessCheckerBlocksNetworkMismatch(t *testing.T) {
 	requireCheckStatus(t, got.Checks, "network_match", ReadinessStatusBlocked)
 }
 
-func TestReadinessCheckerUsesApprovedProviderInventoryAndCostEstimate(t *testing.T) {
+func TestReadinessCheckerUsesProviderInventoryAndCostEstimate(t *testing.T) {
 	cfg := readyReadinessConfig()
 	cfg.DefaultCopies = 2
 	client := readyReadinessClient(2)
@@ -189,7 +191,7 @@ func TestReadinessCheckerStorageErrorsAreUnknownAndSanitized(t *testing.T) {
 			t.Fatalf("readiness response leaked %q: %s", leaked, body)
 		}
 	}
-	if got.PartialErrors["storage_info"] != "RPC call failed" {
+	if got.PartialErrors["provider_inventory"] != "RPC call failed" {
 		t.Fatalf("partial storage error = %#v, want sanitized RPC failure", got.PartialErrors)
 	}
 	if strings.Contains(logs.String(), "level=WARN") {
@@ -257,6 +259,7 @@ func TestReadinessCheckerDraftUsesTemporaryClientAndCloses(t *testing.T) {
 	cfg := readyReadinessConfig()
 	draft := cfg
 	draft.Network = "mainnet"
+	draft.AnchorProviderTier = "none"
 	tempClient := readyReadinessClient(1)
 	tempClient.chain = chain.Mainnet
 	tempClient.payments.balances[chain.Mainnet.Addresses().USDFC] = big.NewInt(1_000)
@@ -268,6 +271,9 @@ func TestReadinessCheckerDraftUsesTemporaryClientAndCloses(t *testing.T) {
 			called = true
 			if got.Network != draft.Network {
 				t.Fatalf("draft network = %q, want %q", got.Network, draft.Network)
+			}
+			if got.AnchorProviderTier != "none" {
+				t.Fatalf("draft tier = %q, want none", got.AnchorProviderTier)
 			}
 			return tempClient, nil
 		},
@@ -287,6 +293,54 @@ func TestReadinessCheckerDraftUsesTemporaryClientAndCloses(t *testing.T) {
 	requireResultStatus(t, got, ReadinessStatusReady)
 	if got := countReadinessChecks(got.Checks, "config_private_key"); got != 1 {
 		t.Fatalf("config_private_key checks = %d, want 1", got)
+	}
+}
+
+func TestReadinessUsesTierAndHealthForRuntimeAndDraft(t *testing.T) {
+	for _, mode := range []ReadinessMode{ReadinessModeRuntime, ReadinessModeDraft} {
+		for _, scenario := range []struct {
+			name    string
+			tier    providerselect.Tier
+			trusted bool
+			healthy bool
+			want    ReadinessStatus
+		}{
+			{"approved required", providerselect.TierApproved, false, true, ReadinessStatusBlocked},
+			{"endorsed without approved", providerselect.TierEndorsed, true, true, ReadinessStatusReady},
+			{"none without membership", providerselect.TierNone, false, true, ReadinessStatusReady},
+			{"none still requires health", providerselect.TierNone, false, false, ReadinessStatusBlocked},
+		} {
+			t.Run(string(mode)+"/"+scenario.name, func(t *testing.T) {
+				cfg := readyReadinessConfig()
+				cfg.AnchorProviderTier = string(scenario.tier)
+				client := readyReadinessClient(1)
+				inventory, err := client.ProviderInventory(t.Context(), cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !scenario.trusted {
+					inventory.Selection.Admission.TrustedIDs = nil
+				}
+				inventory.Selection.Candidates[0].Healthy = scenario.healthy
+				client.inventory = &inventory
+				checker := NewReadinessChecker(cfg, client, WithReadinessClientFactory(func(_ context.Context, got ReadinessConfig) (ReadinessClient, error) {
+					if got.AnchorProviderTier != cfg.AnchorProviderTier {
+						t.Fatalf("draft tier = %q", got.AnchorProviderTier)
+					}
+					return client, nil
+				}))
+				var result ReadinessResult
+				if mode == ReadinessModeDraft {
+					result = checker.CheckDraft(t.Context(), cfg)
+				} else {
+					result = checker.CheckRuntime(t.Context())
+				}
+				requireCheckStatus(t, result.Checks, "providers", scenario.want)
+				if scenario.want == ReadinessStatusReady && len(client.storage.costRefs) != 1 {
+					t.Fatal("funding checks did not receive the selected provider")
+				}
+			})
+		}
 	}
 }
 
@@ -465,12 +519,13 @@ func countReadinessChecks(checks []ReadinessCheck, id string) int {
 }
 
 type fakeReadinessClient struct {
-	address  common.Address
-	chain    chain.Chain
-	addrs    sdk.ResolvedAddresses
-	payments *fakeReadinessPayments
-	storage  *fakeReadinessStorage
-	closed   bool
+	address   common.Address
+	chain     chain.Chain
+	addrs     sdk.ResolvedAddresses
+	payments  *fakeReadinessPayments
+	storage   *fakeReadinessStorage
+	closed    bool
+	inventory *ProviderInventory
 }
 
 func (f *fakeReadinessClient) Address() common.Address { return f.address }
@@ -550,4 +605,21 @@ func (f *fakeReadinessStorage) CalculateMultiContextCosts(
 	f.costPayer = payer
 	f.costPieceSizes = append([]uint64(nil), pieceSizes...)
 	return f.costs, f.costErr
+}
+
+func (f *fakeReadinessClient) ProviderInventory(_ context.Context, cfg ReadinessConfig) (ProviderInventory, error) {
+	if f.inventory != nil {
+		return *f.inventory, nil
+	}
+	in := ProviderInventory{Selection: providerselect.Inventory{Admission: providerselect.Admission{Tier: providerselect.Tier(cfg.AnchorProviderTier)}}, Providers: make(map[string]storage.Provider)}
+	if f.storage.info == nil {
+		return in, f.storage.infoErr
+	}
+	for _, p := range f.storage.info.Providers {
+		id := idtypes.OnChainIDFromSDK(p.Info.ID)
+		in.Selection.Candidates = append(in.Selection.Candidates, providerselect.Candidate{ID: id, Active: p.Info.IsActive, HasPDP: p.Product.IsActive, HasProfile: true, Fresh: true, Healthy: true, ServiceURL: p.Offering.ServiceURL, ProfileURL: p.Offering.ServiceURL})
+		in.Selection.Admission.TrustedIDs = append(in.Selection.Admission.TrustedIDs, id)
+		in.Providers[id.String()] = storage.Provider{ID: p.Info.ID, ServiceURL: p.Offering.ServiceURL, ServiceProvider: p.Info.ServiceProvider, Payee: p.Info.Payee}
+	}
+	return in, f.storage.infoErr
 }

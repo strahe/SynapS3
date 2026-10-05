@@ -3,6 +3,7 @@ import type {
   CommitBatchStatus,
   FilecoinReadinessPreflightPayload,
   ObservabilityListParams,
+  ProviderSelectionStrategy,
   S3UserRole,
 } from '@/api/client'
 import { api } from '@/api/client'
@@ -136,12 +137,14 @@ export function useCreateBucket() {
       ownerAccessKey: string
       defaultCopies: number | null
       minimumDurableCopies: number | null
+      providerSelectionStrategy: ProviderSelectionStrategy
     }) =>
       api.createBucket({
         name: payload.name,
         owner_access_key: payload.ownerAccessKey,
         default_copies: payload.defaultCopies,
         minimum_durable_copies: payload.minimumDurableCopies,
+        provider_selection_strategy: payload.providerSelectionStrategy,
       }),
     onSuccess: (bucket) => {
       qc.invalidateQueries({ queryKey: ['buckets'] })

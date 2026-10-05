@@ -158,6 +158,7 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 		setString("filecoin.rpc_url", &next.Filecoin.RPCURL, req.Filecoin.RPCURL)
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.Filecoin.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.Filecoin.AllowPrivateNetworks)
+		setString("filecoin.anchor_provider_tier", &next.Filecoin.AnchorProviderTier, req.Filecoin.AnchorProviderTier)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.Filecoin.DefaultCopies)
 		if req.Filecoin.Observability != nil {
 			setDuration("filecoin.observability.interval", &next.Filecoin.Observability.Interval, req.Filecoin.Observability.Interval)
@@ -249,6 +250,7 @@ func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*con
 		setString("filecoin.rpc_url", &next.Filecoin.RPCURL, req.RPCURL)
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.AllowPrivateNetworks)
+		setString("filecoin.anchor_provider_tier", &next.Filecoin.AnchorProviderTier, req.AnchorProviderTier)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.DefaultCopies)
 		if req.Observability != nil {
 			setDuration("filecoin.observability.interval", &next.Filecoin.Observability.Interval, req.Observability.Interval)
@@ -389,6 +391,7 @@ type settingsFilecoinConfig struct {
 	WithCDN              bool                        `json:"with_cdn"`
 	AllowPrivateNetworks bool                        `json:"allow_private_networks"`
 	DefaultCopies        int                         `json:"default_copies"`
+	AnchorProviderTier   string                      `json:"anchor_provider_tier"`
 	Observability        settingsObservabilityConfig `json:"observability"`
 }
 
@@ -501,6 +504,7 @@ type settingsFilecoinUpdate struct {
 	WithCDN              *bool                        `json:"with_cdn,omitempty"`
 	AllowPrivateNetworks *bool                        `json:"allow_private_networks,omitempty"`
 	DefaultCopies        *int                         `json:"default_copies,omitempty"`
+	AnchorProviderTier   *string                      `json:"anchor_provider_tier,omitempty"`
 	Observability        *settingsObservabilityUpdate `json:"observability,omitempty"`
 }
 
@@ -568,6 +572,7 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			WithCDN:              cfg.Filecoin.WithCDN,
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 			DefaultCopies:        cfg.Filecoin.DefaultCopies,
+			AnchorProviderTier:   cfg.Filecoin.AnchorProviderTier,
 			Observability: settingsObservabilityConfig{
 				Interval:    cfg.Filecoin.Observability.Interval.String(),
 				Timeout:     cfg.Filecoin.Observability.Timeout.String(),
@@ -653,6 +658,7 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"filecoin.network":                              {},
 		"filecoin.rpc_url":                              {},
 		"filecoin.default_copies":                       {},
+		"filecoin.anchor_provider_tier":                 {},
 		"filecoin.observability.interval":               {},
 		"filecoin.observability.timeout":                {},
 		"filecoin.observability.concurrency":            {},
@@ -687,6 +693,7 @@ func filecoinEditableValidationErrors(cfg *config.Config) []config.FieldError {
 		"filecoin.network":                   {},
 		"filecoin.rpc_url":                   {},
 		"filecoin.default_copies":            {},
+		"filecoin.anchor_provider_tier":      {},
 		"filecoin.observability.interval":    {},
 		"filecoin.observability.timeout":     {},
 		"filecoin.observability.concurrency": {},

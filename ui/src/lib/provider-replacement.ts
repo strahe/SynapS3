@@ -201,6 +201,7 @@ const providerIneligibleReasons: Record<string, string> = {
   observation_stale: 'Health information is out of date. Refresh this provider.',
   profile_missing: 'Provider details are unavailable. Refresh this provider.',
   profile_url_changed: 'The provider service URL changed. Refresh this provider to check its health.',
+  required_provider_unavailable: 'This choice would leave the bucket without a required provider.',
 }
 
 /**

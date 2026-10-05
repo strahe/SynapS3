@@ -413,7 +413,7 @@ func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.Se
 }
 
 func newObservabilityChecker(cfg *config.Config, client *sdk.Client, logger *slog.Logger) observability.RefreshChecker {
-	providerHealth := provider.NewHealthChecker(nil)
+	providerHealth := provider.NewHealthChecker(synapse.NewProviderHTTPClient(cfg.Filecoin.Observability.Timeout, cfg.Filecoin.AllowPrivateNetworks))
 	return observability.NewChecker(observability.CheckerOptions{
 		ProviderSource: observability.NewRegistryProviderSource(provider.NewRegistryService(client.SPRegistry())),
 		ProviderHealth: providerHealth.Probe,

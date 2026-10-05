@@ -15,11 +15,13 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
 type stubProviderSelector struct {
+	mu            sync.Mutex
 	providers     []string
 	err           error
 	calls         int
@@ -35,6 +37,8 @@ func onChainIDValue(value string) idtypes.OnChainID {
 }
 
 func (s *stubProviderSelector) ListReplacementProviderObservations(ctx context.Context, requested *idtypes.OnChainID) ([]observability.ProviderObservation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls++
 	if s.err != nil {
 		return nil, s.err
@@ -57,6 +61,55 @@ func (s *stubProviderSelector) ListReplacementProviderObservations(ctx context.C
 		}
 	}
 	return items, nil
+}
+
+func TestConcurrentReplacementsCannotDependOnUnfinishedTrustedProviders(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "404"}})
+	ctx := t.Context()
+	copies := 2
+	if _, err := fixture.srv.repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{Name: fixture.bucket.Name, SetDefaultCopies: true, DefaultCopies: &copies}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := fixture.srv.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: fixture.bucket.ID, ProviderID: onChainIDValue("303"), CopyIndex: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.srv.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: second.ID, DataSetID: onChainIDValue("3003")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.srv.repos.Observability.RecordApprovedProviders(ctx, time.Now().UTC(), []idtypes.OnChainID{onChainIDValue("101"), onChainIDValue("303")}); err != nil {
+		t.Fatal(err)
+	}
+	other := *fixture
+	other.source = second
+	responses := make([]*httptest.ResponseRecorder, 2)
+	fixtures := []*replacementAPIFixture{fixture, &other}
+	bodies := []string{`{"mode":"manual","provider_id":"202","client_request_id":"concurrent-first"}`, `{"mode":"manual","provider_id":"404","client_request_id":"concurrent-second"}`}
+	var wg sync.WaitGroup
+	for i := range fixtures {
+		wg.Go(func() { responses[i] = fixtures[i].startRaw(t, bodies[i]) })
+	}
+	wg.Wait()
+	winner, loser := 0, 1
+	if responses[1].Code == http.StatusCreated {
+		winner, loser = 1, 0
+	}
+	if responses[winner].Code != http.StatusCreated || responses[loser].Code != http.StatusConflict {
+		t.Fatalf("concurrent responses = %d %s / %d %s", responses[0].Code, responses[0].Body.String(), responses[1].Code, responses[1].Body.String())
+	}
+	row := decodeReplacement(t, responses[winner])
+	if err := fixture.srv.repos.Replacements.MarkFailed(ctx, row.ID, nil, "temporary provider failure"); err != nil {
+		t.Fatal(err)
+	}
+	failedRetry := fixtures[loser].startRaw(t, strings.ReplaceAll(bodies[loser], "concurrent-", "after-failure-"))
+	if failedRetry.Code != http.StatusConflict || decodeAPIError(t, failedRetry)["code"] != "required_provider_unavailable" {
+		t.Fatalf("failed reservation was relied upon: %d %s", failedRetry.Code, failedRetry.Body.String())
+	}
+	fixture.srv.WithProviderTier(providerselect.TierEndorsed)
+	replay := fixtures[winner].startRaw(t, bodies[winner])
+	if replay.Code != http.StatusOK || decodeReplacement(t, replay).Target.ID != row.Target.ID {
+		t.Fatalf("replay reselected after tier change: %d %s", replay.Code, replay.Body.String())
+	}
 }
 
 type replacementAPIFixture struct {
@@ -180,7 +233,7 @@ func decodeAPIError(t *testing.T, rec *httptest.ResponseRecorder) map[string]str
 	return body
 }
 
-func TestReplacementManualDoesNotCheckApproval(t *testing.T) {
+func TestReplacementManualUsesFreshTierSnapshot(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		approved    map[string]bool
@@ -203,6 +256,9 @@ func TestReplacementManualDoesNotCheckApproval(t *testing.T) {
 
 func TestReplacementAutomaticSkipsRevokedApproval(t *testing.T) {
 	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+	if _, err := fixture.srv.repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), []idtypes.OnChainID{onChainIDValue("303")}); err != nil {
+		t.Fatal(err)
+	}
 	fixture.market.approved = map[string]bool{"202": false, "303": true}
 	rec := fixture.start(t, `{"mode":"automatic"}`)
 	if rec.Code != http.StatusCreated {
@@ -213,7 +269,7 @@ func TestReplacementAutomaticSkipsRevokedApproval(t *testing.T) {
 	}
 }
 
-func TestReplacementAutomaticSkipsPreviouslyUsedRetiredProvider(t *testing.T) {
+func TestReplacementAutomaticReusesRetiredProvider(t *testing.T) {
 	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
 	if _, err := fixture.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
 		Set("generation = 2").Where("id = ?", fixture.source.ID).Exec(t.Context()); err != nil {
@@ -231,13 +287,14 @@ func TestReplacementAutomaticSkipsPreviouslyUsedRetiredProvider(t *testing.T) {
 		t.Fatalf("retired candidate = %#v, err=%v", candidates, err)
 	}
 	rec := fixture.start(t, `{"mode":"automatic"}`)
-	if rec.Code != http.StatusConflict || decodeAPIError(t, rec)["code"] != storagereplacement.CodeNoEligibleProvider {
-		t.Fatalf("status = %d body=%s, want no eligible provider", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s, want provider reuse", rec.Code, rec.Body.String())
 	}
 }
 
-func TestReplacementManualAllowsFreshNegativeApprovalCache(t *testing.T) {
+func TestReplacementManualAllowsNegativeApprovalWithoutTierRequirement(t *testing.T) {
 	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	fixture.srv.WithProviderTier(providerselect.TierNone)
 	_, err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -422,7 +479,7 @@ func TestAPIStartDataSetReplacementRejections(t *testing.T) {
 			body:     `{"mode":"automatic"}`,
 			selector: &stubProviderSelector{providers: []string{"101"}},
 			status:   http.StatusConflict,
-			code:     storagereplacement.CodeNoEligibleProvider,
+			code:     "required_provider_unavailable",
 		},
 	}
 	for _, tc := range cases {

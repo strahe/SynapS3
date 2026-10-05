@@ -2,6 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { Database, Loader2, Plus, RefreshCw, UserRound } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
+import type { ProviderSelectionStrategy } from '@/api/client'
 import { type BucketItem, internalRootOwnerAccessKey, type S3User } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { CopyableValue } from '@/components/app/CopyableValue'
@@ -54,6 +55,7 @@ export const Route = createFileRoute('/buckets/')({
 
 function CreateBucketDialog() {
   const [open, setOpen] = useState(false)
+  const [providerSelectionStrategy, setProviderSelectionStrategy] = useState<ProviderSelectionStrategy>('distribution')
   const [bucketName, setBucketName] = useState('')
   const [ownerAccessKey, setOwnerAccessKey] = useState('')
   const [copyPolicyOverride, setCopyPolicyOverride] = useState<string | null>(null)
@@ -73,6 +75,7 @@ function CreateBucketDialog() {
 
   const reset = () => {
     setBucketName('')
+    setProviderSelectionStrategy('distribution')
     setOwnerAccessKey('')
     setCopyPolicyOverride(null)
     setMinimumDurableCopiesOverride(null)
@@ -101,7 +104,7 @@ function CreateBucketDialog() {
     const defaultCopies = targetCopies
     const minimumCopies = selectedTargetCopies(minimumDurableCopies)
     createBucket.mutate(
-      { name, ownerAccessKey, defaultCopies, minimumDurableCopies: minimumCopies },
+      { name, ownerAccessKey, defaultCopies, minimumDurableCopies: minimumCopies, providerSelectionStrategy },
       {
         onSuccess: (bucket) => {
           setOpen(false)
@@ -193,6 +196,26 @@ function CreateBucketDialog() {
               ) : (
                 <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
               )}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="bucket-provider-preference">Provider preference</FieldLabel>
+              <Select
+                value={providerSelectionStrategy}
+                onValueChange={(value) => {
+                  if (value === 'distribution' || value === 'speed') setProviderSelectionStrategy(value)
+                }}
+                disabled={createBucket.isPending}
+              >
+                <SelectTrigger id="bucket-provider-preference" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="distribution">Distribution first</SelectItem>
+                    <SelectItem value="speed">Speed first</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
             </Field>
             <Field>
               <FieldLabel htmlFor="bucket-minimum-durable-copies">Release cache after</FieldLabel>

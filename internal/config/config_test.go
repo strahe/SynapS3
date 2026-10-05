@@ -254,6 +254,10 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{
+			name: "provider requirement", field: "filecoin.anchor_provider_tier",
+			mutate: func(cfg *Config) { cfg.Filecoin.AnchorProviderTier = "any" },
+		},
+		{
 			name:  "server port",
 			field: "server.port",
 			mutate: func(cfg *Config) {
@@ -464,6 +468,9 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Filecoin.DefaultCopies != 3 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
 	}
+	if cfg.Filecoin.AnchorProviderTier != "approved" {
+		t.Errorf("Filecoin.AnchorProviderTier = %q, want approved", cfg.Filecoin.AnchorProviderTier)
+	}
 	if cfg.Filecoin.Observability.Interval != 5*time.Minute {
 		t.Errorf("Filecoin.Observability.Interval = %s, want 5m", cfg.Filecoin.Observability.Interval)
 	}
@@ -576,6 +583,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_WITH_CDN", "true")
 	t.Setenv("SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", "true")
 	t.Setenv("SYNAPS3_FILECOIN_DEFAULT_COPIES", "4")
+	t.Setenv("SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER", "none")
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL", "3m")
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", "4s")
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", "6")
@@ -613,6 +621,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 	if !cfg.Filecoin.WithCDN || !cfg.Filecoin.AllowPrivateNetworks || cfg.Filecoin.DefaultCopies != 4 {
 		t.Fatalf("filecoin config = %#v, want env values", cfg.Filecoin)
+	}
+	if cfg.Filecoin.AnchorProviderTier != "none" {
+		t.Fatalf("provider requirement = %q, want none", cfg.Filecoin.AnchorProviderTier)
 	}
 	if cfg.Filecoin.Observability.Interval != 3*time.Minute ||
 		cfg.Filecoin.Observability.Timeout != 4*time.Second ||

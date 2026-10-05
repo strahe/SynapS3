@@ -37,6 +37,9 @@ func TestCreateBucket_HappyPath(t *testing.T) {
 	if bucket.Status != model.BucketStatusProvisioning {
 		t.Errorf("bucket status = %q, want %q", bucket.Status, model.BucketStatusProvisioning)
 	}
+	if bucket.ProviderSelectionStrategy != "distribution" {
+		t.Errorf("S3 bucket provider preference = %q, want distribution", bucket.ProviderSelectionStrategy)
+	}
 	provisionTask, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
 	if err != nil || provisionTask == nil || provisionTask.Status != model.TaskStatusPending {
 		t.Fatalf("bucket provision task = %#v, err=%v", provisionTask, err)

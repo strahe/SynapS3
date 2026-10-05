@@ -560,3 +560,12 @@ func (r *BunObservabilityRepo) collectionLastCheckedAt(ctx context.Context, coll
 	last := row.LastCheckedAt
 	return &last, nil
 }
+
+func (r *BunObservabilityRepo) GetProviderTierSnapshot(ctx context.Context, tier string) (*observability.ProviderTierSnapshot, error) {
+	row := new(observability.ProviderTierSnapshot)
+	err := r.db.NewSelect().Model(row).Where("tier = ?", tier).Scan(ctx)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return row, err
+}

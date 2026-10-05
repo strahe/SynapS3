@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
@@ -78,6 +79,7 @@ func TestReplacementCandidatesAndSubmitRejectStaleHealth(t *testing.T) {
 
 func TestReplacementRejectsHealthForPreviousServiceURL(t *testing.T) {
 	fixture := newReplacementAPIFixtureWithHealth(t, &stubProviderSelector{providers: []string{"202"}}, false)
+	fixture.srv.WithProviderTier(providerselect.TierNone)
 	now := time.Now().UTC()
 	fixture.srv.observability = observability.NewService(observability.ServiceOptions{
 		Store: fixture.srv.repos.Observability, RefreshInterval: 5 * time.Minute,
@@ -122,6 +124,7 @@ func TestReplacementRejectsHealthForPreviousServiceURL(t *testing.T) {
 
 func TestReplacementRejectsInactiveRegistryProfileAfterHealthTimeout(t *testing.T) {
 	fixture := newReplacementAPIFixtureWithHealth(t, &stubProviderSelector{providers: []string{"202"}}, false)
+	fixture.srv.WithProviderTier(providerselect.TierNone)
 	now := time.Now().UTC()
 	fixture.srv.observability = observability.NewService(observability.ServiceOptions{
 		Store: fixture.srv.repos.Observability, RefreshInterval: 5 * time.Minute,
