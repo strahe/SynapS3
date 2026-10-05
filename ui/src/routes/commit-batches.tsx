@@ -39,13 +39,6 @@ function BatchStatus({ batch }: { batch: CommitBatch }) {
   return <StatusBadge tone={status?.tone}>{status?.label ?? batch.status}</StatusBadge>
 }
 
-function remainingTime(deadline: string | null) {
-  if (!deadline) return '—'
-  const seconds = Math.max(0, Math.ceil((new Date(deadline).getTime() - Date.now()) / 1000))
-  if (seconds === 0) return 'Due now'
-  return seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`
-}
-
 function CommitBatchesPage() {
   const queryClient = useQueryClient()
   const detailTitle = useRef<HTMLHeadingElement>(null)
@@ -163,8 +156,8 @@ function CommitBatchesPage() {
                 <TableHead className="px-4">Storage service</TableHead>
                 <TableHead className="px-4 text-right">Members</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
-                <TableHead className="px-4">Oldest wait</TableHead>
-                <TableHead className="px-4">Wait remaining</TableHead>
+                <TableHead className="px-4">Waiting since</TableHead>
+                <TableHead className="px-4">Submitted</TableHead>
                 <TableHead className="px-4">Status</TableHead>
                 <TableHead className="px-4 text-right">Actions</TableHead>
               </TableRow>
@@ -184,8 +177,14 @@ function CommitBatchesPage() {
                   <TableCell className="px-4 text-muted-foreground">
                     {batch.status === 'collecting' && batch.oldest_ready_at ? timeAgo(batch.oldest_ready_at) : '—'}
                   </TableCell>
-                  <TableCell className="px-4 tabular-nums text-muted-foreground">
-                    {remainingTime(batch.collection_deadline)}
+                  <TableCell className="px-4 text-muted-foreground">
+                    {batch.submitted_at ? (
+                      <time dateTime={batch.submitted_at} title={new Date(batch.submitted_at).toLocaleString()}>
+                        {timeAgo(batch.submitted_at)}
+                      </time>
+                    ) : (
+                      '—'
+                    )}
                   </TableCell>
                   <TableCell className="px-4">
                     <BatchStatus batch={batch} />
