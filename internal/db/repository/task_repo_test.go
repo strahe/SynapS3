@@ -116,6 +116,83 @@ func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key strin
 	return claimed
 }
 
+func TestTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T) {
+	assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t, testDB(t))
+}
+
+func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.DB) {
+	t.Helper()
+	ctx := t.Context()
+	repos := repository.NewRepositories(db)
+	row, _, err := repos.Tasks.Enqueue(ctx, &model.Task{
+		Type: model.TaskTypeUploadPlan, IdempotencyKey: "claim-timing", InputVersion: 1,
+		Input: []byte(`{}`), InputHash: "test", AvailableAt: time.Now(),
+		WaitReason: new("resource"), StatusMessage: new("Old wait"), LastError: new("Old error"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := func() *model.Task {
+		t.Helper()
+		claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute)
+		if err != nil || claimed == nil || claimed.WaitReason != nil || claimed.StatusMessage != nil {
+			t.Fatalf("claim retained wait details: %#v, err=%v", claimed, err)
+		}
+		return claimed
+	}
+	first := claim()
+	if first.WorkStartedAt != nil || first.StartedAt == nil || first.LastError == nil || *first.LastError != "Old error" {
+		t.Fatalf("claim invented work start or cleared history: %#v", first)
+	}
+	actual := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	if err := repos.Tasks.MarkWorkStarted(ctx, row.ID, first.ClaimGeneration, actual); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Tasks.MarkWorkStarted(ctx, row.ID, first.ClaimGeneration, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Tasks.Settle(ctx, row.ID, first.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+		WaitReason: new("resource"), StatusMessage: new("New wait"), LastError: new("Old error"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := claim()
+	if second.WorkStartedAt == nil || !second.WorkStartedAt.Equal(actual) {
+		t.Fatalf("reclaim reset actual work start: %#v", second)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE tasks SET lease_until = ?, wait_reason = 'resource', status_message = 'Expired wait' WHERE id = ?`, time.Now().Add(-time.Second), row.ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered := claim()
+	if recovered.ResumeMode != model.TaskResumeModeRecover || recovered.WorkStartedAt == nil || !recovered.WorkStartedAt.Equal(actual) {
+		t.Fatalf("expired reclaim changed operation timing: %#v", recovered)
+	}
+	if err := repos.Tasks.MarkWorkStarted(ctx, row.ID, second.ClaimGeneration, time.Now()); !errors.Is(err, repository.ErrTaskLeaseLost) {
+		t.Fatalf("stale start writer = %v", err)
+	}
+	if err := repos.Tasks.Settle(ctx, row.ID, recovered.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Tasks.RetryFailed(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried := claim()
+	if retried.WorkStartedAt == nil || !retried.WorkStartedAt.Equal(actual) {
+		t.Fatalf("manual retry reset work start: %#v", retried)
+	}
+	if err := repos.Tasks.Settle(ctx, row.ID, retried.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Tasks.ReactivateTerminal(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	reactivated := claim()
+	if reactivated.WorkStartedAt != nil {
+		t.Fatalf("new activation retained previous work start: %#v", reactivated)
+	}
+}
+
 func TestWriteCheckpointStoresJSONText(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

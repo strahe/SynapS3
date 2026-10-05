@@ -23,6 +23,8 @@ SET status = 'running',
     lease_until = ?,
     started_at = COALESCE(started_at, ?),
     finished_at = NULL,
+    wait_reason = NULL,
+    status_message = NULL,
     updated_at = ?
 WHERE id = (
     SELECT id
@@ -41,6 +43,8 @@ SET status = 'running',
     lease_until = ?,
     started_at = COALESCE(started_at, ?),
     finished_at = NULL,
+    wait_reason = NULL,
+    status_message = NULL,
     updated_at = ?
 WHERE id = (
     SELECT id
@@ -60,6 +64,8 @@ SET status = 'running',
     lease_until = ?,
     started_at = COALESCE(started_at, ?),
     finished_at = NULL,
+    wait_reason = NULL,
+    status_message = NULL,
     updated_at = ?
 WHERE id = (
     SELECT id
@@ -79,6 +85,8 @@ SET status = 'running',
     lease_until = ?,
     started_at = COALESCE(started_at, ?),
     finished_at = NULL,
+    wait_reason = NULL,
+    status_message = NULL,
     updated_at = ?
 WHERE id = (
     SELECT id
@@ -97,6 +105,26 @@ type BunTaskRepo struct {
 }
 
 var _ TaskRepository = (*BunTaskRepo)(nil)
+
+// MarkWorkStarted preserves the first operation time under the live claim fence.
+func (r *BunTaskRepo) MarkWorkStarted(ctx context.Context, id, generation int64, startedAt time.Time) error {
+	if startedAt.IsZero() {
+		return ErrInvalidInput
+	}
+	now := time.Now()
+	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("work_started_at = COALESCE(work_started_at, ?)", startedAt).
+		Set("updated_at = ?", now).
+		Where("id = ? AND claim_generation = ? AND status = ? AND lease_until > ?", id, generation, model.TaskStatusRunning, now).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("recording task %d work start: %w", id, err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrTaskLeaseLost
+	}
+	return nil
+}
 
 func (r *BunTaskRepo) Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error) {
 	if task == nil || task.Type == "" || task.IdempotencyKey == "" || task.InputVersion < 1 || len(task.Input) == 0 || task.InputHash == "" {
@@ -383,6 +411,11 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		Where("id = ? AND status = ?", id, model.TaskStatusRunning).
 		Where("claim_generation = ?", generation).
 		Where("lease_until > ?", now)
+	if transition.ClearWorkStartedAt {
+		query = query.Set("work_started_at = NULL")
+	} else if transition.WorkStartedAt != nil {
+		query = query.Set("work_started_at = COALESCE(work_started_at, ?)", *transition.WorkStartedAt)
+	}
 	if transition.IncrementRetry {
 		query = query.Set("retry_count = retry_count + 1")
 	}
@@ -558,6 +591,7 @@ func (r *BunTaskRepo) ReactivateTerminal(ctx context.Context, id int64) error {
 			Set("claimed_at = NULL").
 			Set("lease_until = NULL").
 			Set("started_at = NULL").
+			Set("work_started_at = NULL").
 			Set("finished_at = NULL").
 			Set("acknowledged_at = NULL").
 			Set("retention_until = NULL").

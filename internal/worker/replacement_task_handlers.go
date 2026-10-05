@@ -34,7 +34,7 @@ type retirementCheckpoint struct {
 
 func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1,
+		Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec: taskengine.StrictJSONCodec(func(input *storagereplacement.CoordinateInput) error {
 			return storagereplacement.ValidateCoordinateInput(*input)
 		}),
@@ -338,7 +338,7 @@ func (h *TaskHandlers) scheduleReplacementRetirement(
 
 func (h *TaskHandlers) dataSetRetireHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeStorageDataSetRetire, InputVersion: 1,
+		Type: model.TaskTypeStorageDataSetRetire, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec: taskengine.StrictJSONCodec(func(input *storagereplacement.RetireInput) error {
 			return storagereplacement.ValidateRetireInput(*input)
 		}),

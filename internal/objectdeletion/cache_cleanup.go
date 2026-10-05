@@ -29,6 +29,9 @@ const (
 //
 // The deletion gate is held on the content key for the same reason: two
 // versions of identical bytes contend for one file, not one file each.
+//
+// beforeDelete runs inside the authorized release transaction and must not
+// perform repository writes or wait for locks.
 func ReleaseContentCache(
 	ctx context.Context,
 	c cache.Cache,
@@ -37,6 +40,7 @@ func ReleaseContentCache(
 	repository cacheReleaseRepository,
 	bucketName string,
 	contentID int64,
+	beforeDelete func(),
 ) (CacheReleaseOutcome, error) {
 	if gate == nil {
 		panic("cache release requires a cache access gate")
@@ -50,6 +54,9 @@ func ReleaseContentCache(
 	gate.GuardDeletion(cacheKey, func() {
 		var released bool
 		released, releaseErr = repository.ReleaseContentCacheIfUnreferenced(ctx, contentID, func() error {
+			if beforeDelete != nil {
+				beforeDelete()
+			}
 			return c.Delete(ctx, bucketName, cacheKey)
 		})
 		if releaseErr == nil && released {

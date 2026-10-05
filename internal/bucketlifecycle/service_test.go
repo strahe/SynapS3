@@ -30,7 +30,7 @@ func newLifecycleTestService(t *testing.T, repos *repository.Repositories, c *te
 	registry := taskengine.NewRegistry()
 	retryLimit := 5
 	err := registry.Register(provisionTestHandler{definition: taskengine.Definition{
-		Type: model.TaskTypeBucketProvision, InputVersion: 1,
+		Type: model.TaskTypeBucketProvision, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec: taskengine.StrictJSONCodec(func(input *ProvisionInput) error {
 			return ValidateProvisionInput(*input)
 		}),

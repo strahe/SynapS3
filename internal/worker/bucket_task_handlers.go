@@ -15,7 +15,7 @@ import (
 
 func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeBucketProvision, InputVersion: 1,
+		Type: model.TaskTypeBucketProvision, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec: taskengine.StrictJSONCodec(func(input *bucketlifecycle.ProvisionInput) error {
 			return bucketlifecycle.ValidateProvisionInput(*input)
 		}),

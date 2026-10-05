@@ -634,6 +634,7 @@ func (b *SynapseBackend) releaseContentCache(ctx context.Context, bucketName str
 		b.repos.Objects,
 		bucketName,
 		*contentID,
+		nil,
 	); err != nil {
 		b.logger.Warn("releasing content cache failed", "bucket", bucketName, "contentID", *contentID, "error", err)
 	}
@@ -1377,6 +1378,7 @@ func (b *SynapseBackend) releaseContentCacheIfUnreferenced(ctx context.Context, 
 		b.repos.Objects,
 		bucketName,
 		contentID,
+		nil,
 	); err != nil {
 		b.logger.Warn(message, "bucket", bucketName, "contentID", contentID, "error", err)
 	}

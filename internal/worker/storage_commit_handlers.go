@@ -36,7 +36,7 @@ type commitCheckpoint struct {
 
 func (h *TaskHandlers) commitHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeStorageCommit, InputVersion: 1,
+		Type: model.TaskTypeStorageCommit, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CommitRequestInput) error {
 			return storagepipeline.ValidateCommitRequestInput(*input)
 		}),
@@ -84,7 +84,7 @@ type commitRun struct {
 
 func (r commitRun) taskID() int64 { return r.execution.ID() }
 
-func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execution, mayExecute bool) taskengine.Result {
+func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execution, mayExecute bool) (result taskengine.Result) {
 	input, err := taskengine.DecodeInput[storagepipeline.CommitRequestInput](execution)
 	if err != nil {
 		return decodeFailure(string(execution.Type()), err)
@@ -95,6 +95,9 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	}
 	if err != nil {
 		return retryTask(err, "commit_request_load_failed")
+	}
+	if request.TaskID != nil && *request.TaskID == execution.ID() && request.FirstSentAt != nil {
+		defer func() { result = result.WithWorkStartedAt(*request.FirstSentAt) }()
 	}
 	switch {
 	case request.Status == storagecommit.RequestStatusConfirmed:
@@ -295,9 +298,15 @@ func (h *TaskHandlers) runReadyCommit(ctx context.Context, run commitRun) tasken
 	attempted, err := run.execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation,
 		commitCheckpoint{RequestID: request.RequestID, Sends: 1, SentAt: now},
 		func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{
+			if err := repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{
 				RequestID: request.RequestID, TaskID: run.taskID(), Now: now,
-			})
+			}); err != nil {
+				return err
+			}
+			if request.FirstSentAt != nil {
+				return repos.Tasks.MarkWorkStarted(ctx, run.taskID(), run.execution.ClaimGeneration(), *request.FirstSentAt)
+			}
+			return nil
 		},
 		func(ctx context.Context) error {
 			sent = run.advancer.Send(ctx, commit, h.recordCommitEvidence(ctx, run, 1))
@@ -445,9 +454,15 @@ func (h *TaskHandlers) runSubmittedCommit(ctx context.Context, run commitRun) ta
 					return err
 				}
 			}
-			return repos.Contents.RecordCommitResend(ctx, repository.CommitSendInput{
+			if err := repos.Contents.RecordCommitResend(ctx, repository.CommitSendInput{
 				RequestID: request.RequestID, TaskID: run.taskID(), Sends: sends, Now: now,
-			})
+			}); err != nil {
+				return err
+			}
+			if request.FirstSentAt != nil {
+				return repos.Tasks.MarkWorkStarted(ctx, run.taskID(), run.execution.ClaimGeneration(), *request.FirstSentAt)
+			}
+			return nil
 		},
 		func(ctx context.Context) error {
 			sent = run.advancer.Send(ctx, commit, h.recordCommitEvidence(ctx, run, sends))

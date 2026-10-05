@@ -59,6 +59,7 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *task
 	} {
 		definition := taskengine.Definition{
 			Type:         taskType,
+			WorkStart:    taskengine.WorkStartOnEffect,
 			InputVersion: 1,
 			Codec:        taskengine.StrictJSONCodec[map[string]any](nil),
 			RetryLimit:   &limit,
@@ -142,7 +143,7 @@ func TestAPITasksPreservesDurationPrecision(t *testing.T) {
 	started := time.Date(2026, 10, 3, 0, 0, 0, 900_000_000, time.UTC)
 	finished := started.Add(200 * time.Millisecond)
 	if _, err := fixture.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("started_at = ?", started).Set("finished_at = ?", finished).
+		Set("started_at = ?", started.Add(-30*time.Minute)).Set("work_started_at = ?", started).Set("finished_at = ?", finished).
 		Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +167,25 @@ func TestAPITasksPreservesDurationPrecision(t *testing.T) {
 	}
 	if elapsed := wireFinish.Sub(wireStart); elapsed != 200*time.Millisecond {
 		t.Fatalf("serialized duration = %s, want 200ms: %s", elapsed, rr.Body.String())
+	}
+}
+
+func TestAPITasksHidesStaleRunningWaitWithoutInventingStart(t *testing.T) {
+	claimedAt := time.Now().Add(-30 * time.Minute)
+	row := &model.Task{
+		Type: model.TaskTypeStorageStore, Status: model.TaskStatusRunning,
+		WaitReason: new("resource"), StatusMessage: new("Old wait"), LastError: new("Previous request failed"),
+		StartedAt: &claimedAt, AvailableAt: claimedAt, CreatedAt: claimedAt,
+	}
+	item := new(Server).taskListItem(row)
+	if item.StartedAt != nil || item.WaitReason != nil || item.StatusMessage != nil || item.LastError == nil {
+		t.Fatalf("legacy running presentation = %#v", item)
+	}
+	row.WaitReason = nil
+	row.StatusMessage = new("Checking storage transfer")
+	item = new(Server).taskListItem(row)
+	if item.StatusMessage == nil || *item.StatusMessage != "Checking storage transfer" {
+		t.Fatalf("current progress was hidden: %#v", item)
 	}
 }
 

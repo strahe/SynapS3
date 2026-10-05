@@ -1,6 +1,24 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { taskSubjectFields, taskSubjectLabel, taskTook } from '../src/lib/tasks.ts'
+import { taskDetailsView, taskSubjectFields, taskSubjectLabel, taskTook } from '../src/lib/tasks.ts'
+
+test('Details shows current progress and keeps earlier errors separate', () => {
+  const last_error = 'Previous request failed'
+  for (const status of ['pending', 'running', 'completed', 'cancelled'] as const) {
+    assert.deepEqual(taskDetailsView({ status, last_error, status_message: 'Checking storage transfer' }), {
+      value: 'Checking storage transfer',
+      label: 'Task details',
+      lastError: last_error,
+    })
+    assert.equal(taskDetailsView({ status, last_error }).value, undefined)
+  }
+  assert.deepEqual(taskDetailsView({ status: 'failed', last_error, status_message: 'Earlier progress' }), {
+    value: last_error,
+    label: 'Task error',
+    lastError: undefined,
+  })
+  assert.equal(taskDetailsView({ status: 'pending', last_error, status_message: last_error }).lastError, undefined)
+})
 
 test('Took measures completed work from first start and rejects incomplete or invalid times', () => {
   const started_at = '2026-10-03T00:00:00.900Z'

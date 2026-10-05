@@ -457,13 +457,19 @@ func TestLRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess(t *testing.T) {
 	if eviction == nil {
 		t.Fatalf("cache eviction did not block behind open reader; planner=%d", planner.ID)
 	}
+	if eviction.WorkStartedAt != nil {
+		t.Fatal("waiting for the cache lock started deletion timing")
+	}
 	if err := runtime.tracker.RecordAccess(t.Context(), *version.ContentID, version.CacheAccessedAt); err != nil {
 		t.Fatalf("record newer cache access: %v", err)
 	}
 	if err := opened.Body.Close(); err != nil {
 		t.Fatalf("close protected cache entry: %v", err)
 	}
-	waitForTask(t, runtime.repos, eviction.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCancelled })
+	cancelled := waitForTask(t, runtime.repos, eviction.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCancelled })
+	if cancelled.WorkStartedAt != nil {
+		t.Fatal("cancelled eviction invented a deletion start")
+	}
 	if deleteCalls.Load() != 0 {
 		t.Fatalf("cache delete calls = %d, want 0", deleteCalls.Load())
 	}
@@ -1620,9 +1626,12 @@ func TestStorageCleanupRetriesCacheRelease(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+	releaseFailed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusPending && task.RetryCount == 1
 	})
+	if releaseFailed.WorkStartedAt == nil {
+		t.Fatal("local cache release failure lost its actual start time")
+	}
 	stored, err := runtime.repos.Contents.GetByID(ctx, content.ID)
 	if err != nil || stored == nil || stored.CleanupTaskID == nil || *stored.CleanupTaskID != taskRow.ID {
 		t.Fatalf("content after failed cache release = %#v, err=%v", stored, err)
@@ -1630,9 +1639,12 @@ func TestStorageCleanupRetriesCacheRelease(t *testing.T) {
 	if _, err := runtime.repos.Tasks.WakePending(ctx, []int64{taskRow.ID}); err != nil {
 		t.Fatalf("WakePending: %v", err)
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+	releaseCompleted := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
 	})
+	if releaseCompleted.WorkStartedAt == nil || !releaseCompleted.WorkStartedAt.Equal(*releaseFailed.WorkStartedAt) {
+		t.Fatal("local cache release retry reset its actual start time")
+	}
 	if stored, err := runtime.repos.Contents.GetByID(ctx, content.ID); stored != nil {
 		t.Fatalf("content after cleanup = %#v, err=%v", stored, err)
 	}
@@ -2157,50 +2169,67 @@ func TestCacheEvictionRecoverCancelsAfterNewGenerationCompletes(t *testing.T) {
 }
 
 func TestCacheEvictionPersistentDeleteFailureReleasesOwner(t *testing.T) {
-	deleteErr := errors.New("cache filesystem is read-only")
-	cacheStore := &testutil.MockCache{
-		DeleteFunc: func(context.Context, string, string) error {
-			return deleteErr
-		},
-	}
-	noRetries := 0
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		cache: cacheStore, policy: cache.EvictionPolicyNone, maxRetries: &noRetries,
-	})
-	version := seedStoredCacheObject(t, runtime, 11, time.Now().UTC().Add(-time.Hour))
-	contentID := *version.ContentID
-	generation, err := runtime.repos.CacheEvictions.NextEvictionGeneration(t.Context(), contentID)
-	if err != nil {
-		t.Fatalf("next eviction generation: %v", err)
-	}
-	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
-		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
-		SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
-	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
-		return repos.CacheEvictions.BindEvictionTask(ctx, contentID, generation, taskRow.ID)
-	})
-	if err != nil {
-		t.Fatalf("enqueue cache eviction: %v", err)
-	}
+	for _, failRecord := range []bool{false, true} {
+		t.Run(fmt.Sprintf("record failure=%v", failRecord), func(t *testing.T) {
+			deleteErr := errors.New("cache deletion failed")
+			cacheStore := &testutil.MockCache{
+				DeleteFunc: func(context.Context, string, string) error {
+					if failRecord {
+						return nil
+					}
+					return deleteErr
+				},
+			}
+			noRetries := 0
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				cache: cacheStore, policy: cache.EvictionPolicyNone, maxRetries: &noRetries,
+			})
+			version := seedStoredCacheObject(t, runtime, 11, time.Now().UTC().Add(-time.Hour))
+			contentID := *version.ContentID
+			if failRecord {
+				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER fail_deletion_record
+			BEFORE UPDATE OF in_cache ON object_cache WHEN NEW.in_cache = 0
+			BEGIN SELECT RAISE(ABORT, 'cache deletion failed'); END`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			generation, err := runtime.repos.CacheEvictions.NextEvictionGeneration(t.Context(), contentID)
+			if err != nil {
+				t.Fatalf("next eviction generation: %v", err)
+			}
+			taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+				Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
+				Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
+				SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
+			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+				return repos.CacheEvictions.BindEvictionTask(ctx, contentID, generation, taskRow.ID)
+			})
+			if err != nil {
+				t.Fatalf("enqueue cache eviction: %v", err)
+			}
 
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	stored := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusFailed
-	})
-	if stored.FailureReason == nil || *stored.FailureReason != "cache_delete_failed" {
-		t.Fatalf("failure reason = %v, want cache_delete_failed", stored.FailureReason)
-	}
-	if stored.LastError == nil || !strings.Contains(*stored.LastError, deleteErr.Error()) {
-		t.Fatalf("last error = %v, want %q", stored.LastError, deleteErr)
-	}
-	entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), contentID)
-	if err != nil || entry == nil {
-		t.Fatalf("load cache entry after failed eviction = %#v, err=%v", entry, err)
-	}
-	if entry.CacheActiveTaskID != nil || !entry.InCache {
-		t.Fatalf("cache entry after failed eviction = %#v, want released owner and retained cache", entry)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			stored := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusFailed
+			})
+			if stored.FailureReason == nil || *stored.FailureReason != "cache_delete_failed" {
+				t.Fatalf("failure reason = %v, want cache_delete_failed", stored.FailureReason)
+			}
+			if stored.LastError == nil || !strings.Contains(*stored.LastError, deleteErr.Error()) {
+				t.Fatalf("last error = %v, want %q", stored.LastError, deleteErr)
+			}
+			if stored.WorkStartedAt == nil {
+				t.Fatal("failed cache deletion lost its actual start time")
+			}
+			entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), contentID)
+			if err != nil || entry == nil {
+				t.Fatalf("load cache entry after failed eviction = %#v, err=%v", entry, err)
+			}
+			if entry.CacheActiveTaskID != nil || !entry.InCache {
+				t.Fatalf("cache entry after failed eviction = %#v, want released owner and retained cache", entry)
+			}
+		})
 	}
 }
 
@@ -3203,7 +3232,7 @@ func TestStoreTasksReachAndRespectProviderMutationLimit(t *testing.T) {
 				t.Fatalf("load store task: %v", err)
 			}
 			if stored.Status == model.TaskStatusPending && stored.ResumeMode == model.TaskResumeModeExecute &&
-				stored.WaitReason != nil && *stored.WaitReason == "resource" && stored.RetryCount == 0 && len(stored.Checkpoint) == 0 {
+				stored.WaitReason != nil && *stored.WaitReason == "resource" && stored.RetryCount == 0 && len(stored.Checkpoint) == 0 && stored.WorkStartedAt == nil {
 				yielded[stored.ID] = true
 			}
 		}
@@ -3282,6 +3311,9 @@ func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
 	})
 	if failed.FailureReason == nil || *failed.FailureReason != "store_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
 		t.Fatalf("store admission task = %#v", failed)
+	}
+	if failed.WorkStartedAt != nil {
+		t.Fatal("store admission failure invented an upload start")
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID || copyRow.IngressStoreAttempt != 0 {
@@ -3608,7 +3640,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ?, work_started_at = NULL WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("make pull recovery ready: %v", err)
 	}
 	select {
@@ -3622,9 +3654,12 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("make repeated pull ready: %v", err)
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+	completed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
 	})
+	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(attempt.AttemptedAt) {
+		t.Fatalf("pull recovery start = %v, want %v", completed.WorkStartedAt, attempt.AttemptedAt)
+	}
 	if pullCalls.Load() != 2 || presignCalls.Load() != 1 {
 		t.Fatalf("pull calls = %d, presign calls = %d; want 2 pulls with one authorization", pullCalls.Load(), presignCalls.Load())
 	}
@@ -4056,12 +4091,19 @@ func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+	broadcast, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || broadcast.BroadcastAttemptedAt == nil {
+		t.Fatalf("broadcast timing = %#v, %v", broadcast, err)
+	}
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ?, work_started_at = NULL WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("make wallet recovery ready: %v", err)
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+	completed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusCompleted
 	})
+	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(*broadcast.BroadcastAttemptedAt) {
+		t.Fatalf("wallet recovery start = %v, want %v", completed.WorkStartedAt, broadcast.BroadcastAttemptedAt)
+	}
 	if broadcasts.Load() != 1 || observations.Load() != 1 {
 		t.Fatalf("wallet calls = broadcasts:%d observations:%d, want 1/1", broadcasts.Load(), observations.Load())
 	}
@@ -5760,6 +5802,122 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	}
 }
 
+func TestDataSetCreationRecoveryRestoresFirstWorkStart(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		sends         int
+		unknownTime   bool
+		existingStart bool
+	}{
+		{name: "first submission", sends: 1},
+		{name: "existing start", sends: 1, existingStart: true},
+		{name: "resubmitted request", sends: 2},
+		{name: "unknown send count"},
+		{name: "unknown attempted time", sends: 1, unknownTime: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sequence := storedObjectSequence.Add(1)
+			providerID := testOnChainID(t, 51000+sequence)
+			clientID := testOnChainID(t, 52000+sequence)
+			createdID := testOnChainID(t, 53000+sequence)
+			ref, err := storage.NewDataSetRef(providerID.SDK(), createdID.SDK(), clientID.SDK())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ready atomic.Bool
+			var sends atomic.Int64
+			target := &testutil.MockStorageTarget{
+				ProviderIDValue: providerID.SDK(),
+				CreateDataSetFunc: func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+					sends.Add(1)
+					return nil, errors.New("unexpected create request")
+				},
+				WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+					if !ready.Load() {
+						return nil, errors.New("submission status is temporarily unavailable")
+					}
+					return &storage.CreateDataSetResult{DataSet: ref}, nil
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: &testutil.MockStorageClient{
+					OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+						return target, nil
+					},
+				},
+				policy: cache.EvictionPolicyNone,
+				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+					return handlers.RegisterStorage(registry)
+				},
+			})
+			ctx := t.Context()
+			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("restore-start-%d", sequence))
+			const transactionID, statusURL = "0xsubmitted", "https://provider.example/status"
+			if err := runtime.repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+				ID: fixture.binding.ID, TransactionID: transactionID, StatusURL: statusURL, ClientDataSetID: &clientID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			baseTime := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+			attemptedAt := baseTime
+			if tc.unknownTime {
+				attemptedAt = time.Time{}
+			}
+			checkpoint, err := json.Marshal(map[string]any{
+				"attempted_at": attemptedAt, "client_data_set_id": clientID.String(),
+				"identity": testutil.DefaultContextIdentity, "sends": tc.sends,
+				"transaction_id": transactionID, "status_url": statusURL,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var existingStart, expectedStart *time.Time
+			if tc.sends == 1 && !tc.unknownTime {
+				expectedStart = &attemptedAt
+			}
+			if tc.existingStart {
+				knownStart := baseTime.Add(-time.Minute)
+				existingStart, expectedStart = &knownStart, &knownStart
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ?, work_started_at = ?, created_at = ? WHERE id = ?`,
+				model.TaskResumeModeRecover, existingStart, baseTime.Add(-30*time.Minute), fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertStart := func(row *model.Task) {
+				t.Helper()
+				if expectedStart == nil {
+					if row.WorkStartedAt != nil {
+						t.Fatalf("unverifiable first start was inferred as %v", row.WorkStartedAt)
+					}
+				} else if row.WorkStartedAt == nil || !row.WorkStartedAt.Equal(*expectedStart) {
+					t.Fatalf("work start = %v, want %v", row.WorkStartedAt, expectedStart)
+				}
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			pending := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(row *model.Task) bool {
+				return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "provider_confirmation"
+			})
+			assertStart(pending)
+			ready.Store(true)
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			completed := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(row *model.Task) bool {
+				return row.Status == model.TaskStatusCompleted
+			})
+			assertStart(completed)
+			if sends.Load() != 0 {
+				t.Fatalf("recovery sent %d duplicate create requests", sends.Load())
+			}
+		})
+	}
+}
+
 // A request is only looked up, waited on, or resent under the identity it was
 // signed for, and an ID the chain resolves to some other data set is never used
 // again. Both stop the task; only the conflict, which the chain settled, gives
@@ -5880,6 +6038,9 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			}
 			if runtime.service.Retryable(failed) != tt.retryable {
 				t.Fatalf("retryable = %v, want %v", runtime.service.Retryable(failed), tt.retryable)
+			}
+			if failed.WorkStartedAt != nil {
+				t.Fatalf("invalid request identity restored work start %v", failed.WorkStartedAt)
 			}
 			kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
 			if err != nil || kept.Status != tt.status || (kept.EnsureTaskID != nil) != tt.fenceHeld {

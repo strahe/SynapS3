@@ -75,6 +75,10 @@ func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
 	}
 }
 
+func TestPostgresTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T) {
+	assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t, newPostgresTaskDB(t))
+}
+
 func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T) {
 	db := newPostgresTaskDB(t)
 	repos := repository.NewRepositories(db)

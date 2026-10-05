@@ -285,7 +285,9 @@ The `status` filter also accepts `dismissed`. `status=failed` returns only unack
 
 Subject lookup accepts `storage_content`, `storage_copy`, `storage_data_set`, `bucket`, `provider`, `storage_replacement`, `wallet_operation`, and `storage_commit_request`. Local resource keys are positive integer IDs, provider keys are decimal uint256 IDs, and registration keys are request IDs; encode each path segment separately. The response includes `subject_type`, `subject_key`, and available resource fields. `copy_index` starts at zero; `local_data_set_id` and string `data_set_id` distinguish local and on-chain datasets. A file sample has `key`, `source` (`current`, `historical`, or `deleted`), and `other_versions`. Wallet amounts remain strings in USDFC base units. Invalid parameters return `400`, unavailable subjects return `404`, and query failures return `500`. Lookup uses local records and may return partial information.
 
-`started_at` and `finished_at` retain fractional seconds. The Tasks page reads subjects only when their tooltip or popover opens. Took measures first start to finish, including waits, retries, and time awaiting recovery; pending and running tasks show no duration, and dismissal does not change it.
+`started_at` is when actual task work first began. Uploads start after waiting for storage resources and hashing the data, immediately before transfer. The field is omitted when work has not started or its start cannot be reliably determined, including tasks that finish without starting work. When a task takes over an existing operation, this time can precede its `created_at`. `started_at` and `finished_at` retain fractional seconds.
+
+Took measures actual start to finish, including later waits, retries, and recovery gaps. Pending and running tasks and tasks without a known start show no duration; dismissal does not change it. The Tasks page reads subjects only when their tooltip or popover opens.
 
 Bulk dismissal takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
 

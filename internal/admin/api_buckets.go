@@ -1486,6 +1486,7 @@ func (s *Server) releaseContentCache(
 		s.repos.Objects,
 		bucketName,
 		*contentID,
+		nil,
 	)
 }
 

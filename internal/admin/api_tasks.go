@@ -185,7 +185,11 @@ func (s *Server) taskListItem(row *model.Task) taskListItem {
 		item.Retryable = s.taskService.Retryable(row)
 		item.Acknowledgeable = s.taskService.Acknowledgeable(row)
 	}
-	item.StartedAt = formattedTime(row.StartedAt)
+	if row.Status == model.TaskStatusRunning && row.WaitReason != nil && *row.WaitReason != "" {
+		item.WaitReason = nil
+		item.StatusMessage = nil
+	}
+	item.StartedAt = formattedTime(row.WorkStartedAt)
 	item.FinishedAt = formattedTime(row.FinishedAt)
 	item.AcknowledgedAt = formattedTime(row.AcknowledgedAt)
 	return item

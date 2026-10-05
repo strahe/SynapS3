@@ -89,7 +89,7 @@ type uploadBindingPlan struct {
 
 func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeUploadPlan, InputVersion: 1,
+		Type: model.TaskTypeUploadPlan, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.UploadPlanInput) error {
 			return storagepipeline.ValidateUploadPlanInput(*input)
 		}),
@@ -349,7 +349,7 @@ func (h *TaskHandlers) selectBucketBindings(ctx context.Context, bucket *model.B
 
 func (h *TaskHandlers) dataSetEnsureHandler() taskengine.Handler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeStorageDataSetEnsure, InputVersion: 1,
+		Type: model.TaskTypeStorageDataSetEnsure, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.DataSetInput) error {
 			return storagepipeline.ValidateDataSetInput(*input)
 		}),
@@ -440,7 +440,13 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 			return taskengine.Fail(err, reason, nil)
 		}
 		if checkpoint.TransactionID != "" {
-			return h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+			result := h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+			// AttemptedAt tracks the latest send; only one submitted request
+			// under the validated identity proves when work first started.
+			if checkpoint.Sends == 1 {
+				result = result.WithWorkStartedAt(checkpoint.AttemptedAt)
+			}
+			return result
 		}
 		// The request went out without its submission being recorded, so it may
 		// or may not have created the data set. Only the chain can tell.
@@ -906,6 +912,7 @@ func (h *TaskHandlers) wakePeerPullPlans(ctx context.Context, repos *repository.
 
 func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 	definition := copyDefinition(model.TaskTypeStorageTransferPlan, h.retryLimit())
+	definition.WorkStart = taskengine.WorkStartOnHandler
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)
 		if handled {
@@ -1138,6 +1145,7 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 		if err != nil {
 			return h.retryStoreNotStarted(execution, err)
 		}
+		var previousWorkStartedAt time.Time
 		for _, old := range previous {
 			var oldInput storagepipeline.CopyGenerationInput
 			var candidate storeCheckpoint
@@ -1154,9 +1162,17 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 				return taskengine.Fail(errors.New("previous Store checkpoints disagree"), "store_checkpoint_conflict", nil)
 			}
 			checkpoint, hasCheckpoint = candidate, true
+			if old.WorkStartedAt != nil && (previousWorkStartedAt.IsZero() || old.WorkStartedAt.Before(previousWorkStartedAt)) {
+				previousWorkStartedAt = *old.WorkStartedAt
+			}
 		}
 		if hasCheckpoint {
-			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+			if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+				if !previousWorkStartedAt.IsZero() {
+					return repos.Tasks.MarkWorkStarted(ctx, execution.ID(), execution.ClaimGeneration(), previousWorkStartedAt)
+				}
+				return nil
+			}); err != nil {
 				return h.retryStoreNotStarted(execution, err)
 			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking storage transfer", nil)
@@ -1469,7 +1485,7 @@ func (h *TaskHandlers) pullHandler() taskengine.Handler {
 	}
 }
 
-func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Execution, mayPull bool) taskengine.Result {
+func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Execution, mayPull bool) (result taskengine.Result) {
 	input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)
 	if handled {
 		return result
@@ -1508,6 +1524,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 				return retryPullDependency(execution, err, "pull_checkpoint_failed")
 			}
 		}
+		defer func() { result = result.WithWorkStartedAt(attempt.AttemptedAt) }()
 	}
 	if copyRow.Status == model.StorageCopyStatusCommitted || copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
 		if attempt != nil {
@@ -1815,7 +1832,7 @@ func pullReservation(input storagepipeline.CopyGenerationInput, taskID int64, at
 
 func copyDefinition(taskType model.TaskType, retryLimit *int) taskengine.Definition {
 	return taskengine.Definition{
-		Type: taskType, InputVersion: 1,
+		Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CopyGenerationInput) error {
 			return storagepipeline.ValidateCopyGenerationInput(*input)
 		}),

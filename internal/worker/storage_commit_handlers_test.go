@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/uptrace/bun"
+
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -847,11 +849,21 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	waitForCommitTask(t, f.runtime, taskID, func(*model.Task) bool { return f.request(t, requestID).TransactionID != nil })
 	// The provider accepted the request but its transaction never landed, and
 	// its status endpoint stays down past the attention threshold.
-	if _, err := f.runtime.db.NewRaw(`UPDATE storage_commit_requests SET submitted_at = ?, last_sent_at = ? WHERE request_id = ?`,
-		time.Now().Add(-time.Hour), time.Now().Add(-time.Hour), requestID).Exec(t.Context()); err != nil {
+	legacyStart := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
+	if err := f.runtime.db.RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := tx.NewRaw(`UPDATE storage_commit_requests SET first_sent_at = ?, submitted_at = ?, last_sent_at = ? WHERE request_id = ?`,
+			legacyStart, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour), requestID).Exec(ctx); err != nil {
+			return err
+		}
+		_, err := tx.NewRaw(`UPDATE tasks SET work_started_at = NULL WHERE id = ?`, taskID).Exec(ctx)
+		return err
+	}); err != nil {
 		t.Fatalf("age submission: %v", err)
 	}
-	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	completed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(legacyStart) {
+		t.Fatalf("registration recovery start = %v, want %v", completed.WorkStartedAt, legacyStart)
+	}
 	waitForCommitted(t, f.runtime, f.copies)
 	if sends, extras := f.provider.sent(); len(sends) != 2 || !sameSends(sends, extras) {
 		t.Fatalf("submissions = %v, want the same request sent again", sends)

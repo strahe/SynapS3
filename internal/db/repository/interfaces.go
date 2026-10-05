@@ -709,6 +709,7 @@ type TaskRepository interface {
 	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error
 	ConsumeStoreRetry(ctx context.Context, id, generation int64) error
 	ValidateClaim(ctx context.Context, id, generation int64) error
+	MarkWorkStarted(ctx context.Context, id, generation int64, startedAt time.Time) error
 	Settle(ctx context.Context, id, generation int64, transition TaskTransition) error
 	ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error
 	WakePending(ctx context.Context, ids []int64) (int, error)
@@ -731,15 +732,17 @@ type TaskRepository interface {
 }
 
 type TaskTransition struct {
-	Status         model.TaskStatus
-	ResumeMode     model.TaskResumeMode
-	AvailableAt    time.Time
-	WaitReason     *string
-	FailureReason  *string
-	LastError      *string
-	StatusMessage  *string
-	IncrementRetry bool
-	RetentionUntil *time.Time
+	WorkStartedAt      *time.Time
+	ClearWorkStartedAt bool
+	Status             model.TaskStatus
+	ResumeMode         model.TaskResumeMode
+	AvailableAt        time.Time
+	WaitReason         *string
+	FailureReason      *string
+	LastError          *string
+	StatusMessage      *string
+	IncrementRetry     bool
+	RetentionUntil     *time.Time
 }
 
 // TaskAcknowledgeFilter selects the failures one bulk dismissal covers. The

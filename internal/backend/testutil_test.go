@@ -162,7 +162,7 @@ func newBackendTaskService(t *testing.T, repos *repository.Repositories) *tasken
 		model.TaskTypeStorageCleanup,
 	} {
 		err := registry.Register(backendTestTaskHandler{definition: taskengine.Definition{
-			Type: taskType, InputVersion: 1,
+			Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 			Codec:      taskengine.StrictJSONCodec[map[string]any](nil),
 			RetryLimit: &retryLimit, AllowRetry: true,
 		}})
