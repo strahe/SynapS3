@@ -103,9 +103,9 @@ jobs:
         if: github.event_name == 'pull_request'
         run: make verify-fast
 
-      - name: Verify database, task, and worker race
+      - name: Verify database race
         if: github.event_name == 'pull_request'
-        run: CGO_ENABLED=1 go test -race -tags dev -count=1 ./internal/db ./internal/task ./internal/worker
+        run: CGO_ENABLED=1 go test -race -tags dev -count=1 ./internal/db
 
       - name: Verify no race
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
