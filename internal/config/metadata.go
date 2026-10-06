@@ -91,7 +91,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"filecoin.anchor_provider_tier": {
 		Label:       "Provider Requirement",
-		Description: "Requires at least one approved or endorsed provider; none removes the list requirement. Restart required.",
+		Description: "Requires at least one provider from the selected list, without fallback; none removes the list requirement. Restart required.",
 		Env:         "SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER",
 		Editable:    true,
 	},

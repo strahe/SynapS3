@@ -24,14 +24,13 @@ type replacementProviderCandidate struct {
 	ApprovedFresh    bool
 	Eligible         bool
 	IneligibleReason string
-	// PreviouslyUsed marks a provider this bucket has used before and fully
-	// retired. It can be chosen again, which automatic selection avoids and an
-	// operator may still want.
+	// PreviouslyUsed marks a provider used by this bucket before; once all its
+	// data sets retire, it can be selected again without a ranking penalty.
 	PreviouslyUsed bool
 }
 
 // replacementProviderCandidates applies the bucket and source rules shared by
-// manual and automatic selection. Each mode applies its approval rules later.
+// manual and automatic selection.
 //
 // The rules follow StorageReplacementRepository.Authorize: the generation being
 // replaced cannot replace itself, and a provider still holding an unretired

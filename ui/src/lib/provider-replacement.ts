@@ -140,7 +140,7 @@ const replacementErrorMessages: Record<string, string> = {
   replacement_no_eligible_provider:
     'No unused storage provider is available right now. Try again later or choose an available provider.',
   replacement_target_unavailable: 'That provider is not available for replacement right now. Choose another provider.',
-  approval_check_unavailable: 'Could not confirm FWSS approval. Try again.',
+  approval_check_unavailable: 'Could not check provider requirements. Try again.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',
   replacement_source_not_current: 'This replica no longer receives writes, so replacing it would change nothing.',
   replacement_source_creating:

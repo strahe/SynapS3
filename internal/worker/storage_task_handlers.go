@@ -138,7 +138,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 
 		plan, err := h.selectUploadBindings(ctx, bucket, upload)
 		if err != nil {
-			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
+			if errors.Is(err, providerselect.ErrNoTrustedProvider) || synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
 				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
 			return retryTask(err, "storage_selection_failed")
