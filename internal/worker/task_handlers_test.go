@@ -51,6 +51,12 @@ import (
 	"github.com/uptrace/bun"
 )
 
+// Business-flow tests leave enough lease time for settlement under the race detector.
+const (
+	handlerTestPollInterval  = 25 * time.Millisecond
+	handlerTestLeaseDuration = 5 * time.Second
+)
+
 type handlerTestRuntime struct {
 	db       *bun.DB
 	repos    *repository.Repositories
@@ -171,10 +177,10 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	concurrency := max(options.concurrency, 1)
 	leaseDuration := options.leaseDuration
 	if leaseDuration == 0 {
-		leaseDuration = 300 * time.Millisecond
+		leaseDuration = handlerTestLeaseDuration
 	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: concurrency, PollInterval: 5 * time.Millisecond, LeaseDuration: leaseDuration,
+		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, repos, registry, slog.Default())
 	if err != nil {
@@ -2001,7 +2007,7 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 	limitedRepos := *runtime.repos
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstPass, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
@@ -2555,7 +2561,7 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 			limitedRepos := *runtime.repos
 			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-				Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 				Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 			}, &limitedRepos, runtime.registry, slog.Default())
 			if err != nil {
@@ -3450,23 +3456,10 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		return target, nil
 	}
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
-	limitedRepos := *runtime.repos
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 6}
-	limitedRepos.Tasks = limited
-	runtime.repos.Tasks = limited
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
-		Retention: time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
-	}, &limitedRepos, runtime.registry, slog.Default())
-	if err != nil {
-		t.Fatalf("new limited task engine: %v", err)
+	recovering := runOneStorageTask(t, runtime, taskRow, model.TaskStatusPending)
+	if recovering.ResumeMode != model.TaskResumeModeRecover || len(recovering.Checkpoint) == 0 || storeCalls.Load() != 1 {
+		t.Fatalf("interrupted store = %#v calls:%d, want checkpointed recovery after one Store", recovering, storeCalls.Load())
 	}
-	cancel, done := runEngine(t, engine)
-	defer stopHandlerEngine(t, cancel, done)
-
-	recovering := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover && len(task.Checkpoint) > 0
-	})
 	var checkpoint struct {
 		AttemptedAt        time.Time `json:"attempted_at"`
 		IntendedPieceCID   string    `json:"intended_piece_cid"`
@@ -3479,19 +3472,17 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		t.Fatalf("store checkpoint = %#v", checkpoint)
 	}
 	parkedState.Store(synapse.ParkedPieceProcessing)
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("wake processing store recovery: %v", err)
+	wakeTask(t, runtime, taskRow.ID)
+	processing := runOneStorageTask(t, runtime, recovering, model.TaskStatusPending)
+	if processing.ResumeMode != model.TaskResumeModeRecover || processing.RetryCount != 0 || storeCalls.Load() != 1 {
+		t.Fatalf("processing recovery = %#v calls:%d, want recovery without retransmission", processing, storeCalls.Load())
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
 	parkedError.Store(true)
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("wake failed store lookup: %v", err)
+	wakeTask(t, runtime, taskRow.ID)
+	lookupFailed := runOneStorageTask(t, runtime, processing, model.TaskStatusPending)
+	if lookupFailed.ResumeMode != model.TaskResumeModeRecover || lookupFailed.RetryCount != 0 || storeCalls.Load() != 1 {
+		t.Fatalf("failed lookup recovery = %#v calls:%d, want recovery without retransmission", lookupFailed, storeCalls.Load())
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 3 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
 	parkedError.Store(false)
 	parkedState.Store(synapse.ParkedPieceMissing)
 	checkpoint.AttemptedAt = time.Now().Add(-31 * time.Minute)
@@ -3502,13 +3493,14 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, checkpointJSON, taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("age store checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("wake store recovery: %v", err)
+	wakeTask(t, runtime, taskRow.ID)
+	replayable := runOneStorageTask(t, runtime, lookupFailed, model.TaskStatusPending)
+	if replayable.ResumeMode != model.TaskResumeModeExecute || storeCalls.Load() != 1 {
+		t.Fatalf("missing piece recovery = %#v calls:%d, want Execute without retransmission in Recover", replayable, storeCalls.Load())
 	}
-	retrying := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 5 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
-	if retrying.RetryCount != 1 || storeCalls.Load() != 2 {
+	wakeTask(t, runtime, taskRow.ID)
+	retrying := runOneStorageTask(t, runtime, replayable, model.TaskStatusPending)
+	if retrying.ResumeMode != model.TaskResumeModeRecover || retrying.RetryCount != 1 || storeCalls.Load() != 2 {
 		t.Fatalf("retransmitted store = retry count:%d calls:%d, want 1/2", retrying.RetryCount, storeCalls.Load())
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -3516,12 +3508,8 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		t.Fatalf("unknown store copy = %#v, err=%v", copyRow, err)
 	}
 	parkedState.Store(synapse.ParkedPieceReady)
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("wake retransmitted store recovery: %v", err)
-	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusCompleted
-	})
+	wakeTask(t, runtime, taskRow.ID)
+	runOneStorageTask(t, runtime, retrying, model.TaskStatusCompleted)
 	if storeCalls.Load() != 2 || cacheOpens.Load() != 4 || parkedCalls.Load() < 5 {
 		t.Fatalf("store recovery calls = store:%d cache:%d parked:%d", storeCalls.Load(), cacheOpens.Load(), parkedCalls.Load())
 	}
@@ -3603,7 +3591,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3, countType: model.TaskTypeStoragePull}
 	limitedRepos.Tasks = limited
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
@@ -3858,7 +3846,7 @@ func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
 	limitedRepos := *runtime.repos
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
@@ -4380,7 +4368,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	limitedRepos := *runtime.repos
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {

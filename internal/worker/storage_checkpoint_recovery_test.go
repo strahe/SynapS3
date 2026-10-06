@@ -456,7 +456,7 @@ func TestStoreRestartBeforeRetryCheckpointRechecksOldPiece(t *testing.T) {
 	limitedRepos := *runtime.repos
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstEngine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
@@ -528,9 +528,12 @@ func TestStoreRestartAfterRetryCheckpointOnlyQueriesProvider(t *testing.T) {
 	}
 	stopHandlerEngine(t, cancel, done)
 	parkedState.Store(synapse.ParkedPieceReady)
-	time.Sleep(350 * time.Millisecond)
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("lease_until = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("expire stopped Store claim: %v", err)
+	}
 	restarted, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, runtime.repos, runtime.registry, slog.Default())
 	if err != nil {
