@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -17,6 +18,91 @@ import (
 
 func TestCopyRetryAdmissionAndHistory(t *testing.T) {
 	copyRetryAdmissionAndHistory(t, testDB(t))
+}
+
+func TestCopyRetryFailedIngressWithSuccessor(t *testing.T) {
+	copyRetryFailedIngressWithSuccessor(t, testDB(t))
+}
+
+func copyRetryFailedIngressWithSuccessor(t *testing.T, db *bun.DB) {
+	t.Helper()
+	for scenario, method := range []model.StorageCopyTransferMethod{model.StorageCopyTransferMethodCacheRestore, model.StorageCopyTransferMethodPeerPull} {
+		t.Run(string(method), func(t *testing.T) {
+			repos := repository.NewRepositories(db)
+			ctx := t.Context()
+			bucket := seedBucket(t, db, "ingress-successor-"+string(method))
+			content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+				BucketID: bucket.ID, ContentSize: 10, Checksum: testutil.StorageChecksum(string(method)), RequestedCopies: 2,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "retry.bin", ContentID: &content.ID, Size: 10, ETag: "retry", ContentType: "application/octet-stream"}
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+				t.Fatal(err)
+			}
+			if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, true); err != nil {
+				t.Fatal(err)
+			}
+			var bindings []repository.UploadCopyBindingInput
+			for index := range 2 {
+				provider := onChainID(t, fmt.Sprint(100+10*scenario+index))
+				dataSet := onChainID(t, fmt.Sprint(200+10*scenario+index))
+				binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: provider, CopyIndex: index})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: dataSet}); err != nil {
+					t.Fatal(err)
+				}
+				transfer := model.StorageCopyTransferMethodIngress
+				if index == 1 {
+					transfer = model.StorageCopyTransferMethodPeerPull
+				}
+				bindings = append(bindings, repository.UploadCopyBindingInput{StorageDataSetID: binding.ID, CopyIndex: index, ProviderID: provider, TransferMethod: transfer})
+			}
+			if err := repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, bindings); err != nil {
+				t.Fatal(err)
+			}
+			copies, err := repos.Contents.ListCopies(ctx, content.ID)
+			if err != nil || len(copies) != 2 {
+				t.Fatalf("copies=%+v err=%v", copies, err)
+			}
+			failed := copies[0]
+			if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
+				Set("ingress_bytes_transferred = 5").Set("ingress_store_attempt = 1").Set("progress_updated_at = ?", time.Now()).
+				Where("id = ?", failed.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{StorageCopyID: failed.ID, ContentID: content.ID, CopyIndex: 0, LastError: "ingress failed"}); err != nil {
+				t.Fatal(err)
+			}
+			successor, err := repos.Contents.PromotePendingIngress(ctx, content.ID)
+			if err != nil || successor == nil || successor.ID != copies[1].ID {
+				t.Fatalf("successor=%+v err=%v", successor, err)
+			}
+			if method == model.StorageCopyTransferMethodPeerPull {
+				testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{StorageCopyID: successor.ID, PieceCID: "bafk2bzacecpiecerestore"})
+			}
+			states, err := repos.Contents.CopyRetryStates(ctx, []int64{failed.ID})
+			if err != nil || !states[failed.ID].Available || states[failed.ID].NextMethod != method {
+				t.Fatalf("states=%+v err=%v", states, err)
+			}
+			release := cacheaccess.NewGate().HoldRead(model.ContentCacheKey(content.ID))
+			defer release()
+			reopened, err := repos.Contents.RetryFailedCopy(ctx, failed.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reopened.Status != model.StorageCopyStatusPending || reopened.TransferMethod != method || reopened.ActiveTaskID != nil || reopened.LastError != nil || reopened.IngressBytesTransferred != 0 || reopened.IngressStoreAttempt != 0 || reopened.ProgressUpdatedAt != nil {
+				t.Fatalf("reopened=%+v", reopened)
+			}
+			ingress, err := repos.Contents.GetIngressCopy(ctx, content.ID)
+			if err != nil || ingress == nil || ingress.ID != successor.ID {
+				t.Fatalf("ingress=%+v err=%v", ingress, err)
+			}
+		})
+	}
 }
 
 func copyRetryAdmissionAndHistory(t *testing.T, db *bun.DB) *model.StorageCopy {

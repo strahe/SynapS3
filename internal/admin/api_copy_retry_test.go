@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -113,6 +114,19 @@ func TestAPIStorageCopyRetryAndPresentation(t *testing.T) {
 	row, err := f.server.repos.Contents.GetUploadCopyByID(t.Context(), f.copy.ID)
 	if err != nil || row.ActiveTaskID == nil || *row.ActiveTaskID != accepted.TaskID || row.WorkGeneration != 1 {
 		t.Fatalf("copy=%+v err=%v", row, err)
+	}
+	work, err := f.server.repos.Tasks.GetByID(t.Context(), accepted.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input storagepipeline.CopyGenerationInput
+	if err := json.Unmarshal(work.Input, &input); err != nil {
+		t.Fatal(err)
+	}
+	if work.Type != model.TaskTypeStorageTransferPlan || work.IdempotencyKey != storagepipeline.TransferPlanKey(f.copy.ID, row.WorkGeneration) ||
+		work.SubjectType == nil || *work.SubjectType != "storage_copy" || work.SubjectKey == nil || *work.SubjectKey != fmt.Sprint(f.copy.ID) ||
+		input.CopyID != f.copy.ID || input.Generation != row.WorkGeneration {
+		t.Fatalf("recovery work=%+v input=%+v", work, input)
 	}
 	history, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
 	if err != nil || history.AcknowledgedAt == nil || history.Status != model.TaskStatusFailed {

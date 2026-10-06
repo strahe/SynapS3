@@ -7,7 +7,7 @@ export function copyRetryBlockedLabel(reason?: string) {
     case 'object_deleted':
       return 'Object deleted'
     case 'replacement_in_progress':
-      return 'Wait for provider replacement'
+      return 'Finish or retry the provider replacement first'
     case 'storage_service_unavailable':
       return 'Storage service unavailable'
     case 'no_source':

@@ -4,19 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
@@ -91,29 +96,50 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 	}
 	otherPiece := testOnChainID(t, 0)
 	testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{StorageCopyID: otherCopy.ID, ContentID: pipeline.upload.ID, CopyIndex: 2, PieceCID: pipeline.pieceCID.String(), PieceID: &otherPiece, RetrievalURL: "https://other.example/piece"})
-	release := runtime.gate.HoldRead(model.ContentCacheKey(pipeline.upload.ID))
-	err = runtime.repos.WithTx(t.Context(), func(tx *repository.Repositories) error {
-		if _, err := tx.Contents.RetryFailedCopy(t.Context(), pipeline.target.ID); err != nil {
-			return err
-		}
-		generation, err := tx.Contents.NextCopyWorkGeneration(t.Context(), pipeline.target.ID)
-		if err != nil {
-			return err
-		}
-		row, _, err := runtime.service.EnqueueInTransaction(t.Context(), tx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(pipeline.target.ID, generation), Input: storagepipeline.CopyGenerationInput{CopyID: pipeline.target.ID, Generation: generation}, SubjectType: "storage_copy", SubjectKey: fmt.Sprint(pipeline.target.ID)})
-		if err != nil {
-			return err
-		}
-		if err := tx.Contents.BindCopyTask(t.Context(), pipeline.target.ID, generation, row.ID); err != nil {
-			return err
-		}
-		return runtime.service.AcknowledgeSubjectInTransaction(t.Context(), tx, "storage_copy", fmt.Sprint(pipeline.target.ID))
-	})
-	release()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	serverCtx, stopServer := context.WithCancel(t.Context())
+	serverDone := make(chan error, 1)
+	server := admin.New("", runtime.db, runtime.cache, runtime.gate, runtime.tracker, 0, runtime.repos, nil, nil, 2, slog.Default()).WithTaskService(runtime.service)
+	go func() { serverDone <- server.Serve(serverCtx, listener) }()
+	defer func() {
+		stopServer()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("admin server shutdown: %v", err)
+			}
+		case <-time.After(handlerTestLeaseDuration):
+			t.Error("admin server did not stop")
+		}
+	}()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://%s/api/v1/storage-copies/%d/retry", listener.Addr(), pipeline.target.ID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (&http.Client{Timeout: handlerTestLeaseDuration}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("retry status=%d body=%s", response.StatusCode, body)
+	}
+	var accepted struct {
+		CopyID int64 `json:"copy_id"`
+		TaskID int64 `json:"task_id"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.CopyID != pipeline.target.ID || accepted.TaskID == 0 || accepted.TaskID == old.ID {
+		t.Fatalf("recovery work=%+v", accepted)
+	}
 	waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
+	waitForTask(t, runtime.repos, accepted.TaskID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
 	var attempts []storagepull.Attempt
 	if err := runtime.db.NewSelect().Model(&attempts).Where("content_id = ?", pipeline.upload.ID).OrderExpr("attempted_at ASC").Scan(t.Context()); err != nil {
 		t.Fatal(err)

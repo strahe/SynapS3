@@ -20,6 +20,10 @@ func TestPostgresCopyRetryAdmissionAndHistory(t *testing.T) {
 	copyRetryAdmissionAndHistory(t, migratedPostgresDB(t))
 }
 
+func TestPostgresCopyRetryFailedIngressWithSuccessor(t *testing.T) {
+	copyRetryFailedIngressWithSuccessor(t, migratedPostgresDB(t))
+}
+
 func TestPostgresOrdinaryCacheRestoreProtectsCache(t *testing.T) {
 	ordinaryCacheRestoreProtectsCache(t, migratedPostgresDB(t))
 }

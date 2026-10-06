@@ -13,6 +13,7 @@ import {
 } from '../src/lib/storage-status-labels.ts'
 
 test('replica retry reasons explain unavailable recovery without reason codes', () => {
+  assert.equal(copyRetryBlockedLabel('replacement_in_progress'), 'Finish or retry the provider replacement first')
   for (const reason of [
     'object_deleted',
     'replacement_in_progress',

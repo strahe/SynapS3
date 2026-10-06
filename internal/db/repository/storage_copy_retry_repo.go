@@ -10,6 +10,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
@@ -46,7 +47,7 @@ func (r *BunStorageContentRepo) CopyRetryStates(ctx context.Context, copyIDs []i
 		(content.cleanup_task_id IS NOT NULL OR NOT EXISTS
 			(SELECT 1 FROM object_versions AS version WHERE version.content_id = copy.content_id)) AS object_deleted,
 		EXISTS (SELECT 1 FROM storage_replacements AS replacement
-			WHERE replacement.status NOT IN ('completed', 'superseded') AND
+			WHERE replacement.status NOT IN (?, ?) AND
 			(replacement.source_data_set_id = copy.storage_data_set_id OR replacement.target_data_set_id = copy.storage_data_set_id))
 		AS replacement_in_progress,
 		EXISTS (SELECT 1 FROM storage_pull_attempts AS attempt
@@ -61,7 +62,7 @@ func (r *BunStorageContentRepo) CopyRetryStates(ctx context.Context, copyIDs []i
 		JOIN storage_data_sets AS data_set ON data_set.id = copy.storage_data_set_id
 		LEFT JOIN object_cache AS cache ON cache.content_id = copy.content_id
 		WHERE copy.id IN (?)`
-	if err := r.db.NewRaw(query, bun.List(copyIDs)).Scan(ctx, &rows); err != nil {
+	if err := r.db.NewRaw(query, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded, bun.List(copyIDs)).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("loading copy retry facts: %w", err)
 	}
 	for _, row := range rows {
@@ -110,13 +111,14 @@ func (r *BunStorageContentRepo) RetryFailedCopy(ctx context.Context, copyID int6
 			}
 			return ErrConflict
 		}
-		if err := reopenFailedUploadCopy(ctx, db, copyID); err != nil {
-			return err
-		}
+		// Change the method before reopening to preserve the unique live ingress slot.
 		if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
 			Set("transfer_method = ?", state.NextMethod).Set("ingress_bytes_transferred = 0").
 			Set("ingress_store_attempt = 0").Set("progress_updated_at = NULL").
 			Where("id = ?", copyID).Exec(ctx); err != nil {
+			return err
+		}
+		if err := reopenFailedUploadCopy(ctx, db, copyID); err != nil {
 			return err
 		}
 		if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
