@@ -427,7 +427,7 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	}
 	stopHandlerEngine(t, cancel, done)
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, f.runtime.repos, f.runtime.registry, slog.Default())
 	if err != nil {
@@ -854,7 +854,7 @@ func TestCollectingCommitFormsBatchesWhenSlotsOpen(t *testing.T) {
 	if signatures != 0 {
 		t.Fatalf("signatures while slots are full = %d, want none", signatures)
 	}
-	for batch := 0; batch < 2; batch++ {
+	for batch := range 2 {
 		heldID := fmt.Sprintf("held-%d", batch)
 		if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
 			RequestID: heldID, TaskID: *f.request(t, heldID).TaskID, FirstPieceID: testOnChainID(t, int64(50+batch)),

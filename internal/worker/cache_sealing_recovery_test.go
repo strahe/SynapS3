@@ -118,7 +118,7 @@ func TestSealIntentAndCachePressureSurviveRuntimeRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			handlers.SetTaskService(service)
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond, Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2}, f.runtime.repos, registry, slog.Default())
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2}, f.runtime.repos, registry, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
