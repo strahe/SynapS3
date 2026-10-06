@@ -25,6 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -46,49 +47,53 @@ const (
 )
 
 type bucketListItem struct {
-	ID                   int64                              `json:"id"`
-	Name                 string                             `json:"name"`
-	OwnerAccessKey       *string                            `json:"owner_access_key"`
-	DefaultCopies        int                                `json:"default_copies"`
-	MinimumDurableCopies int                                `json:"minimum_durable_copies"`
-	Status               string                             `json:"status"`
-	ObjectCount          int64                              `json:"object_count"`
-	TotalSizeBytes       int64                              `json:"total_size_bytes"`
-	StorageHealth        bucketStorageHealthSummaryResponse `json:"storage_health"`
-	CreatedAt            string                             `json:"created_at"`
+	ID                        int64                              `json:"id"`
+	Name                      string                             `json:"name"`
+	OwnerAccessKey            *string                            `json:"owner_access_key"`
+	DefaultCopies             int                                `json:"default_copies"`
+	MinimumDurableCopies      int                                `json:"minimum_durable_copies"`
+	ProviderSelectionStrategy providerselect.Strategy            `json:"provider_selection_strategy"`
+	Status                    string                             `json:"status"`
+	ObjectCount               int64                              `json:"object_count"`
+	TotalSizeBytes            int64                              `json:"total_size_bytes"`
+	StorageHealth             bucketStorageHealthSummaryResponse `json:"storage_health"`
+	CreatedAt                 string                             `json:"created_at"`
 }
 
 type bucketCreateRequest struct {
-	Name                 string `json:"name"`
-	OwnerAccessKey       string `json:"owner_access_key"`
-	DefaultCopies        *int   `json:"default_copies"`
-	MinimumDurableCopies *int   `json:"minimum_durable_copies"`
+	Name                      string                  `json:"name"`
+	OwnerAccessKey            string                  `json:"owner_access_key"`
+	DefaultCopies             *int                    `json:"default_copies"`
+	MinimumDurableCopies      *int                    `json:"minimum_durable_copies"`
+	ProviderSelectionStrategy providerselect.Strategy `json:"provider_selection_strategy"`
 }
 
 type bucketMutationResponse struct {
-	ID                   int64   `json:"id"`
-	Name                 string  `json:"name"`
-	OwnerAccessKey       *string `json:"owner_access_key"`
-	DefaultCopies        int     `json:"default_copies"`
-	MinimumDurableCopies int     `json:"minimum_durable_copies"`
-	Status               string  `json:"status"`
+	ID                        int64                   `json:"id"`
+	Name                      string                  `json:"name"`
+	OwnerAccessKey            *string                 `json:"owner_access_key"`
+	DefaultCopies             int                     `json:"default_copies"`
+	MinimumDurableCopies      int                     `json:"minimum_durable_copies"`
+	ProviderSelectionStrategy providerselect.Strategy `json:"provider_selection_strategy"`
+	Status                    string                  `json:"status"`
 }
 
 type bucketDetailResponse struct {
-	ID                   int64                              `json:"id"`
-	Name                 string                             `json:"name"`
-	OwnerAccessKey       *string                            `json:"owner_access_key"`
-	DefaultCopies        int                                `json:"default_copies"`
-	MinimumDurableCopies int                                `json:"minimum_durable_copies"`
-	Status               string                             `json:"status"`
-	ObjectCount          int64                              `json:"object_count"`
-	TotalSizeBytes       int64                              `json:"total_size_bytes"`
-	StorageHealth        bucketStorageHealthSummaryResponse `json:"storage_health"`
-	CreatedAt            string                             `json:"created_at"`
-	UpdatedAt            string                             `json:"updated_at"`
-	VersioningStatus     string                             `json:"versioning_status"`
-	VersioningEnforced   bool                               `json:"versioning_enforced"`
-	DataSets             []storageDataSetSummaryResponse    `json:"data_sets"`
+	ID                        int64                              `json:"id"`
+	Name                      string                             `json:"name"`
+	OwnerAccessKey            *string                            `json:"owner_access_key"`
+	DefaultCopies             int                                `json:"default_copies"`
+	MinimumDurableCopies      int                                `json:"minimum_durable_copies"`
+	ProviderSelectionStrategy providerselect.Strategy            `json:"provider_selection_strategy"`
+	Status                    string                             `json:"status"`
+	ObjectCount               int64                              `json:"object_count"`
+	TotalSizeBytes            int64                              `json:"total_size_bytes"`
+	StorageHealth             bucketStorageHealthSummaryResponse `json:"storage_health"`
+	CreatedAt                 string                             `json:"created_at"`
+	UpdatedAt                 string                             `json:"updated_at"`
+	VersioningStatus          string                             `json:"versioning_status"`
+	VersioningEnforced        bool                               `json:"versioning_enforced"`
+	DataSets                  []storageDataSetSummaryResponse    `json:"data_sets"`
 	// Replacements is the bucket's full history, newest first.
 	Replacements []providerReplacementResponse `json:"replacements"`
 }
@@ -202,16 +207,17 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		}
 		stats := statsMap[b.ID]
 		items = append(items, bucketListItem{
-			ID:                   b.ID,
-			Name:                 b.Name,
-			OwnerAccessKey:       s.adminOwnerAccessKey(b.OwnerAccessKey),
-			DefaultCopies:        b.DefaultCopies,
-			MinimumDurableCopies: b.MinimumDurableCopies,
-			Status:               string(b.Status),
-			ObjectCount:          stats.Count,
-			TotalSizeBytes:       stats.TotalSize,
-			StorageHealth:        bucketStorageHealthSummaryForBucket(storageHealthMap, b.ID, storageHealthFailed),
-			CreatedAt:            b.CreatedAt.Format(time.RFC3339),
+			ID:                        b.ID,
+			Name:                      b.Name,
+			OwnerAccessKey:            s.adminOwnerAccessKey(b.OwnerAccessKey),
+			DefaultCopies:             b.DefaultCopies,
+			MinimumDurableCopies:      b.MinimumDurableCopies,
+			ProviderSelectionStrategy: b.ProviderSelectionStrategy,
+			Status:                    string(b.Status),
+			ObjectCount:               stats.Count,
+			TotalSizeBytes:            stats.TotalSize,
+			StorageHealth:             bucketStorageHealthSummaryForBucket(storageHealthMap, b.ID, storageHealthFailed),
+			CreatedAt:                 b.CreatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -235,6 +241,10 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 	}
 	if !bucketNameRe.MatchString(name) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name: must be 3-63 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen"})
+		return
+	}
+	if req.ProviderSelectionStrategy != "" && !req.ProviderSelectionStrategy.Valid() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider_selection_strategy must be distribution or speed"})
 		return
 	}
 	if err := validateBucketDefaultCopies(req.DefaultCopies); err != nil {
@@ -266,11 +276,12 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bucket, err := s.bucketLifecycle.CreateWithOptions(r.Context(), bucketlifecycle.CreateOptions{
-		Name:                 name,
-		ACL:                  acl,
-		OwnerAccessKey:       &actualOwnerAccessKey,
-		DefaultCopies:        req.DefaultCopies,
-		MinimumDurableCopies: req.MinimumDurableCopies,
+		Name:                      name,
+		ACL:                       acl,
+		OwnerAccessKey:            &actualOwnerAccessKey,
+		DefaultCopies:             req.DefaultCopies,
+		MinimumDurableCopies:      req.MinimumDurableCopies,
+		ProviderSelectionStrategy: req.ProviderSelectionStrategy,
 	})
 	if err != nil {
 		if errors.Is(err, repository.ErrAlreadyExists) {
@@ -286,12 +297,13 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, bucketMutationResponse{
-		ID:                   bucket.ID,
-		Name:                 bucket.Name,
-		OwnerAccessKey:       s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		DefaultCopies:        bucket.DefaultCopies,
-		MinimumDurableCopies: bucket.MinimumDurableCopies,
-		Status:               string(bucket.Status),
+		ID:                        bucket.ID,
+		Name:                      bucket.Name,
+		OwnerAccessKey:            s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:             bucket.DefaultCopies,
+		MinimumDurableCopies:      bucket.MinimumDurableCopies,
+		ProviderSelectionStrategy: bucket.ProviderSelectionStrategy,
+		Status:                    string(bucket.Status),
 	})
 }
 
@@ -333,21 +345,22 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 	storageHealthMap, storageHealthFailed := s.bucketStorageHealthSummaries(ctx, bucket.ID)
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
-		ID:                   bucket.ID,
-		Name:                 bucket.Name,
-		OwnerAccessKey:       s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		DefaultCopies:        bucket.DefaultCopies,
-		MinimumDurableCopies: bucket.MinimumDurableCopies,
-		Status:               string(bucket.Status),
-		ObjectCount:          stats.Count,
-		TotalSizeBytes:       stats.TotalSize,
-		StorageHealth:        bucketStorageHealthSummaryForBucket(storageHealthMap, bucket.ID, storageHealthFailed),
-		CreatedAt:            bucket.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:            bucket.UpdatedAt.Format(time.RFC3339),
-		VersioningStatus:     "Enabled",
-		VersioningEnforced:   true,
-		DataSets:             dataSets,
-		Replacements:         s.bucketReplacementResponses(ctx, bucket.Name, bucket.ID),
+		ID:                        bucket.ID,
+		Name:                      bucket.Name,
+		OwnerAccessKey:            s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:             bucket.DefaultCopies,
+		MinimumDurableCopies:      bucket.MinimumDurableCopies,
+		ProviderSelectionStrategy: bucket.ProviderSelectionStrategy,
+		Status:                    string(bucket.Status),
+		ObjectCount:               stats.Count,
+		TotalSizeBytes:            stats.TotalSize,
+		StorageHealth:             bucketStorageHealthSummaryForBucket(storageHealthMap, bucket.ID, storageHealthFailed),
+		CreatedAt:                 bucket.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:                 bucket.UpdatedAt.Format(time.RFC3339),
+		VersioningStatus:          "Enabled",
+		VersioningEnforced:        true,
+		DataSets:                  dataSets,
+		Replacements:              s.bucketReplacementResponses(ctx, bucket.Name, bucket.ID),
 	})
 }
 
@@ -407,12 +420,13 @@ func (s *Server) handleAPIUpdateBucketOwner(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, bucketMutationResponse{
-		ID:                   bucket.ID,
-		Name:                 bucket.Name,
-		OwnerAccessKey:       s.adminOwnerAccessKey(&actualOwnerAccessKey),
-		DefaultCopies:        bucket.DefaultCopies,
-		MinimumDurableCopies: bucket.MinimumDurableCopies,
-		Status:               string(bucket.Status),
+		ID:                        bucket.ID,
+		Name:                      bucket.Name,
+		OwnerAccessKey:            s.adminOwnerAccessKey(&actualOwnerAccessKey),
+		DefaultCopies:             bucket.DefaultCopies,
+		MinimumDurableCopies:      bucket.MinimumDurableCopies,
+		ProviderSelectionStrategy: bucket.ProviderSelectionStrategy,
+		Status:                    string(bucket.Status),
 	})
 }
 
@@ -511,12 +525,13 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 	}
 
 	writeJSON(w, http.StatusOK, bucketMutationResponse{
-		ID:                   bucket.ID,
-		Name:                 bucket.Name,
-		OwnerAccessKey:       s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		DefaultCopies:        bucket.DefaultCopies,
-		MinimumDurableCopies: bucket.MinimumDurableCopies,
-		Status:               string(bucket.Status),
+		ID:                        bucket.ID,
+		Name:                      bucket.Name,
+		OwnerAccessKey:            s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:             bucket.DefaultCopies,
+		MinimumDurableCopies:      bucket.MinimumDurableCopies,
+		ProviderSelectionStrategy: bucket.ProviderSelectionStrategy,
+		Status:                    string(bucket.Status),
 	})
 }
 

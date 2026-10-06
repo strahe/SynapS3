@@ -110,6 +110,7 @@ test('preflight payload includes editable filecoin fields and excludes private k
     with_cdn: true,
     allow_private_networks: false,
     default_copies: 2,
+    anchor_provider_tier: 'none',
     observability: { interval: '10m0s', timeout: '10s', concurrency: 4 },
     private_key: 'raw-private-key',
     ignored: 'value',
@@ -122,6 +123,7 @@ test('preflight payload includes editable filecoin fields and excludes private k
       with_cdn: true,
       allow_private_networks: false,
       default_copies: 2,
+      anchor_provider_tier: 'none',
       observability: { interval: '10m0s', timeout: '10s', concurrency: 4 },
     },
   })

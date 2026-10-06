@@ -26,7 +26,7 @@ type PDPBatchUploadProbe struct {
 }
 
 func NewPDPBatchUploadProbe(allowPrivate bool) *PDPBatchUploadProbe {
-	return &PDPBatchUploadProbe{client: newPDPStatusHTTPClient(0, allowPrivate), timeout: uploadProbeTimeout}
+	return &PDPBatchUploadProbe{client: NewProviderHTTPClient(0, allowPrivate), timeout: uploadProbeTimeout}
 }
 
 // Probe measures only the PUT phase; the upload session is intentionally not finalized.

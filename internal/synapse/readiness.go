@@ -13,11 +13,11 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
+	"github.com/strahe/synaps3/internal/providerselect"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/payments"
-	"github.com/strahe/synapse-go/spregistry"
 	"github.com/strahe/synapse-go/storage"
 )
 
@@ -66,6 +66,9 @@ type ReadinessConfig struct {
 	WithCDN              bool
 	AllowPrivateNetworks bool
 	DefaultCopies        int
+	AnchorProviderTier   string
+	ProviderTimeout      time.Duration
+	ProviderConcurrency  int
 }
 
 type readinessPayments interface {
@@ -74,7 +77,6 @@ type readinessPayments interface {
 }
 
 type readinessStorage interface {
-	GetStorageInfo(ctx context.Context, opts *storage.GetStorageInfoOptions) (*storage.StorageInfo, error)
 	CalculateMultiContextCosts(
 		ctx context.Context,
 		pieceSizes []uint64,
@@ -85,6 +87,7 @@ type readinessStorage interface {
 }
 
 type ReadinessClient interface {
+	ProviderInventory(context.Context, ReadinessConfig) (ProviderInventory, error)
 	Address() common.Address
 	Chain() chain.Chain
 	ResolvedAddresses() sdk.ResolvedAddresses
@@ -148,6 +151,7 @@ func (c *ReadinessChecker) CheckRuntime(ctx context.Context) ReadinessResult {
 }
 
 func (c *ReadinessChecker) CheckDraft(ctx context.Context, cfg ReadinessConfig) ReadinessResult {
+	cfg = normalizedReadinessConfig(cfg)
 	result := newReadinessResult(ReadinessModeDraft)
 	if !validateReadinessConfig(cfg, &result) {
 		result.finish()
@@ -180,6 +184,7 @@ func (c *ReadinessChecker) CheckDraft(ctx context.Context, cfg ReadinessConfig) 
 }
 
 func (c *ReadinessChecker) checkClient(ctx context.Context, cfg ReadinessConfig, client ReadinessClient, result *ReadinessResult, validateConfig bool) {
+	cfg = normalizedReadinessConfig(cfg)
 	if validateConfig && !validateReadinessConfig(cfg, result) {
 		return
 	}
@@ -318,27 +323,28 @@ func (c *ReadinessChecker) checkStorage(
 		return
 	}
 
-	info, err := storageSvc.GetStorageInfo(ctx, nil)
+	inventory, err := client.ProviderInventory(ctx, cfg)
 	if err != nil {
-		c.addPartialError(result, "storage_info", err)
-	}
-	if err != nil || info == nil {
-		result.unknown("providers", "Approved storage providers could not be checked.")
+		c.addPartialError(result, "provider_inventory", err)
+		result.unknown("providers", "Storage providers could not be checked.")
 		addStorageDependencyUnknowns(result, "Storage cost estimate could not be calculated.", "Payment funding could not be checked.", "FWSS approval could not be checked.")
 		return
 	}
-
-	refs := readinessCostRefs(info.Providers, cfg.DefaultCopies, cfg.WithCDN)
-	if len(refs) < cfg.DefaultCopies {
-		result.blocked(
-			"providers",
-			fmt.Sprintf("Only %d approved active providers are available; %d copies are configured.", len(refs), cfg.DefaultCopies),
-			"Lower the default copy count or wait for more approved providers.",
-		)
-		addStorageDependencyUnknowns(result, "Storage cost estimate needs enough approved providers.", "Payment funding needs a storage cost estimate.", "FWSS approval needs a storage cost estimate.")
+	selected, selectErr := providerselect.Select(inventory.Selection, providerselect.StrategyDistribution, cfg.DefaultCopies, nil, false)
+	if selectErr != nil || len(selected) < cfg.DefaultCopies {
+		message := fmt.Sprintf("Only %d eligible providers are available; %d copies are configured.", len(selected), cfg.DefaultCopies)
+		if errors.Is(selectErr, providerselect.ErrNoTrustedProvider) {
+			message = "No healthy provider meets the configured provider requirement."
+		}
+		result.blocked("providers", message, "Review provider availability and the configured provider requirement.")
+		addStorageDependencyUnknowns(result, "Storage cost estimate needs enough eligible providers.", "Payment funding needs a storage cost estimate.", "FWSS approval needs a storage cost estimate.")
 		return
 	}
-	result.ready("providers", "Approved active providers are available.")
+	refs := make([]storage.ContextCostRef, 0, len(selected))
+	for _, candidate := range selected {
+		refs = append(refs, storage.ContextCostRef{Provider: inventory.Providers[candidate.ID.String()], WithCDN: cfg.WithCDN})
+	}
+	result.ready("providers", "Eligible storage providers are available.")
 
 	costs, err := storageSvc.CalculateMultiContextCosts(
 		ctx,
@@ -433,6 +439,7 @@ func validateReadinessConfig(cfg ReadinessConfig, result *ReadinessResult) bool 
 		"Default Filecoin copy count is invalid.",
 		fmt.Sprintf("Set filecoin.default_copies between %d and %d.", model.StorageCopiesMin, model.StorageCopiesMax),
 	)
+	add("config_provider_requirement", !providerselect.Tier(cfg.AnchorProviderTier).Valid(), "Provider requirement is valid.", "Provider requirement is invalid.", "Choose approved, endorsed, or none.")
 	return ok
 }
 
@@ -457,37 +464,6 @@ func chainForReadinessNetwork(network string) (chain.Chain, bool) {
 
 func normalizeReadinessNetwork(network string) string {
 	return strings.ToLower(strings.TrimSpace(network))
-}
-
-func readinessCostRefs(providers []spregistry.PDPProvider, copies int, withCDN bool) []storage.ContextCostRef {
-	if copies <= 0 {
-		return nil
-	}
-	refs := make([]storage.ContextCostRef, 0, copies)
-	for _, provider := range providers {
-		if len(refs) >= copies {
-			break
-		}
-		if !readinessProviderUsable(provider) {
-			continue
-		}
-		refs = append(refs, storage.ContextCostRef{
-			Provider: storage.Provider{
-				ID:              provider.Info.ID,
-				ServiceURL:      provider.Offering.ServiceURL,
-				ServiceProvider: provider.Info.ServiceProvider,
-				Payee:           provider.Info.Payee,
-			},
-			WithCDN: withCDN,
-		})
-	}
-	return refs
-}
-
-func readinessProviderUsable(provider spregistry.PDPProvider) bool {
-	return provider.Info.IsActive &&
-		provider.Product.IsActive &&
-		!provider.Info.ID.IsZero()
 }
 
 func newReadinessResult(mode ReadinessMode) ReadinessResult {

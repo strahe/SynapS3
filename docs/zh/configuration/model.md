@@ -87,6 +87,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `s3.region` | `us-east-1` |
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
+| `filecoin.anchor_provider_tier` | `approved` |
 | `database.driver` | `sqlite` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
@@ -121,6 +122,12 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 
 打开 **Batches** 查看已收集的数据，点击 **Submit next batch** 请求提交下一批，最多提交单笔上限的 piece，其余数据继续等待。手动操作独立于自动开关和缓存策略，也需要等待提交名额。点击 **Details** 查看成员、提交时间、交易 ID 和错误；停止的任务在允许恢复时显示 **Recover**。每个成员展示一个关联对象，以及共享该数据的其他版本数量。历史对象信息或大小缺失时会标明不可用。
 
+## 节点选择
+
+`filecoin.anchor_provider_tier` 要求新选择后的节点集合至少保留一个 Approved 或 Endorsed 节点。Endorsed 不要求同时属于 Approved；`none` 取消名单要求。所有候选仍须有当前服务地址的有效健康观测。修改后需重启，已接受的目标不会重新选择。
+
+创建存储桶时，**Provider preference** 可选分布优先（`distribution`，默认）或速度优先（`speed`）。分布优先先比较未退役数据集数量，再比较上传测速；速度优先先选择当前服务地址下测速成功的节点，未测速节点按负载补足。条件相同则随机选择。保存的偏好用于补副本和自动替换，手动替换跳过排序。S3 创建和现有存储桶默认分布优先，创建 API 接受 `provider_selection_strategy`，查询返回保存值；创建后不能修改偏好。节点在该桶的旧数据集全部退役后可再次使用。
+
 ## Admin 会话时长
 
 `admin.auth.session_ttl` 控制每个普通 Admin UI 会话 token 的有效时长，既不是服务端强制的空闲超时，也不是一次登录的绝对上限。经过 5 分钟或 token 有效时长的一半（取较短者）后，服务端允许续期。官方仪表盘只在可信的指针、点击、键盘或滚轮操作后请求续期；后台轮询和仅切回可见标签页不会触发续期。任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后调用续期接口。没有客户端请求续期时，token 会在 `expires_at` 到期。
@@ -131,6 +138,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 
 - `filecoin.network`: `calibration`, `mainnet`。
 - `filecoin.default_copies`: `1` 到 `8`。
+- `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
 - `database.driver`: `sqlite`, `postgres`。
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`。
 - `logging.level`: `debug`, `info`, `warn`, `error`。

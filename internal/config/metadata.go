@@ -89,6 +89,12 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS",
 		Editable:    true,
 	},
+	"filecoin.anchor_provider_tier": {
+		Label:       "Provider Requirement",
+		Description: "Requires at least one provider from the selected list, without fallback; none removes the list requirement. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER",
+		Editable:    true,
+	},
 	"filecoin.default_copies": {
 		Label:       "Default Copies",
 		Description: "Default target Filecoin copies for buckets without an explicit copy policy, from 1 to 8.",

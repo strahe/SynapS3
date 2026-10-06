@@ -86,6 +86,7 @@ const tabFields = {
     'filecoin.with_cdn',
     'filecoin.allow_private_networks',
     'filecoin.default_copies',
+    'filecoin.anchor_provider_tier',
     'filecoin.observability.interval',
     'filecoin.observability.timeout',
     'filecoin.observability.concurrency',
@@ -435,6 +436,19 @@ function SettingsPage() {
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, rpc_url: value } })}
+              />
+              <SelectField
+                label="Provider Requirement"
+                field="filecoin.anchor_provider_tier"
+                value={form.filecoin.anchor_provider_tier}
+                options={['approved', 'endorsed', 'none']}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => {
+                  if (value === 'approved' || value === 'endorsed' || value === 'none') {
+                    setForm({ ...form, filecoin: { ...form.filecoin, anchor_provider_tier: value } })
+                  }
+                }}
               />
               <NumberField
                 label="Default Copies"

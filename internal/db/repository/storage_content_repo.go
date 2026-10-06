@@ -1936,3 +1936,19 @@ func derefString(value *string) string {
 	}
 	return *value
 }
+
+func (r *BunStorageContentRepo) ProviderDataSetLoads(ctx context.Context, ids []types.OnChainID) (map[string]int, error) {
+	out := make(map[string]int)
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		ProviderID string
+		Count      int
+	}
+	err := r.db.NewSelect().Model((*model.StorageDataSet)(nil)).Column("provider_id").ColumnExpr("COUNT(*) AS count").Where("provider_id IN (?) AND status <> ?", bun.List(ids), model.StorageDataSetStatusRetired).Group("provider_id").Scan(ctx, &rows)
+	for _, row := range rows {
+		out[row.ProviderID] = row.Count
+	}
+	return out, err
+}

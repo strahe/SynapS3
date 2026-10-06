@@ -412,6 +412,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 
 func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *testing.T) {
 	cfg := validConfig()
+	cfg.Filecoin.AnchorProviderTier = "endorsed"
 	cfg.Database.DSN = "postgres://synaps3:password@example.invalid:5432/synaps3"
 	cfg.Cache.Dir = "/var/lib/synaps3/cache"
 	path := filepath.Join(t.TempDir(), "config.toml")
@@ -434,6 +435,7 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 		"# dsn = \"\"",
 		"# max_open_conns = 32",
 		"driver = \"sqlite\"",
+		"anchor_provider_tier = \"endorsed\"",
 		"dir = \"/var/lib/synaps3/cache\"",
 	} {
 		assertConfigContains(t, text, want)

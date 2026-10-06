@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 )
@@ -44,6 +45,7 @@ type TaskHandlerDependencies struct {
 	MaxWriteBytes          int64 // largest single cache write; 0 means no room is kept for it
 	LRUHighPercent         int
 	LRULowPercent          int
+	AnchorProviderTier     providerselect.Tier
 	DefaultCopies          int
 	MaxRetries             int
 	// CommitMaxPieces, CommitMaxWait and CommitMaxBacklog shape how transferred
@@ -101,6 +103,12 @@ func NewTaskHandlers(deps TaskHandlerDependencies) (*TaskHandlers, error) {
 	}
 	if deps.CommitMaxPieces < 1 || deps.CommitMaxWait < 0 || deps.CommitMaxBacklog < deps.CommitMaxPieces {
 		return nil, errors.New("storage registration limits are invalid")
+	}
+	if deps.AnchorProviderTier == "" {
+		deps.AnchorProviderTier = providerselect.TierApproved
+	}
+	if !deps.AnchorProviderTier.Valid() {
+		return nil, errors.New("invalid provider tier")
 	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()

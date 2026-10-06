@@ -10,5 +10,8 @@ func ReadinessConfigFromFilecoinConfig(cfg config.FilecoinConfig) ReadinessConfi
 		WithCDN:              cfg.WithCDN,
 		AllowPrivateNetworks: cfg.AllowPrivateNetworks,
 		DefaultCopies:        cfg.DefaultCopies,
+		AnchorProviderTier:   cfg.AnchorProviderTier,
+		ProviderTimeout:      cfg.Observability.Timeout,
+		ProviderConcurrency:  cfg.Observability.Concurrency,
 	}
 }

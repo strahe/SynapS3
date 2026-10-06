@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/uptrace/bun"
 )
 
@@ -58,6 +59,8 @@ type Bucket struct {
 	Status               BucketStatus `bun:"type:text,notnull,default:'provisioning'"`
 	CreatedAt            time.Time    `bun:",nullzero,notnull"`
 	UpdatedAt            time.Time    `bun:",nullzero,notnull"`
+
+	ProviderSelectionStrategy providerselect.Strategy `bun:"type:text,notnull,default:'distribution'"`
 
 	Owner *S3Account `bun:"rel:belongs-to,join:owner_access_key=access_key,on_update:restrict,on_delete:restrict"`
 }

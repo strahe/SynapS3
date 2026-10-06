@@ -23,6 +23,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
@@ -77,11 +78,13 @@ type pullCheckpoint struct {
 }
 
 type selectedBinding struct {
+	admission *providerselect.Admission
 	copyIndex int
 	target    synapse.StorageTarget
 }
 
 type uploadBindingPlan struct {
+	admission *providerselect.Admission
 	copyIndex int
 	provider  idtypes.OnChainID
 	dataSet   *storage.DataSetRef
@@ -135,7 +138,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 
 		plan, err := h.selectUploadBindings(ctx, bucket, upload)
 		if err != nil {
-			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
+			if errors.Is(err, providerselect.ErrNoTrustedProvider) || synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
 				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
 			return retryTask(err, "storage_selection_failed")
@@ -166,6 +169,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 			entry := plan[i]
 			frozen := uploadBindingPlan{
 				copyIndex: entry.copyIndex,
+				admission: entry.admission,
 				provider:  idtypes.OnChainIDFromSDK(entry.target.ProviderID()),
 			}
 			if ref, ok := entry.target.DataSetRef(); ok {
@@ -178,6 +182,12 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 		ingressProviderID := bindingPlan[ingressIndex].provider
 
 		return taskengine.Complete("Storage work scheduled", func(ctx context.Context, repos *repository.Repositories) error {
+			if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
+				return err
+			}
+			if err := validateBindingSelection(ctx, repos, bucket.ID, bindingPlan); err != nil {
+				return err
+			}
 			bindings := make([]model.StorageDataSet, 0, len(bindingPlan))
 			for i := range bindingPlan {
 				entry := bindingPlan[i]
@@ -285,11 +295,13 @@ func (h *TaskHandlers) selectBucketBindings(ctx context.Context, bucket *model.B
 	}
 	targetCount = model.ClampStorageCopies(targetCount)
 	selected := make([]selectedBinding, 0, targetCount)
-	excluded := make([]sdktypes.BigInt, 0, len(bindings))
+	excluded := make(map[string]bool)
 	usedIndexes := make(map[int]struct{}, len(bindings))
 	for i := range bindings {
 		binding := &bindings[i]
-		excluded = append(excluded, binding.ProviderID.SDK())
+		if binding.Status != model.StorageDataSetStatusRetired {
+			excluded[binding.ProviderID.String()] = true
+		}
 		if !binding.IsCurrent {
 			continue
 		}
@@ -331,17 +343,46 @@ func (h *TaskHandlers) selectBucketBindings(ctx context.Context, bucket *model.B
 	if missing > len(indexes) {
 		missing = len(indexes)
 	}
-	targets, selectErr := h.deps.Storage.SelectUploadTargets(ctx, storage.SelectUploadContextsOptions{
-		Copies: missing, ExcludeProviderIDs: excluded, DataSetMetadata: map[string]string{"bucket": bucket.Name},
-	})
-	for i := range targets {
-		if i >= len(indexes) || targets[i] == nil {
+	in, err := h.deps.Observability.SelectionInventory(ctx, h.deps.AnchorProviderTier)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.deps.Repositories.EnrichProviderCandidates(ctx, &in); err != nil {
+		return nil, err
+	}
+	_, hasTrusted, err := h.deps.Repositories.ProviderSelectionState(ctx, bucket.ID, 0, in.Admission)
+	if err != nil {
+		return nil, err
+	}
+	var openErr error
+	for i := 0; i < missing; {
+		candidates, err := providerselect.Select(in, bucket.ProviderSelectionStrategy, 1, excluded, hasTrusted)
+		if err != nil {
+			if openErr != nil {
+				return nil, openErr
+			}
+			return nil, err
+		}
+		if len(candidates) == 0 {
 			break
 		}
-		selected = append(selected, selectedBinding{copyIndex: indexes[i], target: targets[i]})
+		candidate := candidates[0]
+		excluded[candidate.ID.String()] = true
+		target, err := h.deps.Storage.OpenProviderTarget(ctx, candidate.ID.SDK(), storage.NewProviderContextOptions{DataSetMetadata: map[string]string{"bucket": bucket.Name}})
+		if err != nil {
+			openErr = err
+			continue
+		}
+		if target == nil {
+			openErr = errors.New("provider returned no context")
+			continue
+		}
+		selected = append(selected, selectedBinding{copyIndex: indexes[i], target: target, admission: &in.Admission})
+		hasTrusted = hasTrusted || in.Admission.Trusted(candidate.ID)
+		i++
 	}
-	if selectErr != nil && len(targets) == 0 {
-		return nil, selectErr
+	if len(selected) < targetCount && openErr != nil {
+		return nil, openErr
 	}
 	sort.Slice(selected, func(i, j int) bool { return selected[i].copyIndex < selected[j].copyIndex })
 	return selected, nil

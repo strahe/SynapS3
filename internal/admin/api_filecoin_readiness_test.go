@@ -180,7 +180,7 @@ func TestFilecoinReadinessPreflightUsesEffectiveConfigBaselineInSetupMode(t *tes
 	}
 	probe := &fakeFilecoinReadinessProbe{draft: readyFilecoinReadinessResult(synapse.ReadinessModeDraft)}
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", effective, source).WithFilecoinReadiness(probe)
-	req := newFilecoinPreflightRequest(`{"filecoin":{"default_copies":1}}`)
+	req := newFilecoinPreflightRequest(`{"filecoin":{"default_copies":1,"anchor_provider_tier":"none"}}`)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	assertPreflightStatus(t, srv, req, http.StatusOK)
 
@@ -192,6 +192,9 @@ func TestFilecoinReadinessPreflightUsesEffectiveConfigBaselineInSetupMode(t *tes
 	}
 	if probe.draftConfig.DefaultCopies != 1 {
 		t.Fatalf("draft default copies = %d, want payload override", probe.draftConfig.DefaultCopies)
+	}
+	if probe.draftConfig.AnchorProviderTier != "none" {
+		t.Fatalf("draft provider requirement = %q, want none", probe.draftConfig.AnchorProviderTier)
 	}
 }
 
@@ -212,6 +215,9 @@ func TestFilecoinReadinessPreflightRejectsEnvManagedAndInvalidDraftFields(t *tes
 			name:    "invalid draft",
 			payload: `{"filecoin":{"default_copies":0}}`,
 			want:    "filecoin.default_copies",
+		},
+		{
+			name: "invalid provider requirement", payload: `{"filecoin":{"anchor_provider_tier":"any"}}`, want: "filecoin.anchor_provider_tier",
 		},
 		{
 			name:    "invalid observability draft",

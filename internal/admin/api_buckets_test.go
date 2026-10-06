@@ -772,7 +772,7 @@ func (r *recordingObjectListRepo) list(prefix string, include func(string) bool,
 func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 2, "owner-access")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access","default_copies":4,"minimum_durable_copies":2}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access","default_copies":4,"minimum_durable_copies":2,"provider_selection_strategy":"speed"}`))
 	req.Header.Set("Content-Type", "application/json")
 	setBucketWriteHeaders(req)
 	rr := httptest.NewRecorder()
@@ -808,6 +808,9 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if bucket.DefaultCopies != 4 {
 		t.Fatalf("bucket default_copies = %v, want 4", bucket.DefaultCopies)
 	}
+	if bucket.ProviderSelectionStrategy != "speed" {
+		t.Fatalf("provider preference = %q, want speed", bucket.ProviderSelectionStrategy)
+	}
 	if bucket.MinimumDurableCopies != 2 {
 		t.Fatalf("bucket minimum_durable_copies = %v, want 2", bucket.MinimumDurableCopies)
 	}
@@ -817,6 +820,7 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 		OwnerAccessKey *string `json:"owner_access_key"`
 		DefaultCopies  int     `json:"default_copies"`
 		MinimumCopies  int     `json:"minimum_durable_copies"`
+		Strategy       string  `json:"provider_selection_strategy"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode response: %v", err)
@@ -829,6 +833,9 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	}
 	if body.MinimumCopies != 2 {
 		t.Fatalf("minimum copy policy response = %d, want 2", body.MinimumCopies)
+	}
+	if body.Strategy != "speed" {
+		t.Fatalf("provider preference response = %q, want speed", body.Strategy)
 	}
 }
 
@@ -925,11 +932,12 @@ func TestHandleAPIBuckets_CreateBucketRejectsMalformedStrictJSON(t *testing.T) {
 	}
 }
 
-func TestHandleAPIBuckets_CreateBucketRejectsMinimumAboveTarget(t *testing.T) {
+func TestHandleAPIBuckets_CreateBucketRejectsInvalidPolicyAndPreference(t *testing.T) {
 	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 3, "owner-access")
 	for _, body := range []string{
 		`{"name":"invalid-explicit-minimum","owner_access_key":"owner-access","default_copies":2,"minimum_durable_copies":3}`,
 		`{"name":"invalid-inherited-minimum","owner_access_key":"owner-access","minimum_durable_copies":4}`,
+		`{"name":"invalid-preference","owner_access_key":"owner-access","provider_selection_strategy":"fastest"}`,
 	} {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")

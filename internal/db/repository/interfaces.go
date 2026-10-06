@@ -482,6 +482,7 @@ type StorageContentRepository interface {
 	GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
+	ProviderDataSetLoads(context.Context, []types.OnChainID) (map[string]int, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
 	RecordDataSetCreationError(ctx context.Context, id, taskID int64, message string) error
 	// RecordDataSetClientID ties a generation to the client data set ID of its
@@ -788,6 +789,7 @@ type ObservabilityRepository interface {
 	RecordApprovedProviders(context.Context, time.Time, []types.OnChainID) (time.Time, error)
 	RecordEndorsedProviders(context.Context, time.Time, []types.OnChainID) (time.Time, error)
 	ProviderProfiles(context.Context, []types.OnChainID) (map[string]observability.ProviderProfile, error)
+	GetProviderTierSnapshot(context.Context, string) (*observability.ProviderTierSnapshot, error)
 	UpsertProviderObservation(context.Context, time.Time, observability.ProviderState) error
 	OverviewStorageStates(ctx context.Context) ([]model.StorageDataSet, []observability.ProviderState, []observability.DataSetState, *time.Time, *time.Time, error)
 	ReplaceProviderStates(ctx context.Context, checkedAt time.Time, states []observability.ProviderState) error

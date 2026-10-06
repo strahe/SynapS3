@@ -254,6 +254,7 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 				{Field: "filecoin.private_key", Key: "private_key", Value: quoteTOMLString(cfg.Filecoin.PrivateKey), Enabled: !saveMode || presence.FilecoinPrivateKey, Notes: []string{"Required before serving unless SYNAPS3_FILECOIN_PRIVATE_KEY is set."}},
 				{Field: "filecoin.with_cdn", Key: "with_cdn", Value: strconv.FormatBool(cfg.Filecoin.WithCDN), Enabled: saveMode},
 				{Field: "filecoin.allow_private_networks", Key: "allow_private_networks", Value: strconv.FormatBool(cfg.Filecoin.AllowPrivateNetworks), Enabled: saveMode, Notes: []string{"Enable only for trusted private deployments."}},
+				{Field: "filecoin.anchor_provider_tier", Key: "anchor_provider_tier", Value: quoteTOMLString(cfg.Filecoin.AnchorProviderTier), Enabled: saveMode, Notes: []string{"approved | endorsed | none. Restart required."}},
 				{Field: "filecoin.default_copies", Key: "default_copies", Value: strconv.Itoa(cfg.Filecoin.DefaultCopies), Enabled: saveMode, Notes: []string{fmt.Sprintf("Allowed range: 1-%d.", MaxFilecoinDefaultCopies)}},
 			},
 		},

@@ -87,6 +87,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `s3.region` | `us-east-1` |
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
+| `filecoin.anchor_provider_tier` | `approved` |
 | `database.driver` | `sqlite` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
@@ -121,6 +122,12 @@ Enable **Submit batches early to free cache space** in Settings (`worker.tasks.c
 
 Open **Batches** to see collected data. **Submit next batch** requests one submission up to the piece limit; remaining data stays waiting. Manual submission works independently of the automatic switch and cache policy, and waits for submission capacity. **Details** shows members, submission times, transaction ID, and errors; stopped tasks show **Recover** when recovery is allowed. Each member includes a linked object and the number of other versions sharing its data. Missing historical object information or size is marked unavailable.
 
+## Provider Selection
+
+`filecoin.anchor_provider_tier` requires newly selected provider sets to retain at least one Approved or Endorsed provider. Endorsed membership is independent of Approved; `none` removes the list requirement. All candidates still need fresh healthy observations for their current service URL. Changes require restart and do not reselect accepted targets.
+
+At bucket creation, **Provider preference** chooses `distribution` (default) or `speed`. Distribution first prefers providers with fewer non-retired data sets, then faster measured uploads. Speed first prefers successful measurements for the current service URL; unmeasured providers follow by load. Exact ties are randomized. The saved preference applies to additional replicas and automatic replacements; manual replacements bypass ranking. S3-created and existing buckets use distribution. The creation API accepts `provider_selection_strategy`, and bucket queries return the saved value. The preference cannot be changed after creation. A provider can be reused once all its previous data sets for that bucket are retired.
+
 ## Admin Session Lifetime
 
 `admin.auth.session_ttl` controls the lifetime of each standard Admin UI session token. It is neither a server-enforced idle timeout nor an absolute cap on a login. After the earlier of five minutes or half the token lifetime, the server permits renewal. The official dashboard requests renewal only after a trusted pointer, click, keyboard, or wheel interaction; background polling and returning to a visible tab do not trigger it. Any client holding the valid session cookie and matching CSRF token can call the refresh endpoint after `refresh_after`. If no client requests renewal, the token expires at `expires_at`.
@@ -131,6 +138,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 
 - `filecoin.network`: `calibration`, `mainnet`.
 - `filecoin.default_copies`: `1` through `8`.
+- `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
 - `database.driver`: `sqlite`, `postgres`.
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`.
 - `logging.level`: `debug`, `info`, `warn`, `error`.

@@ -31,6 +31,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
@@ -71,6 +72,7 @@ type handlerTestRuntime struct {
 }
 
 type handlerRuntimeOptions struct {
+	providerTier              providerselect.Tier
 	logger                    *slog.Logger
 	cache                     cache.Cache
 	events                    worker.EventPublisher
@@ -128,7 +130,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	if options.maxRetries != nil {
 		maxRetries = *options.maxRetries
 	}
-	var observabilityService *observability.Service
+	observabilityService := observability.NewService(observability.ServiceOptions{Store: repos.Observability})
 	if options.observabilityChecker != nil {
 		observabilityService = observability.NewService(observability.ServiceOptions{
 			Store: repos.Observability, Checker: options.observabilityChecker,
@@ -142,7 +144,8 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		logger = slog.Default()
 	}
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
-		Repositories: repos, Events: options.events, Cache: cacheStore, CacheGate: gate, CacheTracker: tracker,
+		AnchorProviderTier: options.providerTier,
+		Repositories:       repos, Events: options.events, Cache: cacheStore, CacheGate: gate, CacheTracker: tracker,
 		Storage: storageClient, Wallet: options.wallet, Receipts: options.receipts,
 		WalletBroadcastTimeout: options.walletBroadcastTimeout,
 		WalletReceiptTimeout:   options.walletReceiptTimeout,
@@ -291,9 +294,13 @@ func stopHandlerEngine(t *testing.T, cancel context.CancelFunc, done <-chan stru
 	}
 }
 
-func waitForTask(t *testing.T, repos *repository.Repositories, id int64, predicate func(*model.Task) bool) *model.Task {
+func waitForTask(t *testing.T, repos *repository.Repositories, id int64, predicate func(*model.Task) bool, timeout ...time.Duration) *model.Task {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	duration := 3 * time.Second
+	if len(timeout) > 0 {
+		duration = timeout[0]
+	}
+	deadline := time.Now().Add(duration)
 	for time.Now().Before(deadline) {
 		row, err := repos.Tasks.GetByID(t.Context(), id)
 		if err != nil {
@@ -2682,11 +2689,16 @@ func TestBucketProvisionCreatesDataSetsBeforeMarkingReady(t *testing.T) {
 		})
 	}
 	storageClient := &testutil.MockStorageClient{
-		SelectUploadTargetsFunc: func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
-			if opts.Copies != 2 || opts.DataSetMetadata["bucket"] == "" {
-				t.Fatalf("selection options = %#v", opts)
+		OpenProviderTargetFunc: func(_ context.Context, id sdktypes.BigInt, opts storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+			if opts.DataSetMetadata["bucket"] == "" {
+				t.Fatal("bucket metadata missing")
 			}
-			return targets, nil
+			for _, target := range targets {
+				if target.ProviderID().Equal(id) {
+					return target.(*testutil.MockStorageTarget), nil
+				}
+			}
+			return nil, errors.New("unknown provider")
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
@@ -2695,6 +2707,7 @@ func TestBucketProvisionCreatesDataSetsBeforeMarkingReady(t *testing.T) {
 			return handlers.RegisterStorage(registry)
 		},
 	})
+	seedProviderSelection(t, runtime, targets[0].ProviderID(), targets[1].ProviderID())
 	bucket := &model.Bucket{Name: fmt.Sprintf("provision-%d", sequence), Status: model.BucketStatusProvisioning, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
 		t.Fatalf("create bucket: %v", err)
@@ -2771,11 +2784,11 @@ func TestStoragePlanningWaitsKeepErrors(t *testing.T) {
 				runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 					logger: slog.New(slog.NewJSONHandler(logFile, nil)),
 					storage: &testutil.MockStorageClient{
-						SelectUploadTargetsFunc: func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+						OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 							if err := dependencyError(); err != nil && phase.reason == "providers" {
 								return nil, err
 							}
-							return []synapse.StorageTarget{target}, nil
+							return target, nil
 						},
 						PrepareUploadFunc: func(context.Context, uint64, []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error) {
 							if err := dependencyError(); err != nil && phase.reason == "funding" {
@@ -2788,6 +2801,7 @@ func TestStoragePlanningWaitsKeepErrors(t *testing.T) {
 						return handlers.RegisterStorage(registry)
 					},
 				})
+				seedProviderSelection(t, runtime, providerID)
 				bucket := &model.Bucket{
 					Name: fmt.Sprintf("planning-wait-%d", sequence), Status: model.BucketStatusProvisioning,
 					DefaultCopies: 1, MinimumDurableCopies: 1,
@@ -5359,24 +5373,24 @@ func TestUploadPlanAllocatesOnlyWithinTheBucketsOpenSlots(t *testing.T) {
 	providerID := testOnChainID(t, 21000+sequence).SDK()
 	dataSetID := testOnChainID(t, 22000+sequence).SDK()
 	clientDataSetID := testOnChainID(t, 23000+sequence).SDK()
-	selection := make(chan storage.SelectUploadContextsOptions, 4)
+	selection := make(chan storage.NewProviderContextOptions, 4)
 	storageClient := &testutil.MockStorageClient{
-		SelectUploadTargetsFunc: func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		OpenProviderTargetFunc: func(_ context.Context, id sdktypes.BigInt, opts storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 			select {
 			case selection <- opts:
 			default:
 			}
-			return []synapse.StorageTarget{&testutil.MockStorageTarget{
-				ProviderIDValue: providerID, DataSetIDValue: &dataSetID, ClientDataSetIDValue: clientDataSetID,
-			}}, nil
+			return &testutil.MockStorageTarget{ProviderIDValue: id, DataSetIDValue: &dataSetID, ClientDataSetIDValue: clientDataSetID}, nil
 		},
 	}
+
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: storageClient, policy: cache.EvictionPolicyNone,
 		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
 			return handlers.RegisterStorage(registry)
 		},
 	})
+	seedProviderSelection(t, runtime, providerID)
 	ctx := t.Context()
 
 	// One open slot, but the content asks for two copies. Allocation has to be
@@ -5413,7 +5427,7 @@ func TestUploadPlanAllocatesOnlyWithinTheBucketsOpenSlots(t *testing.T) {
 		t.Fatalf("enqueue upload plan = %#v created=%v err=%v", taskRow, created, err)
 	}
 	cancel, done := runHandlerEngine(t, runtime)
-	var opts storage.SelectUploadContextsOptions
+	var opts storage.NewProviderContextOptions
 	select {
 	case opts = <-selection:
 	case <-time.After(5 * time.Second):
@@ -5422,10 +5436,8 @@ func TestUploadPlanAllocatesOnlyWithinTheBucketsOpenSlots(t *testing.T) {
 	}
 	stopHandlerEngine(t, cancel, done)
 
-	// Only one slot is open, so one target is what may be asked for. Asking for
-	// two would hand back a target for an index the bucket never opened.
-	if opts.Copies != 1 {
-		t.Fatalf("requested copies = %d, want 1 bounded by the bucket's free open slots", opts.Copies)
+	if opts.DataSetMetadata["bucket"] != bucket.Name {
+		t.Fatalf("bucket metadata = %q, want %q", opts.DataSetMetadata["bucket"], bucket.Name)
 	}
 	bindings, err := runtime.repos.Contents.ListDataSetBindings(ctx, bucket.ID)
 	if err != nil {
@@ -5447,19 +5459,15 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	failedProvider := testOnChainID(t, 15000+sequence)
 	healthyProvider := testOnChainID(t, 16000+sequence)
 	healthyDataSet := testOnChainID(t, 17000+sequence).SDK()
-	var excludedFailedProvider atomic.Bool
+	var openedFailedProvider atomic.Bool
 	storageClient := &testutil.MockStorageClient{
-		SelectUploadTargetsFunc: func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
-			for _, excluded := range opts.ExcludeProviderIDs {
-				if excluded.String() == failedProvider.String() {
-					excludedFailedProvider.Store(true)
-				}
+		OpenProviderTargetFunc: func(_ context.Context, id sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+			if id.String() == failedProvider.String() {
+				openedFailedProvider.Store(true)
+				return nil, errors.New("failed provider selected")
 			}
 			clientDataSetID := testOnChainID(t, 18000+sequence).SDK()
-			return []synapse.StorageTarget{&testutil.MockStorageTarget{
-				ProviderIDValue: healthyProvider.SDK(), DataSetIDValue: &healthyDataSet,
-				ClientDataSetIDValue: clientDataSetID,
-			}}, nil
+			return &testutil.MockStorageTarget{ProviderIDValue: healthyProvider.SDK(), DataSetIDValue: &healthyDataSet, ClientDataSetIDValue: clientDataSetID}, nil
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
@@ -5468,6 +5476,7 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 			return handlers.RegisterStorage(registry)
 		},
 	})
+	seedProviderSelection(t, runtime, failedProvider.SDK(), healthyProvider.SDK())
 	bucket := &model.Bucket{
 		Name: fmt.Sprintf("provision-recovery-%d", sequence), Status: model.BucketStatusProvisioning,
 		DefaultCopies: 1, MinimumDurableCopies: 1,
@@ -5504,8 +5513,8 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	if err != nil || stored == nil || stored.Status != model.BucketStatusReady {
 		t.Fatalf("bucket after recovery = %#v err=%v, want ready", stored, err)
 	}
-	if !excludedFailedProvider.Load() {
-		t.Fatal("selection did not exclude the failed generation's provider")
+	if openedFailedProvider.Load() {
+		t.Fatal("selection opened the failed generation's provider")
 	}
 	bindings, err := runtime.repos.Contents.ListDataSetBindings(t.Context(), bucket.ID)
 	if err != nil {
@@ -6245,5 +6254,22 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 	stored, err := runtime.repos.Tasks.GetByID(ctx, fixture.ensureTask.ID)
 	if err != nil || stored == nil || strings.Contains(string(stored.Checkpoint), `"transaction_id"`) {
 		t.Fatalf("task = %#v err=%v, want the rejected submission dropped from its checkpoint", stored, err)
+	}
+}
+
+func seedProviderSelection(t *testing.T, runtime handlerTestRuntime, providers ...sdktypes.BigInt) {
+	t.Helper()
+	active, pdp, url := true, true, "https://provider.example"
+	var ids []idtypes.OnChainID
+	for _, provider := range providers {
+		id := idtypes.OnChainIDFromSDK(provider)
+		ids = append(ids, id)
+		err := runtime.repos.Observability.UpsertProviderObservation(t.Context(), time.Now().UTC(), observability.ProviderState{ProviderID: id, Status: observability.StatusAvailable, Active: &active, HasPDP: &pdp, ServiceURL: &url, Profile: &observability.ProviderProfile{ProviderID: id, Active: true, ServiceURL: url, RegistrySnapshot: json.RawMessage(`{"version":1}`)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := runtime.repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), ids); err != nil {
+		t.Fatal(err)
 	}
 }

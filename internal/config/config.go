@@ -19,6 +19,7 @@ import (
 	"github.com/knadh/koanf/v2"
 	cachepkg "github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -71,6 +72,7 @@ type FilecoinConfig struct {
 	WithCDN              bool                        `koanf:"with_cdn"`
 	AllowPrivateNetworks bool                        `koanf:"allow_private_networks"`
 	DefaultCopies        int                         `koanf:"default_copies"`
+	AnchorProviderTier   string                      `koanf:"anchor_provider_tier"`
 	Observability        FilecoinObservabilityConfig `koanf:"observability"`
 }
 
@@ -179,9 +181,10 @@ func defaultConfig() *Config {
 			Region: "us-east-1",
 		},
 		Filecoin: FilecoinConfig{
-			Network:       "calibration",
-			RPCURL:        defaultFilecoinRPCURLs["calibration"],
-			DefaultCopies: DefaultFilecoinCopies,
+			Network:            "calibration",
+			RPCURL:             defaultFilecoinRPCURLs["calibration"],
+			DefaultCopies:      DefaultFilecoinCopies,
+			AnchorProviderTier: string(providerselect.TierApproved),
 			Observability: FilecoinObservabilityConfig{
 				Interval:    5 * time.Minute,
 				Timeout:     5 * time.Second,
@@ -484,6 +487,9 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if strings.TrimSpace(c.Filecoin.PrivateKey) == "" {
 		add("filecoin.private_key", "must be non-empty")
+	}
+	if !providerselect.Tier(c.Filecoin.AnchorProviderTier).Valid() {
+		add("filecoin.anchor_provider_tier", "must be approved, endorsed, or none")
 	}
 	if !model.ValidStorageCopies(c.Filecoin.DefaultCopies) {
 		if c.Filecoin.DefaultCopies < model.StorageCopiesMin {

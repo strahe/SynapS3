@@ -921,6 +921,7 @@ type adminSettingsFilecoinConfig struct {
 	WithCDN              bool   `json:"with_cdn"`
 	AllowPrivateNetworks bool   `json:"allow_private_networks"`
 	DefaultCopies        int    `json:"default_copies"`
+	AnchorProviderTier   string `json:"anchor_provider_tier"`
 }
 
 type adminSettingsCacheConfig struct {
@@ -1035,6 +1036,7 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"filecoin.rpc_url":                              {path: []string{"filecoin", "rpc_url"}, kind: adminSettingString},
 	"filecoin.with_cdn":                             {path: []string{"filecoin", "with_cdn"}, kind: adminSettingBool},
 	"filecoin.allow_private_networks":               {path: []string{"filecoin", "allow_private_networks"}, kind: adminSettingBool},
+	"filecoin.anchor_provider_tier":                 {path: []string{"filecoin", "anchor_provider_tier"}, kind: adminSettingString},
 	"filecoin.default_copies":                       {path: []string{"filecoin", "default_copies"}, kind: adminSettingInt},
 	"cache.dir":                                     {path: []string{"cache", "dir"}, kind: adminSettingString},
 	"cache.max_size_gb":                             {path: []string{"cache", "max_size_gb"}, kind: adminSettingInt},
@@ -1414,6 +1416,7 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "filecoin.rpc_url", Value: settings.Config.Filecoin.RPCURL},
 				{Name: "filecoin.with_cdn", Value: formatAdminYesNo(settings.Config.Filecoin.WithCDN)},
 				{Name: "filecoin.allow_private_networks", Value: formatAdminYesNo(settings.Config.Filecoin.AllowPrivateNetworks)},
+				{Name: "filecoin.anchor_provider_tier", Value: settings.Config.Filecoin.AnchorProviderTier},
 				{Name: "filecoin.default_copies", Value: strconv.Itoa(settings.Config.Filecoin.DefaultCopies)},
 			},
 		},

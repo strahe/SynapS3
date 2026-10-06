@@ -10,6 +10,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerselect"
 	taskengine "github.com/strahe/synaps3/internal/task"
 )
 
@@ -33,11 +34,12 @@ var (
 )
 
 type CreateOptions struct {
-	Name                 string
-	ACL                  []byte
-	OwnerAccessKey       *string
-	DefaultCopies        *int
-	MinimumDurableCopies *int
+	Name                      string
+	ACL                       []byte
+	OwnerAccessKey            *string
+	DefaultCopies             *int
+	MinimumDurableCopies      *int
+	ProviderSelectionStrategy providerselect.Strategy
 }
 
 type DeleteOptions struct {
@@ -85,13 +87,21 @@ func (s *Service) CreateWithOptions(ctx context.Context, options CreateOptions) 
 	if !model.ValidStorageCopies(minimumDurableCopies) || minimumDurableCopies > defaultCopies {
 		return nil, fmt.Errorf("creating bucket %q: minimum durable copies %d out of range: %w", options.Name, minimumDurableCopies, repository.ErrInvalidInput)
 	}
+	strategy := options.ProviderSelectionStrategy
+	if strategy == "" {
+		strategy = providerselect.StrategyDistribution
+	}
+	if !strategy.Valid() {
+		return nil, fmt.Errorf("invalid provider selection strategy: %w", repository.ErrInvalidInput)
+	}
 	bucket := &model.Bucket{
-		Name:                 options.Name,
-		ACL:                  options.ACL,
-		OwnerAccessKey:       options.OwnerAccessKey,
-		DefaultCopies:        defaultCopies,
-		MinimumDurableCopies: minimumDurableCopies,
-		Status:               model.BucketStatusProvisioning,
+		ProviderSelectionStrategy: strategy,
+		Name:                      options.Name,
+		ACL:                       options.ACL,
+		OwnerAccessKey:            options.OwnerAccessKey,
+		DefaultCopies:             defaultCopies,
+		MinimumDurableCopies:      minimumDurableCopies,
+		Status:                    model.BucketStatusProvisioning,
 	}
 
 	if err := s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {

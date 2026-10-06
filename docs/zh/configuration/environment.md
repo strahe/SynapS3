@@ -24,6 +24,7 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | `SYNAPS3_FILECOIN_WITH_CDN` | `filecoin.with_cdn` |
 | `SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS` | `filecoin.allow_private_networks` |
 | `SYNAPS3_FILECOIN_DEFAULT_COPIES` | `filecoin.default_copies` |
+| `SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER` | `filecoin.anchor_provider_tier` |
 | `SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL` | `filecoin.observability.interval` |
 | `SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT` | `filecoin.observability.timeout` |
 | `SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY` | `filecoin.observability.concurrency` |

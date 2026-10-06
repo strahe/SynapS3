@@ -1,3 +1,6 @@
+export type ProviderSelectionStrategy = 'distribution' | 'speed'
+export type AnchorProviderTier = 'approved' | 'endorsed' | 'none'
+
 const BASE = '/api/v1'
 const csrfHeader = 'X-SynapS3-CSRF'
 
@@ -208,6 +211,7 @@ export interface BucketItem {
   owner_access_key: string | null
   default_copies: number
   minimum_durable_copies: number
+  provider_selection_strategy: ProviderSelectionStrategy
   status: BucketStatus
   object_count: number
   total_size_bytes: number
@@ -380,6 +384,7 @@ export interface BucketMutationResponse {
   owner_access_key: string | null
   default_copies: number
   minimum_durable_copies: number
+  provider_selection_strategy: ProviderSelectionStrategy
   status: string
 }
 
@@ -966,6 +971,7 @@ export interface SettingsFilecoinConfig {
   with_cdn: boolean
   allow_private_networks: boolean
   default_copies: number
+  anchor_provider_tier: AnchorProviderTier
   observability: SettingsObservabilityConfig
 }
 
@@ -1105,6 +1111,7 @@ export const api = {
     owner_access_key: string
     default_copies?: number | null
     minimum_durable_copies?: number | null
+    provider_selection_strategy?: ProviderSelectionStrategy
   }) =>
     fetchJSON<BucketMutationResponse>('/buckets', {
       method: 'POST',

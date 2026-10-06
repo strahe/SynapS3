@@ -22,6 +22,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -163,6 +164,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		LRUHighPercent:            cfg.Cache.LRUHighWatermarkPercent,
 		LRULowPercent:             cfg.Cache.LRULowWatermarkPercent,
 		DefaultCopies:             cfg.Filecoin.DefaultCopies,
+		AnchorProviderTier:        providerselect.Tier(cfg.Filecoin.AnchorProviderTier),
 		MaxRetries:                cfg.Worker.Tasks.MaxRetries,
 		CommitMaxPieces:           cfg.Worker.Tasks.CommitMaxPieces,
 		CommitMaxWait:             cfg.Worker.Tasks.CommitMaxWait,
@@ -279,6 +281,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithCommitPolicy(cfg.Worker.Tasks, synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network)).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
 		WithObservability(observabilityService).
+		WithProviderTier(providerselect.Tier(cfg.Filecoin.AnchorProviderTier)).
 		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).
 		WithTaskService(taskService).
 		WithS3IAM(iamService, rootAccount.Access)

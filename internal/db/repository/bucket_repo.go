@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/uptrace/bun"
 )
 
@@ -20,6 +21,12 @@ var _ BucketRepository = (*BunBucketRepo)(nil)
 // Create inserts a bucket together with the replica slots its durability policy
 // asks for, so a bucket never exists without the slots its data sets bind to.
 func (r *BunBucketRepo) Create(ctx context.Context, bucket *model.Bucket) error {
+	if bucket.ProviderSelectionStrategy == "" {
+		bucket.ProviderSelectionStrategy = providerselect.StrategyDistribution
+	}
+	if !bucket.ProviderSelectionStrategy.Valid() {
+		return fmt.Errorf("inserting bucket %q: %w", bucket.Name, ErrInvalidInput)
+	}
 	// An empty status takes the database default.
 	if (bucket.Status != "" && !bucket.Status.Valid()) || !validCopyPolicy(bucket.DefaultCopies, bucket.MinimumDurableCopies) {
 		return fmt.Errorf("inserting bucket %q: %w", bucket.Name, ErrInvalidInput)

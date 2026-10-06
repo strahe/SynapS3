@@ -8,6 +8,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -75,6 +76,9 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 
 		selected, err := h.selectBucketBindings(ctx, bucket, required)
 		if err != nil {
+			if errors.Is(err, providerselect.ErrNoTrustedProvider) {
+				return taskengine.Fail(providerselect.ErrNoTrustedProvider, "required_provider_unavailable", nil)
+			}
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
 				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
@@ -103,6 +107,7 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 			entry := selected[i]
 			frozen := uploadBindingPlan{
 				copyIndex: entry.copyIndex,
+				admission: entry.admission,
 				provider:  idtypes.OnChainIDFromSDK(entry.target.ProviderID()),
 			}
 			if ref, ok := entry.target.DataSetRef(); ok {
@@ -116,6 +121,9 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 			// drains, and promotion below updates the bucket after these data
 			// sets are locked, so the bucket is locked first here too.
 			if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
+				return err
+			}
+			if err := validateBindingSelection(ctx, repos, bucket.ID, plan); err != nil {
 				return err
 			}
 			created := make([]model.StorageDataSet, 0, len(plan))
