@@ -25,9 +25,9 @@ func (r *BunStorageContentRepo) IsPendingReplacementCopy(ctx context.Context, co
 	return count > 0, err
 }
 
-// SetCopyCacheRestore is fenced by the copy task and the pending replacement.
+// SetCopyCacheRestore is fenced by the copy task and cache availability.
 // Locking the cache entry before the content uses the same order as eviction.
-func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error {
+func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID, lastError string) error {
 	if copyID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput
 	}
@@ -53,14 +53,14 @@ func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID,
 		if err != nil {
 			return err
 		}
-		if !pending {
+		if !pending && entry.CacheActiveTaskID != nil {
 			return ErrConflict
 		}
 		now := time.Now()
 		if pullAttemptID != "" {
 			result, err := db.NewUpdate().Model((*storagepull.Attempt)(nil)).
 				Set("status = ?", storagepull.AttemptStatusAbandoned).
-				Set("resolved_at = ?", now).Set("last_error = ?", "pull failed; recovering from cache").
+				Set("resolved_at = ?", now).Set("last_error = ?", lastError).
 				Set("updated_at = ?", now).
 				Where("attempt_id = ? AND content_id = ? AND storage_data_set_id = ?", pullAttemptID, copyRow.ContentID, copyRow.StorageDataSetID).
 				Where("status = ? AND resolved_at IS NULL", storagepull.AttemptStatusAttempted).Exec(ctx)

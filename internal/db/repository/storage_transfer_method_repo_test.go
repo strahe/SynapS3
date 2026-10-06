@@ -244,7 +244,7 @@ func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 	if err := repos.Contents.BindCopyTask(t.Context(), copyRow.ID, 1, taskRow.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.Contents.SetCopyCacheRestore(t.Context(), copyRow.ID, 1, taskRow.ID, ""); err != nil {
+	if err := repos.Contents.SetCopyCacheRestore(t.Context(), copyRow.ID, 1, taskRow.ID, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)

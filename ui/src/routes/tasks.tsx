@@ -3,7 +3,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, RotateCcw, X } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
 
-import { api, type TaskItem } from '@/api/client'
+import { APIError, api, type TaskItem } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
@@ -20,8 +20,9 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useTasks } from '@/hooks/queries'
+import { useRetryStorageCopy, useTasks } from '@/hooks/queries'
 import { storageConfirmationAttentionView } from '@/lib/storage-confirmation-attention'
+import { copyRetryBlockedLabel } from '@/lib/storage-status-labels'
 import { taskDetailsView, taskOperationLabel, taskTook } from '@/lib/tasks'
 import { timeAgo } from '@/lib/utils'
 
@@ -120,6 +121,7 @@ function TasksPage() {
     queryClient.invalidateQueries({ queryKey: ['taskStats'] })
   }
   const retry = useMutation({ mutationFn: api.retryTask, onSuccess: refreshTasks })
+  const retryReplica = useRetryStorageCopy()
   const acknowledge = useMutation({ mutationFn: api.acknowledgeTask, onSuccess: refreshTasks })
   const previewDismissAll = useMutation({
     mutationFn: api.previewAcknowledgeTasks,
@@ -132,10 +134,11 @@ function TasksPage() {
       refreshTasks()
     },
   })
-  const actionError = retry.error ?? acknowledge.error ?? previewDismissAll.error
+  const actionError = retryReplica.error ?? retry.error ?? acknowledge.error ?? previewDismissAll.error
 
   const setFilters = (nextType: TaskOperationFilter, nextStatus: TaskStatusFilter) => {
     retry.reset()
+    retryReplica.reset()
     acknowledge.reset()
     previewDismissAll.reset()
     dismissAll.reset()
@@ -243,7 +246,13 @@ function TasksPage() {
       {actionError && (
         <Alert variant="destructive">
           <AlertTitle>Task action failed</AlertTitle>
-          <AlertDescription>{errorMessage(actionError)}</AlertDescription>
+          <AlertDescription>
+            {retryReplica.error
+              ? retryReplica.error instanceof APIError && retryReplica.error.code
+                ? copyRetryBlockedLabel(retryReplica.error.code)
+                : 'Could not retry replica. Try again.'
+              : errorMessage(actionError)}
+          </AlertDescription>
         </Alert>
       )}
 
@@ -254,12 +263,20 @@ function TasksPage() {
           <TaskTable
             tasks={tasks.data.tasks}
             retryingID={retry.isPending ? retry.variables : undefined}
+            retryingCopyID={retryReplica.isPending ? retryReplica.variables : undefined}
+            onRetryCopy={(id) => {
+              retry.reset()
+              acknowledge.reset()
+              retryReplica.mutate(id)
+            }}
             acknowledgingID={acknowledge.isPending ? acknowledge.variables : undefined}
             onRetry={(id) => {
+              retryReplica.reset()
               acknowledge.reset()
               retry.mutate(id)
             }}
             onAcknowledge={(id) => {
+              retryReplica.reset()
               retry.reset()
               acknowledge.mutate(id)
             }}
@@ -330,12 +347,16 @@ function dismissAllDescription(count: number, operation?: string) {
 function TaskTable({
   tasks,
   retryingID,
+  retryingCopyID,
+  onRetryCopy,
   acknowledgingID,
   onRetry,
   onAcknowledge,
 }: {
   tasks: TaskItem[]
   retryingID?: number
+  retryingCopyID?: number
+  onRetryCopy: (id: number) => void
   acknowledgingID?: number
   onRetry: (id: number) => void
   onAcknowledge: (id: number) => void
@@ -395,11 +416,32 @@ function TaskTable({
               </TableCell>
               <TableCell className="px-4">
                 <div className="flex justify-end gap-2">
-                  {task.retryable && (
+                  {task.copy_retry?.available && (
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={retryingID !== undefined || acknowledgingID !== undefined}
+                      disabled={
+                        retryingCopyID !== undefined || retryingID !== undefined || acknowledgingID !== undefined
+                      }
+                      onClick={() => {
+                        if (task.copy_retry) onRetryCopy(task.copy_retry.copy_id)
+                      }}
+                    >
+                      {retryingCopyID === task.copy_retry.copy_id ? (
+                        <Loader2 data-icon="inline-start" className="animate-spin" />
+                      ) : (
+                        <RotateCcw data-icon="inline-start" />
+                      )}
+                      Retry replica
+                    </Button>
+                  )}
+                  {task.retryable && !task.copy_retry?.available && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={
+                        retryingID !== undefined || acknowledgingID !== undefined || retryingCopyID !== undefined
+                      }
                       onClick={() => onRetry(task.id)}
                     >
                       {retryingID === task.id ? (
@@ -414,7 +456,9 @@ function TaskTable({
                     <Button
                       variant="ghost"
                       size="sm"
-                      disabled={retryingID !== undefined || acknowledgingID !== undefined}
+                      disabled={
+                        retryingID !== undefined || acknowledgingID !== undefined || retryingCopyID !== undefined
+                      }
                       onClick={() => onAcknowledge(task.id)}
                     >
                       {acknowledgingID === task.id ? (
@@ -441,6 +485,9 @@ function TaskDetails({ task }: { task: TaskItem }) {
   const attention = confirmation ? storageConfirmationAttentionView(confirmation.reason_code) : undefined
   return (
     <div className="flex flex-col gap-1">
+      {task.copy_retry && !task.copy_retry.available && (
+        <span className="text-sm text-muted-foreground">{copyRetryBlockedLabel(task.copy_retry.reason_code)}</span>
+      )}
       {details.value ? (
         <CopyableValue value={details.value} label={details.label} displayValue={details.value} maxLength={80} />
       ) : !confirmation ? (

@@ -1025,6 +1025,13 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 			return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready to transfer")
 		}
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
+			migration, err := h.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
+			if err != nil {
+				return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
+			}
+			if !migration {
+				return h.failCopyTask(execution, input, copyRow, errors.New("storage transfer has no local cache"), "copy_cache_missing")
+			}
 			return taskengine.Fail(errors.New("stored content migration cannot read its local cache"), "migration_cache_missing", nil)
 		}
 		return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for a readable storage source", nil)
@@ -1045,8 +1052,12 @@ func (h *TaskHandlers) copyCacheAvailable(ctx context.Context, copyRow *model.St
 }
 
 func (h *TaskHandlers) advanceToCacheRestore(input storagepipeline.CopyGenerationInput, taskID int64, message, pullAttemptID string) taskengine.Result {
+	return h.advanceToCacheRestoreWithError(input, taskID, message, pullAttemptID, "")
+}
+
+func (h *TaskHandlers) advanceToCacheRestoreWithError(input storagepipeline.CopyGenerationInput, taskID int64, message, pullAttemptID, lastError string) taskengine.Result {
 	return taskengine.Complete(message, func(ctx context.Context, repos *repository.Repositories) error {
-		if err := repos.Contents.SetCopyCacheRestore(ctx, input.CopyID, input.Generation, taskID, pullAttemptID); err != nil {
+		if err := repos.Contents.SetCopyCacheRestore(ctx, input.CopyID, input.Generation, taskID, pullAttemptID, lastError); err != nil {
 			return err
 		}
 		return h.enqueueSuccessorCopyTask(ctx, repos, input, taskID, model.TaskTypeStorageStore)
@@ -1075,19 +1086,31 @@ func (h *TaskHandlers) pullWithoutSource(ctx context.Context, execution taskengi
 	return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
 }
 
-func (h *TaskHandlers) recoverMigrationFromCache(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, pullAttemptID string) (taskengine.Result, bool) {
+func (h *TaskHandlers) recoverPullFromCache(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, pullAttemptID, lastError string) (taskengine.Result, bool) {
 	migration, err := h.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
 	if err != nil {
-		return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed"), true
+		return retryPullDependency(execution, err, "replacement_load_failed"), true
+	}
+	if !migration && execution.CancellationRequested() {
+		return taskengine.Result{}, false
 	}
 	if !migration {
-		return taskengine.Result{}, false
+		entry, err := h.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, copyRow.ContentID)
+		if err != nil {
+			return retryPullDependency(execution, err, "copy_cache_load_failed"), true
+		}
+		if entry == nil || entry.CacheActiveTaskID != nil {
+			return taskengine.Result{}, false
+		}
 	}
 	available, err := h.copyCacheAvailable(ctx, copyRow)
 	if err != nil {
-		return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed"), true
+		return retryPullDependency(execution, err, "copy_cache_load_failed"), true
 	}
 	if !available {
+		if !migration {
+			return taskengine.Result{}, false
+		}
 		if copyRow.CommitDecidedByRequest() {
 			return h.failPullTask(execution, input, copyRow, pullAttemptID,
 				errors.New("stored content migration failed and its local cache is unavailable"), "migration_cache_missing"), true
@@ -1096,7 +1119,7 @@ func (h *TaskHandlers) recoverMigrationFromCache(ctx context.Context, execution 
 			return repos.Contents.AbandonMigrationPull(ctx, copyRow.ID, input.Generation, execution.ID(), pullAttemptID)
 		}), true
 	}
-	return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", pullAttemptID), true
+	return h.advanceToCacheRestoreWithError(input, execution.ID(), "Storage copy is recovering from cache", pullAttemptID, lastError), true
 }
 
 func (h *TaskHandlers) storeHandler() taskengine.Handler {
@@ -1289,8 +1312,8 @@ func (h *TaskHandlers) storeWithProviderSlot(
 	calculateReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if hasCheckpoint || copyRow.IngressStoreAttempt > 0 || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
-				return taskengine.Fail(errors.New("storage transfer needs local bytes that are no longer cached"), "store_cache_missing", nil)
+			if result, stop := h.storeMissingCache(ctx, execution, input, copyRow, hasCheckpoint); stop {
+				return result
 			}
 			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
@@ -1345,8 +1368,8 @@ func (h *TaskHandlers) storeWithProviderSlot(
 	storeReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if hasCheckpoint || copyRow.IngressStoreAttempt > 0 || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
-				return taskengine.Fail(errors.New("storage transfer needs local bytes that are no longer cached"), "store_cache_missing", nil)
+			if result, stop := h.storeMissingCache(ctx, execution, input, copyRow, hasCheckpoint); stop {
+				return result
 			}
 			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
@@ -1626,7 +1649,11 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		if len(sources) == 0 {
 			return h.pullWithoutSource(ctx, execution, input, copyRow)
 		}
-		source := sources[0]
+		last, err := h.deps.Repositories.Contents.GetLastAbandonedPullAttempt(ctx, copyRow.ContentID, copyRow.StorageDataSetID)
+		if err != nil {
+			return h.retryCopyTask(execution, input, copyRow, err, "copy_source_load_failed")
+		}
+		source := choosePullSource(sources, last)
 		pieceCID, err = cid.Parse(source.PieceCID)
 		if err != nil {
 			return h.failCopyTask(execution, input, copyRow, err, "source_identity_invalid")
@@ -1701,7 +1728,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 	case storage.PullStatusPending, storage.PullStatusInProgress, storage.PullStatusRetrying:
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	case storage.PullStatusFailed:
-		return h.failConfirmedPull(ctx, execution, input, copyRow, attempt.AttemptID, pdp.ErrPullFailed)
+		return h.failConfirmedPull(ctx, execution, input, copyRow, attempt, pdp.ErrPullFailed)
 	case storage.PullStatusComplete:
 		return h.observePullPiece(ctx, execution, input, copyRow, target, attempt, pieceCID, true)
 	default:
@@ -1773,7 +1800,7 @@ func (h *TaskHandlers) observePullPiece(
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	case synapse.ParkedPieceMissing:
 		if reportedComplete {
-			return h.failConfirmedPull(ctx, execution, input, copyRow, attempt.AttemptID, errors.New("provider no longer has the completed pull piece"))
+			return h.failConfirmedPull(ctx, execution, input, copyRow, attempt, errors.New("provider no longer has the completed pull piece"))
 		}
 		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	default:
@@ -1790,11 +1817,41 @@ func (h *TaskHandlers) pullPieceState(ctx context.Context, target synapse.DataSe
 	return h.deps.ParkedPieces.FindParkedPiece(statusCtx, target.ServiceURL(), pieceCID)
 }
 
-func (h *TaskHandlers) failConfirmedPull(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, attemptID string, err error) taskengine.Result {
-	if result, recovered := h.recoverMigrationFromCache(ctx, execution, input, copyRow, attemptID); recovered {
+func (h *TaskHandlers) failConfirmedPull(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, attempt *storagepull.Attempt, err error) taskengine.Result {
+	err = fmt.Errorf("storage provider %s could not copy the piece from provider %s: %w", copyRow.ProviderID, attempt.SourceProviderID, err)
+	if result, recovered := h.recoverPullFromCache(ctx, execution, input, copyRow, attempt.AttemptID, err.Error()); recovered {
 		return result
 	}
-	return h.failPullTask(execution, input, copyRow, attemptID, err, "pull_failed")
+	return h.failPullTask(execution, input, copyRow, attempt.AttemptID, err, "pull_failed")
+}
+
+func choosePullSource(sources []repository.ReadableStorageCopy, last *storagepull.Attempt) repository.ReadableStorageCopy {
+	if last != nil {
+		for _, source := range sources {
+			if !source.ProviderID.Equal(last.SourceProviderID) || !source.DataSetID.Equal(last.SourceDataSetID) {
+				return source
+			}
+		}
+	}
+	return sources[0]
+}
+
+func (h *TaskHandlers) storeMissingCache(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, hasCheckpoint bool) (taskengine.Result, bool) {
+	err := errors.New("storage transfer needs local bytes that are no longer cached")
+	if hasCheckpoint || copyRow.IngressStoreAttempt > 0 {
+		return taskengine.Fail(err, "store_cache_missing", nil), true
+	}
+	if copyRow.TransferMethod != model.StorageCopyTransferMethodCacheRestore {
+		return taskengine.Result{}, false
+	}
+	migration, loadErr := h.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
+	if loadErr != nil {
+		return h.retryCopyTask(execution, input, copyRow, loadErr, "replacement_load_failed"), true
+	}
+	if migration {
+		return taskengine.Fail(err, "store_cache_missing", nil), true
+	}
+	return h.failCopyTask(execution, input, copyRow, err, "store_cache_missing"), true
 }
 
 func (h *TaskHandlers) retryUnsubmittedPull(

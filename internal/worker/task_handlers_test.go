@@ -2614,6 +2614,8 @@ func bindCopyTask(t *testing.T, runtime handlerTestRuntime, copyRow *model.Stora
 	input := storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation}
 	key := storagepipeline.PullKey(copyRow.ID, generation)
 	switch taskType {
+	case model.TaskTypeStorageTransferPlan:
+		key = storagepipeline.TransferPlanKey(copyRow.ID, generation)
 	case model.TaskTypeStorageStore:
 		key = storagepipeline.StoreKey(copyRow.ID, generation)
 	}

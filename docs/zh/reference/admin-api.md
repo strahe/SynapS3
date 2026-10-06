@@ -133,6 +133,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的存储提供方，以及其他存储提供方不能接管的原因。 |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | 恢复处于 `failed` 或 `cleanup_attention` 的存储提供方替换。 |
+| `POST` | `/api/v1/storage-copies/{id}/retry` | 开始恢复失败的副本。 |
 | `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的存储确认。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
@@ -266,6 +267,14 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 一次存储登记用一个签名请求把写入同一 data set 的一个或多个 piece 登记上链。存储提供方拒绝该登记、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对这些 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方报告该请求仍在处理时，SynapS3 会继续等待。存储提供方拒绝该请求时会稍后再试；登记前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他 data set 时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。
 
 `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储登记，也包括超过 15 分钟仍未登记、SynapS3 仍在继续尝试的登记：登记（`request_id`）、所属任务（`task_id`）、存储提供方和 data set、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的登记。对已停止的登记，使用 `POST /api/v1/tasks/{id}/retry` 重试；重试只会重新核对链上记录，其中的 piece 已在链上时才完成该登记，不会发送任何请求。
+
+### 失败副本恢复
+
+`POST /api/v1/storage-copies/{id}/retry` 无需请求体，创建恢复任务后返回 `202 {"copy_id":12,"task_id":34}`。对象 Provenance 中副本达到 `committed` 才表示恢复完成。创建恢复任务会自动 Dismiss 该副本尚未处理的失败任务，并保留历史记录。
+
+失败 Tasks 条目可包含 `copy_retry: {copy_id, available, reason_code?}`，包括已 Dismiss 的失败。Provenance 副本增加 `copy_id`、可选的 `last_error` 和 `retry: {available, reason_code?}`。两处在可用时提供 **Retry replica**，请求会重新检查当前条件。
+
+冲突返回 `409 {code, error}`，code 为 `object_deleted`、`replacement_in_progress`、`storage_service_unavailable`、`no_source`、`recovery_requires_attention` 或 `copy_retry_in_progress`。无效 ID 返回 `400`，副本不存在或不可访问返回 `404`，恢复服务不可用返回 `503`。传输结果尚未确认时，继续使用原任务的恢复操作。
 
 ## 任务
 

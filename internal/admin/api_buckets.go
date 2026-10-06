@@ -798,6 +798,9 @@ type objectProvenanceResponse struct {
 }
 
 type objectProvenanceCopyResponse struct {
+	CopyID           int64                     `json:"copy_id"`
+	LastError        *string                   `json:"last_error,omitempty"`
+	Retry            *copyRetryResponse        `json:"retry,omitempty"`
 	CopyIndex        int                       `json:"copy_index"`
 	Status           string                    `json:"status"`
 	Health           copyHealthInfo            `json:"health"`
@@ -1866,6 +1869,16 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		providerIDs = append(providerIDs, copyRow.ProviderID)
 	}
 	providerIdentities := s.providerIdentities(ctx, providerIDs)
+	copyIDs := make([]int64, 0, len(provenance.Copies))
+	for _, row := range provenance.Copies {
+		copyIDs = append(copyIDs, row.ID)
+	}
+	retryStates, err := s.repos.Contents.CopyRetryStates(ctx, copyIDs)
+	if err != nil {
+		s.logger.Error("api: failed to load replica recovery", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 	copyFacts := provenanceCopyHealthFacts(bucket.ID, version.VersionID, provenance.Upload, provenance.Copies)
 	copyObservations, copyHealthFailed := s.copyHealthDataSetObservations(ctx, copyHealthLocalDataSetIDs(copyFacts))
 	copyHealthInterval := s.copyHealthRefreshInterval()
@@ -1886,6 +1899,9 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			attentionAt = &value
 		}
 		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
+			CopyID:           copyRow.ID,
+			LastError:        copyRow.LastError,
+			Retry:            copyRetryResponseFor(retryStates[copyRow.ID]),
 			CopyIndex:        copyRow.CopyIndex,
 			Status:           string(copyRow.Status),
 			Health:           copyHealthByIndex[copyRow.CopyIndex],
