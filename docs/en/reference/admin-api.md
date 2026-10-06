@@ -133,6 +133,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | List the providers this replica can move to, and why the others cannot take it. |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | Resume a failed or attention-holding provider replacement. |
+| `POST` | `/api/v1/storage-copies/{id}/retry` | Start recovery of a failed replica. |
 | `GET` | `/api/v1/storage-confirmations` | List storage confirmations that need operator attention. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
@@ -266,6 +267,14 @@ Manual confirmation does not check FWSS approval or whether the provider still r
 A storage registration covers one or more pieces sent to the same data set in one signed request. When the provider rejects it, gives no reply, or still cannot be asked about it 15 minutes after it was sent, SynapS3 checks on chain whether those pieces were registered. If they were not, SynapS3 submits the original request again; the chain accepts that request only once. While the provider reports the request as pending, SynapS3 keeps waiting for it. A provider that refuses the request is asked again later, and a piece it dropped before registration is uploaded again before the whole request is sent again. When the chain shows the request's nonce already used for other pieces or another data set, a request the provider never accepted is signed again with a new nonce, while one the provider accepted stops for review.
 
 `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists registrations that need attention, including any still unregistered after 15 minutes while SynapS3 keeps trying: the registration (`request_id`), owning task (`task_id`), provider and data set, its pieces (`piece_count`, `piece_cids`), the known transaction, the provider's reply when the submission failed (`submit_error`), `submitted_at`, `attention_at`, and stable `reason_code`. The Tasks page shows the same registrations on their Confirm storage tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; the retry only checks the chain again and completes the registration if its pieces are there. It sends nothing.
+
+### Failed Replica Recovery
+
+`POST /api/v1/storage-copies/{id}/retry` takes no body and returns `202 {"copy_id":12,"task_id":34}` after creating recovery work. Completion is reported by the replica's `committed` status in object provenance. Starting recovery dismisses its outstanding failed tasks and retains their history.
+
+Failed Tasks items may include `copy_retry: {copy_id, available, reason_code?}`, including dismissed failures. Provenance replicas include `copy_id`, optional `last_error`, and optional `retry: {available, reason_code?}`. Both views offer **Retry replica** when available; the request rechecks current conditions.
+
+Conflicts return `409 {code, error}` with `object_deleted`, `replacement_in_progress`, `storage_service_unavailable`, `no_source`, `recovery_requires_attention`, or `copy_retry_in_progress`. Invalid IDs return `400`, unknown or inaccessible replicas return `404`, and an unavailable recovery service returns `503`. A transfer with an uncertain result keeps its existing task recovery action.
 
 ## Tasks
 

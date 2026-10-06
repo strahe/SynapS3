@@ -645,7 +645,15 @@ export interface ProviderIdentity {
   extra_capabilities?: Record<string, string>
 }
 
+export interface CopyRetryState {
+  available: boolean
+  reason_code?: string
+}
+
 export interface ObjectProvenanceCopy {
+  copy_id: number
+  last_error?: string
+  retry?: CopyRetryState
   copy_index: number
   status: ObjectUploadCopyStatus
   health: CopyHealthInfo
@@ -719,6 +727,7 @@ export interface CommitBatchDetails extends CommitBatch {
 }
 
 export interface TaskItem {
+  copy_retry?: CopyRetryState & { copy_id: number }
   id: number
   type: string
   operation: string
@@ -1336,6 +1345,8 @@ export const api = {
   getTaskSubject: (type: TaskSubjectInfo['subject_type'], key: string, signal?: AbortSignal) =>
     fetchJSON<TaskSubjectInfo>(`/task-subjects/${encodeURIComponent(type)}/${encodeURIComponent(key)}`, { signal }),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
+  retryStorageCopy: (id: number) =>
+    fetchJSON<{ copy_id: number; task_id: number }>(`/storage-copies/${id}/retry`, { method: 'POST' }),
   acknowledgeTask: (id: number) => fetchJSON(`/tasks/${id}/acknowledge`, { method: 'POST' }),
   previewAcknowledgeTasks: (payload: { type?: string }) => {
     const qs = payload.type ? `?${new URLSearchParams({ type: payload.type }).toString()}` : ''

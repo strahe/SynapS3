@@ -510,7 +510,10 @@ type StorageContentRepository interface {
 	ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error
 	GetPullAttempt(ctx context.Context, attemptID string, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
 	GetUnresolvedPullAttempt(ctx context.Context, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
-	SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error
+	CopyRetryStates(ctx context.Context, copyIDs []int64) (map[int64]CopyRetryState, error)
+	RetryFailedCopy(ctx context.Context, copyID int64) (*model.StorageCopy, error)
+	GetLastAbandonedPullAttempt(ctx context.Context, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
+	SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID, lastError string) error
 	AbandonMigrationPull(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error
 	PromotePendingIngress(ctx context.Context, contentID int64) (*model.StorageCopy, error)
 	ReopenFailedIngressForPull(ctx context.Context, contentID int64) ([]model.StorageCopy, error)
@@ -719,6 +722,7 @@ type TaskRepository interface {
 	RetryFailed(ctx context.Context, id int64) error
 	ReactivateTerminal(ctx context.Context, id int64) error
 	AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error
+	AcknowledgeFailedForSubject(ctx context.Context, subjectType, subjectKey string, retention time.Duration) (int, error)
 	// AcknowledgeFailedMatching dismisses every unacknowledged failure the filter
 	// covers and reports how many it dismissed.
 	AcknowledgeFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter, retention time.Duration) (int, error)

@@ -267,6 +267,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("POST /api/v1/buckets/{name}/data-sets/{id}/replacement", s.handleAPIStartDataSetReplacement)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", s.handleAPIListDataSetReplacementProviders)
 		mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", s.handleAPIRetryStorageReplacement)
+		mux.HandleFunc("POST /api/v1/storage-copies/{id}/retry", s.handleAPIRetryStorageCopy)
 		mux.HandleFunc("GET /api/v1/storage-confirmations", s.handleAPIListStorageConfirmations)
 		mux.HandleFunc("GET /api/v1/commit-batches", s.handleAPIListCommitBatches)
 		mux.HandleFunc("GET /api/v1/commit-batches/{id}", s.handleAPIGetCommitBatch)

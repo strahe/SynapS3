@@ -128,6 +128,18 @@ export function useObjectProvenance(name: string, versionId: string, enabled = t
   })
 }
 
+export function useRetryStorageCopy() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.retryStorageCopy,
+    onSettled: () => {
+      for (const key of ['tasks', 'taskStats', 'objectProvenance', 'objects']) {
+        qc.invalidateQueries({ queryKey: [key] })
+      }
+    },
+  })
+}
+
 export function useCreateBucket() {
   const qc = useQueryClient()
 

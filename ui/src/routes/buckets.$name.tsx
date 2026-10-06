@@ -115,6 +115,7 @@ import {
   useRestoreBucketObject,
   useRestoreBucketObjectVersion,
   useRetryProviderReplacement,
+  useRetryStorageCopy,
   useS3Users,
   useStartProviderReplacement,
   useTestProviderUploadSpeed,
@@ -184,7 +185,7 @@ import {
   storageConfirmationRetryNote,
   storageConfirmationTasksSearch,
 } from '@/lib/storage-confirmation-attention'
-import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
+import { copyRetryBlockedLabel, objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, formatTokenAmount, timeAgo } from '@/lib/utils'
 
@@ -831,9 +832,19 @@ function ProvenanceSummaryItem({
 }
 
 function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
+  const retry = useRetryStorageCopy()
   return (
     <div className="overflow-hidden rounded-md border border-border">
       <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Replicas</div>
+      {retry.error && (
+        <Alert>
+          <AlertDescription>
+            {retry.error instanceof APIError && retry.error.code
+              ? copyRetryBlockedLabel(retry.error.code)
+              : 'Could not retry replica. Try again.'}
+          </AlertDescription>
+        </Alert>
+      )}
       <ScrollArea className="w-full">
         <Table className="min-w-[1080px]">
           <TableHeader>
@@ -847,11 +858,12 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
               <TableHead className="px-3">Piece ID</TableHead>
               <TableHead className="px-3">New</TableHead>
               <TableHead className="px-3">Retrieval URL</TableHead>
+              <TableHead className="px-3">Recovery</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {copies.map((copy) => (
-              <TableRow key={`${copy.copy_index}-${copy.transfer_method}`}>
+              <TableRow key={copy.copy_id}>
                 <TableCell className="px-3 font-mono text-xs">{replicaLabel(copy.copy_index)}</TableCell>
                 <TableCell className="px-3">
                   {transferMethodLabel(copy.transfer_method)}
@@ -864,6 +876,11 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 </TableCell>
                 <TableCell className="px-3">
                   <StatusBadge tone={copyStatusTone(copy)}>{copyStatusLabel(copy)}</StatusBadge>
+                  {copy.last_error && (
+                    <div className="mt-1">
+                      <CopyableValue label="Last error" value={copy.last_error} maxLength={60} />
+                    </div>
+                  )}
                   {copy.attention_code && (
                     <CopyAttentionDetails
                       reasonCode={copy.attention_code}
@@ -903,11 +920,34 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                     '—'
                   )}
                 </TableCell>
+                <TableCell className="px-3">
+                  {copy.retry?.available ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={retry.isPending}
+                      onClick={() => retry.mutate(copy.copy_id)}
+                    >
+                      {retry.isPending && retry.variables === copy.copy_id ? (
+                        <Loader2 data-icon="inline-start" className="animate-spin" />
+                      ) : (
+                        <RotateCcw data-icon="inline-start" />
+                      )}
+                      Retry replica
+                    </Button>
+                  ) : copy.retry ? (
+                    <span className="text-sm text-muted-foreground">
+                      {copyRetryBlockedLabel(copy.retry.reason_code)}
+                    </span>
+                  ) : (
+                    '—'
+                  )}
+                </TableCell>
               </TableRow>
             ))}
             {copies.length === 0 && (
               <TableRow>
-                <TableCell colSpan={9} className="h-20 text-center text-muted-foreground">
+                <TableCell colSpan={10} className="h-20 text-center text-muted-foreground">
                   No replicas recorded
                 </TableCell>
               </TableRow>

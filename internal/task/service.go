@@ -209,6 +209,12 @@ func (s *Service) Acknowledge(ctx context.Context, id int64) error {
 	return s.repos.Tasks.AcknowledgeFailed(ctx, id, s.retention)
 }
 
+// AcknowledgeSubjectInTransaction retains failed history when new work replaces it.
+func (s *Service) AcknowledgeSubjectInTransaction(ctx context.Context, txRepos *repository.Repositories, subjectType, subjectKey string) error {
+	_, err := txRepos.Tasks.AcknowledgeFailedForSubject(ctx, subjectType, subjectKey, s.retention)
+	return err
+}
+
 // AcknowledgeMatching dismisses a backlog of failures in one step and reports
 // how many it dismissed.
 func (s *Service) AcknowledgeMatching(ctx context.Context, filter repository.TaskAcknowledgeFilter) (int, error) {

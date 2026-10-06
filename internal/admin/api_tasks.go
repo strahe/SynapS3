@@ -38,6 +38,7 @@ type taskListItem struct {
 	UpdatedAt       string  `json:"updated_at"`
 
 	StorageConfirmation *taskStorageConfirmation `json:"storage_confirmation,omitempty"`
+	CopyRetry           *taskCopyRetryResponse   `json:"copy_retry,omitempty"`
 }
 
 // taskStorageConfirmation describes the storage registration a Confirm
@@ -77,6 +78,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 		items = append(items, s.taskListItem(&page.Tasks[i]))
 	}
 	s.attachTaskStorageConfirmations(r.Context(), page.Tasks, items)
+	s.attachTaskCopyRetry(r.Context(), page.Tasks, items)
 	response := taskListResponse{Tasks: items}
 	if page.NextBeforeID > 0 {
 		response.NextCursor = &page.NextBeforeID

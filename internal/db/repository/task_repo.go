@@ -629,6 +629,22 @@ const awaitingCommitReviewSQL = `EXISTS (
 	  AND review_request.attention_at IS NOT NULL
 )`
 
+func (r *BunTaskRepo) AcknowledgeFailedForSubject(ctx context.Context, subjectType, subjectKey string, retention time.Duration) (int, error) {
+	if subjectType == "" || subjectKey == "" || retention <= 0 {
+		return 0, ErrInvalidInput
+	}
+	now := time.Now()
+	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("acknowledged_at = ?", now).Set("retention_until = ?", now.Add(retention)).Set("updated_at = ?", now).
+		Where("subject_type = ? AND subject_key = ? AND status = ?", subjectType, subjectKey, model.TaskStatusFailed).
+		Where("acknowledged_at IS NULL").Where("NOT " + awaitingCommitReviewSQL).Exec(ctx)
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	return int(count), err
+}
+
 // AcknowledgeFailed dismisses one failure. A failure whose storage confirmation
 // is flagged for attention is refused with ErrConflict until that confirmation
 // is resolved.
