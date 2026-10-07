@@ -47,7 +47,8 @@ export function replacementInProgress(replacement: ProviderReplacement) {
 
 /** Only these states are resumed by the operator; the rest resume themselves. */
 export function replacementRetryable(replacement: ProviderReplacement) {
-  if (replacement.failure_reason === 'target_in_use') return false
+  if (replacement.retryable !== undefined) return replacement.retryable
+  if (replacement.failure_reason === 'target_in_use' || replacement.failure_reason === 'target_rejected') return false
   return replacement.status === 'failed' || replacement.status === 'cleanup_attention'
 }
 
@@ -57,35 +58,6 @@ export function activeReplacements(replacements: ProviderReplacement[] | undefin
   return replacements.filter(
     (row) => replacementInProgress(row) || row.status === 'failed' || row.status === 'cleanup_attention'
   )
-}
-
-export function replacementForDataSet(replacements: ProviderReplacement[] | undefined, dataSetID: number) {
-  if (!replacements?.length) return undefined
-  return replacements.find(
-    (row) =>
-      (row.source.id === dataSetID || row.target.id === dataSetID) &&
-      (replacementInProgress(row) || row.status === 'failed' || row.status === 'cleanup_attention')
-  )
-}
-
-/**
- * A replacement that is still progressing owns the replica. One that stopped and
- * is waiting for the operator does not: choosing a different provider is how you
- * move on from a target that will not work, and that needs a new confirmation
- * rather than a retry of the old one.
- *
- * That only applies to the replica being replaced. A provider that is itself a
- * replacement's target cannot be replaced again while that replacement is
- * unfinished, because the original source still owes it the data it has not
- * migrated yet. Offering the action there would only produce a conflict.
- */
-export function dataSetReplaceable(dataSet: StorageDataSetSummary, replacements: ProviderReplacement[] | undefined) {
-  if (!dataSet.replaceable) return false
-  const active = replacementForDataSet(replacements, dataSet.id)
-  if (!active) return true
-  if (active.target.id === dataSet.id) return false
-  if (active.status === 'failed') return true
-  return replacementRetryable(active)
 }
 
 /**
@@ -143,10 +115,11 @@ const replacementErrorMessages: Record<string, string> = {
   approval_check_unavailable: 'Could not check provider requirements. Try again.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',
   replacement_source_not_current: 'This replica no longer receives writes, so replacing it would change nothing.',
-  replacement_source_creating:
-    'This replica can be replaced only after its storage service is ready. If the setup failed, retry it from Tasks. While its provider stays unavailable, the setup keeps waiting and the replica cannot be replaced.',
+  replacement_source_running: 'Storage setup is running. Try again shortly.',
+  replacement_source_outcome_unknown:
+    'Could not confirm whether storage setup succeeded. Check its task before replacing the provider.',
   replacement_superseded: 'A newer request has taken over this replica.',
-  replacement_not_retryable: 'This replacement is still progressing on its own.',
+  replacement_not_retryable: 'This replacement cannot be retried in its current state.',
   replacement_task_running: 'Replacement work is still running. Try again shortly.',
 }
 
@@ -157,8 +130,19 @@ const replacementErrorMessages: Record<string, string> = {
 export function replacementNextStep(replacement: ProviderReplacement) {
   switch (replacement.status) {
     case 'failed':
+      if (replacement.failure_reason === 'target_rejected') {
+        return 'This provider rejected setup. Choose a different provider.'
+      }
       if (replacement.failure_reason === 'target_in_use') {
         return 'This provider is already in use. Choose a different provider.'
+      }
+      if (replacement.retryable === false) {
+        if (!replacement.source.is_current && !replacement.target.is_current) {
+          return 'Storage setup needs attention. Check its task.'
+        }
+        return replacement.target.status === 'retired' || replacement.target.status === 'failed'
+          ? 'Storage setup has ended. Choose a different provider for the original replica.'
+          : 'Storage setup stopped. Check its task before continuing.'
       }
       // Choosing a different provider is only open while the old provider still
       // holds the replica. Once the new one has taken it over, the only way
@@ -175,9 +159,19 @@ export function replacementNextStep(replacement: ProviderReplacement) {
   }
 }
 
+export function dataSetSetupMessage(dataSet: StorageDataSetSummary) {
+  if (!dataSet.is_current || dataSet.status === 'ready') return null
+  return dataSet.setup_error ?? replacementErrorMessages[dataSet.replacement_blocked_reason ?? ''] ?? null
+}
+
 /** Turn a failed request into something the operator can act on. */
 export function replacementErrorMessage(error: unknown) {
   if (error instanceof APIError) {
+    if (
+      (error.code === 'replacement_source_outcome_unknown' || error.code === 'replacement_not_retryable') &&
+      error.message
+    )
+      return error.message
     const known = error.code ? replacementErrorMessages[error.code] : undefined
     if (known) return known
     if (error.status === 503) {
@@ -249,4 +243,13 @@ export function providerCandidateMatches(candidate: ReplacementProviderCandidate
     profile?.name?.toLowerCase().includes(needle) ||
       profile?.registry_snapshot.pdp_offering?.location?.toLowerCase().includes(needle)
   )
+}
+
+export function replacementConfirmationDescription(dataSet: StorageDataSetSummary) {
+  const description = dataSet.data_set_id
+    ? 'This starts paying a new provider. Once it is ready, new uploads go there. The old provider is ended after existing objects are readable on the new one.'
+    : 'This creates a replica on the new provider. Storage charges start when its setup succeeds. New uploads that need this replica wait until the new provider is ready.'
+  return dataSet.replacement_has_late_service_risk || (!dataSet.data_set_id && dataSet.client_data_set_id)
+    ? `${description} An earlier request may still create a paid storage service; this replacement will not close it.`
+    : description
 }

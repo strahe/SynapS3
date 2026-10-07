@@ -92,7 +92,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
 | Tasks and storage health | task retry and acknowledgement, storage provider and data set refresh | Requeues work, dismisses a reviewed failure and starts its retention period, or refreshes operational status. |
-| Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
+| Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends any existing old service. |
 
 ## Health and Metrics
 
@@ -198,7 +198,7 @@ The restore streams synchronously for up to one hour and requires enough cache c
 
 ### Replace a Storage Provider
 
-`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` is the only way to replace the storage provider behind a replica. One confirmation authorizes all of it: a new paid storage service, moving new uploads to it, copying existing data across, and ending the old service once every retained version is readable on the new provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down.
+`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` is the only way to replace the storage provider behind a replica. One confirmation authorizes all of it: a new paid storage service, moving new uploads to it, copying existing data across, and ending any existing old service once every retained version is readable on the new provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down.
 
 Choose the new provider automatically:
 
@@ -218,9 +218,11 @@ Read `GET /api/v1/filecoin/warm-storage/price-list` before confirmation. It retu
 
 `client_request_id` is required after trimming and must contain 1–128 characters. The first successful request returns `201 Created`. Replaying the same bucket, source, mode, manual provider, and price fingerprint with the same ID returns the original record and `200 OK`, even after the replica has switched. Reusing the ID with different parameters returns `409 Conflict` with `replacement_idempotency_conflict`. A replay is resolved before current price or, for automatic selection, approval checks, so changes to those inputs cannot authorize a different provider or block a matching replay.
 
-Confirming again for the same replica supersedes the earlier request and returns `201 Created`; it is not a conflict. The unused provider from the earlier request is shut down. `replacement_active` means something else: the replica is the target of another unfinished replacement, which has to be resolved first.
+An in-progress replacement reserves its original replica until it finishes or stops. After a failure or cleanup attention, confirming again for that replica can supersede the earlier request once its target has no unresolved creation. A refused target is checked again under its original wallet and network before it is abandoned, even when the original replica is ready. If its service is found, the new confirmation returns a conflict; retry the existing replacement. Any known unused service from a superseded request follows normal shutdown. `replacement_active` means the replica belongs to an in-progress replacement, or is the target of an unfinished replacement; continue that replacement first.
 
-Only the replica that currently receives writes, and whose storage service is ready, can be replaced. A historical generation, or a replica still setting up its storage service, is reported with `"replaceable": false` in `GET /api/v1/buckets/{name}`; a request for a replica still setting up returns `409 Conflict` with `replacement_source_creating`.
+The current replica can be replaced when its service is ready, no creation request was sent, or its initial creation POST returned 400, 401, or 403 and a check under the original wallet and network found no service. A previous timeout does not prevent the last case. A running setup task returns `409 Conflict` with `replacement_source_running`; an unconfirmed outcome, known submitted transaction, failed lookup, or changed identity returns `replacement_source_outcome_unknown`. Bucket responses provide `replaceable`, optional `replacement_blocked_reason`, and optional `setup_error`; submission rechecks eligibility. Optional `replacement_has_late_service_risk` includes refused targets abandoned by another provider choice.
+
+For a replica without a service, confirmation stops its original creation and prepares the selected provider. The original replica keeps its slot until the new service is ready; if setup fails, choose another provider from the original replica. New uploads that need this replica wait for setup and resume at handover. After handover, required content is restored from another replica or cache; content with neither needs attention. No old service is terminated. A successful absence check cannot rule out a late service from an earlier request; SynapS3 does not automatically adopt or clean up such services.
 
 A successful first confirmation returns `201 Created` with the replacement record; an exact replay returns `200 OK`. `GET /api/v1/buckets/{name}` returns the bucket's recent replacements in `replacements`, newest first, up to the 50 most recent.
 
@@ -228,16 +230,16 @@ Replacement moves through these states:
 
 | Status | Meaning |
 | --- | --- |
-| `preparing_target` | The new service is being created. Writes still go to the current provider. |
+| `preparing_target` | The new service is being created. A ready source keeps receiving writes; otherwise new uploads wait for the selected provider. |
 | `migrating` | The new provider receives new uploads while existing data is copied across. |
 | `waiting` | Paused. `wait_reason` and `wait_message` distinguish service creation (`target_creating`), writable confirmation (`target_writable`), an unreachable provider (`target`), funding, source availability, and safe retirement waits. Most waits resume without action. |
 | `retiring` | Everything is copied and the old service is being ended. |
 | `cleanup_attention` | Ending the old service needs an operator decision, such as settling payment debt. |
-| `failed` | Work ran out of attempts and needs to be retried. |
-| `completed` | The old service is ended and the replica now lives on the new provider. |
+| `failed` | Work stopped and needs action. Follow `retryable` and the reported next step. |
+| `completed` | Required copies are readable on the new provider, and any old service has ended. |
 | `superseded` | A later confirmation replaced this request. |
 
-`last_error` is set only for `failed` and `cleanup_attention`, and is cleared by a retry. Waiting never sets it, because waiting is not a failure. A failed response may also include `failure_reason`. `target_in_use` is permanent for that approved target: choose a different provider; the retry endpoint returns a conflict.
+`last_error` is set only for `failed` and `cleanup_attention`, and is cleared by a retry. Waiting never sets it, because waiting is not a failure. A failed response may also include `failure_reason`. `target_in_use` and `target_rejected` require choosing another provider; the retry endpoint returns a conflict explaining that action. `retryable` reports whether the existing replacement can resume. Before handover, choose a different provider from the original replica. A retryable setup failure leaves the replacement waiting; retry the setup task to continue. A terminated setup cannot be recreated by retrying its replacement.
 
 `items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
 
@@ -256,7 +258,7 @@ Conflicts return `409 Conflict` with a stable code:
 }
 ```
 
-The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_target_creating`, `replacement_source_not_current`, `replacement_source_creating`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; an unavailable manual target returns `400` with `replacement_target_unavailable`; a failed on-chain approval check during automatic selection returns `503 Service Unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
+The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_target_creating`, `replacement_source_not_current`, `replacement_source_running`, `replacement_source_outcome_unknown`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; an unavailable manual target returns `400` with `replacement_target_unavailable`; a failed on-chain approval check during automatic selection returns `503 Service Unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
 
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists all providers with a recorded health observation. Each row includes `manual_selectable`, `manual_block_reason`, `approved_fresh`, `previously_used`, the saved Registry profile when available, health, and recent upload speed. An ineligible provider remains visible for inspection. Reasons include `current_source`, `already_serves_bucket`, `provider_unavailable`, `observation_stale`, `profile_missing`, and `profile_url_changed`. Manual selection does not depend on FWSS approval; it still requires a healthy provider with an active, current profile and the usual bucket constraints. Automatic selection also excludes every provider this bucket has used and checks fresh approved candidates on chain in ID order.
 

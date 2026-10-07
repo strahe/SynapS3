@@ -70,6 +70,7 @@ func (r *BunStorageContentRepo) AuthorizeCopyTask(ctx context.Context, copyID, g
 		Join("JOIN tasks AS copy_task ON copy_task.id = storage_copy.active_task_id").
 		Where("storage_copy.id = ? AND storage_copy.work_generation = ? AND storage_copy.active_task_id = ?", copyID, generation, taskID).
 		Where("copy_task.status = ? AND copy_task.claim_generation = ? AND copy_task.lease_until > ?", model.TaskStatusRunning, claimGeneration, time.Now()).
+		Where(`NOT EXISTS (SELECT 1 FROM storage_data_sets AS ended WHERE ended.id = storage_copy.storage_data_set_id AND ended.data_set_id IS NULL AND ` + dataSetCreationStoppedSQL("ended") + `)`).
 		Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrConflict
@@ -271,6 +272,9 @@ func (r *BunStorageContentRepo) bindDataSetTask(ctx context.Context, dataSetID i
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", dataSetID).
 		Where(fence.taskColumn + " IS NULL")
+	if fence == dataSetEnsureFence {
+		query = query.Where("NOT " + dataSetCreationStoppedSQL("storage_data_set"))
+	}
 	if fenced {
 		query = query.Set(fence.generationColumn+" = ?", generation).
 			Where(fence.generationColumn+" = ?", generation-1)
@@ -286,6 +290,9 @@ func (r *BunStorageContentRepo) authorizeDataSetTask(ctx context.Context, dataSe
 	}
 	dataSet := new(model.StorageDataSet)
 	query := r.db.NewSelect().Model(dataSet).Where("id = ?", dataSetID).Where(fence.taskColumn+" = ?", taskID)
+	if fence == dataSetEnsureFence {
+		query = query.Where("NOT " + dataSetCreationStoppedSQL("storage_data_set"))
+	}
 	if fenced {
 		query = query.Where(fence.generationColumn+" = ?", generation)
 	}

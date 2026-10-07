@@ -18,6 +18,7 @@ import (
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synaps3/internal/worker"
 )
 
 type stubProviderSelector struct {
@@ -129,6 +130,12 @@ func newReplacementAPIFixture(t *testing.T, selector providerReplacementSelector
 func newReplacementAPIFixtureWithHealth(t *testing.T, selector providerReplacementSelector, seedHealth bool) *replacementAPIFixture {
 	t.Helper()
 	srv, _ := newBucketAPITestServer(t)
+	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{Repositories: srv.repos})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers.SetTaskService(srv.taskService)
+	srv.WithDataSetReadyContinuation(handlers)
 	srv.observability = observability.NewService(observability.ServiceOptions{
 		Store: srv.repos.Observability, RefreshInterval: 5 * time.Minute,
 	})
@@ -413,7 +420,11 @@ func TestAPIStartDataSetReplacementIsIdempotent(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
-	if err := fixture.srv.repos.Replacements.Activate(ctx, firstReplacement.ID); err != nil {
+	bound, err := fixture.srv.repos.Replacements.GetByID(ctx, firstReplacement.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.srv.repos.Replacements.Activate(ctx, firstReplacement.ID, bound.TaskGeneration, *bound.TaskID); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 	replay := fixture.startRaw(t, body)
@@ -539,8 +550,8 @@ func TestAPIStartDataSetReplacementWaitsForSourceCreation(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d body=%s, want 409", rec.Code, rec.Body.String())
 	}
-	if got := decodeAPIError(t, rec)["code"]; got != storagereplacement.CodeSourceCreating {
-		t.Fatalf("code = %q, want %q", got, storagereplacement.CodeSourceCreating)
+	if got := decodeAPIError(t, rec)["code"]; got != storagereplacement.CodeSourceOutcomeUnknown {
+		t.Fatalf("code = %q, want %q", got, storagereplacement.CodeSourceOutcomeUnknown)
 	}
 }
 
@@ -557,11 +568,10 @@ func TestAPIStartDataSetReplacementRejectsSecondConfirmation(t *testing.T) {
 	if rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("first confirmation status = %d", rec.Code)
 	}
-	// A second confirmation supersedes the first rather than colliding, which is
-	// how an operator changes their mind about the target.
+	// An active replacement reserves its source even before target creation.
 	rec := fixture.start(t, `{"mode":"manual","provider_id":"303"}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("second confirmation status = %d body=%s, want 201", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict || decodeAPIError(t, rec)["code"] != storagereplacement.CodeActive {
+		t.Fatalf("second confirmation status = %d body=%s, want active replacement conflict", rec.Code, rec.Body.String())
 	}
 }
 

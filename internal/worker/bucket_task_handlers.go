@@ -62,7 +62,13 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 			if binding.Status == model.StorageDataSetStatusReady {
 				ready++
 			} else if (binding.Status == model.StorageDataSetStatusPending || binding.Status == model.StorageDataSetStatusCreating) && binding.EnsureTaskID == nil {
-				allPendingWorkBound = false
+				stopped, err := h.deps.Repositories.Contents.DataSetCreationStopped(ctx, binding.ID)
+				if err != nil {
+					return retryTask(err, "dataset_permission_load_failed")
+				}
+				if !stopped {
+					allPendingWorkBound = false
+				}
 			}
 		}
 		if ready >= required {
@@ -152,6 +158,13 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 			for i := range created {
 				binding := &created[i]
 				if binding.Status == model.StorageDataSetStatusReady || binding.EnsureTaskID != nil {
+					continue
+				}
+				stopped, err := repos.Contents.DataSetCreationStopped(ctx, binding.ID)
+				if err != nil {
+					return err
+				}
+				if stopped {
 					continue
 				}
 				if err := h.enqueueDataSetEnsure(ctx, repos, binding); err != nil && !errors.Is(err, repository.ErrConflict) {

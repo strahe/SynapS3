@@ -47,6 +47,9 @@ func (r *BunStorageReplacementRepo) SeedMigrationBatch(
 		if locked.SeedCursorContentID != row.SeedCursorContentID {
 			return ErrConflict
 		}
+		if locked.Status != storagereplacement.StatusPreparingTarget && locked.Status != storagereplacement.StatusWaiting && locked.Status != storagereplacement.StatusMigrating {
+			return ErrConflict
+		}
 		if len(eligible) > 0 {
 			// The target copy is created before the item that names it, so the
 			// item is born with a target and its composite foreign key to the
@@ -120,15 +123,20 @@ func (r *BunStorageReplacementRepo) scanMigrationCandidates(
 		return nil, row.SeedCursorContentID, 0, nil
 	}
 	cursor = candidates[len(candidates)-1]
-	query := fmt.Sprintf(`SELECT candidate.id
-		FROM storage_contents AS candidate
-		WHERE candidate.id IN (?)
-		  AND EXISTS (
-			SELECT 1 FROM object_versions AS live_version
-			WHERE %s AND live_version.is_delete_marker = ?
-		  )
-		ORDER BY candidate.id`, objectVersionReferencesStorageContentSQL("live_version", "candidate"))
-	if err := r.db.NewRaw(query, bun.List(candidates), false).Scan(ctx, &eligible); err != nil {
+	source, err := (&BunStorageContentRepo{db: r.db}).GetDataSetBindingByID(ctx, row.SourceDataSetID)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if source == nil {
+		return nil, 0, 0, ErrNotFound
+	}
+	query := r.db.NewSelect().TableExpr("storage_contents AS candidate").ColumnExpr("candidate.id").Where("candidate.id IN (?)", bun.List(candidates)).OrderExpr("candidate.id")
+	if source.DataSetID == nil {
+		query = query.Where(localSlotObligationSQL("candidate", "live_version"), row.CopyIndex)
+	} else {
+		query = query.Where(fmt.Sprintf(`EXISTS (SELECT 1 FROM object_versions AS live_version WHERE %s AND live_version.is_delete_marker = FALSE)`, objectVersionReferencesStorageContentSQL("live_version", "candidate")))
+	}
+	if err := query.Scan(ctx, &eligible); err != nil {
 		return nil, 0, 0, fmt.Errorf("selecting replacement candidates: %w", err)
 	}
 	return eligible, cursor, len(candidates), nil
@@ -144,6 +152,7 @@ func markSeedingComplete(ctx context.Context, db bun.IDB, replacementID, cursor 
 		Set("seeding_complete = ?", true).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ? AND seed_cursor_content_id = ?", replacementID, cursor).
+		Where("status IN (?)", bun.List([]storagereplacement.Status{storagereplacement.StatusPreparingTarget, storagereplacement.StatusWaiting, storagereplacement.StatusMigrating})).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("completing replacement seeding: %w", err)
@@ -237,6 +246,10 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 		owed, inFlight, err := sourceCopyState(ctx, db, upload.ID, source.ID)
 		if err != nil {
 			return err
+		}
+		if source.DataSetID == nil {
+			owed = localSlotObligation(upload, version, replacement.CopyIndex)
+			inFlight = false
 		}
 		if !owed {
 			if inFlight {

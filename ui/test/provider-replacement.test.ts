@@ -10,12 +10,13 @@ import {
   activeReplacements,
   dataSetGenerationLabel,
   dataSetGenerationTone,
-  dataSetReplaceable,
+  dataSetSetupMessage,
   providerCandidateDisabledReason,
   providerCandidateLabel,
   providerCandidateMatches,
   providerCandidateNote,
   providerCandidateRegistryLine,
+  replacementConfirmationDescription,
   replacementConfirmationSummary,
   replacementErrorMessage,
   replacementNextStep,
@@ -79,34 +80,39 @@ function replacement(overrides: Partial<ProviderReplacement> = {}): ProviderRepl
   }
 }
 
-// A replica already being replaced must not offer a second confirmation.
-test('a data set in flight is not replaceable again', () => {
-  const set = dataSet()
-  assert.equal(dataSetReplaceable(set, []), true)
-  assert.equal(dataSetReplaceable(set, [replacement({ source: { ...replacement().source, id: set.id } })]), false)
-  // A finished replacement releases the slot.
-  assert.equal(dataSetReplaceable(set, [replacement({ status: 'completed' })]), true)
-})
-
-test('a historical generation is never offered for replacement', () => {
-  assert.equal(dataSetReplaceable(dataSet({ is_current: false, replaceable: false }), []), false)
-})
-
 test('confirmation uses referenced versions and bytes', () => {
   assert.equal(replacementConfirmationSummary(dataSet()), '12 versions · 1 MB')
 })
 
+test('confirmation discloses late paid services only after a creation request', () => {
+  const unsent = dataSet({ status: 'pending', data_set_id: undefined, client_data_set_id: undefined })
+  assert.equal(replacementConfirmationDescription(unsent).includes('earlier request'), false)
+  assert.equal(
+    replacementConfirmationDescription({ ...unsent, client_data_set_id: '909' }).includes('will not close it'),
+    true
+  )
+  for (const source of [unsent, dataSet({ data_set_id: '1001' })]) {
+    assert.match(
+      replacementConfirmationDescription({ ...source, replacement_has_late_service_risk: true }),
+      /earlier request.*paid storage service.*will not close it/
+    )
+  }
+  assert.match(replacementConfirmationDescription(unsent), /New uploads that need this replica wait/)
+  assert.doesNotMatch(replacementConfirmationDescription(dataSet({ data_set_id: '1001' })), /New uploads.*wait/)
+})
+
 test('only operator-owned states are retryable', () => {
+  assert.equal(replacementRetryable(replacement({ status: 'failed', retryable: false })), false)
   assert.equal(replacementRetryable(replacement({ status: 'failed' })), true)
   assert.equal(replacementRetryable(replacement({ status: 'cleanup_attention' })), true)
   assert.equal(replacementRetryable(replacement({ status: 'failed', failure_reason: 'target_in_use' })), false)
+  assert.equal(replacementRetryable(replacement({ status: 'failed', failure_reason: 'target_rejected' })), false)
   for (const status of ['preparing_target', 'migrating', 'waiting', 'retiring', 'completed', 'superseded'] as const) {
     assert.equal(replacementRetryable(replacement({ status })), false, status)
   }
 })
 
-test('a permanent target conflict stays visible and allows a new provider choice', () => {
-  const source = dataSet({ id: 1, is_current: true, replaceable: true })
+test('a permanent target conflict stays visible without offering retry', () => {
   const stopped = replacement({
     status: 'failed',
     failure_reason: 'target_in_use',
@@ -118,7 +124,6 @@ test('a permanent target conflict stays visible and allows a new provider choice
     [stopped.id]
   )
   assert.equal(replacementRetryable(stopped), false)
-  assert.equal(dataSetReplaceable(source, [stopped]), true)
 })
 
 test('every replacement that still needs something is surfaced', () => {
@@ -179,6 +184,16 @@ test('the generation being prepared is not labelled as a past one', () => {
 // A typed conflict must tell the operator what to do, not echo a status code.
 test('errors explain what to do next', () => {
   assert.equal(
+    replacementErrorMessage(
+      new APIError(
+        'Restore the original wallet and network before replacing this provider.',
+        409,
+        'replacement_source_outcome_unknown'
+      )
+    ),
+    'Restore the original wallet and network before replacing this provider.'
+  )
+  assert.equal(
     replacementErrorMessage(new APIError('conflict', 409, 'replacement_target_in_use')),
     'That provider already stores a replica of this bucket. Choose a different one.'
   )
@@ -191,18 +206,21 @@ test('errors explain what to do next', () => {
   assert.equal(replacementErrorMessage('nope'), 'Could not complete the request.')
 })
 
-// #314 says choosing a different target after a failure needs a new
-// confirmation. Treating a stopped replacement as owning the replica left the
-// operator with nothing but Retry on a provider that will not work.
-test('a stopped replacement does not block choosing a different provider', () => {
-  const set = dataSet()
-  const owned = { ...replacement().source, id: set.id }
-  for (const status of ['preparing_target', 'migrating', 'waiting', 'retiring'] as const) {
-    assert.equal(dataSetReplaceable(set, [replacement({ status, source: owned })]), false, status)
-  }
-  for (const status of ['failed', 'cleanup_attention'] as const) {
-    assert.equal(dataSetReplaceable(set, [replacement({ status, source: owned })]), true, status)
-  }
+test('provider refusal directs the operator to another provider', () => {
+  const refused = dataSet({
+    status: 'pending',
+    setup_error: 'Storage provider rejected setup. Choose another provider.',
+  })
+  assert.match(dataSetSetupMessage(refused) ?? '', /Choose another provider/)
+  assert.match(
+    replacementNextStep(replacement({ status: 'failed', failure_reason: 'target_rejected' })) ?? '',
+    /different provider/
+  )
+  assert.match(
+    dataSetSetupMessage(dataSet({ status: 'pending', replacement_blocked_reason: 'replacement_source_running' })) ?? '',
+    /running/
+  )
+  assert.equal(dataSetSetupMessage(dataSet({ setup_error: refused.setup_error })), null)
 })
 
 // The two attention states have different consequences: one means the data has
@@ -227,22 +245,6 @@ test('the next step never echoes the recorded error', () => {
   assert.ok(step.length > 0)
   assert.ok(!step.includes('max retries reached'))
   assert.equal(replacementNextStep(replacement({ status: 'migrating' })), null)
-})
-
-// The API refuses to replace a data set another replacement is still migrating
-// into, because the original source still owes it the data it has not copied.
-// Offering the action there produced a guaranteed 409.
-test('the target of a stopped replacement is not offered for replacement', () => {
-  const target = dataSet({ id: 2, generation: 2 })
-  const row = replacement({
-    status: 'failed',
-    source: { ...replacement().source, id: 1, is_current: false },
-    target: { ...replacement().target, id: 2 },
-  })
-  assert.equal(dataSetReplaceable(target, [row]), false)
-  // The replica being replaced keeps the re-target path #314 requires.
-  const source = dataSet({ id: 1 })
-  assert.equal(dataSetReplaceable(source, [row]), true)
 })
 
 // Changing provider is only open while the old one still holds the replica.

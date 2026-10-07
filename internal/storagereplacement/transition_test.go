@@ -36,11 +36,11 @@ func TestNoStatusTransitionsToItself(t *testing.T) {
 	}
 }
 
-// Retirement is the only path to completion, so no earlier phase may shortcut
-// the safety gate.
-func TestOnlyRetiringReachesCompleted(t *testing.T) {
+// A local source can complete after migration; a remote source must still pass
+// the repository retirement gate.
+func TestCompletionTransitionsRequireFinalWorkingPhase(t *testing.T) {
 	for _, from := range allStatuses {
-		want := from == StatusRetiring
+		want := from == StatusRetiring || from == StatusMigrating
 		if got := Allowed(from, StatusCompleted); got != want {
 			t.Fatalf("Allowed(%s, completed) = %v, want %v", from, got, want)
 		}

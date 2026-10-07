@@ -168,8 +168,9 @@ import {
   activeReplacements,
   dataSetGenerationLabel,
   dataSetGenerationTone,
-  dataSetReplaceable,
+  dataSetSetupMessage,
   providerCandidateDisabledReason,
+  replacementConfirmationDescription,
   replacementConfirmationSummary,
   replacementErrorMessage,
   replacementNextStep,
@@ -1860,7 +1861,6 @@ function BucketDetailsSheet({
                   <BucketStorageDataSets
                     bucketName={bucket.name}
                     dataSets={bucket.data_sets ?? []}
-                    replacements={bucket.replacements ?? []}
                     onReviewStorageRisk={onReviewStorageDataSetRisk}
                     onReplaceProvider={setReplacementTarget}
                   />
@@ -1996,7 +1996,7 @@ function ReplaceProviderDialog({
         if (!open) onClose()
       }}
       title="Replace provider"
-      description="This starts paying a new provider, and new uploads go there. The old provider is ended after existing objects are readable on the new one."
+      description={replacementConfirmationDescription(dataSet)}
       confirmLabel="Replace provider"
       typedTarget="replace"
       confirmationResetKey={`${priceList.data?.fingerprint ?? 'unavailable'}:${confirmationRevision}`}
@@ -2026,12 +2026,16 @@ function ReplaceProviderDialog({
             copyable: true,
             monospace: !namedProvider,
           },
-          { id: 'scope', label: 'Data to copy', value: replacementConfirmationSummary(dataSet), monospace: false },
+          ...(dataSet.data_set_id
+            ? [{ id: 'scope', label: 'Data to copy', value: replacementConfirmationSummary(dataSet), monospace: false }]
+            : []),
         ]}
       />
       <Alert>
         <AlertDescription>
-          Existing objects copy from another replica or from cache. If an object has neither, the old provider stays.
+          {dataSet.data_set_id
+            ? 'Existing objects copy from another replica or from cache. If an object has neither, the old provider stays.'
+            : 'Objects waiting for this replica use another replica or cache. Objects without either need attention.'}
         </AlertDescription>
       </Alert>
       <FieldGroup>
@@ -2437,13 +2441,11 @@ function BucketDetailAction({ label, value, onClick }: { label: string; value: s
 function BucketStorageDataSets({
   bucketName,
   dataSets,
-  replacements,
   onReviewStorageRisk,
   onReplaceProvider,
 }: {
   bucketName: string
   dataSets: StorageDataSetSummary[]
-  replacements: ProviderReplacement[]
   onReviewStorageRisk: (dataSetID: number) => void
   onReplaceProvider: (dataSet: StorageDataSetSummary) => void
 }) {
@@ -2554,6 +2556,14 @@ function BucketStorageDataSets({
                   </TableCell>
                   <TableCell className="overflow-hidden px-3">
                     <DataSetStorageHealthCell dataSet={dataSet} />
+                    {dataSetSetupMessage(dataSet) && (
+                      <p
+                        className="mt-1 truncate text-xs text-muted-foreground"
+                        title={dataSetSetupMessage(dataSet) ?? undefined}
+                      >
+                        {dataSetSetupMessage(dataSet)}
+                      </p>
+                    )}
                   </TableCell>
                   <TableCell className="overflow-hidden px-3">
                     <DataSetImpactCell dataSet={dataSet} />
@@ -2590,7 +2600,7 @@ function BucketStorageDataSets({
                           <TooltipContent>Affected versions</TooltipContent>
                         </Tooltip>
                       )}
-                      {dataSetReplaceable(dataSet, replacements) && (
+                      {dataSet.replaceable && (
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <Button

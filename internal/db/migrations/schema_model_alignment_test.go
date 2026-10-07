@@ -175,7 +175,7 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 			PrimaryKey: field.IsPK,
 			Generated:  field.AutoIncrement && field.Identity,
 		}
-		if _, ok := initialJSONColumn(table.Name, field.Name); ok && db.Dialect().Name() == dialect.SQLite {
+		if db.Dialect().Name() == dialect.SQLite && strings.EqualFold(field.CreateTableSQLType, "jsonb") {
 			want.Type = "text"
 		}
 		// A runtime default changes Bun insert behavior by omitting zero values.

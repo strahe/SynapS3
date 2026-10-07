@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"math/bits"
 	"time"
 
@@ -117,6 +118,7 @@ type StorageDataSet struct {
 	RetirementTaskID     *int64               `bun:",nullzero"`
 	CreatedAt            time.Time            `bun:",nullzero,notnull"`
 	UpdatedAt            time.Time            `bun:",nullzero,notnull"`
+	CreationRejection    json.RawMessage      `bun:"type:jsonb,nullzero"`
 
 	Bucket           *Bucket         `bun:"rel:belongs-to,join:bucket_id=id"`
 	CreatedByContent *StorageContent `bun:"rel:belongs-to,join:created_by_content_id=id"`

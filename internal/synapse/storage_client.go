@@ -250,7 +250,7 @@ func newProviderTargetAdapter(provider *storage.ProviderContext) *providerTarget
 
 func (c *providerTargetAdapter) CreateDataSet(ctx context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 	result, err := c.provider.CreateDataSet(ctx, opts)
-	return result, NormalizeProviderOperationError(ctx, err)
+	return result, normalizeCreateDataSetError(ctx, err)
 }
 
 func (c *providerTargetAdapter) WaitForDataSetCreated(ctx context.Context, statusURL string, clientDataSetID sdktypes.BigInt) (*storage.CreateDataSetResult, error) {

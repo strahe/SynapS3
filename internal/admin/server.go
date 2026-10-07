@@ -36,6 +36,10 @@ type WorkerHealthChecker interface {
 	WorkerHealth() map[string]bool
 }
 
+type dataSetReadyContinuation interface {
+	ContinueReadyDataSet(context.Context, *repository.Repositories, *model.StorageDataSet) error
+}
+
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
 	addr                    string
@@ -50,6 +54,7 @@ type Server struct {
 	cacheMaxBytes           int64
 	repos                   *repository.Repositories
 	taskService             *taskengine.Service
+	dataSetReady            dataSetReadyContinuation
 	bucketLifecycle         *bucketlifecycle.Service
 	workerHealth            WorkerHealthChecker
 	wallet                  synapse.WalletQuerier
@@ -85,6 +90,12 @@ type Server struct {
 func (s *Server) WithTaskService(service *taskengine.Service) *Server {
 	s.taskService = service
 	s.bucketLifecycle.SetTaskService(service)
+	return s
+}
+
+// WithDataSetReadyContinuation shares transactional setup completion with workers.
+func (s *Server) WithDataSetReadyContinuation(continuation dataSetReadyContinuation) *Server {
+	s.dataSetReady = continuation
 	return s
 }
 

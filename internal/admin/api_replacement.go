@@ -14,9 +14,12 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerselect"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synapse-go/storage"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 // providerReplacementSelector resolves the provider an automatic replacement
@@ -51,6 +54,7 @@ type providerReplacementResponse struct {
 	WaitReason    string `json:"wait_reason,omitempty"`
 	WaitMessage   string `json:"wait_message,omitempty"`
 	FailureReason string `json:"failure_reason,omitempty"`
+	Retryable     bool   `json:"retryable"`
 	SelectionMode string `json:"selection_mode"`
 
 	Source replacementDataSetResponse `json:"source"`
@@ -151,6 +155,14 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		}
 		return
 	}
+	source, preflight, err := s.preflightReplacementSource(ctx, bucket, dataSetID)
+	if err != nil {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
+			return
+		}
+		s.writeReplacementError(w, err, name)
+		return
+	}
 	price, priceErr := s.currentWarmStoragePrice(ctx)
 	if priceErr != nil {
 		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
@@ -208,24 +220,43 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		row, created, authorizeErr = txRepos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 			BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: mode,
 			TargetProviderID: targetProvider, ClientRequestID: req.ClientRequestID,
-			PriceListFingerprint: req.PriceListFingerprint,
+			PriceListFingerprint:      req.PriceListFingerprint,
+			VerifiedCreationRejection: preflight.VerifiedCreationRejection,
+			Preflight:                 preflight,
 		})
 		if authorizeErr != nil || !created {
 			return authorizeErr
 		}
-		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
-			Type:           model.TaskTypeProviderReplacementCoordinate,
-			IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
-			Input:          storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
-			SubjectType:    "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
-		})
-		if enqueueErr != nil {
-			return enqueueErr
+		target, err := txRepos.Contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
+		if err != nil {
+			return err
 		}
-		if bindErr := txRepos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, taskRow.ID); bindErr != nil {
-			return bindErr
+		if target != nil && target.EnsureTaskID == nil {
+			ensure, _, err := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
+				Type:           model.TaskTypeStorageDataSetEnsure,
+				IdempotencyKey: storagepipeline.DataSetEnsureKey(target.ID),
+				Input:          storagepipeline.DataSetInput{DataSetID: target.ID},
+				SubjectType:    "storage_data_set", SubjectKey: strconv.FormatInt(target.ID, 10),
+			})
+			if err != nil {
+				return err
+			}
+			if err := txRepos.Contents.BindDataSetEnsureTask(ctx, target.ID, ensure.ID); err != nil {
+				return err
+			}
 		}
-		row.TaskID = &taskRow.ID
+		if err := s.enqueueReplacementCoordinator(ctx, txRepos, row); err != nil {
+			return err
+		}
+		predecessors, err := txRepos.Replacements.ListUnscheduledSuperseded(ctx, row.ID)
+		if err != nil {
+			return err
+		}
+		for i := range predecessors {
+			if err := s.enqueueReplacementCoordinator(ctx, txRepos, &predecessors[i]); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -243,6 +274,103 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, response)
+}
+
+func (s *Server) enqueueReplacementCoordinator(ctx context.Context, repos *repository.Repositories, row *storagereplacement.Replacement) error {
+	taskRow, _, err := s.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+		Type:           model.TaskTypeProviderReplacementCoordinate,
+		IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
+		Input:          storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
+		SubjectType:    "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
+	})
+	if err != nil {
+		return err
+	}
+	if err := repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, taskRow.ID); err != nil {
+		return err
+	}
+	row.TaskID = &taskRow.ID
+	return nil
+}
+
+func (s *Server) preflightReplacementSource(ctx context.Context, bucket *model.Bucket, id int64) (*model.StorageDataSet, *repository.ReplacementPreflight, error) {
+	check, err := s.repos.Replacements.Preflight(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	source := &check.Source
+	if source.BucketID != bucket.ID {
+		return nil, nil, repository.ErrNotFound
+	}
+	if source.DataSetID == nil && len(source.CreationRejection) != 0 {
+		check.VerifiedCreationRejection, err = s.checkReplacementRefusal(ctx, bucket, check, source)
+		if err != nil {
+			return source, nil, err
+		}
+	}
+	for i := range check.Targets {
+		target := &check.Targets[i]
+		if target.DataSet.DataSetID == nil && target.DataSet.Status != model.StorageDataSetStatusRetired && len(target.DataSet.CreationRejection) != 0 {
+			target.VerifiedCreationRejection, err = s.checkReplacementRefusal(ctx, bucket, check, &target.DataSet)
+			if err != nil {
+				return source, nil, err
+			}
+		}
+	}
+	return source, check, nil
+}
+
+func (s *Server) checkReplacementRefusal(ctx context.Context, bucket *model.Bucket, check *repository.ReplacementPreflight, binding *model.StorageDataSet) (*model.DataSetCreationRejection, error) {
+	evidence, err := binding.CreationRejectionEvidence()
+	if err != nil || evidence == nil || s.objectStorage == nil {
+		return nil, storagereplacement.ErrSourceOutcomeUnknown
+	}
+	provider, err := s.objectStorage.OpenProviderTarget(ctx, binding.ProviderID.SDK(), storage.NewProviderContextOptions{
+		DataSetMetadata: map[string]string{"bucket": bucket.Name},
+	})
+	if err != nil {
+		return nil, &storagereplacement.SourceOutcomeError{Message: "Could not check the original storage provider. Try again when it is available."}
+	}
+	identity := storage.ContextIdentity{Payer: evidence.Payer, ChainID: sdktypes.ChainID(evidence.ChainID), RecordKeeper: evidence.RecordKeeper}
+	if provider.ContextIdentity() != identity {
+		return nil, &storagereplacement.SourceOutcomeError{Message: "Restore the original wallet and network before replacing this provider."}
+	}
+	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, evidence.ClientDataSetID.SDK())
+	if err != nil {
+		return nil, &storagereplacement.SourceOutcomeError{Message: "Could not check the original storage service. Try again when the network is available."}
+	}
+	if !found {
+		verified := *evidence
+		verified.AbsenceCheckedAt = time.Now().UTC()
+		return &verified, nil
+	}
+	dataSetID := idtypes.OnChainIDFromSDK(ref.DataSetID())
+	clientID := idtypes.OnChainIDFromSDK(ref.ClientDataSetID())
+	if dataSetID.IsZero() || !clientID.Equal(evidence.ClientDataSetID) || !idtypes.OnChainIDFromSDK(ref.ProviderID()).Equal(binding.ProviderID) {
+		return nil, storagereplacement.ErrSourceOutcomeUnknown
+	}
+	if s.dataSetReady == nil {
+		return nil, errors.New("storage setup continuation is unavailable")
+	}
+	err = s.repos.WithTx(ctx, func(repos *repository.Repositories) error {
+		if err := repos.Replacements.BindObservedService(ctx, repository.BindObservedReplacementServiceInput{
+			Preflight: *check, StorageDataSetID: binding.ID, DataSetID: dataSetID, ClientDataSetID: clientID,
+		}); err != nil {
+			return err
+		}
+		ready, err := repos.Contents.GetDataSetBindingByID(ctx, binding.ID)
+		if err != nil {
+			return err
+		}
+		return s.dataSetReady.ContinueReadyDataSet(ctx, repos, ready)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if binding.ID == check.Source.ID {
+		return nil, &storagereplacement.SourceOutcomeError{Message: "The original storage service was found. Refresh and review the replacement again."}
+	}
+	return nil, &storagereplacement.SourceOutcomeError{Message: "The previous provider's storage service was found. Retry its replacement to continue."}
 }
 
 func (s *Server) writeReplacementReplay(w http.ResponseWriter, ctx context.Context, bucket *model.Bucket, dataSetID int64, req startReplacementRequest, mode storagereplacement.SelectionMode) bool {
@@ -480,6 +608,14 @@ func (s *Server) handleAPIRetryStorageReplacement(w http.ResponseWriter, r *http
 func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketName string) {
 	code := storagereplacement.Code(err)
 	switch {
+	case errors.Is(err, storagereplacement.ErrSourceRunning):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Storage setup is running. Try again shortly.", "code": code})
+	case errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown):
+		message := "Could not confirm whether storage setup succeeded. Check the setup task before replacing the provider."
+		if detail, ok := errors.AsType[*storagereplacement.SourceOutcomeError](err); ok {
+			message = detail.Message
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": message, "code": code})
 	case errors.Is(err, providerselect.ErrNoTrustedProvider):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Replacement must retain a provider that meets the configured requirement", "code": "required_provider_unavailable"})
 	case errors.Is(err, errApprovalCheckUnavailable):
@@ -531,19 +667,18 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 			"error": "this replica no longer receives writes, so replacing it would change nothing",
 			"code":  code,
 		})
-	case errors.Is(err, storagereplacement.ErrSourceCreating):
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "this replica is still setting up its storage service",
-			"code":  code,
-		})
 	case errors.Is(err, storagereplacement.ErrSuperseded):
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "a newer replacement has taken over this replica",
 			"code":  code,
 		})
 	case errors.Is(err, storagereplacement.ErrNotRetryable):
+		message := "This replacement cannot be retried in its current state."
+		if reason, ok := errors.AsType[*storagereplacement.NotRetryableError](err); ok {
+			message = reason.Message
+		}
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "this replacement is still progressing on its own",
+			"error": message,
 			"code":  code,
 		})
 	case errors.Is(err, storagereplacement.ErrTaskRunning):
@@ -585,8 +720,13 @@ func (s *Server) providerReplacementResponseWithProgress(
 	if err != nil {
 		return providerReplacementResponse{}, err
 	}
+	retryErr := s.repos.Replacements.RetryEligibility(ctx, row.ID)
+	if retryErr != nil && !errors.Is(retryErr, storagereplacement.ErrNotRetryable) && !errors.Is(retryErr, storagereplacement.ErrSuperseded) && !errors.Is(retryErr, storagereplacement.ErrTargetInUse) {
+		return providerReplacementResponse{}, retryErr
+	}
 	identities := s.providerIdentities(ctx, replacementProviderIDs(source, target))
 	response := providerReplacementResponse{
+		Retryable:     retryErr == nil,
 		ID:            row.ID,
 		BucketName:    bucketName,
 		CopyIndex:     row.CopyIndex,
@@ -762,6 +902,10 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 	ctx := r.Context()
 	bucket, source, ok := s.replacementSubject(w, ctx, name, dataSetID)
 	if !ok {
+		return
+	}
+	if _, _, err := s.repos.Replacements.SourceEligibility(ctx, source.ID); err != nil {
+		s.writeReplacementError(w, err, name)
 		return
 	}
 	candidates, err := s.replacementProviderCandidates(ctx, bucket, source)

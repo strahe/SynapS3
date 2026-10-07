@@ -25,6 +25,7 @@ var allowedTransitions = map[Status]map[Status]bool{
 		StatusSuperseded: true,
 	},
 	StatusMigrating: {
+		StatusCompleted:  true,
 		StatusWaiting:    true,
 		StatusRetiring:   true,
 		StatusFailed:     true,

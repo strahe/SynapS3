@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -60,10 +61,17 @@ type dataSetCreationCheckpoint struct {
 	// Identity is the payer, chain, and record keeper the request was signed
 	// for; a client data set ID is only unique within it.
 	Identity *storage.ContextIdentity `json:"identity,omitempty"`
-	// Sends counts create requests carrying ClientDataSetID. A request is only
-	// repeated after one whose outcome was never observed, so more than one
-	// send means a rejection no longer proves that no data set exists.
-	Sends int `json:"sends,omitempty"`
+	// Sends counts requests carrying ClientDataSetID. A later HTTP refusal and
+	// absence check permit replacement, but cannot rule out an earlier request
+	// succeeding late. A rejected transaction only resolves its own submission.
+	Sends             int                       `json:"sends,omitempty"`
+	ProviderRejection *dataSetProviderRejection `json:"provider_rejection,omitempty"`
+}
+
+type dataSetProviderRejection struct {
+	StatusCode int       `json:"status_code"`
+	RejectedAt time.Time `json:"rejected_at"`
+	Message    string    `json:"message,omitempty"`
 }
 
 type storeCheckpoint struct {
@@ -144,6 +152,31 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 			return retryTask(err, "storage_selection_failed")
 		}
 		if len(plan) < model.ClampStorageCopies(upload.RequestedCopies) {
+			waiting, attention, err := uploadReplacementWait(ctx, h.deps.Repositories, bucket.ID, upload.RequestedCopies, plan)
+			if err != nil {
+				return retryTask(err, "upload_dependency_check_failed")
+			}
+			if waiting {
+				message := "Waiting for the replacement provider to finish setup"
+				if attention {
+					message = "Storage replacement needs attention. Check it on the bucket page."
+				}
+				return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, storagepipeline.UploadPlanReplacementWaitReason, message, func(ctx context.Context, repos *repository.Repositories) error {
+					if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
+						return err
+					}
+					currentWaiting, currentAttention, err := uploadReplacementWait(ctx, repos, bucket.ID, upload.RequestedCopies, plan)
+					if err != nil {
+						return err
+					}
+					// Activation wakes pending plans under this same bucket lock;
+					// if it won the race, recover without committing a stale wait.
+					if !currentWaiting || currentAttention != attention {
+						return repository.ErrConflict
+					}
+					return nil
+				})
+			}
 			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
 		}
 		targets := make([]synapse.StorageTarget, 0, len(plan))
@@ -288,6 +321,41 @@ func (h *TaskHandlers) selectUploadBindings(ctx context.Context, bucket *model.B
 	return h.selectBucketBindings(ctx, bucket, model.ClampStorageCopies(upload.RequestedCopies))
 }
 
+// Independent provider shortages retain their wait rather than implying that
+// setup of a replacement can supply slots outside its frozen copy obligation.
+func uploadReplacementWait(ctx context.Context, repos *repository.Repositories, bucketID int64, requestedCopies int, plan []selectedBinding) (bool, bool, error) {
+	requestedCopies = model.ClampStorageCopies(requestedCopies)
+	selected := make(map[int]bool, len(plan))
+	for _, entry := range plan {
+		selected[entry.copyIndex] = true
+	}
+	bindings, err := repos.Contents.ListDataSetBindings(ctx, bucketID)
+	if err != nil {
+		return false, false, err
+	}
+	blocked := 0
+	attention := false
+	for _, binding := range bindings {
+		if !binding.IsCurrent || binding.CopyIndex >= requestedCopies || selected[binding.CopyIndex] || binding.DataSetID != nil {
+			continue
+		}
+		stopped, err := repos.Contents.DataSetCreationStopped(ctx, binding.ID)
+		if err != nil {
+			return false, false, err
+		}
+		if !stopped {
+			continue
+		}
+		_, _, eligibilityErr := repos.Replacements.SourceEligibility(ctx, binding.ID)
+		if eligibilityErr != nil && storagereplacement.Code(eligibilityErr) == "" {
+			return false, false, eligibilityErr
+		}
+		blocked++
+		attention = attention || !errors.Is(eligibilityErr, storagereplacement.ErrActiveReplacement)
+	}
+	return blocked > 0 && blocked == requestedCopies-len(selected), attention, nil
+}
+
 func (h *TaskHandlers) selectBucketBindings(ctx context.Context, bucket *model.Bucket, targetCount int) ([]selectedBinding, error) {
 	bindings, err := h.deps.Repositories.Contents.ListDataSetBindings(ctx, bucket.ID)
 	if err != nil {
@@ -308,6 +376,15 @@ func (h *TaskHandlers) selectBucketBindings(ctx context.Context, bucket *model.B
 		usedIndexes[binding.CopyIndex] = struct{}{}
 		if binding.CopyIndex >= targetCount || len(selected) >= targetCount || (binding.Status != model.StorageDataSetStatusReady && binding.Status != model.StorageDataSetStatusPending && binding.Status != model.StorageDataSetStatusCreating) {
 			continue
+		}
+		if binding.DataSetID == nil {
+			stopped, err := h.deps.Repositories.Contents.DataSetCreationStopped(ctx, binding.ID)
+			if err != nil {
+				return nil, err
+			}
+			if stopped {
+				continue
+			}
 		}
 		target, err := h.openBindingTarget(ctx, bucket.Name, binding)
 		if err != nil {
@@ -395,18 +472,14 @@ func (h *TaskHandlers) dataSetEnsureHandler() taskengine.Handler {
 			return storagepipeline.ValidateDataSetInput(*input)
 		}),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
-		// These outcomes already ended the generation: the chain refused the
-		// creation, the chain resolved its ID to a record that is not ours, or
-		// the row proved nothing was ever sent. It is retired and its fence
-		// released, so a retry has nothing left to do. Everything else stays
-		// retryable, because an operator who restores the wallet, the network,
-		// or a missing dependency can finish a creation that was only interrupted.
+		// A refusal checkpoint resumes queries; only settled terminal failures
+		// have no remaining creation work to retry.
 		CanManualRetry: func(task *model.Task) bool {
 			if task == nil || task.FailureReason == nil {
 				return true
 			}
 			switch *task.FailureReason {
-			case "dataset_creation_rejected", "dataset_correlation_conflict", "dataset_creation_unsent":
+			case "dataset_creation_rejected", "dataset_correlation_conflict", "dataset_creation_unsent", "dataset_provider_rejected":
 				return false
 			default:
 				return true
@@ -460,6 +533,25 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 	// A request that already went out is resolved by the ID it used, before any
 	// metadata search: every generation this bucket ever had at this provider
 	// shares that metadata, so a match proves nothing about which one is ours.
+	if len(binding.CreationRejection) != 0 {
+		evidence, err := binding.CreationRejectionEvidence()
+		if err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
+		}
+		identity := storage.ContextIdentity{Payer: evidence.Payer, ChainID: sdktypes.ChainID(evidence.ChainID), RecordKeeper: evidence.RecordKeeper}
+		checkpoint := dataSetCreationCheckpoint{
+			ClientDataSetID: evidence.ClientDataSetID.String(), Identity: &identity,
+			ProviderRejection: &dataSetProviderRejection{StatusCode: evidence.StatusCode, RejectedAt: evidence.RejectedAt},
+		}
+		clientID, reason, err := checkpoint.requestIdentity(provider)
+		if err != nil {
+			if reason == "dataset_identity_changed" {
+				return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "provider_confirmation", "Restore the original wallet and network to check storage setup", nil)
+			}
+			return taskengine.Fail(err, reason, nil)
+		}
+		return h.resolveProviderRejection(ctx, execution, binding, provider, checkpoint, clientID)
+	}
 	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[dataSetCreationCheckpoint](execution)
 	if err != nil {
 		return h.recoverUnnamedCreation(ctx, execution, binding, provider, err)
@@ -470,6 +562,9 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 		// nothing about who pays for the data set it created.
 		clientDataSetID, reason, err := checkpoint.requestIdentity(provider)
 		if err != nil {
+			if checkpoint.ProviderRejection != nil && reason == "dataset_identity_changed" {
+				return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "provider_confirmation", "Restore the original wallet and network to check storage setup", nil)
+			}
 			if reason == "invalid_checkpoint" {
 				return h.recoverUnnamedCreation(ctx, execution, binding, provider, err)
 			}
@@ -479,6 +574,9 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 			// the generation, its copies, and its fence are all kept for an
 			// operator who restores the configuration and retries.
 			return taskengine.Fail(err, reason, nil)
+		}
+		if checkpoint.ProviderRejection != nil {
+			return h.resolveProviderRejection(ctx, execution, binding, provider, checkpoint, clientDataSetID)
 		}
 		if checkpoint.TransactionID != "" {
 			result := h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
@@ -557,7 +655,7 @@ func (h *TaskHandlers) sendDataSetCreation(
 	createCtx, cancelCreate := context.WithCancel(ctx)
 	attempted, createErr := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint,
 		func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Contents.RecordDataSetClientID(ctx, binding.ID, recordedID)
+			return repos.Contents.RecordDataSetClientID(ctx, binding.ID, execution.ID(), recordedID)
 		},
 		func(context.Context) error {
 			var err error
@@ -580,6 +678,9 @@ func (h *TaskHandlers) sendDataSetCreation(
 		})
 	cancelCreate()
 	if createErr != nil && !attempted {
+		if errors.Is(createErr, repository.ErrConflict) || errors.Is(createErr, repository.ErrNotFound) {
+			return taskengine.Cancel("Storage service setup was superseded", nil)
+		}
 		if errors.Is(createErr, taskengine.ErrResourceBusy) {
 			return taskengine.ResourceWait("Waiting for other storage operations to finish")
 		}
@@ -606,6 +707,21 @@ func (h *TaskHandlers) sendDataSetCreation(
 	if submission.TransactionID != "" {
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage service creation", nil)
 	}
+	if rejection, ok := errors.AsType[*synapse.DataSetProviderRejectionError](createErr); ok &&
+		binding.CreateTransactionID == nil && binding.CreateStatusURL == nil && checkpoint.TransactionID == "" {
+		checkpoint.ProviderRejection = &dataSetProviderRejection{StatusCode: rejection.StatusCode, RejectedAt: time.Now().UTC(), Message: synapse.ErrorSummary(createErr)}
+		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+			encoded, encodeErr := json.Marshal(checkpoint)
+			if encodeErr != nil {
+				return taskengine.Fail(encodeErr, "dataset_rejection_record_failed", nil)
+			}
+			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Recording storage provider refusal",
+				func(ctx context.Context, repos *repository.Repositories) error {
+					return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), encoded)
+				})
+		}
+		return h.resolveProviderRejection(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+	}
 	// The request may have reached the provider without its submission reaching
 	// us, so the chain is checked before anything is sent again.
 	delay := unobservedOutcomeDelay(checkpoint.Sends)
@@ -619,6 +735,47 @@ func (h *TaskHandlers) sendDataSetCreation(
 			})
 	}
 	return taskengine.Suspend(model.TaskResumeModeRecover, delay, "provider_confirmation", "Checking storage service creation", nil)
+}
+
+func (h *TaskHandlers) resolveProviderRejection(ctx context.Context, execution taskengine.Execution, binding *model.StorageDataSet, provider synapse.ProviderTarget, checkpoint dataSetCreationCheckpoint, clientID sdktypes.BigInt) taskengine.Result {
+	refusal := checkpoint.ProviderRejection
+	if refusal == nil || refusal.RejectedAt.IsZero() || (refusal.StatusCode != 400 && refusal.StatusCode != 401 && refusal.StatusCode != 403) ||
+		checkpoint.TransactionID != "" || checkpoint.StatusURL != "" || binding.CreateTransactionID != nil || binding.CreateStatusURL != nil {
+		return taskengine.Fail(errors.New("invalid storage provider refusal evidence"), "invalid_checkpoint", nil)
+	}
+	if binding.ClientDataSetID != nil && !binding.ClientDataSetID.Equal(idtypes.OnChainIDFromSDK(clientID)) {
+		return taskengine.Fail(errors.New("storage service creation identity changed"), "dataset_identity_mismatch", nil)
+	}
+	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, clientID)
+	if errors.Is(err, storage.ErrDataSetCorrelationConflict) {
+		return taskengine.Fail(err, "dataset_identity_mismatch", nil)
+	}
+	if err != nil {
+		return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "provider_confirmation", "Checking storage service creation", nil)
+	}
+	if found {
+		dataSetID, foundClientID, err := dataSetRefIDs(binding, ref)
+		if err != nil {
+			return taskengine.Fail(err, "dataset_identity_mismatch", nil)
+		}
+		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID)
+	}
+	identity := checkpoint.Identity
+	evidence := model.DataSetCreationRejection{
+		Version: 1, StatusCode: refusal.StatusCode, RejectedAt: refusal.RejectedAt, AbsenceCheckedAt: time.Now().UTC(),
+		ClientDataSetID: idtypes.OnChainIDFromSDK(clientID), Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper,
+	}
+	message := storagereplacement.ProviderRejectedMessage
+	if refusal.Message != "" {
+		message = synapse.ErrorSummary(errors.New(refusal.Message))
+	}
+	return taskengine.Fail(errors.New(message), "dataset_provider_rejected",
+		func(ctx context.Context, repos *repository.Repositories) error {
+			if err := repos.Contents.RecordDataSetCreationRejection(ctx, binding.ID, binding.Generation, execution.ID(), evidence); err != nil {
+				return err
+			}
+			return repos.Contents.RecordDataSetCreationError(ctx, binding.ID, execution.ID(), message)
+		})
 }
 
 // findRequestedDataSet reads the chain for the data set a request with an
@@ -867,6 +1024,19 @@ func (h *TaskHandlers) finishDataSetEnsure(ctx context.Context, repos *repositor
 	if err := repos.Contents.CompleteDataSetEnsureTask(ctx, binding.ID, taskID); err != nil {
 		return err
 	}
+	ready, err := repos.Contents.GetDataSetBindingByID(ctx, binding.ID)
+	if err != nil {
+		return err
+	}
+	return h.ContinueReadyDataSet(ctx, repos, ready)
+}
+
+// ContinueReadyDataSet schedules replicas and advances provisioning in the
+// caller's transaction. It neither sends creation requests nor binds an ensure task.
+func (h *TaskHandlers) ContinueReadyDataSet(ctx context.Context, repos *repository.Repositories, binding *model.StorageDataSet) error {
+	if binding == nil || binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.IsZero() {
+		return repository.ErrConflict
+	}
 	if err := h.continueDataSetCopies(ctx, repos, binding.ID); err != nil {
 		return err
 	}
@@ -881,6 +1051,27 @@ func (h *TaskHandlers) finishDataSetEnsure(ctx context.Context, repos *repositor
 	if err := h.promoteBucketReady(ctx, repos, bucket.ID, required); err != nil {
 		return err
 	}
+	if binding.IsCurrent {
+		if err := h.wakeReplacementUploadPlans(ctx, repos, bucket.ID, binding.CopyIndex); err != nil {
+			return err
+		}
+	}
+	return h.wakeBucketProvision(ctx, repos, bucket)
+}
+
+func (h *TaskHandlers) wakeReplacementUploadPlans(ctx context.Context, repos *repository.Repositories, bucketID int64, copyIndex int) error {
+	if h.taskService == nil {
+		return errors.New("task service is unavailable")
+	}
+	ids, err := repos.Contents.PendingUploadPlansForReplica(ctx, bucketID, copyIndex)
+	if err != nil {
+		return err
+	}
+	_, err = h.taskService.WakeInTransaction(ctx, repos, ids)
+	return err
+}
+
+func (h *TaskHandlers) wakeBucketProvision(ctx context.Context, repos *repository.Repositories, bucket *model.Bucket) error {
 	provisionTask, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
 	if err != nil {
 		return err

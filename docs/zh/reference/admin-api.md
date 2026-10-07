@@ -92,7 +92,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 后台任务和存储健康 | 任务重试与确认、存储提供方和数据集刷新 | 重新入队任务、将已核对的失败标记为已处理并开始保留期，或刷新运维状态。 |
-| 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
+| 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止已存在的旧服务。 |
 
 ## 健康检查和指标
 
@@ -198,7 +198,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 替换存储提供方
 
-`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费存储服务、把新上传切换过去、复制已有数据，并在每个保留版本都能从新存储提供方读取之后关闭旧存储提供方。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧存储提供方也不会被关闭。
+`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费存储服务、把新上传切换过去、复制已有数据，并在每个保留版本都能从新存储提供方读取之后关闭已存在的旧服务。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧存储提供方也不会被关闭。
 
 自动选择新的存储提供方：
 
@@ -218,9 +218,11 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 `client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式、手动存储提供方和价格指纹使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。重放会在读取当前价格以及自动选择的批准状态前命中原记录，因此清单后续变化不会改选存储提供方。
 
-对同一副本再次确认会取代先前的请求并返回 `201 Created`，不是冲突。先前请求里尚未使用的存储提供方会被关闭。`replacement_active` 表示的是另一件事：该副本是另一次未完成替换的目标，必须先处理那一次。
+替换进行中时，原副本不能再次替换。前次替换失败或关闭旧服务需要处理时，若目标创建结果已明确，可从原副本重新选择提供方。放弃被拒绝的目标前，会按原钱包和网络重新查询，即使原副本已就绪也不会跳过。若查到服务，新确认返回冲突，应重试已有替换。被取代请求中已知的闲置服务沿用正常关闭流程。`replacement_active` 表示该副本正参与进行中的替换，或是未完成替换的目标，需要先继续那一次替换。
 
-只有当前接收写入、且存储服务已就绪的副本可以被替换。历史代，以及仍在创建存储服务的副本，在 `GET /api/v1/buckets/{name}` 中返回 `"replaceable": false`；对仍在创建的副本发起替换返回 `409 Conflict` 和 `replacement_source_creating`。
+当前副本满足以下任一情况即可替换：服务已就绪；尚未发送创建请求；初始创建 POST 返回 400、401 或 403，且按原钱包和网络查询未发现服务。此前发生过超时也可适用最后一种情况。创建任务正在执行时返回 `409 Conflict` 和 `replacement_source_running`；结果未确认、存在已提交交易、查询失败或身份变化时返回 `replacement_source_outcome_unknown`。存储桶响应提供 `replaceable`、可选的 `replacement_blocked_reason` 和 `setup_error`；提交时会重新核验。可选的 `replacement_has_late_service_risk` 也包含改选时将放弃的拒绝目标的迟到计费风险。
+
+尚无服务的副本在确认后停止原来的创建，并准备所选提供方。新服务就绪前，原副本保留槽位；若创建失败，应从原副本改选提供方。需要该副本的新上传会等待新服务设置完成，交接后继续执行。交接后从其他副本或缓存恢复所需内容，两者都没有的内容需要处理。不终止旧服务。查询未发现服务不能排除此前请求迟到成功；SynapS3 不会自动接管或清理这类迟到服务。
 
 首次确认成功返回 `201 Created` 和替换记录；精确重放返回 `200 OK`。`GET /api/v1/buckets/{name}` 在 `replacements` 中返回该存储桶最近的替换记录，最新的在前，最多 50 条。
 
@@ -228,16 +230,16 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 | 状态 | 含义 |
 | --- | --- |
-| `preparing_target` | 正在创建新服务。写入仍然发往当前存储提供方。 |
+| `preparing_target` | 正在创建新服务。已就绪的来源继续接收写入；来源尚无服务时，新上传等待所选提供方就绪。 |
 | `migrating` | 新存储提供方开始接收新上传，同时复制已有数据。 |
 | `waiting` | 已暂停。`wait_reason` 与 `wait_message` 会区分服务创建（`target_creating`）、可写确认（`target_writable`）、存储提供方不可达（`target`）、资金、来源可用性和安全退休等待。多数等待无需操作即可继续。 |
 | `retiring` | 数据已复制完毕，正在终止旧服务。 |
 | `cleanup_attention` | 终止旧服务需要运营者决定，例如结清欠费。 |
-| `failed` | 重试次数用尽，需要重新发起。 |
-| `completed` | 旧服务已终止，该副本已落在新存储提供方上。 |
+| `failed` | 工作已停止，需要操作。根据 `retryable` 和返回的提示处理。 |
+| `completed` | 所需内容可从新提供方读取，存在的旧服务也已终止。 |
 | `superseded` | 更晚的一次确认取代了本次请求。 |
 
-`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 对当前已批准目标是永久失败：需要改选存储提供方，重试接口会返回冲突。
+`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 和 `target_rejected` 都要求改选提供方，重试接口会返回冲突并说明该操作。`retryable` 表示已有替换是否可以恢复。交接前应从原副本改选提供方。可重试的创建任务失败时，替换保持等待；重试该创建任务即可继续。已结束的创建不会因重试替换而重新执行。
 
 `items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
 
@@ -256,7 +258,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_creating`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
+这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing` 和 `profile_url_changed`。手动选择不受 FWSS 批准名单限制，但仍须满足健康、最新资料处于启用状态和存储桶约束。自动选择还会排除该存储桶用过的所有存储提供方，并按 ID 顺序链上核对新鲜获批的候选。
 

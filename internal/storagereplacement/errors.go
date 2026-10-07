@@ -2,9 +2,19 @@ package storagereplacement
 
 import "errors"
 
+// SourceOutcomeError supplies a safe explanation while preserving the 409 code.
+type SourceOutcomeError struct{ Message string }
+
+func (e *SourceOutcomeError) Error() string { return e.Message }
+func (e *SourceOutcomeError) Unwrap() error { return ErrSourceOutcomeUnknown }
+
 var (
-	// ErrActiveReplacement means the source data set already has a replacement
-	// that has not reached a terminal state.
+	// ErrSourceRunning blocks replacement while creation work holds a live claim.
+	ErrSourceRunning = errors.New("storage service setup is still running")
+	// ErrSourceOutcomeUnknown requires an observed result before replacement.
+	ErrSourceOutcomeUnknown = errors.New("storage service creation outcome is not confirmed")
+	// ErrActiveReplacement means this data set is reserved by an unfinished
+	// replacement; only stopped outgoing work permits another provider choice.
 	ErrActiveReplacement = errors.New("data set already has an active replacement")
 
 	// ErrTargetCreating means an earlier replacement of this replica may still
@@ -46,11 +56,6 @@ var (
 	// so replacing it would not change where writes go.
 	ErrSourceNotCurrent = errors.New("data set is not the current replica")
 
-	// ErrSourceCreating means the data set's own storage service may still be
-	// created on chain. Draining it first could leave that service with nothing
-	// to retire it, so replacement waits until the data set is ready.
-	ErrSourceCreating = errors.New("data set is still being created")
-
 	// ErrItemCancelled means this migration item no longer has executable work.
 	ErrItemCancelled = errors.New("replacement item is no longer executable")
 
@@ -66,3 +71,9 @@ var (
 	// state machine.
 	ErrIllegalTransition = errors.New("illegal replacement state transition")
 )
+
+// NotRetryableError supplies the operator action for a stopped replacement.
+type NotRetryableError struct{ Message string }
+
+func (e *NotRetryableError) Error() string { return e.Message }
+func (e *NotRetryableError) Unwrap() error { return ErrNotRetryable }

@@ -284,6 +284,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithProviderTier(providerselect.Tier(cfg.Filecoin.AnchorProviderTier)).
 		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).
 		WithTaskService(taskService).
+		WithDataSetReadyContinuation(handlers).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {
 		adminServer.WithProviderIdentityResolver(opts.ProviderIdentity)
