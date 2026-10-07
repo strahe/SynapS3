@@ -28,8 +28,8 @@ import (
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagereplacement"
-	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/versity/versitygw/auth"
 	"golang.org/x/sync/errgroup"
 )

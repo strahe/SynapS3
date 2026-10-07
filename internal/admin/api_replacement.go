@@ -16,8 +16,8 @@ import (
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
-	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -194,7 +194,7 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		return
 	}
 
-	if s.taskService == nil {
+	if s.taskService == nil || s.replacementMessages == nil {
 		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
 			return
 		}
@@ -204,6 +204,8 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 	var row *storagereplacement.Replacement
 	created := false
 	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		row = nil
+		created = false
 		var authorizeErr error
 		if err := txRepos.Buckets.LockByID(ctx, bucket.ID); err != nil {
 			return err
@@ -232,16 +234,7 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 			return err
 		}
 		if target != nil && target.EnsureTaskID == nil {
-			ensure, _, err := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
-				Type:           model.TaskTypeStorageDataSetEnsure,
-				IdempotencyKey: storagepipeline.DataSetEnsureKey(target.ID),
-				Input:          storagepipeline.DataSetInput{DataSetID: target.ID},
-				SubjectType:    "storage_data_set", SubjectKey: strconv.FormatInt(target.ID, 10),
-			})
-			if err != nil {
-				return err
-			}
-			if err := txRepos.Contents.BindDataSetEnsureTask(ctx, target.ID, ensure.ID); err != nil {
+			if err := s.replacementMessages.Handover(ctx, txRepos, storagepipeline.EnsureDataSet{BindingID: target.ID}); err != nil {
 				return err
 			}
 		}
@@ -349,7 +342,7 @@ func (s *Server) checkReplacementRefusal(ctx context.Context, bucket *model.Buck
 	if dataSetID.IsZero() || !clientID.Equal(evidence.ClientDataSetID) || !idtypes.OnChainIDFromSDK(ref.ProviderID()).Equal(binding.ProviderID) {
 		return nil, storagereplacement.ErrSourceOutcomeUnknown
 	}
-	if s.dataSetReady == nil {
+	if s.replacementMessages == nil {
 		return nil, errors.New("storage setup continuation is unavailable")
 	}
 	err = s.repos.WithTx(ctx, func(repos *repository.Repositories) error {
@@ -358,11 +351,7 @@ func (s *Server) checkReplacementRefusal(ctx context.Context, bucket *model.Buck
 		}); err != nil {
 			return err
 		}
-		ready, err := repos.Contents.GetDataSetBindingByID(ctx, binding.ID)
-		if err != nil {
-			return err
-		}
-		return s.dataSetReady.ContinueReadyDataSet(ctx, repos, ready)
+		return s.replacementMessages.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: binding.ID})
 	})
 	if err != nil {
 		return nil, err

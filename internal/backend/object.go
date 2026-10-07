@@ -18,7 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
@@ -27,7 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagepipeline"
-	taskengine "github.com/strahe/synaps3/internal/task"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	versitybackend "github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -1283,34 +1282,13 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 		if !b.evictionPolicy.EnqueuesAfterUploadEviction() || contentID == nil {
 			return nil
 		}
-		return b.enqueueEvictionTask(ctx, repos, *contentID)
+		if b.cacheEvictionMessages == nil {
+			return errors.New("cache eviction scheduling is unavailable")
+		}
+		return b.cacheEvictionMessages.Handover(ctx, repos, storagepipeline.EvictCacheContent{ContentID: *contentID})
 	default:
 		return nil
 	}
-}
-
-// enqueueEvictionTask schedules cache removal for one content payload. Several
-// versions can name the same bytes, so the unit of eviction is the content.
-func (b *SynapseBackend) enqueueEvictionTask(ctx context.Context, repos *repository.Repositories, contentID int64) error {
-	reservation, err := repos.CacheEvictions.PrepareEviction(ctx, contentID)
-	if err != nil {
-		return err
-	}
-	if reservation.ActiveTaskID != nil {
-		return nil
-	}
-	generation := reservation.Generation
-	taskRow, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeCacheEvict,
-		IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
-		Input:          cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
-		SubjectType:    model.TaskSubjectStorageContent,
-		SubjectKey:     strconv.FormatInt(contentID, 10),
-	})
-	if err != nil {
-		return err
-	}
-	return repos.CacheEvictions.BindEvictionTask(ctx, contentID, generation, taskRow.ID)
 }
 
 func (b *SynapseBackend) bindStorageCleanupTask(ctx context.Context, repos *repository.Repositories, cleanup *repository.StorageCleanupReservation) error {

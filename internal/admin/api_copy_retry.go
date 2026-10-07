@@ -9,7 +9,6 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
-	taskengine "github.com/strahe/synaps3/internal/task"
 )
 
 type copyRetryResponse struct {
@@ -54,7 +53,7 @@ func (s *Server) handleAPIRetryStorageCopy(w http.ResponseWriter, r *http.Reques
 		s.writeCopyRetryError(w, repository.ErrNotFound)
 		return
 	}
-	if s.taskService == nil || s.cacheGate == nil {
+	if s.taskService == nil || s.copyRetryMessages == nil || s.cacheGate == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "replica recovery unavailable"})
 		return
 	}
@@ -62,23 +61,30 @@ func (s *Server) handleAPIRetryStorageCopy(w http.ResponseWriter, r *http.Reques
 	defer release()
 	var taskID int64
 	err = s.repos.WithTx(ctx, func(repos *repository.Repositories) error {
-		if _, err := repos.Contents.RetryFailedCopy(ctx, id); err != nil {
-			return err
-		}
-		generation, err := repos.Contents.NextCopyWorkGeneration(ctx, id)
+		taskID = 0
+		reopened, err := repos.Contents.RetryFailedCopy(ctx, id)
 		if err != nil {
 			return err
 		}
-		row, _, err := s.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(id, generation),
-			Input:       storagepipeline.CopyGenerationInput{CopyID: id, Generation: generation},
-			SubjectType: "storage_copy", SubjectKey: strconv.FormatInt(id, 10),
-		})
+		if reopened == nil {
+			return repository.ErrConflict
+		}
+		if err := s.copyRetryMessages.Handover(ctx, repos, storagepipeline.StartCopyTransfer{CopyID: id}); err != nil {
+			return err
+		}
+		copyRow, err := repos.Contents.GetUploadCopyByID(ctx, id)
 		if err != nil {
 			return err
 		}
-		if err := repos.Contents.BindCopyTask(ctx, id, generation, row.ID); err != nil {
+		if copyRow == nil || copyRow.ActiveTaskID == nil || copyRow.WorkGeneration != reopened.WorkGeneration+1 {
+			return repository.ErrConflict
+		}
+		row, err := repos.Tasks.GetByID(ctx, *copyRow.ActiveTaskID)
+		if err != nil {
 			return err
+		}
+		if row == nil || row.Type != model.TaskTypeStorageTransferPlan {
+			return repository.ErrConflict
 		}
 		if err := s.taskService.AcknowledgeSubjectInTransaction(ctx, repos, "storage_copy", strconv.FormatInt(id, 10)); err != nil {
 			return err

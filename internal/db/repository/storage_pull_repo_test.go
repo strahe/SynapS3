@@ -59,7 +59,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if woken, err := f.repos.Tasks.WakePending(ctx, []int64{row.ID}); err != nil || woken != 0 {
+	if woken, err := f.repos.Tasks.WakePendingOfTypes(ctx, []int64{row.ID}, []model.TaskType{model.TaskTypeStoragePull}, []string{storagepull.WaitQueueFull}); err != nil || woken != 0 {
 		t.Fatalf("early wake = %d, %v", woken, err)
 	}
 	waiting, err := f.repos.Tasks.GetByID(ctx, row.ID)

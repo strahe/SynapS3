@@ -778,6 +778,7 @@ type TaskRepository interface {
 	Settle(ctx context.Context, id, generation int64, transition TaskTransition) error
 	ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error
 	WakePending(ctx context.Context, ids []int64) (int, error)
+	WakePendingOfTypes(ctx context.Context, ids []int64, types []model.TaskType, skipWaitReasons []string) (int, error)
 	RequestCancellation(ctx context.Context, id int64, reason string) error
 	RetryFailed(ctx context.Context, id int64) error
 	ReactivateTerminal(ctx context.Context, id int64) error

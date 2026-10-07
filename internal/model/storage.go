@@ -209,6 +209,35 @@ func (c StorageCopy) WorkTaskID() *int64 {
 	return nil
 }
 
+type CopyContinuationKind uint8
+
+const (
+	CopyContinuationNone CopyContinuationKind = iota
+	CopyContinuationTransfer
+	CopyContinuationRegistration
+)
+
+// ContinuationKind identifies which owner resumes incomplete copy work.
+func (c StorageCopy) ContinuationKind() CopyContinuationKind {
+	if c.ActiveTaskID != nil {
+		return CopyContinuationTransfer
+	}
+	if c.WorkTaskID() != nil {
+		return CopyContinuationRegistration
+	}
+	//exhaustive:enforce
+	switch c.Status {
+	case StorageCopyStatusPending:
+		return CopyContinuationTransfer
+	case StorageCopyStatusPieceReady, StorageCopyStatusCommitting:
+		return CopyContinuationRegistration
+	case StorageCopyStatusCommitted, StorageCopyStatusFailed:
+		return CopyContinuationNone
+	default:
+		return CopyContinuationNone
+	}
+}
+
 var _ bun.BeforeAppendModelHook = (*StorageContent)(nil)
 
 // BeforeAppendModel stamps the audit columns on insert. The database has no

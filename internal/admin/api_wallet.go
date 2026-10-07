@@ -14,8 +14,8 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
-	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/walletoperation"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 // --- Response DTOs ---
