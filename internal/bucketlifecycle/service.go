@@ -11,7 +11,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/providerselect"
-	taskengine "github.com/strahe/synaps3/internal/task"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 // Service coordinates bucket lifecycle operations shared by multiple entrypoints.

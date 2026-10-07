@@ -48,7 +48,8 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sc, cacheGate, accessTracker, logger, backend.WithTaskService(newBackendTaskService(t, repos)))
+	taskService, messages := newBackendTaskRuntime(t, repos)
+	b := backend.New(repos, fsCache, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService), backend.WithCacheEvictionMessages(messages))
 	return &integrationBackend{
 		backend: b,
 		repos:   repos,

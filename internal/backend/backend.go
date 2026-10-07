@@ -9,7 +9,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/synapse"
-	taskengine "github.com/strahe/synaps3/internal/task"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/versity/versitygw/backend"
 )
 
@@ -18,17 +18,18 @@ import (
 type SynapseBackend struct {
 	backend.BackendUnsupported // provides ErrNotImplemented for unimplemented methods
 
-	repos              *repository.Repositories
-	cache              cache.Cache
-	objectReader       *objectreader.Reader
-	cacheGate          *cacheaccess.Gate
-	cacheAccessTracker *cacheaccess.Tracker
-	bucketLifecycle    *bucketlifecycle.Service
-	storage            synapse.StorageClient
-	taskService        *taskengine.Service
-	evictionPolicy     cache.EvictionPolicy
-	defaultCopies      int
-	logger             *slog.Logger
+	repos                 *repository.Repositories
+	cache                 cache.Cache
+	objectReader          *objectreader.Reader
+	cacheGate             *cacheaccess.Gate
+	cacheAccessTracker    *cacheaccess.Tracker
+	bucketLifecycle       *bucketlifecycle.Service
+	storage               synapse.StorageClient
+	taskService           *taskengine.Service
+	cacheEvictionMessages *taskengine.Messenger
+	evictionPolicy        cache.EvictionPolicy
+	defaultCopies         int
+	logger                *slog.Logger
 }
 
 // Option configures SynapseBackend runtime behavior.
@@ -38,6 +39,12 @@ type Option func(*SynapseBackend)
 func WithTaskService(service *taskengine.Service) Option {
 	return func(b *SynapseBackend) {
 		b.taskService = service
+	}
+}
+
+func WithCacheEvictionMessages(messages *taskengine.Messenger) Option {
+	return func(b *SynapseBackend) {
+		b.cacheEvictionMessages = messages
 	}
 }
 

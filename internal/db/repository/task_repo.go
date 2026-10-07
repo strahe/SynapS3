@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -506,13 +507,48 @@ func (r *BunTaskRepo) WakePending(ctx context.Context, ids []int64) (int, error)
 		Where("id IN (?)", bun.List(ids)).
 		Where("status = ?", model.TaskStatusPending).
 		Where("available_at > ?", now).
-		Where("type != ? OR wait_reason IS NULL OR wait_reason != ?", model.TaskTypeStoragePull, storagepull.WaitQueueFull).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("waking pending tasks: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	return int(rows), nil
+}
+
+// WakePendingOfTypes applies type and wait-reason authorization in the update.
+func (r *BunTaskRepo) WakePendingOfTypes(ctx context.Context, ids []int64, types []model.TaskType, skipWaitReasons []string) (int, error) {
+	if len(types) == 0 {
+		return 0, fmt.Errorf("task types are required: %w", ErrInvalidInput)
+	}
+	if slices.Contains(types, "") {
+		return 0, fmt.Errorf("task type is required: %w", ErrInvalidInput)
+	}
+	for _, id := range ids {
+		if id < 1 {
+			return 0, fmt.Errorf("task IDs must be positive: %w", ErrInvalidInput)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	now := time.Now()
+	query := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("available_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("id IN (?)", bun.List(ids)).
+		Where("type IN (?)", bun.List(types)).
+		Where("status = ?", model.TaskStatusPending).
+		Where("available_at > ?", now)
+	if len(skipWaitReasons) != 0 {
+		query = query.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(skipWaitReasons))
+	}
+	result, err := query.Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("waking pending tasks of selected types: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	return int(rows), err
 }
 
 func (r *BunTaskRepo) RequestCancellation(ctx context.Context, id int64, reason string) error {

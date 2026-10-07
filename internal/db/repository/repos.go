@@ -47,6 +47,15 @@ func NewRepositories(db bun.IDB) *Repositories {
 	}
 }
 
+// IsTransaction identifies repositories backed by the caller's Bun transaction.
+func (r *Repositories) IsTransaction() bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.db.(bun.Tx)
+	return ok
+}
+
 // WithTx runs fn inside a database transaction.  The callback receives a
 // *Repositories whose repository implementations are all backed by the same tx.
 // If fn returns nil the transaction is committed; otherwise it is rolled back.

@@ -16,9 +16,11 @@ import (
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
-	taskengine "github.com/strahe/synaps3/internal/task"
+	cachetask "github.com/strahe/synaps3/internal/task/cache"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
@@ -50,8 +52,8 @@ func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBacken
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
-	taskService := newBackendTaskService(t, repos)
-	opts = append(opts, backend.WithTaskService(taskService))
+	taskService, messages := newBackendTaskRuntime(t, repos)
+	opts = append(opts, backend.WithTaskService(taskService), backend.WithCacheEvictionMessages(messages))
 
 	b := backend.New(
 		repos,
@@ -83,8 +85,8 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	taskService := newBackendTaskService(t, repos)
-	b := backend.New(repos, mc, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService))
+	taskService, messages := newBackendTaskRuntime(t, repos)
+	b := backend.New(repos, mc, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService), backend.WithCacheEvictionMessages(messages))
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -104,8 +106,8 @@ func newTestBackendWithCache(t *testing.T, c cache.Cache) *testBackend {
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	taskService := newBackendTaskService(t, repos)
-	b := backend.New(repos, c, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService))
+	taskService, messages := newBackendTaskRuntime(t, repos)
+	b := backend.New(repos, c, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService), backend.WithCacheEvictionMessages(messages))
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -126,8 +128,8 @@ func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient) *testBackend 
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	taskService := newBackendTaskService(t, repos)
-	b := backend.New(repos, fsCache, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService))
+	taskService, messages := newBackendTaskRuntime(t, repos)
+	b := backend.New(repos, fsCache, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService), backend.WithCacheEvictionMessages(messages))
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -151,14 +153,13 @@ func (backendTestTaskHandler) Recover(context.Context, taskengine.Execution) tas
 	return taskengine.Complete("", nil)
 }
 
-func newBackendTaskService(t *testing.T, repos *repository.Repositories) *taskengine.Service {
+func newBackendTaskRuntime(t *testing.T, repos *repository.Repositories) (*taskengine.Service, *taskengine.Messenger) {
 	t.Helper()
 	registry := taskengine.NewRegistry()
 	retryLimit := 5
 	for _, taskType := range []model.TaskType{
 		model.TaskTypeBucketProvision,
 		model.TaskTypeUploadPlan,
-		model.TaskTypeCacheEvict,
 		model.TaskTypeStorageCleanup,
 	} {
 		err := registry.Register(backendTestTaskHandler{definition: taskengine.Definition{
@@ -174,7 +175,35 @@ func newBackendTaskService(t *testing.T, repos *repository.Repositories) *tasken
 	if err != nil {
 		t.Fatalf("creating task service: %v", err)
 	}
-	return service
+	evict, err := cachetask.NewEvictHandler(cachetask.EvictDependencies{Repositories: repos, State: cachetask.NewState(), MaxRetries: retryLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(evict); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := service.Scheduler("backend.cache", model.TaskTypeCacheEvict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := cachetask.NewEvictCacheContentReceiver(cachetask.EvictionDependencies{Scheduler: scheduler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.OwnHandover("cache.evict", storagepipeline.MessageEvictCacheContent, receiver); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := registry.Messenger("backend", []string{storagepipeline.MessageEvictCacheContent}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Minute,
+		Retention: time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+	}, repos, registry, nil); err != nil {
+		t.Fatal(err)
+	}
+	return service, messages
 }
 
 func newBackendCacheAccess(

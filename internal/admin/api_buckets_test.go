@@ -31,9 +31,10 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/storagepipeline"
-	taskengine "github.com/strahe/synaps3/internal/task"
+	"github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
@@ -78,7 +79,25 @@ func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies
 
 	repos := repository.NewRepositories(db)
 	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, filecoinDefaultCopies, testLogger())
-	srv.WithTaskService(newAdminTestTaskService(t, repos))
+	registry := taskengine.NewRegistry()
+	service, err := taskengine.NewService(registry, repos, 7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryPoints, err := task.Register(registry, service, task.Dependencies{
+		Repositories: repos, Cache: localCache, CacheGate: srv.cacheGate, CacheTracker: srv.cacheAccessTracker,
+		DefaultCopies: filecoinDefaultCopies, MaxRetries: 5, Logger: testLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Minute,
+		Retention: 7 * 24 * time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+	}, repos, registry, nil); err != nil {
+		t.Fatal(err)
+	}
+	srv.WithTaskService(service).WithTaskMessages(entryPoints.AdminReplacement, entryPoints.AdminCopyRetry)
 	return srv, repos
 }
 

@@ -10,8 +10,8 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 type provisionTestHandler struct{ definition taskengine.Definition }

@@ -19,8 +19,8 @@ import (
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
-	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -391,9 +391,9 @@ func TestObservedReplacementServiceCompletionIsAtomic(t *testing.T) {
 					return ref, err == nil, err
 				}}, nil
 			}})
-			continuation := f.srv.dataSetReady
+			messages := f.srv.replacementMessages
 			if failure == "dependency" {
-				f.srv.WithDataSetReadyContinuation(nil)
+				f.srv.replacementMessages = nil
 			} else if _, err := f.srv.db.ExecContext(t.Context(), `CREATE TRIGGER reject_recovered_copy_task BEFORE INSERT ON tasks WHEN NEW.type = 'storage_transfer_plan' BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END`); err != nil {
 				t.Fatal(err)
 			}
@@ -414,7 +414,7 @@ func TestObservedReplacementServiceCompletionIsAtomic(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			f.srv.WithDataSetReadyContinuation(continuation)
+			f.srv.replacementMessages = messages
 			recovered := f.start(t, `{"mode":"manual","provider_id":"202"}`)
 			if recovered.Code != http.StatusConflict {
 				t.Fatalf("completion retry: %d %s", recovered.Code, recovered.Body.String())

@@ -27,8 +27,9 @@ import (
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/systemtask"
-	taskengine "github.com/strahe/synaps3/internal/task"
-	"github.com/strahe/synaps3/internal/worker"
+	"github.com/strahe/synaps3/internal/task"
+	"github.com/strahe/synaps3/internal/task/wallet"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3api"
@@ -60,7 +61,7 @@ type FilecoinServices struct {
 	Storage           synapse.StorageClient
 	WalletQuery       synapse.WalletQuerier
 	Wallet            synapse.WalletOperator
-	Receipts          worker.WalletReceiptChecker
+	Receipts          wallet.WalletReceiptChecker
 	Readiness         ReadinessProbe
 	Observability     observability.RefreshChecker
 	// Terminator ends a replaced storage service. Epochs observes the chain so
@@ -96,7 +97,7 @@ type Runtime struct {
 	cacheGate     *cacheaccess.Gate
 	accessTracker *cacheaccess.Tracker
 	iam           auth.IAMService
-	workers       *worker.Manager
+	workers       *taskengine.Manager
 	s3Addresses   []string
 	logger        *slog.Logger
 	shutdown      time.Duration
@@ -143,7 +144,11 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		})
 	}
 	registry := taskengine.NewRegistry()
-	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
+	taskService, err := taskengine.NewService(registry, repos, cfg.Worker.Tasks.Retention)
+	if err != nil {
+		return nil, fmt.Errorf("initializing task service: %w", err)
+	}
+	points, err := task.Register(registry, taskService, task.Dependencies{
 		Repositories:              repos,
 		Events:                    events,
 		Cache:                     localCache,
@@ -176,20 +181,6 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	if err != nil {
 		return nil, fmt.Errorf("initializing task handlers: %w", err)
 	}
-	if err := handlers.RegisterCore(registry); err != nil {
-		return nil, fmt.Errorf("registering core task handlers: %w", err)
-	}
-	if err := handlers.RegisterStorage(registry); err != nil {
-		return nil, fmt.Errorf("registering storage task handlers: %w", err)
-	}
-	if err := handlers.RegisterReplacement(registry); err != nil {
-		return nil, fmt.Errorf("registering replacement task handlers: %w", err)
-	}
-	taskService, err := taskengine.NewService(registry, repos, cfg.Worker.Tasks.Retention)
-	if err != nil {
-		return nil, fmt.Errorf("initializing task service: %w", err)
-	}
-	handlers.SetTaskService(taskService)
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency:                    cfg.Worker.Tasks.Concurrency,
 		PollInterval:                   cfg.Worker.Tasks.PollInterval,
@@ -232,6 +223,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 	appBackend := backend.New(repos, localCache, opts.Filecoin.Storage, cacheGate, accessTracker, logger,
 		backend.WithTaskService(taskService),
+		backend.WithCacheEvictionMessages(points.BackendCacheEviction),
 		backend.WithEvictionPolicy(evictionPolicy),
 		backend.WithDefaultCopies(cfg.Filecoin.DefaultCopies),
 	)
@@ -269,7 +261,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("creating S3 server: %w", err)
 	}
 
-	manager := worker.NewManager(engine, logger)
+	manager := taskengine.NewManager(engine, logger)
 
 	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, cacheGate, accessTracker, maxCacheBytes, repos, manager,
 		opts.Filecoin.WalletQuery, cfg.Filecoin.DefaultCopies, logger).
@@ -284,7 +276,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithProviderTier(providerselect.Tier(cfg.Filecoin.AnchorProviderTier)).
 		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).
 		WithTaskService(taskService).
-		WithDataSetReadyContinuation(handlers).
+		WithTaskMessages(points.AdminReplacement, points.AdminCopyRetry).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {
 		adminServer.WithProviderIdentityResolver(opts.ProviderIdentity)

@@ -18,7 +18,6 @@ import (
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
-	"github.com/strahe/synaps3/internal/worker"
 )
 
 type stubProviderSelector struct {
@@ -130,12 +129,6 @@ func newReplacementAPIFixture(t *testing.T, selector providerReplacementSelector
 func newReplacementAPIFixtureWithHealth(t *testing.T, selector providerReplacementSelector, seedHealth bool) *replacementAPIFixture {
 	t.Helper()
 	srv, _ := newBucketAPITestServer(t)
-	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{Repositories: srv.repos})
-	if err != nil {
-		t.Fatal(err)
-	}
-	handlers.SetTaskService(srv.taskService)
-	srv.WithDataSetReadyContinuation(handlers)
 	srv.observability = observability.NewService(observability.ServiceOptions{
 		Store: srv.repos.Observability, RefreshInterval: 5 * time.Minute,
 	})

@@ -25,7 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/synapse"
-	taskengine "github.com/strahe/synaps3/internal/task"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
@@ -34,10 +34,6 @@ import (
 // WorkerHealthChecker provides worker liveness info. Implemented by worker.Manager.
 type WorkerHealthChecker interface {
 	WorkerHealth() map[string]bool
-}
-
-type dataSetReadyContinuation interface {
-	ContinueReadyDataSet(context.Context, *repository.Repositories, *model.StorageDataSet) error
 }
 
 // Server provides /healthz and /metrics endpoints on a separate port.
@@ -54,7 +50,8 @@ type Server struct {
 	cacheMaxBytes           int64
 	repos                   *repository.Repositories
 	taskService             *taskengine.Service
-	dataSetReady            dataSetReadyContinuation
+	replacementMessages     *taskengine.Messenger
+	copyRetryMessages       *taskengine.Messenger
 	bucketLifecycle         *bucketlifecycle.Service
 	workerHealth            WorkerHealthChecker
 	wallet                  synapse.WalletQuerier
@@ -93,9 +90,9 @@ func (s *Server) WithTaskService(service *taskengine.Service) *Server {
 	return s
 }
 
-// WithDataSetReadyContinuation shares transactional setup completion with workers.
-func (s *Server) WithDataSetReadyContinuation(continuation dataSetReadyContinuation) *Server {
-	s.dataSetReady = continuation
+func (s *Server) WithTaskMessages(replacement, copyRetry *taskengine.Messenger) *Server {
+	s.replacementMessages = replacement
+	s.copyRetryMessages = copyRetry
 	return s
 }
 

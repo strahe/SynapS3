@@ -3,25 +3,16 @@ package worker
 import (
 	"context"
 	"log/slog"
-
-	"github.com/ethereum/go-ethereum/common"
-	ethtypes "github.com/ethereum/go-ethereum/core/types"
-	taskengine "github.com/strahe/synaps3/internal/task"
 )
-
-// WalletReceiptChecker observes a previously broadcast wallet transaction.
-type WalletReceiptChecker interface {
-	TransactionReceipt(context.Context, common.Hash) (*ethtypes.Receipt, error)
-}
 
 // Manager exposes the single task engine through the application's worker
 // lifecycle and health contracts.
 type Manager struct {
-	engine *taskengine.Engine
+	engine *Engine
 	logger *slog.Logger
 }
 
-func NewManager(engine *taskengine.Engine, logger *slog.Logger) *Manager {
+func NewManager(engine *Engine, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
