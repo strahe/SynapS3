@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecleanup"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
@@ -99,27 +100,30 @@ type bucketDetailResponse struct {
 }
 
 type storageDataSetSummaryResponse struct {
-	ID                 int64                     `json:"id"`
-	BucketID           int64                     `json:"bucket_id"`
-	BucketName         string                    `json:"bucket_name,omitempty"`
-	CopyIndex          int                       `json:"copy_index"`
-	Generation         int64                     `json:"generation"`
-	IsCurrent          bool                      `json:"is_current"`
-	Replaceable        bool                      `json:"replaceable"`
-	ProviderID         string                    `json:"provider_id"`
-	ProviderIdentity   *providerIdentityResponse `json:"provider_identity,omitempty"`
-	DataSetID          *string                   `json:"data_set_id,omitempty"`
-	ClientDataSetID    *string                   `json:"client_data_set_id,omitempty"`
-	Status             string                    `json:"status"`
-	CreatedByContentID *int64                    `json:"created_by_content_id,omitempty"`
-	CommittedCopies    int64                     `json:"committed_copies"`
-	ReadableCopies     int64                     `json:"readable_copies"`
-	PhysicalBytes      int64                     `json:"physical_bytes"`
-	ReferencedVersions int64                     `json:"referenced_version_count"`
-	CurrentVersions    int64                     `json:"current_version_count"`
-	CreatedAt          string                    `json:"created_at"`
-	UpdatedAt          string                    `json:"updated_at"`
-	StorageHealth      *dataSetStorageHealthInfo `json:"storage_health,omitempty"`
+	ID                            int64                     `json:"id"`
+	BucketID                      int64                     `json:"bucket_id"`
+	BucketName                    string                    `json:"bucket_name,omitempty"`
+	CopyIndex                     int                       `json:"copy_index"`
+	Generation                    int64                     `json:"generation"`
+	IsCurrent                     bool                      `json:"is_current"`
+	Replaceable                   bool                      `json:"replaceable"`
+	ReplacementHasLateServiceRisk bool                      `json:"replacement_has_late_service_risk,omitempty"`
+	ReplacementBlockedReason      string                    `json:"replacement_blocked_reason,omitempty"`
+	SetupError                    string                    `json:"setup_error,omitempty"`
+	ProviderID                    string                    `json:"provider_id"`
+	ProviderIdentity              *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID                     *string                   `json:"data_set_id,omitempty"`
+	ClientDataSetID               *string                   `json:"client_data_set_id,omitempty"`
+	Status                        string                    `json:"status"`
+	CreatedByContentID            *int64                    `json:"created_by_content_id,omitempty"`
+	CommittedCopies               int64                     `json:"committed_copies"`
+	ReadableCopies                int64                     `json:"readable_copies"`
+	PhysicalBytes                 int64                     `json:"physical_bytes"`
+	ReferencedVersions            int64                     `json:"referenced_version_count"`
+	CurrentVersions               int64                     `json:"current_version_count"`
+	CreatedAt                     string                    `json:"created_at"`
+	UpdatedAt                     string                    `json:"updated_at"`
+	StorageHealth                 *dataSetStorageHealthInfo `json:"storage_health,omitempty"`
 }
 
 type dataSetStorageHealthInfo struct {
@@ -618,33 +622,48 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 	healthByLocalID, healthFailed := s.dataSetStorageHealthStates(ctx, localIDs)
 	for _, summary := range summaries {
 		storageHealth := s.dataSetStorageHealthInfo(healthByLocalID[summary.ID])
+		source, _, eligibilityErr := s.repos.Replacements.SourceEligibility(ctx, summary.ID)
+		blockedReason := storagereplacement.Code(eligibilityErr)
+		if eligibilityErr != nil && blockedReason == "" && s.logger != nil {
+			s.logger.Warn("api: failed to check data set replacement eligibility", "bucket_id", summary.BucketID, "data_set_id", summary.ID, "error", eligibilityErr)
+		}
+		setupError := ""
+		if source != nil {
+			if evidence, err := source.CreationRejectionEvidence(); err == nil && evidence != nil && source.Status != model.StorageDataSetStatusRetired {
+				setupError = storagereplacement.ProviderRejectedMessage
+			}
+		}
+		if detail, ok := errors.AsType[*storagereplacement.SourceOutcomeError](eligibilityErr); ok {
+			setupError = detail.Message
+		}
 		if healthFailed {
 			storageHealth = dataSetStorageHealthQueryFailureInfo()
 		}
 		out = append(out, storageDataSetSummaryResponse{
-			ID:         summary.ID,
-			BucketID:   summary.BucketID,
-			BucketName: summary.BucketName,
-			CopyIndex:  summary.CopyIndex,
-			Generation: summary.Generation,
-			IsCurrent:  summary.IsCurrent,
-			// Only the generation that receives writes can be replaced, and
-			// only once its storage service is ready.
-			Replaceable:        summary.IsCurrent && summary.Status == model.StorageDataSetStatusReady,
-			ProviderID:         summary.ProviderID.String(),
-			ProviderIdentity:   providerIdentityFromSnapshot(identities, summary.ProviderID),
-			DataSetID:          onChainIDStringPtr(summary.DataSetID),
-			ClientDataSetID:    onChainIDStringPtr(summary.ClientDataSetID),
-			Status:             string(summary.Status),
-			CreatedByContentID: summary.CreatedByContentID,
-			CommittedCopies:    summary.CommittedCopies,
-			ReadableCopies:     summary.ReadableCopies,
-			PhysicalBytes:      summary.PhysicalBytes,
-			ReferencedVersions: summary.ReferencedVersions,
-			CurrentVersions:    summary.CurrentVersions,
-			CreatedAt:          summary.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:          summary.UpdatedAt.Format(time.RFC3339),
-			StorageHealth:      storageHealth,
+			ID:                            summary.ID,
+			BucketID:                      summary.BucketID,
+			BucketName:                    summary.BucketName,
+			CopyIndex:                     summary.CopyIndex,
+			Generation:                    summary.Generation,
+			IsCurrent:                     summary.IsCurrent,
+			Replaceable:                   eligibilityErr == nil,
+			ReplacementHasLateServiceRisk: summary.ReplacementHasLateServiceRisk,
+			ReplacementBlockedReason:      blockedReason,
+			SetupError:                    setupError,
+			ProviderID:                    summary.ProviderID.String(),
+			ProviderIdentity:              providerIdentityFromSnapshot(identities, summary.ProviderID),
+			DataSetID:                     onChainIDStringPtr(summary.DataSetID),
+			ClientDataSetID:               onChainIDStringPtr(summary.ClientDataSetID),
+			Status:                        string(summary.Status),
+			CreatedByContentID:            summary.CreatedByContentID,
+			CommittedCopies:               summary.CommittedCopies,
+			ReadableCopies:                summary.ReadableCopies,
+			PhysicalBytes:                 summary.PhysicalBytes,
+			ReferencedVersions:            summary.ReferencedVersions,
+			CurrentVersions:               summary.CurrentVersions,
+			CreatedAt:                     summary.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:                     summary.UpdatedAt.Format(time.RFC3339),
+			StorageHealth:                 storageHealth,
 		})
 	}
 	return out

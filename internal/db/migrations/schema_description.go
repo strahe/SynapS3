@@ -602,7 +602,11 @@ func portableSQLExpression(value string) string {
 // JSON column is jsonb or text depending on the dialect, so it joins the json
 // family only while it has the type its dialect declares.
 func portableColumnType(name dialect.Name, table, column, value string) string {
-	if spec, ok := initialJSONColumn(table, column); ok {
+	spec, ok := initialJSONColumn(table, column)
+	if table == "storage_data_sets" && column == "creation_rejection" {
+		ok = true
+	}
+	if ok {
 		declared := "jsonb"
 		if name == dialect.SQLite || spec.text {
 			declared = "text"

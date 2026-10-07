@@ -56,7 +56,6 @@ func TestCodeMapsReplacementErrors(t *testing.T) {
 		ErrTargetInUse:        CodeTargetInUse,
 		ErrNoEligibleProvider: CodeNoEligibleProvider,
 		ErrSourceNotCurrent:   CodeSourceNotCurrent,
-		ErrSourceCreating:     CodeSourceCreating,
 	}
 	seen := make(map[string]error, len(cases))
 	for err, want := range cases {

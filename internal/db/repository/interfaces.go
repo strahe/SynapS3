@@ -239,24 +239,25 @@ type StorageContentProvenance struct {
 }
 
 type StorageDataSetSummary struct {
-	ID                 int64                      `bun:"id"`
-	BucketID           int64                      `bun:"bucket_id"`
-	BucketName         string                     `bun:"bucket_name"`
-	CopyIndex          int                        `bun:"copy_index"`
-	Generation         int64                      `bun:"generation"`
-	IsCurrent          bool                       `bun:"is_current"`
-	ProviderID         types.OnChainID            `bun:"provider_id"`
-	DataSetID          *types.OnChainID           `bun:"data_set_id"`
-	ClientDataSetID    *types.OnChainID           `bun:"client_data_set_id"`
-	Status             model.StorageDataSetStatus `bun:"status"`
-	CreatedByContentID *int64                     `bun:"created_by_content_id"`
-	CommittedCopies    int64                      `bun:"committed_copies"`
-	ReadableCopies     int64                      `bun:"readable_copies"`
-	PhysicalBytes      int64                      `bun:"physical_bytes"`
-	ReferencedVersions int64                      `bun:"referenced_versions"`
-	CurrentVersions    int64                      `bun:"current_versions"`
-	CreatedAt          time.Time                  `bun:"created_at"`
-	UpdatedAt          time.Time                  `bun:"updated_at"`
+	ID                            int64                      `bun:"id"`
+	BucketID                      int64                      `bun:"bucket_id"`
+	BucketName                    string                     `bun:"bucket_name"`
+	CopyIndex                     int                        `bun:"copy_index"`
+	Generation                    int64                      `bun:"generation"`
+	IsCurrent                     bool                       `bun:"is_current"`
+	ReplacementHasLateServiceRisk bool                       `bun:"replacement_has_late_service_risk"`
+	ProviderID                    types.OnChainID            `bun:"provider_id"`
+	DataSetID                     *types.OnChainID           `bun:"data_set_id"`
+	ClientDataSetID               *types.OnChainID           `bun:"client_data_set_id"`
+	Status                        model.StorageDataSetStatus `bun:"status"`
+	CreatedByContentID            *int64                     `bun:"created_by_content_id"`
+	CommittedCopies               int64                      `bun:"committed_copies"`
+	ReadableCopies                int64                      `bun:"readable_copies"`
+	PhysicalBytes                 int64                      `bun:"physical_bytes"`
+	ReferencedVersions            int64                      `bun:"referenced_versions"`
+	CurrentVersions               int64                      `bun:"current_versions"`
+	CreatedAt                     time.Time                  `bun:"created_at"`
+	UpdatedAt                     time.Time                  `bun:"updated_at"`
 }
 
 type ReadableStorageCopy struct {
@@ -479,6 +480,9 @@ type StorageContentRepository interface {
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
 	ListReadyBucketProviderIDs(ctx context.Context) ([]string, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
+	// PendingUploadPlansForReplica finds replacement waits for the frozen
+	// copy policy that includes this slot. The caller wakes them through TaskService.
+	PendingUploadPlansForReplica(ctx context.Context, bucketID int64, copyIndex int) ([]int64, error)
 	GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
@@ -486,8 +490,12 @@ type StorageContentRepository interface {
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
 	RecordDataSetCreationError(ctx context.Context, id, taskID int64, message string) error
 	// RecordDataSetClientID ties a generation to the client data set ID of its
-	// create request before the request is sent. The ID never changes later.
-	RecordDataSetClientID(ctx context.Context, id int64, clientDataSetID types.OnChainID) error
+	// create request before sending, under the expected ensure fence. The ID
+	// never changes later.
+	RecordDataSetClientID(ctx context.Context, id, ensureTaskID int64, clientDataSetID types.OnChainID) error
+	// RecordDataSetCreationRejection retains refusal evidence under the same
+	// generation, request identity, and ensure fence as the failed settlement.
+	RecordDataSetCreationRejection(ctx context.Context, id, generation, ensureTaskID int64, evidence model.DataSetCreationRejection) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
 	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
@@ -502,6 +510,9 @@ type StorageContentRepository interface {
 	GetLiveVersionForUpload(ctx context.Context, contentID int64) (*model.ObjectVersion, error)
 	ListIncompleteCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error)
 	BindDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
+	// DataSetCreationStopped includes local sources whose replacement revoked
+	// creation even though they still own the slot.
+	DataSetCreationStopped(ctx context.Context, id int64) (bool, error)
 	AuthorizeDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) (*model.StorageDataSet, error)
 	CompleteDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
 	NextCopyWorkGeneration(ctx context.Context, copyID int64) (int64, error)
@@ -586,10 +597,20 @@ type BucketACLSnapshot struct {
 // gate. Every state change is a compare-and-set so a superseded or stale caller
 // is refused rather than silently applied.
 type StorageReplacementRepository interface {
+	// SourceEligibility shares local admission with presentation and authorization;
+	// its boolean distinguishes a source without a ready remote service.
+	SourceEligibility(ctx context.Context, dataSetID int64) (*model.StorageDataSet, bool, error)
+	// Preflight snapshots the source and unresolved targets for remote checks.
+	Preflight(ctx context.Context, dataSetID int64) (*ReplacementPreflight, error)
+	// BindObservedService validates that snapshot without restoring creation
+	// permission. Its caller must continue ready work in the same transaction.
+	BindObservedService(ctx context.Context, input BindObservedReplacementServiceInput) error
+	// RetryEligibility is read-only; Retry rechecks the same target admission.
+	RetryEligibility(ctx context.Context, replacementID int64) error
 	GetReplacementSubject(ctx context.Context, id int64) (*ReplacementSubject, error)
 	// Authorize records one confirmed replacement, creates the target data set
-	// generation, supersedes any earlier replacement of the same source, and
-	// queues the migration coordinator, all in one transaction.
+	// generation, and supersedes eligible stopped predecessors. The caller must
+	// enqueue and bind the new and unscheduled predecessor coordinators in the same transaction.
 	Authorize(ctx context.Context, input AuthorizeReplacementInput) (*storagereplacement.Replacement, bool, error)
 	// Retry resumes failed or cleanup-attention work on the same approved
 	// target. Choosing a different provider requires a new authorization.
@@ -601,6 +622,9 @@ type StorageReplacementRepository interface {
 	GetByID(ctx context.Context, id int64) (*storagereplacement.Replacement, error)
 	GetByClientRequestID(ctx context.Context, bucketID int64, clientRequestID string) (*storagereplacement.Replacement, error)
 	ListForBucket(ctx context.Context, bucketID int64, limit int) ([]storagereplacement.Replacement, error)
+	// ListUnscheduledSuperseded returns predecessors fenced by this confirmation.
+	// The caller must enqueue and bind their cleanup coordinators in the same transaction.
+	ListUnscheduledSuperseded(ctx context.Context, successorID int64) ([]storagereplacement.Replacement, error)
 	GetActiveForDataSet(ctx context.Context, dataSetID int64) (*storagereplacement.Replacement, error)
 	// HasInProgressForDataSet reports whether recovery must leave this data set
 	// alone. Operator-paused failed or attention work does not count as actively
@@ -609,10 +633,10 @@ type StorageReplacementRepository interface {
 	HasInProgressForDataSet(ctx context.Context, dataSetID int64) (bool, error)
 	ListActive(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
 
-	// Activate makes the target the write target and marks the source draining
-	// in one transaction. It touches a fixed number of rows regardless of how
-	// much history the bucket holds.
-	Activate(ctx context.Context, replacementID int64) error
+	// Activate makes the ready target current and retires or drains the source
+	// under the coordinator's generation and domain fence. The caller protects
+	// settlement with its engine claim; row count is independent of bucket history.
+	Activate(ctx context.Context, replacementID, generation, taskID int64) error
 	SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (inserted int, done bool, err error)
 	NextPendingReplacementItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error)
 	MarkReplacementItemCopied(ctx context.Context, replacementID, itemID, targetCopyID int64) error
@@ -625,6 +649,8 @@ type StorageReplacementRepository interface {
 
 	MarkMigrating(ctx context.Context, replacementID int64) error
 	MarkWaiting(ctx context.Context, replacementID int64, reason storagereplacement.WaitReason) error
+	// MarkFailed revalidates durable target refusal under the same lock as ready
+	// binding; a stale refusal returns ErrConflict and must be reevaluated.
 	MarkFailed(ctx context.Context, replacementID int64, reason *storagereplacement.FailureReason, lastError string) error
 	MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error
 	FailForEngineTask(ctx context.Context, taskID int64, lastError string) error
@@ -638,6 +664,14 @@ type StorageReplacementRepository interface {
 	// CompleteRetirement re-runs the whole gate inside its own transaction and
 	// refuses premature completion even when called outside the worker.
 	CompleteRetirement(ctx context.Context, replacementID int64, observedEpoch int64) error
+	// AbandonUncreatedCopiesBatch transfers live, frozen slot obligations only
+	// after activation and under the coordinator fence. The caller must protect
+	// the transaction with its current engine claim.
+	AbandonUncreatedCopiesBatch(ctx context.Context, replacementID, generation, taskID int64, limit int) (bool, error)
+	// CompleteWithoutRemoteSource rechecks readable coverage and settled old
+	// work under the coordinator fence; the caller protects its engine claim.
+	// No remote termination evidence is required.
+	CompleteWithoutRemoteSource(ctx context.Context, replacementID, generation, taskID int64) error
 
 	// CountAbandonedTargetSoleCopies counts the copies that only the target a
 	// later confirmation replaced still holds. CompleteAbandonedTargetTermination
@@ -647,12 +681,38 @@ type StorageReplacementRepository interface {
 
 // AuthorizeReplacementInput is one operator confirmation.
 type AuthorizeReplacementInput struct {
-	BucketID             int64
-	SourceDataSetID      int64
-	SelectionMode        storagereplacement.SelectionMode
-	TargetProviderID     types.OnChainID
-	ClientRequestID      string
-	PriceListFingerprint string
+	BucketID                  int64
+	SourceDataSetID           int64
+	SelectionMode             storagereplacement.SelectionMode
+	TargetProviderID          types.OnChainID
+	ClientRequestID           string
+	PriceListFingerprint      string
+	VerifiedCreationRejection *model.DataSetCreationRejection
+	Preflight                 *ReplacementPreflight
+}
+
+// ReplacementPreflight freezes the local identities checked outside the transaction.
+type ReplacementPreflight struct {
+	Source                    model.StorageDataSet
+	Targets                   []ReplacementTargetCheck
+	VerifiedCreationRejection *model.DataSetCreationRejection
+}
+
+// ReplacementTargetCheck couples the unresolved target identity with its
+// replacement fence and any freshly checked refusal evidence.
+type ReplacementTargetCheck struct {
+	Replacement               storagereplacement.Replacement
+	DataSet                   model.StorageDataSet
+	VerifiedCreationRejection *model.DataSetCreationRejection
+}
+
+// BindObservedReplacementServiceInput authorizes a service observed for one
+// exact preflight identity, including a source with no remaining ensure fence.
+type BindObservedReplacementServiceInput struct {
+	Preflight        ReplacementPreflight
+	StorageDataSetID int64
+	DataSetID        types.OnChainID
+	ClientDataSetID  types.OnChainID
 }
 
 type RetryReplacementInput struct {

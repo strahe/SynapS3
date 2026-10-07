@@ -16,6 +16,9 @@ const (
 	CommitKeyPrefix        = "storage-commit:"
 )
 
+// UploadPlanReplacementWaitReason isolates uploads blocked by a reserved replacement slot.
+const UploadPlanReplacementWaitReason = "replacement"
+
 // UploadPlanInput names the content to ingest. Ingest is a property of the
 // bytes, so two versions of identical content share one plan.
 type UploadPlanInput struct {

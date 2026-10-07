@@ -2483,7 +2483,7 @@ func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePr
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.repos.Replacements.Activate(t.Context(), replacement.ID); err != nil {
+	if err := activateReplacement(t, runtime, replacement.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(t.Context(), pipeline.upload.ID, []repository.UploadCopyBindingInput{{
@@ -4344,7 +4344,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
 	}
-	if err := runtime.repos.Replacements.Activate(ctx, replacement.ID); err != nil {
+	if err := activateReplacement(t, runtime, replacement.ID); err != nil {
 		t.Fatalf("activate replacement: %v", err)
 	}
 	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
@@ -4490,7 +4490,7 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("mark target ready: %v", err)
 			}
-			if err := runtime.repos.Replacements.Activate(ctx, replacement.ID); err != nil {
+			if err := activateReplacement(t, runtime, replacement.ID); err != nil {
 				t.Fatalf("activate replacement: %v", err)
 			}
 			if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
@@ -4863,6 +4863,9 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("mark retirement admission target ready: %v", err)
 	}
+	if err := runtime.repos.Replacements.MarkFailed(t.Context(), first.ID, nil, "replacement stopped"); err != nil {
+		t.Fatal(err)
+	}
 	if _, created, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 		TargetProviderID: testOnChainID(t, 29207), ClientRequestID: "retirement-admission-successor",
@@ -4902,7 +4905,7 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 		t.Fatalf("retirement admission task = %#v", failed)
 	}
 	stored, err := runtime.repos.Replacements.GetByID(ctx, first.ID)
-	if err != nil || stored.Status != storagereplacement.StatusSuperseded || stored.AbandonedTerminationEpoch != nil || stored.LastError != nil {
+	if err != nil || stored.Status != storagereplacement.StatusSuperseded || stored.AbandonedTerminationEpoch != nil || stored.LastError == nil || *stored.LastError != "replacement stopped" {
 		t.Fatalf("replacement after retirement admission failure = %#v, err=%v", stored, err)
 	}
 	if terminator.calls.Load() != 0 {
@@ -4970,6 +4973,9 @@ func seedAbandonedTargetRetirement(t *testing.T, runtime handlerTestRuntime, seq
 		ID: first.TargetDataSetID, DataSetID: id(6), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
+	}
+	if err := runtime.repos.Replacements.MarkFailed(t.Context(), first.ID, nil, "replacement stopped"); err != nil {
+		t.Fatal(err)
 	}
 	if _, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
@@ -5091,7 +5097,7 @@ func seedSourceRetirement(t *testing.T, runtime handlerTestRuntime, sequence int
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
 	}
-	if err := runtime.repos.Replacements.Activate(ctx, replacement.ID); err != nil {
+	if err := activateReplacement(t, runtime, replacement.ID); err != nil {
 		t.Fatalf("activate replacement: %v", err)
 	}
 	if err := runtime.repos.Replacements.BeginRetirement(ctx, replacement.ID); err != nil {
@@ -5295,6 +5301,9 @@ func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *t
 		ID: target.ID, DataSetID: testOnChainID(t, 7302), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark retirement target ready: %v", err)
+	}
+	if err := runtime.repos.Replacements.MarkFailed(t.Context(), first.ID, nil, "replacement stopped"); err != nil {
+		t.Fatal(err)
 	}
 	if _, created, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID,
@@ -5690,8 +5699,7 @@ func wakeTask(t *testing.T, runtime handlerTestRuntime, taskID int64) {
 
 // A create request whose outcome was lost is never given up on: the chain is
 // checked for its client data set ID, the same ID is sent again while nothing
-// is visible, and a later rejection is not taken as proof that the first
-// request failed.
+// is visible. A later chain transaction rejection cannot settle earlier sends.
 func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	sequence := storedObjectSequence.Add(1)
 	providerID := testOnChainID(t, 31000+sequence)
@@ -6001,7 +6009,7 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("recovery-stop-%d", sequence))
 			ctx := t.Context()
 			// One request was sent long ago under the original identity.
-			if err := runtime.repos.Contents.RecordDataSetClientID(ctx, fixture.binding.ID, clientID); err != nil {
+			if err := runtime.repos.Contents.RecordDataSetClientID(ctx, fixture.binding.ID, fixture.ensureTask.ID, clientID); err != nil {
 				t.Fatalf("record client data set ID: %v", err)
 			}
 			recorded := map[string]any{
@@ -6110,7 +6118,7 @@ func TestDataSetCreationRecoversFromAnUnusableCheckpointThroughTheRow(t *testing
 			})
 			ctx := t.Context()
 			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("unnamed-creation-%d", sequence))
-			if err := runtime.repos.Contents.RecordDataSetClientID(ctx, fixture.binding.ID, clientID); err != nil {
+			if err := runtime.repos.Contents.RecordDataSetClientID(ctx, fixture.binding.ID, fixture.ensureTask.ID, clientID); err != nil {
 				t.Fatalf("record client data set ID: %v", err)
 			}
 			// A checkpoint this build cannot decode: the ID arrives as a number
@@ -6274,4 +6282,30 @@ func seedProviderSelection(t *testing.T, runtime handlerTestRuntime, providers .
 	if _, err := runtime.repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), ids); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) error {
+	t.Helper()
+	row, err := runtime.repos.Replacements.GetByID(t.Context(), id)
+	if err != nil {
+		return err
+	}
+	if row.TaskID != nil {
+		return runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, *row.TaskID)
+	}
+	key := fmt.Sprintf("activation-fixture/%d", id)
+	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key})
+	if err != nil {
+		return err
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusCancelled).Set("finished_at = ?", time.Now()).Set("retention_until = ?", time.Now().Add(time.Hour)).Where("id = ?", task.ID).Exec(t.Context()); err != nil {
+		return err
+	}
+	if err := runtime.repos.Replacements.BindTask(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
+		return err
+	}
+	if err := runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
+		return err
+	}
+	return runtime.repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID)
 }

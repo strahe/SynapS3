@@ -127,9 +127,10 @@ func TestPostgresUploadBindingDoesNotLandOnADrainedSource(t *testing.T) {
 	db.AddQueryHook(hold)
 	defer hold.Release()
 
+	coordinator := localCoordinatorTask(t, repos, replacement)
 	activated := make(chan error, 1)
 	go func() {
-		activated <- repos.Replacements.Activate(postgresRaceContext(ctx, "activate"), replacement.ID)
+		activated <- repos.Replacements.Activate(postgresRaceContext(ctx, "activate"), replacement.ID, replacement.TaskGeneration, coordinator.ID)
 	}()
 	waitPostgresSignal(t, hold.reached, "source drained inside activation")
 

@@ -226,8 +226,12 @@ export interface StorageDataSetSummary {
   copy_index: number
   generation: number
   is_current: boolean
-  /** Only the generation that receives writes can be replaced. */
+  /** Server admission includes slot ownership, creation outcome, and active replacements. */
   replaceable: boolean
+  replacement_blocked_reason?: string
+  /** Includes refused targets abandoned when this replica chooses another provider. */
+  replacement_has_late_service_risk?: boolean
+  setup_error?: string
   provider_id: string
   provider_identity?: ProviderIdentity
   data_set_id?: string
@@ -346,7 +350,8 @@ export interface ProviderReplacement {
   status: ProviderReplacementStatus
   wait_reason?: string
   wait_message?: string
-  failure_reason?: 'target_in_use'
+  failure_reason?: 'target_in_use' | 'target_rejected'
+  retryable?: boolean
   selection_mode: 'automatic' | 'manual'
   source: ProviderReplacementDataSet
   target: ProviderReplacementDataSet

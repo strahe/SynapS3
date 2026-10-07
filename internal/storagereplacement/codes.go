@@ -5,24 +5,29 @@ import "errors"
 // Stable machine-readable codes returned alongside API errors. Clients branch
 // on these, so treat them as part of the public contract.
 const (
-	CodeActive              = "replacement_active"
-	CodeTargetCreating      = "replacement_target_creating"
-	CodeSuperseded          = "replacement_superseded"
-	CodeNotRetryable        = "replacement_not_retryable"
-	CodeTaskRunning         = "replacement_task_running"
-	CodeTargetInvalid       = "replacement_target_invalid"
-	CodeTargetInUse         = "replacement_target_in_use"
-	CodeNoEligibleProvider  = "replacement_no_eligible_provider"
-	CodeTargetUnavailable   = "replacement_target_unavailable"
-	CodeIdempotencyConflict = "replacement_idempotency_conflict"
-	CodeSourceNotCurrent    = "replacement_source_not_current"
-	CodeSourceCreating      = "replacement_source_creating"
+	CodeSourceRunning        = "replacement_source_running"
+	CodeSourceOutcomeUnknown = "replacement_source_outcome_unknown"
+	CodeActive               = "replacement_active"
+	CodeTargetCreating       = "replacement_target_creating"
+	CodeSuperseded           = "replacement_superseded"
+	CodeNotRetryable         = "replacement_not_retryable"
+	CodeTaskRunning          = "replacement_task_running"
+	CodeTargetInvalid        = "replacement_target_invalid"
+	CodeTargetInUse          = "replacement_target_in_use"
+	CodeNoEligibleProvider   = "replacement_no_eligible_provider"
+	CodeTargetUnavailable    = "replacement_target_unavailable"
+	CodeIdempotencyConflict  = "replacement_idempotency_conflict"
+	CodeSourceNotCurrent     = "replacement_source_not_current"
 )
 
 // Code maps a replacement error to its stable API code. It returns an empty
 // string for errors that carry no client-facing code.
 func Code(err error) string {
 	switch {
+	case errors.Is(err, ErrSourceRunning):
+		return CodeSourceRunning
+	case errors.Is(err, ErrSourceOutcomeUnknown):
+		return CodeSourceOutcomeUnknown
 	case errors.Is(err, ErrActiveReplacement):
 		return CodeActive
 	case errors.Is(err, ErrTargetCreating):
@@ -45,8 +50,6 @@ func Code(err error) string {
 		return CodeIdempotencyConflict
 	case errors.Is(err, ErrSourceNotCurrent):
 		return CodeSourceNotCurrent
-	case errors.Is(err, ErrSourceCreating):
-		return CodeSourceCreating
 	default:
 		return ""
 	}

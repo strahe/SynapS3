@@ -80,6 +80,14 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 			return taskengine.Fail(fmt.Errorf("provider replacement has unknown wait reason %q", *row.WaitReason), "replacement_unknown_wait_reason", nil)
 		}
 
+		source, err := h.deps.Repositories.Contents.GetDataSetBindingByID(ctx, row.SourceDataSetID)
+		if err != nil || source == nil {
+			if err == nil {
+				err = repository.ErrNotFound
+			}
+			return h.retryReplacement(execution, row.ID, err, "replacement_source_load_failed")
+		}
+		localSource := source.Status == model.StorageDataSetStatusRetired && source.DataSetID == nil
 		target, err := h.deps.Repositories.Contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
 		if err != nil || target == nil {
 			if err == nil {
@@ -87,7 +95,48 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 			}
 			return h.failReplacement(row.ID, err, "replacement_target_missing")
 		}
+		if target.Status == model.StorageDataSetStatusRetired || target.Status == model.StorageDataSetStatusFailed {
+			return h.failReplacement(row.ID, errors.New("replacement target storage setup stopped; choose another provider"), "replacement_target_failed")
+		}
+		if !source.IsCurrent && !target.IsCurrent {
+			return h.failReplacement(row.ID, errors.New("replacement has no current replica; storage setup requires attention"), "replacement_slot_missing")
+		}
+		if target.EnsureTaskID != nil && target.Status != model.StorageDataSetStatusReady {
+			ensure, err := h.deps.Repositories.Tasks.GetByID(ctx, *target.EnsureTaskID)
+			if err != nil {
+				return h.retryReplacement(execution, row.ID, err, "replacement_target_task_load_failed")
+			}
+			if ensure != nil && (ensure.Status == model.TaskStatusFailed || ensure.Status == model.TaskStatusCancelled) && len(target.CreationRejection) == 0 {
+				if h.taskService != nil && h.taskService.Retryable(ensure) {
+					return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "target", "Waiting for storage setup to be retried", func(ctx context.Context, repos *repository.Repositories) error {
+						return repos.Replacements.MarkWaiting(ctx, row.ID, storagereplacement.WaitReasonTargetCreating)
+					})
+				}
+				return h.failReplacement(row.ID, errors.New("replacement storage setup stopped; check its task before continuing"), "replacement_target_failed")
+			}
+		}
+		if localSource && target.IsCurrent && target.Status == model.StorageDataSetStatusReady && target.DataSetID != nil && !target.DataSetID.IsZero() {
+			var done bool
+			err := execution.WriteCheckpointWith(ctx, struct{}{}, func(ctx context.Context, repos *repository.Repositories) error {
+				var err error
+				done, err = repos.Replacements.AbandonUncreatedCopiesBatch(ctx, row.ID, input.Generation, execution.ID(), replacementSeedBatchSize)
+				return err
+			})
+			if err != nil {
+				return h.retryReplacement(execution, row.ID, err, "replacement_source_release_failed")
+			}
+			if !done {
+				return taskengine.Suspend(model.TaskResumeModeRecover, 0, "source_copies", "Preparing replacement replicas", nil)
+			}
+		}
 		if target.Status != model.StorageDataSetStatusReady || target.DataSetID == nil || target.DataSetID.IsZero() {
+			if evidence, err := target.CreationRejectionEvidence(); err == nil && evidence != nil {
+				reason := storagereplacement.FailureReasonTargetRejected
+				return taskengine.Fail(errors.New("storage provider rejected setup"), "replacement_target_rejected",
+					func(ctx context.Context, repos *repository.Repositories) error {
+						return repos.Replacements.MarkFailed(ctx, row.ID, &reason, storagereplacement.ProviderRejectedMessage)
+					})
+			}
 			if target.Status == model.StorageDataSetStatusFailed {
 				return h.failReplacement(row.ID, errors.New("replacement target storage service failed"), "replacement_target_failed")
 			}
@@ -105,21 +154,39 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 		}
 
 		if !target.IsCurrent {
-			incomplete, err := h.deps.Repositories.Contents.ListIncompleteCopiesForDataSet(ctx, row.SourceDataSetID)
-			if err != nil {
-				return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
-			}
-			if len(incomplete) > 0 {
-				return h.waitForSourceWrites(ctx, execution, row, incomplete)
+			if source.DataSetID != nil {
+				incomplete, err := h.deps.Repositories.Contents.ListIncompleteCopiesForDataSet(ctx, row.SourceDataSetID)
+				if err != nil {
+					return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
+				}
+				if len(incomplete) > 0 {
+					return h.waitForSourceWrites(ctx, execution, row, incomplete)
+				}
 			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "activation", "Activating replacement storage service", func(ctx context.Context, repos *repository.Repositories) error {
-				return repos.Replacements.Activate(ctx, row.ID)
+				if err := repos.Replacements.Activate(ctx, row.ID, input.Generation, execution.ID()); err != nil {
+					return err
+				}
+				bucket, err := repos.Buckets.GetByID(ctx, row.BucketID)
+				if err != nil {
+					return err
+				}
+				if bucket == nil {
+					return repository.ErrNotFound
+				}
+				if err := h.promoteBucketReady(ctx, repos, bucket.ID, h.effectiveBucketCopies(bucket)); err != nil {
+					return err
+				}
+				if err := h.wakeReplacementUploadPlans(ctx, repos, bucket.ID, row.CopyIndex); err != nil {
+					return err
+				}
+				return h.wakeBucketProvision(ctx, repos, bucket)
 			})
 		}
-		if row.Status == storagereplacement.StatusWaiting {
-			if err := h.deps.Repositories.Replacements.MarkMigrating(ctx, row.ID); err != nil && !errors.Is(err, repository.ErrConflict) {
-				return h.retryReplacement(execution, row.ID, err, "replacement_state_failed")
-			}
+		if row.Status == storagereplacement.StatusWaiting || row.Status == storagereplacement.StatusPreparingTarget {
+			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "migration", "Preparing replacement replicas", func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.Replacements.MarkMigrating(ctx, row.ID)
+			})
 		}
 
 		inserted, seeded, err := h.deps.Repositories.Replacements.SeedMigrationBatch(ctx, row.ID, replacementSeedBatchSize)
@@ -145,6 +212,11 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 		}
 		if !snapshot.SeedingComplete || snapshot.HasPending {
 			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "copy_work", "Waiting for stored content migration", nil)
+		}
+		if localSource {
+			return taskengine.Complete("Provider replacement completed", func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.Replacements.CompleteWithoutRemoteSource(ctx, row.ID, input.Generation, execution.ID())
+			})
 		}
 		return h.scheduleReplacementRetirement(input, execution.ID(), row, row.SourceDataSetID, "Old storage service retirement scheduled")
 	}

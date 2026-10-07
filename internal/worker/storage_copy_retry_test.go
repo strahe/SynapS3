@@ -232,68 +232,101 @@ func TestCacheRestoreMissingCacheOwnership(t *testing.T) {
 	}
 }
 
-func TestConfirmedPullCacheFallbackReachesCommitted(t *testing.T) {
-	client := &testutil.MockStorageClient{}
-	nonces := &testutil.MockCommitNonces{}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: client, policy: cache.EvictionPolicyNone, commitNonces: nonces, commitMaxPieces: 1,
-		register: func(h *worker.TaskHandlers, r *taskengine.Registry) error { return h.RegisterStorage(r) },
-	})
-	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
-	payload := bytes.Repeat([]byte("r"), int(pipeline.upload.ContentSize))
-	identity, err := piece.Calculate(bytes.NewReader(payload))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", identity.CIDv2.String()).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "fallback.bin", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "fallback", ContentType: "application/octet-stream"}
-	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
-		t.Fatal(err)
-	}
-	runtime.cache.(*testutil.MockCache).ExistsFunc = func(context.Context, string, string) bool { return true }
-	runtime.cache.(*testutil.MockCache).GetFunc = func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
-		return io.NopCloser(bytes.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
-	}
-	provider := newRegistrationProvider(t, pipeline.target.ProviderID.SDK(), pipeline.targetSet.DataSetID.SDK(), pipeline.targetClient, nonces)
-	var pulls, stores atomic.Int64
-	provider.target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
-		pulls.Add(1)
-		return pullStatusResult(request, storage.PullStatusFailed), nil
-	}
-	provider.target.StoreFunc = func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			return nil, err
-		}
-		if !bytes.Equal(data, payload) || !options.PieceCID.Equals(identity.CIDv2) {
-			return nil, errors.New("fallback stored different content")
-		}
-		stores.Add(1)
-		return &storage.StoreResult{PieceCID: options.PieceCID, Size: int64(len(data))}, nil
-	}
-	client.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
-		return provider.target, nil
-	}
-	row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
-	waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
-	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-	if err != nil || copyRow.TransferMethod != model.StorageCopyTransferMethodCacheRestore || pulls.Load() != 1 || stores.Load() != 1 {
-		t.Fatalf("fallback copy=%+v pulls=%d stores=%d err=%v", copyRow, pulls.Load(), stores.Load(), err)
-	}
-	var attempt storagepull.Attempt
-	if err := runtime.db.NewSelect().Model(&attempt).Where("content_id = ? AND storage_data_set_id = ?", pipeline.upload.ID, pipeline.target.StorageDataSetID).Scan(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if attempt.Status != storagepull.AttemptStatusAbandoned || attempt.ResolvedAt == nil || attempt.LastError == nil || !strings.Contains(*attempt.LastError, pipeline.source.ProviderID.String()) {
-		t.Fatalf("fallback attempt=%+v", attempt)
+func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
+	for _, readyContinuation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ready-continuation=%v", readyContinuation), func(t *testing.T) {
+			client := &testutil.MockStorageClient{}
+			nonces := &testutil.MockCommitNonces{}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: client, policy: cache.EvictionPolicyNone, commitNonces: nonces, commitMaxPieces: 1,
+				register: func(h *worker.TaskHandlers, r *taskengine.Registry) error { return h.RegisterStorage(r) },
+			})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+			payload := bytes.Repeat([]byte("r"), int(pipeline.upload.ContentSize))
+			identity, err := piece.Calculate(bytes.NewReader(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", identity.CIDv2.String()).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "fallback.bin", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "fallback", ContentType: "application/octet-stream"}
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
+				t.Fatal(err)
+			}
+			runtime.cache.(*testutil.MockCache).ExistsFunc = func(context.Context, string, string) bool { return true }
+			runtime.cache.(*testutil.MockCache).GetFunc = func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+				return io.NopCloser(bytes.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
+			}
+			provider := newRegistrationProvider(t, pipeline.target.ProviderID.SDK(), pipeline.targetSet.DataSetID.SDK(), pipeline.targetClient, nonces)
+			var pulls, stores atomic.Int64
+			provider.target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				pulls.Add(1)
+				return pullStatusResult(request, storage.PullStatusFailed), nil
+			}
+			provider.target.StoreFunc = func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+				data, err := io.ReadAll(reader)
+				if err != nil {
+					return nil, err
+				}
+				if !bytes.Equal(data, payload) || !options.PieceCID.Equals(identity.CIDv2) {
+					return nil, errors.New("fallback stored different content")
+				}
+				stores.Add(1)
+				return &storage.StoreResult{PieceCID: options.PieceCID, Size: int64(len(data))}, nil
+			}
+			client.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				return provider.target, nil
+			}
+			var row *model.Task
+			wantPulls := int64(1)
+			if readyContinuation {
+				wantPulls = 0
+				if _, err := runtime.db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("transfer_method = ?", model.StorageCopyTransferMethodCacheRestore).Where("id = ?", pipeline.target.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if err := runtime.repos.WithTx(t.Context(), func(repos *repository.Repositories) error {
+					ready, err := repos.Contents.GetDataSetBindingByID(t.Context(), pipeline.target.StorageDataSetID)
+					if err != nil {
+						return err
+					}
+					return runtime.handlers.ContinueReadyDataSet(t.Context(), repos, ready)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+				if err != nil || copyRow.WorkTaskID() == nil {
+					t.Fatalf("ready copy was not scheduled: %#v %v", copyRow, err)
+				}
+				row, err = runtime.repos.Tasks.GetByID(t.Context(), *copyRow.WorkTaskID())
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				row = bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
+			waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || copyRow.TransferMethod != model.StorageCopyTransferMethodCacheRestore || pulls.Load() != wantPulls || stores.Load() != 1 {
+				t.Fatalf("fallback copy=%+v pulls=%d stores=%d err=%v", copyRow, pulls.Load(), stores.Load(), err)
+			}
+			if readyContinuation {
+				return
+			}
+			var attempt storagepull.Attempt
+			if err := runtime.db.NewSelect().Model(&attempt).Where("content_id = ? AND storage_data_set_id = ?", pipeline.upload.ID, pipeline.target.StorageDataSetID).Scan(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if attempt.Status != storagepull.AttemptStatusAbandoned || attempt.ResolvedAt == nil || attempt.LastError == nil || !strings.Contains(*attempt.LastError, pipeline.source.ProviderID.String()) {
+				t.Fatalf("fallback attempt=%+v", attempt)
+			}
+		})
 	}
 }
 

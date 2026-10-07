@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,9 +11,12 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 type BunStorageContentRepo struct {
@@ -609,6 +613,11 @@ func (r *BunStorageContentRepo) ListDataSetSummaries(ctx context.Context, bucket
 			storage_data_set.copy_index,
 			storage_data_set.generation,
 			storage_data_set.is_current,
+			((storage_data_set.data_set_id IS NULL AND storage_data_set.client_data_set_id IS NOT NULL)
+			 OR EXISTS (SELECT 1 FROM storage_replacements AS prior
+			 JOIN storage_data_sets AS prior_target ON prior_target.id = prior.target_data_set_id
+			 WHERE prior.source_data_set_id = storage_data_set.id AND prior.status NOT IN (?, ?)
+			 AND prior_target.data_set_id IS NULL AND prior_target.creation_rejection IS NOT NULL)) AS replacement_has_late_service_risk,
 			storage_data_set.provider_id,
 			storage_data_set.data_set_id,
 			storage_data_set.client_data_set_id,
@@ -664,10 +673,20 @@ func (r *BunStorageContentRepo) ListDataSetSummaries(ctx context.Context, bucket
 		storageHealthCommittedCopyStatusSQL(),
 		storageHealthCommittedCopyStatusSQL(),
 	)
-	if err := r.db.NewRaw(query, bucketID, bucketID).Scan(ctx, &summaries); err != nil {
+	if err := r.db.NewRaw(query, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded, bucketID, bucketID).Scan(ctx, &summaries); err != nil {
 		return nil, fmt.Errorf("listing storage data set summaries: %w", err)
 	}
 	return summaries, nil
+}
+
+func (r *BunStorageContentRepo) PendingUploadPlansForReplica(ctx context.Context, bucketID int64, copyIndex int) ([]int64, error) {
+	var ids []int64
+	err := r.db.NewSelect().Model((*model.Task)(nil)).Column("task.id").
+		Join("JOIN storage_contents AS content ON task.subject_type = ? AND task.subject_key = CAST(content.id AS TEXT)", model.TaskSubjectStorageContent).
+		Where("content.bucket_id = ? AND content.requested_copies > ? AND content.accepted_at IS NULL", bucketID, copyIndex).
+		Where("task.type = ? AND task.status = ? AND task.wait_reason = ?", model.TaskTypeUploadPlan, model.TaskStatusPending, storagepipeline.UploadPlanReplacementWaitReason).
+		Scan(ctx, &ids)
+	return ids, err
 }
 
 // GetDataSetBindingByCopyIndex returns the generation that currently owns the
@@ -764,8 +783,8 @@ func (r *BunStorageContentRepo) MarkDataSetCreating(ctx context.Context, input M
 	return requireDataSetStatusUpdate(ctx, r.db, input.ID, res, "marking storage data set creating")
 }
 
-func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id int64, clientDataSetID types.OnChainID) error {
-	if id <= 0 || clientDataSetID.IsZero() {
+func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id, ensureTaskID int64, clientDataSetID types.OnChainID) error {
+	if id <= 0 || ensureTaskID <= 0 || clientDataSetID.IsZero() {
 		return fmt.Errorf("recording storage client data set ID: %w", ErrInvalidInput)
 	}
 	res, err := r.db.NewUpdate().
@@ -773,12 +792,36 @@ func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id in
 		Set("client_data_set_id = ?", clientDataSetID).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", id).
+		Where("ensure_task_id = ?", ensureTaskID).
+		Where("status IN (?, ?)", model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating).
+		Where("creation_rejection IS NULL").
+		Where("NOT "+dataSetCreationStoppedSQL("storage_data_set")).
 		Where("(client_data_set_id IS NULL OR client_data_set_id = ?)", clientDataSetID).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("recording storage client data set ID: %w", err)
 	}
 	return requireDataSetStatusUpdate(ctx, r.db, id, res, "recording storage client data set ID")
+}
+
+func (r *BunStorageContentRepo) RecordDataSetCreationRejection(ctx context.Context, id, generation, ensureTaskID int64, evidence model.DataSetCreationRejection) error {
+	if id <= 0 || generation <= 0 || ensureTaskID <= 0 || !evidence.Valid() {
+		return ErrInvalidInput
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return err
+	}
+	result, err := r.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("creation_rejection = ?", json.RawMessage(encoded)).
+		Set("last_error = ?", storagereplacement.ProviderRejectedMessage).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND generation = ? AND ensure_task_id = ?", id, generation, ensureTaskID).
+		Where("client_data_set_id = ?", evidence.ClientDataSetID).
+		Where("status IN (?, ?)", model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating).
+		Where("data_set_id IS NULL AND create_transaction_id IS NULL AND create_status_url IS NULL").
+		Exec(ctx)
+	return requireTaskFenceRows(result, err, "recording storage service creation rejection")
 }
 
 func (r *BunStorageContentRepo) MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error {
@@ -1755,10 +1798,33 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types
 	if dataSetID.IsZero() {
 		return fmt.Errorf("dataSetID is required: %w", ErrInvalidInput)
 	}
+	// Use the same bucket -> replacement -> data set order as authorization;
+	// the ready continuation can also update the bucket in this transaction.
+	binding := new(model.StorageDataSet)
+	if err := db.NewSelect().Model(binding).Column("bucket_id").Where("id = ?", id).Scan(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("storage data set %d not found: %w", id, ErrNotFound)
+		}
+		return fmt.Errorf("loading ready data set bucket: %w", err)
+	}
+	if _, err := lockBucketByID(ctx, db, binding.BucketID); err != nil {
+		return err
+	}
+	// Refusal settlement and all ready callers share this gate before reading
+	// the target, so a recovered service cannot become rejected again.
+	var replacements []storagereplacement.Replacement
+	lock := db.NewSelect().Model(&replacements).Column("id").Where("target_data_set_id = ?", id).OrderExpr("id ASC")
+	if db.Dialect().Name() == dialect.PG {
+		lock = lock.For("UPDATE")
+	}
+	if err := lock.Scan(ctx); err != nil {
+		return fmt.Errorf("locking replacement for ready binding: %w", err)
+	}
 	query := db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = CASE WHEN status = ? THEN status ELSE ? END", model.StorageDataSetStatusDraining, model.StorageDataSetStatusReady).
 		Set("data_set_id = ?", dataSetID).
+		Set("creation_rejection = NULL").
 		Set("client_data_set_id = COALESCE(?, client_data_set_id)", clientDataSetID).
 		Set("last_error = CASE WHEN status = ? THEN last_error ELSE NULL END", model.StorageDataSetStatusDraining).
 		Set("updated_at = ?", time.Now()).
@@ -1783,7 +1849,11 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types
 	}
 	rows, _ := res.RowsAffected()
 	if rows > 0 {
-		return nil
+		_, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
+			Set("failure_reason = NULL").Set("last_error = ?", "Storage service was found. Retry the replacement to continue.").
+			Set("updated_at = ?", time.Now()).Where("target_data_set_id = ?", id).
+			Where("status = ? AND failure_reason = ?", storagereplacement.StatusFailed, storagereplacement.FailureReasonTargetRejected).Exec(ctx)
+		return err
 	}
 	current := new(model.StorageDataSet)
 	if err := db.NewSelect().Model(current).Where("id = ?", id).Scan(ctx); err != nil {
