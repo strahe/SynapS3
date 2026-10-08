@@ -33,11 +33,11 @@ func TestPrepareEvictionReusesOnlyMatchingLiveOwner(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal task input: %v", err)
 		}
-		row, created, err := repos.Tasks.Enqueue(ctx, &model.Task{
+		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 			Type: taskType, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
 			InputVersion: 1, InputHash: fmt.Sprintf("hash-%d-%d", contentID, generation),
 			Input: input, SubjectType: &subjectType, SubjectKey: &subjectKey,
-		})
+		}))
 		if err != nil || !created {
 			t.Fatalf("enqueue task = %#v created=%v err=%v", row, created, err)
 		}
@@ -88,11 +88,11 @@ func TestPrepareEvictionReusesOnlyMatchingLiveOwner(t *testing.T) {
 		t.Fatalf("mark owner terminal: %v", err)
 	}
 	next, err := repos.CacheEvictions.PrepareEviction(ctx, terminalContentID)
-	if err != nil || next.Generation != terminal.Generation+1 || next.ActiveTaskID != nil {
+	if err != nil || next.Generation != terminal.Generation || next.ActiveTaskID == nil || *next.ActiveTaskID != terminalTask.ID {
 		t.Fatalf("next reservation after terminal owner = %#v, err=%v", next, err)
 	}
 	entry, err := repos.CacheEvictions.GetCacheEntry(ctx, terminalContentID)
-	if err != nil || entry == nil || entry.CacheActiveTaskID != nil {
+	if err != nil || entry == nil || entry.CacheActiveTaskID == nil || *entry.CacheActiveTaskID != terminalTask.ID {
 		t.Fatalf("cache entry after terminal owner = %#v, err=%v", entry, err)
 	}
 

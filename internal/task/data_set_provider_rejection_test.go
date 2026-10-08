@@ -117,11 +117,16 @@ func TestDataSetProviderRefusalStopsSendingAndPreservesReplacementEvidence(t *te
 				if err != nil || stopped.FailureReason == nil || *stopped.FailureReason != "handler_panic" || len(binding.CreationRejection) != 0 || !strings.Contains(string(stopped.Checkpoint), "provider_rejection") {
 					t.Fatalf("interrupted refusal: binding=%#v task=%#v err=%v", binding, stopped, err)
 				}
-				if !runtime.service.Retryable(stopped) {
+				if !handlerTaskRetryable(t, runtime, stopped) {
 					t.Fatal("refusal lookup cannot recover before its settlement")
 				}
-				if err := runtime.service.Retry(t.Context(), stopped.ID); err != nil {
-					t.Fatal(err)
+				{
+					var retryErr error
+					stopped, retryErr = runtime.service.Retry(t.Context(), stopped.ID)
+					fixture.ensureTask = stopped
+					if retryErr != nil {
+						t.Fatal(retryErr)
+					}
 				}
 			}
 			if failedWrite != nil {
@@ -164,7 +169,7 @@ func TestDataSetProviderRefusalStopsSendingAndPreservesReplacementEvidence(t *te
 				return
 			}
 			evidence, err := binding.CreationRejectionEvidence()
-			if err != nil || evidence == nil || evidence.StatusCode != tc.status || terminal.FailureReason == nil || *terminal.FailureReason != "dataset_provider_rejected" || runtime.service.Retryable(terminal) {
+			if err != nil || evidence == nil || evidence.StatusCode != tc.status || terminal.FailureReason == nil || *terminal.FailureReason != "dataset_provider_rejected" || handlerTaskRetryable(t, runtime, terminal) {
 				t.Fatalf("refusal = %#v, err=%v, task=%#v", evidence, err, terminal)
 			}
 			if !binding.IsCurrent || binding.Status != model.StorageDataSetStatusPending || binding.EnsureTaskID == nil {
@@ -284,15 +289,14 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 					}
 				}
 				if state == "retryable task stopped" || state == "previous replacement failed" || state == "nonretryable task stopped" || state == "cancelled" {
-					status, reason, retention := model.TaskStatusFailed, any("handler_panic"), any(nil)
+					status, reason := model.TaskStatusFailed, any("handler_panic")
 					switch state {
 					case "nonretryable task stopped":
 						reason = "dataset_correlation_conflict"
 					case "cancelled":
 						status, reason = model.TaskStatusCancelled, nil
-						retention = time.Now().Add(time.Hour)
 					}
-					if _, err := runtime.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, retention_until = ?, failure_reason = ? WHERE id = ?", status, time.Now(), retention, reason, targetEnsure.ID).Exec(t.Context()); err != nil {
+					if _, err := runtime.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, failure_reason = ? WHERE id = ?", status, time.Now(), reason, targetEnsure.ID).Exec(t.Context()); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -333,8 +337,12 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 				if err := runtime.repos.Replacements.RetryEligibility(t.Context(), row.ID); !errors.Is(err, storagereplacement.ErrNotRetryable) {
 					t.Fatalf("stopped setup offered replacement retry: %v", err)
 				}
-				if err := runtime.service.Retry(t.Context(), targetEnsure.ID); err != nil {
-					t.Fatal(err)
+				{
+					var retryErr error
+					targetEnsure, retryErr = runtime.service.Retry(t.Context(), targetEnsure.ID)
+					if retryErr != nil {
+						t.Fatal(retryErr)
+					}
 				}
 				if state == "previous replacement failed" {
 					row, err = runtime.repos.Replacements.Retry(t.Context(), repository.RetryReplacementInput{ReplacementID: row.ID})

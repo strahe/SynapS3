@@ -131,12 +131,12 @@ func createWalletOperation(t *testing.T, repos *repository.Repositories, operati
 
 func createWalletTask(t *testing.T, repos *repository.Repositories, key string) int64 {
 	t.Helper()
-	row, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeWalletOperation, IdempotencyKey: "wallet:" + key,
 		InputVersion: 1, Input: []byte(`{"operation_id":1}`), InputHash: key,
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 		AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil || !created {
 		t.Fatalf("enqueue wallet task row=%#v created=%t err=%v", row, created, err)
 	}

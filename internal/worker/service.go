@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,9 +15,8 @@ import (
 )
 
 type Service struct {
-	registry  *Registry
-	repos     *repository.Repositories
-	retention time.Duration
+	registry *Registry
+	repos    *repository.Repositories
 }
 
 type EnqueueRequest struct {
@@ -28,11 +28,11 @@ type EnqueueRequest struct {
 	AvailableAt    time.Time
 }
 
-func NewService(registry *Registry, repos *repository.Repositories, retention time.Duration) (*Service, error) {
-	if registry == nil || repos == nil || repos.Tasks == nil || retention <= 0 {
-		return nil, errors.New("task service requires registry, repository, and positive retention")
+func NewService(registry *Registry, repos *repository.Repositories) (*Service, error) {
+	if registry == nil || repos == nil || repos.Tasks == nil {
+		return nil, errors.New("task service requires registry and repository")
 	}
-	return &Service{registry: registry, repos: repos, retention: retention}, nil
+	return &Service{registry: registry, repos: repos}, nil
 }
 
 func (s *Service) Enqueue(ctx context.Context, request EnqueueRequest) (*model.Task, bool, error) {
@@ -61,10 +61,9 @@ func (s *Service) EnqueueInTransaction(
 	return s.enqueuePrepared(ctx, txRepos.Tasks, prepared)
 }
 
-// EnqueueOrReactivateTerminalInTransaction is the cached-content upload-plan
-// escape hatch. It preserves one idempotency identity while allowing a new
-// live reference to restart work that ended before creating any copies.
-func (s *Service) EnqueueOrReactivateTerminalInTransaction(
+// EnqueueOrReplaceTerminalInTransaction is the cached-content upload-plan
+// entrypoint. A new live reference creates a successor to terminal work.
+func (s *Service) EnqueueOrReplaceTerminalInTransaction(
 	ctx context.Context,
 	txRepos *repository.Repositories,
 	request EnqueueRequest,
@@ -73,7 +72,7 @@ func (s *Service) EnqueueOrReactivateTerminalInTransaction(
 		return nil, false, errors.New("transaction task repository is required")
 	}
 	if request.Type != model.TaskTypeUploadPlan {
-		return nil, false, fmt.Errorf("terminal reactivation is limited to upload plans: %w", repository.ErrInvalidInput)
+		return nil, false, fmt.Errorf("terminal replacement is limited to upload plans: %w", repository.ErrInvalidInput)
 	}
 	prepared, err := s.prepare(request)
 	if err != nil {
@@ -87,11 +86,12 @@ func (s *Service) EnqueueOrReactivateTerminalInTransaction(
 	case model.TaskStatusPending, model.TaskStatusRunning:
 		return stored, false, nil
 	case model.TaskStatusFailed, model.TaskStatusCancelled:
-		if err := txRepos.Tasks.ReactivateTerminal(ctx, stored.ID); err != nil {
+		if err := txRepos.Tasks.SupersedeTerminal(ctx, stored.ID); err != nil {
 			return nil, false, err
 		}
-		stored, err = txRepos.Tasks.GetByID(ctx, stored.ID)
-		return stored, false, err
+		prepared.RetryOfTaskID = &stored.ID
+		prepared.RetryGroupKey = stored.RetryGroupKey
+		return s.enqueuePrepared(ctx, txRepos.Tasks, prepared)
 	case model.TaskStatusCompleted:
 		return nil, false, fmt.Errorf("completed task conflicts with cached content: %w", repository.ErrConflict)
 	default:
@@ -163,7 +163,12 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 		InputVersion: definition.InputVersion, Input: canonical,
 		InputHash: hex.EncodeToString(sum[:]),
 		Status:    model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
-		AvailableAt: availableAt, RetryLimit: cloneInt(definition.RetryLimit),
+		AvailableAt: availableAt, RetryLimit: intPointer(definition.Policy.MaxAttempts - 1),
+		RetryGroupKey: newRetryGroupKey(), Runtime: json.RawMessage(`{}`),
+	}
+	task.Policy, err = encodePolicy(definition.Policy)
+	if err != nil {
+		return nil, err
 	}
 	if subjectType != "" {
 		task.SubjectType = &subjectType
@@ -187,42 +192,18 @@ func (s *Service) Get(ctx context.Context, id int64) (*model.Task, error) {
 	return s.repos.Tasks.GetByID(ctx, id)
 }
 
-func (s *Service) Retry(ctx context.Context, id int64) error {
-	task, err := s.repos.Tasks.GetByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	if task == nil || task.Status != model.TaskStatusFailed {
-		return repository.ErrNotFound
-	}
-	definition, ok := s.registry.Definition(task.Type)
-	if !ok {
-		return fmt.Errorf("%w: %s", ErrUnknownType, task.Type)
-	}
-	if !definition.manualRetryAllowed(task) {
-		return ErrRetryUnsupported
-	}
-	return s.repos.Tasks.RetryFailed(ctx, id)
-}
-
 func (s *Service) Acknowledge(ctx context.Context, id int64) error {
-	return s.repos.Tasks.AcknowledgeFailed(ctx, id, s.retention)
+	return s.repos.Tasks.AcknowledgeFailed(ctx, id)
 }
 
-// AcknowledgeSubjectInTransaction retains failed history when new work replaces it.
-func (s *Service) AcknowledgeSubjectInTransaction(ctx context.Context, txRepos *repository.Repositories, subjectType, subjectKey string) error {
-	_, err := txRepos.Tasks.AcknowledgeFailedForSubject(ctx, subjectType, subjectKey, s.retention)
-	return err
-}
-
-// AcknowledgeMatching dismisses a backlog of failures in one step and reports
-// how many it dismissed.
+// AcknowledgeMatching acknowledges a backlog of failures in one step and reports
+// how many it acknowledged.
 func (s *Service) AcknowledgeMatching(ctx context.Context, filter repository.TaskAcknowledgeFilter) (int, error) {
-	return s.repos.Tasks.AcknowledgeFailedMatching(ctx, filter, s.retention)
+	return s.repos.Tasks.AcknowledgeFailedMatching(ctx, filter)
 }
 
 // CountAcknowledgeable reports how many failures AcknowledgeMatching would
-// dismiss under the same filter.
+// acknowledge under the same filter.
 func (s *Service) CountAcknowledgeable(ctx context.Context, filter repository.TaskAcknowledgeFilter) (int, error) {
 	return s.repos.Tasks.CountFailedMatching(ctx, filter)
 }
@@ -235,7 +216,7 @@ func (s *Service) WakeInTransaction(ctx context.Context, txRepos *repository.Rep
 }
 
 func (s *Service) Retryable(task *model.Task) bool {
-	if task == nil || task.Status != model.TaskStatusFailed {
+	if task == nil || task.Status != model.TaskStatusFailed || task.SupersededAt != nil {
 		return false
 	}
 	definition, ok := s.registry.Definition(task.Type)
@@ -246,10 +227,11 @@ func (s *Service) Acknowledgeable(task *model.Task) bool {
 	return task != nil && task.Status == model.TaskStatusFailed && task.AcknowledgedAt == nil
 }
 
-func cloneInt(value *int) *int {
-	if value == nil {
-		return nil
+func intPointer(value int) *int { return &value }
+func newRetryGroupKey() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		panic(err)
 	}
-	cloned := *value
-	return &cloned
+	return hex.EncodeToString(id[:])
 }

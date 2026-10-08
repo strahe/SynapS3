@@ -29,8 +29,11 @@ type PressureReader interface {
 }
 
 type Dependencies struct {
-	Repositories              *repository.Repositories
-	Scheduler                 *taskengine.Scheduler
+	Repositories *repository.Repositories
+	Scheduler    *taskengine.Scheduler
+	RetryPolicy  interface {
+		RetryableContext(context.Context, *model.Task) (bool, error)
+	}
 	Messenger                 *taskengine.Messenger
 	Resolver                  ReadyDataSetResolver
 	CommitNonces              synapse.CommitNonceReader

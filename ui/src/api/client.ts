@@ -165,6 +165,9 @@ export interface ObservabilityProviderObservation {
 }
 
 export interface ProviderUploadSpeedTest {
+  retry_unavailable_reason?: string
+  retryable?: boolean
+  retry_task_id?: number | null
   state: 'testing' | 'succeeded' | 'failed' | 'stale'
   sample_bytes: number
   duration_ms?: number
@@ -344,6 +347,7 @@ export interface ProviderReplacementDataSet {
 }
 
 export interface ProviderReplacement {
+  retry_unavailable_reason?: string
   id: number
   bucket_name: string
   copy_index: number
@@ -352,6 +356,7 @@ export interface ProviderReplacement {
   wait_message?: string
   failure_reason?: 'target_in_use' | 'target_rejected'
   retryable?: boolean
+  retry_task_id?: number | null
   selection_mode: 'automatic' | 'manual'
   source: ProviderReplacementDataSet
   target: ProviderReplacementDataSet
@@ -650,15 +655,12 @@ export interface ProviderIdentity {
   extra_capabilities?: Record<string, string>
 }
 
-export interface CopyRetryState {
-  available: boolean
-  reason_code?: string
-}
-
 export interface ObjectProvenanceCopy {
   copy_id: number
   last_error?: string
-  retry?: CopyRetryState
+  retryable: boolean
+  retry_task_id: number | null
+  retry_unavailable_reason?: string
   copy_index: number
   status: ObjectUploadCopyStatus
   health: CopyHealthInfo
@@ -732,25 +734,19 @@ export interface CommitBatchDetails extends CommitBatch {
 }
 
 export interface TaskItem {
-  copy_retry?: CopyRetryState & { copy_id: number }
   id: number
   type: string
   operation: string
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
-  presentation_status:
-    | 'queued'
-    | 'scheduled'
-    | 'waiting'
-    | 'running'
-    | 'completed'
-    | 'failed'
-    | 'cancelled'
-    | 'dismissed'
+  presentation_status: 'queued' | 'scheduled' | 'waiting' | 'running' | 'completed' | 'failed' | 'cancelled'
   subject_type?: string
   subject_key?: string
+  retry_of_task_id: number | null
+  superseded_at?: string
   retry_count: number
   retry_limit?: number
   retryable: boolean
+  retry_task_id: number | null
   acknowledgeable: boolean
   last_error?: string
   status_message?: string
@@ -763,6 +759,35 @@ export interface TaskItem {
   created_at: string
   updated_at: string
   storage_confirmation?: TaskStorageConfirmation
+}
+
+export interface TaskPolicy {
+  max_attempts: number | null
+  initial_delay: string
+  maximum_delay: string
+  multiplier: number
+  jitter: number
+  invocation_timeout: string
+  observation_window: string
+  legacy: boolean
+}
+
+export interface TaskDetail {
+  task: TaskItem
+  policy: TaskPolicy | null
+}
+export interface TaskEvent {
+  failure_reason?: string
+  attempt?: number
+  next_attempt?: number
+  retry_task_id?: number
+  sequence: number
+  type: string
+  created_at: string
+}
+export interface TaskEvents {
+  events: TaskEvent[]
+  next_cursor?: number
 }
 
 export interface TaskSubjectProvider {
@@ -1011,8 +1036,6 @@ export interface SettingsTaskWorkerConfig {
   concurrency: number
   poll_interval: string
   lease_duration: string
-  max_retries: number
-  retention: string
   provider_mutation_concurrency: number
   destructive_mutation_concurrency: number
   commit_max_pieces: number
@@ -1158,8 +1181,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(request),
     }),
-  retryProviderReplacement: (replacementID: number) =>
-    fetchJSON<ProviderReplacement>(`/storage-replacements/${replacementID}/retry`, { method: 'POST' }),
   getReplacementProviders: (name: string, dataSetID: number) =>
     fetchJSON<{ providers: ReplacementProviderCandidate[] }>(
       `/buckets/${encodeURIComponent(name)}/data-sets/${dataSetID}/replacement/providers`
@@ -1346,12 +1367,15 @@ export const api = {
     const qs = sp.toString()
     return fetchJSON<TaskListResponse>(`/tasks${qs ? `?${qs}` : ''}`)
   },
+  getTask: (id: number) => fetchJSON<TaskDetail>(`/tasks/${id}`),
+  getTaskHistory: (id: number, cursor?: number) =>
+    fetchJSON<TaskListResponse>(`/tasks/${id}/history?limit=20${cursor ? `&cursor=${cursor}` : ''}`),
+  getTaskEvents: (id: number, cursor?: number) =>
+    fetchJSON<TaskEvents>(`/tasks/${id}/events?limit=20${cursor ? `&cursor=${cursor}` : ''}`),
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
   getTaskSubject: (type: TaskSubjectInfo['subject_type'], key: string, signal?: AbortSignal) =>
     fetchJSON<TaskSubjectInfo>(`/task-subjects/${encodeURIComponent(type)}/${encodeURIComponent(key)}`, { signal }),
-  retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
-  retryStorageCopy: (id: number) =>
-    fetchJSON<{ copy_id: number; task_id: number }>(`/storage-copies/${id}/retry`, { method: 'POST' }),
+  retryTask: (id: number) => fetchJSON<{ task_id: number }>(`/tasks/${id}/retry`, { method: 'POST' }),
   acknowledgeTask: (id: number) => fetchJSON(`/tasks/${id}/acknowledge`, { method: 'POST' }),
   previewAcknowledgeTasks: (payload: { type?: string }) => {
     const qs = payload.type ? `?${new URLSearchParams({ type: payload.type }).toString()}` : ''

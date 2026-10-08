@@ -80,20 +80,20 @@ func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies
 	repos := repository.NewRepositories(db)
 	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, filecoinDefaultCopies, testLogger())
 	registry := taskengine.NewRegistry()
-	service, err := taskengine.NewService(registry, repos, 7*24*time.Hour)
+	service, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		t.Fatal(err)
 	}
 	entryPoints, err := task.Register(registry, service, task.Dependencies{
 		Repositories: repos, Cache: localCache, CacheGate: srv.cacheGate, CacheTracker: srv.cacheAccessTracker,
-		DefaultCopies: filecoinDefaultCopies, MaxRetries: 5, Logger: testLogger(),
+		DefaultCopies: filecoinDefaultCopies, Logger: testLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Minute,
-		Retention: 7 * 24 * time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}, repos, registry, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", srv.handleAPIUploadObject)
 	mux.HandleFunc("POST /api/v1/buckets/{name}/data-sets/{id}/replacement", srv.handleAPIStartDataSetReplacement)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", srv.handleAPIListDataSetReplacementProviders)
-	mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", srv.handleAPIRetryStorageReplacement)
+	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", srv.handleAPITaskRetry)
 	return mux
 }
 
@@ -4542,10 +4542,9 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 	if err != nil || len(copies) != 1 {
 		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
 	}
-	taskRow, _, err := repos.Tasks.Enqueue(context.Background(), &model.Task{
-		Type: model.TaskTypeStorageStore, IdempotencyKey: "progress-display", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "progress-display", Status: model.TaskStatusPending,
-		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	taskRow, _, err := srv.taskService.Enqueue(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeStorageStore, IdempotencyKey: "progress-display",
+		Input: storagepipeline.CopyGenerationInput{CopyID: copies[0].ID, Generation: 1},
 	})
 	if err != nil {
 		t.Fatalf("Enqueue store task: %v", err)

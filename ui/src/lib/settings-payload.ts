@@ -48,8 +48,6 @@ export function buildSettingsPayload(
   if (include('worker.tasks.concurrency')) tasks.concurrency = form.worker.tasks.concurrency
   if (include('worker.tasks.poll_interval')) tasks.poll_interval = form.worker.tasks.poll_interval
   if (include('worker.tasks.lease_duration')) tasks.lease_duration = form.worker.tasks.lease_duration
-  if (include('worker.tasks.max_retries')) tasks.max_retries = form.worker.tasks.max_retries
-  if (include('worker.tasks.retention')) tasks.retention = form.worker.tasks.retention
   if (include('worker.tasks.provider_mutation_concurrency'))
     tasks.provider_mutation_concurrency = form.worker.tasks.provider_mutation_concurrency
   if (include('worker.tasks.destructive_mutation_concurrency'))

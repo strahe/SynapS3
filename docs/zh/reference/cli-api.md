@@ -101,11 +101,11 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 | `--json` | 以 JSON 返回成功响应。 |
 | `--timeout <duration>` | 设置 Admin API 请求超时。 |
 
-列出后台任务时支持 `--type`、`--status`、`--limit` 和基于任务 ID 的 `--cursor`。有效的状态过滤值为 `pending`、`running`、`completed`、`failed`、`cancelled` 和 `dismissed`。pending 工作会显示为 queued、scheduled 或 waiting；`failed` 返回尚未确认的失败，`dismissed` 返回已确认的失败。
+列出任务支持 `--type`、`--status`、`--limit` 和基于 ID 的 `--cursor`。状态为 `pending`、`running`、`completed`、`failed`、`cancelled`；failed 包含已确认失败。
 
-`synaps3 admin task retry` 只恢复响应中标记为可重试的失败任务。存储提供方替换仍在 **Details** → **Storage** → **Data Sets** 中恢复。尚未发出广播、或因内部错误停止的钱包操作可以重试；只有从未广播过的交易才会在重试时发出，广播结果不确定时仍不可重试。因内部错误停止的存储传输任务也可以重试。Store 失败后，**Retry upload** 会先检查提供方；确认分片缺失才再次上传。远端副本删除超过 24 小时仍无法确认时，**Recover** 会先检查副本是否已删除或已排队删除；若仍存在且未排队，可能再次提交付费删除请求，而先前的请求仍可能成功。核对失败结果后，可用 `synaps3 admin task acknowledge <id>` 将任务标记为已处理；确认后开始计算保留期，到期后可能被清理。需要清理积压时，不带 ID 运行并用 `--yes` 确认：`--type` 限定某一种操作，`--before` 指定 RFC 3339 截止时刻（默认为当前时间），该时刻之后记录的失败仍然可见。
+`synaps3 admin task retry` 为可重试的失败任务创建新轮次，并显示新 ID；重复请求返回同一后继。`synaps3 admin task acknowledge <id>` 只确认已查看，结果与历史保持不变。批量确认使用 `--type`、`--before` 和 `--yes` 限定操作及截止时刻。
 
-`synaps3 admin storage-confirmation list` 会显示需要处理的存储登记：每次登记一行，包括所属任务 ID、存储提供方、data set、piece 数量和存储提供方的回复。对已停止的登记，使用 `synaps3 admin task retry <task-id>` 重试：重试只会重新核对链上记录，其中的 piece 已在链上时才完成该登记，不会发送任何请求。
+`synaps3 admin storage-confirmation list` 会显示需要处理的存储登记：每次登记一行，包括所属任务 ID、存储提供方、data set、piece 数量和存储提供方的回复。对已停止的登记，使用 `synaps3 admin task retry <task-id>` 重试：新一轮执行基于已保存的登记证据继续恢复。
 
 缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 

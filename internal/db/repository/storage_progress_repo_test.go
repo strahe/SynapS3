@@ -45,11 +45,11 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
 	}
 	enqueueTask := func(key string) *model.Task {
-		taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskTypeStorageStore, IdempotencyKey: key, InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		})
+		}))
 		if err != nil || !created {
 			t.Fatalf("Enqueue(%s) = %#v, created=%v, err=%v", key, taskRow, created, err)
 		}
@@ -95,7 +95,7 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 		t.Fatalf("ReplaceCopyTask: %v", err)
 	}
 	if err := repos.Tasks.Settle(t.Context(), freshClaim.ID, freshClaim.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatalf("complete first task: %v", err)
 	}
@@ -167,11 +167,11 @@ func TestPermanentDeleteClearsTerminalStoreFence(t *testing.T) {
 	if err != nil || len(copies) != 1 {
 		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
 	}
-	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageStore, IdempotencyKey: "terminal-store-delete", InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "terminal-store-delete", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil || !created {
 		t.Fatalf("Enqueue = %#v, created=%v, err=%v", taskRow, created, err)
 	}

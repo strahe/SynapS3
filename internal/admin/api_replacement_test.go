@@ -578,7 +578,7 @@ func TestAPIRetryStorageReplacementStates(t *testing.T) {
 	created := decodeReplacement(t, rec)
 
 	retry := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/"+strconv.FormatInt(created.ID, 10)+"/retry", nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(fixture.replacementTaskID(t, created.ID), 10)+"/retry", nil)
 		out := httptest.NewRecorder()
 		fixture.mux.ServeHTTP(out, req)
 		return out
@@ -589,22 +589,30 @@ func TestAPIRetryStorageReplacementStates(t *testing.T) {
 	if out.Code != http.StatusConflict {
 		t.Fatalf("retry while preparing = %d, want 409", out.Code)
 	}
-	if got := decodeAPIError(t, out)["code"]; got != storagereplacement.CodeNotRetryable {
+	if got := decodeAPIError(t, out)["code"]; got != "task_retry_unsupported" {
 		t.Fatalf("code = %q, want %q", got, storagereplacement.CodeNotRetryable)
 	}
 
 	if err := fixture.srv.repos.Replacements.MarkFailed(ctx, created.ID, nil, "target creation exhausted"); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
-	out = retry()
-	if out.Code != http.StatusOK {
-		t.Fatalf("retry after failure = %d body=%s, want 200", out.Code, out.Body.String())
+	sourceID := fixture.replacementTaskID(t, created.ID)
+	if _, err := fixture.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("failure_reason = ?", "replacement_failed").Where("id = ?", sourceID).Exec(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if body := decodeReplacement(t, out); body.LastError != nil {
-		t.Fatalf("last_error = %v, want it cleared by the retry", *body.LastError)
+	out = retry()
+	if out.Code != http.StatusAccepted {
+		t.Fatalf("retry after failure = %d %s", out.Code, out.Body.String())
+	}
+	var started struct {
+		TaskID int64 `json:"task_id"`
+	}
+	decodeJSON(t, out, &started)
+	if started.TaskID == sourceID || started.TaskID == 0 {
+		t.Fatalf("retry did not create new round: %#v", started)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/999999/retry", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/999999/retry", nil)
 	out = httptest.NewRecorder()
 	fixture.mux.ServeHTTP(out, req)
 	if out.Code != http.StatusNotFound {
@@ -633,13 +641,13 @@ func TestAPIRetryStorageReplacementRejectsPermanentTargetConflict(t *testing.T) 
 		t.Fatalf("failure_reason = %q, want %q", got, reason)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/"+strconv.FormatInt(created.ID, 10)+"/retry", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(fixture.replacementTaskID(t, created.ID), 10)+"/retry", nil)
 	retry := httptest.NewRecorder()
 	fixture.mux.ServeHTTP(retry, req)
 	if retry.Code != http.StatusConflict {
 		t.Fatalf("retry status = %d body=%s, want 409", retry.Code, retry.Body.String())
 	}
-	if got := decodeAPIError(t, retry)["code"]; got != storagereplacement.CodeTargetInUse {
+	if got := decodeAPIError(t, retry)["code"]; got != "task_retry_unsupported" {
 		t.Fatalf("retry code = %q, want %q", got, storagereplacement.CodeTargetInUse)
 	}
 }
@@ -694,4 +702,13 @@ func TestAPIListDataSetReplacementProvidersRejections(t *testing.T) {
 			t.Fatalf("status = %d body=%s, want 404", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+func (f *replacementAPIFixture) replacementTaskID(t *testing.T, id int64) int64 {
+	t.Helper()
+	row, err := f.srv.repos.Replacements.GetByID(t.Context(), id)
+	if err != nil || row == nil || row.TaskID == nil {
+		t.Fatalf("replacement owner = %#v %v", row, err)
+	}
+	return *row.TaskID
 }

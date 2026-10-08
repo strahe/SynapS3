@@ -68,7 +68,7 @@ func TestReadyBucketSchedulesOneSpeedTestWhenProviderBecomesAvailable(t *testing
 	if err := registry.Register(speed); err != nil {
 		t.Fatal(err)
 	}
-	service, err := taskengine.NewService(registry, repos, time.Hour)
+	service, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		t.Fatal(err)
 	}

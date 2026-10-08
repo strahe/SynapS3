@@ -154,7 +154,7 @@ func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
 	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: "failed again"}); err != nil {
 		t.Fatal(err)
 	}
-	evict, _, err := repos.Tasks.Enqueue(ctx, &model.Task{Type: model.TaskTypeCacheEvict, IdempotencyKey: "retry-race-evict", InputVersion: 1, Input: []byte(`{}`), InputHash: "evict"})
+	evict, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeCacheEvict, IdempotencyKey: "retry-race-evict", InputVersion: 1, Input: []byte(`{}`), InputHash: "evict"}))
 	if err != nil {
 		t.Fatal(err)
 	}

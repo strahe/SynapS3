@@ -753,8 +753,6 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "task concurrency", envName: "SYNAPS3_WORKER_TASKS_CONCURRENCY", payload: `{"worker":{"tasks":{"concurrency":2}}}`, field: "worker.tasks.concurrency"},
 		{name: "task poll interval", envName: "SYNAPS3_WORKER_TASKS_POLL_INTERVAL", payload: `{"worker":{"tasks":{"poll_interval":"9s"}}}`, field: "worker.tasks.poll_interval"},
 		{name: "task lease duration", envName: "SYNAPS3_WORKER_TASKS_LEASE_DURATION", payload: `{"worker":{"tasks":{"lease_duration":"9m"}}}`, field: "worker.tasks.lease_duration"},
-		{name: "task max retries", envName: "SYNAPS3_WORKER_TASKS_MAX_RETRIES", payload: `{"worker":{"tasks":{"max_retries":9}}}`, field: "worker.tasks.max_retries"},
-		{name: "task retention", envName: "SYNAPS3_WORKER_TASKS_RETENTION", payload: `{"worker":{"tasks":{"retention":"72h"}}}`, field: "worker.tasks.retention"},
 		{name: "provider mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"provider_mutation_concurrency":2}}}`, field: "worker.tasks.provider_mutation_concurrency"},
 		{name: "destructive mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"destructive_mutation_concurrency":2}}}`, field: "worker.tasks.destructive_mutation_concurrency"},
 		{name: "commit max pieces", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", payload: `{"worker":{"tasks":{"commit_max_pieces":16}}}`, field: "worker.tasks.commit_max_pieces"},
@@ -805,7 +803,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"server":{"port":"not-a-port"},
 		"s3":{"region":""},
 		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","default_copies":0},
-		"worker":{"tasks":{"max_retries":-1}},
+		"worker":{"tasks":{"concurrency":0}},
 		"logging":{"level":"verbose","format":"xml","s3_access":{"level":"verbose"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -822,7 +820,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"s3.region",
 		"filecoin.rpc_url",
 		"filecoin.default_copies",
-		"worker.tasks.max_retries",
+		"worker.tasks.concurrency",
 		"logging.level",
 		"logging.format",
 		"logging.s3_access.level",

@@ -1,112 +1,22 @@
 package repository_test
 
 import (
-	"context"
 	"errors"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
 
-type taskGCSelectionBarrier struct {
-	selected chan struct{}
-	release  chan struct{}
-	once     sync.Once
-}
-
-func (b *taskGCSelectionBarrier) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
-	return ctx
-}
-
-func (b *taskGCSelectionBarrier) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
-	query := strings.ToLower(event.Query)
-	if event.Err != nil || event.Operation() != "SELECT" ||
-		!strings.Contains(query, "retention_until is not null") ||
-		!strings.Contains(query, "not exists") {
-		return
-	}
-	b.once.Do(func() {
-		close(b.selected)
-		select {
-		case <-b.release:
-		case <-ctx.Done():
-		}
-	})
-}
-
-func TestTaskGCDoesNotDeleteTaskRecoveredAfterSelection(t *testing.T) {
-	db := testutil.NewTestFileDB(t)
-	db.SetMaxOpenConns(2)
-	repos := repository.NewRepositories(db)
-	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
-		Type: "gc_race", IdempotencyKey: "recover-after-selection", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "test", Status: model.TaskStatusPending,
-		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
-	if err != nil || !created {
-		t.Fatalf("enqueue task = %#v created=%v err=%v", taskRow, created, err)
-	}
-	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
-	if err != nil || claimed == nil {
-		t.Fatalf("claim task = %#v err=%v", claimed, err)
-	}
-	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-	}); err != nil {
-		t.Fatalf("fail task: %v", err)
-	}
-	if err := repos.Tasks.AcknowledgeFailed(t.Context(), taskRow.ID, time.Hour); err != nil {
-		t.Fatalf("acknowledge task: %v", err)
-	}
-	if _, err := db.NewRaw(`UPDATE tasks SET retention_until = ? WHERE id = ?`, time.Now().Add(-time.Minute), taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("expire task retention: %v", err)
-	}
-
-	barrier := &taskGCSelectionBarrier{selected: make(chan struct{}), release: make(chan struct{})}
-	db.AddQueryHook(barrier)
-	type gcResult struct {
-		deleted int
-		err     error
-	}
-	result := make(chan gcResult, 1)
-	go func() {
-		deleted, deleteErr := repos.Tasks.DeleteRetained(context.Background(), time.Now(), 10)
-		result <- gcResult{deleted: deleted, err: deleteErr}
-	}()
-	select {
-	case <-barrier.selected:
-	case <-time.After(time.Second):
-		close(barrier.release)
-		t.Fatal("task GC did not reach the selection barrier")
-	}
-	if err := repos.Tasks.RetryFailed(t.Context(), taskRow.ID); err != nil {
-		close(barrier.release)
-		t.Fatalf("recover task during GC: %v", err)
-	}
-	close(barrier.release)
-	out := <-result
-	if out.err != nil || out.deleted != 0 {
-		t.Fatalf("task GC result = deleted:%d err:%v", out.deleted, out.err)
-	}
-	stored, err := repos.Tasks.GetByID(t.Context(), taskRow.ID)
-	if err != nil || stored == nil || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover {
-		t.Fatalf("recovered task = %#v err=%v", stored, err)
-	}
-}
-
 func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key string, lease time.Duration) *model.Task {
 	t.Helper()
-	if _, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: "repository_test", IdempotencyKey: key, InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	}); err != nil || !created {
+	})); err != nil || !created {
 		t.Fatalf("enqueue task %s: created=%v err=%v", key, created, err)
 	}
 	claimed, err := repos.Tasks.ClaimNext(t.Context(), lease)
@@ -124,11 +34,11 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	t.Helper()
 	ctx := t.Context()
 	repos := repository.NewRepositories(db)
-	row, _, err := repos.Tasks.Enqueue(ctx, &model.Task{
+	row, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 		Type: model.TaskTypeUploadPlan, IdempotencyKey: "claim-timing", InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", AvailableAt: time.Now(),
 		WaitReason: new("resource"), StatusMessage: new("Old wait"), LastError: new("Old error"),
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,22 +84,19 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	if err := repos.Tasks.Settle(ctx, row.ID, recovered.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.Tasks.RetryFailed(ctx, row.ID); err != nil {
+
+	stored, err := repos.Tasks.GetByID(ctx, row.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	child := repositorySuccessor(t, repos, stored, false)
 	retried := claim()
-	if retried.WorkStartedAt == nil || !retried.WorkStartedAt.Equal(actual) {
-		t.Fatalf("manual retry reset work start: %#v", retried)
+	if retried.ID != child.ID || retried.WorkStartedAt != nil || retried.RetryCount != 0 {
+		t.Fatalf("successor retained previous work start or budget: %#v", retried)
 	}
-	if err := repos.Tasks.Settle(ctx, row.ID, retried.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repos.Tasks.ReactivateTerminal(ctx, row.ID); err != nil {
-		t.Fatal(err)
-	}
-	reactivated := claim()
-	if reactivated.WorkStartedAt != nil {
-		t.Fatalf("new activation retained previous work start: %#v", reactivated)
+	original, err := repos.Tasks.GetByID(ctx, row.ID)
+	if err != nil || original.Status != model.TaskStatusFailed || original.WorkStartedAt == nil || !original.WorkStartedAt.Equal(actual) {
+		t.Fatalf("retry changed original timing: %#v, %v", original, err)
 	}
 }
 
@@ -227,7 +134,7 @@ func TestListKeepsCheckpointForRetryChecks(t *testing.T) {
 	if err != nil || len(page.Tasks) != 1 {
 		t.Fatalf("List = %#v, err=%v", page, err)
 	}
-	if listed := page.Tasks[0]; string(listed.Checkpoint) != `{"attempted":true}` || len(listed.Input) != 0 {
+	if listed := page.Tasks[0]; string(listed.Checkpoint) != `{"attempted":true}` || string(listed.Input) != `{}` {
 		t.Fatalf("listed checkpoint = %s, input = %s", listed.Checkpoint, listed.Input)
 	}
 }
@@ -241,11 +148,11 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 	ctx := t.Context()
 	seedFailed := func(key string, taskType model.TaskType, failedAt time.Time) int64 {
 		t.Helper()
-		row, created, err := repos.Tasks.Enqueue(ctx, &model.Task{
+		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 			Type: taskType, IdempotencyKey: key, InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		})
+		}))
 		if err != nil || !created {
 			t.Fatalf("enqueue %s: created=%v err=%v", key, created, err)
 		}
@@ -269,13 +176,13 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 	otherType := seedFailed("bulk-other-type", model.TaskTypeCacheEvict, cutoff.Add(-time.Minute))
 	afterCutoff := seedFailed("bulk-after-cutoff", model.TaskTypeStorageStore, cutoff.Add(time.Minute))
 	alreadyDismissed := seedFailed("bulk-already-dismissed", model.TaskTypeStorageStore, cutoff.Add(-time.Minute))
-	if err := repos.Tasks.AcknowledgeFailed(ctx, alreadyDismissed, time.Hour); err != nil {
+	if err := repos.Tasks.AcknowledgeFailed(ctx, alreadyDismissed); err != nil {
 		t.Fatalf("AcknowledgeFailed: %v", err)
 	}
 
 	count, err := repos.Tasks.AcknowledgeFailedMatching(ctx, repository.TaskAcknowledgeFilter{
 		Type: model.TaskTypeStorageStore, FailedBefore: cutoff,
-	}, time.Hour)
+	})
 	if err != nil || count != 1 {
 		t.Fatalf("AcknowledgeFailedMatching = %d, err=%v, want 1", count, err)
 	}
@@ -295,9 +202,7 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 		if (stored.AcknowledgedAt != nil) != check.dismissed {
 			t.Fatalf("%s dismissed = %v, want %v", check.what, stored.AcknowledgedAt != nil, check.dismissed)
 		}
-		if check.dismissed && stored.RetentionUntil == nil {
-			t.Fatalf("%s was dismissed without a retention deadline", check.what)
-		}
+
 	}
 }
 

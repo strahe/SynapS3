@@ -28,7 +28,7 @@ func TestProviderSelectionIgnoresRetiredLoadAndOldURLSpeed(t *testing.T) {
 	if _, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 0}); err != nil {
 		t.Fatal(err)
 	}
-	row, _, err := repos.Tasks.Enqueue(ctx, &model.Task{Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: "selection-speed", InputVersion: 1, Input: []byte(`{}`), InputHash: "selection-speed", Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now()})
+	row, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: "selection-speed", InputVersion: 1, Input: []byte(`{}`), InputHash: "selection-speed", Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now()}))
 	if err != nil {
 		t.Fatal(err)
 	}

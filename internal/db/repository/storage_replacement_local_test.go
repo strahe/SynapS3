@@ -33,7 +33,7 @@ func localReplacementSource(t *testing.T, db *bun.DB, name string) (*repository.
 func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int64) *model.Task {
 	t.Helper()
 	key := fmt.Sprintf("local-ensure/%d", dataSetID)
-	row, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key})
+	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int
 func localCoordinatorTask(t *testing.T, repos *repository.Repositories, row *storagereplacement.Replacement) *model.Task {
 	t.Helper()
 	key := fmt.Sprintf("local-coordinate/%d/%d", row.ID, row.TaskGeneration)
-	coordinator, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key})
+	coordinator, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +388,7 @@ func replacementUploadWakeScope(t *testing.T, db *bun.DB) {
 		}
 		subjectType, subjectKey := string(model.TaskSubjectStorageContent), fmt.Sprint(content.ID)
 		input := json.RawMessage(fmt.Sprintf(`{"content_id":%d}`, content.ID))
-		row, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(content.ID), InputVersion: 1, Input: input, InputHash: c.name, SubjectType: &subjectType, SubjectKey: &subjectKey})
+		row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(content.ID), InputVersion: 1, Input: input, InputHash: c.name, SubjectType: &subjectType, SubjectKey: &subjectKey}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -470,11 +470,11 @@ func rejectedLocalTargetCanBeReplacedAgain(t *testing.T, db *bun.DB) {
 	if err != nil || count != 2 {
 		t.Fatalf("successor copies=%d err=%v", count, err)
 	}
-	if _, err := db.NewRaw("UPDATE tasks SET acknowledged_at = ?, retention_until = ? WHERE id = ?", time.Now().Add(-time.Hour), time.Now().Add(-time.Minute), ensure.ID).Exec(t.Context()); err != nil {
+	if _, err := db.NewRaw("UPDATE tasks SET acknowledged_at = ? WHERE id = ?", time.Now().Add(-time.Hour), ensure.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repos.Tasks.DeleteRetained(t.Context(), time.Now(), 128); err != nil {
-		t.Fatal(err)
+	if stored, err := repos.Tasks.GetByID(t.Context(), ensure.ID); err != nil || stored == nil {
+		t.Fatalf("task history missing: %#v, %v", stored, err)
 	}
 	kept, err := repos.Contents.GetDataSetBindingByID(t.Context(), refused.ID)
 	if err != nil {

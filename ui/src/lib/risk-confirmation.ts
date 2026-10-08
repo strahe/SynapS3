@@ -170,22 +170,6 @@ export function collectSettingsRiskChanges(
     'medium',
     'Changes how quickly interrupted work can be recovered.'
   )
-  if (next.worker.tasks.max_retries > initial.worker.tasks.max_retries) {
-    addChanged(
-      'worker.tasks.max_retries',
-      initial.worker.tasks.max_retries,
-      next.worker.tasks.max_retries,
-      'medium',
-      'Increases automatic recovery attempts for failed background work.'
-    )
-  }
-  addChanged(
-    'worker.tasks.retention',
-    initial.worker.tasks.retention,
-    next.worker.tasks.retention,
-    'medium',
-    'Changes how long finished background operations remain visible.'
-  )
   if (next.worker.tasks.provider_mutation_concurrency > initial.worker.tasks.provider_mutation_concurrency) {
     addChanged(
       'worker.tasks.provider_mutation_concurrency',

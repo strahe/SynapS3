@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
-import { ChevronLeft, ChevronRight, Eye, Layers, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Eye, Layers, Loader2, RefreshCw } from 'lucide-react'
 import { type ReactNode, useRef, useState } from 'react'
 
 import { api, type CommitBatch, type CommitBatchDetails, type CommitBatchStatus } from '@/api/client'
@@ -8,6 +8,7 @@ import { CopyableValue } from '@/components/app/CopyableValue'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
+import { RetryButton } from '@/components/tasks/RetryButton'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -62,7 +63,6 @@ function CommitBatchesPage() {
       void refresh()
     },
   })
-  const recover = useMutation({ mutationFn: api.retryTask, onSuccess: refresh })
   const requestSeal = (batch: CommitBatch) => {
     seal.mutate(batch.request_id)
   }
@@ -197,7 +197,6 @@ function CommitBatchesPage() {
                         aria-label={`Details for batch ${batch.request_id}`}
                         onClick={() => {
                           setSelected(batch.request_id)
-                          recover.reset()
                         }}
                       >
                         <Eye data-icon="inline-start" />
@@ -251,7 +250,6 @@ function CommitBatchesPage() {
         onOpenChange={(open) => {
           if (!open) {
             setSelected(null)
-            recover.reset()
           }
         }}
       >
@@ -362,23 +360,7 @@ function CommitBatchesPage() {
                       <div className="flex flex-col gap-2">
                         <div className="flex flex-wrap items-center gap-2">
                           {sealButton(detail.data)}
-                          {detail.data.task?.retryable && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={recover.isPending}
-                              onClick={() => {
-                                if (detail.data.task) recover.mutate(detail.data.task.id)
-                              }}
-                            >
-                              {recover.isPending ? (
-                                <Loader2 data-icon="inline-start" className="animate-spin" />
-                              ) : (
-                                <RotateCcw data-icon="inline-start" />
-                              )}
-                              Recover
-                            </Button>
-                          )}
+                          {detail.data.task?.retryable && <RetryButton taskID={detail.data.task.retry_task_id} />}
                         </div>
                         {detail.data.can_seal && (
                           <p className="text-xs text-muted-foreground">
@@ -391,12 +373,10 @@ function CommitBatchesPage() {
                   </>
                 )
               )}
-              {((seal.isError && seal.variables === selected) || recover.isError) && (
+              {seal.isError && seal.variables === selected && (
                 <Alert variant="destructive">
                   <AlertTitle>Couldn't complete the action</AlertTitle>
-                  <AlertDescription>
-                    {(recover.error ?? seal.error)?.message ?? 'Refresh and try again.'}
-                  </AlertDescription>
+                  <AlertDescription>{seal.error?.message ?? 'Refresh and try again.'}</AlertDescription>
                 </Alert>
               )}
             </div>

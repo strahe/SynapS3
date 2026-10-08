@@ -128,12 +128,25 @@ export function useObjectProvenance(name: string, versionId: string, enabled = t
   })
 }
 
-export function useRetryStorageCopy() {
+export function useRetryTask() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: api.retryStorageCopy,
+    mutationFn: api.retryTask,
     onSettled: () => {
-      for (const key of ['tasks', 'taskStats', 'objectProvenance', 'objects']) {
+      for (const key of [
+        'tasks',
+        'taskStats',
+        'objectProvenance',
+        'objects',
+        'bucket',
+        'observabilityProviders',
+        'replacementProviders',
+        'commitBatch',
+        'commitBatches',
+        'task',
+        'taskHistory',
+        'taskEvents',
+      ]) {
         qc.invalidateQueries({ queryKey: [key] })
       }
     },
@@ -284,19 +297,6 @@ export function useRefreshProviderTiers() {
       qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
       qc.invalidateQueries({ queryKey: ['bucket'] })
       qc.invalidateQueries({ queryKey: ['objectProvenance'] })
-    },
-  })
-}
-
-export function useRetryProviderReplacement() {
-  const qc = useQueryClient()
-
-  return useMutation({
-    mutationFn: ({ replacementID }: { bucket: string; replacementID: number }) =>
-      api.retryProviderReplacement(replacementID),
-    onSuccess: (_, variables) => {
-      qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
-      qc.invalidateQueries({ queryKey: ['tasks'] })
     },
   })
 }

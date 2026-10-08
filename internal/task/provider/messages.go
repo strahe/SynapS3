@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -21,9 +22,23 @@ func NewBucketReadySubscriber(deps BucketReadyDependencies) (taskengine.MessageH
 		if !ok || input.BucketID <= 0 {
 			return errors.New("invalid bucket readiness message")
 		}
-		refresh, err := tx.Tasks.GetByIdentity(ctx, model.TaskTypeObservabilityRefresh, "system:observability-refresh")
+		const scheduleKey = "system:observability-refresh"
+		schedule, err := tx.TaskSchedules.GetForUpdate(ctx, scheduleKey)
+		if err != nil {
+			return err
+		}
+		if schedule == nil {
+			return tx.TaskSchedules.Ensure(ctx, scheduleKey, time.Now().UTC())
+		}
+		if schedule.LatestTaskID == nil {
+			return nil
+		}
+		refresh, err := tx.Tasks.GetByID(ctx, *schedule.LatestTaskID)
 		if err != nil || refresh == nil {
 			return err
+		}
+		if refresh.Status != model.TaskStatusPending && refresh.Status != model.TaskStatusRunning {
+			return tx.TaskSchedules.ScheduleNext(ctx, scheduleKey, refresh.ID, time.Now().UTC())
 		}
 		_, err = deps.Scheduler.WakeInTransaction(ctx, tx, []int64{refresh.ID}, taskengine.WakePendingFilter{Types: []model.TaskType{model.TaskTypeObservabilityRefresh}})
 		return err

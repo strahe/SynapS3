@@ -27,16 +27,16 @@ test('task subject lookup encodes its identity and forwards cancellation', async
   assert.equal(request.signal, controller.signal)
 })
 
-test('replica retry starts new work for the copy', async () => {
+test('task retry creates a successor', async () => {
   const originalFetch = globalThis.fetch
   let request: { url?: string; method?: string; body?: BodyInit | null } = {}
   globalThis.fetch = (async (input, init) => {
     request = { url: String(input), method: init?.method, body: init?.body }
-    return new Response(JSON.stringify({ copy_id: 12, task_id: 34 }), { status: 202 })
+    return new Response(JSON.stringify({ task_id: 34 }), { status: 202 })
   }) as typeof fetch
   try {
-    assert.deepEqual(await api.retryStorageCopy(12), { copy_id: 12, task_id: 34 })
-    assert.deepEqual(request, { url: '/api/v1/storage-copies/12/retry', method: 'POST', body: undefined })
+    assert.deepEqual(await api.retryTask(12), { task_id: 34 })
+    assert.deepEqual(request, { url: '/api/v1/tasks/12/retry', method: 'POST', body: undefined })
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -88,7 +88,7 @@ function installFakeXMLHttpRequest() {
   }
 }
 
-test('bulk task dismissal posts the operation filter and the cutoff', async () => {
+test('bulk task acknowledgement posts the operation filter and the cutoff', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ url: string; method?: string; body?: BodyInit | null }> = []
   globalThis.fetch = (async (input, init) => {

@@ -61,6 +61,8 @@ func runtimePersistentModels() []any {
 	return []any{
 		(*model.Task)(nil),
 		(*model.TaskPayload)(nil),
+		(*model.TaskEvent)(nil),
+		(*model.TaskSchedule)(nil),
 		(*model.S3Account)(nil),
 		(*model.Bucket)(nil),
 		(*model.BucketReplicaSlot)(nil),
@@ -163,10 +165,16 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 	if len(actual) != len(table.Fields) {
 		t.Errorf("%s column count = %d, runtime fields = %d", table.Name, len(actual), len(table.Fields))
 	}
-	limit := min(len(actual), len(table.Fields))
-	for i := range limit {
-		field := table.Fields[i]
-		got := actual[i]
+	byName := make(map[string]appliedColumn, len(actual))
+	for _, column := range actual {
+		byName[column.Name] = column
+	}
+	for i, field := range table.Fields {
+		got, exists := byName[field.Name]
+		if !exists {
+			t.Errorf("%s missing runtime column %s", table.Name, field.Name)
+			continue
+		}
 		want := appliedColumn{
 			Name:       field.Name,
 			Type:       normalizedSQLType(field.CreateTableSQLType),

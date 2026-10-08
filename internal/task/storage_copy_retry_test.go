@@ -26,6 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -113,7 +114,7 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 			t.Error("admin server did not stop")
 		}
 	}()
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://%s/api/v1/storage-copies/%d/retry", listener.Addr(), pipeline.target.ID), nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://%s/api/v1/tasks/%d/retry", listener.Addr(), old.ID), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,13 +128,12 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 		t.Fatalf("retry status=%d body=%s", response.StatusCode, body)
 	}
 	var accepted struct {
-		CopyID int64 `json:"copy_id"`
 		TaskID int64 `json:"task_id"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
 		t.Fatal(err)
 	}
-	if accepted.CopyID != pipeline.target.ID || accepted.TaskID == 0 || accepted.TaskID == old.ID {
+	if accepted.TaskID == 0 || accepted.TaskID == old.ID {
 		t.Fatalf("recovery work=%+v", accepted)
 	}
 	waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
@@ -149,7 +149,7 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 		t.Fatalf("retry did not rotate source: %+v", attempts)
 	}
 	history, err := runtime.repos.Tasks.GetByID(t.Context(), old.ID)
-	if err != nil || history.Status != model.TaskStatusFailed || history.AcknowledgedAt == nil || !bytes.Equal(history.Checkpoint, failed.Checkpoint) {
+	if err != nil || history.Status != model.TaskStatusFailed || history.AcknowledgedAt != nil || history.SupersededAt == nil || !bytes.Equal(history.Checkpoint, failed.Checkpoint) {
 		t.Fatalf("history=%+v err=%v", history, err)
 	}
 }
@@ -170,7 +170,7 @@ func TestConfirmedPullDependencyFailureRetainsAttempt(t *testing.T) {
 	runtime.repos.Contents = failedPullCacheDependency{runtime.repos.Contents}
 	result := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
 	attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.upload.ID, pipeline.target.StorageDataSetID)
-	if err != nil || attempt.ResolvedAt != nil || result.FailureReason == nil || *result.FailureReason != storagepull.FailureOutcomeUnknown {
+	if err != nil || attempt.ResolvedAt != nil || result.FailureReason == nil || *result.FailureReason != "attempts_exhausted" {
 		t.Fatalf("failure=%+v attempt=%+v err=%v", result, attempt, err)
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -235,8 +235,15 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 		t.Run(fmt.Sprintf("ready-continuation=%v", readyContinuation), func(t *testing.T) {
 			client := &testutil.MockStorageClient{}
 			nonces := &testutil.MockCommitNonces{}
+			var pulls, stores atomic.Int64
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 				storage: client, policy: cache.EvictionPolicyNone, commitNonces: nonces, commitMaxPieces: 1,
+				parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+					if stores.Load() > 0 {
+						return synapse.ParkedPieceReady, nil
+					}
+					return synapse.ParkedPieceMissing, nil
+				}),
 			})
 			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 			payload := bytes.Repeat([]byte("r"), int(pipeline.upload.ContentSize))
@@ -259,7 +266,6 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 				return io.NopCloser(bytes.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
 			}
 			provider := newRegistrationProvider(t, pipeline.target.ProviderID.SDK(), pipeline.targetSet.DataSetID.SDK(), pipeline.targetClient, nonces)
-			var pulls, stores atomic.Int64
 			provider.target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 				pulls.Add(1)
 				return pullStatusResult(request, storage.PullStatusFailed), nil
@@ -305,7 +311,23 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 			} else {
 				row = bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
 			}
-			cancel, done := runHandlerEngine(t, runtime)
+			prepareHandlerTaskFixtures(t, runtime)
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+				ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+				OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
+					if claimed.Type == model.TaskTypeStorageStore && transition.Status == model.TaskStatusPending && stores.Load() > 0 {
+						// Advance the parking poll after submission without waiting for the production interval.
+						if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now()).Where("id = ? AND status = ?", claimed.ID, model.TaskStatusPending).Exec(t.Context()); err != nil {
+							t.Errorf("advance Store observation: %v", err)
+						}
+					}
+				},
+			}, runtime.repos, runtime.registry, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runEngine(t, engine)
 			defer stopHandlerEngine(t, cancel, done)
 			waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
 			waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })

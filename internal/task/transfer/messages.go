@@ -20,6 +20,9 @@ func NewStartCopyTransferReceiver(coordinator *CopyCoordinator) (taskengine.Mess
 		if !ok || request.CopyID < 1 {
 			return errors.New("invalid start copy transfer message")
 		}
+		if request.RecoveryTaskID != 0 {
+			return coordinator.enqueueRecoveryCopyTaskAt(ctx, tx, request.CopyID, request.RecoveryTaskID, request.AvailableAt)
+		}
 		return coordinator.enqueueCopyTaskAt(ctx, tx, request.CopyID, model.TaskTypeStorageTransferPlan, request.AvailableAt)
 	}, nil
 }

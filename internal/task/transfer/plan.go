@@ -10,7 +10,7 @@ import (
 )
 
 func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
-	definition := copyDefinition(model.TaskTypeStorageTransferPlan, h.retryLimit())
+	definition := copyDefinition(model.TaskTypeStorageTransferPlan)
 	definition.WorkStart = taskengine.WorkStartOnHandler
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)
@@ -31,7 +31,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 			return h.failCopyTask(execution, input, copyRow, repository.ErrNotFound, "dataset_missing")
 		}
 		if binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.IsZero() {
-			return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "dataset", "Waiting for storage service", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "dataset", "Waiting for storage service", nil)
 		}
 		unreferenced, err := h.CopyCoordinator.deps.Repositories.Objects.ContentIsUnreferenced(ctx, copyRow.ContentID)
 		if err != nil {
@@ -59,7 +59,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 				return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
 			}
 			if !migration {
-				return taskengine.Suspend(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
+				return taskengine.Wait(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
 			}
 			available, err := copyCacheAvailable(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Cache, copyRow)
 			if err != nil {
@@ -72,7 +72,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 		default:
 			// A method this version does not know may not be a store, so the
 			// copy waits instead of being uploaded.
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "transfer_method",
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "transfer_method",
 				"Waiting for a newer version that supports this copy's transfer method", nil)
 		}
 		available, err := copyCacheAvailable(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Cache, copyRow)
@@ -92,7 +92,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 			}
 			return taskengine.Fail(errors.New("stored content migration cannot read its local cache"), "migration_cache_missing", nil)
 		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for a readable storage source", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for a readable storage source", nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }

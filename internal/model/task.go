@@ -43,9 +43,9 @@ const (
 	TaskSubjectStorageCommitRequest = "storage_commit_request"
 )
 
-// RecurringSystemTaskTypes returns the perpetual maintenance task types.
+// RecurringSystemTaskTypes returns the scheduled maintenance task types.
 func RecurringSystemTaskTypes() []TaskType {
-	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeObservabilityRefresh, TaskTypeApprovedProviderRefresh, TaskTypeEndorsedProviderRefresh, TaskTypeGC}
+	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeObservabilityRefresh, TaskTypeApprovedProviderRefresh, TaskTypeEndorsedProviderRefresh}
 }
 
 // IsRecurringSystem reports whether the task is a perpetual maintenance loop
@@ -73,23 +73,28 @@ const (
 	TaskResumeModeRecover TaskResumeMode = "recover"
 )
 
-// Task is a reclaimable execution record. Domain tables retain durable safety
-// evidence independently of this row.
+// Task is a permanently retained execution round. Domain tables own external
+// effect safety independently of its execution history.
 type Task struct {
 	bun.BaseModel `bun:"table:tasks"`
 
-	ID             int64    `bun:",pk,autoincrement,identity"`
-	Type           TaskType `bun:"type:text,notnull"`
-	IdempotencyKey string   `bun:"type:text,notnull"`
-	InputVersion   int      `bun:"type:integer,notnull"`
-	InputHash      string   `bun:"type:text,notnull"`
-	SubjectType    *string  `bun:"type:text,nullzero"`
-	SubjectKey     *string  `bun:"type:text,nullzero"`
+	ID             int64      `bun:",pk,autoincrement,identity"`
+	Type           TaskType   `bun:"type:text,notnull"`
+	IdempotencyKey string     `bun:"type:text,notnull"`
+	InputVersion   int        `bun:"type:integer,notnull"`
+	InputHash      string     `bun:"type:text,notnull"`
+	SubjectType    *string    `bun:"type:text,nullzero"`
+	SubjectKey     *string    `bun:"type:text,nullzero"`
+	RetryOfTaskID  *int64     `bun:",nullzero"`
+	RetryGroupKey  string     `bun:"type:text,notnull"`
+	SupersededAt   *time.Time `bun:",nullzero"`
 
 	// Input and Checkpoint live in task_payloads and are projected on read, so
 	// renewing a lease never rewrites the JSON a task carries.
 	Input      json.RawMessage `bun:",scanonly"`
 	Checkpoint json.RawMessage `bun:",scanonly"`
+	Policy     json.RawMessage `bun:",scanonly"`
+	Runtime    json.RawMessage `bun:",scanonly"`
 
 	Status        TaskStatus     `bun:"type:text,notnull,default:'pending'"`
 	ResumeMode    TaskResumeMode `bun:"type:text,notnull,default:'execute'"`
@@ -109,7 +114,6 @@ type Task struct {
 	StartedAt               *time.Time `bun:",nullzero"`
 	FinishedAt              *time.Time `bun:",nullzero"`
 	AcknowledgedAt          *time.Time `bun:",nullzero"`
-	RetentionUntil          *time.Time `bun:",nullzero"`
 	CreatedAt               time.Time  `bun:",nullzero,notnull"`
 	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
 	WorkStartedAt           *time.Time `bun:",nullzero"`
@@ -124,6 +128,32 @@ type TaskPayload struct {
 	TaskID     int64           `bun:",pk"`
 	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
 	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
+	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
+	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
+}
+
+// TaskRuntime is durable admission evidence, independent of diagnostic events.
+type TaskRuntime struct {
+	OperationKey        string     `json:"operation_key,omitempty"`
+	OperationStartedAt  *time.Time `json:"operation_started_at,omitempty"`
+	LastAdmittedAttempt int        `json:"last_admitted_attempt,omitempty"`
+}
+
+type TaskEvent struct {
+	bun.BaseModel `bun:"table:task_events"`
+	TaskID        int64           `bun:",pk"`
+	Sequence      int64           `bun:",pk"`
+	Type          string          `bun:"type:text,notnull"`
+	CreatedAt     time.Time       `bun:",notnull"`
+	Details       json.RawMessage `bun:"details_json,type:jsonb,notnull"`
+}
+
+type TaskSchedule struct {
+	bun.BaseModel `bun:"table:task_schedules"`
+	Key           string    `bun:"type:text,pk"`
+	NextRunAt     time.Time `bun:",notnull"`
+	LatestTaskID  *int64    `bun:",nullzero"`
+	Generation    int64     `bun:",notnull"`
 }
 
 func (t *Task) CancellationRequested() bool {

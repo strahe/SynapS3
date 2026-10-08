@@ -29,11 +29,11 @@ func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
 	input := json.RawMessage(`{}`)
 	sum := sha256.Sum256(input)
 	for index := range taskCount {
-		if _, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskType("postgres_claim_test"), IdempotencyKey: fmt.Sprintf("claim-%d", index),
 			InputVersion: 1, Input: input, InputHash: hex.EncodeToString(sum[:]),
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		}); err != nil || !created {
+		})); err != nil || !created {
 			t.Fatalf("enqueue task %d: created=%t err=%v", index, created, err)
 		}
 	}
@@ -79,17 +79,25 @@ func TestPostgresTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T) {
 	assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t, newPostgresTaskDB(t))
 }
 
+func TestPostgresTaskOperationAdmissionAndRollback(t *testing.T) {
+	assertTaskOperationAdmissionAndRollback(t, newPostgresTaskDB(t))
+}
+
+func TestPostgresTaskEventsAreBoundedAndTransactional(t *testing.T) {
+	assertTaskEventsAreBoundedAndTransactional(t, newPostgresTaskDB(t))
+}
+
 func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T) {
 	db := newPostgresTaskDB(t)
 	repos := repository.NewRepositories(db)
 	availableAt := time.Now().Add(-time.Minute)
 	for index := range 2 {
-		if _, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskType("postgres_skip_locked_test"), IdempotencyKey: fmt.Sprintf("claim-%d", index),
 			InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: fmt.Sprintf("hash-%d", index),
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: availableAt.Add(time.Duration(index) * time.Second),
-		}); err != nil || !created {
+		})); err != nil || !created {
 			t.Fatalf("enqueue task %d: created=%t err=%v", index, created, err)
 		}
 	}

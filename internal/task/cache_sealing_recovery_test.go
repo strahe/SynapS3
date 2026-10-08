@@ -93,18 +93,18 @@ func TestSealIntentAndCachePressureSurviveRuntimeRestart(t *testing.T) {
 				t.Fatal("invalid restarted cache state")
 			}
 			registry := taskengine.NewRegistry()
-			service, err := taskengine.NewService(registry, f.runtime.repos, time.Hour)
+			service, err := taskengine.NewService(registry, f.runtime.repos)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if _, err := task.Register(registry, service, task.Dependencies{
 				Repositories: repository.NewRepositories(f.runtime.db), Cache: reopened, CacheGate: f.runtime.gate, CacheTracker: f.runtime.tracker,
 				Storage: f.runtime.storage, CommitNonces: f.provider.nonces, EvictionPolicy: policy, MaxCacheBytes: 384, MaxWriteBytes: 256,
-				CommitMaxWait: 30 * time.Minute, CommitSealOnCachePressure: source == "cache pressure", DefaultCopies: 1, MaxRetries: 5, Logger: slog.Default(),
+				CommitMaxWait: 30 * time.Minute, CommitSealOnCachePressure: source == "cache pressure", DefaultCopies: 1, Logger: slog.Default(),
 			}); err != nil {
 				t.Fatal(err)
 			}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2}, f.runtime.repos, registry, slog.Default())
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2}, f.runtime.repos, registry, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -91,8 +91,8 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
-| Tasks and storage health | task retry and acknowledgement, storage provider and data set refresh | Requeues work, dismisses a reviewed failure and starts its retention period, or refreshes operational status. |
-| Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends any existing old service. |
+| Tasks and storage health | task retry and acknowledgement, storage provider and data set refresh | Creates another execution, acknowledges a reviewed failure, or refreshes operational status. |
+| Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement` | Creates a new paid storage service, moves a replica to it, and ends any existing old service. |
 
 ## Health and Metrics
 
@@ -132,8 +132,6 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | List versions affected by storage health issues. |
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | List the providers this replica can move to, and why the others cannot take it. |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
-| `POST` | `/api/v1/storage-replacements/{id}/retry` | Resume a failed or attention-holding provider replacement. |
-| `POST` | `/api/v1/storage-copies/{id}/retry` | Start recovery of a failed replica. |
 | `GET` | `/api/v1/storage-confirmations` | List storage confirmations that need operator attention. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
@@ -245,7 +243,7 @@ Replacement moves through these states:
 
 Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, `items_failed`, and `items_attention` report mutually exclusive current work counts. Confirmation work is included in `items_active`; work that needs an operator is included only in `items_attention`. Both counts remain outstanding work. `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
 
-`POST /api/v1/storage-replacements/{id}/retry` resumes a `failed` or `cleanup_attention` replacement on the same approved provider.
+Use the replacement response’s `retry_task_id` with the task Retry endpoint. It continues on the same approved provider.
 
 Choosing a different provider requires a new confirmation, and is only available while the retiring provider still holds the replica. Once the new provider has taken the replica over, each generation holds data the other does not, so confirming again on either one is refused (`replacement_source_not_current` on the old, `replacement_active` on the new) and the approved copy has to be finished with retry.
 
@@ -266,17 +264,13 @@ Manual confirmation does not check FWSS approval or whether the provider still r
 
 ### Storage confirmation attention
 
-A storage registration covers one or more pieces sent to the same data set in one signed request. When the provider rejects it, gives no reply, or still cannot be asked about it 15 minutes after it was sent, SynapS3 checks on chain whether those pieces were registered. If they were not, SynapS3 submits the original request again; the chain accepts that request only once. While the provider reports the request as pending, SynapS3 keeps waiting for it. A provider that refuses the request is asked again later, and a piece it dropped before registration is uploaded again before the whole request is sent again. When the chain shows the request's nonce already used for other pieces or another data set, a request the provider never accepted is signed again with a new nonce, while one the provider accepted stops for review.
+A storage registration covers one or more pieces sent to the same data set in one signed request. When the provider rejects it, gives no reply, or still cannot be asked about it 15 minutes after it was sent, SynapS3 checks on chain whether those pieces were registered. If they were not, SynapS3 submits the original request again; the chain accepts that request only once. While the provider reports the request as pending, SynapS3 keeps waiting for it. A provider that refuses the request is asked again later, and a piece it dropped before registration is uploaded again before the whole request is sent again. When the chain shows the request's nonce already used for other pieces or another data set, a request the provider never accepted is signed again with a new nonce, while one the provider accepted stops for review. Automatic recovery uses a finite execution budget; when it runs out, the saved registration remains available for manual Retry.
 
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists registrations that need attention, including any still unregistered after 15 minutes while SynapS3 keeps trying: the registration (`request_id`), owning task (`task_id`), provider and data set, its pieces (`piece_count`, `piece_cids`), the known transaction, the provider's reply when the submission failed (`submit_error`), `submitted_at`, `attention_at`, and stable `reason_code`. The Tasks page shows the same registrations on their Confirm storage tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; the retry only checks the chain again and completes the registration if its pieces are there. It sends nothing.
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists registrations that need attention, including any still unregistered after 15 minutes while SynapS3 keeps trying: the registration (`request_id`), owning task (`task_id`), provider and data set, its pieces (`piece_count`, `piece_cids`), the known transaction, the provider's reply when the submission failed (`submit_error`), `submitted_at`, `attention_at`, and stable `reason_code`. The Tasks page shows the same registrations on their Confirm storage tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; a new execution resumes from the saved registration evidence.
 
 ### Failed Replica Recovery
 
-`POST /api/v1/storage-copies/{id}/retry` takes no body and returns `202 {"copy_id":12,"task_id":34}` after creating recovery work. Completion is reported by the replica's `committed` status in object provenance. Starting recovery dismisses its outstanding failed tasks and retains their history.
-
-Failed Tasks items may include `copy_retry: {copy_id, available, reason_code?}`, including dismissed failures. Provenance replicas include `copy_id`, optional `last_error`, and optional `retry: {available, reason_code?}`. Both views offer **Retry replica** when available; the request rechecks current conditions.
-
-Conflicts return `409 {code, error}` with `object_deleted`, `replacement_in_progress`, `storage_service_unavailable`, `no_source`, `recovery_requires_attention`, or `copy_retry_in_progress`. Invalid IDs return `400`, unknown or inaccessible replicas return `404`, and an unavailable recovery service returns `503`. A transfer with an uncertain result keeps its existing task recovery action.
+Provenance replicas and replacement details expose `retryable` and `retry_task_id`. Use the task Retry endpoint for that ID. A missing historical task has no Retry action. A replica reaches `committed` when its recovery is complete.
 
 ## Tasks
 
@@ -284,23 +278,28 @@ Conflicts return `409 {code, error}` with `object_deleted`, `replacement_in_prog
 | --- | --- | --- |
 | `GET` | `/api/v1/tasks` | List background tasks. Supports `type`, `status`, `limit`, and ID-based `cursor`. |
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
+| `GET` | `/api/v1/tasks/{id}` | Read the task and its frozen execution policy. |
+| `GET` | `/api/v1/tasks/{id}/history` | Read its execution chain with `limit` and `cursor`. |
+| `GET` | `/api/v1/tasks/{id}/events` | Read retained key events with `limit` and `cursor`. |
 | `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | Read one task subject and its known related information. |
-| `POST` | `/api/v1/tasks/{id}/retry` | Recover a failed task when `retryable` is true. |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | Dismiss a failed task when `acknowledgeable` is true. Acknowledgement starts its retention period, after which it may be cleaned up. |
-| `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk dismissal would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
-| `POST` | `/api/v1/tasks/acknowledge` | Dismiss a backlog of failed tasks at once. Returns `acknowledged` with the number dismissed. |
+| `POST` | `/api/v1/tasks/{id}/retry` | Create a new execution when `retryable` is true. |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | Mark a failed task as viewed when `acknowledgeable` is true. Its result and history remain unchanged. |
+| `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk acknowledgement would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
+| `POST` | `/api/v1/tasks/acknowledge` | Acknowledge matching failures. Returns `acknowledged` with the number updated. |
 
-`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. A Confirm storage task whose registration needs attention also includes `storage_confirmation` with `request_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
+`POST /api/v1/tasks/{id}/retry` takes no body and returns `202 {"task_id":456}`. Automatic retries stay in the original execution; manual Retry creates a successor with a fresh policy and budget. Repeating the same request returns the same successor. Missing tasks return 404; obsolete or ineligible sources return 409.
 
-The `status` filter also accepts `dismissed`. `status=failed` returns only unacknowledged failures, while `status=dismissed` returns acknowledged failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`.
+`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`. Responses also include `operation`, optional subject identity, and server-computed `retryable`, `retry_task_id`, and `acknowledgeable` fields. A Confirm storage task whose registration needs attention also includes `storage_confirmation` with `request_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
+
+`status=failed` includes acknowledged failures. `acknowledged_at` is independent of status; task history is retained indefinitely.
 
 Subject lookup accepts `storage_content`, `storage_copy`, `storage_data_set`, `bucket`, `provider`, `storage_replacement`, `wallet_operation`, and `storage_commit_request`. Local resource keys are positive integer IDs, provider keys are decimal uint256 IDs, and registration keys are request IDs; encode each path segment separately. The response includes `subject_type`, `subject_key`, and available resource fields. `copy_index` starts at zero; `local_data_set_id` and string `data_set_id` distinguish local and on-chain datasets. A file sample has `key`, `source` (`current`, `historical`, or `deleted`), and `other_versions`. Wallet amounts remain strings in USDFC base units. Invalid parameters return `400`, unavailable subjects return `404`, and query failures return `500`. Lookup uses local records and may return partial information.
 
-`started_at` is when actual task work first began. Uploads start after waiting for storage resources and hashing the data, immediately before transfer. The field is omitted when work has not started or its start cannot be reliably determined, including tasks that finish without starting work. When a task takes over an existing operation, this time can precede its `created_at`. `started_at` and `finished_at` retain fractional seconds.
+`started_at` is when actual task work first began. Uploads start after waiting for storage resources and hashing the data, immediately before transfer. The field is omitted when work has not started or its start cannot be reliably determined, including tasks that finish without starting work. A new execution records its own actual start or recovery time. `started_at` and `finished_at` retain fractional seconds.
 
-Took measures actual start to finish, including later waits, retries, and recovery gaps. Pending and running tasks and tasks without a known start show no duration; dismissal does not change it. The Tasks page reads subjects only when their tooltip or popover opens.
+Took measures actual start to finish, including later waits, retries, and recovery gaps. Pending and running tasks and tasks without a known start show no duration; acknowledgement does not change it. The Tasks page reads subjects only when their tooltip or popover opens.
 
-Bulk dismissal takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
+Bulk acknowledgement takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
 
 ```json
 {
@@ -311,18 +310,18 @@ Bulk dismissal takes a JSON body with an optional `type` and an optional RFC 333
 
 Failures recorded after that moment stay visible, so a backlog can be cleared without hiding a failure nobody has reviewed. An unknown `type` or an unparsable `failed_before` returns `400 Bad Request`, as does a body with unknown fields, trailing content, or more than 4 KiB.
 
-To show a number before dismissing, count first and then confirm with the cutoff that count was taken at:
+To show a number before acknowledging, count first and then confirm with the cutoff that count was taken at:
 
 ```bash
 curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 # {"count":12,"as_of":"2026-09-12T08:30:00.123456789Z"}
 ```
 
-Passing that `as_of` back as `failed_before` dismisses exactly what was counted.
+Passing that `as_of` back as `failed_before` acknowledges exactly what was counted.
 
-`/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`. `tasks.attention.storage_confirmations` counts stopped storage confirmations.
+`/api/v1/overview` groups `tasks.by_status` by status. Its failed count includes acknowledged failures; `tasks.attention.failed` counts unacknowledged, unsuperseded failures.
 
-Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacement recovery remains in the Data Sets API. Wallet operations are retryable before a broadcast starts or after an internal error; a retry sends the transaction only if it was never broadcast. Storage transfer tasks that stopped because of an internal error are also retryable. Retrying an uncertain Store checks the provider and does not upload the bytes again.
+Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacements and failed speed tests use the same task Retry endpoint. Retry eligibility depends on the current operation and saved evidence; uncertain external effects are observed before any safe resend. Missing task history prevents Retry.
 
 ## Wallet and Filecoin
 
@@ -344,7 +343,7 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 | `GET` | `/api/v1/observability/data-sets` | Local data set health data, with stopped storage confirmations per listed data set in `storage_confirmations_by_data_set`. |
 | `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
 
-Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests cannot be retried through the task retry endpoint; start a new test instead. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
+Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests expose `retry_task_id` and support the same task Retry endpoint, creating a fresh measurement. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
 
 When a provider health check fails, the provider's `signal.last_error` says why: the check timed out, could not connect, was redirected, received an HTTP error status, or got a reply that is not from a PDP service.
 

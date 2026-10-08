@@ -986,7 +986,7 @@ func TestPutObjectFreezesRequestedCopiesPerContent(t *testing.T) {
 	}
 }
 
-func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
+func TestPutObjectCreatesSuccessorForTerminalUploadPlan(t *testing.T) {
 	for _, terminalStatus := range []model.TaskStatus{model.TaskStatusFailed, model.TaskStatusCancelled} {
 		t.Run(string(terminalStatus), func(t *testing.T) {
 			tb := newTestBackend(t)
@@ -1018,13 +1018,12 @@ func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
 			if terminalStatus == model.TaskStatusCancelled {
 				transition.FailureReason = nil
 				transition.LastError = nil
-				transition.RetentionUntil = new(time.Now().Add(time.Hour))
 			}
 			if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, transition); err != nil {
 				t.Fatalf("settle old upload plan: %v", err)
 			}
 			if terminalStatus == model.TaskStatusFailed {
-				if err := tb.repos.Tasks.AcknowledgeFailed(ctx, claimed.ID, time.Hour); err != nil {
+				if err := tb.repos.Tasks.AcknowledgeFailed(ctx, claimed.ID); err != nil {
 					t.Fatalf("acknowledge old upload plan: %v", err)
 				}
 			}
@@ -1034,13 +1033,13 @@ func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
 			if err != nil || secondVersion == nil || secondVersion.ContentID == nil || *secondVersion.ContentID != *version.ContentID {
 				t.Fatalf("second version = %#v, err=%v", secondVersion, err)
 			}
-			reactivated, err := tb.repos.Tasks.GetByID(ctx, taskRow.ID)
+			reactivated, err := tb.repos.Tasks.GetDirectSuccessor(ctx, taskRow.ID)
 			if err != nil || reactivated == nil {
 				t.Fatalf("reactivated task = %#v, err=%v", reactivated, err)
 			}
 			if reactivated.Status != model.TaskStatusPending || reactivated.ResumeMode != model.TaskResumeModeExecute ||
 				reactivated.RetryCount != 0 || len(reactivated.Checkpoint) != 0 || reactivated.FailureReason != nil ||
-				reactivated.CancellationRequestedAt != nil || reactivated.CancellationReason != nil || reactivated.AcknowledgedAt != nil || reactivated.RetentionUntil != nil {
+				reactivated.CancellationRequestedAt != nil || reactivated.CancellationReason != nil || reactivated.AcknowledgedAt != nil {
 				t.Fatalf("reactivated task retained terminal state: %#v", reactivated)
 			}
 		})
@@ -1065,7 +1064,7 @@ func TestPutObjectRejectsCompletedUploadPlanForCachedContent(t *testing.T) {
 		t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
 	}
 	if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatalf("complete inconsistent upload plan: %v", err)
 	}

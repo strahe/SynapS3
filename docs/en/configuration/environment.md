@@ -40,8 +40,6 @@ Configuration environment variables use the `SYNAPS3_` prefix and map underscore
 | `SYNAPS3_WORKER_TASKS_CONCURRENCY` | `worker.tasks.concurrency` |
 | `SYNAPS3_WORKER_TASKS_POLL_INTERVAL` | `worker.tasks.poll_interval` |
 | `SYNAPS3_WORKER_TASKS_LEASE_DURATION` | `worker.tasks.lease_duration` |
-| `SYNAPS3_WORKER_TASKS_MAX_RETRIES` | `worker.tasks.max_retries` |
-| `SYNAPS3_WORKER_TASKS_RETENTION` | `worker.tasks.retention` |
 | `SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY` | `worker.tasks.provider_mutation_concurrency` |
 | `SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY` | `worker.tasks.destructive_mutation_concurrency` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES` | `worker.tasks.commit_max_pieces` |

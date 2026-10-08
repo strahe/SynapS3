@@ -24,6 +24,7 @@ type CacheEvictionRepository interface {
 	NextEvictionGeneration(ctx context.Context, contentID int64) (int64, error)
 	PrepareEviction(ctx context.Context, contentID int64) (CacheEvictionReservation, error)
 	BindEvictionTask(ctx context.Context, contentID, generation, taskID int64) error
+	TransferEvictionTaskOwner(ctx context.Context, contentID, generation, oldTaskID, newTaskID int64) error
 	ListLRUCandidates(ctx context.Context, limit int) ([]cacheeviction.Candidate, error)
 	ActiveEvictionBytes(ctx context.Context) (int64, error)
 	ReclaimableLRUBytes(ctx context.Context) (int64, error)
@@ -34,6 +35,7 @@ type CacheEvictionRepository interface {
 
 	NextDurabilityGeneration(ctx context.Context, bucketID int64) (int64, error)
 	BindDurabilityTask(ctx context.Context, bucketID, generation, taskID int64) error
+	TransferDurabilityTaskOwner(ctx context.Context, bucketID, generation, oldTaskID, newTaskID int64) error
 	// NextBucketDurabilityCandidate returns the next cached content in the
 	// bucket that now satisfies the bucket's minimum durability. It no longer
 	// promotes any lifecycle state: pipeline position is derived from the copy
@@ -107,7 +109,7 @@ func (r *BunCacheEvictionRepo) PrepareEviction(ctx context.Context, contentID in
 	if err != nil {
 		return CacheEvictionReservation{}, fmt.Errorf("loading active cache eviction task: %w", err)
 	}
-	if taskRow.Status == model.TaskStatusPending || taskRow.Status == model.TaskStatusRunning {
+	if taskRow.Status == model.TaskStatusPending || taskRow.Status == model.TaskStatusRunning || taskRow.Status == model.TaskStatusFailed {
 		expectedSubjectKey := strconv.FormatInt(contentID, 10)
 		var taskInput cacheeviction.EvictInput
 		inputErr := json.Unmarshal(taskRow.Input, &taskInput)
@@ -188,7 +190,7 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int)
 		ColumnExpr("storage_content.bucket_id").
 		ColumnExpr("storage_content.content_size").
 		ColumnExpr("object_cache.cache_accessed_at").
-		Where("object_cache.cache_active_task_id IS NULL").
+		Where("object_cache.cache_active_task_id IS NULL OR object_cache.cache_active_task_id IN (SELECT id FROM tasks WHERE status = ? AND type = ?)", model.TaskStatusFailed, model.TaskTypeCacheEvict).
 		Where("object_cache.cache_accessed_at IS NOT NULL").
 		OrderExpr("object_cache.cache_accessed_at, object_cache.content_id")
 	if limit > 0 {

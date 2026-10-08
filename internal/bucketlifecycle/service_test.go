@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -28,18 +27,17 @@ func (provisionTestHandler) Recover(context.Context, taskengine.Execution) taske
 func newLifecycleTestService(t *testing.T, repos *repository.Repositories, c *testutil.MockCache, logger *slog.Logger) *Service {
 	t.Helper()
 	registry := taskengine.NewRegistry()
-	retryLimit := 5
 	err := registry.Register(provisionTestHandler{definition: taskengine.Definition{
 		Type: model.TaskTypeBucketProvision, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
 		Codec: taskengine.StrictJSONCodec(func(input *ProvisionInput) error {
 			return ValidateProvisionInput(*input)
 		}),
-		RetryLimit: &retryLimit, AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}})
 	if err != nil {
 		t.Fatalf("register bucket provision handler: %v", err)
 	}
-	tasks, err := taskengine.NewService(registry, repos, 7*24*time.Hour)
+	tasks, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		t.Fatalf("create task service: %v", err)
 	}
@@ -180,7 +178,7 @@ func TestServiceCreateReturnsErrorWhenBucketCreateFails(t *testing.T) {
 func TestServiceCreateRollsBackBucketWhenProvisionTaskCannotBeEnqueued(t *testing.T) {
 	repos := testutil.NewTestRepos(t)
 	registry := taskengine.NewRegistry()
-	tasks, err := taskengine.NewService(registry, repos, time.Hour)
+	tasks, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		t.Fatalf("create task service: %v", err)
 	}

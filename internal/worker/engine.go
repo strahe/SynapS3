@@ -24,7 +24,6 @@ type EngineConfig struct {
 	Concurrency                    int
 	PollInterval                   time.Duration
 	LeaseDuration                  time.Duration
-	Retention                      time.Duration
 	ProviderMutationConcurrency    int
 	DestructiveMutationConcurrency int
 	OnTaskSettled                  func(*model.Task, repository.TaskTransition)
@@ -66,7 +65,7 @@ type recoveryRequest struct {
 
 func NewEngine(config EngineConfig, repos *repository.Repositories, registry *Registry, logger *slog.Logger) (*Engine, error) {
 	if config.Concurrency < 1 || config.PollInterval <= 0 || config.LeaseDuration <= config.PollInterval ||
-		config.Retention <= 0 || config.ProviderMutationConcurrency < 1 || config.DestructiveMutationConcurrency < 1 {
+		config.ProviderMutationConcurrency < 1 || config.DestructiveMutationConcurrency < 1 {
 		return nil, errors.New("invalid task engine configuration")
 	}
 	if repos == nil || repos.Tasks == nil || registry == nil {
@@ -90,7 +89,6 @@ func NewEngine(config EngineConfig, repos *repository.Repositories, registry *Re
 		recoveryWake:          make(chan struct{}, 1),
 		settlementRetryDelays: []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second},
 		renewalRetryDelays:    []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second},
-		retryDelay:            defaultRetryDelay,
 		resourceWaitDelay:     defaultResourceWaitDelay,
 		resourceWaits:         make(map[int64]int),
 	}, nil
@@ -104,6 +102,10 @@ func (e *Engine) Healthy() bool {
 }
 
 func (e *Engine) Run(ctx context.Context) error {
+	service, _ := NewService(e.registry, e.repos)
+	if err := service.bootstrap(ctx); err != nil {
+		return err
+	}
 	var workers sync.WaitGroup
 	for range e.config.Concurrency {
 		workers.Go(func() {
@@ -112,6 +114,16 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	workers.Go(func() {
 		e.runRecoveryQueue(ctx)
+	})
+	workers.Go(func() {
+		for ctx.Err() == nil {
+			if err := service.dispatchSchedules(ctx); err != nil {
+				e.logger.Error("dispatching task schedules", "error", err)
+			}
+			if !sleepContext(ctx, e.config.PollInterval) {
+				return
+			}
+		}
 	})
 	workers.Wait()
 	return nil
@@ -158,6 +170,26 @@ func (e *Engine) executeClaimSafely(parent context.Context, claimed *model.Task)
 
 func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	logger := e.logger.With("task_id", claimed.ID, "task_type", claimed.Type, "claim_generation", claimed.ClaimGeneration)
+	if claimed.Type == model.TaskTypeGC || legacyPolicy(claimed) {
+		service, _ := NewService(e.registry, e.repos)
+		if err := service.handoff(parent, claimed); err != nil {
+			logger.Error("handing off legacy task", "error", err)
+			if errors.Is(err, errInvalidLegacyTask) {
+				if e.commitResult(parent, claimed, Fail(err, "invalid_legacy_task", nil)) == nil {
+					return
+				}
+			}
+			e.abandonClaim(claimed)
+		}
+		return
+	}
+	policy, policyErr := DecodePolicy(claimed)
+	if policyErr != nil {
+		if err := e.commitResult(parent, claimed, Fail(policyErr, "invalid_policy", nil)); err != nil {
+			e.abandonClaim(claimed)
+		}
+		return
+	}
 	handler, ok := e.registry.Handler(claimed.Type)
 	if !ok {
 		logger.Error("claimed task has no registered handler")
@@ -223,6 +255,12 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 		renewalDone = true
 	}
 	defer stopLeaseRenewal()
+	invocationCtx := handlerCtx
+	if policy.InvocationTimeout > 0 {
+		var cancel context.CancelFunc
+		invocationCtx, cancel = context.WithTimeout(handlerCtx, policy.InvocationTimeout)
+		defer cancel()
+	}
 
 	execution := Execution{
 		task: *claimed,
@@ -248,6 +286,53 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 				}
 				if startWork {
 					return txRepos.Tasks.MarkWorkStarted(ctx, claimed.ID, claimed.ClaimGeneration, time.Now())
+				}
+				return nil
+			})
+		},
+		admit: func(ctx context.Context, key string, value any, settlement Settlement) error {
+			if !leaseSafe.Load() {
+				return repository.ErrTaskLeaseLost
+			}
+			checkpoint, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			return e.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+				if err := tx.Tasks.AdmitEffect(ctx, claimed.ID, claimed.ClaimGeneration, key, checkpoint); err != nil {
+					return err
+				}
+				if settlement != nil {
+					if err := invokeSettlement(ctx, settlement, tx); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		},
+		observe: func(ctx context.Context, key string) (time.Time, error) {
+			var start time.Time
+			err := e.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+				var err error
+				start, err = tx.Tasks.ObserveOperation(ctx, claimed.ID, claimed.ClaimGeneration, key)
+				return err
+			})
+			return start, err
+		},
+		resolve: func(ctx context.Context, key string, value any, settlement Settlement) error {
+			checkpoint, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			return e.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+				if err := tx.Tasks.ResolveOperation(ctx, claimed.ID, claimed.ClaimGeneration, key); err != nil {
+					return err
+				}
+				if err := tx.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, checkpoint); err != nil {
+					return err
+				}
+				if settlement != nil {
+					return invokeSettlement(ctx, settlement, tx)
 				}
 				return nil
 			})
@@ -284,7 +369,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 			return
 		}
 	}
-	result, panicked := invokeHandler(handlerCtx, handler, execution)
+	result, panicked := invokeHandler(invocationCtx, handler, execution)
 	if panicked != nil {
 		logger.Error("task handler panicked", "error", panicked, "stack", string(debug.Stack()))
 		stopLeaseRenewal()
@@ -292,6 +377,10 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 			e.abandonClaim(claimed)
 		}
 		return
+	}
+	if invocationCtx.Err() != nil && parent.Err() == nil && leaseSafe.Load() && (result.kind == resultWait || result.kind == resultInvalid) {
+		// Preserve observed terminal results and evidence returned by the handler.
+		result = RetryBackoff(invocationCtx.Err(), "invocation_timeout", result.settlement).WithRetrySettlements(result.onRetry, result.onExhausted)
 	}
 	if parent.Err() != nil || !leaseSafe.Load() {
 		logger.Warn("task result discarded because the lease is uncertain")
@@ -374,13 +463,13 @@ func validateResult(result Result, _ *model.Task) error {
 		return nil
 	case resultCancel:
 		return nil
-	case resultSuspend:
-		if result.delay < 0 || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
+	case resultWait:
+		if result.err != nil || result.delay < 0 || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
 			return ErrInvalidResult
 		}
 		return nil
 	case resultRetry:
-		if result.delay < 0 || result.err == nil || result.failureReason == "" {
+		if result.delay < 0 || result.err == nil || result.failureReason == "" || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
 			return ErrInvalidResult
 		}
 		return nil
@@ -390,7 +479,7 @@ func validateResult(result Result, _ *model.Task) error {
 }
 
 func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result Result) error {
-	transition := e.transitionFor(claimed, result)
+	var transition repository.TaskTransition
 	var lastErr error
 	for _, delay := range e.settlementRetryDelays {
 		if delay > 0 {
@@ -411,12 +500,39 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 			if err := txRepos.Tasks.ValidateClaim(settlementCtx, claimed.ID, claimed.ClaimGeneration); err != nil {
 				return err
 			}
+			current, err := txRepos.Tasks.GetForUpdate(settlementCtx, claimed.ID)
+			if err != nil {
+				return err
+			}
+			transition = e.transitionFor(current, result)
+			transition.CancellationObserved = claimed.CancellationRequested()
+			if result.kind == resultRetry {
+				if transition.IncrementRetry && result.onRetry != nil {
+					if err := result.onRetry(settlementCtx, txRepos, transition.AvailableAt); err != nil {
+						return err
+					}
+				}
+				if !transition.IncrementRetry && result.onExhausted != nil {
+					if err := invokeSettlement(settlementCtx, result.onExhausted, txRepos); err != nil {
+						return err
+					}
+				}
+			}
 			if result.settlement != nil {
 				if err := invokeSettlement(settlementCtx, result.settlement, txRepos); err != nil {
 					return err
 				}
 			}
-			return txRepos.Tasks.Settle(settlementCtx, claimed.ID, claimed.ClaimGeneration, transition)
+			if err := txRepos.Tasks.Settle(settlementCtx, claimed.ID, claimed.ClaimGeneration, transition); err != nil {
+				return err
+			}
+			if err := e.settleSchedule(settlementCtx, txRepos, claimed, result, transition); err != nil {
+				return err
+			}
+			if result.kind == resultWait {
+				return nil
+			}
+			return txRepos.Tasks.AppendEvent(settlementCtx, claimed.ID, string(transition.Status), mustEvent(map[string]any{"failure_reason": dereference(transition.FailureReason), "next_attempt": current.RetryCount + 1 + boolInt(transition.IncrementRetry)}))
 		})
 		cancel()
 		if lastErr == nil {
@@ -488,11 +604,8 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 	}
 	switch result.kind {
 	case resultComplete:
-		retention := now.Add(e.config.Retention)
 		transition.Status = model.TaskStatusCompleted
-		transition.RetentionUntil = &retention
-	case resultSuspend:
-		transition.ClearWorkStartedAt = claimed.Type.IsRecurringSystem() && result.waitReason == "scheduled" && result.err == nil
+	case resultWait:
 		delay := result.delay
 		if result.resourceWait {
 			delay = e.resourceWaitDelay(e.consecutiveResourceWaits(claimed.ID))
@@ -501,13 +614,20 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.ResumeMode = result.resumeMode
 		transition.AvailableAt = now.Add(delay)
 	case resultRetry:
-		if claimed.RetryLimit != nil && claimed.RetryCount >= *claimed.RetryLimit {
+		if claimed.RetryLimit == nil || claimed.RetryCount >= *claimed.RetryLimit {
 			transition.Status = model.TaskStatusFailed
+			transition.FailureReason = textPointer("attempts_exhausted")
 		} else {
 			delay := result.delay
 			if result.retryBackoff {
-				delay = e.retryDelay(claimed.RetryCount)
+				policy, _ := DecodePolicy(claimed)
+				backoff := policy.Backoff.delay(claimed.RetryCount)
+				if e.retryDelay != nil {
+					backoff = e.retryDelay(claimed.RetryCount)
+				}
+				delay = maxDuration(delay, backoff)
 			}
+			transition.ResumeMode = result.resumeMode
 			transition.IncrementRetry = true
 			transition.Status = model.TaskStatusPending
 			transition.AvailableAt = now.Add(delay)
@@ -515,15 +635,9 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 	case resultFail:
 		transition.Status = model.TaskStatusFailed
 	case resultCancel:
-		retention := now.Add(e.config.Retention)
 		transition.Status = model.TaskStatusCancelled
-		transition.RetentionUntil = &retention
 	}
 	return transition
-}
-
-func defaultRetryDelay(retryCount int) time.Duration {
-	return backoffDelay(retryCount, retryBaseDelay, retryMaximumDelay, rand.Float64())
 }
 
 func defaultResourceWaitDelay(waits int) time.Duration {
@@ -788,4 +902,11 @@ func decodeHash(value string) []byte {
 		return nil
 	}
 	return decoded
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

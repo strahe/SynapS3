@@ -43,7 +43,7 @@ func (h *UploadSpeedTestHandler) newHandler() *taskengine.FuncHandler {
 			_, err := types.ParseOnChainID("provider_id", input.ProviderID)
 			return err
 		}),
-		RetryLimit: new(int), AllowRetry: false,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 1, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		OnEngineFailure: func(task *model.Task, reason string) taskengine.Settlement {
 			return func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.ProviderUploadSpeed.FailActiveTask(ctx, task.ID, reason)
@@ -74,7 +74,7 @@ func (h *UploadSpeedTestHandler) executeProviderUploadSpeed(ctx context.Context,
 	}
 	var duration time.Duration
 	err = execution.WithResource(ctx, taskengine.ResourceProviderUploadSpeed, func(ctx context.Context) error {
-		_, effectErr := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation,
+		_, effectErr := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "speed:"+input.ProviderID,
 			providerbenchmark.Checkpoint{Attempted: true}, nil, func(ctx context.Context) error {
 				var probeErr error
 				duration, probeErr = h.deps.UploadSpeedProbe.Probe(ctx, serviceURL)

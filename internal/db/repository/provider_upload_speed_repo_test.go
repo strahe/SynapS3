@@ -16,11 +16,11 @@ func TestProviderUploadSpeedKeepsOnlyLatestResultAcrossHealthRefresh(t *testing.
 	repos := repository.NewRepositories(db)
 	newTask := func(key string) int64 {
 		t.Helper()
-		row, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: key, InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		})
+		}))
 		if err != nil || !created {
 			t.Fatalf("enqueue task: %v, created=%v", err, created)
 		}
@@ -72,27 +72,26 @@ func TestProviderUploadSpeedKeepsOnlyLatestResultAcrossHealthRefresh(t *testing.
 	}
 }
 
-func TestProviderUploadSpeedReleasesTaskForRetentionCleanup(t *testing.T) {
+func TestProviderUploadSpeedCompletionPreservesTaskHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	claimed := enqueueAndClaimTask(t, repos, "speed-task-gc", time.Minute)
 	if err := repos.ProviderUploadSpeed.Begin(t.Context(), "101", providerbenchmark.URLHash("https://provider.example"), claimed.ID); err != nil {
 		t.Fatal(err)
 	}
-	expired := time.Now().Add(-time.Minute)
 	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: &expired,
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := repos.Tasks.DeleteRetained(t.Context(), time.Now(), 10); err != nil || deleted != 0 {
-		t.Fatalf("cleanup while speed test references task = %d, %v", deleted, err)
+	if stored, err := repos.Tasks.GetByID(t.Context(), claimed.ID); err != nil || stored == nil {
+		t.Fatalf("task history missing: %#v, %v", stored, err)
 	}
 	if err := repos.ProviderUploadSpeed.Finish(t.Context(), "101", claimed.ID, providerbenchmark.StateSucceeded, 1000, providerbenchmark.SampleBytes, ""); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := repos.Tasks.DeleteRetained(t.Context(), time.Now(), 10); err != nil || deleted != 1 {
-		t.Fatalf("cleanup after speed test settles = %d, %v", deleted, err)
+	if stored, err := repos.Tasks.GetByID(t.Context(), claimed.ID); err != nil || stored == nil {
+		t.Fatalf("task history missing: %#v, %v", stored, err)
 	}
 	row, err := repos.ProviderUploadSpeed.Get(t.Context(), "101")
 	if err != nil || row == nil || row.State != providerbenchmark.StateSucceeded {

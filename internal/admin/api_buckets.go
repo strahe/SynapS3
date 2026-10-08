@@ -817,23 +817,25 @@ type objectProvenanceResponse struct {
 }
 
 type objectProvenanceCopyResponse struct {
-	CopyID           int64                     `json:"copy_id"`
-	LastError        *string                   `json:"last_error,omitempty"`
-	Retry            *copyRetryResponse        `json:"retry,omitempty"`
-	CopyIndex        int                       `json:"copy_index"`
-	Status           string                    `json:"status"`
-	Health           copyHealthInfo            `json:"health"`
-	ProviderID       *string                   `json:"provider_id,omitempty"`
-	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
-	DataSetID        *string                   `json:"data_set_id,omitempty"`
-	PieceID          *string                   `json:"piece_id,omitempty"`
-	TransferMethod   string                    `json:"transfer_method"`
-	Progress         *uploadProgressResponse   `json:"progress,omitempty"`
-	RetrievalURL     *string                   `json:"retrieval_url,omitempty"`
-	IsNewDataSet     bool                      `json:"is_new_data_set"`
-	AttentionCode    *string                   `json:"attention_code,omitempty"`
-	AttentionAt      *string                   `json:"attention_at,omitempty"`
-	SubmitError      *string                   `json:"submit_error,omitempty"`
+	CopyID                 int64                     `json:"copy_id"`
+	LastError              *string                   `json:"last_error,omitempty"`
+	Retryable              bool                      `json:"retryable"`
+	RetryTaskID            *int64                    `json:"retry_task_id"`
+	RetryUnavailableReason string                    `json:"retry_unavailable_reason,omitempty"`
+	CopyIndex              int                       `json:"copy_index"`
+	Status                 string                    `json:"status"`
+	Health                 copyHealthInfo            `json:"health"`
+	ProviderID             *string                   `json:"provider_id,omitempty"`
+	ProviderIdentity       *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID              *string                   `json:"data_set_id,omitempty"`
+	PieceID                *string                   `json:"piece_id,omitempty"`
+	TransferMethod         string                    `json:"transfer_method"`
+	Progress               *uploadProgressResponse   `json:"progress,omitempty"`
+	RetrievalURL           *string                   `json:"retrieval_url,omitempty"`
+	IsNewDataSet           bool                      `json:"is_new_data_set"`
+	AttentionCode          *string                   `json:"attention_code,omitempty"`
+	AttentionAt            *string                   `json:"attention_at,omitempty"`
+	SubmitError            *string                   `json:"submit_error,omitempty"`
 }
 
 type uploadProgressResponse struct {
@@ -1888,16 +1890,6 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		providerIDs = append(providerIDs, copyRow.ProviderID)
 	}
 	providerIdentities := s.providerIdentities(ctx, providerIDs)
-	copyIDs := make([]int64, 0, len(provenance.Copies))
-	for _, row := range provenance.Copies {
-		copyIDs = append(copyIDs, row.ID)
-	}
-	retryStates, err := s.repos.Contents.CopyRetryStates(ctx, copyIDs)
-	if err != nil {
-		s.logger.Error("api: failed to load replica recovery", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
 	copyFacts := provenanceCopyHealthFacts(bucket.ID, version.VersionID, provenance.Upload, provenance.Copies)
 	copyObservations, copyHealthFailed := s.copyHealthDataSetObservations(ctx, copyHealthLocalDataSetIDs(copyFacts))
 	copyHealthInterval := s.copyHealthRefreshInterval()
@@ -1917,10 +1909,15 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			value := copyRow.CommitAttentionAt.Format(time.RFC3339)
 			attentionAt = &value
 		}
+		retryID, retryReason, err := s.retryTaskForSubject(ctx, "storage_copy", strconv.FormatInt(copyRow.ID, 10), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
 		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
-			CopyID:           copyRow.ID,
-			LastError:        copyRow.LastError,
-			Retry:            copyRetryResponseFor(retryStates[copyRow.ID]),
+			CopyID:    copyRow.ID,
+			LastError: copyRow.LastError,
+			Retryable: retryID != nil, RetryTaskID: retryID, RetryUnavailableReason: retryReason,
 			CopyIndex:        copyRow.CopyIndex,
 			Status:           string(copyRow.Status),
 			Health:           copyHealthByIndex[copyRow.CopyIndex],

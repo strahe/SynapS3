@@ -87,9 +87,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	}); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
 		t.Fatalf("delete unresolved pull's last reference = %v", err)
 	}
-	if err := f.repos.Tasks.RetryFailed(ctx, row.ID); err != nil {
-		t.Fatal(err)
-	}
+	row = repositorySuccessor(t, f.repos, row, true)
 	retried, err := f.repos.Tasks.GetByID(ctx, row.ID)
 	if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" ||
 		retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
@@ -104,9 +102,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.repos.Tasks.RetryFailed(ctx, row.ID); err != nil {
-		t.Fatal(err)
-	}
+	row = repositorySuccessor(t, f.repos, row, false)
 	retried, err = f.repos.Tasks.GetByID(ctx, row.ID)
 	if err != nil || retried.Status != model.TaskStatusPending || retried.ResumeMode != model.TaskResumeModeRecover ||
 		retried.CancellationRequestedAt != nil || retried.CancellationReason != nil || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
@@ -237,18 +233,17 @@ func testPullAuthorizationLedger(t *testing.T, f commitFixture) {
 	if err := f.repos.Contents.CompleteCopyTask(ctx, copyRow.ID, generation, row.ID); err != nil {
 		t.Fatal(err)
 	}
-	retentionUntil := time.Now().Add(-time.Hour)
 	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: &retentionUntil,
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := f.repos.Tasks.DeleteRetained(ctx, time.Now(), 10); err != nil || deleted != 1 {
-		t.Fatalf("task GC = %d, %v", deleted, err)
+	if stored, err := f.repos.Tasks.GetByID(ctx, row.ID); err != nil || stored == nil {
+		t.Fatalf("completed task history missing: %#v, %v", stored, err)
 	}
 	history, err := f.repos.Contents.GetPullAttempt(ctx, input.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID)
 	if err != nil || history.Status != storagepull.AttemptStatusAttempted || history.ResolvedAt == nil ||
 		history.ExtraDataHex != original.ExtraDataHex || !history.AttemptedAt.Equal(original.AttemptedAt) {
-		t.Fatalf("authorization history after task GC = %#v, %v", history, err)
+		t.Fatalf("authorization history after task completion = %#v, %v", history, err)
 	}
 }

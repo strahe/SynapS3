@@ -187,7 +187,7 @@ func (s *Server) writeCommitBatch(w http.ResponseWriter, r *http.Request, status
 			return
 		}
 		if task != nil {
-			items := []taskListItem{s.taskListItem(task)}
+			items := []taskListItem{s.taskListItem(r.Context(), task)}
 			s.attachTaskStorageConfirmations(r.Context(), []model.Task{*task}, items)
 			response.Task = &items[0]
 		}

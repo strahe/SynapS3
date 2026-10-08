@@ -279,13 +279,6 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
-			name:  "worker max retries",
-			field: "worker.tasks.max_retries",
-			mutate: func(cfg *Config) {
-				cfg.Worker.Tasks.MaxRetries = -1
-			},
-		},
-		{
 			name:  "worker commit max pieces",
 			field: "worker.tasks.commit_max_pieces",
 			mutate: func(cfg *Config) {
@@ -594,8 +587,6 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_WORKER_TASKS_CONCURRENCY", "7")
 	t.Setenv("SYNAPS3_WORKER_TASKS_POLL_INTERVAL", "9s")
 	t.Setenv("SYNAPS3_WORKER_TASKS_LEASE_DURATION", "2m")
-	t.Setenv("SYNAPS3_WORKER_TASKS_MAX_RETRIES", "8")
-	t.Setenv("SYNAPS3_WORKER_TASKS_RETENTION", "96h")
 	t.Setenv("SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", "3")
 	t.Setenv("SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", "2")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", "16")
@@ -639,8 +630,6 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	if cfg.Worker.Tasks.Concurrency != 7 ||
 		cfg.Worker.Tasks.PollInterval != 9*time.Second ||
 		cfg.Worker.Tasks.LeaseDuration != 2*time.Minute ||
-		cfg.Worker.Tasks.MaxRetries != 8 ||
-		cfg.Worker.Tasks.Retention != 96*time.Hour ||
 		cfg.Worker.Tasks.ProviderMutationConcurrency != 3 ||
 		cfg.Worker.Tasks.DestructiveMutationConcurrency != 2 ||
 		cfg.Worker.Tasks.CommitMaxPieces != 16 ||
@@ -1085,5 +1074,24 @@ func TestValidate_MaxRequests_ExceedsMaxConnections(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "max_requests") {
 		t.Fatalf("expected max_requests error, got: %v", err)
+	}
+}
+
+func TestRemovedTaskConfigurationIsRejected(t *testing.T) {
+	for _, field := range []string{"max_retries", "retention"} {
+		t.Run(field, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte("[worker.tasks]\n"+field+" = 1\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "has been removed") {
+				t.Fatalf("removed field: %v", err)
+			}
+			envName := "SYNAPS3_WORKER_TASKS_" + strings.ToUpper(field)
+			t.Setenv(envName, "1")
+			if _, err := Load(""); err == nil || !strings.Contains(err.Error(), envName) {
+				t.Fatalf("removed env: %v", err)
+			}
+		})
 	}
 }

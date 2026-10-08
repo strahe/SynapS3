@@ -158,7 +158,7 @@ func testCacheDependentCommitsAndSafeCleanupAccounting(t *testing.T, f commitFix
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner, _, err := f.repos.Tasks.Enqueue(ctx, &model.Task{Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(member.ContentID, reservation.Generation), InputVersion: 1, InputHash: "cache-cleanup", Input: input, SubjectType: new(model.TaskSubjectStorageContent), SubjectKey: new(strconv.FormatInt(member.ContentID, 10))})
+	owner, _, err := f.repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(member.ContentID, reservation.Generation), InputVersion: 1, InputHash: "cache-cleanup", Input: input, SubjectType: new(model.TaskSubjectStorageContent), SubjectKey: new(strconv.FormatInt(member.ContentID, 10))}))
 	if err != nil {
 		t.Fatal(err)
 	}

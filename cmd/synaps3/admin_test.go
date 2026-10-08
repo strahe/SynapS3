@@ -838,12 +838,12 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 	t.Setenv(configEnvVar, "")
 
-	t.Run("task list help documents dismissed status", func(t *testing.T) {
+	t.Run("task list help documents execution statuses", func(t *testing.T) {
 		out, err := runAdminCommand(t, []string{"synaps3", "admin", "task", "list", "--help"})
 		if err != nil {
 			t.Fatalf("task list help: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "pending, running, completed, failed, cancelled, or dismissed") {
+		if !strings.Contains(out, "pending, running, completed, failed, or cancelled") {
 			t.Fatalf("task list help missing status filters:\n%s", out)
 		}
 	})
@@ -866,7 +866,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 				if got := r.Header.Get("X-SynapS3-Settings-Write"); got != "" {
 					t.Fatalf("task retry write header = %q, want empty", got)
 				}
-				writeAdminTestJSON(t, w, http.StatusOK, map[string]string{"status": "requeued"})
+				writeAdminTestJSON(t, w, http.StatusAccepted, map[string]int64{"task_id": 43})
 			default:
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}

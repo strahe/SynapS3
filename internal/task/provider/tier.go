@@ -31,8 +31,8 @@ func NewEndorsedRefreshHandler(deps TierRefreshDependencies) (*EndorsedRefreshHa
 func newTierHandler(deps TierRefreshDependencies, taskType model.TaskType, tier string) *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
-		RetryLimit: nil, AllowRetry: true,
+		Codec:  taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}
 	run := func(ctx context.Context, _ taskengine.Execution) taskengine.Result {
 		if deps.Observability == nil {
@@ -53,7 +53,7 @@ func newTierHandler(deps TierRefreshDependencies, taskType model.TaskType, tier 
 		if deps.Events != nil {
 			deps.Events.Publish("provider_catalog_updated", map[string]any{})
 		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, deps.Observability.RefreshInterval(), "scheduled", "Provider list refreshed", nil)
+		return taskengine.CompleteCycle(deps.Observability.RefreshInterval(), "Provider list refreshed", nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }

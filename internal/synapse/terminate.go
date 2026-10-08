@@ -166,3 +166,42 @@ func normalizeTerminationError(ctx context.Context, err error) error {
 	}
 	return NormalizeProviderOperationError(ctx, err)
 }
+
+// ObserveTermination reads chain and provider evidence without sending a request.
+func (s *StorageServiceAdapter) ObserveTermination(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, bool, error) {
+	ended, err := s.recordedTermination(ctx, dataSetID)
+	if err != nil || ended != nil {
+		return ended, false, err
+	}
+	if s.service == nil {
+		return nil, false, errors.New("storage service status unavailable")
+	}
+	target, err := s.service.NewDataSetContext(ctx, dataSetID, storage.NewDataSetContextOptions{})
+	if err != nil {
+		return nil, false, err
+	}
+	client := s.providerHTTP
+	if client == nil {
+		client = NewProviderHTTPClient(defaultPDPStatusTimeout, false)
+	}
+	provider, err := pdp.New(target.ServiceURL(), pdp.WithHTTPClient(client), pdp.WithMaxRetries(0))
+	if err != nil {
+		return nil, false, err
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, defaultPDPStatusTimeout)
+	defer cancel()
+	status, err := provider.GetTerminateServiceStatus(pollCtx, dataSetID)
+	if httpErr, ok := errors.AsType[*pdp.HTTPError](err); ok && httpErr.StatusCode == 404 {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, NormalizeProviderOperationError(ctx, err)
+	}
+	if status == nil {
+		return nil, false, errors.New("termination observation returned no status")
+	}
+	if status.FWSSTerminated {
+		return nil, true, nil
+	} // Await the payer-checked chain record.
+	return nil, true, nil
+}

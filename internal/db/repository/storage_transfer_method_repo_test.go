@@ -93,11 +93,11 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	pullTask, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	pullTask, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStoragePull, IdempotencyKey: "zero-piece-pull", InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "zero-piece-pull", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil || !created {
 		t.Fatalf("enqueue pull task = %#v, created=%v, err=%v", pullTask, created, err)
 	}
@@ -233,11 +233,11 @@ func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 	if _, err := repos.CacheEvictions.AuthorizeDeletion(t.Context(), content.ID, reservation.Generation, evict.ID, nil); !errors.Is(err, cacheeviction.ErrNoLongerEligible) {
 		t.Fatalf("eviction during pending migration = %v, want ineligible", err)
 	}
-	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: "cache-restore-plan", InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "cache-restore-plan", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil || !created {
 		t.Fatalf("enqueue copy task = %#v, created=%v, err=%v", taskRow, created, err)
 	}

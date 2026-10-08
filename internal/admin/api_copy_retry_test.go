@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,9 +10,8 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
-	"github.com/strahe/synaps3/internal/storagepull"
-	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 type copyRetryAPIFixture struct {
@@ -60,14 +58,21 @@ func newCopyRetryAPIFixture(t *testing.T) copyRetryAPIFixture {
 	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{StorageCopyID: copyRow.ID, ContentID: content.ID, CopyIndex: 0, LastError: "transfer failed"}); err != nil {
 		t.Fatal(err)
 	}
-	subject, key := "storage_copy", fmt.Sprint(copyRow.ID)
-	finished := time.Now()
-	old, _, err := repos.Tasks.Enqueue(ctx, &model.Task{Type: model.TaskTypeStoragePull, IdempotencyKey: "old-pull", InputVersion: 1, Input: []byte(`{}`), InputHash: "old", SubjectType: &subject, SubjectKey: &key, Status: model.TaskStatusFailed, FinishedAt: &finished})
+	old, _, err := server.taskService.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageStore, IdempotencyKey: storagepipeline.StoreKey(copyRow.ID, 1), Input: storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("work_generation = ?", 1).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("retry_count = ?", 5).Set("failure_reason = ?", "store_failed").Where("id = ?", old.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	old, err = repos.Tasks.GetByID(ctx, old.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mux := newBucketAPIMux(server)
-	mux.HandleFunc("POST /api/v1/storage-copies/{id}/retry", server.handleAPIRetryStorageCopy)
 	mux.HandleFunc("GET /api/v1/tasks", server.handleAPITasks)
 	return copyRetryAPIFixture{server: server, copy: copyRow, version: version, oldTask: old, mux: mux}
 }
@@ -78,146 +83,55 @@ func (f copyRetryAPIFixture) request(method, path string) *httptest.ResponseReco
 	return rr
 }
 
-func TestAPIStorageCopyRetryAndPresentation(t *testing.T) {
+func TestAPIStorageCopyUsesTaskRetryAndPreservesHistory(t *testing.T) {
 	f := newCopyRetryAPIFixture(t)
-	for _, dismissed := range []bool{false, true} {
-		status := "failed"
-		if dismissed {
-			status = "dismissed"
-			if err := f.server.taskService.Acknowledge(t.Context(), f.oldTask.ID); err != nil {
-				t.Fatal(err)
-			}
-		}
-		rr := f.request("GET", "/api/v1/tasks?status="+status)
-		var page taskListResponse
-		decodeJSON(t, rr, &page)
-		if rr.Code != 200 || len(page.Tasks) != 1 || page.Tasks[0].CopyRetry == nil || !page.Tasks[0].CopyRetry.Available || page.Tasks[0].Retryable {
-			t.Fatalf("tasks=%+v response=%s", page, rr.Body)
-		}
-	}
-	rr := f.request("GET", "/api/v1/buckets/retry-api/objects/provenance?version_id="+f.version.VersionID)
-	var provenance objectProvenanceResponse
-	decodeJSON(t, rr, &provenance)
-	if rr.Code != 200 || len(provenance.Copies) != 1 || provenance.Copies[0].CopyID != f.copy.ID || provenance.Copies[0].Retry == nil || !provenance.Copies[0].Retry.Available || provenance.Copies[0].LastError == nil {
-		t.Fatalf("provenance=%+v response=%s", provenance, rr.Body)
-	}
-	path := fmt.Sprintf("/api/v1/storage-copies/%d/retry", f.copy.ID)
-	rr = f.request("POST", path)
-	var accepted struct {
-		CopyID int64 `json:"copy_id"`
-		TaskID int64 `json:"task_id"`
-	}
-	decodeJSON(t, rr, &accepted)
-	if rr.Code != 202 || accepted.CopyID != f.copy.ID || accepted.TaskID == f.oldTask.ID || accepted.TaskID == 0 {
-		t.Fatalf("retry=%s status=%d", rr.Body, rr.Code)
-	}
-	row, err := f.server.repos.Contents.GetUploadCopyByID(t.Context(), f.copy.ID)
-	if err != nil || row.ActiveTaskID == nil || *row.ActiveTaskID != accepted.TaskID || row.WorkGeneration != 1 {
-		t.Fatalf("copy=%+v err=%v", row, err)
-	}
-	work, err := f.server.repos.Tasks.GetByID(t.Context(), accepted.TaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var input storagepipeline.CopyGenerationInput
-	if err := json.Unmarshal(work.Input, &input); err != nil {
-		t.Fatal(err)
-	}
-	if work.Type != model.TaskTypeStorageTransferPlan || work.IdempotencyKey != storagepipeline.TransferPlanKey(f.copy.ID, row.WorkGeneration) ||
-		work.SubjectType == nil || *work.SubjectType != "storage_copy" || work.SubjectKey == nil || *work.SubjectKey != fmt.Sprint(f.copy.ID) ||
-		input.CopyID != f.copy.ID || input.Generation != row.WorkGeneration {
-		t.Fatalf("recovery work=%+v input=%+v", work, input)
-	}
-	history, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
-	if err != nil || history.AcknowledgedAt == nil || history.Status != model.TaskStatusFailed {
-		t.Fatalf("history=%+v err=%v", history, err)
-	}
-	if rr := f.request("POST", path); rr.Code != 409 {
-		t.Fatalf("duplicate=%d %s", rr.Code, rr.Body)
-	}
-	rr = f.request("GET", "/api/v1/tasks?status=dismissed")
+	rr := f.request(http.MethodGet, "/api/v1/tasks?status=failed")
 	var page taskListResponse
 	decodeJSON(t, rr, &page)
-	if len(page.Tasks) != 1 || page.Tasks[0].CopyRetry != nil {
-		t.Fatalf("retry shown for pending copy: %+v", page)
+	if len(page.Tasks) != 1 || !page.Tasks[0].Retryable || page.Tasks[0].RetryTaskID == nil || *page.Tasks[0].RetryTaskID != f.oldTask.ID {
+		t.Fatalf("source action = %#v", page.Tasks)
+	}
+	path := fmt.Sprintf("/api/v1/tasks/%d/retry", f.oldTask.ID)
+	rr = f.request(http.MethodPost, path)
+	var result struct {
+		TaskID int64 `json:"task_id"`
+	}
+	decodeJSON(t, rr, &result)
+	if rr.Code != 202 || result.TaskID == f.oldTask.ID || result.TaskID == 0 {
+		t.Fatalf("retry = %d %s", rr.Code, rr.Body.String())
+	}
+	next, err := f.server.repos.Tasks.GetByID(t.Context(), result.TaskID)
+	if err != nil || next == nil || next.Type != model.TaskTypeStorageTransferPlan || next.RetryCount != 0 || next.RetryOfTaskID == nil || *next.RetryOfTaskID != f.oldTask.ID {
+		t.Fatalf("new round = %#v %v", next, err)
+	}
+	old, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
+	if err != nil || old.Status != model.TaskStatusFailed || old.RetryCount != 5 || old.AcknowledgedAt != nil || old.SupersededAt == nil {
+		t.Fatalf("old = %#v %v", old, err)
+	}
+	rr = f.request(http.MethodPost, path)
+	var repeat struct {
+		TaskID int64 `json:"task_id"`
+	}
+	decodeJSON(t, rr, &repeat)
+	if rr.Code != 202 || repeat.TaskID != result.TaskID {
+		t.Fatalf("replay = %d %#v", rr.Code, repeat)
+	}
+	if rr = f.request(http.MethodPost, fmt.Sprintf("/api/v1/storage-copies/%d/retry", f.copy.ID)); rr.Code != 404 {
+		t.Fatalf("removed route = %d", rr.Code)
 	}
 }
 
-func TestAPIStorageCopyRetryAdmissionErrors(t *testing.T) {
-	for _, tt := range []struct {
-		name, code string
-		status     int
-		change     func(*testing.T, copyRetryAPIFixture)
-	}{
-		{name: "no source", code: "no_source", status: 409, change: func(t *testing.T, f copyRetryAPIFixture) {
-			if err := f.server.repos.Objects.SetVersionCachePresence(t.Context(), f.version.VersionID, false); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "unavailable", code: "storage_service_unavailable", status: 409, change: func(t *testing.T, f copyRetryAPIFixture) {
-			if _, err := f.server.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("is_current = ?", false).Set("status = ?", model.StorageDataSetStatusDraining).Where("id = ?", f.copy.StorageDataSetID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "deleted", code: "object_deleted", status: 409, change: func(t *testing.T, f copyRetryAPIFixture) {
-			if _, err := f.server.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("cleanup_task_id = ?", f.oldTask.ID).Where("id = ?", f.copy.ContentID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "replacement", code: "replacement_in_progress", status: 409, change: func(t *testing.T, f copyRetryAPIFixture) {
-			if _, _, err := f.server.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: f.copy.BucketID, SourceDataSetID: f.copy.StorageDataSetID, TargetProviderID: onChainID(t, "102"), ClientRequestID: "replace", SelectionMode: storagereplacement.SelectionModeManual, PriceListFingerprint: "prices"}); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "unresolved", code: "recovery_requires_attention", status: 409, change: func(t *testing.T, f copyRetryAPIFixture) {
-			row := &storagepull.Attempt{AttemptID: "unresolved", ContentID: f.copy.ContentID, StorageDataSetID: f.copy.StorageDataSetID, Status: storagepull.AttemptStatusAttempted, SourceProviderID: onChainID(t, "102"), SourceDataSetID: onChainID(t, "202"), SourcePieceID: onChainID(t, "0"), SourcePieceCID: "piece", SourceRetrievalURL: "https://source.example", ExtraDataHex: "abcd", AttemptedAt: time.Now()}
-			if _, err := f.server.db.NewInsert().Model(row).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "service missing", status: 503, change: func(_ *testing.T, f copyRetryAPIFixture) { f.server.taskService = nil }},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			f := newCopyRetryAPIFixture(t)
-			tt.change(t, f)
-			rr := f.request("POST", fmt.Sprintf("/api/v1/storage-copies/%d/retry", f.copy.ID))
-			var body map[string]string
-			decodeJSON(t, rr, &body)
-			if rr.Code != tt.status || body["code"] != tt.code {
-				t.Fatalf("response=%d %+v", rr.Code, body)
-			}
-		})
-	}
+func TestAPIStorageCopyTaskRetryRechecksAdmission(t *testing.T) {
 	f := newCopyRetryAPIFixture(t)
-	for _, tt := range []struct {
-		id     string
-		status int
-	}{{"bad", 400}, {"0", 400}, {"99999", 404}} {
-		if rr := f.request("POST", "/api/v1/storage-copies/"+tt.id+"/retry"); rr.Code != tt.status {
-			t.Fatalf("id=%s status=%d", tt.id, rr.Code)
-		}
-	}
-}
-
-func TestAPIStorageCopyRetryRollsBackWhenEnqueueFails(t *testing.T) {
-	f := newCopyRetryAPIFixture(t)
-	// Existing identity is terminal, so it cannot be bound as new live work.
-	finished := time.Now()
-	retention := finished.Add(time.Hour)
-	_, _, err := f.server.repos.Tasks.Enqueue(t.Context(), &model.Task{Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(f.copy.ID, 1), InputVersion: 1, Input: []byte(`{}`), InputHash: "different", Status: model.TaskStatusCompleted, FinishedAt: &finished, RetentionUntil: &retention})
-	if err != nil {
+	if err := f.server.repos.Objects.SetVersionCachePresence(t.Context(), f.version.VersionID, false); err != nil {
 		t.Fatal(err)
 	}
-	rr := f.request("POST", fmt.Sprintf("/api/v1/storage-copies/%d/retry", f.copy.ID))
-	if rr.Code == 202 {
-		t.Fatal("accepted incompatible task identity")
+	rr := f.request(http.MethodPost, fmt.Sprintf("/api/v1/tasks/%d/retry", f.oldTask.ID))
+	if rr.Code != 409 {
+		t.Fatalf("missing source = %d %s", rr.Code, rr.Body.String())
 	}
-	copyRow, err := f.server.repos.Contents.GetUploadCopyByID(t.Context(), f.copy.ID)
-	if err != nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil {
-		t.Fatalf("copy=%+v err=%v", copyRow, err)
-	}
-	history, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
-	if err != nil || history.AcknowledgedAt != nil {
-		t.Fatalf("history=%+v err=%v", history, err)
+	old, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
+	if err != nil || old.SupersededAt != nil {
+		t.Fatalf("rejected retry changed source = %#v %v", old, err)
 	}
 }

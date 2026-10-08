@@ -24,7 +24,6 @@ import (
 	"github.com/strahe/synaps3/internal/task/cleanup"
 	"github.com/strahe/synaps3/internal/task/commit"
 	"github.com/strahe/synaps3/internal/task/dataset"
-	"github.com/strahe/synaps3/internal/task/gc"
 	providertask "github.com/strahe/synaps3/internal/task/provider"
 	"github.com/strahe/synaps3/internal/task/replacement"
 	"github.com/strahe/synaps3/internal/task/transfer"
@@ -61,7 +60,7 @@ type Dependencies struct {
 	LRULowPercent          int
 	AnchorProviderTier     providerselect.Tier
 	DefaultCopies          int
-	MaxRetries             int
+
 	// CommitMaxPieces, CommitMaxWait and CommitMaxBacklog shape how transferred
 	// copies of one data set are registered together.
 	CommitMaxPieces           int
@@ -77,9 +76,6 @@ type Dependencies struct {
 func normalizeDependencies(deps Dependencies) (Dependencies, error) {
 	if deps.Repositories == nil || deps.Repositories.Tasks == nil {
 		return deps, errors.New("task handlers require repositories")
-	}
-	if deps.MaxRetries < 0 {
-		return deps, errors.New("task retry limit cannot be negative")
 	}
 	if deps.WalletBroadcastTimeout < 0 || deps.WalletReceiptTimeout < 0 {
 		return deps, errors.New("wallet timeouts cannot be negative")
@@ -135,7 +131,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("creating transfer scheduler: %w", err)
 	}
-	commitScheduler, err := service.Scheduler("commit", model.TaskTypeStorageCommit)
+	commitScheduler, err := service.Scheduler("commit", model.TaskTypeStorageCommit, model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
 	if err != nil {
 		return points, fmt.Errorf("creating commit scheduler: %w", err)
 	}
@@ -158,6 +154,10 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	uploadScheduler, err := service.Scheduler("upload", model.TaskTypeUploadPlan)
 	if err != nil {
 		return points, fmt.Errorf("creating upload scheduler: %w", err)
+	}
+	replacementScheduler, err := service.Scheduler("replacement", model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+	if err != nil {
+		return points, fmt.Errorf("creating replacement scheduler: %w", err)
 	}
 	transferMessages, err := registry.Messenger("transfer", []string{storagepipeline.MessageJoinCommit}, []string{})
 	if err != nil {
@@ -202,11 +202,11 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("creating binding selector: %w", err)
 	}
-	copies, err := transfer.NewCopyCoordinator(transfer.CoordinatorDependencies{Repositories: deps.Repositories, Scheduler: transferScheduler, Messenger: transferMessages, MaxRetries: deps.MaxRetries})
+	copies, err := transfer.NewCopyCoordinator(transfer.CoordinatorDependencies{Repositories: deps.Repositories, Scheduler: transferScheduler, Messenger: transferMessages})
 	if err != nil {
 		return points, fmt.Errorf("creating copy coordinator: %w", err)
 	}
-	commitHandler, err := commit.NewHandler(commit.Dependencies{Repositories: deps.Repositories, CommitNonces: deps.CommitNonces, ParkedPieces: deps.ParkedPieces, Cache: deps.Cache, EvictionPolicy: deps.EvictionPolicy, CommitSealOnCachePressure: deps.CommitSealOnCachePressure, CommitMaxPieces: deps.CommitMaxPieces, CommitMaxWait: deps.CommitMaxWait, LegacyPieceStorageIDLimit: deps.LegacyPieceStorageIDLimit, Logger: deps.Logger, Scheduler: commitScheduler, Messenger: commitMessages, Resolver: resolver, Pressure: state})
+	commitHandler, err := commit.NewHandler(commit.Dependencies{Repositories: deps.Repositories, CommitNonces: deps.CommitNonces, ParkedPieces: deps.ParkedPieces, Cache: deps.Cache, EvictionPolicy: deps.EvictionPolicy, CommitSealOnCachePressure: deps.CommitSealOnCachePressure, CommitMaxPieces: deps.CommitMaxPieces, CommitMaxWait: deps.CommitMaxWait, LegacyPieceStorageIDLimit: deps.LegacyPieceStorageIDLimit, Logger: deps.Logger, Scheduler: commitScheduler, RetryPolicy: service, Messenger: commitMessages, Resolver: resolver, Pressure: state})
 	if err != nil {
 		return points, fmt.Errorf("constructing commitHandler: %w", err)
 	}
@@ -214,11 +214,11 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing capacity: %w", err)
 	}
-	evict, err := cachetask.NewEvictHandler(cachetask.EvictDependencies{Repositories: deps.Repositories, Cache: deps.Cache, CacheGate: deps.CacheGate, CacheTracker: deps.CacheTracker, EvictionPolicy: deps.EvictionPolicy, MaxCacheBytes: deps.MaxCacheBytes, MaxWriteBytes: deps.MaxWriteBytes, LRULowPercent: deps.LRULowPercent, MaxRetries: deps.MaxRetries, State: state})
+	evict, err := cachetask.NewEvictHandler(cachetask.EvictDependencies{Repositories: deps.Repositories, Cache: deps.Cache, CacheGate: deps.CacheGate, CacheTracker: deps.CacheTracker, EvictionPolicy: deps.EvictionPolicy, MaxCacheBytes: deps.MaxCacheBytes, MaxWriteBytes: deps.MaxWriteBytes, LRULowPercent: deps.LRULowPercent, State: state})
 	if err != nil {
 		return points, fmt.Errorf("constructing evict: %w", err)
 	}
-	durability, err := cachetask.NewDurabilityHandler(cachetask.DurabilityDependencies{Repositories: deps.Repositories, EvictionPolicy: deps.EvictionPolicy, MaxRetries: deps.MaxRetries, Scheduler: cacheScheduler})
+	durability, err := cachetask.NewDurabilityHandler(cachetask.DurabilityDependencies{Repositories: deps.Repositories, EvictionPolicy: deps.EvictionPolicy, Scheduler: cacheScheduler})
 	if err != nil {
 		return points, fmt.Errorf("constructing durability: %w", err)
 	}
@@ -234,11 +234,11 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing pull: %w", err)
 	}
-	ensure, err := dataset.NewEnsureHandler(dataset.EnsureDependencies{Repositories: deps.Repositories, Storage: deps.Storage, MaxRetries: deps.MaxRetries, Logger: deps.Logger, Messenger: datasetMessages})
+	ensure, err := dataset.NewEnsureHandler(dataset.EnsureDependencies{Repositories: deps.Repositories, Storage: deps.Storage, Logger: deps.Logger, Messenger: datasetMessages})
 	if err != nil {
 		return points, fmt.Errorf("constructing ensure: %w", err)
 	}
-	retire, err := dataset.NewRetireHandler(dataset.RetireDependencies{Repositories: deps.Repositories, Terminator: deps.Terminator, Epochs: deps.Epochs, MaxRetries: deps.MaxRetries, Logger: deps.Logger})
+	retire, err := dataset.NewRetireHandler(dataset.RetireDependencies{Repositories: deps.Repositories, Terminator: deps.Terminator, Epochs: deps.Epochs, Logger: deps.Logger})
 	if err != nil {
 		return points, fmt.Errorf("constructing retire: %w", err)
 	}
@@ -246,19 +246,19 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing bucketHandler: %w", err)
 	}
-	uploadHandler, err := uploadplan.NewHandler(uploadplan.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Observability: deps.Observability, MaxRetries: deps.MaxRetries, Logger: deps.Logger, Selector: selector, Messenger: uploadMessages})
+	uploadHandler, err := uploadplan.NewHandler(uploadplan.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Observability: deps.Observability, Logger: deps.Logger, Selector: selector, Messenger: uploadMessages})
 	if err != nil {
 		return points, fmt.Errorf("constructing uploadHandler: %w", err)
 	}
-	replacementHandler, err := replacement.NewHandler(replacement.Dependencies{Repositories: deps.Repositories, Messenger: replacementMessages, RetryPolicy: service})
+	replacementHandler, err := replacement.NewHandler(replacement.Dependencies{Repositories: deps.Repositories, Messenger: replacementMessages, RetryPolicy: service, Scheduler: replacementScheduler})
 	if err != nil {
 		return points, fmt.Errorf("constructing replacementHandler: %w", err)
 	}
-	cleanupHandler, err := cleanup.NewHandler(cleanup.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Receipts: deps.Receipts, WalletReceiptTimeout: deps.WalletReceiptTimeout, Cache: deps.Cache, CacheGate: deps.CacheGate, CacheTracker: deps.CacheTracker, MaxRetries: deps.MaxRetries, Logger: deps.Logger})
+	cleanupHandler, err := cleanup.NewHandler(cleanup.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Receipts: deps.Receipts, WalletReceiptTimeout: deps.WalletReceiptTimeout, Cache: deps.Cache, CacheGate: deps.CacheGate, CacheTracker: deps.CacheTracker, Logger: deps.Logger})
 	if err != nil {
 		return points, fmt.Errorf("constructing cleanupHandler: %w", err)
 	}
-	walletHandler, err := wallet.NewHandler(wallet.Dependencies{Repositories: deps.Repositories, Wallet: deps.Wallet, Receipts: deps.Receipts, WalletBroadcastTimeout: deps.WalletBroadcastTimeout, WalletReceiptTimeout: deps.WalletReceiptTimeout, MaxRetries: deps.MaxRetries})
+	walletHandler, err := wallet.NewHandler(wallet.Dependencies{Repositories: deps.Repositories, Wallet: deps.Wallet, Receipts: deps.Receipts, WalletBroadcastTimeout: deps.WalletBroadcastTimeout, WalletReceiptTimeout: deps.WalletReceiptTimeout})
 	if err != nil {
 		return points, fmt.Errorf("constructing walletHandler: %w", err)
 	}
@@ -278,12 +278,8 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing speed: %w", err)
 	}
-	gcHandler, err := gc.NewHandler(gc.Dependencies{Repositories: deps.Repositories})
-	if err != nil {
-		return points, fmt.Errorf("constructing gcHandler: %w", err)
-	}
-	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, walletHandler, observabilityHandler, approved, endorsed, speed, gcHandler} {
-		if err := registry.Register(handler); err != nil {
+	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
+		if err := registry.Register(bindRetryContract(handler, deps)); err != nil {
 			return points, err
 		}
 	}

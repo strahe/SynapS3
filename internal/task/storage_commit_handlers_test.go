@@ -424,7 +424,7 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	stopHandlerEngine(t, cancel, done)
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, f.runtime.repos, f.runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("restart engine: %v", err)
@@ -542,7 +542,9 @@ func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T
 			}
 			cancel, done := runHandlerEngine(t, f.runtime)
 			defer stopHandlerEngine(t, cancel, done)
-			waitForTask(t, f.runtime.repos, planner.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusPending && task.ClaimGeneration > 0 })
+			waitForTask(t, f.runtime.repos, planner.ID, func(task *model.Task) bool {
+				return task.ClaimGeneration > 0 && ((policy == cache.EvictionPolicyNone && task.Status == model.TaskStatusCompleted) || (policy == cache.EvictionPolicyLRU && task.Status == model.TaskStatusPending))
+			})
 			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.WaitReason != nil && *task.WaitReason == "collecting" })
 			if f.request(t, requestID).Status != storagecommit.RequestStatusCollecting {
 				t.Fatal("safe cleanup unexpectedly ended collection")
@@ -918,14 +920,25 @@ func TestRefusedCommitRequestBacksOffAndSendsTheSameRequest(t *testing.T) {
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	waiting := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == storagecommit.ProviderRejectedWaitReason
+	waiting := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
+		request := f.request(t, requestID)
+		return task.Status == model.TaskStatusPending && task.RetryCount == 1 && request.Refusals == 1 && request.RetryAt != nil
 	})
 	if waiting.ResumeMode != model.TaskResumeModeExecute {
 		t.Fatalf("refused task = %#v, want an execute wait", waiting)
 	}
-	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusReady || request.Refusals != 1 || request.RetryAt == nil {
+	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusReady || request.Refusals != 1 || request.RetryAt == nil || !request.RetryAt.After(time.Now()) {
 		t.Fatalf("refused request = %#v", request)
+	}
+	wakeTask(t, f.runtime, taskID)
+	protocolWait := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.ClaimGeneration > waiting.ClaimGeneration
+	})
+	if protocolWait.RetryCount != 1 {
+		t.Fatalf("protocol wait consumed another retry: %#v", protocolWait)
+	}
+	if sends, _ := f.provider.sent(); len(sends) != 1 {
+		t.Fatalf("provider refusal deadline was bypassed: %d submissions", len(sends))
 	}
 	f.retryRefusedNow(t, requestID, taskID)
 	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
@@ -944,7 +957,7 @@ func TestDroppedMemberIsTransferredAgainBeforeTheRequestIsResent(t *testing.T) {
 	defer stopHandlerEngine(t, cancel, done)
 
 	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == storagecommit.ProviderRejectedWaitReason
+		return task.Status == model.TaskStatusPending && task.FailureReason != nil && *task.FailureReason == storagecommit.ProviderRejectedWaitReason
 	})
 	// The member keeps its place in the signed request while its piece is
 	// transferred again; the other member waits with it.
@@ -1081,8 +1094,8 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 		t.Fatalf("age submission: %v", err)
 	}
 	completed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(legacyStart) {
-		t.Fatalf("registration recovery start = %v, want %v", completed.WorkStartedAt, legacyStart)
+	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(legacyStart) {
+		t.Fatalf("registration recovery start = %v, must be after the original submission %v", completed.WorkStartedAt, legacyStart)
 	}
 	waitForCommitted(t, f.runtime, f.copies)
 	if sends, extras := f.provider.sent(); len(sends) != 2 || !sameSends(sends, extras) {
@@ -1126,7 +1139,7 @@ func TestSubmittedRequestWhoseNonceWasSpentStopsForReview(t *testing.T) {
 	defer stopHandlerEngine(t, cancel, done)
 
 	failed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
-	if failed.FailureReason == nil || *failed.FailureReason != string(storagecommit.AttentionSubmissionMismatch) || !f.runtime.service.Retryable(failed) {
+	if failed.FailureReason == nil || *failed.FailureReason != string(storagecommit.AttentionSubmissionMismatch) || !handlerTaskRetryable(t, f.runtime, failed) {
 		t.Fatalf("stopped task = %#v, want a retryable submission_mismatch", failed)
 	}
 	request := f.request(t, requestID)
@@ -1134,7 +1147,7 @@ func TestSubmittedRequestWhoseNonceWasSpentStopsForReview(t *testing.T) {
 		*request.AttentionCode != string(storagecommit.AttentionSubmissionMismatch) {
 		t.Fatalf("request = %#v, want flagged submission_mismatch", request)
 	}
-	if err := f.runtime.repos.Tasks.AcknowledgeFailed(t.Context(), taskID, time.Hour); !errors.Is(err, repository.ErrConflict) {
+	if err := f.runtime.repos.Tasks.AcknowledgeFailed(t.Context(), taskID); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("dismissing the stopped registration = %v, want conflict", err)
 	}
 	if sends, _ := f.provider.sent(); len(sends) != 1 {
@@ -1180,8 +1193,8 @@ func TestUnknownAttentionCodeStopsRecovery(t *testing.T) {
 	}
 	f.makeResendDue(t, requestID)
 	failed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
-	if failed.FailureReason == nil || *failed.FailureReason != "commit_attention_unknown" || f.runtime.service.Retryable(failed) {
-		t.Fatalf("stopped task = %#v, want a non-retryable unknown attention stop", failed)
+	if failed.FailureReason == nil || *failed.FailureReason != "commit_attention_unknown" || handlerTaskRetryable(t, f.runtime, failed) {
+		t.Fatalf("stopped task = %#v, reason=%v retryable=%v, want a non-retryable unknown attention stop", failed, failed.FailureReason, handlerTaskRetryable(t, f.runtime, failed))
 	}
 	if sends, _ := f.provider.sent(); len(sends) != 1 {
 		t.Fatalf("submissions = %d, want only the lost one", len(sends))
@@ -1215,175 +1228,48 @@ func TestRequestTooLargeToSignIsSplitInHalves(t *testing.T) {
 	}
 }
 
-// pullRegistration is a peer copy whose first Pull succeeds and every later one
-// fails for good. Its provider answers sends from script, and has dropped the
-// pulled piece once it refuses one.
-type pullRegistration struct {
-	nonce    uint64
-	runtime  handlerTestRuntime
-	pipeline seededCopyPipeline
-	mu       sync.Mutex
-	script   []sendOutcome
-	sends    int
-	pulls    int
-}
-
-func newPullRegistration(t *testing.T, script ...sendOutcome) *pullRegistration {
-	t.Helper()
-	r := &pullRegistration{script: script}
-	parked := &droppedPieces{missing: map[string]bool{}}
-	target := &testutil.MockStorageTarget{
-		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			r.nonce++
-			return testutil.CommitExtraData(r.nonce), nil
-		},
-		SubmitPullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			r.pulls++
-			if r.pulls == 1 {
-				return pullStatusResult(request, storage.PullStatusComplete), nil
+// Exhaustion retains the sealed request even when the last send was refused or its outcome is unknown.
+func TestCommitExhaustionRetainsEvidenceWithoutReopeningMembers(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		outcome   sendOutcome
+		status    storagecommit.RequestStatus
+		wantSends int
+	}{
+		{"refused", sendRefuse, storagecommit.RequestStatusReady, 0},
+		{"unknown outcome", sendLost, storagecommit.RequestStatusSubmitted, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parked := &droppedPieces{missing: map[string]bool{}}
+			f := newRegistrationFixture(t, 1, parked, 0, func(options *handlerRuntimeOptions) {
+				options.maxAttempts = new(1)
+			})
+			f.provider.script = []sendOutcome{tc.outcome}
+			parked.drop(f.pieceCID(t, f.copies[0]))
+			requestID, taskID := f.collect(t)
+			cancel, done := runHandlerEngine(t, f.runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			failed := waitForCommitTask(t, f.runtime, taskID, func(row *model.Task) bool { return row.Status == model.TaskStatusFailed })
+			if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || failed.RetryCount != 0 {
+				t.Fatalf("exhausted coordinator = %#v", failed)
 			}
-			return pullStatusResult(request, storage.PullStatusFailed), nil
-		},
-		SubmitCommitFunc: func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			r.sends++
-			parked.drop(request.Pieces[0].PieceCID.String())
-			if r.sends > len(r.script) || r.script[r.sends-1] == sendRefuse {
-				return nil, &pdp.HTTPError{StatusCode: 400, Body: "piece not found"}
+			request := f.request(t, requestID)
+			if request.Status != tc.status || request.TaskID == nil || *request.TaskID != taskID || request.ExtraDataHex == nil || request.SealedAt == nil || request.FirstSentAt == nil || request.LastSentAt == nil || request.Sends != tc.wantSends {
+				t.Fatalf("exhaustion lost request evidence or owner: %#v", request)
 			}
-			return nil, &pdp.HTTPError{StatusCode: 502, Body: "bad gateway"}
-		},
+			member := waitForCopy(t, f.runtime, f.copies[0].ID, func(*model.StorageCopy) bool { return true })
+			if member.CommitRequestID == nil || *member.CommitRequestID != requestID || member.CommitPosition == nil || member.ActiveTaskID != nil {
+				t.Fatalf("exhaustion reopened or detached member: %#v", member)
+			}
+			count, err := f.runtime.db.NewSelect().Model((*model.Task)(nil)).Where("type IN (?)", bun.List([]model.TaskType{model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull})).Count(t.Context())
+			if err != nil || count != 0 {
+				t.Fatalf("exhaustion created %d recovery tasks, err=%v", count, err)
+			}
+			if sends, _ := f.provider.sent(); len(sends) != 1 {
+				t.Fatalf("submissions = %d, want one", len(sends))
+			}
+		})
 	}
-	storageClient := &testutil.MockStorageClient{}
-	r.runtime = newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: storageClient, policy: cache.EvictionPolicyNone,
-		commitNonces: &testutil.MockCommitNonces{}, parkedPieces: parked,
-	})
-	r.pipeline = seedCopyPipeline(t, r.runtime, model.StorageCopyStatusPending)
-	version := &model.ObjectVersion{
-		VersionID: model.NewVersionID(), BucketID: r.pipeline.upload.BucketID, Key: "pull-registration.bin",
-		ContentID: &r.pipeline.upload.ID, Size: r.pipeline.upload.ContentSize, ETag: "pull-registration",
-		ContentType: "application/octet-stream",
-	}
-	if _, err := r.runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-		t.Fatal(err)
-	}
-	target.ProviderIDValue = r.pipeline.targetSet.ProviderID.SDK()
-	dataSetID := r.pipeline.targetSet.DataSetID.SDK()
-	target.DataSetIDValue = &dataSetID
-	target.ClientDataSetIDValue = r.pipeline.targetClient
-	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
-		return target, nil
-	}
-	bindCopyTask(t, r.runtime, r.pipeline.target, model.TaskTypeStoragePull)
-	return r
-}
-
-func (r *pullRegistration) sent() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.sends
-}
-
-// copyRow waits for the peer copy to satisfy predicate, waking registration
-// tasks meanwhile.
-func (r *pullRegistration) copyRow(t *testing.T, predicate func(*model.StorageCopy) bool) *model.StorageCopy {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		copyRow, err := r.runtime.repos.Contents.GetUploadCopyByID(t.Context(), r.pipeline.target.ID)
-		if err != nil {
-			t.Fatalf("load copy: %v", err)
-		}
-		if predicate(copyRow) {
-			return copyRow
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("copy did not reach the expected state: %#v", copyRow)
-		}
-		wakeCommitTasks(t, r.runtime)
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-func TestUnacceptedRequestFailsAMemberThatCannotBeTransferredAgain(t *testing.T) {
-	r := newPullRegistration(t, sendRefuse)
-	cancel, done := runHandlerEngine(t, r.runtime)
-	defer stopHandlerEngine(t, cancel, done)
-
-	// The provider refused the request and had dropped the piece; pulling it
-	// again fails for good. The request was never accepted, so it is given up
-	// and the copy fails as any other copy would.
-	failed := r.copyRow(t, func(c *model.StorageCopy) bool { return c.Status == model.StorageCopyStatusFailed })
-	if failed.CommitRequestID != nil || failed.ActiveTaskID != nil || failed.LastError == nil {
-		t.Fatalf("failed copy = %#v, want released with its transfer error", failed)
-	}
-	var requests []storagecommit.Request
-	if err := r.runtime.db.NewSelect().Model(&requests).Where("storage_data_set_id = ?", r.pipeline.targetSet.ID).Scan(t.Context()); err != nil {
-		t.Fatalf("load requests: %v", err)
-	}
-	if len(requests) != 1 || requests[0].Status != storagecommit.RequestStatusAbandoned {
-		t.Fatalf("requests = %#v, want the refused request given up", requests)
-	}
-	if r.sent() != 1 {
-		t.Fatalf("submissions = %d, want 1", r.sent())
-	}
-	// The source still holds a readable copy, so the content itself is fine.
-	if content, err := r.runtime.repos.Contents.GetByID(t.Context(), r.pipeline.upload.ID); err != nil || content.ErrorMessage != nil {
-		t.Fatalf("content = %#v, %v, want it not flagged", content, err)
-	}
-}
-
-func TestSubmittedRequestTransfersAGivenUpMemberAgainLater(t *testing.T) {
-	r := newPullRegistration(t, sendLost, sendRefuse)
-	cancel, done := runHandlerEngine(t, r.runtime)
-	defer stopHandlerEngine(t, cancel, done)
-
-	member := r.copyRow(t, func(c *model.StorageCopy) bool {
-		return c.CommitRequestID != nil && c.Status == model.StorageCopyStatusCommitting
-	})
-	requestID := *member.CommitRequestID
-	waitForCommitTask(t, r.runtime, requestTaskID(t, r.runtime, requestID), func(*model.Task) bool { return r.sent() == 1 })
-	if _, err := r.runtime.db.NewRaw(`UPDATE storage_commit_requests SET last_sent_at = ? WHERE request_id = ?`,
-		time.Now().Add(-time.Hour), requestID).Exec(t.Context()); err != nil {
-		t.Fatalf("age latest send: %v", err)
-	}
-
-	// The resend is refused for a dropped piece that cannot be pulled again.
-	// The first send may still land, so the copy stays in its request and is
-	// transferred again later.
-	retried := r.copyRow(t, func(c *model.StorageCopy) bool {
-		if c.Status != model.StorageCopyStatusPending || c.ActiveTaskID == nil || c.LastError == nil {
-			return false
-		}
-		task, err := r.runtime.repos.Tasks.GetByID(t.Context(), *c.ActiveTaskID)
-		return err == nil && task.Type == model.TaskTypeStorageTransferPlan && task.AvailableAt.After(time.Now().Add(time.Minute))
-	})
-	if retried.CommitRequestID == nil || *retried.CommitRequestID != requestID || retried.CommitPosition == nil {
-		t.Fatalf("copy = %#v, want it kept at its position", retried)
-	}
-	var request storagecommit.Request
-	if err := r.runtime.db.NewSelect().Model(&request).Where("request_id = ?", requestID).Scan(t.Context()); err != nil ||
-		request.Status != storagecommit.RequestStatusSubmitted {
-		t.Fatalf("request = %#v, %v, want still submitted", request, err)
-	}
-	if r.sent() != 2 {
-		t.Fatalf("submissions = %d, want 2", r.sent())
-	}
-}
-
-func requestTaskID(t *testing.T, runtime handlerTestRuntime, requestID string) int64 {
-	t.Helper()
-	request, err := runtime.repos.Contents.GetCommitRequest(t.Context(), requestID)
-	if err != nil || request.TaskID == nil {
-		t.Fatalf("request %s = %#v, %v", requestID, request, err)
-	}
-	return *request.TaskID
 }
 
 type droppedPieces struct {

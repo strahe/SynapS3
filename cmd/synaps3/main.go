@@ -460,8 +460,6 @@ func setupModeAllowedField(field string) bool {
 		"worker.tasks.concurrency",
 		"worker.tasks.poll_interval",
 		"worker.tasks.lease_duration",
-		"worker.tasks.max_retries",
-		"worker.tasks.retention",
 		"worker.tasks.provider_mutation_concurrency",
 		"worker.tasks.destructive_mutation_concurrency",
 		"worker.tasks.commit_max_pieces",

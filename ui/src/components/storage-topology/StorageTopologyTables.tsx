@@ -4,6 +4,7 @@ import type { MouseEvent, ReactNode } from 'react'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation, ProviderProfile } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { StatusBadge } from '@/components/app/StatusBadge'
+import { RetryButton } from '@/components/tasks/RetryButton'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
@@ -179,7 +180,9 @@ function ProviderHealthCell({
         <TopologySignalBadge status={row.status} signal={row.provider?.signal} />
       </div>
       <div>
-        {testing ? (
+        {test?.retryable ? (
+          <RetryButton taskID={test.retry_task_id} />
+        ) : testing ? (
           <Button variant="ghost" size="icon-xs" disabled aria-label={`Testing upload speed for ${name}`}>
             <Loader2 className="animate-spin" />
           </Button>

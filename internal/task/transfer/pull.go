@@ -25,7 +25,7 @@ func (h *PullHandler) pullWithoutSource(ctx context.Context, execution taskengin
 		return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
 	}
 	if !migration {
-		return taskengine.Suspend(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
 	}
 	available, err := copyCacheAvailable(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Cache, copyRow)
 	if err != nil {
@@ -78,7 +78,7 @@ func (h *PullHandler) recoverPullFromCache(ctx context.Context, execution tasken
 }
 
 func (h *PullHandler) pullHandler() *taskengine.FuncHandler {
-	definition := copyDefinition(model.TaskTypeStoragePull, h.retryLimit())
+	definition := copyDefinition(model.TaskTypeStoragePull)
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runPull(ctx, execution, true)
 	}, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
@@ -126,7 +126,6 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 				return retryPullDependency(execution, err, "pull_checkpoint_failed")
 			}
 		}
-		defer func() { result = result.WithWorkStartedAt(attempt.AttemptedAt) }()
 	}
 	if copyRow.Status == model.StorageCopyStatusCommitted || copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
 		if attempt != nil {
@@ -157,7 +156,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready for ingress")
 	}
 	if attempt == nil && !mayPull {
-		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)
 	}
 	_, target, _, _, err := copyContext(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Resolver, copyRow)
 	if err != nil {
@@ -216,8 +215,11 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		}
 		checkpoint = pullCheckpoint{AttemptID: attemptID}
 	}
-	if !mayPull || execution.CancellationRequested() {
+	if (!mayPull && !checkpoint.Accepted) || execution.CancellationRequested() {
 		return h.observePullPiece(ctx, execution, input, copyRow, target, attempt, pieceCID, false)
+	}
+	if delay := time.Until(checkpoint.NextRequestAt); delay > 0 {
+		return taskengine.Wait(model.TaskResumeModeRecover, delay, storagepull.WaitQueueFull, "Waiting for the provider to accept storage transfers", nil)
 	}
 	var submitted *storage.PullResult
 	var attempted bool
@@ -230,18 +232,18 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		})
 		return err
 	}
-	if freshAttempt {
-		attempted, err = execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint,
+	if !checkpoint.Accepted {
+		attempted, err = execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "pull:"+attempt.AttemptID, checkpoint,
 			func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Contents.ReservePullRequest(ctx, pullReservation(input, execution.ID(), attempt))
 			}, submit)
 	} else {
-		err = execution.WithResource(ctx, taskengine.ResourceProviderMutation, submit)
+		err = submit(ctx)
 	}
 	if errors.Is(err, taskengine.ErrResourceBusy) {
 		return taskengine.ResourceWait("Waiting for other storage operations to finish")
 	}
-	if freshAttempt && !attempted && err != nil {
+	if !checkpoint.Accepted && !attempted && err != nil {
 		return h.retryUnsubmittedPull(execution, input, copyRow, attempt, err)
 	}
 	if errors.Is(err, pdp.ErrPullQueueFull) {
@@ -249,8 +251,11 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		if httpErr, ok := errors.AsType[*pdp.HTTPError](err); ok && httpErr.RetryAfter > 0 {
 			delay = httpErr.RetryAfter
 		}
-		return taskengine.SuspendWithError(model.TaskResumeModeRecover, delay, storagepull.WaitQueueFull,
-			"Waiting for storage provider", synapse.SummarizedError(err), nil)
+		checkpoint.NextRequestAt = time.Now().UTC().Add(delay)
+		if recordErr := execution.WriteCheckpoint(ctx, checkpoint); recordErr != nil {
+			return retryPullOutcome(execution, errors.Join(err, recordErr), "pull_queue_delay_record_failed")
+		}
+		return taskengine.RetryInMode(synapse.SummarizedError(err), storagepull.WaitQueueFull, model.TaskResumeModeRecover, delay, nil)
 	}
 	if err != nil {
 		if synapse.ClassifyPullError(err) == synapse.PullErrorTerminal {
@@ -262,9 +267,15 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 	if err != nil {
 		return retryPullOutcome(execution, err, "pull_status_invalid")
 	}
+	if !checkpoint.Accepted {
+		checkpoint.Accepted = true
+		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+			return retryPullOutcome(execution, err, "pull_acceptance_record_failed")
+		}
+	}
 	switch status {
 	case storage.PullStatusPending, storage.PullStatusInProgress, storage.PullStatusRetrying:
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	case storage.PullStatusFailed:
 		return h.failConfirmedPull(ctx, execution, input, copyRow, attempt, pdp.ErrPullFailed)
 	case storage.PullStatusComplete:
@@ -296,12 +307,19 @@ func (h *PullHandler) observePullPiece(
 	}
 	switch state {
 	case synapse.ParkedPieceProcessing:
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	case synapse.ParkedPieceMissing:
 		if reportedComplete {
 			return h.failConfirmedPull(ctx, execution, input, copyRow, attempt, errors.New("provider no longer has the completed pull piece"))
 		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		checkpoint, _, err := taskengine.DecodeCheckpoint[pullCheckpoint](execution)
+		if err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
+		}
+		if delay := time.Until(checkpoint.NextRequestAt); delay > 0 {
+			return taskengine.Wait(model.TaskResumeModeExecute, delay, storagepull.WaitQueueFull, "Waiting for the provider to accept storage transfers", nil)
+		}
+		return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	default:
 		return retryPullOutcome(execution, fmt.Errorf("unknown parked piece state %q", state), "pull_status_invalid")
 	}
@@ -324,28 +342,6 @@ func (h *PullHandler) failConfirmedPull(ctx context.Context, execution taskengin
 	return h.failPullTask(execution, input, copyRow, attempt.AttemptID, err, "pull_failed")
 }
 
-func (h *PullHandler) retryUnsubmittedPull(
-	execution taskengine.Execution,
-	input storagepipeline.CopyGenerationInput,
-	copyRow *model.StorageCopy,
-	attempt *storagepull.Attempt,
-	err error,
-) taskengine.Result {
-	if !execution.RetryWillFail() {
-		return retryTask(err, "pull_checkpoint_failed")
-	}
-	return taskengine.Fail(err, "pull_checkpoint_failed", func(ctx context.Context, repos *repository.Repositories) error {
-		attemptID := attempt.AttemptID
-		// A commit error can leave the reservation durable even though the
-		// effect was never called. Resolve it in the copy's settlement.
-		if _, loadErr := repos.Contents.GetPullAttempt(ctx, attemptID, copyRow.ContentID, copyRow.StorageDataSetID); errors.Is(loadErr, repository.ErrNotFound) {
-			attemptID = ""
-		} else if loadErr != nil {
-			return loadErr
-		}
-		if copyRow.CommitDecidedByRequest() {
-			return h.releaseMemberTransfer(execution, input, copyRow, err.Error(), attemptID)(ctx, repos)
-		}
-		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, err.Error(), attemptID)
-	})
+func (h *PullHandler) retryUnsubmittedPull(_ taskengine.Execution, _ storagepipeline.CopyGenerationInput, _ *model.StorageCopy, _ *storagepull.Attempt, err error) taskengine.Result {
+	return retryTask(err, "pull_checkpoint_failed")
 }

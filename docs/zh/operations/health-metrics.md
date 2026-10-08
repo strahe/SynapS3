@@ -49,7 +49,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-status 应显示后台任务处理正常。task stats 会把已确认失败单独统计为 dismissed，仪表盘会把 pending 工作显示为 queued、scheduled 或 waiting。
+status 应显示后台任务处理正常。已确认失败仍计为 failed；pending 工作显示为 queued、scheduled 或 waiting。
 
 ## Prometheus Metrics
 

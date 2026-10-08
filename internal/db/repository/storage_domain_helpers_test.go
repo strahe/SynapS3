@@ -142,10 +142,10 @@ func TestFailForEngineTaskLeavesTheReplacementRetryable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Authorize: %v", err)
 			}
-			coordinator, _, err := repos.Tasks.Enqueue(ctx, &model.Task{
+			coordinator, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 				Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: "engine-failed-coordinator",
 				InputVersion: 1, Input: []byte(`{}`), InputHash: "engine-failed-coordinator",
-			})
+			}))
 			if err != nil {
 				t.Fatalf("enqueue coordinator: %v", err)
 			}
@@ -295,10 +295,10 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Authorize(first): %v", err)
 	}
-	ensureTask, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	ensureTask, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "target-creating-ensure",
 		InputVersion: 1, Input: []byte(`{}`), InputHash: "target-creating-ensure",
-	})
+	}))
 	if err != nil {
 		t.Fatalf("enqueue target ensure: %v", err)
 	}
@@ -362,10 +362,10 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 			if err != nil {
 				t.Fatalf("Authorize(first): %v", err)
 			}
-			ensureTask, _, err := repos.Tasks.Enqueue(ctx, &model.Task{
+			ensureTask, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 				Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "dead-fence-ensure",
 				InputVersion: 1, Input: []byte(`{}`), InputHash: "dead-fence-ensure",
-			})
+			}))
 			if err != nil {
 				t.Fatalf("enqueue target ensure: %v", err)
 			}

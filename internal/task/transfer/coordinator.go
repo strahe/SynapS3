@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -73,25 +74,6 @@ func (h *CopyCoordinator) authorizeCopyTask(
 		if execution.Type() == model.TaskTypeStoragePull {
 			return input, nil, true, retryPullDependency(execution, err, "copy_authorization_failed")
 		}
-		if execution.Type() == model.TaskTypeStorageStore && execution.RetryWillFail() {
-			return input, nil, true, taskengine.Fail(err, "copy_authorization_failed", nil)
-		}
-		if execution.RetryWillFail() {
-			message := err.Error()
-			return input, nil, true, taskengine.Fail(err, "copy_authorization_failed", func(ctx context.Context, repos *repository.Repositories) error {
-				copyRow, authorizeErr := repos.Contents.AuthorizeCopyTask(ctx, input.CopyID, input.Generation, execution.ID(), execution.ClaimGeneration())
-				if errors.Is(authorizeErr, repository.ErrConflict) || errors.Is(authorizeErr, repository.ErrNotFound) {
-					return nil
-				}
-				if authorizeErr != nil {
-					return authorizeErr
-				}
-				if copyRow.CommitDecidedByRequest() {
-					return nil
-				}
-				return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
-			})
-		}
 		return input, nil, true, retryTask(err, "copy_authorization_failed")
 	}
 	return input, copyRow, false, taskengine.Result{}
@@ -138,6 +120,46 @@ func (h *CopyCoordinator) enqueueCopyTaskAt(ctx context.Context, repos *reposito
 	return repos.Contents.BindCopyTask(ctx, copyID, generation, taskRow.ID)
 }
 
+func (h *CopyCoordinator) enqueueRecoveryCopyTaskAt(ctx context.Context, repos *repository.Repositories, copyID, sourceID int64, availableAt time.Time) error {
+	if h.deps.Scheduler == nil {
+		return errors.New("task service is unavailable")
+	}
+	copyRow, err := repos.Contents.GetUploadCopyByID(ctx, copyID)
+	if err != nil {
+		return err
+	}
+	source, err := repos.Tasks.GetByID(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	if source == nil || copyRow == nil || copyRow.ActiveTaskID != nil {
+		return repository.ErrConflict
+	}
+	var previous storagepipeline.CopyGenerationInput
+	if err := json.Unmarshal(source.Input, &previous); err != nil {
+		return err
+	}
+	if previous.CopyID != copyID || previous.Generation != copyRow.WorkGeneration {
+		return repository.ErrConflict
+	}
+	latest, err := repos.Tasks.LatestForSubject(ctx, model.TaskSubjectStorageCopy, strconv.FormatInt(copyID, 10), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+	if err != nil {
+		return err
+	}
+	if latest == nil || latest.ID != sourceID {
+		return repository.ErrConflict
+	}
+	input := storagepipeline.CopyGenerationInput{CopyID: copyID, Generation: previous.Generation + 1}
+	taskRow, err := h.deps.Scheduler.EnqueueRecoveryInTransaction(ctx, repos, sourceID, taskengine.EnqueueRequest{
+		Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(copyID, input.Generation), Input: input,
+		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyID, 10), AvailableAt: availableAt,
+	})
+	if err != nil {
+		return err
+	}
+	return repos.Contents.BindCopyTask(ctx, copyID, input.Generation, taskRow.ID)
+}
+
 func (h *CopyCoordinator) enqueueSuccessorCopyTask(
 	ctx context.Context,
 	repos *repository.Repositories,
@@ -173,7 +195,7 @@ func (h *CopyCoordinator) copyContextFailure(
 		return taskengine.Fail(err, "copy_owner_missing", nil)
 	}
 	if synapse.IsProviderUnavailable(err) || errors.Is(err, storage.ErrDataSetUnavailable) {
-		return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
 	}
 	if settleSafe {
 		return h.retryCopyTask(execution, input, copyRow, err, "copy_context_failed")
@@ -221,10 +243,7 @@ func (h *CopyCoordinator) retryCopyTask(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if !execution.RetryWillFail() {
-		return retryTask(err, reason)
-	}
-	return h.failCopyTask(execution, input, copyRow, err, reason)
+	return retryTask(err, reason)
 }
 
 func (h *CopyCoordinator) failPullTask(

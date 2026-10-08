@@ -182,14 +182,6 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Label: "Task Lease Duration", Description: "Time another process waits before recovering interrupted background work. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_LEASE_DURATION", Editable: true,
 	},
-	"worker.tasks.max_retries": {
-		Label: "Task Max Retries", Description: "Default retry limit for background operations. Restart required.",
-		Env: "SYNAPS3_WORKER_TASKS_MAX_RETRIES", Editable: true,
-	},
-	"worker.tasks.retention": {
-		Label: "Task Retention", Description: "How long finished background operations remain visible. Restart required.",
-		Env: "SYNAPS3_WORKER_TASKS_RETENTION", Editable: true,
-	},
 	"worker.tasks.provider_mutation_concurrency": {
 		Label: "Storage Mutation Concurrency", Description: "Maximum concurrent requests that change remote storage. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", Editable: true,
