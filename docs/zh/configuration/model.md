@@ -73,7 +73,7 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
 | `database` | PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
-| `worker.tasks` | 统一后台任务执行和存储变更并发限制。 |
+| `worker.tasks` | 后台任务全局并发和上传并发限制。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
 | `admin` | 仪表盘、Admin API 监听地址和 Admin 认证设置。 |
 

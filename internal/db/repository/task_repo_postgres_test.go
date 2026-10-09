@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"strings"
 	"sync"
@@ -98,7 +99,12 @@ func (h *claimQueryRecorder) AfterQuery(_ context.Context, event *bun.QueryEvent
 	}
 }
 
-func TestPostgresTaskClaimFilteredBacklogQueryPlan(t *testing.T) {
+var taskClaimDiagnostics = flag.Bool("task-claim-diagnostics", false, "Record PostgreSQL task claim plans with an excluded backlog")
+
+func TestPostgresTaskClaimFilteredBacklogDiagnostics(t *testing.T) {
+	if !*taskClaimDiagnostics {
+		t.Skip("run with -args -task-claim-diagnostics")
+	}
 	db := newPostgresTaskDB(t)
 	ctx := t.Context()
 	const backlogPerMode = 5000

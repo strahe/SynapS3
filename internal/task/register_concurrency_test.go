@@ -4,8 +4,6 @@ import (
 	"testing"
 
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/task"
-	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 func TestRegisteredTaskConcurrencyDefaults(t *testing.T) {
@@ -25,17 +23,5 @@ func TestRegisteredTaskConcurrencyDefaults(t *testing.T) {
 		if !ok || definition.MaxConcurrency != limits[taskType] {
 			t.Errorf("%s concurrency = %d, want %d", taskType, definition.MaxConcurrency, limits[taskType])
 		}
-	}
-}
-
-func TestTaskRegistrationRejectsNegativeUploadConcurrency(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	registry := taskengine.NewRegistry()
-	service, err := taskengine.NewService(registry, runtime.repos)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, UploadConcurrency: -1}); err == nil {
-		t.Fatal("registered tasks with negative upload concurrency")
 	}
 }

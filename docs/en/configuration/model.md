@@ -73,7 +73,7 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `filecoin.observability` | Provider and local data set health checks. |
 | `database` | PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
-| `worker.tasks` | Shared background task execution and provider mutation limits. |
+| `worker.tasks` | Global background task and upload concurrency limits. |
 | `logging` | Runtime log level, format, and S3 access logs. |
 | `admin` | Dashboard, Admin API listener, and Admin auth settings. |
 

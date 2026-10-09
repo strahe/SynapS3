@@ -81,12 +81,6 @@ func normalizeDependencies(deps Dependencies) (Dependencies, error) {
 	if deps.WalletBroadcastTimeout < 0 || deps.WalletReceiptTimeout < 0 {
 		return deps, errors.New("wallet timeouts cannot be negative")
 	}
-	if deps.UploadConcurrency < 0 {
-		return deps, errors.New("upload concurrency cannot be negative")
-	}
-	if deps.UploadConcurrency == 0 {
-		deps.UploadConcurrency = config.DefaultUploadConcurrency
-	}
 	if deps.WalletBroadcastTimeout == 0 {
 		deps.WalletBroadcastTimeout = 2 * time.Minute
 	}
