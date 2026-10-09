@@ -111,11 +111,11 @@ func (f commitFixture) request(t *testing.T, id string) *storagecommit.Request {
 
 // commitTask is the task row a request with the given ID is driven by.
 func commitTask(requestID string) *model.Task {
-	return &model.Task{
+	return repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageCommit, IdempotencyKey: requestID, InputVersion: 1,
 		Input: fmt.Appendf(nil, `{"request_id":%q}`, requestID), InputHash: requestID,
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	}
+	})
 }
 
 func (f commitFixture) task(t *testing.T, key string) int64 {
@@ -560,14 +560,20 @@ func testSignedCommitMembersAreDecidedByTheirRequest(t *testing.T, f commitFixtu
 func testRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T, f commitFixture) {
 	ctx := t.Context()
 	taskID, _ := f.sealedRequest(t, "retained")
-	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusCompleted).Set("finished_at = ?", time.Now()).
-		Set("retention_until = ?", time.Now().Add(-time.Hour)).
-		Where("id = ?", taskID).Exec(ctx); err != nil {
-		t.Fatalf("expire task: %v", err)
+	row, err := f.repos.Tasks.GetByID(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if deleted, err := f.repos.Tasks.DeleteRetained(ctx, time.Now(), 10); err != nil || deleted != 0 {
-		t.Fatalf("DeleteRetained = %d, %v, want the request's task kept", deleted, err)
+	now := time.Now()
+	generation := row.ClaimGeneration + 1
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusRunning).Set("claim_generation = ?", generation).Set("claimed_at = ?", now).Set("lease_until = ?", now.Add(time.Minute)).Set("started_at = ?", now).Where("id = ?", taskID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Tasks.Settle(ctx, taskID, generation, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute}); err != nil {
+		t.Fatal(err)
+	}
+	if stored, err := f.repos.Tasks.GetByID(ctx, taskID); err != nil || stored == nil {
+		t.Fatalf("task history missing: %#v, %v", stored, err)
 	}
 }
 

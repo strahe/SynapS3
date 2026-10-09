@@ -109,12 +109,15 @@ func (s *Server) handleAPIRefreshProvider(w http.ResponseWriter, r *http.Request
 }
 
 type providerUploadSpeedView struct {
-	State          string     `json:"state"`
-	SampleBytes    int64      `json:"sample_bytes"`
-	DurationMS     *int64     `json:"duration_ms,omitempty"`
-	BytesPerSecond *int64     `json:"bytes_per_second,omitempty"`
-	TestedAt       *time.Time `json:"tested_at,omitempty"`
-	FailureCode    *string    `json:"failure_code,omitempty"`
+	RetryUnavailableReason string     `json:"retry_unavailable_reason,omitempty"`
+	Retryable              bool       `json:"retryable"`
+	RetryTaskID            *int64     `json:"retry_task_id"`
+	State                  string     `json:"state"`
+	SampleBytes            int64      `json:"sample_bytes"`
+	DurationMS             *int64     `json:"duration_ms,omitempty"`
+	BytesPerSecond         *int64     `json:"bytes_per_second,omitempty"`
+	TestedAt               *time.Time `json:"tested_at,omitempty"`
+	FailureCode            *string    `json:"failure_code,omitempty"`
 }
 
 func uploadSpeedView(row providerbenchmark.Result, profile *observability.ProviderProfile, observedServiceURL *string) *providerUploadSpeedView {
@@ -177,7 +180,7 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 			view.ProviderProfile = &copy
 		}
 		if row, ok := tests[item.Facts.ProviderID.String()]; ok {
-			view.UploadSpeedTest = uploadSpeedView(row, view.ProviderProfile, item.Facts.ServiceURL)
+			view.UploadSpeedTest = s.uploadSpeedViewWithRetry(r.Context(), item.Facts.ProviderID.String(), row, view.ProviderProfile, item.Facts.ServiceURL)
 		}
 		items = append(items, view)
 	}
@@ -424,4 +427,13 @@ func (s *Server) extendObservabilityRefreshWriteDeadline(w http.ResponseWriter) 
 
 func (s *Server) requireObservabilityRefresh(w http.ResponseWriter, r *http.Request) bool {
 	return true
+}
+
+func (s *Server) uploadSpeedViewWithRetry(ctx context.Context, providerID string, row providerbenchmark.Result, profile *observability.ProviderProfile, serviceURL *string) *providerUploadSpeedView {
+	view := uploadSpeedView(row, profile, serviceURL)
+	if row.State == providerbenchmark.StateFailed {
+		view.RetryTaskID, view.RetryUnavailableReason, _ = s.retryTaskForSubject(ctx, "provider", providerID, model.TaskTypeProviderUploadSpeedTest)
+		view.Retryable = view.RetryTaskID != nil
+	}
+	return view
 }

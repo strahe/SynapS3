@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -25,7 +26,6 @@ type EvictDependencies struct {
 	MaxCacheBytes  int64
 	MaxWriteBytes  int64
 	LRULowPercent  int
-	MaxRetries     int
 }
 type EvictHandler struct {
 	*taskengine.FuncHandler
@@ -36,14 +36,11 @@ func NewEvictHandler(deps EvictDependencies) (*EvictHandler, error) {
 	if deps.Repositories == nil || deps.Repositories.Tasks == nil || deps.State == nil {
 		return nil, errors.New("cache eviction handler requires repositories and state")
 	}
-	if deps.MaxRetries < 0 {
-		return nil, errors.New("task retry limit cannot be negative")
-	}
 	h := &EvictHandler{deps: deps}
 	h.FuncHandler = h.newHandler()
 	return h, nil
 }
-func (h *EvictHandler) retryLimit() *int { value := h.deps.MaxRetries; return &value }
+
 func (h *EvictHandler) lruLowBytes() int64 {
 	return lruLowBytes(h.deps.MaxCacheBytes, h.deps.MaxWriteBytes, h.deps.LRULowPercent)
 }
@@ -55,11 +52,32 @@ type cacheEvictionCheckpoint struct {
 func (h *EvictHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeCacheEvict, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
-		Codec:      taskengine.StrictJSONCodec(cacheeviction.ValidateEvictInput),
-		RetryLimit: h.retryLimit(), AllowRetry: true,
+		Codec:  taskengine.StrictJSONCodec(cacheeviction.ValidateEvictInput),
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) int64 {
 			return input.ContentID
 		}),
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input cacheeviction.EvictInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		row, err := repos.CacheEvictions.GetCacheEntry(ctx, input.ContentID)
+		if err != nil {
+			return err
+		}
+		if row == nil || row.CacheActiveTaskID == nil || *row.CacheActiveTaskID != source.ID || row.CacheOperationGeneration != input.Generation {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input cacheeviction.EvictInput
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.CacheEvictions.TransferEvictionTaskOwner(ctx, input.ContentID, input.Generation, old.ID, next.ID)
 	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runCacheEviction(ctx, execution, true)
@@ -83,11 +101,11 @@ func (h *EvictHandler) runCacheEviction(
 		return taskengine.Fail(
 			errors.New("cache deletion dependencies are unavailable"),
 			"dependency_unavailable",
-			h.releaseCacheEvictionSettlement(input, execution.ID()),
+			nil,
 		)
 	}
 	if _, _, checkpointErr := taskengine.DecodeCheckpoint[cacheEvictionCheckpoint](execution); checkpointErr != nil {
-		return taskengine.Fail(checkpointErr, "invalid_checkpoint", h.releaseCacheEvictionSettlement(input, execution.ID()))
+		return taskengine.Fail(checkpointErr, "invalid_checkpoint", nil)
 	}
 	if allowDelete {
 		checkpoint := cacheEvictionCheckpoint{AttemptedAt: time.Now().UTC()}
@@ -180,7 +198,7 @@ func (h *EvictHandler) deleteAuthorizedCacheEntry(
 			if closeErr := body.Close(); closeErr != nil {
 				return h.retryCacheEviction(execution, input, closeErr, "cache_observation_failed")
 			}
-			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Local cache removal is ready", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Local cache removal is ready", nil)
 		case os.IsNotExist(err):
 			finalizeErr := h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
 				if err := repos.Tasks.ValidateClaim(ctx, execution.ID(), execution.ClaimGeneration()); err != nil {
@@ -227,7 +245,7 @@ func (h *EvictHandler) deleteAuthorizedCacheEntry(
 		}
 		switch {
 		case errors.Is(deleteErr, cacheeviction.ErrDurabilityThreshold) && input.AccessedAt == nil:
-			return taskengine.Suspend(model.TaskResumeModeExecute, dependencyWait, "durability", "Waiting for durable storage", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, dependencyWait, "durability", "Waiting for durable storage", nil)
 		case errors.Is(deleteErr, cacheeviction.ErrDurabilityThreshold), errors.Is(deleteErr, cacheeviction.ErrNoLongerEligible),
 			errors.Is(deleteErr, cacheeviction.ErrAccessChanged), errors.Is(deleteErr, repository.ErrNotFound), errors.Is(deleteErr, repository.ErrConflict):
 			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
@@ -266,9 +284,6 @@ func (h *EvictHandler) retryCacheEviction(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if execution.RetryWillFail() {
-		return taskengine.Fail(err, reason, h.releaseCacheEvictionSettlement(input, execution.ID()))
-	}
 	return taskengine.RetryBackoff(err, reason, nil)
 }
 

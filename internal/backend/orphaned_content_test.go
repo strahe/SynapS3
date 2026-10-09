@@ -26,7 +26,7 @@ func newTestBackendWithoutUploadPlanning(t *testing.T) *testBackend {
 	repos := repository.NewRepositories(db)
 	fsCache := newTestCache(t, 1<<30)
 	gate, tracker := newBackendCacheAccess(repos)
-	service, err := taskengine.NewService(taskengine.NewRegistry(), repos, time.Hour)
+	service, err := taskengine.NewService(taskengine.NewRegistry(), repos)
 	if err != nil {
 		t.Fatalf("creating task service: %v", err)
 	}

@@ -37,7 +37,7 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 						t.Fatalf("start before actual effect = %#v, err=%v", prepared, err)
 					}
 					ready := time.Now()
-					attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]bool{"attempted": true}, nil, func(ctx context.Context) error {
+					attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", map[string]bool{"attempted": true}, nil, func(ctx context.Context) error {
 						stored, err := harness.repos.Tasks.GetByID(ctx, execution.ID())
 						if err != nil || stored.WorkStartedAt == nil {
 							t.Fatalf("start during effect = %#v, err=%v", stored, err)
@@ -67,34 +67,42 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 	}
 }
 
-func TestRecurringWorkStartResetsOnlyAfterSuccessfulCycle(t *testing.T) {
-	definition := testDefinition(nil, false)
-	definition.Type = model.TaskTypeGC
+func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
+	definition := testDefinition(nil, true)
+	definition.Type = model.TaskTypeObservabilityRefresh
 	definition.WorkStart = WorkStartOnHandler
 	calls := 0
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: definition,
-		execute: func(context.Context, Execution) Result {
-			calls++
-			if calls == 1 {
-				return ResourceWait("Waiting for capacity")
-			}
-			return Suspend(model.TaskResumeModeExecute, time.Hour, "scheduled", "", nil)
-		},
-	}, nil)
-	row, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: model.TaskTypeGC, IdempotencyKey: "cycle", Input: testInput{Value: "cycle"}})
-	if err != nil {
+	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: func(context.Context, Execution) Result {
+		calls++
+		if calls == 1 {
+			return ResourceWait("Waiting for capacity")
+		}
+		return CompleteCycle(time.Hour, "Done", nil)
+	}}, nil)
+	if err := h.service.bootstrap(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	harness.engine.resourceWaitDelay = func(int) time.Duration { return 0 }
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	waiting, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || waiting.WorkStartedAt == nil {
-		t.Fatalf("same-cycle wait lost start: %#v, err=%v", waiting, err)
+	row, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "test-cycle:1")
+	h.engine.resourceWaitDelay = func(int) time.Duration { return 0 }
+	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
+	waiting, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
+	if waiting.WorkStartedAt == nil {
+		t.Fatal("Wait lost work start")
 	}
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	scheduled, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || scheduled.WorkStartedAt != nil || scheduled.WaitReason == nil || *scheduled.WaitReason != "scheduled" {
-		t.Fatalf("next cycle retained start: %#v, err=%v", scheduled, err)
+	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
+	finished, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
+	if finished.Status != model.TaskStatusCompleted || !finished.WorkStartedAt.Equal(*waiting.WorkStartedAt) {
+		t.Fatal("cycle overwrote work timing")
+	}
+	schedule, _ := h.repos.TaskSchedules.GetForUpdate(t.Context(), "test-cycle")
+	if err := h.repos.TaskSchedules.ScheduleNext(t.Context(), schedule.Key, row.ID, time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.dispatchSchedules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	next, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "test-cycle:2")
+	if next == nil || next.WorkStartedAt != nil || next.RetryCount != 0 || next.ID <= row.ID {
+		t.Fatalf("new cycle: %#v", next)
 	}
 }

@@ -95,7 +95,7 @@ type TaskItem struct {
 	SubjectType        *string `json:"subject_type,omitempty"`
 	SubjectKey         *string `json:"subject_key,omitempty"`
 	RetryCount         int     `json:"retry_count"`
-	RetryLimit         *int    `json:"retry_limit,omitempty"`
+	MaxAttempts        *int    `json:"max_attempts"`
 	LastError          *string `json:"last_error,omitempty"`
 	StatusMessage      *string `json:"status_message,omitempty"`
 	WaitReason         *string `json:"wait_reason,omitempty"`

@@ -2,6 +2,8 @@ package repository_test
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -44,18 +46,19 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 	if err != nil || len(copies) != 1 {
 		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
 	}
-	enqueueTask := func(key string) *model.Task {
-		taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	enqueueTask := func(key string, generation int64) *model.Task {
+		taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskTypeStorageStore, IdempotencyKey: key, InputVersion: 1,
-			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
+			Input:       []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copies[0].ID, generation)),
+			SubjectType: new(model.TaskSubjectStorageCopy), SubjectKey: new(strconv.FormatInt(copies[0].ID, 10)), InputHash: key, Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		})
+		}))
 		if err != nil || !created {
 			t.Fatalf("Enqueue(%s) = %#v, created=%v, err=%v", key, taskRow, created, err)
 		}
 		return taskRow
 	}
-	firstTask := enqueueTask("progress-first")
+	firstTask := enqueueTask("progress-first", 1)
 	if err := repos.Contents.BindCopyTask(t.Context(), copies[0].ID, 1, firstTask.ID); err != nil {
 		t.Fatalf("BindCopyTask(first): %v", err)
 	}
@@ -90,12 +93,12 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 		t.Fatalf("RecordIngressStoreProgress(first): %v", err)
 	}
 
-	secondTask := enqueueTask("progress-second")
+	secondTask := enqueueTask("progress-second", 2)
 	if err := repos.Contents.ReplaceCopyTask(t.Context(), copies[0].ID, 1, firstTask.ID, 2, secondTask.ID); err != nil {
 		t.Fatalf("ReplaceCopyTask: %v", err)
 	}
 	if err := repos.Tasks.Settle(t.Context(), freshClaim.ID, freshClaim.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatalf("complete first task: %v", err)
 	}
@@ -167,11 +170,11 @@ func TestPermanentDeleteClearsTerminalStoreFence(t *testing.T) {
 	if err != nil || len(copies) != 1 {
 		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
 	}
-	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageStore, IdempotencyKey: "terminal-store-delete", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "terminal-store-delete", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copies[0].ID)), SubjectType: new(model.TaskSubjectStorageCopy), SubjectKey: new(strconv.FormatInt(copies[0].ID, 10)), InputHash: "terminal-store-delete", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil || !created {
 		t.Fatalf("Enqueue = %#v, created=%v, err=%v", taskRow, created, err)
 	}

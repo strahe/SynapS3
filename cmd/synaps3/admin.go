@@ -378,8 +378,9 @@ func adminTaskCommand() *cli.Command {
 				Name:  "list",
 				Usage: "list background tasks",
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "scope", Value: "work", Usage: "list work or history"},
 					&cli.StringFlag{Name: "type", Usage: "filter by task type"},
-					&cli.StringFlag{Name: "status", Usage: "filter by status (pending, running, completed, failed, cancelled, or dismissed)"},
+					&cli.StringFlag{Name: "status", Usage: "filter by status (pending, running, completed, failed, or cancelled)"},
 					&cli.IntFlag{Name: "limit", Value: 20, Usage: "maximum tasks to return"},
 					&cli.Int64Flag{Name: "cursor", Usage: "continue before this task ID"},
 				},
@@ -389,7 +390,7 @@ func adminTaskCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					query := url.Values{}
+					query := url.Values{"scope": {cmd.String("scope")}}
 					if taskType != "" {
 						query.Set("type", taskType)
 					}
@@ -419,13 +420,14 @@ func adminTaskCommand() *cli.Command {
 			{
 				Name:  "stats",
 				Usage: "show task status counts",
+				Flags: []cli.Flag{&cli.StringFlag{Name: "scope", Value: "work", Usage: "count work or history"}},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					client, opts, err := newAdminClientFromCommand(ctx, cmd)
 					if err != nil {
 						return err
 					}
 					var stats []adminTaskStatusCount
-					if err := client.getJSON(ctx, "/api/v1/tasks/stats", &stats); err != nil {
+					if err := client.getJSON(ctx, "/api/v1/tasks/stats?"+url.Values{"scope": {cmd.String("scope")}}.Encode(), &stats); err != nil {
 						return err
 					}
 					if opts.JSON {
@@ -450,25 +452,27 @@ func adminTaskCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					var resp map[string]string
+					var resp struct {
+						TaskID int64 `json:"task_id"`
+					}
 					if err := client.postJSON(ctx, "/api/v1/tasks/"+url.PathEscape(taskID)+"/retry", nil, &resp, false); err != nil {
 						return err
 					}
 					if opts.JSON {
 						return writeAdminJSON(cmd.Root().Writer, resp)
 					}
-					_, err = fmt.Fprintf(cmd.Root().Writer, "Task %s %s\n", taskID, resp["status"])
+					_, err = fmt.Fprintf(cmd.Root().Writer, "Retry task %d\n", resp.TaskID)
 					return err
 				},
 			},
 			{
 				Name:      "acknowledge",
-				Usage:     "dismiss a failed task, or a backlog of failed tasks",
+				Usage:     "acknowledge a failed task, or a backlog of failed tasks",
 				ArgsUsage: "[id]",
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "type", Usage: "dismiss only failures of this operation type"},
-					&cli.StringFlag{Name: "before", Usage: "dismiss only failures recorded before this RFC 3339 time (default: now)"},
-					&cli.BoolFlag{Name: "yes", Usage: "confirm dismissing every matching failed task"},
+					&cli.StringFlag{Name: "type", Usage: "acknowledge only failures of this operation type"},
+					&cli.StringFlag{Name: "before", Usage: "acknowledge only failures recorded before this RFC 3339 time (default: now)"},
+					&cli.BoolFlag{Name: "yes", Usage: "confirm acknowledging every matching failed task"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Len() > 0 {
@@ -478,7 +482,7 @@ func adminTaskCommand() *cli.Command {
 						return acknowledgeSingleTask(ctx, cmd)
 					}
 					if !cmd.Bool("yes") {
-						return errors.New("dismissing a backlog requires --yes")
+						return errors.New("acknowledging a backlog requires --yes")
 					}
 					payload := map[string]string{}
 					if value := cmd.String("type"); value != "" {
@@ -501,7 +505,7 @@ func adminTaskCommand() *cli.Command {
 					if opts.JSON {
 						return writeAdminJSON(cmd.Root().Writer, resp)
 					}
-					_, err = fmt.Fprintf(cmd.Root().Writer, "Dismissed %d failed tasks\n", resp.Acknowledged)
+					_, err = fmt.Fprintf(cmd.Root().Writer, "Acknowledged %d failed tasks\n", resp.Acknowledged)
 					return err
 				},
 			},
@@ -940,8 +944,6 @@ type adminSettingsTaskWorkerConfig struct {
 	Concurrency                    int    `json:"concurrency"`
 	PollInterval                   string `json:"poll_interval"`
 	LeaseDuration                  string `json:"lease_duration"`
-	MaxRetries                     int    `json:"max_retries"`
-	Retention                      string `json:"retention"`
 	ProviderMutationConcurrency    int    `json:"provider_mutation_concurrency"`
 	DestructiveMutationConcurrency int    `json:"destructive_mutation_concurrency"`
 	CommitMaxPieces                int    `json:"commit_max_pieces"`
@@ -975,7 +977,10 @@ type adminTaskItem struct {
 	SubjectType        *string `json:"subject_type,omitempty"`
 	SubjectKey         *string `json:"subject_key,omitempty"`
 	RetryCount         int     `json:"retry_count"`
-	RetryLimit         *int    `json:"retry_limit,omitempty"`
+	RetryOfTaskID      *int64  `json:"retry_of_task_id"`
+	RetryTaskID        *int64  `json:"retry_task_id"`
+	SupersededAt       *string `json:"superseded_at,omitempty"`
+	MaxAttempts        *int    `json:"max_attempts"`
 	Retryable          bool    `json:"retryable"`
 	Acknowledgeable    bool    `json:"acknowledgeable"`
 	LastError          *string `json:"last_error,omitempty"`
@@ -1046,8 +1051,6 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"worker.tasks.concurrency":                      {path: []string{"worker", "tasks", "concurrency"}, kind: adminSettingInt},
 	"worker.tasks.poll_interval":                    {path: []string{"worker", "tasks", "poll_interval"}, kind: adminSettingString},
 	"worker.tasks.lease_duration":                   {path: []string{"worker", "tasks", "lease_duration"}, kind: adminSettingString},
-	"worker.tasks.max_retries":                      {path: []string{"worker", "tasks", "max_retries"}, kind: adminSettingInt},
-	"worker.tasks.retention":                        {path: []string{"worker", "tasks", "retention"}, kind: adminSettingString},
 	"worker.tasks.provider_mutation_concurrency":    {path: []string{"worker", "tasks", "provider_mutation_concurrency"}, kind: adminSettingInt},
 	"worker.tasks.destructive_mutation_concurrency": {path: []string{"worker", "tasks", "destructive_mutation_concurrency"}, kind: adminSettingInt},
 	"worker.tasks.commit_max_pieces":                {path: []string{"worker", "tasks", "commit_max_pieces"}, kind: adminSettingInt},
@@ -1234,7 +1237,7 @@ func acknowledgeSingleTask(ctx context.Context, cmd *cli.Command) error {
 	if opts.JSON {
 		return writeAdminJSON(cmd.Root().Writer, resp)
 	}
-	_, err = fmt.Fprintf(cmd.Root().Writer, "Task %s %s\n", taskID, resp["status"])
+	_, err = fmt.Fprintf(cmd.Root().Writer, "Task %s acknowledged\n", taskID)
 	return err
 }
 
@@ -1436,8 +1439,6 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "worker.tasks.concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.Concurrency)},
 				{Name: "worker.tasks.poll_interval", Value: settings.Config.Worker.Tasks.PollInterval},
 				{Name: "worker.tasks.lease_duration", Value: settings.Config.Worker.Tasks.LeaseDuration},
-				{Name: "worker.tasks.max_retries", Value: strconv.Itoa(settings.Config.Worker.Tasks.MaxRetries)},
-				{Name: "worker.tasks.retention", Value: settings.Config.Worker.Tasks.Retention},
 				{Name: "worker.tasks.provider_mutation_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.ProviderMutationConcurrency)},
 				{Name: "worker.tasks.destructive_mutation_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.DestructiveMutationConcurrency)},
 				{Name: "worker.tasks.commit_max_pieces", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxPieces)},
@@ -1484,8 +1485,8 @@ func writeAdminTasksTable(w io.Writer, tasks []adminTaskItem) error {
 			subject = *task.SubjectType + ":" + *task.SubjectKey
 		}
 		retries := strconv.Itoa(task.RetryCount)
-		if task.RetryLimit != nil {
-			retries = fmt.Sprintf("%d/%d", task.RetryCount, *task.RetryLimit)
+		if task.MaxAttempts != nil {
+			retries = fmt.Sprintf("%d/%d", task.RetryCount, *task.MaxAttempts-1)
 		}
 		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", task.ID, task.Operation, task.PresentationStatus, retries, subject, task.AvailableAt, details)
 	}

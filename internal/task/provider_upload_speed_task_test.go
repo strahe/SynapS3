@@ -122,8 +122,8 @@ func TestProviderUploadSpeedRecoveryNeverReuploads(t *testing.T) {
 		Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().TableExpr("task_payloads").Set("checkpoint_json = ?", `{"attempted":true}`).
-		Where("task_id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewUpdate().TableExpr("tasks").Set("checkpoint_json = ?", `{"attempted":true}`).
+		Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	cancel, done := runHandlerEngine(t, runtime)
@@ -149,9 +149,9 @@ func TestProviderUploadSpeedRecoverySettlesCompletedPutWithoutReupload(t *testin
 		Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().TableExpr("task_payloads").
+	if _, err := runtime.db.NewUpdate().TableExpr("tasks").
 		Set("checkpoint_json = ?", `{"attempted":true,"duration_ms":2000,"bytes_per_second":16777216}`).
-		Where("task_id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+		Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	cancel, done := runHandlerEngine(t, runtime)

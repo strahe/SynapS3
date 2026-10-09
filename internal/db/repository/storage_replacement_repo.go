@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -267,7 +268,8 @@ func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSet
 	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
 		Set("task_generation = task_generation + 1").Set("task_id = NULL").
 		Where("id IN (?)", bun.List(ids)).
-		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?))",
+		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?) UNION ALL SELECT task_id FROM task_history WHERE status IN (?, ?, ?))",
+			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted,
 			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted).
 		Exec(ctx); err != nil {
 		return nil, fmt.Errorf("fencing stopped superseded coordinator: %w", err)
@@ -374,13 +376,24 @@ func (r *BunStorageReplacementRepo) BindTask(ctx context.Context, replacementID,
 	if replacementID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput
 	}
-	result, err := r.db.NewUpdate().
-		Model((*storagereplacement.Replacement)(nil)).
-		Set("task_id = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND task_generation = ? AND task_id IS NULL", replacementID, generation).
-		Exec(ctx)
-	return requireTaskFenceRows(result, err, "binding provider replacement task")
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "storage_replacement", strconv.FormatInt(replacementID, 10), model.TaskTypeProviderReplacementCoordinate)
+		if err != nil {
+			return err
+		}
+		input, err := storagereplacement.ParseCoordinateInput(task)
+		if err != nil || input.ReplacementID != replacementID || input.Generation != generation {
+			return ErrConflict
+		}
+
+		result, err := db.NewUpdate().
+			Model((*storagereplacement.Replacement)(nil)).
+			Set("task_id = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ? AND task_generation = ? AND task_id IS NULL", replacementID, generation).
+			Exec(ctx)
+		return requireTaskFenceRows(result, err, "binding provider replacement task")
+	})
 }
 
 func (r *BunStorageReplacementRepo) AuthorizeTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error) {

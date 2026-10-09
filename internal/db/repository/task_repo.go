@@ -7,11 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
@@ -127,117 +125,6 @@ func (r *BunTaskRepo) MarkWorkStarted(ctx context.Context, id, generation int64,
 	return nil
 }
 
-func (r *BunTaskRepo) Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error) {
-	if task == nil || task.Type == "" || task.IdempotencyKey == "" || task.InputVersion < 1 || len(task.Input) == 0 || task.InputHash == "" {
-		return nil, false, fmt.Errorf("task identity and canonical input are required: %w", ErrInvalidInput)
-	}
-	if task.Status == "" {
-		task.Status = model.TaskStatusPending
-	}
-	if task.ResumeMode == "" {
-		task.ResumeMode = model.TaskResumeModeExecute
-	}
-	if task.AvailableAt.IsZero() {
-		task.AvailableAt = time.Now()
-	}
-
-	inserted := false
-	if err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		result, err := db.NewInsert().
-			Model(task).
-			On("CONFLICT (type, idempotency_key) DO NOTHING").
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("enqueuing task %s/%s: %w", task.Type, task.IdempotencyKey, err)
-		}
-		if rows, _ := result.RowsAffected(); rows != 1 {
-			return nil
-		}
-		inserted = true
-		payload := &model.TaskPayload{TaskID: task.ID, Input: task.Input, Checkpoint: task.Checkpoint}
-		if _, err := db.NewInsert().Model(payload).Exec(ctx); err != nil {
-			return fmt.Errorf("enqueuing task %s/%s payload: %w", task.Type, task.IdempotencyKey, err)
-		}
-		return nil
-	}); err != nil {
-		return nil, false, err
-	}
-	if inserted {
-		return task, true, nil
-	}
-	existing, err := r.GetByIdentity(ctx, task.Type, task.IdempotencyKey)
-	if err != nil {
-		return nil, false, err
-	}
-	if existing == nil {
-		return nil, false, fmt.Errorf("loading task after identity conflict: %w", ErrNotFound)
-	}
-	return existing, false, nil
-}
-
-// withTaskPayload projects the JSON a task carries from the row that holds it.
-func withTaskPayload(q *bun.SelectQuery) *bun.SelectQuery {
-	return q.
-		ColumnExpr("task.*").
-		ColumnExpr("task_payload.input_json AS input").
-		ColumnExpr("task_payload.checkpoint_json AS checkpoint").
-		Join("JOIN task_payloads AS task_payload ON task_payload.task_id = task.id")
-}
-
-// loadTaskPayload fills in the JSON for a task read without the join, such as
-// one returned by the claim statement.
-func loadTaskPayload(ctx context.Context, db bun.IDB, task *model.Task) error {
-	payload := new(model.TaskPayload)
-	if err := db.NewSelect().Model(payload).Where("task_id = ?", task.ID).Scan(ctx); err != nil {
-		return fmt.Errorf("selecting task %d payload: %w", task.ID, err)
-	}
-	task.Input = payload.Input
-	task.Checkpoint = payload.Checkpoint
-	return nil
-}
-
-func (r *BunTaskRepo) GetByID(ctx context.Context, id int64) (*model.Task, error) {
-	task := new(model.Task)
-	err := withTaskPayload(r.db.NewSelect().Model(task)).Where("task.id = ?", id).Scan(ctx)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("selecting task %d: %w", id, err)
-	}
-	return task, nil
-}
-
-func (r *BunTaskRepo) GetByIdentity(ctx context.Context, taskType model.TaskType, key string) (*model.Task, error) {
-	task := new(model.Task)
-	err := withTaskPayload(r.db.NewSelect().Model(task)).
-		Where("task.type = ? AND task.idempotency_key = ?", taskType, key).
-		Scan(ctx)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("selecting task %s/%s: %w", taskType, key, err)
-	}
-	return task, nil
-}
-
-func (r *BunTaskRepo) PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error) {
-	if copyID < 1 || taskID < 1 {
-		return nil, ErrInvalidInput
-	}
-	var tasks []model.Task
-	err := withTaskPayload(r.db.NewSelect().Model(&tasks)).
-		Where("task.type = ? AND task.status = ?", model.TaskTypeStorageStore, model.TaskStatusFailed).
-		Where("task.subject_type = ? AND task.subject_key = ?", model.TaskSubjectStorageCopy, strconv.FormatInt(copyID, 10)).
-		Where("task.id <> ? AND task_payload.checkpoint_json IS NOT NULL", taskID).
-		OrderExpr("task.id DESC").Scan(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("selecting previous Store checkpoints: %w", err)
-	}
-	return tasks, nil
-}
-
 func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error) {
 	if leaseDuration <= 0 {
 		return nil, fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
@@ -298,9 +185,6 @@ func claimTaskWithSQL(ctx context.Context, db bun.IDB, query string, now, leaseU
 	if err != nil {
 		return nil, fmt.Errorf("claiming next task: %w", err)
 	}
-	if err := loadTaskPayload(ctx, db, task); err != nil {
-		return nil, err
-	}
 	return task, nil
 }
 
@@ -326,54 +210,16 @@ func (r *BunTaskRepo) RenewLease(ctx context.Context, id, generation int64, leas
 }
 
 func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error {
-	if len(checkpoint) == 0 {
-		return fmt.Errorf("checkpoint is required: %w", ErrInvalidInput)
+	if !jsonObject(checkpoint) {
+		return ErrInvalidInput
 	}
 	now := time.Now()
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		result, err := db.NewUpdate().
-			Model((*model.Task)(nil)).
-			Set("resume_mode = ?", model.TaskResumeModeRecover).
-			Set("updated_at = ?", now).
-			Where("id = ? AND status = ?", id, model.TaskStatusRunning).
-			Where("claim_generation = ?", generation).
-			Where("lease_until > ?", now).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("writing task %d checkpoint: %w", id, err)
-		}
-		if rows, _ := result.RowsAffected(); rows != 1 {
-			return ErrTaskLeaseLost
-		}
-		// checkpoint must stay a json.RawMessage: bun renders a plain []byte as
-		// a bytea/blob literal, which PostgreSQL jsonb rejects.
-		result, err = db.NewUpdate().
-			Model((*model.TaskPayload)(nil)).
-			Set("checkpoint_json = ?", checkpoint).
-			Where("task_id = ?", id).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("writing task %d checkpoint: %w", id, err)
-		}
-		if rows, _ := result.RowsAffected(); rows != 1 {
-			return fmt.Errorf("writing task %d checkpoint: payload row not found: %w", id, ErrNotFound)
-		}
-		return nil
-	})
-}
-
-func (r *BunTaskRepo) ConsumeStoreRetry(ctx context.Context, id, generation int64) error {
-	now := time.Now()
-	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("retry_count = retry_count + 1").Set("updated_at = ?", now).
-		Where("id = ? AND type = ? AND status = ?", id, model.TaskTypeStorageStore, model.TaskStatusRunning).
-		Where("claim_generation = ? AND lease_until > ?", generation, now).
-		Where("retry_limit IS NULL OR retry_count < retry_limit").Exec(ctx)
+	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", checkpoint).Set("resume_mode = ?", model.TaskResumeModeRecover).Set("updated_at = ?", now).Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("consuming Store retry: %w", err)
+		return fmt.Errorf("writing task %d checkpoint: %w", id, err)
 	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return ErrConflict
+	if n, _ := result.RowsAffected(); n != 1 {
+		return ErrTaskLeaseLost
 	}
 	return nil
 }
@@ -394,71 +240,12 @@ func (r *BunTaskRepo) ValidateClaim(ctx context.Context, id, generation int64) e
 	return nil
 }
 
-func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transition TaskTransition) error {
-	if !validTaskTransition(transition) {
-		return fmt.Errorf("invalid task transition: %w", ErrInvalidInput)
-	}
-	now := time.Now()
-	query := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", transition.Status).
-		Set("wait_reason = ?", transition.WaitReason).
-		Set("failure_reason = ?", transition.FailureReason).
-		Set("last_error = ?", transition.LastError).
-		Set("status_message = ?", transition.StatusMessage).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ? AND status = ?", id, model.TaskStatusRunning).
-		Where("claim_generation = ?", generation).
-		Where("lease_until > ?", now)
-	if transition.ClearWorkStartedAt {
-		query = query.Set("work_started_at = NULL")
-	} else if transition.WorkStartedAt != nil {
-		query = query.Set("work_started_at = COALESCE(work_started_at, ?)", *transition.WorkStartedAt)
-	}
-	if transition.IncrementRetry {
-		query = query.Set("retry_count = retry_count + 1")
-	}
-	if transition.Status == model.TaskStatusPending {
-		availableAt := "CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END"
-		if r.db.Dialect().Name() == dialect.PG {
-			// PostgreSQL infers a CASE of untyped timestamp literals as text.
-			availableAt = "CASE WHEN cancellation_requested_at IS NOT NULL THEN CAST(? AS TIMESTAMPTZ) ELSE CAST(? AS TIMESTAMPTZ) END"
-		}
-		query = query.
-			Set("resume_mode = CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END", model.TaskResumeModeRecover, transition.ResumeMode).
-			Set("available_at = "+availableAt, now, transition.AvailableAt).
-			Set("finished_at = NULL").
-			Set("retention_until = NULL").
-			Set("acknowledged_at = NULL")
-	} else {
-		query = query.
-			Set("resume_mode = ?", transition.ResumeMode).
-			Set("finished_at = ?", now).
-			Set("retention_until = ?", transition.RetentionUntil)
-	}
-	result, err := query.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("settling task %d: %w", id, err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrTaskLeaseLost
-	}
-	return nil
-}
-
 func validTaskTransition(transition TaskTransition) bool {
 	switch transition.Status {
 	case model.TaskStatusPending:
-		return !transition.AvailableAt.IsZero() &&
-			(transition.ResumeMode == model.TaskResumeModeExecute || transition.ResumeMode == model.TaskResumeModeRecover) &&
-			transition.RetentionUntil == nil
-	case model.TaskStatusCompleted, model.TaskStatusCancelled:
-		return transition.RetentionUntil != nil
-	case model.TaskStatusFailed:
-		return transition.RetentionUntil == nil
+		return !transition.AvailableAt.IsZero() && (transition.ResumeMode == model.TaskResumeModeExecute || transition.ResumeMode == model.TaskResumeModeRecover)
+	case model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled:
+		return transition.ResumeMode == model.TaskResumeModeExecute || transition.ResumeMode == model.TaskResumeModeRecover
 	default:
 		return false
 	}
@@ -542,6 +329,7 @@ func (r *BunTaskRepo) WakePendingOfTypes(ctx context.Context, ids []int64, types
 		Where("available_at > ?", now)
 	if len(skipWaitReasons) != 0 {
 		query = query.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(skipWaitReasons))
+		query = query.Where("failure_reason IS NULL OR failure_reason NOT IN (?)", bun.List(skipWaitReasons))
 	}
 	result, err := query.Exec(ctx)
 	if err != nil {
@@ -558,7 +346,7 @@ func (r *BunTaskRepo) RequestCancellation(ctx context.Context, id int64, reason 
 		Set("cancellation_requested_at = COALESCE(cancellation_requested_at, ?)", now).
 		Set("cancellation_reason = COALESCE(cancellation_reason, ?)", nullableText(reason)).
 		Set("resume_mode = ?", model.TaskResumeModeRecover).
-		Set("available_at = CASE WHEN status = ? THEN ? ELSE available_at END", model.TaskStatusPending, now).
+		Set("available_at = CASE WHEN status = ? AND cancellation_requested_at IS NULL THEN ? ELSE available_at END", model.TaskStatusPending, now).
 		Set("updated_at = ?", now).
 		Where("id = ? AND status IN (?, ?)", id, model.TaskStatusPending, model.TaskStatusRunning).
 		Exec(ctx)
@@ -572,150 +360,12 @@ func (r *BunTaskRepo) RequestCancellation(ctx context.Context, id int64, reason 
 	return nil
 }
 
-func (r *BunTaskRepo) RetryFailed(ctx context.Context, id int64) error {
-	now := time.Now()
-	result, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusPending).
-		Set("resume_mode = ?", model.TaskResumeModeRecover).
-		Set("available_at = ?", now).
-		Set("retry_count = 0").
-		Set("retry_limit = CASE WHEN type = ? AND retry_limit = 0 THEN 1 ELSE retry_limit END", model.TaskTypeStorageStore).
-		Set("cancellation_requested_at = CASE WHEN type = ? AND failure_reason = ? THEN NULL ELSE cancellation_requested_at END", model.TaskTypeStoragePull, storagepull.FailureCancelOutcomeUnknown).
-		Set("cancellation_reason = CASE WHEN type = ? AND failure_reason = ? THEN NULL ELSE cancellation_reason END", model.TaskTypeStoragePull, storagepull.FailureCancelOutcomeUnknown).
-		Set("failure_reason = NULL").
-		Set("last_error = NULL").
-		Set("status_message = NULL").
-		Set("wait_reason = NULL").
-		Set("finished_at = NULL").
-		Set("acknowledged_at = NULL").
-		Set("retention_until = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("retrying task %d: %w", id, err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// ReactivateTerminal reuses a terminal idempotency record as a fresh execute
-// run. It is intentionally narrower than manual retry: callers must first
-// verify that the task's immutable input still describes the desired work.
-func (r *BunTaskRepo) ReactivateTerminal(ctx context.Context, id int64) error {
-	if id < 1 {
-		return fmt.Errorf("reactivating terminal task: %w", ErrInvalidInput)
-	}
-	now := time.Now()
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		result, err := db.NewUpdate().
-			Model((*model.Task)(nil)).
-			Set("status = ?", model.TaskStatusPending).
-			Set("resume_mode = ?", model.TaskResumeModeExecute).
-			Set("available_at = ?", now).
-			Set("wait_reason = NULL").
-			Set("retry_count = 0").
-			Set("failure_reason = NULL").
-			Set("last_error = NULL").
-			Set("status_message = NULL").
-			Set("cancellation_requested_at = NULL").
-			Set("cancellation_reason = NULL").
-			Set("claimed_at = NULL").
-			Set("lease_until = NULL").
-			Set("started_at = NULL").
-			Set("work_started_at = NULL").
-			Set("finished_at = NULL").
-			Set("acknowledged_at = NULL").
-			Set("retention_until = NULL").
-			Set("updated_at = ?", now).
-			Where("id = ? AND type = ? AND status IN (?, ?)", id, model.TaskTypeUploadPlan, model.TaskStatusFailed, model.TaskStatusCancelled).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("reactivating terminal task %d: %w", id, err)
-		}
-		if rows, _ := result.RowsAffected(); rows != 1 {
-			return fmt.Errorf("reactivating terminal task %d: %w", id, ErrConflict)
-		}
-		result, err = db.NewUpdate().
-			Model((*model.TaskPayload)(nil)).
-			Set("checkpoint_json = NULL").
-			Where("task_id = ?", id).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("clearing terminal task %d checkpoint: %w", id, err)
-		}
-		if rows, _ := result.RowsAffected(); rows != 1 {
-			return fmt.Errorf("clearing terminal task %d checkpoint: %w", id, ErrConflict)
-		}
-		return nil
-	})
-}
-
-// awaitingCommitReviewSQL matches a task whose storage registration is flagged
-// for attention. Dismissing that task would hide the only sign that the
-// registration still holds its data set's commit capacity.
 const awaitingCommitReviewSQL = `EXISTS (
-	SELECT 1 FROM storage_commit_requests AS review_request
-	WHERE review_request.task_id = ?TableAlias.id
-	  AND review_request.status = 'submitted'
-	  AND review_request.attention_at IS NOT NULL
+ SELECT 1 FROM storage_commit_requests AS review_request
+ WHERE review_request.task_id = ?TableAlias.id
+   AND review_request.status = 'submitted'
+   AND review_request.attention_at IS NOT NULL
 )`
-
-func (r *BunTaskRepo) AcknowledgeFailedForSubject(ctx context.Context, subjectType, subjectKey string, retention time.Duration) (int, error) {
-	if subjectType == "" || subjectKey == "" || retention <= 0 {
-		return 0, ErrInvalidInput
-	}
-	now := time.Now()
-	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("acknowledged_at = ?", now).Set("retention_until = ?", now.Add(retention)).Set("updated_at = ?", now).
-		Where("subject_type = ? AND subject_key = ? AND status = ?", subjectType, subjectKey, model.TaskStatusFailed).
-		Where("acknowledged_at IS NULL").Where("NOT " + awaitingCommitReviewSQL).Exec(ctx)
-	if err != nil {
-		return 0, err
-	}
-	count, err := result.RowsAffected()
-	return int(count), err
-}
-
-// AcknowledgeFailed dismisses one failure. A failure whose storage confirmation
-// is flagged for attention is refused with ErrConflict until that confirmation
-// is resolved.
-func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error {
-	if retention <= 0 {
-		return fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
-	}
-	now := time.Now()
-	result, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("acknowledged_at = COALESCE(acknowledged_at, ?)", now).
-		Set("retention_until = COALESCE(retention_until, ?)", now.Add(retention)).
-		Set("updated_at = ?", now).
-		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
-		Where("NOT " + awaitingCommitReviewSQL).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("acknowledging task %d: %w", id, err)
-	}
-	if rows, _ := result.RowsAffected(); rows == 1 {
-		return nil
-	}
-	held, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
-		Where(awaitingCommitReviewSQL).
-		Exists(ctx)
-	if err != nil {
-		return fmt.Errorf("acknowledging task %d: %w", id, err)
-	}
-	if held {
-		return ErrConflict
-	}
-	return ErrNotFound
-}
 
 // acknowledgeFailedMatching selects the failures one bulk dismissal covers. The
 // preview and the dismissal itself share it, so the number an operator confirms
@@ -723,7 +373,7 @@ func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention
 func acknowledgeFailedMatching(filter TaskAcknowledgeFilter) func(bun.QueryBuilder) bun.QueryBuilder {
 	return func(query bun.QueryBuilder) bun.QueryBuilder {
 		query = query.
-			Where("status = ? AND acknowledged_at IS NULL", model.TaskStatusFailed).
+			Where("status = ?", model.TaskStatusFailed).
 			Where("finished_at IS NOT NULL AND finished_at <= ?", filter.FailedBefore).
 			Where("NOT " + awaitingCommitReviewSQL)
 		if filter.Type != "" {
@@ -747,153 +397,14 @@ func (r *BunTaskRepo) CountFailedMatching(ctx context.Context, filter TaskAcknow
 	return count, nil
 }
 
-func (r *BunTaskRepo) AcknowledgeFailedMatching(
-	ctx context.Context,
-	filter TaskAcknowledgeFilter,
-	retention time.Duration,
-) (int, error) {
-	if retention <= 0 {
-		return 0, fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
-	}
-	if filter.FailedBefore.IsZero() {
-		return 0, fmt.Errorf("acknowledging failed tasks: %w", ErrInvalidInput)
-	}
-	now := time.Now()
-	result, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("acknowledged_at = ?", now).
-		Set("retention_until = ?", now.Add(retention)).
-		Set("updated_at = ?", now).
-		ApplyQueryBuilder(acknowledgeFailedMatching(filter)).
-		Exec(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("acknowledging failed tasks: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	return int(rows), nil
-}
-
-func (r *BunTaskRepo) DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error) {
-	if now.IsZero() || limit < 1 {
-		return 0, fmt.Errorf("deleting retained tasks: %w", ErrInvalidInput)
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	var ids []int64
-	err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Column("id").
-		Where("retention_until IS NOT NULL AND retention_until <= ?", now).
-		Where(`NOT EXISTS (SELECT 1 FROM object_cache WHERE cache_active_task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM buckets WHERE durability_task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM storage_contents WHERE cleanup_task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM storage_copies WHERE active_task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM storage_commit_requests WHERE task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM storage_data_sets WHERE ensure_task_id = task.id OR retirement_task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM wallet_operations WHERE task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM provider_upload_speed_tests WHERE active_task_id = task.id)`).
-		Where(`NOT EXISTS (SELECT 1 FROM storage_replacements WHERE task_id = task.id)`).
-		OrderExpr("retention_until, id").
-		Limit(limit).
-		Scan(ctx, &ids)
-	if err != nil {
-		return 0, fmt.Errorf("selecting retained tasks: %w", err)
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	result, err := r.db.NewDelete().
-		Model((*model.Task)(nil)).
-		Where("id IN (?)", bun.List(ids)).
-		Where("retention_until IS NOT NULL AND retention_until <= ?", now).
-		Exec(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("deleting retained tasks: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	return int(rows), nil
-}
-
-func (r *BunTaskRepo) List(ctx context.Context, filter TaskListFilter) (TaskPage, error) {
-	limit := filter.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
-	var tasks []model.Task
-	// A listing never decodes inputs, so it leaves them out; manual-retry checks
-	// read the checkpoint, which stays.
-	query := r.db.NewSelect().Model(&tasks).
-		ColumnExpr("task.*").
-		ColumnExpr("task_payload.checkpoint_json AS checkpoint").
-		Join("JOIN task_payloads AS task_payload ON task_payload.task_id = task.id").
-		OrderExpr("task.id DESC").
-		Limit(limit + 1)
-	if filter.Type != "" {
-		query = query.Where("task.type = ?", filter.Type)
-	}
-	if filter.Status != "" {
-		query = query.Where("task.status = ?", filter.Status)
-	}
-	if filter.Acknowledged != nil {
-		if *filter.Acknowledged {
-			query = query.Where("task.acknowledged_at IS NOT NULL")
-		} else {
-			query = query.Where("task.acknowledged_at IS NULL")
-		}
-	}
-	if filter.HideHealthyRecurringSystem {
-		query = query.Where("(task.type NOT IN (?) OR task.status = ?)", bun.List(model.RecurringSystemTaskTypes()), model.TaskStatusFailed)
-	}
-	if filter.BeforeID > 0 {
-		query = query.Where("task.id < ?", filter.BeforeID)
-	}
-	if err := query.Scan(ctx); err != nil {
-		return TaskPage{}, fmt.Errorf("listing tasks: %w", err)
-	}
-	page := TaskPage{Tasks: tasks}
-	if len(page.Tasks) > limit {
-		page.Tasks = page.Tasks[:limit]
-		page.NextBeforeID = page.Tasks[len(page.Tasks)-1].ID
-	}
-	return page, nil
-}
-
-func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, error) {
-	var counts []TaskStatusCount
-	err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Column("type", "status").
-		ColumnExpr("COUNT(*) AS count").
-		Group("type", "status").
-		Scan(ctx, &counts)
-	if err != nil {
-		return nil, fmt.Errorf("counting tasks by status: %w", err)
-	}
-	return counts, nil
-}
-
 func (r *BunTaskRepo) CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error) {
-	const presentationStatus = "CASE WHEN status = 'failed' AND acknowledged_at IS NOT NULL THEN 'dismissed' ELSE status END"
-	var counts []TaskStatusCount
-	err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Column("type").
-		ColumnExpr(presentationStatus+" AS status").
-		ColumnExpr("COUNT(*) AS count").
-		GroupExpr("type, "+presentationStatus).
-		Scan(ctx, &counts)
-	if err != nil {
-		return nil, fmt.Errorf("counting tasks by presentation status: %w", err)
-	}
-	return counts, nil
+	return r.CountByStatus(ctx)
 }
 
 func (r *BunTaskRepo) CountUnacknowledgedFailed(ctx context.Context) (int64, error) {
 	count, err := r.db.NewSelect().
 		Model((*model.Task)(nil)).
 		Where("status = ?", model.TaskStatusFailed).
-		Where("acknowledged_at IS NULL").
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting unacknowledged failed tasks: %w", err)

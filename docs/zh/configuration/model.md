@@ -73,7 +73,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
 | `database` | SQLite 或 PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
-| `worker.tasks` | 统一后台任务执行、恢复、保留时间和存储变更并发限制。 |
+| `worker.tasks` | 统一后台任务执行和存储变更并发限制。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
 | `admin` | 仪表盘、Admin API 监听地址和 Admin 认证设置。 |
 
@@ -98,8 +98,6 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `worker.tasks.concurrency` | `12` |
 | `worker.tasks.poll_interval` | `5s` |
 | `worker.tasks.lease_duration` | `5m` |
-| `worker.tasks.max_retries` | `5` |
-| `worker.tasks.retention` | `168h` |
 | `worker.tasks.provider_mutation_concurrency` | `4` |
 | `worker.tasks.destructive_mutation_concurrency` | `2` |
 | `worker.tasks.commit_max_pieces` | `32` |
@@ -112,7 +110,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。操作遇到对应额度已满时会先让出、稍后自动再试，不占用 `concurrency` 名额，其他后台任务照常运行。任务设置修改后必须重启 SynapS3，已经创建的任务保留创建时记录的重试上限。
+`worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。操作遇到对应额度已满时会先让出、稍后自动再试，不占用 `concurrency` 名额，其他后台任务照常运行。任务设置修改后必须重启 SynapS3。每类任务声明有限重试策略，每轮执行保留创建时记录的策略。任务历史永久保存。
 
 写入同一存储服务的上传和复制副本会一起收集，直到可以提交。`commit_max_pieces`（1–200）只限制一笔交易的 piece 数，不限制收集数量；Mainnet 上 data set ID 小于 1,559、Calibration 上小于 32,331 的存储服务每次最多 80 个。收集数量达到该服务适用的单笔上限、存储服务不再接受新数据、手动提交或最早的 piece 等待达到 `commit_max_wait`（0–30m）后，下一批达到提交条件；`0s` 表示无需等待收集窗口。所有批次都要等该服务的 4 个在途名额空出，并让更早的可提交已签名批次先发送。轮到下一批时，取最早准备好的 piece，最多取单笔上限，签名后立即尝试发送；剩余数据继续收集，保留原来的等待起点。已签名批次仍可能等待共享发送资源。等待提交的上传数据保留在本地缓存。更长的窗口会推迟提交、需要已登记来源的副本复制及本地缓存淘汰。
 
@@ -120,7 +118,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 
 在 Settings 启用 **Submit batches early to free cache space**（`worker.tasks.commit_seal_on_cache_pressure`），可在安全自动清理无法腾出足够空间时提前提交未满批次。提前提交仍需等待在途名额和更早的可提交批次。默认关闭，修改后需要重启。`lru` 按实际清理目标判断；`after_upload` 按被拒绝写入所需的容量判断；`none` 不自动提前提交。更小的批次可能增加交易成本。缓存删除仍需等待确认并满足存储桶的耐久要求。
 
-打开 **Batches** 查看已收集的数据，点击 **Submit next batch** 请求提交下一批，最多提交单笔上限的 piece，其余数据继续等待。手动操作独立于自动开关和缓存策略，也需要等待提交名额。点击 **Details** 查看成员、提交时间、交易 ID 和错误；停止的任务在允许恢复时显示 **Recover**。每个成员展示一个关联对象，以及共享该数据的其他版本数量。历史对象信息或大小缺失时会标明不可用。
+打开 **Batches** 查看已收集的数据，点击 **Submit next batch** 请求提交下一批，最多提交单笔上限的 piece，其余数据继续等待。手动操作独立于自动开关和缓存策略，也需要等待提交名额。点击 **Details** 查看成员、提交时间、交易 ID 和错误；停止的任务在允许恢复时显示 **Retry**。每个成员展示一个关联对象，以及共享该数据的其他版本数量。历史对象信息或大小缺失时会标明不可用。
 
 ## 节点选择
 

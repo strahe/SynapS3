@@ -157,8 +157,8 @@ type ObjectRepository interface {
 	// CreateRestoredVersionAndSetCurrent creates a new current data version only
 	// when the selected source still exists and the expected version is current.
 	CreateRestoredVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion, sourceVersionID, expectedCurrentVersionID string) (objectID int64, err error)
-	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
-	DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error
+	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key, versionID string) (*model.ObjectVersion, error)
+	DeleteMarkerVersion(ctx context.Context, bucketID int64, key, versionID string) error
 	DeleteObjectVersionPermanently(ctx context.Context, input DeleteObjectVersionInput) (DeleteObjectVersionResult, error)
 	DeleteDeletedObjectPermanently(ctx context.Context, input DeleteDeletedObjectInput) (DeleteDeletedObjectResult, error)
 	// ClearContentCachePresence records that a content payload no longer has
@@ -174,18 +174,18 @@ type ObjectRepository interface {
 	// RestoreCurrentDeleteMarkerStack is the admin trash restore path: it removes
 	// the current delete marker stack until the latest data version becomes current,
 	// unlike S3 versioned delete which removes only one specified delete marker.
-	RestoreCurrentDeleteMarkerStack(ctx context.Context, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error)
+	RestoreCurrentDeleteMarkerStack(ctx context.Context, bucketID int64, key, currentMarkerVersionID string) (*model.ObjectVersion, error)
 	GetObjectByID(ctx context.Context, id int64) (*model.Object, error)
 	GetObjectByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
 	GetCurrentVersionByObjectID(ctx context.Context, objectID int64) (*model.ObjectVersion, error)
 	GetCurrentVersionByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.ObjectVersion, error)
 	GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error)
-	GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
-	ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error)
-	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
-	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
-	ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
-	ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error)
+	GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key, versionID string) (*model.ObjectVersion, error)
+	ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix, afterKey string, maxKeys int) ([]model.ObjectVersion, error)
+	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
+	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
+	ListVersionsByKey(ctx context.Context, bucketID int64, key, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
+	ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error)
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error
 	// RecordContentCacheAccess advances LRU recency for one content payload
 	// without changing whether its bytes are present.
@@ -331,6 +331,7 @@ type BucketStorageHealthRiskDataSet struct {
 
 type StorageCleanupRepository interface {
 	BindTask(ctx context.Context, contentID, generation, taskID int64) error
+	TransferTaskOwner(ctx context.Context, contentID, generation, oldTaskID, newTaskID int64) error
 	AuthorizeTask(ctx context.Context, contentID, generation, taskID int64) ([]model.StorageCleanupCopy, error)
 	MarkCopyRemoved(ctx context.Context, id int64) error
 	MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error
@@ -510,6 +511,7 @@ type StorageContentRepository interface {
 	GetLiveVersionForUpload(ctx context.Context, contentID int64) (*model.ObjectVersion, error)
 	ListIncompleteCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error)
 	BindDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
+	TransferEnsureTaskOwner(ctx context.Context, dataSetID, generation, oldTaskID, newTaskID int64) error
 	// DataSetCreationStopped includes local sources whose replacement revoked
 	// creation even though they still own the slot.
 	DataSetCreationStopped(ctx context.Context, id int64) (bool, error)
@@ -517,6 +519,7 @@ type StorageContentRepository interface {
 	CompleteDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
 	NextCopyWorkGeneration(ctx context.Context, copyID int64) (int64, error)
 	BindCopyTask(ctx context.Context, copyID, generation, taskID int64) error
+	TransferCopyTaskOwner(ctx context.Context, copyID, generation, oldTaskID, newTaskID int64) error
 	AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error)
 	ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error
 	GetPullAttempt(ctx context.Context, attemptID string, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
@@ -532,6 +535,7 @@ type StorageContentRepository interface {
 	CompleteCopyTask(ctx context.Context, copyID, generation, taskID int64) error
 	NextDataSetRetirementGeneration(ctx context.Context, dataSetID int64) (int64, error)
 	BindDataSetRetirementTask(ctx context.Context, dataSetID, generation, taskID int64) error
+	TransferRetireTaskOwner(ctx context.Context, dataSetID, generation, oldTaskID, newTaskID int64) error
 	AuthorizeDataSetRetirementTask(ctx context.Context, dataSetID, generation, taskID int64) (*model.StorageDataSet, error)
 	CompleteDataSetRetirementTask(ctx context.Context, dataSetID, generation, taskID int64) error
 	// GetUploadCopyForDataSet addresses one concrete data set generation.
@@ -544,6 +548,7 @@ type StorageContentRepository interface {
 	JoinCollectingCommitRequest(ctx context.Context, input JoinCommitRequestInput) (string, int, error)
 	CreateCollectingCommitRequest(ctx context.Context, input CreateCommitRequestInput) error
 	GetCommitRequest(ctx context.Context, requestID string) (*storagecommit.Request, error)
+	TransferCommitTaskOwner(ctx context.Context, requestID string, oldTaskID, newTaskID int64) error
 	ListCommitRequestPieces(ctx context.Context, requestID string) ([]storagecommit.RequestPiece, error)
 	ListCommitRequestMembers(ctx context.Context, requestID string) ([]CommitRequestMember, error)
 	CommitQueueState(ctx context.Context, storageDataSetID int64, now time.Time) (CommitQueueState, error)
@@ -616,6 +621,8 @@ type StorageReplacementRepository interface {
 	// target. Choosing a different provider requires a new authorization.
 	Retry(ctx context.Context, input RetryReplacementInput) (*storagereplacement.Replacement, error)
 	BindTask(ctx context.Context, replacementID, generation, taskID int64) error
+	TransferTaskOwner(ctx context.Context, replacementID, generation, oldTaskID, newTaskID int64) error
+	ResumeCoordinatorTask(ctx context.Context, replacementID, generation, oldTaskID, newTaskID int64) error
 	AuthorizeTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
 	CompleteTask(ctx context.Context, replacementID, generation, taskID int64) error
 
@@ -663,7 +670,7 @@ type StorageReplacementRepository interface {
 	EvaluateRetirementGate(ctx context.Context, replacementID int64, observedEpoch *int64) (RetirementGate, error)
 	// CompleteRetirement re-runs the whole gate inside its own transaction and
 	// refuses premature completion even when called outside the worker.
-	CompleteRetirement(ctx context.Context, replacementID int64, observedEpoch int64) error
+	CompleteRetirement(ctx context.Context, replacementID, observedEpoch int64) error
 	// AbandonUncreatedCopiesBatch transfers live, frozen slot obligations only
 	// after activation and under the coordinator fence. The caller must protect
 	// the transaction with its current engine claim.
@@ -767,12 +774,24 @@ func (g RetirementGate) Passed() bool { return len(g.Blockers) == 0 }
 type TaskRepository interface {
 	Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
+	GetForUpdate(ctx context.Context, id int64) (*model.Task, error)
+	GetDirectSuccessor(ctx context.Context, id int64) (*model.Task, error)
+	SupersedeTerminal(ctx context.Context, id int64) error
+	CloseLegacy(ctx context.Context, id, generation int64) error
+	FailLegacyPending(ctx context.Context, id, generation int64, cause string) error
+	LatestForSubject(ctx context.Context, subjectType, subjectKey string, types ...model.TaskType) (*model.Task, error)
+	ListCurrentFailedForSubject(ctx context.Context, subjectType, subjectKey string, beforeID int64, limit int, types ...model.TaskType) (TaskPage, error)
+	ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error)
+	AppendEvent(ctx context.Context, taskID int64, eventType string, details json.RawMessage) error
+	ListEvents(ctx context.Context, taskID, beforeSequence int64, limit int) ([]model.TaskEvent, error)
+	ObserveOperation(ctx context.Context, id, generation int64, key string) (time.Time, error)
+	AdmitEffect(ctx context.Context, id, generation int64, key string, checkpoint json.RawMessage) error
+	ResolveOperation(ctx context.Context, id, generation int64, key string) error
 	GetByIdentity(ctx context.Context, taskType model.TaskType, idempotencyKey string) (*model.Task, error)
 	PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error)
 	ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error)
 	RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error)
 	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error
-	ConsumeStoreRetry(ctx context.Context, id, generation int64) error
 	ValidateClaim(ctx context.Context, id, generation int64) error
 	MarkWorkStarted(ctx context.Context, id, generation int64, startedAt time.Time) error
 	Settle(ctx context.Context, id, generation int64, transition TaskTransition) error
@@ -780,52 +799,76 @@ type TaskRepository interface {
 	WakePending(ctx context.Context, ids []int64) (int, error)
 	WakePendingOfTypes(ctx context.Context, ids []int64, types []model.TaskType, skipWaitReasons []string) (int, error)
 	RequestCancellation(ctx context.Context, id int64, reason string) error
-	RetryFailed(ctx context.Context, id int64) error
-	ReactivateTerminal(ctx context.Context, id int64) error
-	AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error
-	AcknowledgeFailedForSubject(ctx context.Context, subjectType, subjectKey string, retention time.Duration) (int, error)
-	// AcknowledgeFailedMatching dismisses every unacknowledged failure the filter
-	// covers and reports how many it dismissed.
-	AcknowledgeFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter, retention time.Duration) (int, error)
+	AcknowledgeFailed(ctx context.Context, id int64) error
+	AcknowledgeFailedForSubject(ctx context.Context, subjectType, subjectKey string) (int, error)
+	// AcknowledgeFailedMatching acknowledges every unacknowledged failure the filter
+	// covers and reports how many it acknowledged.
+	AcknowledgeFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter) (int, error)
 	// CountFailedMatching reports how many failures the same filter covers, so a
-	// bulk dismissal can be previewed before it is confirmed.
+	// bulk confirmation can be previewed before it is confirmed.
 	CountFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter) (int, error)
-	DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error)
 	List(ctx context.Context, filter TaskListFilter) (TaskPage, error)
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	CountByScope(ctx context.Context, scope TaskScope) ([]TaskStatusCount, error)
 	CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountUnacknowledgedFailed(ctx context.Context) (int64, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
 }
 
-type TaskTransition struct {
-	WorkStartedAt      *time.Time
-	ClearWorkStartedAt bool
-	Status             model.TaskStatus
-	ResumeMode         model.TaskResumeMode
-	AvailableAt        time.Time
-	WaitReason         *string
-	FailureReason      *string
-	LastError          *string
-	StatusMessage      *string
-	IncrementRetry     bool
-	RetentionUntil     *time.Time
+type TaskScheduleRepository interface {
+	Ensure(ctx context.Context, key string, nextRunAt time.Time) error
+	GetForUpdate(ctx context.Context, key string) (*model.TaskSchedule, error)
+	GetByTaskID(ctx context.Context, taskID int64) (*model.TaskSchedule, error)
+	ListDue(ctx context.Context, now time.Time) ([]model.TaskSchedule, error)
+	SetHead(ctx context.Context, key string, expectedGeneration, generation int64, expectedTaskID, taskID *int64, nextRunAt time.Time) error
+	ScheduleNext(ctx context.Context, key string, taskID int64, nextRunAt time.Time) error
 }
 
-// TaskAcknowledgeFilter selects the failures one bulk dismissal covers. The
+type TaskTransition struct {
+	WorkStartedAt        *time.Time
+	ClearWorkStartedAt   bool
+	Status               model.TaskStatus
+	ResumeMode           model.TaskResumeMode
+	AvailableAt          time.Time
+	WaitReason           *string
+	FailureReason        *string
+	LastError            *string
+	StatusMessage        *string
+	IncrementRetry       bool
+	CancellationObserved bool
+}
+
+// TaskAcknowledgeFilter selects the failures one bulk confirmation covers. The
 // cutoff is what the operator saw: failures recorded after it stay visible.
 type TaskAcknowledgeFilter struct {
 	Type         model.TaskType
 	FailedBefore time.Time
 }
 
+type TaskScope string
+
+const (
+	TaskScopeWork    TaskScope = "work"
+	TaskScopeHistory TaskScope = "history"
+)
+
+func (s TaskScope) Valid() bool {
+	//exhaustive:enforce
+	switch s {
+	case "", TaskScopeWork, TaskScopeHistory:
+		return true
+	default:
+		return false
+	}
+}
+
 type TaskListFilter struct {
-	Type                       model.TaskType
-	Status                     model.TaskStatus
-	Acknowledged               *bool
-	BeforeID                   int64
-	Limit                      int
-	HideHealthyRecurringSystem bool
+	Scope        TaskScope
+	Type         model.TaskType
+	Status       model.TaskStatus
+	Acknowledged *bool
+	BeforeID     int64
+	Limit        int
 }
 
 type TaskPage struct {
@@ -838,6 +881,7 @@ type WalletOperationRepository interface {
 	CreateOrGet(ctx context.Context, input CreateWalletOperationInput) (*model.WalletOperation, bool, error)
 	GetByID(ctx context.Context, id int64) (*model.WalletOperation, error)
 	BindTask(ctx context.Context, id, taskID int64) error
+	TransferTaskOwner(ctx context.Context, id, oldTaskID, newTaskID int64) error
 	MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error
 	MarkSubmitted(ctx context.Context, id, taskID int64, txHash string) error
 	MarkConfirmed(ctx context.Context, id, taskID int64, txHash string) error
@@ -866,6 +910,7 @@ type ObservabilityRepository interface {
 
 type ProviderUploadSpeedRepository interface {
 	Begin(context.Context, string, string, int64) error
+	TransferTaskOwner(context.Context, int64, int64) error
 	BeginIfAbsent(context.Context, string, string, int64) error
 	Finish(context.Context, string, int64, providerbenchmark.State, int64, int64, string) error
 	FailActiveTask(context.Context, int64, string) error

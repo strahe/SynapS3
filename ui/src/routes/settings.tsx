@@ -102,8 +102,6 @@ const tabFields = {
     'worker.tasks.concurrency',
     'worker.tasks.poll_interval',
     'worker.tasks.lease_duration',
-    'worker.tasks.max_retries',
-    'worker.tasks.retention',
     'worker.tasks.provider_mutation_concurrency',
     'worker.tasks.destructive_mutation_concurrency',
     'worker.tasks.commit_max_pieces',
@@ -957,22 +955,6 @@ function TaskWorkerSection({
           data={data}
           errors={errors}
           onChange={(next) => onChange({ ...value, lease_duration: next })}
-        />
-        <NumberField
-          label="Max Retries"
-          field="worker.tasks.max_retries"
-          value={value.max_retries}
-          data={data}
-          errors={errors}
-          onChange={(next) => onChange({ ...value, max_retries: next })}
-        />
-        <TextField
-          label="Task Retention"
-          field="worker.tasks.retention"
-          value={value.retention}
-          data={data}
-          errors={errors}
-          onChange={(next) => onChange({ ...value, retention: next })}
         />
         <NumberField
           label="Storage Mutation Concurrency"

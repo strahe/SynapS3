@@ -2,6 +2,7 @@ package bucketprovision
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -67,9 +68,22 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *bucketlifecycle.ProvisionInput) error {
 			return bucketlifecycle.ValidateProvisionInput(*input)
 		}),
-		// Provisioning re-reads bucket state on every wake and can wait a long
-		// time for providers, so transient errors must not exhaust it.
-		RetryLimit: nil, AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+	}
+	definition.Subject = taskengine.SubjectFromInput("bucket", func(input bucketlifecycle.ProvisionInput) int64 { return input.BucketID })
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input bucketlifecycle.ProvisionInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		bucket, err := repos.Buckets.GetByID(ctx, input.BucketID)
+		if err != nil {
+			return err
+		}
+		if bucket == nil || source.IdempotencyKey != bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies) {
+			return repository.ErrConflict
+		}
+		return nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[bucketlifecycle.ProvisionInput](execution)
@@ -124,7 +138,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			})
 		}
 		if covered == required && allPendingWorkBound {
-			return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", nil)
 		}
 
 		selected, err := h.deps.Selector.SelectBucketBindings(ctx, bucket, required)
@@ -138,7 +152,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			return retryTask(err, "storage_selection_failed")
 		}
 		if len(selected) < required {
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
 		}
 		targets := make([]synapse.StorageTarget, 0, len(selected))
 		for i := range selected {
@@ -152,7 +166,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			return retryTask(err, "storage_funding_failed")
 		}
 		if costs == nil || !costs.Ready {
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "funding", uploadFundingWaitMessage(costs), nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "funding", uploadFundingWaitMessage(costs), nil)
 		}
 
 		plan := make([]bindingtask.Plan, 0, len(selected))
@@ -230,7 +244,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		if allResolved {
 			return taskengine.Complete("Bucket storage is ready", settlement)
 		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", settlement)
+		return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", settlement)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }
@@ -247,6 +261,9 @@ func (h *Handler) effectiveBucketCopies(bucket *model.Bucket) int {
 }
 
 func (h *Handler) waitForStorageDependency(ctx context.Context, execution taskengine.Execution, reason, message string, err error) taskengine.Result {
+	if synapse.IsProviderCandidateWait(err) {
+		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, reason, message, nil)
+	}
 	summary := synapse.SummarizedError(err)
 	level := slog.LevelWarn
 	if execution.LastError() == summary.Error() {
@@ -254,7 +271,7 @@ func (h *Handler) waitForStorageDependency(ctx context.Context, execution tasken
 	}
 	h.deps.Logger.Log(ctx, level, "storage task waiting for dependency",
 		"task_id", execution.ID(), "task_type", execution.Type(), "wait_reason", reason, "error", summary)
-	return taskengine.SuspendWithError(model.TaskResumeModeExecute, storageDependencyWait, reason, message, summary, nil)
+	return taskengine.RetryInMode(summary, reason, model.TaskResumeModeExecute, storageDependencyWait, nil)
 }
 
 func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {

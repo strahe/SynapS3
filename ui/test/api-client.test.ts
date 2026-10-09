@@ -27,16 +27,16 @@ test('task subject lookup encodes its identity and forwards cancellation', async
   assert.equal(request.signal, controller.signal)
 })
 
-test('replica retry starts new work for the copy', async () => {
+test('task retry creates a successor', async () => {
   const originalFetch = globalThis.fetch
   let request: { url?: string; method?: string; body?: BodyInit | null } = {}
   globalThis.fetch = (async (input, init) => {
     request = { url: String(input), method: init?.method, body: init?.body }
-    return new Response(JSON.stringify({ copy_id: 12, task_id: 34 }), { status: 202 })
+    return new Response(JSON.stringify({ task_id: 34 }), { status: 202 })
   }) as typeof fetch
   try {
-    assert.deepEqual(await api.retryStorageCopy(12), { copy_id: 12, task_id: 34 })
-    assert.deepEqual(request, { url: '/api/v1/storage-copies/12/retry', method: 'POST', body: undefined })
+    assert.deepEqual(await api.retryTask(12), { task_id: 34 })
+    assert.deepEqual(request, { url: '/api/v1/tasks/12/retry', method: 'POST', body: undefined })
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -88,7 +88,7 @@ function installFakeXMLHttpRequest() {
   }
 }
 
-test('bulk task dismissal posts the operation filter and the cutoff', async () => {
+test('bulk task acknowledgement posts the operation filter and the cutoff', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ url: string; method?: string; body?: BodyInit | null }> = []
   globalThis.fetch = (async (input, init) => {
@@ -837,4 +837,27 @@ test('object upload rejects files outside FOC size limits before XHR', async () 
   } finally {
     restore()
   }
+})
+
+test('task list and statistics select work or history explicitly', async () => {
+  const originalFetch = globalThis.fetch
+  const requests: string[] = []
+  globalThis.fetch = (async (input) => {
+    requests.push(String(input))
+    return new Response(JSON.stringify({ tasks: [] }))
+  }) as typeof fetch
+  try {
+    await api.getTasks({})
+    await api.getTasks({ scope: 'history', type: 'storage_store', status: 'completed', cursor: 143, limit: 20 })
+    await api.getTaskStats()
+    await api.getTaskStats('history')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(requests, [
+    '/api/v1/tasks?scope=work',
+    '/api/v1/tasks?scope=history&type=storage_store&status=completed&limit=20&cursor=143',
+    '/api/v1/tasks/stats?scope=work',
+    '/api/v1/tasks/stats?scope=history',
+  ])
 })

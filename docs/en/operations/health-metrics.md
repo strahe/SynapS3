@@ -49,7 +49,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-Status should show background task processing as healthy. Task stats report acknowledged failures separately as dismissed, and the dashboard presents pending work as queued, scheduled, or waiting.
+Status should show background task processing as healthy. Acknowledged failures remain failed; pending work is shown as queued, scheduled, or waiting.
 
 ## Prometheus Metrics
 

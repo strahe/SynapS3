@@ -2,25 +2,6 @@ import type { ObjectState, ObjectStatus } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
 import { titleCaseEnum } from './utils.ts'
 
-export function copyRetryBlockedLabel(reason?: string) {
-  switch (reason) {
-    case 'object_deleted':
-      return 'Object deleted'
-    case 'replacement_in_progress':
-      return 'Finish or retry the provider replacement first'
-    case 'storage_service_unavailable':
-      return 'Storage service unavailable'
-    case 'no_source':
-      return 'No source available'
-    case 'recovery_requires_attention':
-      return 'Resolve the previous transfer first'
-    case 'copy_retry_in_progress':
-      return 'Replica changed. Refresh to check its status.'
-    default:
-      return 'Replica retry unavailable'
-  }
-}
-
 export function taskReplicaLabel(task: { copy_index?: number; copyIndex?: number }) {
   const copyIndex = task.copy_index ?? task.copyIndex
   if (typeof copyIndex !== 'number') return '—'

@@ -36,9 +36,9 @@ type EventPublisher interface {
 
 type CoordinatorDependencies struct {
 	Repositories *repository.Repositories
+	CacheGate    *cacheaccess.Gate
 	Scheduler    *taskengine.Scheduler
 	Messenger    *taskengine.Messenger
-	MaxRetries   int
 }
 
 type CopyCoordinator struct {
@@ -48,9 +48,6 @@ type CopyCoordinator struct {
 func NewCopyCoordinator(deps CoordinatorDependencies) (*CopyCoordinator, error) {
 	if deps.Repositories == nil || deps.Repositories.Tasks == nil || deps.Scheduler == nil || deps.Messenger == nil {
 		return nil, errors.New("copy coordinator requires repositories, scheduler and messenger")
-	}
-	if deps.MaxRetries < 0 {
-		return nil, errors.New("task retry limit cannot be negative")
 	}
 	return &CopyCoordinator{deps: deps}, nil
 }
@@ -147,12 +144,9 @@ type storeCheckpoint struct {
 }
 
 type pullCheckpoint struct {
-	AttemptID string `json:"attempt_id"`
-}
-
-func (h *CopyCoordinator) retryLimit() *int {
-	value := h.deps.MaxRetries
-	return &value
+	AttemptID     string    `json:"attempt_id"`
+	Accepted      bool      `json:"accepted,omitempty"`
+	NextRequestAt time.Time `json:"next_request_at,omitzero"`
 }
 
 func (h *CopyCoordinator) wake(ctx context.Context, tx *repository.Repositories, ids []int64) (int, error) {

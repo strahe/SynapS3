@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -27,7 +28,6 @@ type Dependencies struct {
 	Receipts               WalletReceiptChecker
 	WalletBroadcastTimeout time.Duration
 	WalletReceiptTimeout   time.Duration
-	MaxRetries             int
 }
 type Handler struct {
 	*taskengine.FuncHandler
@@ -37,9 +37,6 @@ type Handler struct {
 func NewHandler(deps Dependencies) (*Handler, error) {
 	if deps.Repositories == nil || deps.Repositories.Tasks == nil {
 		return nil, errors.New("wallet handler requires repositories")
-	}
-	if deps.MaxRetries < 0 {
-		return nil, errors.New("task retry limit cannot be negative")
 	}
 	if deps.WalletBroadcastTimeout < 0 || deps.WalletReceiptTimeout < 0 {
 		return nil, errors.New("wallet timeouts cannot be negative")
@@ -54,22 +51,43 @@ func NewHandler(deps Dependencies) (*Handler, error) {
 	h.FuncHandler = h.newHandler()
 	return h, nil
 }
-func (h *Handler) retryLimit() *int { value := h.deps.MaxRetries; return &value }
 
 const externalPollInterval = 5 * time.Second
 
 func (h *Handler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeWalletOperation, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
-		Codec:      taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
-		RetryLimit: h.retryLimit(), AllowRetry: true,
-		// Recovery never broadcasts without proof that nothing was sent, so a
-		// failure the Engine recorded itself is as safe to retry as one that
-		// stopped before broadcast.
-		CanManualRetry: func(task *model.Task) bool {
-			return task != nil && task.FailureReason != nil &&
-				(*task.FailureReason == "wallet_broadcast_not_started" || taskengine.RecoverableEngineFailure(*task.FailureReason))
+		Codec:   taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
+		Subject: taskengine.SubjectFromInput("wallet_operation", func(input walletoperation.Input) int64 { return input.OperationID }),
+		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		CanManualRetry: func(source *model.Task) bool {
+			return source != nil && (source.FailureReason == nil || (*source.FailureReason != "invalid_checkpoint" && *source.FailureReason != "wallet_broadcast_unknown" && *source.FailureReason != "wallet_transaction_reverted"))
 		},
+	}
+
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input walletoperation.Input
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		row, err := repos.WalletOperations.GetByID(ctx, input.OperationID)
+		if err != nil {
+			return err
+		}
+		if row == nil || row.TaskID == nil || *row.TaskID != source.ID || row.Status == model.WalletOperationStatusUnknown || row.Status == model.WalletOperationStatusConfirmed {
+			return repository.ErrConflict
+		}
+		if row.BroadcastAttemptedAt != nil && (row.TxHash == nil || *row.TxHash == "") {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input walletoperation.Input
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.WalletOperations.TransferTaskOwner(ctx, input.OperationID, old.ID, next.ID)
 	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.executeWalletOperation(ctx, execution)
@@ -107,7 +125,7 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 	checkpoint := walletoperation.Checkpoint{BroadcastAttempted: true}
 	var txHash string
 	var alreadyComplete bool
-	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceWallet, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceWallet, fmt.Sprintf("wallet:%d", op.ID), checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, execution.ID())
 	}, func(ctx context.Context) error {
 		requestCtx, cancel := context.WithTimeout(ctx, h.deps.WalletBroadcastTimeout)
@@ -143,11 +161,11 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 	if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 	}); err != nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Recording wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Recording wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 		})
 	}
-	return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", nil)
+	return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", nil)
 }
 
 func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengine.Execution) (result taskengine.Result) {
@@ -160,7 +178,8 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		return h.retryWalletOperation(execution, input.OperationID, err, "wallet_load_failed")
 	}
 	if op != nil && op.TaskID != nil && *op.TaskID == execution.ID() && op.BroadcastAttemptedAt != nil {
-		defer func() { result = result.WithWorkStartedAt(*op.BroadcastAttemptedAt) }()
+		startedAt := time.Now().UTC()
+		defer func() { result = result.WithWorkStartedAt(startedAt) }()
 	}
 	if result, done := h.walletTerminalResult(op, execution.ID()); done {
 		return result
@@ -178,7 +197,7 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 	}
 	if txHash == "" {
 		if !hasCheckpoint && op.BroadcastAttemptedAt == nil {
-			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Wallet operation is ready", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Wallet operation is ready", nil)
 		}
 		err := errors.New("wallet transaction identity could not be recovered")
 		return taskengine.Fail(err, "wallet_broadcast_unknown", func(ctx context.Context, repos *repository.Repositories) error {
@@ -186,7 +205,7 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		})
 	}
 	if h.deps.Receipts == nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 		})
 	}
@@ -197,11 +216,10 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 	}
 	if err != nil && !errors.Is(err, ethereum.NotFound) {
-		return taskengine.SuspendWithError(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction",
-			synapse.SummarizedError(err), markSubmitted)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "transaction_confirmation", model.TaskResumeModeRecover, externalPollInterval, markSubmitted)
 	}
 	if err != nil || receipt == nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
+		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
 	}
 	if receipt.Status == ethtypes.ReceiptStatusSuccessful {
 		return taskengine.Complete("Wallet transaction confirmed", func(ctx context.Context, repos *repository.Repositories) error {
@@ -214,13 +232,8 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 	})
 }
 
-func (h *Handler) retryWalletOperation(execution taskengine.Execution, operationID int64, err error, reason string) taskengine.Result {
-	if !execution.RetryWillFail() {
-		return retryTask(err, reason)
-	}
-	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.WalletOperations.MarkFailed(ctx, operationID, execution.ID(), err.Error())
-	})
+func (h *Handler) retryWalletOperation(_ taskengine.Execution, _ int64, err error, reason string) taskengine.Result {
+	return retryTask(err, reason)
 }
 
 func (h *Handler) walletTerminalResult(op *model.WalletOperation, taskID int64) (taskengine.Result, bool) {

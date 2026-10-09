@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  copyRetryBlockedLabel,
   objectStateLabel,
   replicaLabel,
   storageCleanupCopyStatusLabel,
@@ -11,22 +10,6 @@ import {
   taskReplicaLabel,
   transferMethodLabel,
 } from '../src/lib/storage-status-labels.ts'
-
-test('replica retry reasons explain unavailable recovery without reason codes', () => {
-  assert.equal(copyRetryBlockedLabel('replacement_in_progress'), 'Finish or retry the provider replacement first')
-  for (const reason of [
-    'object_deleted',
-    'replacement_in_progress',
-    'storage_service_unavailable',
-    'no_source',
-    'recovery_requires_attention',
-    'copy_retry_in_progress',
-  ]) {
-    assert.ok(copyRetryBlockedLabel(reason))
-    assert.ok(!copyRetryBlockedLabel(reason).includes(reason))
-  }
-  assert.equal(copyRetryBlockedLabel('future'), 'Replica retry unavailable')
-})
 
 test('object state labels describe the derived storage position in user-facing terms', () => {
   assert.equal(objectStateLabel('cached', 'uploading'), 'Stored in cache')

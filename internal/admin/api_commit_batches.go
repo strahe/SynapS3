@@ -187,8 +187,11 @@ func (s *Server) writeCommitBatch(w http.ResponseWriter, r *http.Request, status
 			return
 		}
 		if task != nil {
-			items := []taskListItem{s.taskListItem(task)}
-			s.attachTaskStorageConfirmations(r.Context(), []model.Task{*task}, items)
+			items := []taskListItem{s.taskListItem(r.Context(), task)}
+			if err := s.attachTaskStorageConfirmations(r.Context(), []model.Task{*task}, items); err != nil {
+				s.commitBatchError(w, err)
+				return
+			}
 			response.Task = &items[0]
 		}
 	}

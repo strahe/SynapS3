@@ -25,6 +25,8 @@ synaps3 admin task list --status failed --limit 50
 
 使用部署环境原有的安装方式替换可执行文件、软件包或容器镜像。Docker 命令见 [Docker 部署](../getting-started/docker.md)。
 
+废弃的 `worker.upload`、`worker.provider_replacement`、`worker.evictor` 和 `worker.storage_cleanup` 配置段会被拒绝；请替换为 `worker.tasks` 设置。启动升级版本前，还必须删除 `worker.tasks.max_retries`、`worker.tasks.retention`、`SYNAPS3_WORKER_TASKS_MAX_RETRIES` 和 `SYNAPS3_WORKER_TASKS_RETENTION`，否则配置校验会拒绝启动。重试预算由任务类型决定，历史永久保留。
+
 使用预期的数据库和缓存启动 SynapS3。如果启动时报告数据库不兼容，请停止进程、保持数据库不变，然后按[数据库不兼容时](#数据库不兼容时)处理。
 
 启动后运行：
@@ -54,7 +56,7 @@ sqlite3 -readonly /backup/path/synaps3-pre-upgrade.db "PRAGMA integrity_check;"
 
 完整性检查必须输出 `ok`。把备份、需要保留的 WAL/SHM 文件、匹配的缓存和配置作为同一恢复集保护。PostgreSQL 部署应使用 `pg_dump` 或部署批准的数据库快照，并单独验证该备份产物。
 
-SynapS3 不会修改不兼容的数据库。废弃的 `worker.upload`、`worker.provider_replacement`、`worker.evictor` 和 `worker.storage_cleanup` 配置段也会被拒绝；请替换为 `worker.tasks` 设置。
+SynapS3 不会修改不兼容的数据库。
 
 使用空数据库启动时，不会导入原有的存储桶、对象、用户、存储数据集、钱包操作、存储提供方替换或任务。已创建的远端付费存储服务仍会运行。请保留经过验证的备份，以便单独核对和处理这些服务与记录。
 
@@ -64,19 +66,19 @@ SynapS3 不会修改不兼容的数据库。废弃的 `worker.upload`、`worker.
 
 重启后，未完成的工作会自动恢复处理。
 
-- 只重试仪表盘或 API 标记为可重试的失败任务。
+- 使用 **Retry** 恢复已停止的任务。任务列表按结果显示重试资格，打开详情后再检查当前条件。如果其他操作已接管，或恢复不安全，Retry 会说明原因并刷新列表。
 - 从 **Details** → **Storage** → **Data Sets** 恢复存储提供方替换。
 - 存储传输任务因内部错误停止时仍可重试。重试会先检查上一次已经完成的部分，再继续。如果错误来自无法处理该任务的版本，请先安装兼容的版本。
 - 钱包操作在尚未发出广播、或因内部错误停止时，可以从 Tasks 重试。重试会先核对这笔操作：从未广播过时才会发出交易，否则只检查已经发出的交易。如果广播可能已经发出、却没有记录到交易，操作会被标为结果未知，不能再重试。
-- **Retry upload** 会先检查存储提供方是否已有分片；确认缺失后才重新上传。重传可能增加带宽用量或开启另一次上传会话。
-- `status=failed` 只列出尚未确认的失败；使用 `status=dismissed` 查看已确认的失败。
-- 存储提供方拒绝存储登记、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对其中的 piece 是否已登记，未登记时再次提交原请求；同一请求只能登记一次。存储提供方在登记前删除的 piece 会先重新传输，再整体重新提交该请求。如果无法从其他存储提供方重新复制：存储提供方从未接受过的请求会去掉它重新签名，该副本标记为失败；已被接受的请求会稍后再次尝试复制。从本地缓存重新上传时如果停止，并在 Tasks 页面提供 Retry，对应的登记会一直等待，直到你重试该上传。如果链上已把请求的 nonce 用在别处，存储提供方从未接受过的请求会换一个新 nonce 重新签名；对于已被接受的请求，链上记录与请求不符时，确认会停止：可在 **Tasks**（Confirm storage、Failed）中或使用 `synaps3 admin storage-confirmation list` 找到它及存储提供方的回复，并使用 **Recover** 重新核对链上记录。请求已登记时，Recover 会完成该确认。
+- **Retry** 会先检查存储提供方是否已有分片；确认缺失后才重新上传。重传可能增加带宽用量或开启另一次上传会话。
+- 确认将失败移入 History；用 `scope=history&status=failed` 查看。
+- 存储登记恢复会保留已签名请求，并在再次提交前检查链上结果。缺失的分片会在安全时重新传输。存储提供方错误和传输失败使用有限预算。登记明确被拒绝且链上核实未落地时，无法恢复的分片不会阻止其余分片继续登记。恢复停止后，确认会保留已有证据。在 **Tasks**（Confirm storage、Failed）中或通过 `synaps3 admin storage-confirmation list` 找到它，恢复依赖后使用 **Retry**。已被接受的请求如果与链上证据冲突，会继续停止并等待核查。
+- Pull 队列已满时，会按存储提供方要求的延迟再次尝试，不消耗重试预算。其他失败在新建或手动重试的 Pull 轮次中最多使用 12 次机会；已有轮次保留原策略。
 
 常用命令：
 
 ```bash
 synaps3 admin task list --status failed --limit 100
-synaps3 admin task list --status dismissed --limit 100
 synaps3 admin task stats
 synaps3 admin task retry 42
 synaps3 admin task acknowledge 42

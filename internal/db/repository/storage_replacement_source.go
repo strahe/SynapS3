@@ -2,7 +2,6 @@ package repository
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -112,12 +111,14 @@ func replaceableEarlierTargets(ctx context.Context, db bun.IDB, sourceDataSetID 
 
 func uncreatedDataSetEligibility(ctx context.Context, db bun.IDB, source *model.StorageDataSet) error {
 	if source.EnsureTaskID != nil {
-		var status model.TaskStatus
-		err := db.NewSelect().Model((*model.Task)(nil)).Column("status").Where("id = ?", *source.EnsureTaskID).Scan(ctx, &status)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		task, err := (&BunTaskRepo{db: db}).GetByID(ctx, *source.EnsureTaskID)
+		if err != nil {
 			return err
 		}
-		if status == model.TaskStatusRunning {
+		if task == nil {
+			return ErrNotFound
+		}
+		if task.Status == model.TaskStatusRunning {
 			return storagereplacement.ErrSourceRunning
 		}
 	}

@@ -47,6 +47,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 	if _, err := s3Client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
+	waitForRegistrationBucket(t, admin, bucket)
 
 	group, ctx := errgroup.WithContext(t.Context())
 	for i := range objects {
@@ -102,7 +103,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 
 	// Uploads and Pull replicas share the same batching policy.
 	registrations := 0
-	path := "/api/v1/tasks?type=storage_commit&limit=100"
+	path := "/api/v1/tasks?scope=history&type=storage_commit&limit=100"
 	for {
 		var tasks e2e.TaskListResponse
 		raw, err := admin.GetJSON(t.Context(), path, &tasks)
@@ -118,7 +119,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 		if tasks.NextCursor == nil {
 			break
 		}
-		path = "/api/v1/tasks?type=storage_commit&limit=100&cursor=" + strconv.FormatInt(*tasks.NextCursor, 10)
+		path = "/api/v1/tasks?scope=history&type=storage_commit&limit=100&cursor=" + strconv.FormatInt(*tasks.NextCursor, 10)
 	}
 	if registrations < config.DefaultFilecoinCopies || registrations > copies/2 {
 		t.Fatalf("registrations = %d for %d copies, want at least two copies per registration on average",
@@ -148,6 +149,7 @@ func TestSystemManualSealBypassesLongCollectionWindow(t *testing.T) {
 		if _, err := client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatal(err)
 		}
+		waitForRegistrationBucket(t, admin, bucket)
 		if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("manual.bin"), Body: bytes.NewReader(bytes.Repeat([]byte(bucket), 8000))}); err != nil {
 			t.Fatal(err)
 		}
@@ -208,4 +210,15 @@ func TestSystemManualSealBypassesLongCollectionWindow(t *testing.T) {
 			return raw, len(list.Objects) == 1 && list.Objects[0].State == "stored" && list.Objects[0].Location.Filecoin, err
 		})
 	}
+}
+
+func waitForRegistrationBucket(t *testing.T, admin *e2e.AdminClient, bucket string) {
+	t.Helper()
+	e2e.Eventually(t, t.Context(), 60*time.Second, "bucket ready for uploads", func(ctx context.Context) (string, bool, error) {
+		var detail struct {
+			Status string `json:"status"`
+		}
+		_, err := admin.GetJSON(ctx, "/api/v1/buckets/"+url.PathEscape(bucket), &detail)
+		return detail.Status, detail.Status == "ready", err
+	})
 }

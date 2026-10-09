@@ -28,7 +28,7 @@ func communicationHarness(t *testing.T, db *bun.DB, types []model.TaskType, conf
 	t.Helper()
 	repos := repository.NewRepositories(db)
 	registry := NewRegistry()
-	service, err := NewService(registry, repos, time.Hour)
+	service, err := NewService(registry, repos)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,11 +42,12 @@ func communicationHarness(t *testing.T, db *bun.DB, types []model.TaskType, conf
 	configure(registry, service)
 	engine, err := NewEngine(EngineConfig{
 		Concurrency: 1, PollInterval: time.Millisecond, LeaseDuration: time.Minute,
-		Retention: time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}, repos, registry, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine.retryDelay = func(int) time.Duration { return 0 }
 	return taskHarness{db: db, repos: repos, registry: registry, service: service, engine: engine}
 }
 
@@ -114,7 +115,7 @@ func TestRegistryRequiresClosedCommunicationDeclarations(t *testing.T) {
 
 func TestSchedulerRequiresRegisteredTypesAtFreeze(t *testing.T) {
 	registry := NewRegistry()
-	service, err := NewService(registry, repository.NewRepositories(testutil.NewTestFileDB(t)), time.Hour)
+	service, err := NewService(registry, repository.NewRepositories(testutil.NewTestFileDB(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

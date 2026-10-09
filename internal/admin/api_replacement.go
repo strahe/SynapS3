@@ -47,15 +47,18 @@ type startReplacementRequest struct {
 // Counts are deliberately named for what they measure: a confirmation talks
 // about referenced versions, progress talks about stored content.
 type providerReplacementResponse struct {
-	ID            int64  `json:"id"`
-	BucketName    string `json:"bucket_name"`
-	CopyIndex     int    `json:"copy_index"`
-	Status        string `json:"status"`
-	WaitReason    string `json:"wait_reason,omitempty"`
-	WaitMessage   string `json:"wait_message,omitempty"`
-	FailureReason string `json:"failure_reason,omitempty"`
-	Retryable     bool   `json:"retryable"`
-	SelectionMode string `json:"selection_mode"`
+	ID                     int64  `json:"id"`
+	BucketName             string `json:"bucket_name"`
+	CopyIndex              int    `json:"copy_index"`
+	Status                 string `json:"status"`
+	WaitReason             string `json:"wait_reason,omitempty"`
+	WaitMessage            string `json:"wait_message,omitempty"`
+	FailureReason          string `json:"failure_reason,omitempty"`
+	Retryable              bool   `json:"retryable"`
+	RetryTaskID            *int64 `json:"retry_task_id"`
+	RetryUnavailableReason string `json:"retry_unavailable_reason,omitempty"`
+	RetirementAttention    bool   `json:"retirement_attention,omitempty"`
+	SelectionMode          string `json:"selection_mode"`
 
 	Source replacementDataSetResponse `json:"source"`
 	Target replacementDataSetResponse `json:"target"`
@@ -539,61 +542,6 @@ var (
 	errApprovalCheckUnavailable = errors.New("provider requirement check is unavailable")
 )
 
-// handleAPIRetryStorageReplacement resumes work an operator owns. Choosing a
-// different provider needs a new confirmation, so this endpoint never changes
-// the approved target.
-func (s *Server) handleAPIRetryStorageReplacement(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid replacement id"})
-		return
-	}
-	ctx := r.Context()
-	if s.taskService == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
-		return
-	}
-	var row *storagereplacement.Replacement
-	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		var retryErr error
-		row, retryErr = txRepos.Replacements.Retry(ctx, repository.RetryReplacementInput{ReplacementID: id})
-		if retryErr != nil {
-			return retryErr
-		}
-		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
-			Type:           model.TaskTypeProviderReplacementCoordinate,
-			IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
-			Input:          storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
-			SubjectType:    "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
-		})
-		if enqueueErr != nil {
-			return enqueueErr
-		}
-		if bindErr := txRepos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, taskRow.ID); bindErr != nil {
-			return bindErr
-		}
-		row.TaskID = &taskRow.ID
-		return nil
-	})
-	if err != nil {
-		s.writeReplacementError(w, err, "")
-		return
-	}
-	bucket, err := s.repos.Buckets.GetByID(ctx, row.BucketID)
-	if err != nil || bucket == nil {
-		s.logger.Error("api: failed to load bucket for replacement retry", "error", err, "bucketID", row.BucketID)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-	response, err := s.providerReplacementResponse(ctx, bucket.Name, row)
-	if err != nil {
-		s.logger.Error("api: failed to build replacement response", "error", err, "replacementID", row.ID)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-	writeJSON(w, http.StatusOK, response)
-}
-
 func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketName string) {
 	code := storagereplacement.Code(err)
 	switch {
@@ -709,13 +657,32 @@ func (s *Server) providerReplacementResponseWithProgress(
 	if err != nil {
 		return providerReplacementResponse{}, err
 	}
-	retryErr := s.repos.Replacements.RetryEligibility(ctx, row.ID)
-	if retryErr != nil && !errors.Is(retryErr, storagereplacement.ErrNotRetryable) && !errors.Is(retryErr, storagereplacement.ErrSuperseded) && !errors.Is(retryErr, storagereplacement.ErrTargetInUse) {
-		return providerReplacementResponse{}, retryErr
+	var retryTask, retirementTask *model.Task
+	if row.Status == storagereplacement.StatusRetiring || row.Status == storagereplacement.StatusCleanupAttention || row.Status == storagereplacement.StatusSuperseded {
+		retirementDataSet := source
+		if row.Status == storagereplacement.StatusSuperseded {
+			retirementDataSet = target
+		}
+		if retirementDataSet != nil && retirementDataSet.RetirementTaskID != nil {
+			retirementTask, err = s.repos.Tasks.GetByID(ctx, *retirementDataSet.RetirementTaskID)
+			if err != nil {
+				return providerReplacementResponse{}, err
+			}
+		}
+		retryTask = retirementTask
+	} else if row.TaskID != nil {
+		retryTask, err = s.repos.Tasks.GetByID(ctx, *row.TaskID)
+		if err != nil {
+			return providerReplacementResponse{}, err
+		}
+	}
+	retryID, retryReason, err := s.inspectTaskRetry(ctx, retryTask)
+	if err != nil {
+		return providerReplacementResponse{}, err
 	}
 	identities := s.providerIdentities(ctx, replacementProviderIDs(source, target))
 	response := providerReplacementResponse{
-		Retryable:     retryErr == nil,
+		Retryable: retryID != nil, RetryTaskID: retryID, RetryUnavailableReason: retryReason,
 		ID:            row.ID,
 		BucketName:    bucketName,
 		CopyIndex:     row.CopyIndex,
@@ -749,6 +716,23 @@ func (s *Server) providerReplacementResponseWithProgress(
 	}
 	if row.FailureReason != nil {
 		response.FailureReason = string(*row.FailureReason)
+	}
+	if retirementTask != nil && retirementTask.Status == model.TaskStatusFailed && retirementTask.SupersededAt == nil {
+		response.RetirementAttention = true
+		response.LastError = retirementTask.LastError
+		response.WaitReason, response.WaitMessage = "", ""
+		response.Progress.Phase = string(storagereplacement.PhaseNone)
+		if row.Status != storagereplacement.StatusSuperseded {
+			response.Status = string(storagereplacement.StatusCleanupAttention)
+		}
+	} else if retirementTask != nil &&
+		(retirementTask.Status == model.TaskStatusPending || retirementTask.Status == model.TaskStatusRunning) {
+		response.LastError = nil
+		response.WaitReason, response.WaitMessage = "", ""
+		if row.Status == storagereplacement.StatusCleanupAttention {
+			response.Status = string(storagereplacement.StatusRetiring)
+			response.Progress.Phase = string(storagereplacement.PhaseRetire)
+		}
 	}
 	return response, nil
 }
@@ -957,7 +941,7 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 			if candidate.Observation != nil {
 				observedServiceURL = candidate.Observation.Facts.ServiceURL
 			}
-			view.UploadSpeedTest = uploadSpeedView(row, view.ProviderProfile, observedServiceURL)
+			view.UploadSpeedTest = s.uploadSpeedViewWithRetry(ctx, candidate.ProviderID.String(), row, view.ProviderProfile, observedServiceURL)
 		}
 		providers = append(providers, view)
 	}

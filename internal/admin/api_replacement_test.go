@@ -18,6 +18,7 @@ import (
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 type stubProviderSelector struct {
@@ -578,7 +579,7 @@ func TestAPIRetryStorageReplacementStates(t *testing.T) {
 	created := decodeReplacement(t, rec)
 
 	retry := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/"+strconv.FormatInt(created.ID, 10)+"/retry", nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(fixture.replacementTaskID(t, created.ID), 10)+"/retry", nil)
 		out := httptest.NewRecorder()
 		fixture.mux.ServeHTTP(out, req)
 		return out
@@ -589,26 +590,165 @@ func TestAPIRetryStorageReplacementStates(t *testing.T) {
 	if out.Code != http.StatusConflict {
 		t.Fatalf("retry while preparing = %d, want 409", out.Code)
 	}
-	if got := decodeAPIError(t, out)["code"]; got != storagereplacement.CodeNotRetryable {
+	if got := decodeAPIError(t, out)["code"]; got != "task_retry_unsupported" {
 		t.Fatalf("code = %q, want %q", got, storagereplacement.CodeNotRetryable)
 	}
 
 	if err := fixture.srv.repos.Replacements.MarkFailed(ctx, created.ID, nil, "target creation exhausted"); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
-	out = retry()
-	if out.Code != http.StatusOK {
-		t.Fatalf("retry after failure = %d body=%s, want 200", out.Code, out.Body.String())
+	sourceID := fixture.replacementTaskID(t, created.ID)
+	if _, err := fixture.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("failure_reason = ?", "replacement_failed").Where("id = ?", sourceID).Exec(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if body := decodeReplacement(t, out); body.LastError != nil {
-		t.Fatalf("last_error = %v, want it cleared by the retry", *body.LastError)
+	out = retry()
+	if out.Code != http.StatusAccepted {
+		t.Fatalf("retry after failure = %d %s", out.Code, out.Body.String())
+	}
+	var started struct {
+		TaskID int64 `json:"task_id"`
+	}
+	decodeJSON(t, out, &started)
+	if started.TaskID == sourceID || started.TaskID == 0 {
+		t.Fatalf("retry did not create new round: %#v", started)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/999999/retry", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/999999/retry", nil)
 	out = httptest.NewRecorder()
 	fixture.mux.ServeHTTP(out, req)
 	if out.Code != http.StatusNotFound {
 		t.Fatalf("retry unknown replacement = %d, want 404", out.Code)
+	}
+}
+
+func TestReplacementResponseShowsBoundRetirementFailureWithoutChangingDomainEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		abandoned        bool
+		cleanupAttention bool
+	}{
+		{name: "source"},
+		{name: "source with persisted attention", cleanupAttention: true},
+		{name: "unused target", abandoned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			abandoned := tc.abandoned
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+			ctx := t.Context()
+			created := decodeReplacement(t, f.start(t, `{"mode":"manual","provider_id":"202"}`))
+			row, err := f.srv.repos.Replacements.GetByID(ctx, created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.srv.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: onChainIDValue("2002")}); err != nil {
+				t.Fatal(err)
+			}
+			dataSetID := row.SourceDataSetID
+			if abandoned {
+				if err := f.srv.repos.Replacements.MarkFailed(ctx, row.ID, nil, "replacement stopped"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Where("id = ?", *row.TaskID).Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if rr := f.start(t, `{"mode":"manual","provider_id":"303"}`); rr.Code != http.StatusCreated {
+					t.Fatalf("superseding replacement = %d %s", rr.Code, rr.Body.String())
+				}
+				dataSetID = row.TargetDataSetID
+			} else {
+				if err := f.srv.repos.Replacements.Activate(ctx, row.ID, row.TaskGeneration, *row.TaskID); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.srv.repos.Replacements.BeginRetirement(ctx, row.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			retirement, _, err := f.srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
+				Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: "failed-retirement",
+				Input: storagereplacement.RetireInput{ReplacementID: row.ID, DataSetID: dataSetID, Generation: 1},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.srv.repos.Contents.BindDataSetRetirementTask(ctx, dataSetID, 1, retirement.ID); err != nil {
+				t.Fatal(err)
+			}
+			evidence := repository.RecordTerminationEpochInput{ReplacementID: row.ID, Epoch: 123, TxHash: "0xtermination"}
+			if abandoned {
+				err = f.srv.repos.Replacements.RecordAbandonedTerminationEpoch(ctx, evidence)
+			} else {
+				err = f.srv.repos.Replacements.RecordTerminationEpoch(ctx, evidence)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.cleanupAttention {
+				if err := f.srv.repos.Replacements.MarkCleanupAttention(ctx, row.ID, "Earlier retirement stopped"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+				Set("failure_reason = ?", "attempts_exhausted").Set("last_error = ?", "Could not check retirement").
+				Set("finished_at = ?", time.Now()).Where("id = ?", retirement.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			before, err := f.srv.repos.Replacements.GetByID(ctx, row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := f.srv.providerReplacementResponse(ctx, f.bucket.Name, before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := string(storagereplacement.StatusCleanupAttention)
+			if abandoned {
+				wantStatus = string(storagereplacement.StatusSuperseded)
+			}
+			if response.Status != wantStatus || !response.RetirementAttention || !response.Retryable || response.RetryTaskID == nil || *response.RetryTaskID != retirement.ID || response.LastError == nil || *response.LastError != "Could not check retirement" {
+				t.Fatalf("retirement response = %#v", response)
+			}
+			after, err := f.srv.repos.Replacements.GetByID(ctx, row.ID)
+			if err != nil || after.Status != before.Status || after.LastError != nil && (before.LastError == nil || *after.LastError != *before.LastError) {
+				t.Fatalf("presentation changed replacement: before=%#v after=%#v err=%v", before, after, err)
+			}
+			if abandoned {
+				if after.AbandonedTerminationEpoch == nil || *after.AbandonedTerminationEpoch != evidence.Epoch {
+					t.Fatalf("lost target termination evidence: %#v", after)
+				}
+			} else if after.TerminationEpoch == nil || *after.TerminationEpoch != evidence.Epoch {
+				t.Fatalf("lost source termination evidence: %#v", after)
+			}
+			retryPath := "/api/v1/tasks/" + strconv.FormatInt(*response.RetryTaskID, 10) + "/retry"
+			retry := httptest.NewRecorder()
+			f.mux.ServeHTTP(retry, httptest.NewRequest(http.MethodPost, retryPath, nil))
+			if retry.Code != http.StatusAccepted {
+				t.Fatalf("retirement Retry = %d %s", retry.Code, retry.Body.String())
+			}
+			var started struct {
+				TaskID int64 `json:"task_id"`
+			}
+			decodeJSON(t, retry, &started)
+			bound, err := f.srv.repos.Contents.GetDataSetBindingByID(ctx, dataSetID)
+			if err != nil || bound.RetirementTaskID == nil || *bound.RetirementTaskID != started.TaskID || started.TaskID == retirement.ID {
+				t.Fatalf("Retry did not transfer retirement ownership: %#v %v", bound, err)
+			}
+			after, err = f.srv.repos.Replacements.GetByID(ctx, row.ID)
+			if err != nil || after.Status != before.Status || before.LastError != nil && (after.LastError == nil || *after.LastError != *before.LastError) {
+				t.Fatalf("Retry changed replacement identity: %#v %v", after, err)
+			}
+			if !abandoned && (after.TerminationEpoch == nil || *after.TerminationEpoch != evidence.Epoch) ||
+				abandoned && (after.AbandonedTerminationEpoch == nil || *after.AbandonedTerminationEpoch != evidence.Epoch) {
+				t.Fatalf("Retry changed termination evidence: %#v", after)
+			}
+			response, err = f.srv.providerReplacementResponse(ctx, f.bucket.Name, after)
+			wantStatus = string(after.Status)
+			if tc.cleanupAttention {
+				wantStatus = string(storagereplacement.StatusRetiring)
+			}
+			if err != nil || response.RetirementAttention || response.Retryable || response.LastError != nil || response.Status != wantStatus {
+				t.Fatalf("Retry retained stale failure presentation: %#v %v", response, err)
+			}
+		})
 	}
 }
 
@@ -633,13 +773,13 @@ func TestAPIRetryStorageReplacementRejectsPermanentTargetConflict(t *testing.T) 
 		t.Fatalf("failure_reason = %q, want %q", got, reason)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/"+strconv.FormatInt(created.ID, 10)+"/retry", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(fixture.replacementTaskID(t, created.ID), 10)+"/retry", nil)
 	retry := httptest.NewRecorder()
 	fixture.mux.ServeHTTP(retry, req)
 	if retry.Code != http.StatusConflict {
 		t.Fatalf("retry status = %d body=%s, want 409", retry.Code, retry.Body.String())
 	}
-	if got := decodeAPIError(t, retry)["code"]; got != storagereplacement.CodeTargetInUse {
+	if got := decodeAPIError(t, retry)["code"]; got != "task_retry_unsupported" {
 		t.Fatalf("retry code = %q, want %q", got, storagereplacement.CodeTargetInUse)
 	}
 }
@@ -694,4 +834,13 @@ func TestAPIListDataSetReplacementProvidersRejections(t *testing.T) {
 			t.Fatalf("status = %d body=%s, want 404", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+func (f *replacementAPIFixture) replacementTaskID(t *testing.T, id int64) int64 {
+	t.Helper()
+	row, err := f.srv.repos.Replacements.GetByID(t.Context(), id)
+	if err != nil || row == nil || row.TaskID == nil {
+		t.Fatalf("replacement owner = %#v %v", row, err)
+	}
+	return *row.TaskID
 }

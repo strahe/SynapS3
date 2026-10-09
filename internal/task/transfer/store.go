@@ -19,26 +19,9 @@ import (
 )
 
 func (h *StoreHandler) storeHandler() *taskengine.FuncHandler {
-	definition := copyDefinition(model.TaskTypeStorageStore, h.retryLimit())
+	definition := h.copyDefinition(model.TaskTypeStorageStore)
 	definition.AllowRetry = true
-	definition.CanManualRetry = func(task *model.Task) bool {
-		if task == nil || task.FailureReason == nil {
-			return false
-		}
-		if taskengine.RecoverableEngineFailure(*task.FailureReason) {
-			return true
-		}
-		switch *task.FailureReason {
-		case "store_not_started":
-			return len(task.Checkpoint) == 0
-		case "store_retry_limit", "store_cache_missing", "store_checkpoint_write_failed", "copy_authorization_failed":
-			return true
-		case "store_outcome_unknown", "store_processing_timeout", "store_check_failed", "store_result_invalid", "store_cache_read_failed", "store_identity_mismatch", "commit_presign_failed", "copy_owner_missing", "copy_context_failed":
-			return len(task.Checkpoint) > 0
-		default:
-			return false
-		}
-	}
+	definition.Policy.ObservationWindow = storeAttentionAfter
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runStore(ctx, execution, true)
 	}, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
@@ -76,7 +59,7 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 		return h.recoverStore(ctx, execution, input, copyRow, target, checkpoint)
 	}
 	if !mayStore {
-		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)
 	}
 	if hasCheckpoint {
 		if err := validateStoreCheckpoint(checkpoint, copyRow.ContentSize); err != nil {
@@ -88,13 +71,10 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 		}
 		state, checkErr := h.storePieceState(ctx, target, checkpoint, pieceCID)
 		if checkErr != nil || state == synapse.ParkedPieceProcessing {
-			return h.waitForStoreStatus(checkpoint, state, checkErr)
+			return h.waitForStoreStatus(ctx, execution, checkpoint, state, checkErr)
 		}
 		if state == synapse.ParkedPieceReady {
 			return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
-		}
-		if execution.RetryWillFail() {
-			return taskengine.Fail(errors.New("storage transfer retry limit reached"), "store_retry_limit", nil)
 		}
 	}
 	if !hasCheckpoint && copyRow.IngressStoreAttempt > 0 {
@@ -102,7 +82,6 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 		if err != nil {
 			return h.retryStoreNotStarted(execution, err)
 		}
-		var previousWorkStartedAt time.Time
 		for _, old := range previous {
 			var oldInput storagepipeline.CopyGenerationInput
 			var candidate storeCheckpoint
@@ -119,20 +98,12 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 				return taskengine.Fail(errors.New("previous Store checkpoints disagree"), "store_checkpoint_conflict", nil)
 			}
 			checkpoint, hasCheckpoint = candidate, true
-			if old.WorkStartedAt != nil && (previousWorkStartedAt.IsZero() || old.WorkStartedAt.Before(previousWorkStartedAt)) {
-				previousWorkStartedAt = *old.WorkStartedAt
-			}
 		}
 		if hasCheckpoint {
-			if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
-				if !previousWorkStartedAt.IsZero() {
-					return repos.Tasks.MarkWorkStarted(ctx, execution.ID(), execution.ClaimGeneration(), previousWorkStartedAt)
-				}
-				return nil
-			}); err != nil {
+			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 				return h.retryStoreNotStarted(execution, err)
 			}
-			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking storage transfer", nil)
+			return taskengine.Wait(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking storage transfer", nil)
 		}
 	}
 	if !hasCheckpoint && !copyRow.CommitSealed() {
@@ -191,13 +162,10 @@ func (h *StoreHandler) storeWithProviderSlot(
 		}
 		state, checkErr := h.storePieceState(ctx, target, previous, pieceCID)
 		if checkErr != nil || state == synapse.ParkedPieceProcessing {
-			return h.waitForStoreStatus(previous, state, checkErr)
+			return h.waitForStoreStatus(ctx, execution, previous, state, checkErr)
 		}
 		if state == synapse.ParkedPieceReady {
 			return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
-		}
-		if execution.RetryWillFail() {
-			return taskengine.Fail(errors.New("storage transfer retry limit reached"), "store_retry_limit", nil)
 		}
 	}
 	calculateReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
@@ -206,7 +174,7 @@ func (h *StoreHandler) storeWithProviderSlot(
 			if result, stop := h.storeMissingCache(ctx, execution, input, copyRow, hasCheckpoint); stop {
 				return result
 			}
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
 		return h.storeCacheFailure(execution, hasCheckpoint, err)
 	}
@@ -253,16 +221,13 @@ func (h *StoreHandler) storeWithProviderSlot(
 			return h.retryStoreNotStarted(execution, fmt.Errorf("unexpected storage provider state %q", state))
 		}
 	}
-	if (hasCheckpoint || copyRow.IngressStoreAttempt > 0) && execution.RetryWillFail() {
-		return taskengine.Fail(errors.New("storage transfer retry limit reached"), "store_retry_limit", nil)
-	}
 	storeReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if result, stop := h.storeMissingCache(ctx, execution, input, copyRow, hasCheckpoint); stop {
 				return result
 			}
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
 		return h.storeCacheFailure(execution, hasCheckpoint, err)
 	}
@@ -275,11 +240,6 @@ func (h *StoreHandler) storeWithProviderSlot(
 	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 		checkpoint.IngressAttempt = copyRow.IngressStoreAttempt + 1
 		checkpointSettlement = func(ctx context.Context, repos *repository.Repositories) error {
-			if hasCheckpoint || copyRow.IngressStoreAttempt > 0 {
-				if err := repos.Tasks.ConsumeStoreRetry(ctx, execution.ID(), execution.ClaimGeneration()); err != nil {
-					return err
-				}
-			}
 			_, err := repos.Contents.BeginIngressStoreProgress(ctx, repository.BeginIngressStoreProgressInput{
 				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(), Attempt: checkpoint.IngressAttempt,
 			})
@@ -288,7 +248,7 @@ func (h *StoreHandler) storeWithProviderSlot(
 	}
 	var stored *storage.StoreResult
 	var progress *uploadProgressReporter
-	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint, checkpointSettlement, func(ctx context.Context) error {
+	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "store:"+checkpoint.IntendedPieceCID, checkpoint, checkpointSettlement, func(ctx context.Context) error {
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 			progress = h.newIngressProgressReporter(ctx, execution.ID(), input.Generation, copyRow.ID, checkpoint.IngressAttempt, content, bucket)
 		}
@@ -303,6 +263,9 @@ func (h *StoreHandler) storeWithProviderSlot(
 	defer progress.Close()
 	if err != nil {
 		if !attempted {
+			if errors.Is(err, taskengine.ErrEffectAlreadyAdmitted) {
+				return taskengine.RetryInMode(err, "store_resend_required", model.TaskResumeModeRecover, 0, nil)
+			}
 			if hasCheckpoint || copyRow.IngressStoreAttempt > 0 {
 				return taskengine.Fail(err, "store_checkpoint_write_failed", nil)
 			}
@@ -313,15 +276,14 @@ func (h *StoreHandler) storeWithProviderSlot(
 				"task_id", execution.ID(), "copy_id", copyRow.ID, "content_id", copyRow.ContentID,
 				"provider_id", copyRow.ProviderID, "storage_data_set_id", copyRow.StorageDataSetID, "error", synapse.ErrorSummary(err))
 		}
-		return taskengine.SuspendWithError(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer",
-			synapse.SummarizedError(err), nil)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, nil)
 	}
 	if stored == nil || !stored.PieceCID.Equals(pieceInfo.CIDv2) || stored.Size != content.ContentSize {
 		err := errors.New("storage provider returned a mismatched piece identity or size")
 		return taskengine.Fail(err, "store_result_invalid", nil)
 	}
 	progress.Flush(content.ContentSize, true)
-	return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(stored.PieceCID), stored.PieceCID, "")
+	return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage transfer", nil)
 }
 
 func (h *StoreHandler) recoverStore(
@@ -331,7 +293,7 @@ func (h *StoreHandler) recoverStore(
 	copyRow *model.StorageCopy,
 	target synapse.DataSetTarget,
 	checkpoint storeCheckpoint,
-) taskengine.Result {
+) (result taskengine.Result) {
 	if err := validateStoreCheckpoint(checkpoint, copyRow.ContentSize); err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
@@ -339,17 +301,16 @@ func (h *StoreHandler) recoverStore(
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
+	startedAt := time.Now().UTC()
+	defer func() { result = result.WithWorkStartedAt(startedAt) }()
 	state, findErr := h.storePieceState(ctx, target, checkpoint, pieceCID)
 	if findErr == nil && state == synapse.ParkedPieceReady {
 		return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
 	}
 	if findErr == nil && state == synapse.ParkedPieceMissing {
-		if execution.RetryWillFail() {
-			return taskengine.Fail(errors.New("storage transfer retry limit reached"), "store_retry_limit", nil)
-		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "provider_confirmation", "Retrying storage transfer", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready to resend", nil)
 	}
-	return h.waitForStoreStatus(checkpoint, state, findErr)
+	return h.waitForStoreStatus(ctx, execution, checkpoint, state, findErr)
 }
 
 func (h *StoreHandler) storePieceState(ctx context.Context, target synapse.DataSetTarget, checkpoint storeCheckpoint, pieceCID cid.Cid) (synapse.ParkedPieceState, error) {
@@ -385,20 +346,22 @@ func (h *StoreHandler) storePieceState(ctx context.Context, target synapse.DataS
 	return synapse.ParkedPieceProcessing, nil
 }
 
-func (h *StoreHandler) waitForStoreStatus(checkpoint storeCheckpoint, state synapse.ParkedPieceState, checkErr error) taskengine.Result {
-	if time.Since(checkpoint.AttemptedAt) < storeAttentionAfter {
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
-	}
+func (h *StoreHandler) waitForStoreStatus(ctx context.Context, execution taskengine.Execution, checkpoint storeCheckpoint, state synapse.ParkedPieceState, checkErr error) taskengine.Result {
 	if checkErr != nil {
-		return taskengine.Fail(checkErr, "store_check_failed", nil)
+		return retryTask(checkErr, "store_check_failed")
 	}
-	return taskengine.Fail(fmt.Errorf("storage provider still reports %s", state), "store_processing_timeout", nil)
+	startedAt, err := execution.ObserveOperation(ctx, fmt.Sprintf("store:%s", checkpoint.IntendedPieceCID))
+	if err != nil {
+		return retryTask(err, "store_observation_failed")
+	}
+	window := execution.Policy().ObservationWindow
+	if window > 0 && time.Since(startedAt) >= window {
+		return taskengine.Fail(fmt.Errorf("storage provider still reports %s", state), "store_processing_timeout", nil)
+	}
+	return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 }
 
-func (h *StoreHandler) retryStoreNotStarted(execution taskengine.Execution, err error) taskengine.Result {
-	if execution.RetryWillFail() {
-		return taskengine.Fail(err, "store_not_started", nil)
-	}
+func (h *StoreHandler) retryStoreNotStarted(_ taskengine.Execution, err error) taskengine.Result {
 	return retryTask(err, "store_not_started")
 }
 

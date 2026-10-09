@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -63,6 +64,10 @@ func IsTerminationBlocked(err error) bool {
 // someone else's service, so it is never terminated; an operator has to put the
 // original wallet or network back.
 var ErrServicePaidByAnother = errors.New("storage service is paid for by another wallet")
+
+// ErrTerminationObservationUnavailable identifies a provider status read that
+// permits the existing payer-checked termination fallback.
+var ErrTerminationObservationUnavailable = errors.New("provider termination status unavailable")
 
 // TerminateService ends the storage service for one data set. It is the
 // destructive boundary of provider replacement and must only be called after
@@ -165,4 +170,52 @@ func normalizeTerminationError(ctx context.Context, err error) error {
 		return &ProviderUnavailableError{Cause: err}
 	}
 	return NormalizeProviderOperationError(ctx, err)
+}
+
+// ObserveTermination reads chain and provider evidence without sending a request.
+func (s *StorageServiceAdapter) ObserveTermination(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, bool, error) {
+	ended, err := s.recordedTermination(ctx, dataSetID)
+	if err != nil || ended != nil {
+		return ended, false, err
+	}
+	if s.service == nil {
+		return nil, false, errors.New("storage service status unavailable")
+	}
+	target, err := s.service.NewDataSetContext(ctx, dataSetID, storage.NewDataSetContextOptions{})
+	if err != nil {
+		return nil, false, err
+	}
+	client := s.providerHTTP
+	if client == nil {
+		client = NewProviderHTTPClient(defaultPDPStatusTimeout, false)
+	}
+	provider, err := pdp.New(target.ServiceURL(), pdp.WithHTTPClient(client), pdp.WithMaxRetries(0))
+	if err != nil {
+		return nil, false, err
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, defaultPDPStatusTimeout)
+	defer cancel()
+	status, err := provider.GetTerminateServiceStatus(pollCtx, dataSetID)
+	if httpErr, ok := errors.AsType[*pdp.HTTPError](err); ok && httpErr.StatusCode == 404 {
+		return nil, false, nil
+	}
+	if err != nil {
+		normalized := NormalizeProviderOperationError(ctx, err)
+		if ctx.Err() == nil && IsProviderUnavailable(normalized) {
+			// Rate limiting is a request to wait, not evidence of an offline
+			// provider. Keep authorization and malformed responses out too.
+			if httpErr, ok := errors.AsType[*pdp.HTTPError](err); !ok ||
+				httpErr.StatusCode == http.StatusRequestTimeout || httpErr.StatusCode >= http.StatusInternalServerError {
+				return nil, false, fmt.Errorf("%w: %w", ErrTerminationObservationUnavailable, normalized)
+			}
+		}
+		return nil, false, normalized
+	}
+	if status == nil {
+		return nil, false, errors.New("termination observation returned no status")
+	}
+	if status.FWSSTerminated {
+		return nil, true, nil
+	} // Await the payer-checked chain record.
+	return nil, true, nil
 }

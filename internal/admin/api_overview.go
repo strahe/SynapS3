@@ -126,14 +126,11 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Tasks
-	taskCounts, err := s.repos.Tasks.CountByStatus(ctx)
+	taskCounts, err := s.repos.Tasks.CountByScope(ctx, repository.TaskScopeWork)
 	if err != nil {
 		s.logger.Warn("overview: failed to count tasks", "error", err)
 	} else {
 		for _, tc := range taskCounts {
-			if model.TaskType(tc.Type).IsRecurringSystem() && tc.Status != string(model.TaskStatusFailed) {
-				continue
-			}
 			resp.Tasks.ByStatus[tc.Status] += tc.Count
 		}
 	}

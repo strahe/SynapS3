@@ -18,8 +18,9 @@ type EnsureDataSet struct{ BindingID int64 }
 func (EnsureDataSet) MessageType() string { return MessageEnsureDataSet }
 
 type StartCopyTransfer struct {
-	CopyID      int64
-	AvailableAt time.Time
+	CopyID         int64
+	AvailableAt    time.Time
+	RecoveryTaskID int64
 }
 
 func (StartCopyTransfer) MessageType() string { return MessageStartCopyTransfer }

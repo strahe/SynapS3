@@ -30,6 +30,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
 	"github.com/uptrace/bun"
@@ -715,8 +716,9 @@ func TestPutObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	if task == nil {
 		t.Fatal("expected upload task")
 	}
-	if task.Type != model.TaskTypeUploadPlan || task.RetryLimit == nil || *task.RetryLimit != 5 {
-		t.Fatalf("task = %#v, want upload_plan with retry limit 5", task)
+	policy, policyErr := worker.DecodePolicy(task)
+	if task.Type != model.TaskTypeUploadPlan || policyErr != nil || policy.MaxAttempts != 6 {
+		t.Fatalf("task = %#v, policy = %#v, err = %v; want upload_plan with six attempts", task, policy, policyErr)
 	}
 }
 
@@ -986,7 +988,7 @@ func TestPutObjectFreezesRequestedCopiesPerContent(t *testing.T) {
 	}
 }
 
-func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
+func TestPutObjectCreatesSuccessorForTerminalUploadPlan(t *testing.T) {
 	for _, terminalStatus := range []model.TaskStatus{model.TaskStatusFailed, model.TaskStatusCancelled} {
 		t.Run(string(terminalStatus), func(t *testing.T) {
 			tb := newTestBackend(t)
@@ -1018,13 +1020,12 @@ func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
 			if terminalStatus == model.TaskStatusCancelled {
 				transition.FailureReason = nil
 				transition.LastError = nil
-				transition.RetentionUntil = new(time.Now().Add(time.Hour))
 			}
 			if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, transition); err != nil {
 				t.Fatalf("settle old upload plan: %v", err)
 			}
 			if terminalStatus == model.TaskStatusFailed {
-				if err := tb.repos.Tasks.AcknowledgeFailed(ctx, claimed.ID, time.Hour); err != nil {
+				if err := tb.repos.Tasks.AcknowledgeFailed(ctx, claimed.ID); err != nil {
 					t.Fatalf("acknowledge old upload plan: %v", err)
 				}
 			}
@@ -1034,13 +1035,13 @@ func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
 			if err != nil || secondVersion == nil || secondVersion.ContentID == nil || *secondVersion.ContentID != *version.ContentID {
 				t.Fatalf("second version = %#v, err=%v", secondVersion, err)
 			}
-			reactivated, err := tb.repos.Tasks.GetByID(ctx, taskRow.ID)
+			reactivated, err := tb.repos.Tasks.GetDirectSuccessor(ctx, taskRow.ID)
 			if err != nil || reactivated == nil {
 				t.Fatalf("reactivated task = %#v, err=%v", reactivated, err)
 			}
 			if reactivated.Status != model.TaskStatusPending || reactivated.ResumeMode != model.TaskResumeModeExecute ||
 				reactivated.RetryCount != 0 || len(reactivated.Checkpoint) != 0 || reactivated.FailureReason != nil ||
-				reactivated.CancellationRequestedAt != nil || reactivated.CancellationReason != nil || reactivated.AcknowledgedAt != nil || reactivated.RetentionUntil != nil {
+				reactivated.CancellationRequestedAt != nil || reactivated.CancellationReason != nil || reactivated.AcknowledgedAt != nil {
 				t.Fatalf("reactivated task retained terminal state: %#v", reactivated)
 			}
 		})
@@ -1065,7 +1066,7 @@ func TestPutObjectRejectsCompletedUploadPlanForCachedContent(t *testing.T) {
 		t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
 	}
 	if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatalf("complete inconsistent upload plan: %v", err)
 	}
@@ -1118,8 +1119,9 @@ func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) 
 	if task.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, input.Generation) {
 		t.Fatalf("evict task key = %q", task.IdempotencyKey)
 	}
-	if task.RetryLimit == nil || *task.RetryLimit != 5 {
-		t.Fatalf("evict task retry limit = %v, want 5", task.RetryLimit)
+	policy, policyErr := worker.DecodePolicy(task)
+	if policyErr != nil || policy.MaxAttempts != 6 {
+		t.Fatalf("evict task policy = %#v, err = %v; want six attempts", policy, policyErr)
 	}
 }
 
@@ -3105,8 +3107,9 @@ func TestCopyObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	}
 	for _, task := range page.Tasks {
 		if task.SubjectType != nil && task.SubjectKey != nil && *task.SubjectType == "storage_content" && *task.SubjectKey == contentSubjectForVersion(t, tb, dstObj.VersionID) {
-			if task.RetryLimit == nil || *task.RetryLimit != 5 {
-				t.Fatalf("copy upload task retry limit = %v, want 5", task.RetryLimit)
+			policy, policyErr := worker.DecodePolicy(&task)
+			if policyErr != nil || policy.MaxAttempts != 6 {
+				t.Fatalf("copy upload task policy = %#v, err = %v; want six attempts", policy, policyErr)
 			}
 			return
 		}

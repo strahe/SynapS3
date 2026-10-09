@@ -472,12 +472,32 @@ func TestBaselineStoresLargeGeneration(t *testing.T) {
 
 func insertBaselineTestTask(t *testing.T, db *bun.DB, key string) int64 {
 	t.Helper()
+
 	var id int64
-	if err := db.QueryRow(`INSERT INTO tasks
-		(type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at)
-		VALUES ('test', ?, 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-		RETURNING id`, key).Scan(&id); err != nil {
-		t.Fatalf("insert baseline test task %q: %v", key, err)
+	query := `INSERT INTO tasks (type,idempotency_key,input_version,input_hash,available_at,created_at,updated_at) VALUES ('test',?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id`
+	args := []any{key}
+	current, err := columnExists(t.Context(), db, "tasks", "retry_group_key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current {
+		query = `INSERT INTO tasks (type,idempotency_key,retry_group_key,input_version,input_hash,available_at,created_at,updated_at) VALUES ('test',?,?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id`
+		args = append(args, "test:"+key)
+	}
+	body, err := columnExists(t.Context(), db, "tasks", "input_json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body {
+		query = `INSERT INTO tasks (type,idempotency_key,input_version,input_hash,available_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json) VALUES ('test',?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":-1}','{}','[]') RETURNING id`
+		args = []any{key}
+	}
+	if err := db.QueryRow(query, args...).Scan(&id); err != nil {
+		t.Fatalf("insert task %q: %v", key, err)
+	}
+
+	if body {
+		return id
 	}
 	if _, err := db.Exec(`INSERT INTO task_payloads (task_id, input_json) VALUES (?, '{}')`, id); err != nil {
 		t.Fatalf("insert baseline test task payload %q: %v", key, err)

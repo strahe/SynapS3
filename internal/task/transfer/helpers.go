@@ -17,23 +17,19 @@ import (
 	"github.com/strahe/synapse-go/storage"
 )
 
-func copyDefinition(taskType model.TaskType, retryLimit *int) taskengine.Definition {
+func (h *CopyCoordinator) copyDefinition(taskType model.TaskType) taskengine.Definition {
 	return taskengine.Definition{
 		Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CopyGenerationInput) error {
 			return storagepipeline.ValidateCopyGenerationInput(*input)
 		}),
-		RetryLimit: retryLimit, AllowRetry: true,
-		// A copy task that the Engine failed itself still holds its copy, and
-		// only a retry can release it. Failures a handler settles keep their
-		// own policy.
-		CanManualRetry: func(task *model.Task) bool {
-			if task == nil || task.FailureReason == nil {
-				return false
-			}
-			return taskengine.RecoverableEngineFailure(*task.FailureReason) ||
-				(task.Type == model.TaskTypeStoragePull && (*task.FailureReason == storagepull.FailureOutcomeUnknown || *task.FailureReason == storagepull.FailureCancelOutcomeUnknown || *task.FailureReason == storagepull.FailureRecoveryBlocked))
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		CanManualRetry: func(source *model.Task) bool {
+			return source != nil && (source.FailureReason == nil || *source.FailureReason != "invalid_checkpoint")
 		},
+		InspectRetry:  h.inspectCopyRetry,
+		PrepareRetry:  h.prepareCopyRetry,
+		LegacyHandoff: transferCopyOwner,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
 			return input.CopyID
 		}),
@@ -54,7 +50,7 @@ func copyTaskKey(taskType model.TaskType, copyID, generation int64) string {
 }
 
 func waitForCommitBacklog() taskengine.Result {
-	return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "commit_backlog",
+	return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "commit_backlog",
 		"Waiting for earlier transfers to this storage service to be registered", nil)
 }
 
@@ -127,17 +123,11 @@ func choosePullSource(sources []repository.ReadableStorageCopy, last *storagepul
 }
 
 func retryPullDependency(execution taskengine.Execution, err error, reason string) taskengine.Result {
-	if !execution.RetryWillFail() {
-		return retryTask(err, reason)
-	}
-	if execution.CancellationRequested() {
-		return taskengine.Fail(err, storagepull.FailureRecoveryBlocked, nil)
-	}
-	return failPullOutcome(execution, err)
+	return retryTask(err, reason)
 }
 
 func retryPullOutcome(execution taskengine.Execution, err error, reason string) taskengine.Result {
-	if execution.CancellationRequested() || execution.RetryWillFail() {
+	if execution.CancellationRequested() {
 		return failPullOutcome(execution, err)
 	}
 	return retryTask(err, reason)

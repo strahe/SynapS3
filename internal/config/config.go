@@ -105,8 +105,6 @@ type TaskWorkerConfig struct {
 	Concurrency                    int           `koanf:"concurrency"`
 	PollInterval                   time.Duration `koanf:"poll_interval"`
 	LeaseDuration                  time.Duration `koanf:"lease_duration"`
-	MaxRetries                     int           `koanf:"max_retries"`
-	Retention                      time.Duration `koanf:"retention"`
 	ProviderMutationConcurrency    int           `koanf:"provider_mutation_concurrency"`
 	DestructiveMutationConcurrency int           `koanf:"destructive_mutation_concurrency"`
 	CommitMaxPieces                int           `koanf:"commit_max_pieces"`
@@ -207,8 +205,6 @@ func defaultConfig() *Config {
 				Concurrency:                    12,
 				PollInterval:                   5 * time.Second,
 				LeaseDuration:                  5 * time.Minute,
-				MaxRetries:                     5,
-				Retention:                      7 * 24 * time.Hour,
 				ProviderMutationConcurrency:    4,
 				DestructiveMutationConcurrency: 2,
 				CommitMaxPieces:                DefaultCommitMaxPieces,
@@ -309,6 +305,19 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 				return nil, PersistedFieldPresence{}, fmt.Errorf("loading config file %s: %w", path, err)
 			}
 			fileLoaded = true
+		}
+	}
+	for _, removed := range []struct{ field, env string }{
+		{"worker.tasks.max_retries", "SYNAPS3_WORKER_TASKS_MAX_RETRIES"},
+		{"worker.tasks.retention", "SYNAPS3_WORKER_TASKS_RETENTION"},
+	} {
+		if k.Exists(removed.field) {
+			return nil, PersistedFieldPresence{}, fmt.Errorf("configuration key %q has been removed", removed.field)
+		}
+		if includeEnv {
+			if _, exists := os.LookupEnv(removed.env); exists {
+				return nil, PersistedFieldPresence{}, fmt.Errorf("environment variable %q has been removed", removed.env)
+			}
 		}
 	}
 	presence := persistedFieldPresence(k, fileLoaded)
@@ -526,12 +535,6 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if tasks.LeaseDuration <= tasks.PollInterval {
 		add("worker.tasks.lease_duration", "must be greater than worker.tasks.poll_interval")
-	}
-	if tasks.MaxRetries < 0 {
-		add("worker.tasks.max_retries", fmt.Sprintf("must be >= 0, got %d", tasks.MaxRetries))
-	}
-	if tasks.Retention <= 0 {
-		add("worker.tasks.retention", fmt.Sprintf("must be > 0, got %s", tasks.Retention))
 	}
 	if tasks.ProviderMutationConcurrency < 1 {
 		add("worker.tasks.provider_mutation_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.ProviderMutationConcurrency))

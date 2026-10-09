@@ -468,8 +468,8 @@ function StorageTopologyPage() {
 
   const pageClassName =
     tab === 'topology'
-      ? 'flex h-[calc(100svh-3.5rem)] min-h-0 min-w-0 flex-col gap-4 overflow-hidden px-6 pt-6 pb-0 md:h-svh'
-      : 'flex min-h-[calc(100vh-3rem)] min-w-0 flex-col gap-4 p-6'
+      ? 'flex h-[calc(100svh-3.5rem)] min-h-0 min-w-0 flex-col gap-6 overflow-hidden px-6 pt-6 pb-0 md:h-svh'
+      : 'flex min-h-[calc(100vh-3rem)] min-w-0 flex-col gap-6 p-6'
 
   return (
     <div className={pageClassName}>

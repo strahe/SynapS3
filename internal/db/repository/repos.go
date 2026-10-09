@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/uptrace/bun"
 )
@@ -19,6 +18,7 @@ type Repositories struct {
 	Replacements        StorageReplacementRepository
 	StorageCleanup      StorageCleanupRepository
 	Tasks               TaskRepository
+	TaskSchedules       TaskScheduleRepository
 	CacheEvictions      CacheEvictionRepository
 	Multiparts          MultipartUploadRepository
 	WalletOperations    WalletOperationRepository
@@ -38,6 +38,7 @@ func NewRepositories(db bun.IDB) *Repositories {
 		Replacements:        &BunStorageReplacementRepo{db: db},
 		StorageCleanup:      &BunStorageCleanupRepo{db: db},
 		Tasks:               &BunTaskRepo{db: db},
+		TaskSchedules:       &BunTaskScheduleRepo{db: db},
 		CacheEvictions:      &BunCacheEvictionRepo{db: db},
 		Multiparts:          &BunMultipartRepo{db: db},
 		WalletOperations:    &BunWalletOperationRepo{db: db},
@@ -65,24 +66,8 @@ func (r *Repositories) WithTx(ctx context.Context, fn func(txRepos *Repositories
 		return fmt.Errorf("WithTx requires *bun.DB, got %T", r.db)
 	}
 
-	for attempt := 0; ; attempt++ {
-		err := bunDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-			txRepos := NewRepositories(tx)
-			return fn(txRepos)
-		})
-		if err == nil {
-			return nil
-		}
-		if !shouldRetryRepositoryTx(err) || attempt >= 19 {
-			return err
-		}
-		delay := min(time.Duration(attempt+1)*25*time.Millisecond, 200*time.Millisecond)
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	return runRepositoryTx(ctx, bunDB, func(ctx context.Context, tx bun.Tx) error {
+		txRepos := NewRepositories(tx)
+		return fn(txRepos)
+	})
 }

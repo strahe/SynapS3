@@ -13,6 +13,7 @@ import type {
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
+import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -257,15 +258,19 @@ function ProviderActions({
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap gap-2">
-        {(testing || canTestProviderUploadSpeed(provider)) && (
-          <Button size="sm" variant="outline" disabled={testing} onClick={() => testUploadSpeed.mutate(providerID)}>
-            {testing ? (
-              <Loader2 data-icon="inline-start" className="animate-spin" />
-            ) : (
-              <Gauge data-icon="inline-start" />
-            )}
-            {testing ? 'Testing upload speed…' : 'Test upload speed'}
-          </Button>
+        {provider?.upload_speed_test?.retryable ? (
+          <RetryButton taskID={provider.upload_speed_test.retry_task_id} />
+        ) : (
+          (testing || canTestProviderUploadSpeed(provider)) && (
+            <Button size="sm" variant="outline" disabled={testing} onClick={() => testUploadSpeed.mutate(providerID)}>
+              {testing ? (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              ) : (
+                <Gauge data-icon="inline-start" />
+              )}
+              {testing ? 'Testing upload speed…' : 'Test upload speed'}
+            </Button>
+          )
         )}
         <Button
           size="sm"
@@ -277,6 +282,9 @@ function ProviderActions({
           Refresh provider
         </Button>
       </div>
+      {provider?.upload_speed_test?.retry_unavailable_reason && (
+        <p className="text-xs text-muted-foreground">{provider.upload_speed_test.retry_unavailable_reason}</p>
+      )}
       {testUploadSpeed.isError && (
         <p className="text-xs text-destructive">{providerUploadSpeedTestErrorMessage(testUploadSpeed.error, name)}</p>
       )}

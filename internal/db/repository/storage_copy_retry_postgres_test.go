@@ -127,7 +127,9 @@ func TestPostgresCopyRetryConcurrentRequests(t *testing.T) {
 	waitForPostgresLockWait(t, db, "storage_contents")
 	hold.Release()
 	err1, err2 := <-done, <-done
-	if !((err1 == nil && errors.Is(err2, repository.ErrConflict)) || (err2 == nil && errors.Is(err1, repository.ErrConflict))) {
+	firstWon := err1 == nil && errors.Is(err2, repository.ErrConflict)
+	secondWon := err2 == nil && errors.Is(err1, repository.ErrConflict)
+	if !firstWon && !secondWon {
 		t.Fatalf("concurrent retry=%v, %v", err1, err2)
 	}
 }
@@ -154,14 +156,11 @@ func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
 	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: "failed again"}); err != nil {
 		t.Fatal(err)
 	}
-	evict, _, err := repos.Tasks.Enqueue(ctx, &model.Task{Type: model.TaskTypeCacheEvict, IdempotencyKey: "retry-race-evict", InputVersion: 1, Input: []byte(`{}`), InputHash: "evict"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	reservation, err := repos.CacheEvictions.PrepareEviction(ctx, copyRow.ContentID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	evict := enqueueCacheEvictionTask(t, repos, copyRow.ContentID, reservation.Generation, "retry-race-evict")
 	if err := repos.CacheEvictions.BindEvictionTask(ctx, copyRow.ContentID, reservation.Generation, evict.ID); err != nil {
 		t.Fatal(err)
 	}

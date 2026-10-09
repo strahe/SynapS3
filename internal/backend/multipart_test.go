@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/s3err"
@@ -358,8 +359,9 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	if task == nil {
 		t.Fatal("expected upload task")
 	}
-	if task.Type != model.TaskTypeUploadPlan || task.RetryLimit == nil || *task.RetryLimit != 5 {
-		t.Fatalf("task = %#v, want upload_plan with retry limit 5", task)
+	policy, policyErr := worker.DecodePolicy(task)
+	if task.Type != model.TaskTypeUploadPlan || policyErr != nil || policy.MaxAttempts != 6 {
+		t.Fatalf("task = %#v, policy = %#v, err = %v; want upload_plan with six attempts", task, policy, policyErr)
 	}
 }
 

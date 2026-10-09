@@ -143,8 +143,11 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 		})
 	}
+	if adapter, ok := opts.Filecoin.Storage.(*synapse.StorageServiceAdapter); ok {
+		adapter.ConfigureProviderHTTPClient(cfg.Filecoin.AllowPrivateNetworks)
+	}
 	registry := taskengine.NewRegistry()
-	taskService, err := taskengine.NewService(registry, repos, cfg.Worker.Tasks.Retention)
+	taskService, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		return nil, fmt.Errorf("initializing task service: %w", err)
 	}
@@ -170,7 +173,6 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		LRULowPercent:             cfg.Cache.LRULowWatermarkPercent,
 		DefaultCopies:             cfg.Filecoin.DefaultCopies,
 		AnchorProviderTier:        providerselect.Tier(cfg.Filecoin.AnchorProviderTier),
-		MaxRetries:                cfg.Worker.Tasks.MaxRetries,
 		CommitMaxPieces:           cfg.Worker.Tasks.CommitMaxPieces,
 		CommitMaxWait:             cfg.Worker.Tasks.CommitMaxWait,
 		CommitMaxBacklog:          cfg.Worker.Tasks.CommitMaxBacklog,
@@ -181,11 +183,24 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	if err != nil {
 		return nil, fmt.Errorf("initializing task handlers: %w", err)
 	}
+	capacityInterval := 5 * time.Second
+	if evictionPolicy == cache.EvictionPolicyNone {
+		capacityInterval = time.Hour
+	}
+	for _, schedule := range []taskengine.ScheduleDefinition{
+		{Key: systemtask.CacheCapacityKey, Type: model.TaskTypeCacheCapacityReconcile, Subject: taskengine.Subject{Type: "system", Key: "cache-capacity"}, Input: systemtask.Input{}, Interval: capacityInterval},
+		{Key: "system:observability-refresh", Type: model.TaskTypeObservabilityRefresh, Subject: taskengine.Subject{Type: "system", Key: "observability"}, Input: systemtask.Input{}, Interval: observabilityService.RefreshInterval()},
+		{Key: "system:approved-provider-refresh", Type: model.TaskTypeApprovedProviderRefresh, Subject: taskengine.Subject{Type: "system", Key: "approved-providers"}, Input: systemtask.Input{}, Interval: observabilityService.RefreshInterval()},
+		{Key: "system:endorsed-provider-refresh", Type: model.TaskTypeEndorsedProviderRefresh, Subject: taskengine.Subject{Type: "system", Key: "endorsed-providers"}, Input: systemtask.Input{}, Interval: observabilityService.RefreshInterval()},
+	} {
+		if err := registry.RegisterSchedule(schedule); err != nil {
+			return nil, fmt.Errorf("registering task schedule: %w", err)
+		}
+	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency:                    cfg.Worker.Tasks.Concurrency,
 		PollInterval:                   cfg.Worker.Tasks.PollInterval,
 		LeaseDuration:                  cfg.Worker.Tasks.LeaseDuration,
-		Retention:                      cfg.Worker.Tasks.Retention,
 		ProviderMutationConcurrency:    cfg.Worker.Tasks.ProviderMutationConcurrency,
 		DestructiveMutationConcurrency: cfg.Worker.Tasks.DestructiveMutationConcurrency,
 		OnTaskSettled: func(taskRow *model.Task, transition repository.TaskTransition) {
@@ -194,32 +209,6 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}, repos, registry, logger)
 	if err != nil {
 		return nil, fmt.Errorf("initializing task engine: %w", err)
-	}
-	for _, recurring := range []taskengine.EnqueueRequest{
-		{
-			Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
-		},
-		{
-			Type: model.TaskTypeObservabilityRefresh, IdempotencyKey: "system:observability-refresh",
-			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "observability",
-		},
-		{
-			Type: model.TaskTypeApprovedProviderRefresh, IdempotencyKey: "system:approved-provider-refresh",
-			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "approved-providers",
-		},
-		{
-			Type: model.TaskTypeEndorsedProviderRefresh, IdempotencyKey: "system:endorsed-provider-refresh",
-			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "endorsed-providers",
-		},
-		{
-			Type: model.TaskTypeGC, IdempotencyKey: "system:task-gc",
-			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "task-gc",
-		},
-	} {
-		if _, _, err := taskService.Enqueue(ctx, recurring); err != nil {
-			return nil, fmt.Errorf("seeding recurring task %s: %w", recurring.Type, err)
-		}
 	}
 	appBackend := backend.New(repos, localCache, opts.Filecoin.Storage, cacheGate, accessTracker, logger,
 		backend.WithTaskService(taskService),

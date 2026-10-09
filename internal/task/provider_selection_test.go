@@ -144,7 +144,7 @@ func TestUploadPlanWaitsForRequiredProvider(t *testing.T) {
 			noRetries := 0
 			providerID, dataSetID := sdktypes.NewBigInt(202), sdktypes.NewBigInt(2202)
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-				providerTier: tier, maxRetries: &noRetries,
+				providerTier: tier, maxAttempts: taskTestMaxAttempts(&noRetries),
 
 				storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 					return &testutil.MockStorageTarget{ProviderIDValue: providerID, DataSetIDValue: &dataSetID, ClientDataSetIDValue: sdktypes.NewBigInt(2)}, nil
@@ -189,7 +189,7 @@ func TestUploadPlanWaitsForRequiredProvider(t *testing.T) {
 				waiting := waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
 					return row.ClaimGeneration == generation && (row.Status == model.TaskStatusFailed || (row.Status == model.TaskStatusPending && row.WaitReason != nil))
 				})
-				if waiting.Status != model.TaskStatusPending || waiting.WaitReason == nil || *waiting.WaitReason != "providers" || waiting.RetryCount != 0 || waiting.LastError == nil || *waiting.LastError != providerselect.ErrNoTrustedProvider.Error() {
+				if waiting.Status != model.TaskStatusPending || waiting.WaitReason == nil || *waiting.WaitReason != "providers" || waiting.RetryCount != 0 || waiting.LastError != nil {
 					t.Fatalf("missing %s provider did not wait: %#v", tier, waiting)
 				}
 				if generation == 1 {
@@ -293,14 +293,14 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			replanned := waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
 				return row.ClaimGeneration == 2 && (row.Status == model.TaskStatusFailed || (row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "providers"))
 			}, 15*time.Second)
-			if replanned.LastError == nil || !strings.Contains(*replanned.LastError, providerselect.ErrNoTrustedProvider.Error()) {
+			if taskType == model.TaskTypeBucketProvision && (replanned.LastError == nil || !strings.Contains(*replanned.LastError, providerselect.ErrNoTrustedProvider.Error())) {
 				t.Fatalf("binding settlement did not reject the changed set: %#v", replanned)
 			}
 			if taskType == model.TaskTypeBucketProvision {
 				if replanned.Status != model.TaskStatusFailed || replanned.FailureReason == nil || *replanned.FailureReason != "required_provider_unavailable" {
 					t.Fatalf("provisioning did not preserve its missing-provider failure: %#v", replanned)
 				}
-			} else if replanned.Status != model.TaskStatusPending || replanned.RetryCount != 0 {
+			} else if replanned.Status != model.TaskStatusPending || replanned.RetryCount != 0 || replanned.LastError != nil {
 				t.Fatalf("upload did not wait after replanning: %#v", replanned)
 			}
 			bindings, err := runtime.repos.Contents.ListDataSetBindings(ctx, bucket.ID)

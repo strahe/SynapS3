@@ -24,7 +24,8 @@ type CacheEvictionRepository interface {
 	NextEvictionGeneration(ctx context.Context, contentID int64) (int64, error)
 	PrepareEviction(ctx context.Context, contentID int64) (CacheEvictionReservation, error)
 	BindEvictionTask(ctx context.Context, contentID, generation, taskID int64) error
-	ListLRUCandidates(ctx context.Context, limit int) ([]cacheeviction.Candidate, error)
+	TransferEvictionTaskOwner(ctx context.Context, contentID, generation, oldTaskID, newTaskID int64) error
+	ListLRUCandidates(ctx context.Context, limit int, after ...CacheLRUCursor) ([]cacheeviction.Candidate, error)
 	ActiveEvictionBytes(ctx context.Context) (int64, error)
 	ReclaimableLRUBytes(ctx context.Context) (int64, error)
 	AuthorizeDeletion(ctx context.Context, contentID, generation, taskID int64, expectedAccess *time.Time) (*cacheeviction.AuthorizedDeletion, error)
@@ -34,6 +35,7 @@ type CacheEvictionRepository interface {
 
 	NextDurabilityGeneration(ctx context.Context, bucketID int64) (int64, error)
 	BindDurabilityTask(ctx context.Context, bucketID, generation, taskID int64) error
+	TransferDurabilityTaskOwner(ctx context.Context, bucketID, generation, oldTaskID, newTaskID int64) error
 	// NextBucketDurabilityCandidate returns the next cached content in the
 	// bucket that now satisfies the bucket's minimum durability. It no longer
 	// promotes any lifecycle state: pipeline position is derived from the copy
@@ -45,6 +47,11 @@ type CacheEvictionRepository interface {
 type CacheEvictionReservation struct {
 	Generation   int64
 	ActiveTaskID *int64
+}
+
+type CacheLRUCursor struct {
+	AccessedAt time.Time
+	ContentID  int64
 }
 
 type BunCacheEvictionRepo struct {
@@ -96,18 +103,14 @@ func (r *BunCacheEvictionRepo) PrepareEviction(ctx context.Context, contentID in
 		return CacheEvictionReservation{Generation: entry.CacheOperationGeneration + 1}, nil
 	}
 
-	taskRow := new(model.Task)
-	err = withTaskPayload(r.db.NewSelect().
-		Model(taskRow).
-		Where("task.id = ?", *entry.CacheActiveTaskID)).
-		Scan(ctx)
-	if errors.Is(err, sql.ErrNoRows) {
-		return CacheEvictionReservation{}, ErrConflict
-	}
+	taskRow, err := (&BunTaskRepo{db: r.db}).GetByID(ctx, *entry.CacheActiveTaskID)
 	if err != nil {
 		return CacheEvictionReservation{}, fmt.Errorf("loading active cache eviction task: %w", err)
 	}
-	if taskRow.Status == model.TaskStatusPending || taskRow.Status == model.TaskStatusRunning {
+	if taskRow == nil {
+		return CacheEvictionReservation{}, ErrConflict
+	}
+	if taskRow.Status == model.TaskStatusPending || taskRow.Status == model.TaskStatusRunning || taskRow.Status == model.TaskStatusFailed {
 		expectedSubjectKey := strconv.FormatInt(contentID, 10)
 		var taskInput cacheeviction.EvictInput
 		inputErr := json.Unmarshal(taskRow.Input, &taskInput)
@@ -147,50 +150,67 @@ func (r *BunCacheEvictionRepo) BindEvictionTask(ctx context.Context, contentID, 
 	if contentID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput
 	}
-	result, err := r.db.NewUpdate().
-		Model((*model.ObjectCache)(nil)).
-		Set("cache_operation_generation = ?", generation).
-		Set("cache_active_task_id = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("content_id = ?", contentID).
-		Where("cache_operation_generation = ?", generation-1).
-		Where("cache_active_task_id IS NULL").
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("binding cache eviction task: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 1 {
-		return nil
-	}
-	var existing struct {
-		Generation int64  `bun:"cache_operation_generation"`
-		TaskID     *int64 `bun:"cache_active_task_id"`
-	}
-	err = r.db.NewSelect().
-		Model((*model.ObjectCache)(nil)).
-		Column("cache_operation_generation", "cache_active_task_id").
-		Where("content_id = ?", contentID).
-		Scan(ctx, &existing)
-	if err != nil {
-		return fmt.Errorf("checking cache eviction binding: %w", err)
-	}
-	if existing.Generation == generation && existing.TaskID != nil && *existing.TaskID == taskID {
-		return nil
-	}
-	return ErrConflict
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "storage_content", strconv.FormatInt(contentID, 10), model.TaskTypeCacheEvict)
+		if err != nil {
+			return err
+		}
+		input, err := cacheeviction.ParseEvictInput(task)
+		if err != nil || input.ContentID != contentID || input.Generation != generation {
+			return ErrConflict
+		}
+
+		result, err := db.NewUpdate().
+			Model((*model.ObjectCache)(nil)).
+			Set("cache_operation_generation = ?", generation).
+			Set("cache_active_task_id = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("content_id = ?", contentID).
+			Where("cache_operation_generation = ?", generation-1).
+			Where("cache_active_task_id IS NULL").
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("binding cache eviction task: %w", err)
+		}
+		rows, _ := result.RowsAffected()
+		if rows == 1 {
+			return nil
+		}
+		var existing struct {
+			Generation int64  `bun:"cache_operation_generation"`
+			TaskID     *int64 `bun:"cache_active_task_id"`
+		}
+		err = db.NewSelect().
+			Model((*model.ObjectCache)(nil)).
+			Column("cache_operation_generation", "cache_active_task_id").
+			Where("content_id = ?", contentID).
+			Scan(ctx, &existing)
+		if err != nil {
+			return fmt.Errorf("checking cache eviction binding: %w", err)
+		}
+		if existing.Generation == generation && existing.TaskID != nil && *existing.TaskID == taskID {
+			return nil
+		}
+		return ErrConflict
+	})
 }
 
-func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int) ([]cacheeviction.Candidate, error) {
+func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int, after ...CacheLRUCursor) ([]cacheeviction.Candidate, error) {
+	if len(after) > 1 || len(after) == 1 && (after[0].AccessedAt.IsZero() || after[0].ContentID <= 0) {
+		return nil, ErrInvalidInput
+	}
 	var candidates []cacheeviction.Candidate
 	query := safeCacheEvictionQuery(r.db).
 		ColumnExpr("object_cache.content_id").
 		ColumnExpr("storage_content.bucket_id").
 		ColumnExpr("storage_content.content_size").
-		ColumnExpr("object_cache.cache_accessed_at").
-		Where("object_cache.cache_active_task_id IS NULL").
-		Where("object_cache.cache_accessed_at IS NOT NULL").
-		OrderExpr("object_cache.cache_accessed_at, object_cache.content_id")
+		ColumnExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at) AS cache_accessed_at").
+		Where("object_cache.cache_active_task_id IS NULL OR object_cache.cache_active_task_id IN (SELECT id FROM (SELECT id,status,type FROM tasks UNION ALL SELECT task_id AS id,status,type FROM task_history) AS task_round WHERE status = ? AND type = ?)", model.TaskStatusFailed, model.TaskTypeCacheEvict).
+		OrderExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at), object_cache.content_id")
+	if len(after) == 1 {
+		cursor := after[0]
+		query = query.Where("(COALESCE(object_cache.cache_accessed_at, object_cache.created_at) > ? OR (COALESCE(object_cache.cache_accessed_at, object_cache.created_at) = ? AND object_cache.content_id > ?))", cursor.AccessedAt, cursor.AccessedAt, cursor.ContentID)
+	}
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -213,9 +233,8 @@ func (r *BunCacheEvictionRepo) ActiveEvictionBytes(ctx context.Context) (int64, 
 		ColumnExpr("storage_content.id AS content_id, storage_content.content_size").
 		ColumnExpr("object_cache.cache_operation_generation AS generation").
 		ColumnExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at) AS accessed_at").
-		ColumnExpr("eviction_task.idempotency_key, eviction_payload.input_json AS input").
+		ColumnExpr("eviction_task.idempotency_key, eviction_task.input_json AS input").
 		Join("JOIN tasks AS eviction_task ON eviction_task.id = object_cache.cache_active_task_id").
-		Join("JOIN task_payloads AS eviction_payload ON eviction_payload.task_id = eviction_task.id").
 		Where("eviction_task.type = ? AND eviction_task.input_version = 1", model.TaskTypeCacheEvict).
 		Where("eviction_task.subject_type = ? AND eviction_task.subject_key = CAST(storage_content.id AS TEXT)", model.TaskSubjectStorageContent).
 		Where("eviction_task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
@@ -244,7 +263,6 @@ func (r *BunCacheEvictionRepo) ReclaimableLRUBytes(ctx context.Context) (int64, 
 	err := safeCacheEvictionQuery(r.db).
 		ColumnExpr("COALESCE(SUM(storage_content.content_size), 0)").
 		Where("object_cache.cache_active_task_id IS NULL").
-		Where("object_cache.cache_accessed_at IS NOT NULL").
 		Scan(ctx, &total)
 	if err != nil {
 		return 0, fmt.Errorf("summing reclaimable cache bytes: %w", err)
@@ -419,22 +437,36 @@ func (r *BunCacheEvictionRepo) NextDurabilityGeneration(ctx context.Context, buc
 }
 
 func (r *BunCacheEvictionRepo) BindDurabilityTask(ctx context.Context, bucketID, generation, taskID int64) error {
-	result, err := r.db.NewUpdate().
-		Model((*model.Bucket)(nil)).
-		Set("durability_generation = ?", generation).
-		Set("durability_task_id = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", bucketID).
-		Where("durability_generation = ?", generation-1).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("binding bucket durability task: %w", err)
+	if bucketID < 1 || generation < 1 || taskID < 1 {
+		return ErrInvalidInput
 	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrConflict
-	}
-	return nil
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "bucket", strconv.FormatInt(bucketID, 10), model.TaskTypeCacheReconcileDurability)
+		if err != nil {
+			return err
+		}
+		input, err := cacheeviction.ParseDurabilityInput(task)
+		if err != nil || input.BucketID != bucketID || input.Generation != generation {
+			return ErrConflict
+		}
+
+		result, err := db.NewUpdate().
+			Model((*model.Bucket)(nil)).
+			Set("durability_generation = ?", generation).
+			Set("durability_task_id = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ?", bucketID).
+			Where("durability_generation = ?", generation-1).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("binding bucket durability task: %w", err)
+		}
+		rows, _ := result.RowsAffected()
+		if rows != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
 }
 
 func (r *BunCacheEvictionRepo) NextBucketDurabilityCandidate(ctx context.Context, bucketID, generation, taskID int64) (*model.StorageContent, error) {

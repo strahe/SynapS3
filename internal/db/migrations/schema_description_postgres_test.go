@@ -17,9 +17,9 @@ func TestValidateCurrentSchemaComparesPostgresJSONColumnType(t *testing.T) {
 		t.Fatalf("ValidateCurrentSchema before the change = %v", err)
 	}
 	for _, change := range []string{
-		`ALTER TABLE task_payloads DROP CONSTRAINT chk_task_payloads_input_json_json`,
-		`ALTER TABLE task_payloads ALTER COLUMN input_json TYPE text USING input_json::text`,
-		`ALTER TABLE task_payloads ADD CONSTRAINT chk_task_payloads_input_json_json CHECK (jsonb_typeof(input_json::jsonb) = 'object')`,
+		`ALTER TABLE tasks DROP CONSTRAINT chk_tasks_input_json_json`,
+		`ALTER TABLE tasks ALTER COLUMN input_json TYPE text USING input_json::text`,
+		`ALTER TABLE tasks ADD CONSTRAINT chk_tasks_input_json_json CHECK (jsonb_typeof(input_json::jsonb) = 'object')`,
 	} {
 		if _, err := db.ExecContext(ctx, change); err != nil {
 			t.Fatalf("%s: %v", change, err)

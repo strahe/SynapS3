@@ -73,25 +73,6 @@ func (h *CopyCoordinator) authorizeCopyTask(
 		if execution.Type() == model.TaskTypeStoragePull {
 			return input, nil, true, retryPullDependency(execution, err, "copy_authorization_failed")
 		}
-		if execution.Type() == model.TaskTypeStorageStore && execution.RetryWillFail() {
-			return input, nil, true, taskengine.Fail(err, "copy_authorization_failed", nil)
-		}
-		if execution.RetryWillFail() {
-			message := err.Error()
-			return input, nil, true, taskengine.Fail(err, "copy_authorization_failed", func(ctx context.Context, repos *repository.Repositories) error {
-				copyRow, authorizeErr := repos.Contents.AuthorizeCopyTask(ctx, input.CopyID, input.Generation, execution.ID(), execution.ClaimGeneration())
-				if errors.Is(authorizeErr, repository.ErrConflict) || errors.Is(authorizeErr, repository.ErrNotFound) {
-					return nil
-				}
-				if authorizeErr != nil {
-					return authorizeErr
-				}
-				if copyRow.CommitDecidedByRequest() {
-					return nil
-				}
-				return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
-			})
-		}
 		return input, nil, true, retryTask(err, "copy_authorization_failed")
 	}
 	return input, copyRow, false, taskengine.Result{}
@@ -138,6 +119,30 @@ func (h *CopyCoordinator) enqueueCopyTaskAt(ctx context.Context, repos *reposito
 	return repos.Contents.BindCopyTask(ctx, copyID, generation, taskRow.ID)
 }
 
+func (h *CopyCoordinator) enqueueRecoveryCopyTaskAt(ctx context.Context, repos *repository.Repositories, copyID, sourceID int64, availableAt time.Time) error {
+	if h.deps.Scheduler == nil {
+		return errors.New("task service is unavailable")
+	}
+	copyRow, err := repos.Contents.GetUploadCopyByID(ctx, copyID)
+	if err != nil {
+		return err
+	}
+	source, err := repos.Tasks.GetByID(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	preparation, err := h.prepareCopyRecovery(ctx, repos, source, copyRow)
+	if err != nil {
+		return err
+	}
+	preparation.Request.AvailableAt = availableAt
+	taskRow, err := h.deps.Scheduler.EnqueueRecoveryInTransaction(ctx, repos, sourceID, preparation.Request)
+	if err != nil {
+		return err
+	}
+	return preparation.Bind(ctx, repos, source, taskRow)
+}
+
 func (h *CopyCoordinator) enqueueSuccessorCopyTask(
 	ctx context.Context,
 	repos *repository.Repositories,
@@ -173,7 +178,7 @@ func (h *CopyCoordinator) copyContextFailure(
 		return taskengine.Fail(err, "copy_owner_missing", nil)
 	}
 	if synapse.IsProviderUnavailable(err) || errors.Is(err, storage.ErrDataSetUnavailable) {
-		return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
 	}
 	if settleSafe {
 		return h.retryCopyTask(execution, input, copyRow, err, "copy_context_failed")
@@ -221,10 +226,7 @@ func (h *CopyCoordinator) retryCopyTask(
 	err error,
 	reason string,
 ) taskengine.Result {
-	if !execution.RetryWillFail() {
-		return retryTask(err, reason)
-	}
-	return h.failCopyTask(execution, input, copyRow, err, reason)
+	return retryTask(err, reason)
 }
 
 func (h *CopyCoordinator) failPullTask(

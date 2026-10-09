@@ -264,7 +264,7 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	overviewSeedTask(t, taskService, repos, model.TaskTypeUploadPlan, "plan-completed", model.TaskStatusCompleted)
 	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "store-failed", model.TaskStatusFailed)
 	dismissed := overviewSeedTask(t, taskService, repos, model.TaskTypeStoragePull, "pull-dismissed", model.TaskStatusFailed)
-	if err := repos.Tasks.AcknowledgeFailed(ctx, dismissed.ID, time.Hour); err != nil {
+	if err := repos.Tasks.AcknowledgeFailed(ctx, dismissed.ID); err != nil {
 		t.Fatalf("acknowledge failed task: %v", err)
 	}
 	overviewSeedTask(t, taskService, repos, model.TaskTypeUploadPlan, "plan-pending", model.TaskStatusPending)
@@ -309,8 +309,8 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	if body.Objects.TotalSizeBytes != 30 {
 		t.Fatalf("total_size_bytes = %d, want 30", body.Objects.TotalSizeBytes)
 	}
-	if body.Tasks.ByStatus[string(model.TaskStatusCompleted)] == 0 {
-		t.Fatal("overview should keep legacy task status counts")
+	if body.Tasks.ByStatus[string(model.TaskStatusCompleted)] != 0 {
+		t.Fatal("overview should only report current work")
 	}
 	if body.Objects.Attention.NeedsAttention != 1 {
 		t.Fatalf("needs_attention = %d, want 1", body.Objects.Attention.NeedsAttention)
@@ -446,10 +446,6 @@ func overviewSeedTask(
 		return taskRow
 	}
 	transition := repository.TaskTransition{Status: status, ResumeMode: model.TaskResumeModeRecover}
-	if status == model.TaskStatusCompleted || status == model.TaskStatusCancelled {
-		retentionUntil := time.Now().Add(7 * 24 * time.Hour)
-		transition.RetentionUntil = &retentionUntil
-	}
 	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, transition); err != nil {
 		t.Fatalf("Settle(%s): %v", key, err)
 	}

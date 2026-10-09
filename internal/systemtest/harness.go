@@ -119,8 +119,6 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 		Concurrency:                    4,
 		PollInterval:                   15 * time.Millisecond,
 		LeaseDuration:                  time.Second,
-		MaxRetries:                     3,
-		Retention:                      time.Hour,
 		ProviderMutationConcurrency:    4,
 		DestructiveMutationConcurrency: 2,
 		CommitMaxPieces:                config.DefaultCommitMaxPieces,

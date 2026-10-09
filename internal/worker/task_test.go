@@ -6,12 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -62,7 +60,7 @@ func testDefinition(retryLimit *int, allowRetry bool) Definition {
 			}
 			return nil
 		}),
-		RetryLimit: retryLimit,
+		Policy:     ExecutionPolicy{MaxAttempts: testAttempts(retryLimit), Backoff: DefaultBackoffPolicy()},
 		AllowRetry: allowRetry,
 	}
 }
@@ -87,15 +85,20 @@ func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *Eng
 	if err := registry.Register(handler); err != nil {
 		t.Fatalf("register handler: %v", err)
 	}
-	service, err := NewService(registry, repos, time.Hour)
+	if handler.Definition().Type.IsRecurringSystem() {
+		if err := registry.RegisterSchedule(ScheduleDefinition{Key: "test-cycle", Type: handler.Definition().Type, Input: testInput{Value: "cycle"}, Interval: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service, err := NewService(registry, repos)
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
 	engineConfig := EngineConfig{
-		Concurrency:                    4,
-		PollInterval:                   10 * time.Millisecond,
-		LeaseDuration:                  5 * time.Second,
-		Retention:                      time.Hour,
+		Concurrency:   4,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 5 * time.Second,
+
 		ProviderMutationConcurrency:    4,
 		DestructiveMutationConcurrency: 2,
 	}
@@ -106,6 +109,7 @@ func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *Eng
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
+	engine.retryDelay = func(int) time.Duration { return 0 }
 	return taskHarness{db: db, repos: repos, registry: registry, service: service, engine: engine}
 }
 
@@ -243,7 +247,7 @@ func TestEngineConstructionFreezesRegistry(t *testing.T) {
 	limit := 5
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
 	err := harness.registry.Register(scriptedHandler{definition: Definition{
-		Type: "late_operation", InputVersion: 1, WorkStart: WorkStartOnEffect,
+		Type: "late_operation", InputVersion: 1, WorkStart: WorkStartOnEffect, Policy: ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy()},
 		Codec: StrictJSONCodec(func(input *testInput) error { return nil }),
 	}})
 	if !errors.Is(err, ErrRegistryFrozen) {
@@ -263,12 +267,12 @@ func TestRegistryFreezesDefinitionAtRegistration(t *testing.T) {
 	limit = 9
 
 	definition, ok := registry.Definition(testTaskType)
-	if !ok || definition.InputVersion != 1 || !definition.AllowRetry || definition.RetryLimit == nil || *definition.RetryLimit != 5 {
+	if !ok || definition.InputVersion != 1 || !definition.AllowRetry || definition.Policy.MaxAttempts != 6 {
 		t.Fatalf("registered definition changed = %#v", definition)
 	}
-	*definition.RetryLimit = 11
+	definition.Policy.MaxAttempts = 11
 	again, ok := registry.Definition(testTaskType)
-	if !ok || again.RetryLimit == nil || *again.RetryLimit != 5 {
+	if !ok || again.Policy.MaxAttempts != 6 {
 		t.Fatalf("returned definition mutated registry = %#v", again)
 	}
 }
@@ -276,17 +280,16 @@ func TestRegistryFreezesDefinitionAtRegistration(t *testing.T) {
 func TestEngineSettlesAllFiveStates(t *testing.T) {
 	limit := 0
 	tests := []struct {
-		name          string
-		result        Result
-		wantStatus    model.TaskStatus
-		wantMode      model.TaskResumeMode
-		wantRetry     int
-		wantRetention bool
+		name       string
+		result     Result
+		wantStatus model.TaskStatus
+		wantMode   model.TaskResumeMode
+		wantRetry  int
 	}{
-		{name: "completed", result: Complete("done", nil), wantStatus: model.TaskStatusCompleted, wantMode: model.TaskResumeModeRecover, wantRetention: true},
-		{name: "pending", result: Suspend(model.TaskResumeModeExecute, time.Hour, "scheduled", "later", nil), wantStatus: model.TaskStatusPending, wantMode: model.TaskResumeModeExecute},
+		{name: "completed", result: Complete("done", nil), wantStatus: model.TaskStatusCompleted, wantMode: model.TaskResumeModeRecover},
+		{name: "pending", result: Wait(model.TaskResumeModeExecute, time.Hour, "scheduled", "later", nil), wantStatus: model.TaskStatusPending, wantMode: model.TaskResumeModeExecute},
 		{name: "failed", result: Fail(errors.New("permanent"), "permanent_failure", nil), wantStatus: model.TaskStatusFailed, wantMode: model.TaskResumeModeRecover},
-		{name: "cancelled", result: Cancel("superseded", nil), wantStatus: model.TaskStatusCancelled, wantMode: model.TaskResumeModeRecover, wantRetention: true},
+		{name: "cancelled", result: Cancel("superseded", nil), wantStatus: model.TaskStatusCancelled, wantMode: model.TaskResumeModeRecover},
 		{name: "retry limit reached", result: Retry(errors.New("temporary"), "temporary_failure", 0, nil), wantStatus: model.TaskStatusFailed, wantMode: model.TaskResumeModeRecover},
 	}
 	for _, tt := range tests {
@@ -306,9 +309,6 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 			if stored.Status != tt.wantStatus || stored.ResumeMode != tt.wantMode || stored.RetryCount != tt.wantRetry {
 				t.Fatalf("settled task = status:%s mode:%s retries:%d", stored.Status, stored.ResumeMode, stored.RetryCount)
 			}
-			if (stored.RetentionUntil != nil) != tt.wantRetention {
-				t.Fatalf("retention = %v, want present %v", stored.RetentionUntil, tt.wantRetention)
-			}
 			if stored.Status != model.TaskStatusPending && stored.FinishedAt == nil {
 				t.Fatal("terminal task has no finished time")
 			}
@@ -322,38 +322,11 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 	}
 }
 
-func TestEngineSuspendKeepsWaitErrorUntilALaterResult(t *testing.T) {
-	limit := 1
-	var runs atomic.Int64
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&limit, true),
-		execute: func(context.Context, Execution) Result {
-			if runs.Add(1) == 1 {
-				return SuspendWithError(model.TaskResumeModeExecute, 0, "provider_confirmation", "Checking request",
-					errors.New(strings.Repeat("é", maxTaskErrorBytes)), nil)
-			}
-			return Suspend(model.TaskResumeModeExecute, 0, "provider_confirmation", "Checking request", nil)
-		},
-	}, nil)
-	row := enqueueTestTask(t, harness, "wait-error", "wait-error")
-
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil {
-		t.Fatalf("get waiting task: %v", err)
-	}
-	if stored.Status != model.TaskStatusPending || stored.LastError == nil ||
-		len(*stored.LastError) > maxTaskErrorBytes+len("…") || !utf8.ValidString(*stored.LastError) {
-		t.Fatalf("waiting task = status:%s last_error:%v, want pending with a bounded error", stored.Status, stored.LastError)
-	}
-
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	stored, err = harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil {
-		t.Fatalf("get waiting task: %v", err)
-	}
-	if stored.LastError != nil {
-		t.Fatalf("last_error = %q, want cleared by a wait without an error", *stored.LastError)
+func TestEngineRejectsWaitWithError(t *testing.T) {
+	result := Wait(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking request", nil)
+	result.err = errors.New("query failed")
+	if !errors.Is(validateResult(result, nil), ErrInvalidResult) {
+		t.Fatal("Wait accepted an error")
 	}
 }
 
@@ -361,7 +334,7 @@ func TestEngineNotifiesAfterSettlementCommits(t *testing.T) {
 	limit := 1
 	var notified atomic.Int64
 	config := EngineConfig{
-		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second, Retention: time.Hour,
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 		OnTaskSettled: func(taskRow *model.Task, transition repository.TaskTransition) {
 			if taskRow.IdempotencyKey != "notify" || transition.Status != model.TaskStatusCompleted {
@@ -389,7 +362,9 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 		return 37 * time.Second
 	}
 	now := time.Now()
-	transition := harness.engine.transitionFor(&model.Task{RetryCount: 3, RetryLimit: &limit}, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
+	row := enqueueTestTask(t, harness, "backoff", "backoff")
+	row.RetryCount = 3
+	transition := harness.engine.transitionFor(row, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
 	if transition.Status != model.TaskStatusPending || !transition.IncrementRetry {
 		t.Fatalf("transition = %#v, want pending retry", transition)
 	}
@@ -431,7 +406,7 @@ func TestResourceWaitBacksOffWithoutConsumingRetries(t *testing.T) {
 		execute: func(context.Context, Execution) Result {
 			switch executions.Add(1) {
 			case 3:
-				return Suspend(model.TaskResumeModeExecute, 0, "dependency", "Waiting for something else", nil)
+				return Wait(model.TaskResumeModeExecute, 0, "dependency", "Waiting for something else", nil)
 			case 5:
 				return Complete("admitted", nil)
 			default:
@@ -464,40 +439,33 @@ func TestResourceWaitBacksOffWithoutConsumingRetries(t *testing.T) {
 	}
 }
 
-func TestServiceRetryForcesRecoverAndAcknowledgeStartsRetention(t *testing.T) {
+func TestServiceRetryCreatesIndependentRoundAndAcknowledgeKeepsFailed(t *testing.T) {
 	limit := 5
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&limit, true),
-		execute: func(context.Context, Execution) Result {
-			return Fail(errors.New("failed"), "test_failure", nil)
-		},
-	}, nil)
-	row := enqueueTestTask(t, harness, "retry", "retry")
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-
-	if err := harness.service.Retry(t.Context(), row.ID); err != nil {
-		t.Fatalf("retry failed task: %v", err)
+	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result { return Fail(errors.New("failed"), "test_failure", nil) }}, nil)
+	row := enqueueTestTask(t, h, "retry", "retry")
+	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
+	original, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
+	next, err := h.service.Retry(t.Context(), row.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover || stored.RetryCount != 0 {
-		t.Fatalf("retried task = %#v, err=%v", stored, err)
+	if next.ID <= row.ID || next.RetryOfTaskID == nil || *next.RetryOfTaskID != row.ID || next.RetryCount != 0 || next.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("successor: %#v", next)
 	}
-
-	claimed := claimTestTask(t, harness)
-	if claimed.ResumeMode != model.TaskResumeModeRecover {
-		t.Fatalf("manual retry claim mode = %s", claimed.ResumeMode)
+	again, err := h.service.Retry(t.Context(), row.ID)
+	if err != nil || again.ID != next.ID {
+		t.Fatalf("replay: %#v %v", again, err)
 	}
-	if err := harness.repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-	}); err != nil {
-		t.Fatalf("fail retried task: %v", err)
+	stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
+	if stored.Status != model.TaskStatusFailed || stored.SupersededAt == nil || stored.RetryCount != original.RetryCount || dereference(stored.LastError) != dereference(original.LastError) || !stored.FinishedAt.Equal(*original.FinishedAt) {
+		t.Fatalf("source changed: %#v", stored)
 	}
-	if err := harness.service.Acknowledge(t.Context(), row.ID); err != nil {
-		t.Fatalf("acknowledge failed task: %v", err)
+	if err := h.service.Acknowledge(t.Context(), row.ID); err != nil {
+		t.Fatal(err)
 	}
-	stored, err = harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.AcknowledgedAt == nil || stored.RetentionUntil == nil {
-		t.Fatalf("acknowledged task = %#v, err=%v", stored, err)
+	stored, _ = h.repos.Tasks.GetByID(t.Context(), row.ID)
+	if stored.Status != model.TaskStatusFailed || stored.AcknowledgedAt == nil {
+		t.Fatalf("ack: %#v", stored)
 	}
 }
 
@@ -523,7 +491,7 @@ func TestServiceManualRetryPredicateUsesFailureEvidence(t *testing.T) {
 	if harness.service.Retryable(stored) {
 		t.Fatal("unsafe failed task is retryable")
 	}
-	if err := harness.service.Retry(t.Context(), row.ID); !errors.Is(err, ErrRetryUnsupported) {
+	if _, err := harness.service.Retry(t.Context(), row.ID); !errors.Is(err, ErrRetryUnsupported) {
 		t.Fatalf("Retry = %v, want ErrRetryUnsupported", err)
 	}
 }
@@ -618,7 +586,7 @@ func TestExpiredClaimIsRecoveredAndStaleGenerationIsFenced(t *testing.T) {
 		t.Fatalf("stale work start error = %v", err)
 	}
 	if err := harness.repos.Tasks.Settle(t.Context(), stale.ID, stale.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); !errors.Is(err, repository.ErrTaskLeaseLost) {
 		t.Fatalf("stale settlement error = %v", err)
 	}
@@ -664,7 +632,7 @@ func TestEngineAcceptsDatabaseJSONNormalizationAndUsesCanonicalInput(t *testing.
 		},
 	}, nil)
 	row := enqueueTestTask(t, harness, "normalized", "normalized")
-	if _, err := harness.db.NewRaw(`UPDATE task_payloads SET input_json = ? WHERE task_id = ?`, `{ "value" : "normalized" }`, row.ID).Exec(t.Context()); err != nil {
+	if _, err := harness.db.NewRaw(`UPDATE tasks SET input_json = ? WHERE id = ?`, `{ "value" : "normalized" }`, row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("normalize stored task JSON: %v", err)
 	}
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
@@ -886,8 +854,11 @@ func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
 			effectCalls := 0
 			execution := Execution{
 				task: model.Task{ResumeMode: tt.mode}, checkpoint: tt.checkpoint, resource: tt.resource,
+				admit: func(ctx context.Context, _ string, value any, settlement Settlement) error {
+					return tt.checkpoint(ctx, value, settlement, true)
+				},
 			}
-			attempted, err := execution.WithCheckpointedEffect(t.Context(), ResourceProviderMutation, map[string]bool{"attempted": true}, func(context.Context, *repository.Repositories) error {
+			attempted, err := execution.WithCheckpointedEffect(t.Context(), ResourceProviderMutation, "test-effect", map[string]bool{"attempted": true}, func(context.Context, *repository.Repositories) error {
 				return nil
 			}, func(context.Context) error {
 				effectCalls++
@@ -906,7 +877,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(ctx context.Context, execution Execution) Result {
-			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]bool{"attempted": true}, func(ctx context.Context, repos *repository.Repositories) error {
+			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", map[string]bool{"attempted": true}, func(ctx context.Context, repos *repository.Repositories) error {
 				if err := repos.Tasks.RequestCancellation(ctx, execution.ID(), "must roll back"); err != nil {
 					return err
 				}
@@ -947,7 +918,7 @@ func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun
 	harness := newTaskHarnessWithDB(t, db, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(ctx context.Context, execution Execution) Result {
-			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
+			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
 				stored, err := repos.Tasks.GetByID(ctx, execution.ID())
 				if err != nil {
 					return err
@@ -1072,7 +1043,7 @@ func (r *delayedShortenRepository) ShortenLease(ctx context.Context, id, generat
 func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
-		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second, Retention: time.Hour,
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{
@@ -1100,7 +1071,7 @@ func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 func TestEngineSuccessfulRenewalKeepsHealthCurrent(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
-		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second, Retention: time.Hour,
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, &config)
@@ -1138,7 +1109,7 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	limit := 5
 	var recovers atomic.Int64
 	config := EngineConfig{
-		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second, Retention: time.Hour,
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{
@@ -1157,8 +1128,7 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	}
 	harness.repos.Tasks = ordered
 	if _, err := harness.db.ExecContext(t.Context(), `CREATE TRIGGER fail_task_settlement
-		BEFORE UPDATE OF status ON tasks
-		WHEN OLD.status = 'running' AND NEW.status <> 'running'
+		BEFORE INSERT ON task_history
 		BEGIN SELECT RAISE(FAIL, 'injected settlement failure'); END`); err != nil {
 		t.Fatalf("create settlement fault: %v", err)
 	}
@@ -1219,7 +1189,7 @@ func TestEngineSettlementPanicRollsBackAndShortensLease(t *testing.T) {
 func TestEngineRecoveryQueueDoesNotDropLeaseShorteningWork(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
-		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: time.Minute, Retention: time.Hour,
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: time.Minute,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, &config)
@@ -1272,7 +1242,7 @@ func TestEngineRenewsLeaseWhileSettlementIsRetried(t *testing.T) {
 	limit := 5
 	var settlements atomic.Int64
 	config := EngineConfig{
-		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second, Retention: time.Hour,
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{
@@ -1446,7 +1416,7 @@ func TestResourceWaitFreesWorkersForOtherTasks(t *testing.T) {
 			if input.Value == "plain" {
 				return Complete("plain work finished", nil)
 			}
-			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, input, nil, func(ctx context.Context) error {
+			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", input, nil, func(ctx context.Context) error {
 				holding <- input.Value
 				select {
 				case <-release:
@@ -1464,7 +1434,7 @@ func TestResourceWaitFreesWorkersForOtherTasks(t *testing.T) {
 			return Complete("gated work finished", nil)
 		},
 	}, &EngineConfig{
-		Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second, Retention: time.Hour,
+		Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
 		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	})
 	harness.engine.resourceWaitDelay = func(int) time.Duration { return 50 * time.Millisecond }
@@ -1526,4 +1496,11 @@ func TestResourceWaitFreesWorkersForOtherTasks(t *testing.T) {
 			t.Fatalf("gated task consumed retries while waiting: %#v", stored)
 		}
 	}
+}
+
+func testAttempts(limit *int) int {
+	if limit == nil {
+		return 6
+	}
+	return *limit + 1
 }

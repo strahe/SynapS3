@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -59,38 +60,65 @@ func (h *CapacityHandler) lruLowBytes() int64 {
 }
 
 const (
-	dependencyWait       = time.Minute
-	externalPollInterval = 5 * time.Second
-	taskGCInterval       = time.Hour
+	dependencyWait        = time.Minute
+	externalPollInterval  = 5 * time.Second
+	disabledCycleInterval = time.Hour
 )
 
 type cacheCapacityCheckpoint struct {
-	CycleActive       bool  `json:"cycle_active"`
-	RefusedWriteBytes int64 `json:"refused_write_bytes,omitempty"`
+	CycleActive         bool  `json:"cycle_active"`
+	RefusedWriteBytes   int64 `json:"refused_write_bytes,omitempty"`
+	PreviousCycleFailed bool  `json:"previous_cycle_failed,omitempty"`
 }
 
 func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeCacheCapacityReconcile, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
-		RetryLimit: nil, AllowRetry: true,
+		Codec:  taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		NextCycleCheckpoint: func(ctx context.Context, repos *repository.Repositories, previous *model.Task) (json.RawMessage, error) {
+			var cp cacheCapacityCheckpoint
+			if previous == nil {
+				return nil, nil
+			}
+			if len(previous.Checkpoint) > 0 && json.Unmarshal(previous.Checkpoint, &cp) != nil {
+				return append(json.RawMessage(nil), previous.Checkpoint...), nil
+			}
+			cp.PreviousCycleFailed = cp.PreviousCycleFailed || previous.Status == model.TaskStatusFailed
+			if !cp.PreviousCycleFailed && previous.SubjectType != nil && previous.SubjectKey != nil {
+				failed, err := repos.Tasks.ListCurrentFailedForSubject(ctx, *previous.SubjectType, *previous.SubjectKey, previous.ID, 1, previous.Type)
+				if err != nil {
+					return nil, err
+				}
+				cp.PreviousCycleFailed = len(failed.Tasks) > 0
+			}
+			if !cp.CycleActive && cp.RefusedWriteBytes == 0 && !cp.PreviousCycleFailed {
+				return nil, nil
+			}
+			raw, _ := json.Marshal(cp)
+			return raw, nil
+		},
 	}
 	var pendingWriteRefusal atomic.Int64
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		previousPressure := h.deps.State.pressure.Swap(nil)
-		if h.deps.EvictionPolicy == cache.EvictionPolicyNone ||
-			(h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload && !h.deps.CommitSealOnCachePressure) {
-			return taskengine.Suspend(model.TaskResumeModeExecute, taskGCInterval, "scheduled", "Automatic cache cleanup is disabled", nil)
-		}
-		if h.deps.Cache == nil || h.deps.CacheTracker == nil || h.deps.Scheduler == nil || h.deps.MaxCacheBytes <= 0 {
-			return taskengine.Fail(errors.New("cache capacity dependencies are unavailable"), "dependency_unavailable", nil)
-		}
 		checkpoint, _, err := taskengine.DecodeCheckpoint[cacheCapacityCheckpoint](execution)
 		if err != nil {
 			return taskengine.Fail(err, "invalid_checkpoint", nil)
 		}
+		if h.deps.EvictionPolicy == cache.EvictionPolicyNone ||
+			(h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload && !h.deps.CommitSealOnCachePressure) {
+			if checkpoint.PreviousCycleFailed {
+				checkpoint.PreviousCycleFailed = false
+				return completeCapacityCycle(execution, checkpoint, disabledCycleInterval, "Automatic cache cleanup is disabled")
+			}
+			return taskengine.Wait(model.TaskResumeModeExecute, disabledCycleInterval, "scheduled", "Automatic cache cleanup is disabled", nil)
+		}
+		if h.deps.Cache == nil || h.deps.CacheTracker == nil || h.deps.Scheduler == nil || h.deps.MaxCacheBytes <= 0 {
+			return taskengine.Fail(errors.New("cache capacity dependencies are unavailable"), "dependency_unavailable", nil)
+		}
 		if h.deps.EvictionPolicy == cache.EvictionPolicyLRU && !h.deps.CacheTracker.SafeForLRU() {
-			return taskengine.Suspend(model.TaskResumeModeRecover, dependencyWait, "cache_access", "Waiting for reliable cache access records", nil)
+			return taskengine.Wait(model.TaskResumeModeRecover, dependencyWait, "cache_access", "Waiting for reliable cache access records", nil)
 		}
 		usedBytes := h.deps.Cache.CapacitySnapshot().OccupiedBytes()
 		highBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRUHighPercent)
@@ -114,18 +142,24 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 				next.CycleActive = true
 			}
 		}
+		cycleActive := next.CycleActive
+		cycleCompleted := checkpoint.CycleActive && !next.CycleActive
+		if h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload {
+			cycleActive = next.RefusedWriteBytes > 0
+			cycleCompleted = checkpoint.RefusedWriteBytes > 0 && next.RefusedWriteBytes == 0
+		}
+		if !cycleActive && (cycleCompleted || checkpoint.PreviousCycleFailed) {
+			next.PreviousCycleFailed = false
+			return completeCapacityCycle(execution, next, externalPollInterval, "Local cache usage is within its target")
+		}
 		if next != checkpoint {
 			if err := execution.WriteCheckpoint(ctx, next); err != nil {
 				pendingWriteRefusal.Store(max(writeRefused, next.RefusedWriteBytes))
 				return retryTask(err, "cache_capacity_checkpoint_failed")
 			}
 		}
-		cycleActive := next.CycleActive
-		if h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload {
-			cycleActive = next.RefusedWriteBytes > 0
-		}
 		if !cycleActive {
-			return taskengine.Suspend(model.TaskResumeModeExecute, externalPollInterval, "scheduled", "Local cache usage is within its target", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, externalPollInterval, "scheduled", "Local cache usage is within its target", nil)
 		}
 		activeBytes, err := h.deps.Repositories.CacheEvictions.ActiveEvictionBytes(ctx)
 		if err != nil {
@@ -134,11 +168,22 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 		bytesToPlan := usedBytes - lowBytes - activeBytes
 		var plannedBytes int64
 		var plannedTasks int
+		var failedTasks []int64
 		if bytesToPlan > 0 && h.deps.EvictionPolicy == cache.EvictionPolicyLRU {
-			plannedBytes, plannedTasks, err = h.planLRUEvictions(ctx, bytesToPlan)
+			plannedBytes, plannedTasks, failedTasks, err = h.planLRUEvictions(ctx, bytesToPlan)
 			if err != nil {
 				return retryTask(err, "cache_capacity_plan_failed")
 			}
+		}
+		if len(failedTasks) > 0 {
+			return taskengine.RetryBackoff(errors.New("cache cleanup work failed"), "cache_cleanup_retry", nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+				for _, id := range failedTasks {
+					if _, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, id, availableAt); err != nil {
+						return err
+					}
+				}
+				return nil
+			}, nil)
 		}
 		if h.deps.CommitSealOnCachePressure {
 			if err := h.updateCachePressure(ctx, lowBytes, previousPressure); err != nil {
@@ -152,28 +197,66 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 		if plannedTasks > 0 {
 			message = fmt.Sprintf("Scheduled cleanup for %d cached items (%d bytes)", plannedTasks, plannedBytes)
 		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, externalPollInterval, "cache_cleanup", message, nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, externalPollInterval, "cache_cleanup", message, nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }
 
-func (h *CapacityHandler) planLRUEvictions(ctx context.Context, bytesToPlan int64) (int64, int, error) {
+func completeCapacityCycle(execution taskengine.Execution, checkpoint cacheCapacityCheckpoint, delay time.Duration, message string) taskengine.Result {
+	return taskengine.CompleteCycle(delay, message, func(ctx context.Context, repos *repository.Repositories) error {
+		raw, err := json.Marshal(checkpoint)
+		if err != nil {
+			return err
+		}
+		return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), raw)
+	})
+}
+
+func (h *CapacityHandler) planLRUEvictions(ctx context.Context, bytesToPlan int64) (int64, int, []int64, error) {
 	const candidateBatchSize = 100
 	var plannedBytes int64
 	var plannedTasks int
+	var failedTasks []int64
+	var cursor []repository.CacheLRUCursor
+	seenContents := make(map[int64]struct{})
+	seenFailures := make(map[int64]struct{})
 	for bytesToPlan > 0 {
-		candidates, err := h.deps.Repositories.CacheEvictions.ListLRUCandidates(ctx, candidateBatchSize)
+		candidates, err := h.deps.Repositories.CacheEvictions.ListLRUCandidates(ctx, candidateBatchSize, cursor...)
 		if err != nil {
-			return plannedBytes, plannedTasks, err
+			return plannedBytes, plannedTasks, failedTasks, err
 		}
 		if len(candidates) == 0 {
 			break
 		}
-		createdThisBatch := 0
 		for i := range candidates {
 			candidate := candidates[i]
+			if _, seen := seenContents[candidate.ContentID]; seen {
+				continue
+			}
+			seenContents[candidate.ContentID] = struct{}{}
+			entry, err := h.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, candidate.ContentID)
+			if err != nil {
+				return plannedBytes, plannedTasks, failedTasks, err
+			}
+			if entry != nil && entry.CacheActiveTaskID != nil {
+				source, err := h.deps.Repositories.Tasks.GetByID(ctx, *entry.CacheActiveTaskID)
+				if err != nil {
+					return plannedBytes, plannedTasks, failedTasks, err
+				}
+				if source != nil && source.Status == model.TaskStatusFailed {
+					if _, seen := seenFailures[source.ID]; !seen {
+						seenFailures[source.ID] = struct{}{}
+						failedTasks = append(failedTasks, source.ID)
+						bytesToPlan -= candidate.Size
+					}
+					if bytesToPlan <= 0 {
+						break
+					}
+				}
+				continue
+			}
 			scheduled := false
-			err := h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
+			err = h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
 				accessedAt := cacheeviction.NormalizeAccessTime(candidate.AccessedAt)
 				var err error
 				scheduled, err = enqueueEviction(ctx, repos, h.deps.Scheduler, candidate.ContentID, &accessedAt)
@@ -183,7 +266,7 @@ func (h *CapacityHandler) planLRUEvictions(ctx context.Context, bytesToPlan int6
 				continue
 			}
 			if err != nil {
-				return plannedBytes, plannedTasks, fmt.Errorf("planning cache cleanup for content %d: %w", candidate.ContentID, err)
+				return plannedBytes, plannedTasks, failedTasks, fmt.Errorf("planning cache cleanup for content %d: %w", candidate.ContentID, err)
 			}
 			if !scheduled {
 				continue
@@ -191,16 +274,17 @@ func (h *CapacityHandler) planLRUEvictions(ctx context.Context, bytesToPlan int6
 			plannedBytes += candidate.Size
 			bytesToPlan -= candidate.Size
 			plannedTasks++
-			createdThisBatch++
 			if bytesToPlan <= 0 {
 				break
 			}
 		}
-		if len(candidates) < candidateBatchSize || createdThisBatch == 0 {
+		last := candidates[len(candidates)-1]
+		cursor = []repository.CacheLRUCursor{{AccessedAt: last.AccessedAt, ContentID: last.ContentID}}
+		if len(candidates) < candidateBatchSize {
 			break
 		}
 	}
-	return plannedBytes, plannedTasks, nil
+	return plannedBytes, plannedTasks, failedTasks, nil
 }
 
 func (h *CapacityHandler) updateCachePressure(ctx context.Context, targetBytes int64, previous *pressureSnapshot) error {

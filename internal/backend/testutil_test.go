@@ -156,7 +156,6 @@ func (backendTestTaskHandler) Recover(context.Context, taskengine.Execution) tas
 func newBackendTaskRuntime(t *testing.T, repos *repository.Repositories) (*taskengine.Service, *taskengine.Messenger) {
 	t.Helper()
 	registry := taskengine.NewRegistry()
-	retryLimit := 5
 	for _, taskType := range []model.TaskType{
 		model.TaskTypeBucketProvision,
 		model.TaskTypeUploadPlan,
@@ -164,18 +163,18 @@ func newBackendTaskRuntime(t *testing.T, repos *repository.Repositories) (*taske
 	} {
 		err := registry.Register(backendTestTaskHandler{definition: taskengine.Definition{
 			Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
-			Codec:      taskengine.StrictJSONCodec[map[string]any](nil),
-			RetryLimit: &retryLimit, AllowRetry: true,
+			Codec:  taskengine.StrictJSONCodec[map[string]any](nil),
+			Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		}})
 		if err != nil {
 			t.Fatalf("registering test task type %s: %v", taskType, err)
 		}
 	}
-	service, err := taskengine.NewService(registry, repos, 7*24*time.Hour)
+	service, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		t.Fatalf("creating task service: %v", err)
 	}
-	evict, err := cachetask.NewEvictHandler(cachetask.EvictDependencies{Repositories: repos, State: cachetask.NewState(), MaxRetries: retryLimit})
+	evict, err := cachetask.NewEvictHandler(cachetask.EvictDependencies{Repositories: repos, State: cachetask.NewState()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +198,7 @@ func newBackendTaskRuntime(t *testing.T, repos *repository.Repositories) (*taske
 	}
 	if _, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Minute,
-		Retention: time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}, repos, registry, nil); err != nil {
 		t.Fatal(err)
 	}

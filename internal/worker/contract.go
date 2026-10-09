@@ -16,15 +16,16 @@ import (
 )
 
 var (
-	ErrUnknownType      = errors.New("unknown task type")
-	ErrInputConflict    = errors.New("task input conflict")
-	ErrRetryUnsupported = errors.New("task retry is not supported")
-	ErrInvalidResult    = errors.New("invalid task result")
-	ErrRegistryFrozen   = errors.New("task registry is frozen")
-	ErrEffectForbidden  = errors.New("external effects are forbidden during recovery")
-	ErrResourceBusy     = errors.New("task resource is busy")
-	ErrCodecPanic       = errors.New("task input codec panicked")
-	ErrInvalidCanonical = errors.New("task input codec returned invalid canonical JSON")
+	ErrEffectAlreadyAdmitted = repository.ErrTaskEffectAlreadyAdmitted
+	ErrUnknownType           = errors.New("unknown task type")
+	ErrInputConflict         = errors.New("task input conflict")
+	ErrRetryUnsupported      = errors.New("task retry is not supported")
+	ErrInvalidResult         = errors.New("invalid task result")
+	ErrRegistryFrozen        = errors.New("task registry is frozen")
+	ErrEffectForbidden       = errors.New("external effects are forbidden during recovery")
+	ErrResourceBusy          = errors.New("task resource is busy")
+	ErrCodecPanic            = errors.New("task input codec panicked")
+	ErrInvalidCanonical      = errors.New("task input codec returned invalid canonical JSON")
 )
 
 // Codec validates input and returns its canonical JSON representation.
@@ -91,7 +92,7 @@ type Definition struct {
 	WorkStart    WorkStartPolicy
 	InputVersion int
 	Codec        Codec
-	RetryLimit   *int
+	Policy       ExecutionPolicy
 	AllowRetry   bool
 	// CanManualRetry optionally narrows AllowRetry for one failed task based on
 	// its durable failure evidence. Nil preserves the type-wide policy.
@@ -102,7 +103,22 @@ type Definition struct {
 	// Subject derives the task's subject from its canonical input. Types whose
 	// tasks repository logic finds by subject declare it; enqueue then fills
 	// the subject and refuses one that names a different row.
-	Subject SubjectFunc
+	Subject      SubjectFunc
+	InspectRetry func(context.Context, *repository.Repositories, *model.Task) error
+	PrepareRetry func(context.Context, *repository.Repositories, *model.Task) (RetryPreparation, error)
+	// LegacyHandoff also binds same-type retries unless PrepareRetry overrides it.
+	LegacyHandoff       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	NextCycleCheckpoint func(context.Context, *repository.Repositories, *model.Task) (json.RawMessage, error)
+}
+
+type RetryPreparation struct {
+	Request              EnqueueRequest
+	Checkpoint           json.RawMessage
+	ResumeMode           model.TaskResumeMode
+	PreserveCancellation bool
+	Validate             func(context.Context, *repository.Repositories, *model.Task) error
+	Bind                 func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	Release              func()
 }
 
 // WorkStartPolicy identifies when a task begins its own work.
@@ -149,8 +165,8 @@ func (d Definition) validate() error {
 	if d.Type == "" || d.InputVersion < 1 || d.Codec == nil {
 		return fmt.Errorf("incomplete definition for %q", d.Type)
 	}
-	if d.RetryLimit != nil && *d.RetryLimit < 0 {
-		return fmt.Errorf("negative retry limit for %q", d.Type)
+	if err := d.Policy.validate(); err != nil {
+		return fmt.Errorf("policy for %q: %w", d.Type, err)
 	}
 	if d.WorkStart != WorkStartOnHandler && d.WorkStart != WorkStartOnEffect {
 		return fmt.Errorf("work start policy is required for %q", d.Type)
@@ -170,7 +186,7 @@ type ResultKind uint8
 const (
 	resultInvalid ResultKind = iota
 	resultComplete
-	resultSuspend
+	resultWait
 	resultRetry
 	resultFail
 	resultCancel
@@ -192,6 +208,9 @@ type Result struct {
 	err           error
 	message       string
 	settlement    Settlement
+	onRetry       RetrySettlement
+	onExhausted   Settlement
+	cycleDelay    time.Duration
 	workStartedAt *time.Time
 }
 
@@ -209,19 +228,11 @@ func Complete(message string, settlement Settlement) Result {
 	return Result{kind: resultComplete, message: message, settlement: settlement}
 }
 
-func Suspend(mode model.TaskResumeMode, delay time.Duration, reason, message string, settlement Settlement) Result {
+func Wait(mode model.TaskResumeMode, delay time.Duration, reason, message string, settlement Settlement) Result {
 	return Result{
-		kind: resultSuspend, resumeMode: mode, delay: delay,
+		kind: resultWait, resumeMode: mode, delay: delay,
 		waitReason: reason, message: message, settlement: settlement,
 	}
-}
-
-// SuspendWithError waits like Suspend and keeps err as the task's last error,
-// so a wait caused by a failed request shows why until a later result clears it.
-func SuspendWithError(mode model.TaskResumeMode, delay time.Duration, reason, message string, err error, settlement Settlement) Result {
-	result := Suspend(mode, delay, reason, message, settlement)
-	result.err = err
-	return result
 }
 
 // ResourceWait yields a task that found its resource gate full. It resumes in
@@ -229,14 +240,14 @@ func SuspendWithError(mode model.TaskResumeMode, delay time.Duration, reason, me
 // and it consumes no retry budget.
 func ResourceWait(message string) Result {
 	return Result{
-		kind: resultSuspend, resumeMode: model.TaskResumeModeExecute, resourceWait: true,
+		kind: resultWait, resumeMode: model.TaskResumeModeExecute, resourceWait: true,
 		waitReason: "resource", message: message,
 	}
 }
 
 func Retry(err error, failureReason string, delay time.Duration, settlement Settlement) Result {
 	return Result{
-		kind: resultRetry, resumeMode: model.TaskResumeModeRecover, delay: delay,
+		kind: resultRetry, resumeMode: model.TaskResumeModeRecover, delay: delay, retryBackoff: true,
 		failureReason: failureReason, err: err, settlement: settlement,
 	}
 }
@@ -276,26 +287,18 @@ type Execution struct {
 	task       model.Task
 	checkpoint checkpointWriter
 	resource   resourceRunner
+	admit      func(context.Context, string, any, Settlement) error
+	observe    func(context.Context, string) (time.Time, error)
+	resolve    func(context.Context, string, any, Settlement) error
 }
 
-func (e Execution) ID() int64                  { return e.task.ID }
-func (e Execution) Type() model.TaskType       { return e.task.Type }
-func (e Execution) InputVersion() int          { return e.task.InputVersion }
-func (e Execution) ClaimGeneration() int64     { return e.task.ClaimGeneration }
-func (e Execution) Mode() model.TaskResumeMode { return e.task.ResumeMode }
-func (e Execution) RetryCount() int            { return e.task.RetryCount }
-func (e Execution) LastError() string          { return dereference(e.task.LastError) }
-func (e Execution) RetryLimit() (int, bool) {
-	if e.task.RetryLimit == nil {
-		return 0, false
-	}
-	return *e.task.RetryLimit, true
-}
-
-func (e Execution) RetryWillFail() bool {
-	limit, limited := e.RetryLimit()
-	return limited && e.RetryCount() >= limit
-}
+func (e Execution) ID() int64                   { return e.task.ID }
+func (e Execution) Type() model.TaskType        { return e.task.Type }
+func (e Execution) InputVersion() int           { return e.task.InputVersion }
+func (e Execution) ClaimGeneration() int64      { return e.task.ClaimGeneration }
+func (e Execution) Mode() model.TaskResumeMode  { return e.task.ResumeMode }
+func (e Execution) RetryCount() int             { return e.task.RetryCount }
+func (e Execution) LastError() string           { return dereference(e.task.LastError) }
 func (e Execution) CancellationRequested() bool { return e.task.CancellationRequested() }
 func (e Execution) CancellationReason() string  { return dereference(e.task.CancellationReason) }
 func (e Execution) Input() json.RawMessage      { return bytes.Clone(e.task.Input) }
@@ -335,6 +338,7 @@ func (e Execution) WithResource(ctx context.Context, resource Resource, fn func(
 func (e Execution) WithCheckpointedEffect(
 	ctx context.Context,
 	resource Resource,
+	operationKey string,
 	checkpoint any,
 	settlement Settlement,
 	effect func(context.Context) error,
@@ -343,10 +347,10 @@ func (e Execution) WithCheckpointedEffect(
 		return false, errors.New("external effect is required")
 	}
 	err = e.WithResource(ctx, resource, func(ctx context.Context) error {
-		if e.checkpoint == nil {
-			return errors.New("checkpoint writer is unavailable")
+		if e.admit == nil {
+			return errors.New("effect admission is unavailable")
 		}
-		if err := e.checkpoint(ctx, checkpoint, settlement, true); err != nil {
+		if err := e.admit(ctx, operationKey, checkpoint, settlement); err != nil {
 			return err
 		}
 		attempted = true
@@ -378,4 +382,44 @@ func dereference(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+// RetrySettlement receives the next opportunity's earliest execution time.
+type RetrySettlement func(context.Context, *repository.Repositories, time.Time) error
+
+func (r Result) WithRetrySettlements(onRetry RetrySettlement, onExhausted Settlement) Result {
+	r.onRetry, r.onExhausted = onRetry, onExhausted
+	return r
+}
+
+func (r Result) WithResumeMode(mode model.TaskResumeMode) Result { r.resumeMode = mode; return r }
+func (r Result) WithMinimumDelay(delay time.Duration) Result {
+	r.delay = delay
+	r.retryBackoff = true
+	return r
+}
+
+func RetryInMode(err error, reason string, mode model.TaskResumeMode, minimumDelay time.Duration, settlement Settlement) Result {
+	return RetryBackoff(err, reason, settlement).WithResumeMode(mode).WithMinimumDelay(minimumDelay)
+}
+
+func CompleteCycle(delay time.Duration, message string, settlement Settlement) Result {
+	r := Complete(message, settlement)
+	r.cycleDelay = delay
+	return r
+}
+
+func (e Execution) Policy() ExecutionPolicy { p, _ := DecodePolicy(&e.task); return p }
+func (e Execution) ObserveOperation(ctx context.Context, key string) (time.Time, error) {
+	if e.observe == nil {
+		return time.Time{}, errors.New("operation observation is unavailable")
+	}
+	return e.observe(ctx, key)
+}
+
+func (e Execution) ResolveOperation(ctx context.Context, key string, checkpoint any, settlement Settlement) error {
+	if e.resolve == nil {
+		return errors.New("operation resolution is unavailable")
+	}
+	return e.resolve(ctx, key, checkpoint, settlement)
 }

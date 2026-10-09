@@ -838,12 +838,12 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 	t.Setenv(configEnvVar, "")
 
-	t.Run("task list help documents dismissed status", func(t *testing.T) {
+	t.Run("task list help documents execution statuses", func(t *testing.T) {
 		out, err := runAdminCommand(t, []string{"synaps3", "admin", "task", "list", "--help"})
 		if err != nil {
 			t.Fatalf("task list help: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "pending, running, completed, failed, cancelled, or dismissed") {
+		if !strings.Contains(out, "pending, running, completed, failed, or cancelled") {
 			t.Fatalf("task list help missing status filters:\n%s", out)
 		}
 	})
@@ -866,7 +866,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 				if got := r.Header.Get("X-SynapS3-Settings-Write"); got != "" {
 					t.Fatalf("task retry write header = %q, want empty", got)
 				}
-				writeAdminTestJSON(t, w, http.StatusOK, map[string]string{"status": "requeued"})
+				writeAdminTestJSON(t, w, http.StatusAccepted, map[string]int64{"task_id": 43})
 			default:
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
@@ -876,8 +876,11 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list", "--status", "failed", "--limit", "50"}); err != nil {
 			t.Fatalf("task list: %v\n%s", err, out)
 		}
-		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "retry", "42"}); err != nil {
-			t.Fatalf("task retry: %v\n%s", err, out)
+		for range 2 {
+			out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "retry", "42"})
+			if err != nil || out != "Retry task 43\n" {
+				t.Fatalf("task retry: %v\n%s", err, out)
+			}
 		}
 		if !sawList || !sawRetry {
 			t.Fatalf("sawList=%v sawRetry=%v", sawList, sawRetry)
@@ -934,7 +937,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 					"subject_type":        "object_version",
 					"subject_key":         "version-1",
 					"retry_count":         5,
-					"retry_limit":         5,
+					"max_attempts":        6,
 					"available_at":        "2026-05-05T10:00:00Z",
 				}},
 			})
@@ -954,8 +957,8 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []map[string]any{{
 				"id": 9, "type": "storage_store", "operation": "Store content",
-				"status": "failed", "presentation_status": "dismissed",
-				"retry_count": 5, "retry_limit": 5, "retryable": false, "acknowledgeable": false,
+				"status": "failed", "presentation_status": "failed",
+				"retry_count": 5, "max_attempts": 6, "retryable": false, "acknowledgeable": false,
 				"failure_reason": "provider_error", "last_error": "provider unavailable",
 				"available_at": "2026-05-05T10:00:00Z", "started_at": "2026-05-05T10:00:01Z",
 				"finished_at": "2026-05-05T10:00:02Z", "acknowledged_at": "2026-05-05T10:00:03Z",
@@ -990,7 +993,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 					"status":              "pending",
 					"presentation_status": "Waiting",
 					"retry_count":         0,
-					"retry_limit":         5,
+					"max_attempts":        6,
 					"wait_reason":         "durability_pending",
 					"status_message":      "Waiting for durable storage",
 					"available_at":        "2026-05-05T10:00:00Z",
@@ -1137,4 +1140,32 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 
 func containsString(values []string, want string) bool {
 	return slices.Contains(values, want)
+}
+
+func TestAdminTaskCommandsSelectScope(t *testing.T) {
+	t.Setenv(configEnvVar, "")
+	for _, command := range []string{"list", "stats"} {
+		for _, scope := range []string{"work", "history"} {
+			t.Run(command+"/"+scope, func(t *testing.T) {
+				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Query().Get("scope") != scope {
+						t.Fatalf("scope = %q, want %s", r.URL.Query().Get("scope"), scope)
+					}
+					if command == "list" {
+						writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []any{}})
+					} else {
+						writeAdminTestJSON(t, w, http.StatusOK, []any{})
+					}
+				}))
+				defer ts.Close()
+				args := []string{"synaps3", "admin", "--admin-url", ts.URL, "task", command}
+				if scope != "work" {
+					args = append(args, "--scope", scope)
+				}
+				if out, err := runAdminCommand(t, args); err != nil {
+					t.Fatalf("task %s: %v %s", command, err, out)
+				}
+			})
+		}
+	}
 }

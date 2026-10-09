@@ -257,8 +257,6 @@ func (r *calibrationRuntime) PrepareConfig() error {
 		Concurrency:                    4,
 		PollInterval:                   5 * time.Second,
 		LeaseDuration:                  5 * time.Minute,
-		MaxRetries:                     3,
-		Retention:                      7 * 24 * time.Hour,
 		ProviderMutationConcurrency:    4,
 		DestructiveMutationConcurrency: 2,
 	}
@@ -922,10 +920,15 @@ func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient) {
 	lastSummary := "none"
 	e2e.Eventually(t, t.Context(), uploadTaskTimeout, "all upload tasks completed without failures", func(ctx context.Context) (string, bool, error) {
 		var tasks e2e.TaskListResponse
-		_, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload_plan&limit=100", &tasks)
+		_, err := admin.GetJSON(ctx, "/api/v1/tasks?scope=work&type=upload_plan&limit=100", &tasks)
 		if err != nil {
 			return lastSummary, false, err
 		}
+		var history e2e.TaskListResponse
+		if _, err := admin.GetJSON(ctx, "/api/v1/tasks?scope=history&type=upload_plan&limit=100", &history); err != nil {
+			return lastSummary, false, err
+		}
+		tasks.Tasks = append(tasks.Tasks, history.Tasks...)
 		lastSummary = uploadTaskSummary(tasks)
 		progress.Changed(t, "upload tasks", lastSummary)
 		seen, active, failed := 0, 0, 0

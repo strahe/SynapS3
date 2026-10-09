@@ -59,7 +59,7 @@ func DecideCopyRetry(f CopyRetryFacts) (model.StorageCopyTransferMethod, CopyRet
 		return model.StorageCopyTransferMethodPeerPull, "", true
 	}
 	if !f.CacheAvailable {
-		return "", CopyRetryNoSource, false
+		return model.StorageCopyTransferMethodPeerPull, "", true
 	}
 	if f.Method == model.StorageCopyTransferMethodIngress && !f.OtherIngress {
 		return model.StorageCopyTransferMethodIngress, "", true

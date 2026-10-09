@@ -3,9 +3,13 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
+
+	"github.com/strahe/synaps3/internal/storagecleanup"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
@@ -23,22 +27,33 @@ func (r *BunStorageCleanupRepo) BindTask(ctx context.Context, contentID, generat
 	if contentID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput
 	}
-	result, err := r.db.NewUpdate().
-		Model((*model.StorageContent)(nil)).
-		Set("cleanup_task_id = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", contentID).
-		Where("cleanup_generation = ?", generation).
-		Where("cleanup_task_id IS NULL OR cleanup_task_id = ?", taskID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("binding storage cleanup task: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrConflict
-	}
-	return nil
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "storage_content", strconv.FormatInt(contentID, 10), model.TaskTypeStorageCleanup)
+		if err != nil {
+			return err
+		}
+		var input storagecleanup.Input
+		if json.Unmarshal(task.Input, &input) != nil || input.ContentID != contentID || input.Generation != generation {
+			return ErrConflict
+		}
+
+		result, err := db.NewUpdate().
+			Model((*model.StorageContent)(nil)).
+			Set("cleanup_task_id = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ?", contentID).
+			Where("cleanup_generation = ?", generation).
+			Where("cleanup_task_id IS NULL OR cleanup_task_id = ?", taskID).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("binding storage cleanup task: %w", err)
+		}
+		rows, _ := result.RowsAffected()
+		if rows != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
 }
 
 func (r *BunStorageCleanupRepo) AuthorizeTask(ctx context.Context, contentID, generation, taskID int64) ([]model.StorageCleanupCopy, error) {

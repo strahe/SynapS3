@@ -280,8 +280,6 @@ func applyTaskWorkerUpdate(
 	setInt("worker.tasks.concurrency", &target.Concurrency, req.Concurrency)
 	setDuration("worker.tasks.poll_interval", &target.PollInterval, req.PollInterval)
 	setDuration("worker.tasks.lease_duration", &target.LeaseDuration, req.LeaseDuration)
-	setInt("worker.tasks.max_retries", &target.MaxRetries, req.MaxRetries)
-	setDuration("worker.tasks.retention", &target.Retention, req.Retention)
 	setInt("worker.tasks.provider_mutation_concurrency", &target.ProviderMutationConcurrency, req.ProviderMutationConcurrency)
 	setInt("worker.tasks.destructive_mutation_concurrency", &target.DestructiveMutationConcurrency, req.DestructiveMutationConcurrency)
 	setInt("worker.tasks.commit_max_pieces", &target.CommitMaxPieces, req.CommitMaxPieces)
@@ -417,8 +415,6 @@ type settingsTaskWorkerConfig struct {
 	Concurrency                    int    `json:"concurrency"`
 	PollInterval                   string `json:"poll_interval"`
 	LeaseDuration                  string `json:"lease_duration"`
-	MaxRetries                     int    `json:"max_retries"`
-	Retention                      string `json:"retention"`
 	ProviderMutationConcurrency    int    `json:"provider_mutation_concurrency"`
 	DestructiveMutationConcurrency int    `json:"destructive_mutation_concurrency"`
 	CommitMaxPieces                int    `json:"commit_max_pieces"`
@@ -530,8 +526,6 @@ type settingsTaskWorkerUpdate struct {
 	Concurrency                    *int    `json:"concurrency,omitempty"`
 	PollInterval                   *string `json:"poll_interval,omitempty"`
 	LeaseDuration                  *string `json:"lease_duration,omitempty"`
-	MaxRetries                     *int    `json:"max_retries,omitempty"`
-	Retention                      *string `json:"retention,omitempty"`
 	ProviderMutationConcurrency    *int    `json:"provider_mutation_concurrency,omitempty"`
 	DestructiveMutationConcurrency *int    `json:"destructive_mutation_concurrency,omitempty"`
 	CommitMaxPieces                *int    `json:"commit_max_pieces,omitempty"`
@@ -605,8 +599,6 @@ func toSettingsTaskWorkerConfig(cfg config.TaskWorkerConfig) settingsTaskWorkerC
 		Concurrency:                    cfg.Concurrency,
 		PollInterval:                   cfg.PollInterval.String(),
 		LeaseDuration:                  cfg.LeaseDuration.String(),
-		MaxRetries:                     cfg.MaxRetries,
-		Retention:                      cfg.Retention.String(),
 		ProviderMutationConcurrency:    cfg.ProviderMutationConcurrency,
 		DestructiveMutationConcurrency: cfg.DestructiveMutationConcurrency,
 		CommitMaxPieces:                cfg.CommitMaxPieces,
@@ -665,8 +657,6 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"worker.tasks.concurrency":                      {},
 		"worker.tasks.poll_interval":                    {},
 		"worker.tasks.lease_duration":                   {},
-		"worker.tasks.max_retries":                      {},
-		"worker.tasks.retention":                        {},
 		"worker.tasks.provider_mutation_concurrency":    {},
 		"worker.tasks.destructive_mutation_concurrency": {},
 		"worker.tasks.commit_max_pieces":                {},

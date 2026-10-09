@@ -103,7 +103,7 @@ func TestSystemGoldenPath(t *testing.T) {
 
 	e2e.Eventually(t, t.Context(), 5*time.Second, "completed upload tasks", func(ctx context.Context) (string, bool, error) {
 		var tasks e2e.TaskListResponse
-		raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload_plan&limit=100", &tasks)
+		raw, err := admin.GetJSON(ctx, "/api/v1/tasks?scope=history&type=upload_plan&limit=100", &tasks)
 		if err != nil {
 			return raw, false, err
 		}

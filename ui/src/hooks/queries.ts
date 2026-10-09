@@ -5,6 +5,7 @@ import type {
   ObservabilityListParams,
   ProviderSelectionStrategy,
   S3UserRole,
+  TaskScope,
 } from '@/api/client'
 import { api } from '@/api/client'
 
@@ -128,12 +129,25 @@ export function useObjectProvenance(name: string, versionId: string, enabled = t
   })
 }
 
-export function useRetryStorageCopy() {
+export function useRetryTask() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: api.retryStorageCopy,
+    mutationFn: api.retryTask,
     onSettled: () => {
-      for (const key of ['tasks', 'taskStats', 'objectProvenance', 'objects']) {
+      for (const key of [
+        'tasks',
+        'taskStats',
+        'objectProvenance',
+        'objects',
+        'bucket',
+        'observabilityProviders',
+        'replacementProviders',
+        'commitBatch',
+        'commitBatches',
+        'task',
+        'taskHistory',
+        'taskEvents',
+      ]) {
         qc.invalidateQueries({ queryKey: [key] })
       }
     },
@@ -288,19 +302,6 @@ export function useRefreshProviderTiers() {
   })
 }
 
-export function useRetryProviderReplacement() {
-  const qc = useQueryClient()
-
-  return useMutation({
-    mutationFn: ({ replacementID }: { bucket: string; replacementID: number }) =>
-      api.retryProviderReplacement(replacementID),
-    onSuccess: (_, variables) => {
-      qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
-      qc.invalidateQueries({ queryKey: ['tasks'] })
-    },
-  })
-}
-
 export function useDeleteBucketObject() {
   const qc = useQueryClient()
 
@@ -399,19 +400,21 @@ export function useRestoreBucketObjectVersion() {
   })
 }
 
-export function useTasks(taskType: string, status: string, limit: number, cursor?: number) {
+export function useTasks(scope: TaskScope, taskType: string, status: string, limit: number, cursor?: number) {
   return useQuery({
-    queryKey: ['tasks', taskType, status, limit, cursor],
-    queryFn: () => api.getTasks({ type: taskType, status, limit, cursor }),
-    refetchInterval: 10_000,
+    queryKey: ['tasks', scope, taskType, status, limit, cursor],
+    queryFn: () => api.getTasks({ scope, type: taskType, status, limit, cursor }),
+    refetchInterval: scope === 'work' ? 10_000 : false,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
   })
 }
 
-export function useTaskStats() {
+export function useTaskStats(scope: TaskScope = 'work') {
   return useQuery({
-    queryKey: ['taskStats'],
-    queryFn: api.getTaskStats,
-    refetchInterval: 10_000,
+    queryKey: ['taskStats', scope],
+    queryFn: () => api.getTaskStats(scope),
+    refetchInterval: scope === 'work' ? 10_000 : false,
   })
 }
 

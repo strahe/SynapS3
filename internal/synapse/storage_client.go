@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
+
+	"github.com/strahe/synapse-go/pdp"
+	"github.com/strahe/synapse-go/piece"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
@@ -25,13 +29,14 @@ type dataSetWriteReader interface {
 // StorageServiceAdapter adapts synapse-go's concrete immutable storage
 // contexts to SynapS3's testable staged storage interface.
 type StorageServiceAdapter struct {
-	service    *storage.Service
-	terminator storageServiceTerminator
-	dataSets   dataSetStateReader
-	writable   dataSetWriteReader
-	identity   storage.ContextIdentity
-	verifier   common.Address
-	cleanup    *cleanupPieceReader
+	service      *storage.Service
+	terminator   storageServiceTerminator
+	dataSets     dataSetStateReader
+	writable     dataSetWriteReader
+	identity     storage.ContextIdentity
+	verifier     common.Address
+	cleanup      *cleanupPieceReader
+	providerHTTP *http.Client
 }
 
 // AdaptStorageService wraps the SDK storage service. dataSets reads the FWSS
@@ -113,6 +118,9 @@ func (s *StorageServiceAdapter) SelectUploadTargets(ctx context.Context, opts st
 		if err != nil {
 			return nil, err
 		}
+		if dataSet, ok := target.(*dataSetTargetAdapter); ok {
+			dataSet.providerHTTP = s.providerHTTP
+		}
 		out = append(out, target)
 	}
 	return out, normalizeSelectUploadTargetsError(selectErr)
@@ -126,7 +134,9 @@ func (s *StorageServiceAdapter) OpenProviderTarget(ctx context.Context, provider
 	if storageCtx == nil {
 		return nil, errors.New("opening provider target returned no context")
 	}
-	return newProviderTargetAdapter(storageCtx), nil
+	target := newProviderTargetAdapter(storageCtx)
+	target.providerHTTP = s.providerHTTP
+	return target, nil
 }
 
 func (s *StorageServiceAdapter) OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (DataSetTarget, error) {
@@ -137,7 +147,9 @@ func (s *StorageServiceAdapter) OpenDataSetTarget(ctx context.Context, dataSetID
 	if storageCtx == nil {
 		return nil, errors.New("opening data set target returned no context")
 	}
-	return newDataSetTargetAdapter(storageCtx, s.writable), nil
+	target := newDataSetTargetAdapter(storageCtx, s.writable)
+	target.providerHTTP = s.providerHTTP
+	return target, nil
 }
 
 func (s *StorageServiceAdapter) OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error) {
@@ -238,7 +250,8 @@ func (c storageTargetAdapter) ServiceURL() string { return c.inner.ServiceURL() 
 
 type providerTargetAdapter struct {
 	storageTargetAdapter
-	provider *storage.ProviderContext
+	provider     *storage.ProviderContext
+	providerHTTP *http.Client
 }
 
 func newProviderTargetAdapter(provider *storage.ProviderContext) *providerTargetAdapter {
@@ -254,8 +267,41 @@ func (c *providerTargetAdapter) CreateDataSet(ctx context.Context, opts *storage
 }
 
 func (c *providerTargetAdapter) WaitForDataSetCreated(ctx context.Context, statusURL string, clientDataSetID sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
-	result, err := c.provider.WaitForDataSetCreated(ctx, statusURL, clientDataSetID)
-	return result, NormalizeProviderOperationError(ctx, err)
+	client := c.providerHTTP
+	if client == nil {
+		client = NewProviderHTTPClient(defaultPDPStatusTimeout, false)
+	}
+	provider, err := pdp.New(c.ServiceURL(), pdp.WithHTTPClient(client), pdp.WithMaxRetries(0))
+	if err != nil {
+		return nil, err
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, defaultPDPStatusTimeout)
+	defer cancel()
+	status, err := provider.GetDataSetCreationStatus(pollCtx, statusURL)
+	if errors.Is(err, pdp.ErrTxRejected) {
+		return nil, ErrProviderTransactionRejected
+	}
+	if err != nil {
+		return nil, NormalizeProviderOperationError(ctx, err)
+	}
+	if status == nil {
+		return nil, errors.New("data set observation returned no status")
+	}
+	if status.TxStatus != "confirmed" || !status.DataSetCreated {
+		return nil, nil
+	}
+	if status.DataSetID == nil || status.DataSetID.IsZero() {
+		return nil, errors.New("confirmed data set has no identity")
+	}
+	ref, err := storage.NewDataSetRef(c.ProviderID(), *status.DataSetID, clientDataSetID)
+	if err != nil {
+		return nil, err
+	}
+	result := &storage.CreateDataSetResult{TransactionID: status.CreateMessageHash.Hex(), DataSet: ref}
+	if status.ConfirmedTxHash != (common.Hash{}) {
+		result.ConfirmedTransactionID = status.ConfirmedTxHash.Hex()
+	}
+	return result, nil
 }
 
 func (c *providerTargetAdapter) ContextIdentity() storage.ContextIdentity {
@@ -273,8 +319,9 @@ func (c *providerTargetAdapter) FindDataSetByClientDataSetID(
 
 type dataSetTargetAdapter struct {
 	storageTargetAdapter
-	dataSet  *storage.DataSetContext
-	writable dataSetWriteReader
+	dataSet      *storage.DataSetContext
+	writable     dataSetWriteReader
+	providerHTTP *http.Client
 }
 
 func newDataSetTargetAdapter(dataSet *storage.DataSetContext, writable dataSetWriteReader) *dataSetTargetAdapter {
@@ -285,8 +332,29 @@ func newDataSetTargetAdapter(dataSet *storage.DataSetContext, writable dataSetWr
 }
 
 func (c *dataSetTargetAdapter) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
-	result, err := c.dataSet.Store(ctx, reader, opts)
-	return result, NormalizeProviderOperationError(ctx, err)
+	if opts == nil || !opts.PieceCID.Defined() {
+		return nil, errors.New("upload submission requires a piece identity")
+	}
+	info, err := piece.ParseV2(opts.PieceCID)
+	if err != nil {
+		return nil, err
+	}
+	client := c.providerHTTP
+	if client == nil {
+		client = NewProviderHTTPClient(0, false)
+	}
+	provider, err := pdp.New(c.ServiceURL(), pdp.WithHTTPClient(client))
+	if err != nil {
+		return nil, err
+	}
+	result, err := provider.UploadPieceStreaming(ctx, reader, pdp.UploadPieceStreamingOptions{Size: int64(info.RawSize), PieceCID: opts.PieceCID, OnProgress: opts.OnProgress})
+	if err != nil {
+		return nil, NormalizeProviderOperationError(ctx, err)
+	}
+	if result == nil || !result.PieceCID.Equals(opts.PieceCID) || result.Size != int64(info.RawSize) {
+		return nil, errors.New("upload submission returned a mismatched piece")
+	}
+	return &storage.StoreResult{PieceCID: result.PieceCID, Size: result.Size}, nil
 }
 
 func (c *dataSetTargetAdapter) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {
@@ -347,3 +415,8 @@ var (
 	_ DataSetTarget  = (*dataSetTargetAdapter)(nil)
 	_ CleanupContext = (*storage.DataSetContext)(nil)
 )
+
+// ConfigureProviderHTTPClient preserves the deployment URL policy for uploads.
+func (s *StorageServiceAdapter) ConfigureProviderHTTPClient(allowPrivate bool) {
+	s.providerHTTP = NewProviderHTTPClient(0, allowPrivate)
+}

@@ -297,12 +297,15 @@ func TestRefusedReplacementTargetIsRecheckedBeforeChangingProvider(t *testing.T)
 				t.Fatalf("unsafe abandonment: %d %s target=%#v", second.Code, second.Body.String(), stored)
 			}
 			if outcome == "found" {
+				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), f.replacementTaskID(t, row.ID)).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
 				if stored.Status != model.StorageDataSetStatusReady || stored.DataSetID == nil || len(stored.CreationRejection) != 0 || stored.EnsureTaskID != nil {
 					t.Fatalf("service not recovered: %#v", stored)
 				}
 				retry := httptest.NewRecorder()
-				f.mux.ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/api/v1/storage-replacements/"+strconv.FormatInt(row.ID, 10)+"/retry", nil))
-				if retry.Code != http.StatusOK || decodeReplacement(t, retry).Status != string(storagereplacement.StatusPreparingTarget) {
+				f.mux.ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(f.replacementTaskID(t, row.ID), 10)+"/retry", nil))
+				if retry.Code != http.StatusAccepted {
 					t.Fatalf("recovered target could not resume: %d %s", retry.Code, retry.Body.String())
 				}
 			}
@@ -440,7 +443,7 @@ func TestReadyIncomingReplacementTargetRemainsUnavailable(t *testing.T) {
 	if err := f.srv.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: onChainIDValue("2002")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.srv.repos.Replacements.Activate(t.Context(), row.ID, row.TaskGeneration, *row.TaskID); err != nil {
+	if err := f.srv.repos.Replacements.Activate(t.Context(), row.ID, row.TaskGeneration, f.replacementTaskID(t, row.ID)); err != nil {
 		t.Fatal(err)
 	}
 	for _, stopped := range []bool{false, true} {
@@ -580,7 +583,12 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 				if err := f.srv.repos.Contents.CompleteDataSetEnsureTask(t.Context(), target.ID, ensureID); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, retention_until = ? WHERE id = ?", model.TaskStatusCompleted, time.Now(), time.Now().Add(time.Hour), ensureID).Exec(t.Context()); err != nil {
+				now := time.Now()
+				var generation int64
+				if err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, claimed_at = ?, lease_until = ?, claim_generation = claim_generation + 1 WHERE id = ? RETURNING claim_generation", model.TaskStatusRunning, now, now.Add(time.Minute), ensureID).Scan(t.Context(), &generation); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.srv.repos.Tasks.Settle(t.Context(), ensureID, generation, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute}); err != nil {
 					t.Fatal(err)
 				}
 				switch phase {
@@ -592,7 +600,7 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 					if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "replacement stopped"); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), *row.TaskID).Exec(t.Context()); err != nil {
+					if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), f.replacementTaskID(t, row.ID)).Exec(t.Context()); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -625,7 +633,7 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 					}
 					failed := f.start(t, confirmation)
 					before, err := f.srv.repos.Replacements.GetByID(t.Context(), row.ID)
-					if failed.Code != http.StatusInternalServerError || err != nil || before.Status != phase || before.TaskGeneration != row.TaskGeneration || before.TaskID == nil || *before.TaskID != *row.TaskID {
+					if failed.Code != http.StatusInternalServerError || err != nil || before.Status != phase || before.TaskGeneration != row.TaskGeneration || before.TaskID == nil || *before.TaskID != f.replacementTaskID(t, row.ID) {
 						t.Fatalf("partial supersession: %d replacement=%#v err=%v", failed.Code, before, err)
 					}
 					count, err := f.srv.db.NewSelect().Model((*model.StorageDataSet)(nil)).Where("bucket_id = ?", f.bucket.ID).Count(t.Context())

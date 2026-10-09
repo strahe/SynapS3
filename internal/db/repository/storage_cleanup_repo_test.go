@@ -60,13 +60,17 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	if cleanup == nil || cleanup.ContentID != contentID || cleanup.TaskID != nil {
 		t.Fatalf("last delete cleanup = %#v", cleanup)
 	}
-	taskRow, created, err := repos.Tasks.Enqueue(ctx, &model.Task{
+	taskRow, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageCleanup, IdempotencyKey: "cleanup-finalize", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "cleanup-finalize", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"content_id":%d,"generation":%d}`, contentID, cleanup.Generation)), InputHash: "cleanup-finalize", Status: model.TaskStatusPending,
+		SubjectType: new(model.TaskSubjectStorageContent), SubjectKey: new(strconv.FormatInt(contentID, 10)),
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil || !created {
 		t.Fatalf("Enqueue = %#v, created=%v, err=%v", taskRow, created, err)
+	}
+	if err := repos.StorageCleanup.BindTask(ctx, contentID, cleanup.Generation+1, taskRow.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("BindTask with different generation = %v, want ErrConflict", err)
 	}
 	if err := repos.StorageCleanup.BindTask(ctx, contentID, cleanup.Generation, taskRow.ID); err != nil {
 		t.Fatalf("BindTask: %v", err)
@@ -426,11 +430,11 @@ func TestStorageCleanupCancelsCollectingCommitBeforeSnapshot(t *testing.T) {
 func collectCleanupBoundaryCopy(t *testing.T, repos *repository.Repositories, copyRow *model.StorageCopy) (string, int64) {
 	t.Helper()
 	requestID := "cleanup-boundary-request"
-	taskRow, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+	taskRow, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageCommit, IdempotencyKey: "cleanup-boundary-commit", InputVersion: 1,
 		Input: []byte(`{"request_id":"cleanup-boundary-request"}`), InputHash: "cleanup-boundary-commit",
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Enqueue commit task: %v", err)
 	}

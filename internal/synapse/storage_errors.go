@@ -89,6 +89,30 @@ func IsNoProviderCandidates(err error) bool {
 	return errors.As(err, &target)
 }
 
+// IsProviderCandidateWait identifies an empty selection without a failed probe.
+func IsProviderCandidateWait(err error) bool {
+	var candidates *NoProviderCandidatesError
+	if !errors.As(err, &candidates) {
+		return false
+	}
+	return candidates.Cause == nil || candidateAbsenceOnly(candidates.Cause)
+}
+
+func candidateAbsenceOnly(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, cause := range joined.Unwrap() {
+			if !candidateAbsenceOnly(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return candidateAbsenceOnly(cause)
+	}
+	return err == storage.ErrNoHealthyProviders || err == storage.ErrNoEndorsedProvider || err == storage.ErrEndorsementsNotConfigured || errors.Is(err, storage.ErrInsufficientUploadContexts)
+}
+
 func IsProviderUnavailable(err error) bool {
 	var unavailable *ProviderUnavailableError
 	return errors.As(err, &unavailable)

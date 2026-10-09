@@ -71,19 +71,19 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		       CASE
 		         WHEN item.id IS NULL THEN NULL
 		         WHEN item.status <> 'pending' THEN item.status
-		         WHEN target_copy.status = 'failed' OR copy_task.status = 'failed' THEN 'failed'
-		         WHEN copy_task.status = 'pending' AND copy_task.wait_reason = 'source' THEN 'waiting_source'
+		         WHEN target_copy.status = 'failed' OR COALESCE(copy_task.status, copy_history.status) = 'failed' THEN 'failed'
+		         WHEN COALESCE(copy_task.status, copy_history.status) = 'pending' AND COALESCE(copy_task.wait_reason, copy_history.wait_reason) = 'source' THEN 'waiting_source'
 		         WHEN coordinator.status = 'pending' AND coordinator.wait_reason = 'source'
 		              AND item.id = (SELECT MIN(waiting_item.id)
 		                             FROM storage_replacement_items AS waiting_item
 		                             WHERE waiting_item.replacement_id = replacement.id
 		                               AND waiting_item.status = 'pending') THEN 'waiting_source'
-		         WHEN copy_task.status = 'pending' AND copy_task.retry_count > 0 AND copy_task.available_at > ? THEN 'retrying'
-		         WHEN copy_task.status IN ('pending', 'running') THEN 'active'
+		         WHEN COALESCE(copy_task.status, copy_history.status) = 'pending' AND COALESCE(copy_task.retry_count, copy_history.retry_count) > 0 AND COALESCE(copy_task.available_at, copy_history.available_at) > ? THEN 'retrying'
+		         WHEN COALESCE(copy_task.status, copy_history.status) IN ('pending', 'running') THEN 'active'
 		         ELSE 'pending'
 		       END AS progress_status,
-		       CASE WHEN copy_task.status = 'pending' AND copy_task.retry_count > 0 AND copy_task.available_at > ?
-		            THEN copy_task.available_at END AS next_retry_at
+		       CASE WHEN COALESCE(copy_task.status, copy_history.status) = 'pending' AND COALESCE(copy_task.retry_count, copy_history.retry_count) > 0 AND COALESCE(copy_task.available_at, copy_history.available_at) > ?
+		            THEN COALESCE(copy_task.available_at, copy_history.available_at) END AS next_retry_at
 		FROM storage_replacements AS replacement
 		JOIN storage_data_sets AS target ON target.id = replacement.target_data_set_id
 		LEFT JOIN storage_replacement_items AS item ON item.replacement_id = replacement.id
@@ -92,6 +92,8 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		      AND target_copy.storage_data_set_id = item.target_data_set_id
 		LEFT JOIN storage_commit_requests AS target_request ON target_request.request_id = target_copy.commit_request_id
 		LEFT JOIN tasks AS copy_task ON copy_task.id = COALESCE(target_copy.active_task_id,
+		     CASE WHEN target_copy.status IN ('piece_ready', 'committing') THEN target_request.task_id END)
+		LEFT JOIN task_history AS copy_history ON copy_history.task_id = COALESCE(target_copy.active_task_id,
 		     CASE WHEN target_copy.status IN ('piece_ready', 'committing') THEN target_request.task_id END)
 		LEFT JOIN tasks AS coordinator ON coordinator.id = replacement.task_id
 		WHERE replacement.id IN (?)

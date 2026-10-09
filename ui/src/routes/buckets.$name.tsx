@@ -61,6 +61,7 @@ import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
 import { WarmStoragePriceDetails } from '@/components/app/WarmStoragePriceDetails'
 import { StorageRiskHeader, StorageRiskView } from '@/components/buckets/StorageRiskView'
+import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   Breadcrumb,
@@ -114,8 +115,7 @@ import {
   useReplacementProviderCandidates,
   useRestoreBucketObject,
   useRestoreBucketObjectVersion,
-  useRetryProviderReplacement,
-  useRetryStorageCopy,
+  useRetryTask,
   useS3Users,
   useStartProviderReplacement,
   useTestProviderUploadSpeed,
@@ -174,7 +174,6 @@ import {
   replacementConfirmationSummary,
   replacementErrorMessage,
   replacementNextStep,
-  replacementRetryable,
   replacementStatusLabel,
   replacementStatusTone,
 } from '@/lib/provider-replacement'
@@ -186,7 +185,7 @@ import {
   storageConfirmationRetryNote,
   storageConfirmationTasksSearch,
 } from '@/lib/storage-confirmation-attention'
-import { copyRetryBlockedLabel, objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
+import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, formatTokenAmount, timeAgo } from '@/lib/utils'
 
@@ -833,17 +832,13 @@ function ProvenanceSummaryItem({
 }
 
 function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
-  const retry = useRetryStorageCopy()
+  const retry = useRetryTask()
   return (
     <div className="overflow-hidden rounded-md border border-border">
       <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Replicas</div>
       {retry.error && (
         <Alert>
-          <AlertDescription>
-            {retry.error instanceof APIError && retry.error.code
-              ? copyRetryBlockedLabel(retry.error.code)
-              : 'Could not retry replica. Try again.'}
-          </AlertDescription>
+          <AlertDescription>Could not retry. Refresh and try again.</AlertDescription>
         </Alert>
       )}
       <ScrollArea className="w-full">
@@ -922,26 +917,15 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                   )}
                 </TableCell>
                 <TableCell className="px-3">
-                  {copy.retry?.available ? (
-                    <Button
-                      size="sm"
-                      variant="outline"
+                  {copy.retryable ? (
+                    <RetryButton
+                      taskID={copy.retry_task_id}
+                      pending={retry.isPending && retry.variables === copy.retry_task_id}
                       disabled={retry.isPending}
-                      onClick={() => retry.mutate(copy.copy_id)}
-                    >
-                      {retry.isPending && retry.variables === copy.copy_id ? (
-                        <Loader2 data-icon="inline-start" className="animate-spin" />
-                      ) : (
-                        <RotateCcw data-icon="inline-start" />
-                      )}
-                      Retry replica
-                    </Button>
-                  ) : copy.retry ? (
-                    <span className="text-sm text-muted-foreground">
-                      {copyRetryBlockedLabel(copy.retry.reason_code)}
-                    </span>
+                      onRetry={(id) => retry.mutate(id)}
+                    />
                   ) : (
-                    '—'
+                    <span className="text-sm text-muted-foreground">{copy.retry_unavailable_reason || '—'}</span>
                   )}
                 </TableCell>
               </TableRow>
@@ -1854,7 +1838,6 @@ function BucketDetailsSheet({
               <div ref={storageRef}>
                 <BucketDetailsSection title="Storage">
                   <ProviderReplacementProgress
-                    bucketName={bucket.name}
                     replacements={bucket.replacements ?? []}
                     onOpenLastError={setReplacementError}
                   />
@@ -2142,18 +2125,28 @@ function ReplaceProviderDialog({
                   >
                     Refresh provider
                   </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={testUploadSpeed.isPending || !inspectedProvider.manual_selectable}
-                    onClick={() => testUploadSpeed.mutate(inspectedProvider.provider_id)}
-                  >
-                    {testUploadSpeed.isPending && testUploadSpeed.variables === inspectedProvider.provider_id
-                      ? 'Starting speed test…'
-                      : 'Test upload speed (32 MiB)'}
-                  </Button>
+
+                  {inspectedProvider.upload_speed_test?.retryable ? (
+                    <RetryButton taskID={inspectedProvider.upload_speed_test.retry_task_id} />
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={testUploadSpeed.isPending || !inspectedProvider.manual_selectable}
+                      onClick={() => testUploadSpeed.mutate(inspectedProvider.provider_id)}
+                    >
+                      {testUploadSpeed.isPending && testUploadSpeed.variables === inspectedProvider.provider_id
+                        ? 'Starting speed test…'
+                        : 'Test upload speed (32 MiB)'}
+                    </Button>
+                  )}
                 </div>
+                {inspectedProvider.upload_speed_test?.retry_unavailable_reason && (
+                  <p className="text-xs text-muted-foreground">
+                    {inspectedProvider.upload_speed_test.retry_unavailable_reason}
+                  </p>
+                )}
                 {refreshProvider.isError && refreshProvider.variables === inspectedProvider.provider_id && (
                   <p className="text-xs text-destructive">Could not refresh this provider. Try again.</p>
                 )}
@@ -2214,11 +2207,9 @@ function ReplaceProviderDialog({
  * rather than disappearing.
  */
 function ProviderReplacementProgress({
-  bucketName,
   replacements,
   onOpenLastError,
 }: {
-  bucketName: string
   replacements: ProviderReplacement[]
   onOpenLastError: (text: string) => void
 }) {
@@ -2229,7 +2220,6 @@ function ProviderReplacementProgress({
       {active.map((replacement) => (
         <ProviderReplacementProgressCard
           key={replacement.id}
-          bucketName={bucketName}
           replacement={replacement}
           onOpenLastError={onOpenLastError}
         />
@@ -2239,27 +2229,32 @@ function ProviderReplacementProgress({
 }
 
 function ProviderReplacementProgressCard({
-  bucketName,
   replacement,
   onOpenLastError,
 }: {
-  bucketName: string
   replacement: ProviderReplacement
   onOpenLastError: (text: string) => void
 }) {
-  const retryReplacement = useRetryProviderReplacement()
-  const [retryError, setRetryError] = useState<string | null>(null)
   const nextStep = replacementNextStep(replacement)
 
   return (
     <div className="flex flex-col gap-2 rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm font-medium">
-          Replacing {replicaLabel(replacement.copy_index)} · {replacement.source.provider_id} →{' '}
-          {replacement.target.provider_id}
+          {replacement.retirement_attention ? (
+            <>
+              Retiring storage for {replicaLabel(replacement.copy_index)} ·{' '}
+              {replacement.status === 'superseded' ? replacement.target.provider_id : replacement.source.provider_id}
+            </>
+          ) : (
+            <>
+              Replacing {replicaLabel(replacement.copy_index)} · {replacement.source.provider_id} →{' '}
+              {replacement.target.provider_id}
+            </>
+          )}
         </span>
-        <StatusBadge tone={replacementStatusTone(replacement.status)}>
-          {replacementStatusLabel(replacement.status)}
+        <StatusBadge tone={replacement.retirement_attention ? 'danger' : replacementStatusTone(replacement.status)}>
+          {replacement.retirement_attention ? 'Retirement stopped' : replacementStatusLabel(replacement.status)}
         </StatusBadge>
       </div>
       <ReplacementProgressView progress={replacement.progress} />
@@ -2271,31 +2266,13 @@ function ProviderReplacementProgressCard({
           onClick={() => onOpenLastError(replacement.last_error ?? '')}
         />
       )}
-      {retryError && (
-        <Alert variant="destructive">
-          <AlertDescription>{retryError}</AlertDescription>
-        </Alert>
-      )}
-      {replacementRetryable(replacement) && (
+      {replacement.retryable ? (
         <div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={retryReplacement.isPending}
-            onClick={() => {
-              setRetryError(null)
-              retryReplacement.mutate(
-                { bucket: bucketName, replacementID: replacement.id },
-                { onError: (error) => setRetryError(replacementErrorMessage(error)) }
-              )
-            }}
-          >
-            {retryReplacement.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            Retry replacement
-          </Button>
+          <RetryButton taskID={replacement.retry_task_id} />
         </div>
-      )}
+      ) : replacement.retry_unavailable_reason ? (
+        <p className="text-sm text-muted-foreground">{replacement.retry_unavailable_reason}</p>
+      ) : null}
     </div>
   )
 }

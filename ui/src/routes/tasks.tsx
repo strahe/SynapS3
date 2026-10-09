@@ -1,15 +1,17 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, RotateCcw, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, X } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
 
-import { APIError, api, type TaskItem } from '@/api/client'
+import { api, type TaskItem, type TaskScope } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { RetryButton } from '@/components/tasks/RetryButton'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
+import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog'
 import { TaskSubject } from '@/components/tasks/TaskSubject'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -19,11 +21,11 @@ import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/p
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useRetryStorageCopy, useTasks } from '@/hooks/queries'
+import { useRetryTask, useTasks } from '@/hooks/queries'
 import { storageConfirmationAttentionView } from '@/lib/storage-confirmation-attention'
-import { copyRetryBlockedLabel } from '@/lib/storage-status-labels'
-import { taskDetailsView, taskOperationLabel, taskTook } from '@/lib/tasks'
+import { taskDetailsView, taskOperationLabel, taskRetryErrorMessage, taskStatusesForScope, taskTook } from '@/lib/tasks'
 import { timeAgo } from '@/lib/utils'
 
 const PAGE_SIZE = 20
@@ -44,6 +46,10 @@ const taskOperations = [
   { value: 'storage_dataset_retire', label: taskOperationLabel('storage_dataset_retire') },
   { value: 'wallet_operation', label: taskOperationLabel('wallet_operation') },
   { value: 'provider_upload_speed_test', label: taskOperationLabel('provider_upload_speed_test') },
+  { value: 'cache_capacity_reconcile', label: taskOperationLabel('cache_capacity_reconcile') },
+  { value: 'observability_refresh', label: taskOperationLabel('observability_refresh') },
+  { value: 'approved_provider_refresh', label: taskOperationLabel('approved_provider_refresh') },
+  { value: 'endorsed_provider_refresh', label: taskOperationLabel('endorsed_provider_refresh') },
 ] as const
 
 const taskStatuses = [
@@ -52,7 +58,6 @@ const taskStatuses = [
   { value: 'running', label: 'Running' },
   { value: 'completed', label: 'Completed' },
   { value: 'failed', label: 'Failed' },
-  { value: 'dismissed', label: 'Dismissed' },
   { value: 'cancelled', label: 'Cancelled' },
 ] as const
 
@@ -64,12 +69,12 @@ const presentationLabels: Record<TaskItem['presentation_status'], string> = {
   completed: 'Completed',
   failed: 'Failed',
   cancelled: 'Cancelled',
-  dismissed: 'Dismissed',
 }
 
 type TaskOperationFilter = (typeof taskOperations)[number]['value']
 type TaskStatusFilter = (typeof taskStatuses)[number]['value']
 type TasksSearch = {
+  scope?: TaskScope
   type?: Exclude<TaskOperationFilter, 'all'>
   status?: Exclude<TaskStatusFilter, 'all'>
 }
@@ -77,19 +82,22 @@ type TasksSearch = {
 const taskOperationValues = new Set<string>(
   taskOperations.map((option) => option.value).filter((value) => value !== 'all')
 )
-const taskStatusValues = new Set<string>(taskStatuses.map((option) => option.value).filter((value) => value !== 'all'))
 
 export const Route = createFileRoute('/tasks')({
-  validateSearch: (search: Record<string, unknown>): TasksSearch => ({
-    type:
-      typeof search.type === 'string' && taskOperationValues.has(search.type)
-        ? (search.type as TasksSearch['type'])
-        : undefined,
-    status:
-      typeof search.status === 'string' && taskStatusValues.has(search.status)
-        ? (search.status as TasksSearch['status'])
-        : undefined,
-  }),
+  validateSearch: (search: Record<string, unknown>): TasksSearch => {
+    const scope = search.scope === 'history' ? 'history' : 'work'
+    return {
+      scope,
+      type:
+        typeof search.type === 'string' && taskOperationValues.has(search.type)
+          ? (search.type as TasksSearch['type'])
+          : undefined,
+      status:
+        typeof search.status === 'string' && taskStatusesForScope(scope).includes(search.status as TaskItem['status'])
+          ? (search.status as TasksSearch['status'])
+          : undefined,
+    }
+  },
   component: TasksPage,
 })
 
@@ -99,15 +107,22 @@ function TasksPage() {
   const queryClient = useQueryClient()
   const [cursor, setCursor] = useState<number>()
   const [cursorHistory, setCursorHistory] = useState<Array<number | undefined>>([])
+  const scope = search.scope ?? 'work'
   const taskType = search.type ?? ''
   const status = search.status ?? ''
-  const filterKey = `${taskType}:${status}`
+  const filterKey = `${scope}:${taskType}:${status}`
   const previousFilterKey = useRef(filterKey)
-  const tasks = useTasks(taskType, status, PAGE_SIZE, cursor)
+  const tasks = useTasks(
+    scope,
+    taskType,
+    status,
+    PAGE_SIZE,
+    previousFilterKey.current === filterKey ? cursor : undefined
+  )
   // What the operator is asked to confirm: the server's own count, the moment
   // it counted, and the operation it counted for. Confirming sends all three
   // back, so nothing that failed while the dialog was open is swept up.
-  const [dismissAllScope, setDismissAllScope] = useState<DismissAllScope | null>(null)
+  const [acknowledgeAllScope, setAcknowledgeAllScope] = useState<AcknowledgeAllScope | null>(null)
 
   useEffect(() => {
     if (previousFilterKey.current === filterKey) return
@@ -120,31 +135,30 @@ function TasksPage() {
     queryClient.invalidateQueries({ queryKey: ['tasks'] })
     queryClient.invalidateQueries({ queryKey: ['taskStats'] })
   }
-  const retry = useMutation({ mutationFn: api.retryTask, onSuccess: refreshTasks })
-  const retryReplica = useRetryStorageCopy()
+  const retry = useRetryTask()
   const acknowledge = useMutation({ mutationFn: api.acknowledgeTask, onSuccess: refreshTasks })
-  const previewDismissAll = useMutation({
+  const previewAcknowledgeAll = useMutation({
     mutationFn: api.previewAcknowledgeTasks,
-    onSuccess: (preview, variables) => setDismissAllScope({ ...preview, type: variables.type }),
+    onSuccess: (preview, variables) => setAcknowledgeAllScope({ ...preview, type: variables.type }),
   })
-  const dismissAll = useMutation({
+  const acknowledgeAll = useMutation({
     mutationFn: api.acknowledgeTasks,
     onSuccess: () => {
-      setDismissAllScope(null)
+      setAcknowledgeAllScope(null)
       refreshTasks()
     },
   })
-  const actionError = retryReplica.error ?? retry.error ?? acknowledge.error ?? previewDismissAll.error
+  const actionError = retry.error ?? acknowledge.error ?? previewAcknowledgeAll.error
 
-  const setFilters = (nextType: TaskOperationFilter, nextStatus: TaskStatusFilter) => {
+  const setFilters = (nextType: TaskOperationFilter, nextStatus: TaskStatusFilter, nextScope: TaskScope = scope) => {
     retry.reset()
-    retryReplica.reset()
     acknowledge.reset()
-    previewDismissAll.reset()
-    dismissAll.reset()
+    previewAcknowledgeAll.reset()
+    acknowledgeAll.reset()
     navigate({
       to: '/tasks',
       search: {
+        scope: nextScope,
         type: nextType === 'all' ? undefined : nextType,
         status: nextStatus === 'all' ? undefined : nextStatus,
       },
@@ -174,18 +188,18 @@ function TasksPage() {
         title="Tasks"
         actions={
           <div className="flex items-center gap-2">
-            {status === 'failed' && (
+            {scope === 'work' && status === 'failed' && (
               <Button
                 variant="outline"
                 size="sm"
-                disabled={!tasks.data?.tasks.length || previewDismissAll.isPending}
+                disabled={!tasks.data?.tasks.length || previewAcknowledgeAll.isPending}
                 onClick={() => {
-                  dismissAll.reset()
-                  previewDismissAll.mutate({ type: search.type })
+                  acknowledgeAll.reset()
+                  previewAcknowledgeAll.mutate({ type: search.type })
                 }}
               >
                 <X data-icon="inline-start" />
-                Dismiss all
+                Acknowledge all
               </Button>
             )}
             <Button variant="outline" size="sm" onClick={() => tasks.refetch()} disabled={tasks.isFetching}>
@@ -196,167 +210,174 @@ function TasksPage() {
         }
       />
 
-      <div className="flex flex-wrap items-end gap-3">
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="task-operation-filter">Operation</Label>
-          <Select
-            value={(search.type ?? 'all') as TaskOperationFilter}
-            onValueChange={(value) =>
-              setFilters(value as TaskOperationFilter, (search.status ?? 'all') as TaskStatusFilter)
-            }
-          >
-            <SelectTrigger id="task-operation-filter" className="w-64">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {taskOperations.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
+      <Tabs
+        value={scope}
+        onValueChange={(value) => setFilters(search.type ?? 'all', 'all', value as TaskScope)}
+        className="gap-6"
+      >
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <TabsList aria-label="Tasks" className="max-w-full justify-start overflow-x-auto">
+            <TabsTrigger value="work">Work</TabsTrigger>
+            <TabsTrigger value="history">History</TabsTrigger>
+          </TabsList>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="task-operation-filter" className="text-sm text-muted-foreground">
+                Operation
+              </Label>
+              <Select
+                value={(search.type ?? 'all') as TaskOperationFilter}
+                onValueChange={(value) =>
+                  setFilters(value as TaskOperationFilter, (search.status ?? 'all') as TaskStatusFilter)
+                }
+              >
+                <SelectTrigger id="task-operation-filter" className="w-52">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {taskOperations.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="task-status-filter" className="text-sm text-muted-foreground">
+                Status
+              </Label>
+              <Select
+                value={(search.status ?? 'all') as TaskStatusFilter}
+                onValueChange={(value) =>
+                  setFilters((search.type ?? 'all') as TaskOperationFilter, value as TaskStatusFilter)
+                }
+              >
+                <SelectTrigger id="task-status-filter" className="w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {taskStatuses
+                      .filter((option) => option.value === 'all' || taskStatusesForScope(scope).includes(option.value))
+                      .map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
         </div>
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="task-status-filter">Status</Label>
-          <Select
-            value={(search.status ?? 'all') as TaskStatusFilter}
-            onValueChange={(value) =>
-              setFilters((search.type ?? 'all') as TaskOperationFilter, value as TaskStatusFilter)
-            }
-          >
-            <SelectTrigger id="task-status-filter" className="w-44">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {taskStatuses.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
-      {actionError && (
-        <Alert variant="destructive">
-          <AlertTitle>Task action failed</AlertTitle>
-          <AlertDescription>
-            {retryReplica.error
-              ? retryReplica.error instanceof APIError && retryReplica.error.code
-                ? copyRetryBlockedLabel(retryReplica.error.code)
-                : 'Could not retry replica. Try again.'
-              : errorMessage(actionError)}
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {tasks.isLoading ? (
-        <TaskTableSkeleton />
-      ) : tasks.data?.tasks.length ? (
-        <>
-          <TaskTable
-            tasks={tasks.data.tasks}
-            retryingID={retry.isPending ? retry.variables : undefined}
-            retryingCopyID={retryReplica.isPending ? retryReplica.variables : undefined}
-            onRetryCopy={(id) => {
-              retry.reset()
-              acknowledge.reset()
-              retryReplica.mutate(id)
-            }}
-            acknowledgingID={acknowledge.isPending ? acknowledge.variables : undefined}
-            onRetry={(id) => {
-              retryReplica.reset()
-              acknowledge.reset()
-              retry.mutate(id)
-            }}
-            onAcknowledge={(id) => {
-              retryReplica.reset()
-              retry.reset()
-              acknowledge.mutate(id)
-            }}
-          />
-          {(cursorHistory.length > 0 || tasks.data.next_cursor) && (
-            <Pagination>
-              <PaginationContent>
-                <PaginationItem>
-                  <Button variant="outline" size="sm" onClick={previousPage} disabled={cursorHistory.length === 0}>
-                    <ChevronLeft data-icon="inline-start" />
-                    Previous
-                  </Button>
-                </PaginationItem>
-                <PaginationItem>
-                  <Button variant="outline" size="sm" onClick={nextPage} disabled={!tasks.data.next_cursor}>
-                    Next
-                    <ChevronRight data-icon="inline-end" />
-                  </Button>
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
+        <TabsContent value={scope} className="flex flex-col gap-6">
+          {actionError && (
+            <Alert variant="destructive">
+              <AlertTitle>Task action failed</AlertTitle>
+              <AlertDescription>
+                {retry.error ? taskRetryErrorMessage(retry.error) : errorMessage(actionError)}
+              </AlertDescription>
+            </Alert>
           )}
-        </>
-      ) : (
-        <Empty>
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <ListTodo />
-            </EmptyMedia>
-            <EmptyTitle>No tasks found</EmptyTitle>
-            <EmptyDescription>Try another operation or status filter.</EmptyDescription>
-          </EmptyHeader>
-        </Empty>
-      )}
+
+          {tasks.isLoading ? (
+            <TaskTableSkeleton />
+          ) : tasks.data?.tasks.length ? (
+            <>
+              <TaskTable
+                tasks={tasks.data.tasks}
+                retryingID={retry.isPending ? retry.variables : undefined}
+                acknowledgingID={acknowledge.isPending ? acknowledge.variables : undefined}
+                onRetry={(id) => {
+                  acknowledge.reset()
+                  retry.mutate(id)
+                }}
+                onAcknowledge={(id) => {
+                  retry.reset()
+                  acknowledge.mutate(id)
+                }}
+              />
+              {(cursorHistory.length > 0 || tasks.data.next_cursor) && (
+                <Pagination>
+                  <PaginationContent>
+                    <PaginationItem>
+                      <Button variant="outline" size="sm" onClick={previousPage} disabled={cursorHistory.length === 0}>
+                        <ChevronLeft data-icon="inline-start" />
+                        Previous
+                      </Button>
+                    </PaginationItem>
+                    <PaginationItem>
+                      <Button variant="outline" size="sm" onClick={nextPage} disabled={!tasks.data.next_cursor}>
+                        Next
+                        <ChevronRight data-icon="inline-end" />
+                      </Button>
+                    </PaginationItem>
+                  </PaginationContent>
+                </Pagination>
+              )}
+            </>
+          ) : (
+            <Empty>
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <ListTodo />
+                </EmptyMedia>
+                <EmptyTitle>No tasks found</EmptyTitle>
+                <EmptyDescription>Try another operation or status filter.</EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          )}
+        </TabsContent>
+      </Tabs>
 
       <DangerActionAlertDialog
-        open={dismissAllScope !== null}
+        open={acknowledgeAllScope !== null}
         onOpenChange={(open) => {
           if (open) return
-          dismissAll.reset()
-          setDismissAllScope(null)
+          acknowledgeAll.reset()
+          setAcknowledgeAllScope(null)
         }}
-        title="Dismiss failed tasks"
-        description={dismissAllDescription(dismissAllScope?.count ?? 0, dismissAllScope?.type)}
-        confirmLabel={dismissAllScope?.count === 1 ? 'Dismiss 1 task' : `Dismiss ${dismissAllScope?.count ?? 0} tasks`}
-        pending={dismissAll.isPending}
-        confirmDisabled={dismissAllScope?.count === 0}
-        error={dismissAll.error ? errorMessage(dismissAll.error) : null}
+        title="Acknowledge failed tasks"
+        description={acknowledgeAllDescription(acknowledgeAllScope?.count ?? 0, acknowledgeAllScope?.type)}
+        confirmLabel={
+          acknowledgeAllScope?.count === 1
+            ? 'Acknowledge 1 task'
+            : `Acknowledge ${acknowledgeAllScope?.count ?? 0} tasks`
+        }
+        pending={acknowledgeAll.isPending}
+        confirmDisabled={acknowledgeAllScope?.count === 0}
+        error={acknowledgeAll.error ? errorMessage(acknowledgeAll.error) : null}
         onConfirm={() => {
-          if (!dismissAllScope) return
-          dismissAll.mutate({ type: dismissAllScope.type, failed_before: dismissAllScope.as_of })
+          if (!acknowledgeAllScope) return
+          acknowledgeAll.mutate({ type: acknowledgeAllScope.type, failed_before: acknowledgeAllScope.as_of })
         }}
       />
     </div>
   )
 }
 
-type DismissAllScope = { count: number; as_of: string; type?: string }
+type AcknowledgeAllScope = { count: number; as_of: string; type?: string }
 
-function dismissAllDescription(count: number, operation?: string) {
+function acknowledgeAllDescription(count: number, operation?: string) {
   const label = operation ? (taskOperations.find((option) => option.value === operation)?.label ?? operation) : ''
   const scope = label ? ` for ${label}` : ''
-  if (count === 0) return `No failed tasks${scope} are left to dismiss.`
+  if (count === 0) return `No failed tasks${scope} are left to acknowledge.`
   const tasks = count === 1 ? '1 failed task' : `${count} failed tasks`
-  return `${tasks}${scope} will move to Dismissed and be removed after the retention period. Tasks that fail after you confirm stay in the list, and nothing is retried.`
+  return `${tasks}${scope} will move to History. Their results and Retry availability remain unchanged.`
 }
 
 function TaskTable({
   tasks,
   retryingID,
-  retryingCopyID,
-  onRetryCopy,
   acknowledgingID,
   onRetry,
   onAcknowledge,
 }: {
   tasks: TaskItem[]
   retryingID?: number
-  retryingCopyID?: number
-  onRetryCopy: (id: number) => void
   acknowledgingID?: number
   onRetry: (id: number) => void
   onAcknowledge: (id: number) => void
@@ -397,6 +418,7 @@ function TaskTable({
                   <StatusBadge tone={taskStatusTone(task.presentation_status)}>
                     {presentationLabels[task.presentation_status]}
                   </StatusBadge>
+                  {task.acknowledged_at && <span className="text-xs text-muted-foreground">Acknowledged</span>}
                   {task.retry_count > 0 && (
                     <span className="whitespace-nowrap text-xs text-muted-foreground">{taskRetriesLabel(task)}</span>
                   )}
@@ -416,49 +438,20 @@ function TaskTable({
               </TableCell>
               <TableCell className="px-4">
                 <div className="flex justify-end gap-2">
-                  {task.copy_retry?.available && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={
-                        retryingCopyID !== undefined || retryingID !== undefined || acknowledgingID !== undefined
-                      }
-                      onClick={() => {
-                        if (task.copy_retry) onRetryCopy(task.copy_retry.copy_id)
-                      }}
-                    >
-                      {retryingCopyID === task.copy_retry.copy_id ? (
-                        <Loader2 data-icon="inline-start" className="animate-spin" />
-                      ) : (
-                        <RotateCcw data-icon="inline-start" />
-                      )}
-                      Retry replica
-                    </Button>
-                  )}
-                  {task.retryable && !task.copy_retry?.available && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={
-                        retryingID !== undefined || acknowledgingID !== undefined || retryingCopyID !== undefined
-                      }
-                      onClick={() => onRetry(task.id)}
-                    >
-                      {retryingID === task.id ? (
-                        <Loader2 data-icon="inline-start" className="animate-spin" />
-                      ) : (
-                        <RotateCcw data-icon="inline-start" />
-                      )}
-                      {task.type === 'storage_store' ? 'Retry upload' : 'Recover'}
-                    </Button>
+                  <TaskDetailsDialog taskID={task.id} />
+                  {task.retryable && (
+                    <RetryButton
+                      taskID={task.retry_task_id}
+                      pending={retryingID === task.retry_task_id}
+                      disabled={retryingID !== undefined || acknowledgingID !== undefined}
+                      onRetry={onRetry}
+                    />
                   )}
                   {task.acknowledgeable && (
                     <Button
                       variant="ghost"
                       size="sm"
-                      disabled={
-                        retryingID !== undefined || acknowledgingID !== undefined || retryingCopyID !== undefined
-                      }
+                      disabled={retryingID !== undefined || acknowledgingID !== undefined}
                       onClick={() => onAcknowledge(task.id)}
                     >
                       {acknowledgingID === task.id ? (
@@ -466,7 +459,7 @@ function TaskTable({
                       ) : (
                         <X data-icon="inline-start" />
                       )}
-                      Dismiss
+                      Acknowledge
                     </Button>
                   )}
                 </div>
@@ -485,9 +478,6 @@ function TaskDetails({ task }: { task: TaskItem }) {
   const attention = confirmation ? storageConfirmationAttentionView(confirmation.reason_code) : undefined
   return (
     <div className="flex flex-col gap-1">
-      {task.copy_retry && !task.copy_retry.available && (
-        <span className="text-sm text-muted-foreground">{copyRetryBlockedLabel(task.copy_retry.reason_code)}</span>
-      )}
       {details.value ? (
         <CopyableValue value={details.value} label={details.label} displayValue={details.value} maxLength={80} />
       ) : !confirmation ? (
@@ -565,7 +555,7 @@ function TaskCreatedTime({ task }: { task: TaskItem }) {
 }
 
 function taskRetriesLabel(task: TaskItem) {
-  if (task.retry_limit !== undefined) return `${task.retry_count}/${task.retry_limit} retries`
+  if (task.max_attempts != null) return `${task.retry_count}/${task.max_attempts - 1} retries`
   return task.retry_count === 1 ? '1 retry' : `${task.retry_count} retries`
 }
 

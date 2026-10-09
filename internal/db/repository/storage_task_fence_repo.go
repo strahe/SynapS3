@@ -52,14 +52,19 @@ func (r *BunStorageContentRepo) BindCopyTask(ctx context.Context, copyID, genera
 	if copyID < 1 || generation < 1 || taskID < 1 {
 		return ErrInvalidInput
 	}
-	result, err := r.db.NewUpdate().
-		Model((*model.StorageCopy)(nil)).
-		Set("work_generation = ?", generation).
-		Set("active_task_id = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND work_generation = ? AND active_task_id IS NULL", copyID, generation-1).
-		Exec(ctx)
-	return requireTaskFenceRows(result, err, "binding storage copy task")
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		if err := validateCopyTaskBinding(ctx, db, copyID, generation, taskID); err != nil {
+			return err
+		}
+		result, err := db.NewUpdate().
+			Model((*model.StorageCopy)(nil)).
+			Set("work_generation = ?", generation).
+			Set("active_task_id = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ? AND work_generation = ? AND active_task_id IS NULL", copyID, generation-1).
+			Exec(ctx)
+		return requireTaskFenceRows(result, err, "binding storage copy task")
+	})
 }
 
 func (r *BunStorageContentRepo) AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error) {
@@ -175,14 +180,22 @@ func (r *BunStorageContentRepo) ReplaceCopyTask(ctx context.Context, copyID, gen
 	if copyID < 1 || generation < 1 || taskID < 1 || nextGeneration != generation+1 || nextTaskID < 1 {
 		return ErrInvalidInput
 	}
-	result, err := r.db.NewUpdate().
-		Model((*model.StorageCopy)(nil)).
-		Set("work_generation = ?", nextGeneration).
-		Set("active_task_id = ?", nextTaskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND work_generation = ? AND active_task_id = ?", copyID, generation, taskID).
-		Exec(ctx)
-	return requireTaskFenceRows(result, err, "advancing storage copy task")
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		if err := validateCopyTaskBinding(ctx, db, copyID, generation, taskID); err != nil {
+			return err
+		}
+		if err := validateCopyTaskBinding(ctx, db, copyID, nextGeneration, nextTaskID); err != nil {
+			return err
+		}
+		result, err := db.NewUpdate().
+			Model((*model.StorageCopy)(nil)).
+			Set("work_generation = ?", nextGeneration).
+			Set("active_task_id = ?", nextTaskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ? AND work_generation = ? AND active_task_id = ?", copyID, generation, taskID).
+			Exec(ctx)
+		return requireTaskFenceRows(result, err, "advancing storage copy task")
+	})
 }
 
 func (r *BunStorageContentRepo) CompleteCopyTask(ctx context.Context, copyID, generation, taskID int64) error {
@@ -266,21 +279,30 @@ func (r *BunStorageContentRepo) bindDataSetTask(ctx context.Context, dataSetID i
 	if err != nil {
 		return err
 	}
-	query := r.db.NewUpdate().
-		Model((*model.StorageDataSet)(nil)).
-		Set(fence.taskColumn+" = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", dataSetID).
-		Where(fence.taskColumn + " IS NULL")
-	if fence == dataSetEnsureFence {
-		query = query.Where("NOT " + dataSetCreationStoppedSQL("storage_data_set"))
-	}
-	if fenced {
-		query = query.Set(fence.generationColumn+" = ?", generation).
-			Where(fence.generationColumn+" = ?", generation-1)
-	}
-	result, err := query.Exec(ctx)
-	return requireTaskFenceRows(result, err, "binding data set task")
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		taskType := model.TaskTypeStorageDataSetEnsure
+		if fence == dataSetRetirementFence {
+			taskType = model.TaskTypeStorageDataSetRetire
+		}
+		if err := validateDataSetTaskBinding(ctx, db, dataSetID, generation, taskID, taskType); err != nil {
+			return err
+		}
+		query := db.NewUpdate().
+			Model((*model.StorageDataSet)(nil)).
+			Set(fence.taskColumn+" = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ?", dataSetID).
+			Where(fence.taskColumn + " IS NULL")
+		if fence == dataSetEnsureFence {
+			query = query.Where("NOT " + dataSetCreationStoppedSQL("storage_data_set"))
+		}
+		if fenced {
+			query = query.Set(fence.generationColumn+" = ?", generation).
+				Where(fence.generationColumn+" = ?", generation-1)
+		}
+		result, err := query.Exec(ctx)
+		return requireTaskFenceRows(result, err, "binding data set task")
+	})
 }
 
 func (r *BunStorageContentRepo) authorizeDataSetTask(ctx context.Context, dataSetID int64, fence dataSetFence, generation, taskID int64) (*model.StorageDataSet, error) {

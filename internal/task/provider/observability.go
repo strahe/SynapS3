@@ -40,8 +40,8 @@ func NewObservabilityHandler(deps ObservabilityDependencies) (*ObservabilityHand
 func (h *ObservabilityHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeObservabilityRefresh, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
-		RetryLimit: nil, AllowRetry: true,
+		Codec:  taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}
 	run := func(ctx context.Context, _ taskengine.Execution) taskengine.Result {
 		if h.deps.Observability == nil {
@@ -58,7 +58,7 @@ func (h *ObservabilityHandler) newHandler() *taskengine.FuncHandler {
 		if err := h.scheduleMissingProviderSpeedTests(ctx); err != nil {
 			return retryTask(err, "provider_speed_schedule_failed")
 		}
-		return taskengine.Suspend(model.TaskResumeModeExecute, h.deps.Observability.RefreshInterval(), "scheduled", "Storage health refreshed", nil)
+		return taskengine.CompleteCycle(h.deps.Observability.RefreshInterval(), "Storage health refreshed", nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }

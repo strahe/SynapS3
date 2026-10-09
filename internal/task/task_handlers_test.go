@@ -61,17 +61,18 @@ const (
 )
 
 type handlerTestRuntime struct {
-	db          *bun.DB
-	repos       *repository.Repositories
-	cache       cache.Cache
-	gate        *cacheaccess.Gate
-	tracker     *cacheaccess.Tracker
-	storage     *testutil.MockStorageClient
-	ready       *taskengine.Messenger
-	entryPoints task.EntryPoints
-	registry    *taskengine.Registry
-	service     *taskengine.Service
-	engine      *taskengine.Engine
+	db              *bun.DB
+	repos           *repository.Repositories
+	cache           cache.Cache
+	gate            *cacheaccess.Gate
+	tracker         *cacheaccess.Tracker
+	storage         *testutil.MockStorageClient
+	ready           *taskengine.Messenger
+	entryPoints     task.EntryPoints
+	registry        *taskengine.Registry
+	service         *taskengine.Service
+	engine          *taskengine.Engine
+	testMaxAttempts *int
 }
 
 type handlerRuntimeOptions struct {
@@ -101,7 +102,7 @@ type handlerRuntimeOptions struct {
 	highPercent          int
 	lowPercent           int
 	concurrency          int
-	maxRetries           *int
+	maxAttempts          *int
 	leaseDuration        time.Duration
 	observabilityChecker observability.RefreshChecker
 	retireOnly           bool
@@ -130,10 +131,6 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	gate := cacheaccess.NewGate()
 	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
-	maxRetries := 5
-	if options.maxRetries != nil {
-		maxRetries = *options.maxRetries
-	}
 	observabilityService := observability.NewService(observability.ServiceOptions{Store: repos.Observability})
 	if options.observabilityChecker != nil {
 		observabilityService = observability.NewService(observability.ServiceOptions{
@@ -148,7 +145,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		logger = slog.Default()
 	}
 	registry := taskengine.NewRegistry()
-	service, err := taskengine.NewService(registry, repos, time.Hour)
+	service, err := taskengine.NewService(registry, repos)
 	if err != nil {
 		t.Fatalf("new task service: %v", err)
 	}
@@ -157,7 +154,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	if options.retireOnly {
 		handler, err := dataset.NewRetireHandler(dataset.RetireDependencies{
 			Repositories: repos, Terminator: options.terminator, Epochs: options.epochs,
-			MaxRetries: maxRetries, Logger: logger,
+			Logger: logger,
 		})
 		if err != nil {
 			t.Fatalf("new retirement handler: %v", err)
@@ -181,7 +178,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 			Observability: observabilityService, UploadSpeedProbe: options.uploadSpeedProbe,
 			EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 			LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
-			DefaultCopies: 2, MaxRetries: maxRetries, Logger: logger,
+			DefaultCopies: 2, Logger: logger,
 			CommitMaxWait:             options.commitMaxWait,
 			CommitMaxPieces:           options.commitMaxPieces,
 			CommitSealOnCachePressure: options.commitSealOnCachePressure,
@@ -202,14 +199,14 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
-		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, repos, registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new task engine: %v", err)
 	}
 	return handlerTestRuntime{
 		db: db, repos: repos, cache: cacheStore, gate: gate, tracker: tracker,
-		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, engine: engine,
+		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, engine: engine, testMaxAttempts: options.maxAttempts,
 	}
 }
 
@@ -286,8 +283,132 @@ func (c testReceiptChecker) TransactionReceipt(ctx context.Context, hash common.
 	return c.check(ctx, hash)
 }
 
+func taskTestMaxAttempts(retries *int) *int {
+	if retries == nil {
+		return nil
+	}
+	return new(*retries + 1)
+}
+
+func handlerTaskMaxAttempts(t *testing.T, row *model.Task) int {
+	t.Helper()
+	policy, err := taskengine.DecodePolicy(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy.MaxAttempts
+}
+
+func handlerTaskRetryable(t *testing.T, runtime handlerTestRuntime, row *model.Task) bool {
+	t.Helper()
+	eligible, err := runtime.service.RetryableContext(t.Context(), row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return eligible
+}
+
+func handlerTaskFixture(t *testing.T, runtime handlerTestRuntime, row *model.Task) *model.Task {
+	t.Helper()
+	definition, ok := runtime.registry.Definition(row.Type)
+	if !ok {
+		definition.Policy = taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}
+	}
+	if definition.Subject != nil && row.SubjectType == nil && row.SubjectKey == nil {
+		subject, err := definition.Subject(row.Input)
+		if err == nil {
+			row.SubjectType, row.SubjectKey = &subject.Type, &subject.Key
+		}
+	}
+	var err error
+	row.Policy, err = json.Marshal(map[string]any{"version": 2, "max_attempts": definition.Policy.MaxAttempts, "backoff": definition.Policy.Backoff, "invocation_timeout": definition.Policy.InvocationTimeout, "observation_window": definition.Policy.ObservationWindow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func settleHandlerTaskFixture(t *testing.T, runtime handlerTestRuntime, taskID int64, status model.TaskStatus, reason *string) {
+	t.Helper()
+	row, err := runtime.repos.Tasks.GetByID(t.Context(), taskID)
+	if err != nil || row == nil {
+		t.Fatalf("get task for fixture settlement: %v", err)
+	}
+	generation := row.ClaimGeneration + 1
+	now := time.Now()
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusRunning).Set("claim_generation = ?", generation).
+		Set("claimed_at = ?", now).Set("lease_until = ?", now.Add(time.Minute)).Set("started_at = ?", now).
+		Where("id = ?", taskID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.repos.Tasks.Settle(t.Context(), taskID, generation, repository.TaskTransition{Status: status, ResumeMode: model.TaskResumeModeRecover, FailureReason: reason}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func ageHandlerOperation(t *testing.T, runtime handlerTestRuntime, taskID int64, age time.Duration) {
+	t.Helper()
+	row, err := runtime.repos.Tasks.GetByID(t.Context(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(row.Runtime, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["operation_key"] == nil || state["operation_key"] == "" {
+		t.Fatal("operation observation has not started")
+	}
+	state["operation_started_at"] = time.Now().UTC().Add(-age)
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("runtime_json = ?", json.RawMessage(raw)).Where("id = ?", taskID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func prepareHandlerTaskFixtures(t *testing.T, runtime handlerTestRuntime) {
+	t.Helper()
+	before := int64(0)
+	for {
+		page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{Status: model.TaskStatusPending, BeforeID: before, Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range page.Tasks {
+			var snapshot map[string]json.RawMessage
+			if err := json.Unmarshal(row.Policy, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if runtime.testMaxAttempts != nil && row.RetryCount < *runtime.testMaxAttempts {
+				snapshot["max_attempts"] = json.RawMessage(fmt.Sprint(*runtime.testMaxAttempts))
+			}
+			backoff, err := json.Marshal(taskengine.BackoffPolicy{InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot["backoff"] = backoff
+			raw, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("policy_json = ?", json.RawMessage(raw)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if page.NextBeforeID == 0 {
+			return
+		}
+		before = page.NextBeforeID
+	}
+}
+
 func runHandlerEngine(t *testing.T, runtime handlerTestRuntime) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
+	prepareHandlerTaskFixtures(t, runtime)
 	return runEngine(t, runtime.engine)
 }
 
@@ -330,11 +451,12 @@ func waitForTask(t *testing.T, repos *repository.Repositories, id int64, predica
 		time.Sleep(5 * time.Millisecond)
 	}
 	row, _ := repos.Tasks.GetByID(t.Context(), id)
-	t.Fatalf("task %d did not reach expected state: status=%s resume=%s reason=%s error=%s",
+	t.Fatalf("task %d did not reach expected state: status=%s resume=%s reason=%s error=%s message=%s",
 		id, taskField(row, func(r *model.Task) *string { s := string(r.Status); return &s }),
 		taskField(row, func(r *model.Task) *string { s := string(r.ResumeMode); return &s }),
 		taskField(row, func(r *model.Task) *string { return r.FailureReason }),
-		taskField(row, func(r *model.Task) *string { return r.LastError }))
+		taskField(row, func(r *model.Task) *string { return r.LastError }),
+		taskField(row, func(r *model.Task) *string { return r.StatusMessage }))
 	return nil
 }
 
@@ -669,7 +791,7 @@ func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 	failedTask := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if !runtime.service.Retryable(failedTask) || len(failedTask.Checkpoint) == 0 {
+	if !handlerTaskRetryable(t, runtime, failedTask) || len(failedTask.Checkpoint) == 0 {
 		t.Fatal("Store result failure lost its recovery checkpoint")
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(ctx, copies[0].ID)
@@ -899,17 +1021,16 @@ func TestStorageCleanupKeepsCheckingScheduledDeletionBeforeDeadline(t *testing.T
 
 func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 	for _, tc := range []struct {
-		name                   string
-		withHash               bool
-		missingTime            bool
-		wantMissingTimeMessage bool
-		recentScheduled        bool
-		recentOtherCheckpoint  bool
+		name                  string
+		withHash              bool
+		missingTime           bool
+		recentScheduled       bool
+		recentOtherCheckpoint bool
 	}{
 		{name: "checkpoint takes precedence over recent scheduled time", withHash: true, recentScheduled: true},
 		{name: "scheduled time is fallback", withHash: true, missingTime: true},
 		{name: "unrecorded request"},
-		{name: "checkpoint without timestamp", missingTime: true, wantMissingTimeMessage: true},
+		{name: "checkpoint without timestamp", missingTime: true},
 		{name: "another copy checkpoint is ignored", withHash: true, recentOtherCheckpoint: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -966,8 +1087,8 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode cleanup checkpoint: %v", err)
 			}
-			if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-				Set("checkpoint_json = ?", encodedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("checkpoint_json = ?", encodedCheckpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 				t.Fatalf("set cleanup checkpoint: %v", err)
 			}
 			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
@@ -977,8 +1098,9 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+				return task.Status == model.TaskStatusPending && task.ClaimGeneration > 0
 			})
+			ageHandlerOperation(t, runtime, taskRow.ID, 25*time.Hour)
 			pieceQueued.Store(false)
 			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
 				Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
@@ -988,18 +1110,14 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 				return task.Status == model.TaskStatusFailed
 			})
 			if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" ||
-				!runtime.service.Retryable(failed) || deleteCalls.Load() != 0 {
+				!handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 0 {
 				t.Fatalf("timed-out cleanup = %#v, delete calls = %d", failed, deleteCalls.Load())
 			}
 			if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
 				t.Fatalf("timed-out cleanup details = %v", failed.LastError)
 			}
-			if tc.wantMissingTimeMessage {
-				if strings.Contains(*failed.LastError, "after 24 hours") {
-					t.Fatalf("missing-time cleanup claims a completed wait: %q", *failed.LastError)
-				}
-			} else if !strings.Contains(*failed.LastError, "after 24 hours") {
-				t.Fatalf("timed-out cleanup omits the elapsed wait: %q", *failed.LastError)
+			if !strings.Contains(*failed.LastError, "after 24 hours") {
+				t.Fatalf("timed-out cleanup omits the elapsed operation observation: %q", *failed.LastError)
 			}
 			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
 				t.Fatalf("reload cleanup copy: %v", err)
@@ -1007,8 +1125,12 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 			if copyRow.Status != model.StorageCleanupCopyStatusFailed {
 				t.Fatalf("timed-out cleanup copy = %#v", copyRow)
 			}
-			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-				t.Fatalf("retry timed-out cleanup: %v", err)
+			{
+				var retryErr error
+				taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+				if retryErr != nil {
+					t.Fatalf("retry timed-out cleanup: %v", retryErr)
+				}
 			}
 			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				return deleteCalls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
@@ -1050,7 +1172,7 @@ func TestStorageCleanupConfirmsRemovalAfterDeadline(t *testing.T) {
 	})
 }
 
-func TestStorageCleanupWaitsWhenDataSetIsNotLive(t *testing.T) {
+func TestStorageCleanupObservationErrorsExhaustWithEvidenceRetained(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: removedPieceStorageClient(),
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
@@ -1073,8 +1195,7 @@ func TestStorageCleanupWaitsWhenDataSetIsNotLive(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
-			task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+		return task.Status == model.TaskStatusFailed && task.FailureReason != nil && *task.FailureReason == "attempts_exhausted"
 	})
 	copyRows, err = runtime.repos.StorageCleanup.AuthorizeTask(ctx, content.ID, 1, taskRow.ID)
 	if err != nil || len(copyRows) != 1 || copyRows[0].Status != model.StorageCleanupCopyStatusDeleteScheduled {
@@ -1170,14 +1291,18 @@ func TestStorageCleanupReissuesOnlyAfterConfirmedFailureAndManualRetry(t *testin
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_transaction_reverted" || !runtime.service.Retryable(failed) || deleteCalls.Load() != 0 {
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_transaction_reverted" || !handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 0 {
 		t.Fatalf("confirmed failure task = %#v, delete calls = %d", failed, deleteCalls.Load())
 	}
 	if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
 		t.Fatalf("confirmed failure details = %v", failed.LastError)
 	}
-	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-		t.Fatalf("retry confirmed failure: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry confirmed failure: %v", retryErr)
+		}
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 3 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
@@ -1277,21 +1402,24 @@ func TestStorageCleanupManualRetryWithoutHashDoesNotAutomaticallyResend(t *testi
 		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("prepare failed cleanup task: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
 		Set("checkpoint_json = ?", checkpoint).
-		Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("record unconfirmed retry checkpoint: %v", err)
 	}
-	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-		t.Fatalf("retry failed cleanup: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry failed cleanup: %v", retryErr)
+		}
 	}
 	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3}
 	runtime.repos.Tasks = limited
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
-			task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+	firstWait := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.ClaimGeneration > 0 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("manual retry sent %d deletion requests, want one", deleteCalls.Load())
@@ -1301,7 +1429,7 @@ func TestStorageCleanupManualRetryWithoutHashDoesNotAutomaticallyResend(t *testi
 		t.Fatalf("advance cleanup poll: %v", err)
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 3 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+		return task.ClaimGeneration > firstWait.ClaimGeneration && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("automatic recovery sent %d deletion requests, want one", deleteCalls.Load())
@@ -1351,8 +1479,8 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode old retry checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-		Set("checkpoint_json = ?", checkpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("checkpoint_json = ?", checkpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("record old retry checkpoint: %v", err)
 	}
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
@@ -1364,7 +1492,7 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending
 	})
 	if deleteCalls.Load() != 0 {
 		t.Fatalf("old unrecorded retry sent %d duplicate requests", deleteCalls.Load())
@@ -1379,10 +1507,11 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode aged retry checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-		Set("checkpoint_json = ?", agedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("checkpoint_json = ?", agedCheckpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("age old retry checkpoint: %v", err)
 	}
+	ageHandlerOperation(t, runtime, taskRow.ID, 25*time.Hour)
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
 		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("advance old retry poll: %v", err)
@@ -1390,14 +1519,18 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !runtime.service.Retryable(failed) || deleteCalls.Load() != 0 {
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 0 {
 		t.Fatalf("old retry deadline = %#v, delete calls = %d", failed, deleteCalls.Load())
 	}
-	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-		t.Fatalf("retry timed-out old request: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry timed-out old request: %v", retryErr)
+		}
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 4 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+		return task.ClaimGeneration > 0 && deleteCalls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("manual retry sent %d deletion requests, want one", deleteCalls.Load())
@@ -1435,8 +1568,12 @@ func TestStorageCleanupLegacyFailedCopyWithoutHashCanRetry(t *testing.T) {
 		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("prepare failed cleanup task: %v", err)
 	}
-	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-		t.Fatalf("retry legacy cleanup: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry legacy cleanup: %v", retryErr)
+		}
 	}
 	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
 	runtime.repos.Tasks = limited
@@ -1492,8 +1629,12 @@ func TestStorageCleanupManualRetryChecksChainBeforeSending(t *testing.T) {
 				Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 				t.Fatalf("prepare failed cleanup task: %v", err)
 			}
-			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-				t.Fatalf("retry cleanup: %v", err)
+			{
+				var retryErr error
+				taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+				if retryErr != nil {
+					t.Fatalf("retry cleanup: %v", retryErr)
+				}
 			}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
@@ -1518,14 +1659,14 @@ func TestStorageCleanupManualRetryCheckpointFailureDoesNotSend(t *testing.T) {
 		{name: "ledger reset", trigger: `CREATE TRIGGER fail_cleanup_retry BEFORE UPDATE OF status ON storage_cleanup_copies
 			WHEN OLD.status = 'failed' AND NEW.status = 'pending'
 			BEGIN SELECT RAISE(FAIL, 'injected cleanup retry failure'); END`},
-		{name: "checkpoint write", trigger: `CREATE TRIGGER fail_cleanup_checkpoint BEFORE UPDATE OF checkpoint_json ON task_payloads
+		{name: "checkpoint write", trigger: `CREATE TRIGGER fail_cleanup_checkpoint BEFORE UPDATE OF checkpoint_json ON tasks
 			BEGIN SELECT RAISE(FAIL, 'injected checkpoint failure'); END`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			noRetries := 0
 			var deleteCalls atomic.Int64
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-				maxRetries: &noRetries,
+				maxAttempts: taskTestMaxAttempts(&noRetries),
 				storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 					return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 						deleteCalls.Add(1)
@@ -1556,15 +1697,19 @@ func TestStorageCleanupManualRetryCheckpointFailureDoesNotSend(t *testing.T) {
 			if _, err := runtime.db.ExecContext(ctx, tc.trigger); err != nil {
 				t.Fatalf("install fault trigger: %v", err)
 			}
-			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-				t.Fatalf("retry cleanup: %v", err)
+			{
+				var retryErr error
+				taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+				if retryErr != nil {
+					t.Fatalf("retry cleanup: %v", retryErr)
+				}
 			}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				return task.Status == model.TaskStatusFailed
 			})
-			if failed.FailureReason == nil || *failed.FailureReason != "cleanup_not_started" || len(failed.Checkpoint) != 0 || deleteCalls.Load() != 0 {
+			if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || len(failed.Checkpoint) != 0 || deleteCalls.Load() != 0 {
 				t.Fatalf("failed pre-request settlement = %#v, delete calls = %d", failed, deleteCalls.Load())
 			}
 			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
@@ -1622,10 +1767,11 @@ func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode aged checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-		Set("checkpoint_json = ?", agedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("checkpoint_json = ?", agedCheckpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("age cleanup checkpoint: %v", err)
 	}
+	ageHandlerOperation(t, runtime, taskRow.ID, 25*time.Hour)
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
 		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("advance cleanup poll: %v", err)
@@ -1633,7 +1779,7 @@ func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !runtime.service.Retryable(failed) || deleteCalls.Load() != 1 {
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 1 {
 		t.Fatalf("unrecorded hash outcome = %#v, delete calls = %d", failed, deleteCalls.Load())
 	}
 }
@@ -1769,7 +1915,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 			return cleanupContext, nil
 		},
 	}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, maxRetries: &noRetries, deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, maxAttempts: taskTestMaxAttempts(&noRetries), deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
 		return synapse.CleanupPieceState{Live: true}, nil
 	}})
 	bucket := &model.Bucket{Name: "cleanup-admission", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
@@ -1825,7 +1971,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, failed) || len(failed.Checkpoint) != 0 {
 		t.Fatalf("cleanup admission task = %#v", failed)
 	}
 	copies, err := runtime.repos.StorageCleanup.AuthorizeTask(t.Context(), content.ID, 1, taskRow.ID)
@@ -1837,7 +1983,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	}
 }
 
-func TestCacheCapacityTaskStaysPendingWhenLRUDisabled(t *testing.T) {
+func TestCacheCapacityWaitsWhenLRUDisabled(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
 	planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
 		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
@@ -1850,11 +1996,10 @@ func TestCacheCapacityTaskStaysPendingWhenLRUDisabled(t *testing.T) {
 	defer stopHandlerEngine(t, cancel, done)
 
 	stored := waitForTask(t, runtime.repos, planner.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.StatusMessage != nil &&
-			*task.StatusMessage == "Automatic cache cleanup is disabled"
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "scheduled"
 	})
-	if stored.FinishedAt != nil || stored.RetentionUntil != nil || stored.RetryCount != 0 {
-		t.Fatalf("disabled recurring task became terminal: %#v", stored)
+	if stored.FinishedAt != nil || stored.RetryCount != 0 || stored.AvailableAt.Before(time.Now().Add(59*time.Minute)) {
+		t.Fatalf("disabled recurring round did not wait: %#v", stored)
 	}
 	same, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
 		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
@@ -1929,7 +2074,7 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
 			}
 			if tt.failCheckpoint {
-				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER fail_capacity_checkpoint BEFORE UPDATE OF checkpoint_json ON task_payloads
+				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER fail_capacity_checkpoint BEFORE UPDATE OF checkpoint_json ON tasks
 					BEGIN SELECT RAISE(FAIL, 'injected checkpoint failure'); END`); err != nil {
 					t.Fatalf("install checkpoint fault: %v", err)
 				}
@@ -1976,7 +2121,7 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				}
 			}
 			page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{
-				Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
+				Scope: repository.TaskScopeHistory, Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
 			})
 			if err != nil || len(page.Tasks) != tt.wantEvicted {
 				t.Fatalf("completed cache tasks = %#v, err=%v", page.Tasks, err)
@@ -2030,7 +2175,7 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstPass, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -2198,7 +2343,7 @@ func TestCacheEvictionRecoverCancelsAfterNewGenerationCompletes(t *testing.T) {
 	}
 }
 
-func TestCacheEvictionPersistentDeleteFailureReleasesOwner(t *testing.T) {
+func TestCacheEvictionPersistentDeleteFailureRetainsOwner(t *testing.T) {
 	for _, failRecord := range []bool{false, true} {
 		t.Run(fmt.Sprintf("record failure=%v", failRecord), func(t *testing.T) {
 			deleteErr := errors.New("cache deletion failed")
@@ -2212,7 +2357,7 @@ func TestCacheEvictionPersistentDeleteFailureReleasesOwner(t *testing.T) {
 			}
 			noRetries := 0
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-				cache: cacheStore, policy: cache.EvictionPolicyNone, maxRetries: &noRetries,
+				cache: cacheStore, policy: cache.EvictionPolicyNone, maxAttempts: taskTestMaxAttempts(&noRetries),
 			})
 			version := seedStoredCacheObject(t, runtime, 11, time.Now().UTC().Add(-time.Hour))
 			contentID := *version.ContentID
@@ -2243,8 +2388,8 @@ func TestCacheEvictionPersistentDeleteFailureReleasesOwner(t *testing.T) {
 			stored := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				return task.Status == model.TaskStatusFailed
 			})
-			if stored.FailureReason == nil || *stored.FailureReason != "cache_delete_failed" {
-				t.Fatalf("failure reason = %v, want cache_delete_failed", stored.FailureReason)
+			if stored.FailureReason == nil || *stored.FailureReason != "attempts_exhausted" {
+				t.Fatalf("failure reason = %v, want attempts_exhausted", stored.FailureReason)
 			}
 			if stored.LastError == nil || !strings.Contains(*stored.LastError, deleteErr.Error()) {
 				t.Fatalf("last error = %v, want %q", stored.LastError, deleteErr)
@@ -2256,8 +2401,8 @@ func TestCacheEvictionPersistentDeleteFailureReleasesOwner(t *testing.T) {
 			if err != nil || entry == nil {
 				t.Fatalf("load cache entry after failed eviction = %#v, err=%v", entry, err)
 			}
-			if entry.CacheActiveTaskID != nil || !entry.InCache {
-				t.Fatalf("cache entry after failed eviction = %#v, want released owner and retained cache", entry)
+			if entry.CacheActiveTaskID == nil || *entry.CacheActiveTaskID != taskRow.ID || !entry.InCache {
+				t.Fatalf("cache entry after failed eviction = %#v, want retained owner and cache", entry)
 			}
 		})
 	}
@@ -2575,7 +2720,7 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-				Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+				ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 			}, &limitedRepos, runtime.registry, slog.Default())
 			if err != nil {
 				t.Fatal(err)
@@ -2745,7 +2890,7 @@ func TestBucketProvisionCreatesDataSetsBeforeMarkingReady(t *testing.T) {
 	}
 }
 
-func TestStoragePlanningWaitsKeepErrors(t *testing.T) {
+func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T) {
 	selectionErr := &synapse.NoProviderCandidatesError{Cause: errors.Join(
 		storage.ErrNoHealthyProviders,
 		fmt.Errorf("provider 2: GET https://provider.example/pdp/ping?token=secret-token: %w: provider.example resolves to 198.18.0.1", storage.ErrPrivateNetwork),
@@ -2838,13 +2983,13 @@ func TestStoragePlanningWaitsKeepErrors(t *testing.T) {
 				cancel, done := runHandlerEngine(t, runtime)
 				defer stopHandlerEngine(t, cancel, done)
 				waiting := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-					return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == phase.reason
+					return task.Status == model.TaskStatusPending && task.ClaimGeneration == 1 && task.LastError != nil
 				})
 				wantError := synapse.ErrorSummary(phase.err)
 				if waiting.LastError == nil || *waiting.LastError != wantError {
 					t.Fatalf("waiting task last_error = %v, want %q", waiting.LastError, wantError)
 				}
-				if waiting.RetryCount != 0 || waiting.ResumeMode != model.TaskResumeModeExecute || waiting.AvailableAt.Before(time.Now().Add(45*time.Second)) {
+				if waiting.RetryCount != 1 || waiting.ResumeMode != model.TaskResumeModeExecute {
 					t.Fatalf("waiting task changed retry behavior: %#v", waiting)
 				}
 				logged, err := os.ReadFile(logFile.Name())
@@ -3073,7 +3218,7 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: storageClient, maxRetries: &noRetries,
+		storage: storageClient, maxAttempts: taskTestMaxAttempts(&noRetries),
 	})
 	bucket := &model.Bucket{Name: "data-set-admission", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
@@ -3104,7 +3249,7 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "dataset_creation_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, failed) || len(failed.Checkpoint) != 0 {
 		t.Fatalf("data set admission task = %#v", failed)
 	}
 	stored, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), binding.ID)
@@ -3114,8 +3259,12 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	if createCalls.Load() != 0 {
 		t.Fatalf("data set creation after admission failure = %d calls", createCalls.Load())
 	}
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatalf("retry data set admission task: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(t.Context(), taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry data set admission task: %v", retryErr)
+		}
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
@@ -3125,7 +3274,7 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	}
 }
 
-func TestTaskGCLeavesStorageEvidenceIntact(t *testing.T) {
+func TestTaskHistorySurvivesReleasedStorageOwner(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		policy: cache.EvictionPolicyNone,
 	})
@@ -3138,18 +3287,13 @@ func TestTaskGCLeavesStorageEvidenceIntact(t *testing.T) {
 	if err := runtime.repos.Contents.CompleteCopyTask(t.Context(), pipeline.target.ID, pipeline.target.WorkGeneration+1, taskRow.ID); err != nil {
 		t.Fatalf("clear copy task fence: %v", err)
 	}
-	retentionUntil := time.Now().Add(-time.Minute)
 	if err := runtime.repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: &retentionUntil,
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover,
 	}); err != nil {
 		t.Fatalf("complete retained task: %v", err)
 	}
-	deleted, err := runtime.repos.Tasks.DeleteRetained(t.Context(), time.Now(), 10)
-	if err != nil || deleted != 1 {
-		t.Fatalf("delete retained tasks = %d, err=%v", deleted, err)
-	}
-	if stored, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID); err != nil || stored != nil {
-		t.Fatalf("collected task = %#v, err=%v", stored, err)
+	if stored, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID); err != nil || stored == nil || stored.Status != model.TaskStatusCompleted || len(stored.Input) == 0 {
+		t.Fatalf("saved task history = %#v, err=%v", stored, err)
 	}
 	if upload, err := runtime.repos.Contents.GetByID(t.Context(), pipeline.upload.ID); err != nil || upload == nil {
 		t.Fatalf("storage upload evidence = %#v, err=%v", upload, err)
@@ -3291,7 +3435,7 @@ func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
 	}
 	storageClient := &testutil.MockStorageClient{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		cache: cacheStore, storage: storageClient, maxRetries: &noRetries,
+		cache: cacheStore, storage: storageClient, maxAttempts: taskTestMaxAttempts(&noRetries),
 	})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
@@ -3312,7 +3456,7 @@ func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "store_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, failed) || len(failed.Checkpoint) != 0 {
 		t.Fatalf("store admission task = %#v", failed)
 	}
 	if failed.WorkStartedAt != nil {
@@ -3325,48 +3469,18 @@ func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
 	if storeCalls.Load() != 0 || cacheOpens.Load() != 0 {
 		t.Fatalf("store admission calls = store:%d cache:%d, want 0/0", storeCalls.Load(), cacheOpens.Load())
 	}
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatalf("retry store admission task: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(t.Context(), taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry store admission task: %v", retryErr)
+		}
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
 	})
 	if storeCalls.Load() != 0 || cacheOpens.Load() != 0 {
 		t.Fatalf("store recovery calls = store:%d cache:%d, want no new calls", storeCalls.Load(), cacheOpens.Load())
-	}
-}
-
-func TestStoreManualRetryRequiresUnsettledRecoveryEvidence(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	checkpoint := json.RawMessage(`{"attempted_at":"2026-09-09T00:00:00Z"}`)
-	tests := []struct {
-		name       string
-		reason     string
-		checkpoint json.RawMessage
-		want       bool
-	}{
-		{name: "not started", reason: "store_not_started", want: true},
-		{name: "not started with checkpoint", reason: "store_not_started", checkpoint: checkpoint},
-		{name: "unknown outcome", reason: "store_outcome_unknown", checkpoint: checkpoint, want: true},
-		{name: "unknown outcome without checkpoint", reason: "store_outcome_unknown"},
-		{name: "checkpointed context failure", reason: "copy_context_failed", checkpoint: checkpoint, want: true},
-		{name: "checkpointed owner missing", reason: "copy_owner_missing", checkpoint: checkpoint, want: true},
-		{name: "context failure before checkpoint", reason: "copy_context_failed"},
-		{name: "invalid checkpoint", reason: "invalid_checkpoint", checkpoint: checkpoint},
-		{name: "store result failure", reason: "store_result_invalid", checkpoint: checkpoint, want: true},
-		{name: "presign failure", reason: "commit_presign_failed", checkpoint: checkpoint, want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reason := tt.reason
-			taskRow := &model.Task{
-				Type: model.TaskTypeStorageStore, Status: model.TaskStatusFailed,
-				FailureReason: &reason, Checkpoint: tt.checkpoint,
-			}
-			if got := runtime.service.Retryable(taskRow); got != tt.want {
-				t.Fatalf("Retryable() = %t, want %t", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -3462,13 +3576,13 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 	parkedState.Store(synapse.ParkedPieceProcessing)
 	wakeTask(t, runtime, taskRow.ID)
 	processing := runOneStorageTask(t, runtime, recovering, model.TaskStatusPending)
-	if processing.ResumeMode != model.TaskResumeModeRecover || processing.RetryCount != 0 || storeCalls.Load() != 1 {
+	if processing.ResumeMode != model.TaskResumeModeRecover || processing.RetryCount != 1 || storeCalls.Load() != 1 {
 		t.Fatalf("processing recovery = %#v calls:%d, want recovery without retransmission", processing, storeCalls.Load())
 	}
 	parkedError.Store(true)
 	wakeTask(t, runtime, taskRow.ID)
 	lookupFailed := runOneStorageTask(t, runtime, processing, model.TaskStatusPending)
-	if lookupFailed.ResumeMode != model.TaskResumeModeRecover || lookupFailed.RetryCount != 0 || storeCalls.Load() != 1 {
+	if lookupFailed.ResumeMode != model.TaskResumeModeRecover || lookupFailed.RetryCount != 2 || storeCalls.Load() != 1 {
 		t.Fatalf("failed lookup recovery = %#v calls:%d, want recovery without retransmission", lookupFailed, storeCalls.Load())
 	}
 	parkedError.Store(false)
@@ -3478,7 +3592,7 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode old store checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, checkpointJSON, taskRow.ID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, checkpointJSON, taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("age store checkpoint: %v", err)
 	}
 	wakeTask(t, runtime, taskRow.ID)
@@ -3488,8 +3602,8 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 	}
 	wakeTask(t, runtime, taskRow.ID)
 	retrying := runOneStorageTask(t, runtime, replayable, model.TaskStatusPending)
-	if retrying.ResumeMode != model.TaskResumeModeRecover || retrying.RetryCount != 1 || storeCalls.Load() != 2 {
-		t.Fatalf("retransmitted store = retry count:%d calls:%d, want 1/2", retrying.RetryCount, storeCalls.Load())
+	if retrying.ResumeMode != model.TaskResumeModeRecover || retrying.RetryCount != 3 || storeCalls.Load() != 2 {
+		t.Fatalf("retransmitted store = retry count:%d calls:%d, want 3/2", retrying.RetryCount, storeCalls.Load())
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID {
@@ -3577,7 +3691,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	limitedRepos.Tasks = limited
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -3611,7 +3725,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 		t.Fatalf("Commit requests before Pull completes = %d, %v", count, err)
 	}
 	if lostCheckpoint {
-		if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("checkpoint_json = NULL").Where("task_id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+		if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = NULL").Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3632,7 +3746,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	completed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
 	})
-	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(attempt.AttemptedAt) {
+	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(attempt.AttemptedAt) {
 		t.Fatalf("pull recovery start = %v, want %v", completed.WorkStartedAt, attempt.AttemptedAt)
 	}
 	if pullCalls.Load() != 2 || presignCalls.Load() != 1 {
@@ -3753,7 +3867,7 @@ func newPullTask(
 	}
 	storageClient := &testutil.MockStorageClient{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: storageClient, policy: cache.EvictionPolicyNone, maxRetries: maxRetries, parkedPieces: parked,
+		storage: storageClient, policy: cache.EvictionPolicyNone, maxAttempts: taskTestMaxAttempts(maxRetries), parkedPieces: parked,
 	})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
@@ -3775,7 +3889,7 @@ func assertProtectedPullFailure(
 ) *model.Task {
 	t.Helper()
 	failed := runOneStorageTask(t, runtime, taskRow, model.TaskStatusFailed)
-	if failed.FailureReason == nil || *failed.FailureReason != wantReason || !runtime.service.Retryable(failed) {
+	if failed.FailureReason == nil || *failed.FailureReason != wantReason || !handlerTaskRetryable(t, runtime, failed) {
 		t.Fatalf("pull task failure = %#v, want retryable %s", failed, wantReason)
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -3826,7 +3940,7 @@ func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -3849,7 +3963,7 @@ func TestPullUnknownErrorFailsWhenRetryBudgetIsExhausted(t *testing.T) {
 	limit := 0
 	var pullCalls atomic.Int64
 	runtime, pipeline, taskRow := newPullErrorTask(t, errors.New("new sdk pull failure"), &limit, &pullCalls)
-	failed := assertProtectedPullFailure(t, runtime, pipeline, taskRow, storagepull.FailureOutcomeUnknown)
+	failed := assertProtectedPullFailure(t, runtime, pipeline, taskRow, "attempts_exhausted")
 	if pullCalls.Load() != 1 {
 		t.Fatalf("pull calls = %d, want 1", pullCalls.Load())
 	}
@@ -3875,8 +3989,12 @@ func TestPullUnknownErrorFailsWhenRetryBudgetIsExhausted(t *testing.T) {
 			t.Fatalf("delete last reference to an unresolved pull = %v", err)
 		}
 	}
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatal(err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(t.Context(), taskRow.ID)
+		if retryErr != nil {
+			t.Fatal(retryErr)
+		}
 	}
 	retried, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID)
 	if err != nil || retried.Status != model.TaskStatusPending || retried.ResumeMode != model.TaskResumeModeRecover ||
@@ -4064,7 +4182,7 @@ func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 	completed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusCompleted
 	})
-	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.Equal(*broadcast.BroadcastAttemptedAt) {
+	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(*broadcast.BroadcastAttemptedAt) {
 		t.Fatalf("wallet recovery start = %v, want %v", completed.WorkStartedAt, broadcast.BroadcastAttemptedAt)
 	}
 	if broadcasts.Load() != 1 || observations.Load() != 1 {
@@ -4093,7 +4211,7 @@ func TestWalletBroadcastHasIndependentDeadline(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if runtime.service.Retryable(failed) {
+	if handlerTaskRetryable(t, runtime, failed) {
 		t.Fatal("wallet task with an uncertain broadcast is unexpectedly retryable")
 	}
 	if broadcasts.Load() != 1 {
@@ -4109,7 +4227,7 @@ func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	limit := 0
 	var broadcasts atomic.Int64
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		maxRetries: &limit,
+		maxAttempts: taskTestMaxAttempts(&limit),
 		wallet: testWalletOperator{fund: func(context.Context, *big.Int) (string, error) {
 			broadcasts.Add(1)
 			return "", errors.New("unexpected wallet broadcast")
@@ -4126,7 +4244,7 @@ func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "wallet_broadcast_not_started" || !runtime.service.Retryable(failed) {
+	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, failed) {
 		t.Fatalf("wallet admission task = %#v", failed)
 	}
 	storedOperation, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
@@ -4136,8 +4254,12 @@ func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	if len(failed.Checkpoint) != 0 || broadcasts.Load() != 0 {
 		t.Fatalf("wallet admission wrote evidence or called effect: checkpoint=%s broadcasts=%d", failed.Checkpoint, broadcasts.Load())
 	}
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatalf("retry not-started wallet task: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(t.Context(), taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry not-started wallet task: %v", retryErr)
+		}
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
@@ -4331,7 +4453,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -4354,9 +4476,8 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	}
 }
 
-// A migration task that stopped but can still be retried keeps the replacement
-// waiting for that retry; only a task that cannot be retried fails it.
-func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
+// Reopening failed child work spends the coordinator budget and preserves its source history.
+func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T) {
 	tests := []struct {
 		name              string
 		reason            string
@@ -4365,8 +4486,7 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 		wantFenceReleased bool
 	}{
 		{name: "retryable", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
-		{name: "not retryable", reason: "store_result_invalid", wantFailed: true},
-		{name: "missing migration cache", reason: "migration_cache_missing", wantFailed: true, wantFenceReleased: true},
+		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -4482,6 +4602,7 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 				t.Fatalf("enqueue replacement coordinator: %v", err)
 			}
 
+			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1, countType: model.TaskTypeProviderReplacementCoordinate}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			if tt.wantFailed {
@@ -4499,9 +4620,17 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 				return
 			}
 			waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusPending && task.StatusMessage != nil &&
-					*task.StatusMessage == "Waiting for a failed migration task to be retried"
+				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_copy_failed"
 			})
+			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, successor) != 6 {
+				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
+			}
+			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
+			if err != nil || sourceHistory.Status != model.TaskStatusFailed || sourceHistory.SupersededAt == nil || !bytes.Equal(sourceHistory.Checkpoint, json.RawMessage(tt.checkpoint)) {
+				t.Fatalf("failed source history = %#v, err=%v", sourceHistory, err)
+			}
+
 			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
 			if err != nil || stored.Status == storagereplacement.StatusFailed {
 				t.Fatalf("replacement = %#v err=%v, want it waiting for the migration retry", stored, err)
@@ -4510,10 +4639,8 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 	}
 }
 
-// Activation waits for writes already bound to the source. A write whose task
-// failed can only finish through a retry, so the replacement keeps waiting while
-// one is possible and fails, naming the write, when none is.
-func TestReplacementActivationWaitsOnlyForRecoverableSourceWrites(t *testing.T) {
+// Activation recovers failed source writes through a separately budgeted child round.
+func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 	tests := []struct {
 		name       string
 		reason     string
@@ -4522,7 +4649,7 @@ func TestReplacementActivationWaitsOnlyForRecoverableSourceWrites(t *testing.T) 
 	}{
 		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
 		{name: "engine failure", reason: "handler_panic"},
-		{name: "write that cannot be retried", reason: "store_result_invalid", wantFailed: true},
+		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -4611,6 +4738,7 @@ func TestReplacementActivationWaitsOnlyForRecoverableSourceWrites(t *testing.T) 
 				t.Fatalf("enqueue replacement coordinator: %v", err)
 			}
 
+			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1, countType: model.TaskTypeProviderReplacementCoordinate}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			if tt.wantFailed {
@@ -4629,9 +4757,17 @@ func TestReplacementActivationWaitsOnlyForRecoverableSourceWrites(t *testing.T) 
 				return
 			}
 			waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusPending && task.StatusMessage != nil &&
-					*task.StatusMessage == "Waiting for a failed storage write to be retried"
+				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_source_write_failed"
 			})
+			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, successor) != 6 {
+				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
+			}
+			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
+			if err != nil || sourceHistory.Status != model.TaskStatusFailed || sourceHistory.SupersededAt == nil || !bytes.Equal(sourceHistory.Checkpoint, json.RawMessage(tt.checkpoint)) {
+				t.Fatalf("failed source history = %#v, err=%v", sourceHistory, err)
+			}
+
 			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
 			if err != nil || stored.Status == storagereplacement.StatusFailed {
 				t.Fatalf("replacement = %#v err=%v, want it waiting for the write retry", stored, err)
@@ -4640,51 +4776,6 @@ func TestReplacementActivationWaitsOnlyForRecoverableSourceWrites(t *testing.T) 
 	}
 }
 
-// A task the Engine failed itself keeps holding its domain row until it is
-// retried, so copy work and wallet operations offer Retry for failures a later
-// build can recover from. Failures the handlers settle keep their own policy.
-func TestEngineFailuresOfDomainOwnedTasksCanBeRetried(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	retryable := func(taskType model.TaskType, reason string) bool {
-		return runtime.service.Retryable(&model.Task{Type: taskType, Status: model.TaskStatusFailed, FailureReason: &reason})
-	}
-	engineFailures := map[string]bool{
-		"handler_unavailable": true, "input_version_unsupported": true, "invalid_input": true,
-		"input_codec_panic": true, "handler_panic": true, "invalid_result": true,
-		"invalid_input_hash": false,
-	}
-	for _, taskType := range []model.TaskType{
-		model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull,
-		model.TaskTypeStorageCommit, model.TaskTypeWalletOperation,
-	} {
-		for reason, want := range engineFailures {
-			if got := retryable(taskType, reason); got != want {
-				t.Errorf("Retryable(%s, %s) = %v, want %v", taskType, reason, got, want)
-			}
-		}
-	}
-	for _, tc := range []struct {
-		taskType model.TaskType
-		reason   string
-		want     bool
-	}{
-		{model.TaskTypeStoragePull, "pull_presign_failed", false},
-		{model.TaskTypeStorageCommit, "commit_rejected", false},
-		{model.TaskTypeStorageStore, "store_retry_limit", true},
-		{model.TaskTypeWalletOperation, "wallet_broadcast_not_started", true},
-		{model.TaskTypeWalletOperation, "wallet_broadcast_unknown", false},
-		{model.TaskTypeWalletOperation, "wallet_amount_invalid", false},
-	} {
-		if got := retryable(tc.taskType, tc.reason); got != tc.want {
-			t.Errorf("Retryable(%s, %s) = %v, want %v", tc.taskType, tc.reason, got, tc.want)
-		}
-	}
-}
-
-// The Engine can fail a coordinator claim before the handler runs, for
-// example when a build cannot read its input. The replacement then fails so the
-// Data Sets retry can resume it, instead of staying in progress with no
-// coordinator.
 func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
 	ctx := t.Context()
@@ -4714,11 +4805,11 @@ func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 		t.Fatalf("authorize replacement: %v", err)
 	}
 	// A coordinator written by a build whose input this one cannot read.
-	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, &model.Task{
+	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, handlerTaskFixture(t, runtime, &model.Task{
 		Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: bucket.Name,
-		InputVersion: 99, Input: []byte(`{}`), InputHash: bucket.Name,
+		InputVersion: 99, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: bucket.Name,
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	})
+	}))
 	if err != nil {
 		t.Fatalf("enqueue coordinator: %v", err)
 	}
@@ -4742,7 +4833,7 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 	noRetries := 0
 	terminator := &testServiceTerminator{err: errors.New("unexpected termination")}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		maxRetries: &noRetries, terminator: terminator, epochs: testEpochReader{epoch: 80},
+		maxAttempts: taskTestMaxAttempts(&noRetries), terminator: terminator, epochs: testEpochReader{epoch: 80},
 		retireOnly: true,
 	})
 	ctx := t.Context()
@@ -4817,7 +4908,7 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "termination_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, failed) || len(failed.Checkpoint) != 0 {
 		t.Fatalf("retirement admission task = %#v", failed)
 	}
 	stored, err := runtime.repos.Replacements.GetByID(ctx, first.ID)
@@ -4827,8 +4918,12 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 	if terminator.calls.Load() != 0 {
 		t.Fatalf("retirement admission called terminator %d times", terminator.calls.Load())
 	}
-	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-		t.Fatalf("retry retirement admission task: %v", err)
+	{
+		var retryErr error
+		taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+		if retryErr != nil {
+			t.Fatalf("retry retirement admission task: %v", retryErr)
+		}
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
@@ -4969,7 +5064,7 @@ func TestRetirementBlockedByPaymentDebtWaitsForTheOperator(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "termination_blocked" || !runtime.service.Retryable(failed) || terminator.calls.Load() != 1 {
+	if failed.FailureReason == nil || *failed.FailureReason != "termination_blocked" || !handlerTaskRetryable(t, runtime, failed) || terminator.calls.Load() != 1 {
 		t.Fatalf("blocked retirement = %#v after %d requests, want a retryable termination_blocked failure", failed, terminator.calls.Load())
 	}
 }
@@ -5068,7 +5163,7 @@ func TestRetirementStopsWhenTheSigningIdentityChanged(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode checkpoint: %v", err)
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), taskRow.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), taskRow.ID).Exec(ctx); err != nil {
 				t.Fatalf("write checkpoint: %v", err)
 			}
 
@@ -5130,8 +5225,12 @@ func TestRetirementStopsOnADataSetAnotherWalletPaysFor(t *testing.T) {
 			// Retrying before the wallet is fixed stops the same way, instead of
 			// leaving the task running against a replacement that already waits
 			// for an operator.
-			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-				t.Fatalf("retry retirement: %v", err)
+			{
+				var retryErr error
+				taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+				if retryErr != nil {
+					t.Fatalf("retry retirement: %v", retryErr)
+				}
 			}
 			refused := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				return task.Status == model.TaskStatusFailed
@@ -5143,8 +5242,12 @@ func TestRetirementStopsOnADataSetAnotherWalletPaysFor(t *testing.T) {
 
 			// The original wallet is back, and the retirement runs to completion.
 			terminator.notPaidFor.Store(false)
-			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
-				t.Fatalf("retry retirement: %v", err)
+			{
+				var retryErr error
+				taskRow, retryErr = runtime.service.Retry(ctx, taskRow.ID)
+				if retryErr != nil {
+					t.Fatalf("retry retirement: %v", retryErr)
+				}
 			}
 			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				return terminator.calls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
@@ -5509,7 +5612,7 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), ensureTask.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
 
@@ -5518,7 +5621,7 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, ensureTask.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if runtime.service.Retryable(failed) {
+	if handlerTaskRetryable(t, runtime, failed) {
 		t.Fatal("a rejected creation offers a retry that could only fail again")
 	}
 
@@ -5682,7 +5785,7 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(aged), fixture.ensureTask.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(aged), fixture.ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("age checkpoint: %v", err)
 	}
 	wakeTask(t, runtime, fixture.ensureTask.ID)
@@ -5705,7 +5808,7 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	}
 }
 
-func TestDataSetCreationRecoveryRestoresFirstWorkStart(t *testing.T) {
+func TestDataSetCreationRecoveryRecordsIndependentRoundStart(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		sends         int
@@ -5771,13 +5874,11 @@ func TestDataSetCreationRecoveryRestoresFirstWorkStart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
 				t.Fatal(err)
 			}
 			var existingStart, expectedStart *time.Time
-			if tc.sends == 1 && !tc.unknownTime {
-				expectedStart = &attemptedAt
-			}
+
 			if tc.existingStart {
 				knownStart := baseTime.Add(-time.Minute)
 				existingStart, expectedStart = &knownStart, &knownStart
@@ -5789,8 +5890,8 @@ func TestDataSetCreationRecoveryRestoresFirstWorkStart(t *testing.T) {
 			assertStart := func(row *model.Task) {
 				t.Helper()
 				if expectedStart == nil {
-					if row.WorkStartedAt != nil {
-						t.Fatalf("unverifiable first start was inferred as %v", row.WorkStartedAt)
+					if row.WorkStartedAt == nil || !row.WorkStartedAt.After(baseTime) {
+						t.Fatalf("round recovery start = %v, must be after persisted submission %v", row.WorkStartedAt, baseTime)
 					}
 				} else if row.WorkStartedAt == nil || !row.WorkStartedAt.Equal(*expectedStart) {
 					t.Fatalf("work start = %v, want %v", row.WorkStartedAt, expectedStart)
@@ -5799,7 +5900,7 @@ func TestDataSetCreationRecoveryRestoresFirstWorkStart(t *testing.T) {
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			pending := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(row *model.Task) bool {
-				return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "provider_confirmation"
+				return row.Status == model.TaskStatusPending && row.RetryCount > 0
 			})
 			assertStart(pending)
 			ready.Store(true)
@@ -5917,7 +6018,7 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode checkpoint: %v", err)
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
 				t.Fatalf("write checkpoint: %v", err)
 			}
 			if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ? WHERE id = ?`, model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(ctx); err != nil {
@@ -5933,8 +6034,8 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 				t.Fatalf("failure = %v after %d create requests and %d waits, want %s with neither",
 					failed.FailureReason, sends.Load(), waits.Load(), tt.reason)
 			}
-			if runtime.service.Retryable(failed) != tt.retryable {
-				t.Fatalf("retryable = %v, want %v", runtime.service.Retryable(failed), tt.retryable)
+			if handlerTaskRetryable(t, runtime, failed) != tt.retryable {
+				t.Fatalf("retryable = %v, want %v", handlerTaskRetryable(t, runtime, failed), tt.retryable)
 			}
 			if failed.WorkStartedAt != nil {
 				t.Fatalf("invalid request identity restored work start %v", failed.WorkStartedAt)
@@ -6008,7 +6109,7 @@ func TestDataSetCreationRecoversFromAnUnusableCheckpointThroughTheRow(t *testing
 			}
 			// A checkpoint this build cannot decode: the ID arrives as a number
 			// where the record expects text.
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`,
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`,
 				`{"client_data_set_id": 12}`, fixture.ensureTask.ID).Exec(ctx); err != nil {
 				t.Fatalf("write checkpoint: %v", err)
 			}
@@ -6070,8 +6171,8 @@ func TestDataSetEnsureGivesUpAGenerationThatNeverSent(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "dataset_creation_unsent" || runtime.service.Retryable(failed) {
-		t.Fatalf("failure = %v retryable=%v, want dataset_creation_unsent with no retry offered", failed.FailureReason, runtime.service.Retryable(failed))
+	if failed.FailureReason == nil || *failed.FailureReason != "dataset_creation_unsent" || handlerTaskRetryable(t, runtime, failed) {
+		t.Fatalf("failure = %v retryable=%v, want dataset_creation_unsent with no retry offered", failed.FailureReason, handlerTaskRetryable(t, runtime, failed))
 	}
 	kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
 	if err != nil || kept.Status != model.StorageDataSetStatusRetired || kept.EnsureTaskID != nil {
@@ -6124,7 +6225,7 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ? WHERE id = ?`, model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(ctx); err != nil {
@@ -6173,11 +6274,8 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 		return runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, *row.TaskID)
 	}
 	key := fmt.Sprintf("activation-fixture/%d", id)
-	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key})
+	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key, SubjectType: new("storage_replacement"), SubjectKey: new(fmt.Sprint(row.ID))}))
 	if err != nil {
-		return err
-	}
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusCancelled).Set("finished_at = ?", time.Now()).Set("retention_until = ?", time.Now().Add(time.Hour)).Where("id = ?", task.ID).Exec(t.Context()); err != nil {
 		return err
 	}
 	if err := runtime.repos.Replacements.BindTask(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
@@ -6186,5 +6284,9 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 	if err := runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
 		return err
 	}
-	return runtime.repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID)
+	if err := runtime.repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
+		return err
+	}
+	settleHandlerTaskFixture(t, runtime, task.ID, model.TaskStatusCancelled, nil)
+	return nil
 }

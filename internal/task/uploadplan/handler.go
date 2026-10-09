@@ -2,6 +2,7 @@ package uploadplan
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,8 +35,8 @@ type Dependencies struct {
 	Observability *observability.Service
 	Selector      *bindingtask.Selector
 	Messenger     *taskengine.Messenger
-	MaxRetries    int
-	Logger        *slog.Logger
+
+	Logger *slog.Logger
 }
 
 const (
@@ -51,9 +52,6 @@ type Handler struct {
 func NewHandler(deps Dependencies) (*Handler, error) {
 	if deps.Repositories == nil || deps.Repositories.Tasks == nil {
 		return nil, errors.New("task repositories are required")
-	}
-	if deps.MaxRetries < 0 {
-		return nil, errors.New("task retry limit cannot be negative")
 	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -72,10 +70,31 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.UploadPlanInput) error {
 			return storagepipeline.ValidateUploadPlanInput(*input)
 		}),
-		RetryLimit: h.retryLimit(), AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) int64 {
 			return input.ContentID
 		}),
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input storagepipeline.UploadPlanInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		content, err := repos.Contents.GetByID(ctx, input.ContentID)
+		if err != nil {
+			return err
+		}
+		if content == nil || content.AcceptedAt != nil {
+			return repository.ErrConflict
+		}
+		unreferenced, err := repos.Objects.ContentIsUnreferenced(ctx, input.ContentID)
+		if err != nil {
+			return err
+		}
+		if unreferenced {
+			return repository.ErrConflict
+		}
+		return nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagepipeline.UploadPlanInput](execution)
@@ -129,7 +148,7 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 				if attention {
 					message = "Storage replacement needs attention. Check it on the bucket page."
 				}
-				return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, storagepipeline.UploadPlanReplacementWaitReason, message, func(ctx context.Context, repos *repository.Repositories) error {
+				return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, storagepipeline.UploadPlanReplacementWaitReason, message, func(ctx context.Context, repos *repository.Repositories) error {
 					if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
 						return err
 					}
@@ -145,7 +164,7 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 					return nil
 				})
 			}
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
 		}
 		targets := make([]synapse.StorageTarget, 0, len(plan))
 		for i := range plan {
@@ -163,7 +182,7 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 			return retryTask(err, "storage_funding_failed")
 		}
 		if costs == nil || !costs.Ready {
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "funding", uploadFundingWaitMessage(costs), nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "funding", uploadFundingWaitMessage(costs), nil)
 		}
 		bindingPlan := make([]bindingtask.Plan, 0, len(plan))
 		for i := range plan {
@@ -294,6 +313,9 @@ func uploadReplacementWait(ctx context.Context, repos *repository.Repositories, 
 }
 
 func (h *Handler) waitForStorageDependency(ctx context.Context, execution taskengine.Execution, reason, message string, err error) taskengine.Result {
+	if synapse.IsProviderCandidateWait(err) || errors.Is(err, providerselect.ErrNoTrustedProvider) {
+		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, reason, message, nil)
+	}
 	summary := synapse.SummarizedError(err)
 	level := slog.LevelWarn
 	if execution.LastError() == summary.Error() {
@@ -301,7 +323,7 @@ func (h *Handler) waitForStorageDependency(ctx context.Context, execution tasken
 	}
 	h.deps.Logger.Log(ctx, level, "storage task waiting for dependency",
 		"task_id", execution.ID(), "task_type", execution.Type(), "wait_reason", reason, "error", summary)
-	return taskengine.SuspendWithError(model.TaskResumeModeExecute, storageDependencyWait, reason, message, summary, nil)
+	return taskengine.RetryInMode(summary, reason, model.TaskResumeModeExecute, storageDependencyWait, nil)
 }
 
 func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {
@@ -364,9 +386,4 @@ func retryTask(err error, reason string) taskengine.Result {
 
 func decodeFailure(taskType string, err error) taskengine.Result {
 	return taskengine.Fail(fmt.Errorf("decoding %s input: %w", taskType, err), "invalid_input", nil)
-}
-
-func (h *Handler) retryLimit() *int {
-	value := h.deps.MaxRetries
-	return &value
 }

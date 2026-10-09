@@ -13,7 +13,7 @@ func TestProductionRegistrationClosesAllTaskDependencies(t *testing.T) {
 		model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull,
 		model.TaskTypeCacheCapacityReconcile, model.TaskTypeCacheEvict, model.TaskTypeCacheReconcileDurability,
 		model.TaskTypeObservabilityRefresh, model.TaskTypeApprovedProviderRefresh, model.TaskTypeEndorsedProviderRefresh,
-		model.TaskTypeProviderUploadSpeedTest, model.TaskTypeGC, model.TaskTypeWalletOperation,
+		model.TaskTypeProviderUploadSpeedTest, model.TaskTypeWalletOperation,
 		model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageDataSetRetire, model.TaskTypeStorageCommit,
 		model.TaskTypeBucketProvision, model.TaskTypeUploadPlan, model.TaskTypeProviderReplacementCoordinate,
 		model.TaskTypeStorageCleanup,

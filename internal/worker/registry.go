@@ -14,6 +14,7 @@ type Registry struct {
 	handlers    map[model.TaskType]Handler
 	definitions map[model.TaskType]Definition
 	schedulers  []*Scheduler
+	periodic    []ScheduleDefinition
 	producers   map[string]*Messenger
 	messages    map[string]*messageRoute
 	messageIDs  map[string]struct{}
@@ -46,7 +47,6 @@ func (r *Registry) Register(handler Handler) error {
 	if _, exists := r.handlers[definition.Type]; exists {
 		return fmt.Errorf("handler %q already registered", definition.Type)
 	}
-	definition.RetryLimit = cloneInt(definition.RetryLimit)
 	r.handlers[definition.Type] = handler
 	r.definitions[definition.Type] = definition
 	return nil
@@ -92,7 +92,6 @@ func (r *Registry) Definition(taskType model.TaskType) (Definition, bool) {
 	if !ok {
 		return Definition{}, false
 	}
-	definition.RetryLimit = cloneInt(definition.RetryLimit)
 	return definition, true
 }
 

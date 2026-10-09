@@ -26,6 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -113,7 +114,7 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 			t.Error("admin server did not stop")
 		}
 	}()
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://%s/api/v1/storage-copies/%d/retry", listener.Addr(), pipeline.target.ID), nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://%s/api/v1/tasks/%d/retry", listener.Addr(), old.ID), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,13 +128,12 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 		t.Fatalf("retry status=%d body=%s", response.StatusCode, body)
 	}
 	var accepted struct {
-		CopyID int64 `json:"copy_id"`
 		TaskID int64 `json:"task_id"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
 		t.Fatal(err)
 	}
-	if accepted.CopyID != pipeline.target.ID || accepted.TaskID == 0 || accepted.TaskID == old.ID {
+	if accepted.TaskID == 0 || accepted.TaskID == old.ID {
 		t.Fatalf("recovery work=%+v", accepted)
 	}
 	waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
@@ -149,8 +149,122 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 		t.Fatalf("retry did not rotate source: %+v", attempts)
 	}
 	history, err := runtime.repos.Tasks.GetByID(t.Context(), old.ID)
-	if err != nil || history.Status != model.TaskStatusFailed || history.AcknowledgedAt == nil || !bytes.Equal(history.Checkpoint, failed.Checkpoint) {
+	if err != nil || history.Status != model.TaskStatusFailed || history.AcknowledgedAt != nil || history.SupersededAt == nil || !bytes.Equal(history.Checkpoint, failed.Checkpoint) {
 		t.Fatalf("history=%+v err=%v", history, err)
+	}
+}
+
+func TestCopyRetryWaitsForSourceAndCanUseLaterCache(t *testing.T) {
+	for _, tt := range []struct {
+		name                   string
+		sourceAppears          bool
+		loseSourceAfterHandoff bool
+	}{
+		{name: "cache appears"},
+		{name: "source appears", sourceAppears: true},
+		{name: "cache after source disappears", sourceAppears: true, loseSourceAfterHandoff: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var cached atomic.Bool
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				policy: cache.EvictionPolicyNone,
+				cache:  &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return cached.Load() }},
+			})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+			version := &model.ObjectVersion{
+				VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "retry-later-source.bin",
+				ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "retry-later-source", ContentType: "application/octet-stream",
+			}
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, false); err != nil {
+				t.Fatal(err)
+			}
+			setSource := func(available bool) {
+				t.Helper()
+				status := model.StorageDataSetStatusRetired
+				if available {
+					status = model.StorageDataSetStatusReady
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+					Set("status = ?", status).Set("is_current = ?", available).
+					Where("id = ?", pipeline.source.StorageDataSetID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setSource(false)
+			old := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
+			reason := "copy_cache_missing"
+			settleHandlerTaskFixture(t, runtime, old.ID, model.TaskStatusFailed, &reason)
+			if err := runtime.repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+				StorageCopyID: pipeline.target.ID, ContentID: pipeline.target.ContentID, CopyIndex: pipeline.target.CopyIndex, LastError: "source unavailable",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Contents.CompleteCopyTask(t.Context(), pipeline.target.ID, 1, old.ID); err != nil {
+				t.Fatal(err)
+			}
+			plan, err := runtime.service.Retry(t.Context(), old.ID)
+			if err != nil || plan == nil || plan.Type != model.TaskTypeStorageTransferPlan || plan.RetryOfTaskID == nil || *plan.RetryOfTaskID != old.ID {
+				t.Fatalf("retry without source = %#v, error=%v", plan, err)
+			}
+			waiting := runOneStorageTask(t, runtime, plan, model.TaskStatusPending)
+			if waiting.WaitReason == nil || *waiting.WaitReason != "source" || waiting.RetryCount != 0 {
+				t.Fatalf("source wait = %#v", waiting)
+			}
+			if tt.sourceAppears {
+				setSource(true)
+			} else {
+				cached.Store(true)
+				if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wakeTask(t, runtime, waiting.ID)
+			runOneStorageTask(t, runtime, waiting, model.TaskStatusCompleted)
+			owned, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || owned.ActiveTaskID == nil {
+				t.Fatalf("recovery owner = %#v, error=%v", owned, err)
+			}
+			next, err := runtime.repos.Tasks.GetByID(t.Context(), *owned.ActiveTaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := model.TaskTypeStorageStore
+			if tt.sourceAppears {
+				want = model.TaskTypeStoragePull
+			}
+			if next.Type != want || (want == model.TaskTypeStorageStore && owned.TransferMethod != model.StorageCopyTransferMethodCacheRestore) {
+				t.Fatalf("later source did not advance recovery: copy=%#v, task=%#v", owned, next)
+			}
+			if !tt.loseSourceAfterHandoff {
+				return
+			}
+			setSource(false)
+			dataSetID := pipeline.targetSet.DataSetID.SDK()
+			runtime.storage.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				return &testutil.MockStorageTarget{ProviderIDValue: pipeline.targetSet.ProviderID.SDK(), DataSetIDValue: &dataSetID, ClientDataSetIDValue: pipeline.targetClient}, nil
+			}
+			waiting = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+			if waiting.WaitReason == nil || *waiting.WaitReason != "source" || waiting.RetryCount != 0 {
+				t.Fatalf("source disappeared after handoff = %#v", waiting)
+			}
+			cached.Store(true)
+			if err := runtime.repos.Objects.SetVersionCachePresence(t.Context(), version.VersionID, true); err != nil {
+				t.Fatal(err)
+			}
+			wakeTask(t, runtime, waiting.ID)
+			runOneStorageTask(t, runtime, waiting, model.TaskStatusCompleted)
+			owned, err = runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || owned.TransferMethod != model.StorageCopyTransferMethodCacheRestore || owned.ActiveTaskID == nil {
+				t.Fatalf("cache recovery after handoff = %#v, error=%v", owned, err)
+			}
+			next, err = runtime.repos.Tasks.GetByID(t.Context(), *owned.ActiveTaskID)
+			if err != nil || next.Type != model.TaskTypeStorageStore {
+				t.Fatalf("cache recovery work after handoff = %#v, error=%v", next, err)
+			}
+		})
 	}
 }
 
@@ -170,7 +284,7 @@ func TestConfirmedPullDependencyFailureRetainsAttempt(t *testing.T) {
 	runtime.repos.Contents = failedPullCacheDependency{runtime.repos.Contents}
 	result := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
 	attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.upload.ID, pipeline.target.StorageDataSetID)
-	if err != nil || attempt.ResolvedAt != nil || result.FailureReason == nil || *result.FailureReason != storagepull.FailureOutcomeUnknown {
+	if err != nil || attempt.ResolvedAt != nil || result.FailureReason == nil || *result.FailureReason != "attempts_exhausted" {
 		t.Fatalf("failure=%+v attempt=%+v err=%v", result, attempt, err)
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -235,8 +349,15 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 		t.Run(fmt.Sprintf("ready-continuation=%v", readyContinuation), func(t *testing.T) {
 			client := &testutil.MockStorageClient{}
 			nonces := &testutil.MockCommitNonces{}
+			var pulls, stores atomic.Int64
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 				storage: client, policy: cache.EvictionPolicyNone, commitNonces: nonces, commitMaxPieces: 1,
+				parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+					if stores.Load() > 0 {
+						return synapse.ParkedPieceReady, nil
+					}
+					return synapse.ParkedPieceMissing, nil
+				}),
 			})
 			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 			payload := bytes.Repeat([]byte("r"), int(pipeline.upload.ContentSize))
@@ -259,7 +380,6 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 				return io.NopCloser(bytes.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
 			}
 			provider := newRegistrationProvider(t, pipeline.target.ProviderID.SDK(), pipeline.targetSet.DataSetID.SDK(), pipeline.targetClient, nonces)
-			var pulls, stores atomic.Int64
 			provider.target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 				pulls.Add(1)
 				return pullStatusResult(request, storage.PullStatusFailed), nil
@@ -305,7 +425,23 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 			} else {
 				row = bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
 			}
-			cancel, done := runHandlerEngine(t, runtime)
+			prepareHandlerTaskFixtures(t, runtime)
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+				ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+				OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
+					if claimed.Type == model.TaskTypeStorageStore && transition.Status == model.TaskStatusPending && stores.Load() > 0 {
+						// Advance the parking poll after submission without waiting for the production interval.
+						if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now()).Where("id = ? AND status = ?", claimed.ID, model.TaskStatusPending).Exec(t.Context()); err != nil {
+							t.Errorf("advance Store observation: %v", err)
+						}
+					}
+				},
+			}, runtime.repos, runtime.registry, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runEngine(t, engine)
 			defer stopHandlerEngine(t, cancel, done)
 			waitForCommitted(t, runtime, []*model.StorageCopy{pipeline.target})
 			waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })

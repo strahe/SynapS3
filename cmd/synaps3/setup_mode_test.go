@@ -39,7 +39,6 @@ func TestShouldStartSetupModeAllowsEditableConfigErrors(t *testing.T) {
 	cfg.Worker.Tasks.Concurrency = 0
 	cfg.Worker.Tasks.PollInterval = 0
 	cfg.Worker.Tasks.LeaseDuration = 0
-	cfg.Worker.Tasks.MaxRetries = -1
 	cfg.Logging.Level = "verbose"
 	cfg.Logging.S3Access.Level = "verbose"
 

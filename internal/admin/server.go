@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -274,8 +275,6 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("PUT /api/v1/buckets/{name}/copy-policy", s.handleAPIUpdateBucketCopyPolicy)
 		mux.HandleFunc("POST /api/v1/buckets/{name}/data-sets/{id}/replacement", s.handleAPIStartDataSetReplacement)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", s.handleAPIListDataSetReplacementProviders)
-		mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", s.handleAPIRetryStorageReplacement)
-		mux.HandleFunc("POST /api/v1/storage-copies/{id}/retry", s.handleAPIRetryStorageCopy)
 		mux.HandleFunc("GET /api/v1/storage-confirmations", s.handleAPIListStorageConfirmations)
 		mux.HandleFunc("GET /api/v1/commit-batches", s.handleAPIListCommitBatches)
 		mux.HandleFunc("GET /api/v1/commit-batches/{id}", s.handleAPIGetCommitBatch)
@@ -296,6 +295,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", s.handleAPIDownloadObject)
 		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", s.handleAPIUploadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
+		mux.HandleFunc("GET /api/v1/tasks/{id}", s.handleAPIGetTask)
+		mux.HandleFunc("GET /api/v1/tasks/{id}/history", s.handleAPITaskHistory)
+		mux.HandleFunc("GET /api/v1/tasks/{id}/events", s.handleAPITaskEvents)
 		mux.HandleFunc("GET /api/v1/task-subjects/{subject_type}/{subject_key}", s.handleAPITaskSubject)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleAPITaskRetry)
@@ -467,21 +469,41 @@ func (s *Server) handleAPITaskRetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
 		return
 	}
-	if err := s.taskService.Retry(r.Context(), id); err != nil {
-		if errors.Is(err, taskengine.ErrRetryUnsupported) {
+	if r.Body != nil {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1))
+		if err != nil || len(body) > 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be empty"})
+			return
+		}
+	}
+	row, err := s.taskService.Retry(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			source, sourceErr := s.repos.Tasks.GetByID(r.Context(), id)
+			if errors.Is(sourceErr, repository.ErrNotFound) || (sourceErr == nil && source == nil) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
+				return
+			}
+			if sourceErr != nil {
+				s.logger.Error("api: failed to read retry source", "taskID", id, "error", sourceErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+				return
+			}
+		}
+		if reason, known := taskRetryUnavailableReason(err); known {
 			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "This operation cannot be recovered from Tasks.",
+				"error": reason,
 				"code":  "task_retry_unsupported",
 			})
-		} else if errors.Is(err, repository.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
+		} else if errors.Is(err, repository.ErrTaskIdentityContended) || errors.Is(err, repository.ErrRepositoryContended) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Service is busy. Try again."})
 		} else {
 			s.logger.Error("api: failed to retry task", "taskID", id, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "pending"})
+	writeJSON(w, http.StatusAccepted, map[string]int64{"task_id": row.ID})
 }
 
 func (s *Server) handleAPITaskAcknowledge(w http.ResponseWriter, r *http.Request) {
@@ -498,7 +520,7 @@ func (s *Server) handleAPITaskAcknowledge(w http.ResponseWriter, r *http.Request
 		if errors.Is(err, repository.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
 		} else if errors.Is(err, repository.ErrConflict) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "this task's storage confirmation is unresolved; retry the task instead of dismissing it"})
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "this task's storage confirmation is unresolved; retry the task before acknowledging it"})
 		} else {
 			s.logger.Error("api: failed to acknowledge task", "taskID", id, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -526,7 +548,7 @@ func (s *Server) refreshMetricsLoop(ctx context.Context) {
 }
 
 func (s *Server) refreshMetrics(ctx context.Context) {
-	taskCounts, err := s.repos.Tasks.CountByStatus(ctx)
+	taskCounts, err := s.repos.Tasks.CountByScope(ctx, repository.TaskScopeWork)
 	if err != nil {
 		s.logger.Warn("failed to refresh task queue metrics", "error", err)
 	} else {
