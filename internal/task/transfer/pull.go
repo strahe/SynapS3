@@ -24,7 +24,11 @@ func (h *PullHandler) pullWithoutSource(ctx context.Context, execution taskengin
 	if err != nil {
 		return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
 	}
-	if !migration {
+	recovery, err := h.copyRetryAllowsCache(ctx, execution, input)
+	if err != nil {
+		return h.retryCopyTask(execution, input, copyRow, err, "copy_recovery_load_failed")
+	}
+	if !migration && !recovery {
 		return taskengine.Wait(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
 	}
 	available, err := copyCacheAvailable(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Cache, copyRow)
@@ -32,6 +36,9 @@ func (h *PullHandler) pullWithoutSource(ctx context.Context, execution taskengin
 		return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed")
 	}
 	if !available {
+		if !migration {
+			return taskengine.Wait(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
+		}
 		err := errors.New("stored content migration has no readable source or local cache")
 		if copyRow.CommitDecidedByRequest() {
 			return h.failPullTask(execution, input, copyRow, "", err, "migration_cache_missing")
@@ -78,7 +85,8 @@ func (h *PullHandler) recoverPullFromCache(ctx context.Context, execution tasken
 }
 
 func (h *PullHandler) pullHandler() *taskengine.FuncHandler {
-	definition := copyDefinition(model.TaskTypeStoragePull)
+	definition := h.copyDefinition(model.TaskTypeStoragePull)
+	definition.Policy.MaxAttempts = 12
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runPull(ctx, execution, true)
 	}, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
@@ -252,10 +260,18 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 			delay = httpErr.RetryAfter
 		}
 		checkpoint.NextRequestAt = time.Now().UTC().Add(delay)
-		if recordErr := execution.WriteCheckpoint(ctx, checkpoint); recordErr != nil {
+		var recordErr error
+		if !checkpoint.Accepted {
+			// Curio rolls back queue rejection, so only this admission is resolved.
+			// The authorization and ownership remain available for recovery.
+			recordErr = execution.ResolveOperation(ctx, "pull:"+attempt.AttemptID, checkpoint, nil)
+		} else {
+			recordErr = execution.WriteCheckpoint(ctx, checkpoint)
+		}
+		if recordErr != nil {
 			return retryPullOutcome(execution, errors.Join(err, recordErr), "pull_queue_delay_record_failed")
 		}
-		return taskengine.RetryInMode(synapse.SummarizedError(err), storagepull.WaitQueueFull, model.TaskResumeModeRecover, delay, nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, delay, storagepull.WaitQueueFull, "Waiting for the provider to accept storage transfers", nil)
 	}
 	if err != nil {
 		if synapse.ClassifyPullError(err) == synapse.PullErrorTerminal {

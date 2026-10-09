@@ -2241,11 +2241,20 @@ function ProviderReplacementProgressCard({
     <div className="flex flex-col gap-2 rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm font-medium">
-          Replacing {replicaLabel(replacement.copy_index)} · {replacement.source.provider_id} →{' '}
-          {replacement.target.provider_id}
+          {replacement.retirement_attention ? (
+            <>
+              Retiring storage for {replicaLabel(replacement.copy_index)} ·{' '}
+              {replacement.status === 'superseded' ? replacement.target.provider_id : replacement.source.provider_id}
+            </>
+          ) : (
+            <>
+              Replacing {replicaLabel(replacement.copy_index)} · {replacement.source.provider_id} →{' '}
+              {replacement.target.provider_id}
+            </>
+          )}
         </span>
-        <StatusBadge tone={replacementStatusTone(replacement.status)}>
-          {replacementStatusLabel(replacement.status)}
+        <StatusBadge tone={replacement.retirement_attention ? 'danger' : replacementStatusTone(replacement.status)}>
+          {replacement.retirement_attention ? 'Retirement stopped' : replacementStatusLabel(replacement.status)}
         </StatusBadge>
       </div>
       <ReplacementProgressView progress={replacement.progress} />

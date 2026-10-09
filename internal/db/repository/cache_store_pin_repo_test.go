@@ -3,8 +3,8 @@ package repository_test
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -72,8 +72,15 @@ func TestUnfinishedStoreProtectsCacheAfterMinimumDurability(t *testing.T) {
 	if candidates, err := repos.CacheEvictions.ListLRUCandidates(t.Context(), 10); err != nil || len(candidates) != 0 {
 		t.Fatalf("LRU candidates with unfinished Store = %#v, err=%v", candidates, err)
 	}
-	durabilityTask := enqueueAndClaimTask(t, repos, "unfinished-store-durability", time.Minute)
 	durabilityGeneration, err := repos.CacheEvictions.NextDurabilityGeneration(t.Context(), bucket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durabilityTask, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
+		Type: model.TaskTypeCacheReconcileDurability, IdempotencyKey: "unfinished-store-durability", InputVersion: 1, InputHash: "durability",
+		Input:       []byte(fmt.Sprintf(`{"bucket_id":%d,"generation":%d}`, bucket.ID, durabilityGeneration)),
+		SubjectType: new("bucket"), SubjectKey: new(strconv.FormatInt(bucket.ID, 10)),
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +90,11 @@ func TestUnfinishedStoreProtectsCacheAfterMinimumDurability(t *testing.T) {
 	if candidate, err := repos.CacheEvictions.NextBucketDurabilityCandidate(t.Context(), bucket.ID, durabilityGeneration, durabilityTask.ID); err != nil || candidate != nil {
 		t.Fatalf("capacity cleanup candidate with unfinished Store = %#v, err=%v", candidate, err)
 	}
-	evict := enqueueAndClaimTask(t, repos, "unfinished-store-eviction", time.Minute)
 	reservation, err := repos.CacheEvictions.PrepareEviction(t.Context(), content.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	evict := enqueueCacheEvictionTask(t, repos, content.ID, reservation.Generation, "unfinished-store-eviction")
 	if err := repos.CacheEvictions.BindEvictionTask(t.Context(), content.ID, reservation.Generation, evict.ID); err != nil {
 		t.Fatal(err)
 	}

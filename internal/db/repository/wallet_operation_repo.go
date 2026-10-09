@@ -3,9 +3,13 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
+
+	"github.com/strahe/synaps3/internal/walletoperation"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
@@ -78,14 +82,25 @@ func (r *BunWalletOperationRepo) BindTask(ctx context.Context, id, taskID int64)
 	if id < 1 || taskID < 1 {
 		return ErrInvalidInput
 	}
-	res, err := r.db.NewUpdate().
-		Model((*model.WalletOperation)(nil)).
-		Set("task_id = ?", taskID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND status = ?", id, model.WalletOperationStatusPending).
-		Where("task_id IS NULL OR task_id = ?", taskID).
-		Exec(ctx)
-	return requireRows(res, err, "binding wallet operation task")
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "wallet_operation", strconv.FormatInt(id, 10), model.TaskTypeWalletOperation)
+		if err != nil {
+			return err
+		}
+		var input walletoperation.Input
+		if json.Unmarshal(task.Input, &input) != nil || input.OperationID != id {
+			return ErrConflict
+		}
+
+		res, err := db.NewUpdate().
+			Model((*model.WalletOperation)(nil)).
+			Set("task_id = ?", taskID).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ? AND status = ?", id, model.WalletOperationStatusPending).
+			Where("task_id IS NULL OR task_id = ?", taskID).
+			Exec(ctx)
+		return requireRows(res, err, "binding wallet operation task")
+	})
 }
 
 func (r *BunWalletOperationRepo) MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error {

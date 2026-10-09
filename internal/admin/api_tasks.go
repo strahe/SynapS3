@@ -16,30 +16,31 @@ import (
 )
 
 type taskListItem struct {
-	ID              int64   `json:"id"`
-	Type            string  `json:"type"`
-	Operation       string  `json:"operation"`
-	Status          string  `json:"status"`
-	Presentation    string  `json:"presentation_status"`
-	SubjectType     *string `json:"subject_type,omitempty"`
-	SubjectKey      *string `json:"subject_key,omitempty"`
-	RetryCount      int     `json:"retry_count"`
-	RetryLimit      *int    `json:"retry_limit,omitempty"`
-	RetryOfTaskID   *int64  `json:"retry_of_task_id"`
-	SupersededAt    *string `json:"superseded_at,omitempty"`
-	RetryTaskID     *int64  `json:"retry_task_id"`
-	Retryable       bool    `json:"retryable"`
-	Acknowledgeable bool    `json:"acknowledgeable"`
-	WaitReason      *string `json:"wait_reason,omitempty"`
-	FailureReason   *string `json:"failure_reason,omitempty"`
-	LastError       *string `json:"last_error,omitempty"`
-	StatusMessage   *string `json:"status_message,omitempty"`
-	AvailableAt     string  `json:"available_at"`
-	StartedAt       *string `json:"started_at,omitempty"`
-	FinishedAt      *string `json:"finished_at,omitempty"`
-	AcknowledgedAt  *string `json:"acknowledged_at,omitempty"`
-	CreatedAt       string  `json:"created_at"`
-	UpdatedAt       string  `json:"updated_at"`
+	ID                     int64   `json:"id"`
+	Type                   string  `json:"type"`
+	Operation              string  `json:"operation"`
+	Status                 string  `json:"status"`
+	Presentation           string  `json:"presentation_status"`
+	SubjectType            *string `json:"subject_type,omitempty"`
+	SubjectKey             *string `json:"subject_key,omitempty"`
+	RetryCount             int     `json:"retry_count"`
+	MaxAttempts            *int    `json:"max_attempts"`
+	RetryOfTaskID          *int64  `json:"retry_of_task_id"`
+	SupersededAt           *string `json:"superseded_at,omitempty"`
+	RetryTaskID            *int64  `json:"retry_task_id"`
+	Retryable              bool    `json:"retryable"`
+	RetryUnavailableReason string  `json:"retry_unavailable_reason,omitempty"`
+	Acknowledgeable        bool    `json:"acknowledgeable"`
+	WaitReason             *string `json:"wait_reason,omitempty"`
+	FailureReason          *string `json:"failure_reason,omitempty"`
+	LastError              *string `json:"last_error,omitempty"`
+	StatusMessage          *string `json:"status_message,omitempty"`
+	AvailableAt            string  `json:"available_at"`
+	StartedAt              *string `json:"started_at,omitempty"`
+	FinishedAt             *string `json:"finished_at,omitempty"`
+	AcknowledgedAt         *string `json:"acknowledged_at,omitempty"`
+	CreatedAt              string  `json:"created_at"`
+	UpdatedAt              string  `json:"updated_at"`
 
 	StorageConfirmation *taskStorageConfirmation `json:"storage_confirmation,omitempty"`
 }
@@ -80,7 +81,10 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 	for i := range page.Tasks {
 		items = append(items, s.taskListItem(r.Context(), &page.Tasks[i]))
 	}
-	s.attachTaskStorageConfirmations(r.Context(), page.Tasks, items)
+	if err := s.attachTaskStorageConfirmations(r.Context(), page.Tasks, items); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 	response := taskListResponse{Tasks: items}
 	if page.NextBeforeID > 0 {
 		response.NextCursor = &page.NextBeforeID
@@ -94,17 +98,21 @@ func parseTaskListFilter(r *http.Request) (repository.TaskListFilter, error) {
 			return repository.TaskListFilter{}, &taskQueryError{removed + " is no longer supported"}
 		}
 	}
+	scope, err := parseTaskScope(r)
+	if err != nil {
+		return repository.TaskListFilter{}, err
+	}
 	filter := repository.TaskListFilter{
-		Type:                       model.TaskType(r.URL.Query().Get("type")),
-		Limit:                      50,
-		HideHealthyRecurringSystem: true,
+		Type:  model.TaskType(r.URL.Query().Get("type")),
+		Scope: scope,
+		Limit: 50,
 	}
 	status := r.URL.Query().Get("status")
 	if filter.Type != "" && !validTaskType(filter.Type) {
 		return repository.TaskListFilter{}, &taskQueryError{"unknown task type"}
 	}
-	if status != "" && !validTaskStatus(status) {
-		return repository.TaskListFilter{}, &taskQueryError{"status must be pending, running, completed, failed, or cancelled"}
+	if status != "" && !validTaskScopeStatus(scope, status) {
+		return repository.TaskListFilter{}, &taskQueryError{"status is unavailable in this scope"}
 	}
 	filter.Status = model.TaskStatus(status)
 	if raw := r.URL.Query().Get("limit"); raw != "" {
@@ -128,14 +136,25 @@ type taskQueryError struct{ message string }
 
 func (e *taskQueryError) Error() string { return e.message }
 
-func validTaskStatus(status string) bool {
-	switch status {
-	case string(model.TaskStatusPending), string(model.TaskStatusRunning), string(model.TaskStatusCompleted),
-		string(model.TaskStatusFailed), string(model.TaskStatusCancelled):
-		return true
-	default:
-		return false
+func parseTaskScope(r *http.Request) (repository.TaskScope, error) {
+	scope := repository.TaskScope(r.URL.Query().Get("scope"))
+	if scope == "" {
+		return repository.TaskScopeWork, nil
 	}
+	if scope != repository.TaskScopeWork && scope != repository.TaskScopeHistory {
+		return "", &taskQueryError{"scope must be work or history"}
+	}
+	return scope, nil
+}
+
+func validTaskScopeStatus(scope repository.TaskScope, status string) bool {
+	if status == string(model.TaskStatusFailed) {
+		return true
+	}
+	if scope == repository.TaskScopeHistory {
+		return status == string(model.TaskStatusCompleted) || status == string(model.TaskStatusCancelled)
+	}
+	return status == string(model.TaskStatusPending) || status == string(model.TaskStatusRunning)
 }
 
 func validTaskType(taskType model.TaskType) bool {
@@ -165,12 +184,12 @@ func validTaskType(taskType model.TaskType) bool {
 	}
 }
 
-func (s *Server) taskListItem(ctx context.Context, row *model.Task) taskListItem {
+func (s *Server) taskListItem(_ context.Context, row *model.Task) taskListItem {
 	item := taskListItem{
 		ID: row.ID, Type: string(row.Type), Operation: taskOperationLabel(row.Type),
 		Status: string(row.Status), Presentation: taskPresentationStatus(row, time.Now()),
 		SubjectType: row.SubjectType, SubjectKey: row.SubjectKey,
-		RetryCount: row.RetryCount, RetryLimit: row.RetryLimit,
+		RetryCount: row.RetryCount, MaxAttempts: taskMaxAttempts(row),
 		RetryOfTaskID: row.RetryOfTaskID, SupersededAt: formattedTime(row.SupersededAt),
 		WaitReason: row.WaitReason, FailureReason: row.FailureReason,
 		LastError: row.LastError, StatusMessage: row.StatusMessage,
@@ -178,7 +197,7 @@ func (s *Server) taskListItem(ctx context.Context, row *model.Task) taskListItem
 		CreatedAt:   row.CreatedAt.Format(time.RFC3339), UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
 	}
 	if s.taskService != nil {
-		item.Retryable, _ = s.taskService.RetryableContext(ctx, row)
+		item.Retryable = s.taskService.Retryable(row)
 		if item.Retryable {
 			item.RetryTaskID = &row.ID
 		}
@@ -194,10 +213,23 @@ func (s *Server) taskListItem(ctx context.Context, row *model.Task) taskListItem
 	return item
 }
 
-// attachTaskStorageConfirmations adds the confirmation each Confirm storage
-// task holds while it is flagged for attention. A failed lookup leaves the
-// list without it; acknowledgement is still refused by the repository.
-func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []model.Task, items []taskListItem) {
+func taskMaxAttempts(row *model.Task) *int {
+	var snapshot struct {
+		Version     int  `json:"version"`
+		Legacy      bool `json:"legacy"`
+		MaxAttempts *int `json:"max_attempts"`
+	}
+	if json.Unmarshal(row.Policy, &snapshot) != nil || snapshot.MaxAttempts == nil || *snapshot.MaxAttempts < 1 {
+		return nil
+	}
+	if snapshot.Version == 2 || (snapshot.Version == 0 && snapshot.Legacy) {
+		return snapshot.MaxAttempts
+	}
+	return nil
+}
+
+// Unresolved storage attention blocks acknowledgement on every task view.
+func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []model.Task, items []taskListItem) error {
 	var commitTaskIDs []int64
 	for i := range rows {
 		if rows[i].Type == model.TaskTypeStorageCommit {
@@ -205,12 +237,12 @@ func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []mode
 		}
 	}
 	if len(commitTaskIDs) == 0 {
-		return
+		return nil
 	}
 	records, err := s.repos.Contents.ListCommitAttentionForTasks(ctx, commitTaskIDs)
 	if err != nil {
-		s.logger.Warn("api: failed to list task storage confirmations", "error", err)
-		return
+		s.logger.Error("api: failed to list task storage confirmations", "error", err)
+		return err
 	}
 	byTask := make(map[int64]storagecommit.AttentionRecord, len(records))
 	for _, record := range records {
@@ -237,6 +269,7 @@ func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []mode
 			SubmittedAt:   record.SubmittedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
 		}
 	}
+	return nil
 }
 
 func taskPresentationStatus(row *model.Task, now time.Time) string {
@@ -294,7 +327,7 @@ func taskOperationLabel(taskType model.TaskType) string {
 	case model.TaskTypeProviderUploadSpeedTest:
 		return "Test upload speed"
 	case model.TaskTypeGC:
-		return "Clean task history"
+		return "Legacy task cleanup"
 	default:
 		return "Background operation"
 	}
@@ -409,7 +442,16 @@ func (s *Server) handleAPITaskAcknowledgeMatching(w http.ResponseWriter, r *http
 }
 
 func (s *Server) handleAPITaskStats(w http.ResponseWriter, r *http.Request) {
-	counts, err := s.repos.Tasks.CountByPresentationStatus(r.Context())
+	scope, err := parseTaskScope(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if status := r.URL.Query().Get("status"); status != "" && !validTaskScopeStatus(scope, status) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status is unavailable in this scope"})
+		return
+	}
+	counts, err := s.repos.Tasks.CountByScope(r.Context(), scope)
 	if err != nil {
 		s.logger.Error("api: failed to count tasks", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -417,9 +459,6 @@ func (s *Server) handleAPITaskStats(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]taskStatsItem, 0, len(counts))
 	for _, count := range counts {
-		if model.TaskType(count.Type).IsRecurringSystem() && count.Status != string(model.TaskStatusFailed) {
-			continue
-		}
 		items = append(items, taskStatsItem{Type: count.Type, Status: count.Status, Count: count.Count})
 	}
 	writeJSON(w, http.StatusOK, items)
@@ -449,8 +488,18 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item := s.taskListItem(r.Context(), row)
+	retryID, retryReason, err := s.inspectTaskRetry(r.Context(), row)
+	if err != nil {
+		s.logger.Error("api: failed to inspect task retry", "error", err, "taskID", id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	item.Retryable, item.RetryTaskID, item.RetryUnavailableReason = retryID != nil, retryID, retryReason
 	items := []taskListItem{item}
-	s.attachTaskStorageConfirmations(r.Context(), []model.Task{*row}, items)
+	if err := s.attachTaskStorageConfirmations(r.Context(), []model.Task{*row}, items); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 	response := struct {
 		Task   taskListItem    `json:"task"`
 		Policy *taskPolicyView `json:"policy"`
@@ -464,12 +513,11 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 			Backoff           taskengine.BackoffPolicy `json:"backoff"`
 			InvocationTimeout time.Duration            `json:"invocation_timeout"`
 			ObservationWindow time.Duration            `json:"observation_window"`
+			MaxAttempts       *int                     `json:"max_attempts"`
 		}
 		if json.Unmarshal(row.Policy, &snapshot) == nil && snapshot.Version == 0 && snapshot.Legacy {
 			response.Policy = &taskPolicyView{Legacy: true, InitialDelay: snapshot.Backoff.InitialDelay.String(), MaximumDelay: snapshot.Backoff.MaximumDelay.String(), Multiplier: snapshot.Backoff.Multiplier, Jitter: snapshot.Backoff.Jitter, InvocationTimeout: snapshot.InvocationTimeout.String(), ObservationWindow: snapshot.ObservationWindow.String()}
-			if row.RetryLimit != nil {
-				response.Policy.MaxAttempts = new(*row.RetryLimit + 1)
-			}
+			response.Policy.MaxAttempts = snapshot.MaxAttempts
 		}
 	}
 	writeJSON(w, 200, response)
@@ -531,6 +579,10 @@ func (s *Server) handleAPITaskHistory(w http.ResponseWriter, r *http.Request) {
 	response := taskListResponse{Tasks: make([]taskListItem, 0, len(page.Tasks))}
 	for i := range page.Tasks {
 		response.Tasks = append(response.Tasks, s.taskListItem(r.Context(), &page.Tasks[i]))
+	}
+	if err := s.attachTaskStorageConfirmations(r.Context(), page.Tasks, response.Tasks); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
 	}
 	if page.NextBeforeID > 0 {
 		response.NextCursor = &page.NextBeforeID

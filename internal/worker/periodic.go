@@ -83,10 +83,21 @@ func (s *Service) bootstrap(ctx context.Context) error {
 			return err
 		}
 		for i := range page.Tasks {
-			task := &page.Tasks[i]
+			task, err := s.repos.Tasks.GetByID(ctx, page.Tasks[i].ID)
+			if err != nil {
+				return err
+			}
+			if task == nil || task.Status != model.TaskStatusPending {
+				continue
+			}
 			if legacyPolicy(task) || task.Type == model.TaskTypeGC {
 				if err := s.handoff(ctx, task); err != nil {
-					return fmt.Errorf("handing off task %d: %w", task.ID, err)
+					if !errors.Is(err, errInvalidLegacyTask) {
+						return fmt.Errorf("handing off task %d: %w", task.ID, err)
+					}
+					if err := s.failInvalidLegacyPending(ctx, task, err); err != nil {
+						return fmt.Errorf("failing invalid legacy task %d: %w", task.ID, err)
+					}
 				}
 			}
 		}
@@ -143,7 +154,10 @@ func (s *Service) dispatchSchedules(ctx context.Context) error {
 			}
 			definition, _ := s.registry.Definition(def.Type)
 			if previous != nil && definition.NextCycleCheckpoint != nil {
-				task.Checkpoint = definition.NextCycleCheckpoint(previous)
+				task.Checkpoint, err = definition.NextCycleCheckpoint(ctx, tx, previous)
+				if err != nil {
+					return err
+				}
 			}
 			created, _, err := s.enqueuePrepared(ctx, tx.Tasks, task)
 			if err != nil {
@@ -186,12 +200,12 @@ func (e *Engine) settleSchedule(ctx context.Context, tx *repository.Repositories
 	// Earlier failures remain actionable until a subsequent cycle ends.
 	var before int64
 	for {
-		page, err := tx.Tasks.List(ctx, repository.TaskListFilter{Type: claimed.Type, Status: model.TaskStatusFailed, BeforeID: before, Limit: 100})
+		page, err := tx.Tasks.ListCurrentFailedForSubject(ctx, dereference(claimed.SubjectType), dereference(claimed.SubjectKey), before, 100, claimed.Type)
 		if err != nil {
 			return err
 		}
 		for _, old := range page.Tasks {
-			if old.ID < claimed.ID && dereference(old.SubjectType) == dereference(claimed.SubjectType) && dereference(old.SubjectKey) == dereference(claimed.SubjectKey) {
+			if old.ID < claimed.ID {
 				if err := tx.Tasks.SupersedeTerminal(ctx, old.ID); err != nil {
 					return err
 				}

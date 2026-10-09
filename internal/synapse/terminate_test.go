@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -239,6 +242,116 @@ func TestStorageServiceAdapterTerminationRefusesADataSetItDoesNotPayFor(t *testi
 			}
 			if len(stub.calls) != tt.wantCalls {
 				t.Fatalf("termination requests = %d, want %d", len(stub.calls), tt.wantCalls)
+			}
+		})
+	}
+}
+
+type terminationContextResolver struct {
+	target *storage.DataSetContext
+}
+
+func (r terminationContextResolver) ResolveProviderContext(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (*storage.ProviderContext, error) {
+	return nil, errors.New("provider context was not requested")
+}
+
+func (r terminationContextResolver) ResolveDataSetContext(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (*storage.DataSetContext, error) {
+	return r.target, nil
+}
+
+type terminationStatusTransport func(*http.Request) (*http.Response, error)
+
+func (f terminationStatusTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func terminationObserver(t *testing.T, transport terminationStatusTransport, chain *stubDataSetStateReader) *StorageServiceAdapter {
+	t.Helper()
+	payer := common.HexToAddress("0x1001")
+	recordKeeper := common.HexToAddress("0x2002")
+	chainID := sdktypes.ChainID(314159)
+	ref, err := storage.NewDataSetRef(sdktypes.NewBigInt(101), sdktypes.NewBigInt(42), sdktypes.NewBigInt(303))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := storage.NewDataSetContext(storage.Provider{ID: ref.ProviderID(), ServiceURL: "https://provider.example"}, &inertPDPProviderClient{}, nil, ref,
+		storage.WithPayer(payer), storage.WithChainID(chainID), storage.WithRecordKeeper(recordKeeper))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := storage.New(storage.Options{ContextResolver: terminationContextResolver{target: target}, PayerAddress: payer, ChainID: chainID, RecordKeeper: recordKeeper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &StorageServiceAdapter{service: service, dataSets: chain, identity: storage.ContextIdentity{Payer: payer}, providerHTTP: &http.Client{Transport: transport}}
+}
+
+func TestTerminationObservationSeparatesProviderOutagesFromBackpressure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		status       int
+		body         string
+		transportErr error
+		cancel       bool
+		wantFallback bool
+		wantError    bool
+		wantPending  bool
+	}{
+		{name: "provider server error", status: 500, wantFallback: true, wantError: true},
+		{name: "provider unavailable", status: 503, wantFallback: true, wantError: true},
+		{name: "provider timeout", transportErr: context.DeadlineExceeded, wantFallback: true, wantError: true},
+		{name: "provider network failure", transportErr: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}, wantFallback: true, wantError: true},
+		{name: "rate limited", status: 429, wantError: true},
+		{name: "unauthorized", status: 401, wantError: true},
+		{name: "invalid response", status: 200, body: `{"terminationTxHash":"invalid"}`, wantError: true},
+		{name: "caller cancelled", cancel: true, transportErr: context.Canceled, wantError: true},
+		{name: "no request", status: 404},
+		{name: "pending relay", status: 200, body: `{}`, wantPending: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := terminationObserver(t, func(r *http.Request) (*http.Response, error) {
+				if r.Method != http.MethodGet || r.URL.Path != "/pdp/data-sets/42/terminate" {
+					t.Fatalf("unexpected termination observation %s %s", r.Method, r.URL.Path)
+				}
+				if tt.transportErr != nil {
+					return nil, tt.transportErr
+				}
+				return &http.Response{StatusCode: tt.status, Body: io.NopCloser(strings.NewReader(tt.body)), Header: http.Header{}, Request: r}, nil
+			}, &stubDataSetStateReader{payer: common.HexToAddress("0x1001")})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancel {
+				cancel()
+			}
+			ended, pending, err := adapter.ObserveTermination(ctx, sdktypes.NewBigInt(42))
+			if ended != nil || pending != tt.wantPending || (err != nil) != tt.wantError || errors.Is(err, ErrTerminationObservationUnavailable) != tt.wantFallback {
+				t.Fatalf("observation = %#v, pending=%t, err=%v; want pending=%t, error=%t, fallback=%t", ended, pending, err, tt.wantPending, tt.wantError, tt.wantFallback)
+			}
+		})
+	}
+}
+
+func TestTerminationObservationKeepsChainAndPayerFailuresOutOfFallback(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		chain     *stubDataSetStateReader
+		wantError bool
+		wantEnded bool
+	}{
+		{name: "chain unavailable", chain: &stubDataSetStateReader{err: &ProviderUnavailableError{Cause: errors.New("RPC unavailable")}}, wantError: true},
+		{name: "payer mismatch", chain: &stubDataSetStateReader{payer: common.HexToAddress("0x2002")}, wantError: true},
+		{name: "already terminated", chain: &stubDataSetStateReader{payer: common.HexToAddress("0x1001"), endEpochs: []int64{84}}, wantEnded: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := terminationObserver(t, func(*http.Request) (*http.Response, error) {
+				t.Fatal("provider read must follow a live payer-checked chain record")
+				return nil, errors.New("unexpected provider read")
+			}, tt.chain)
+			ended, pending, err := adapter.ObserveTermination(t.Context(), sdktypes.NewBigInt(42))
+			if pending || (ended != nil) != tt.wantEnded || (err != nil) != tt.wantError || errors.Is(err, ErrTerminationObservationUnavailable) {
+				t.Fatalf("observation = %#v, pending=%t, err=%v", ended, pending, err)
 			}
 		})
 	}

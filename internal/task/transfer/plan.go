@@ -2,15 +2,17 @@ package transfer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
-	definition := copyDefinition(model.TaskTypeStorageTransferPlan)
+	definition := h.copyDefinition(model.TaskTypeStorageTransferPlan)
 	definition.WorkStart = taskengine.WorkStartOnHandler
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)
@@ -58,7 +60,11 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 			if err != nil {
 				return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
 			}
-			if !migration {
+			recovery, err := h.copyRetryAllowsCache(ctx, execution, input)
+			if err != nil {
+				return h.retryCopyTask(execution, input, copyRow, err, "copy_recovery_load_failed")
+			}
+			if !migration && !recovery {
 				return taskengine.Wait(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
 			}
 			available, err := copyCacheAvailable(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Cache, copyRow)
@@ -66,6 +72,9 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 				return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed")
 			}
 			if !available {
+				if !migration {
+					return taskengine.Wait(model.TaskResumeModeExecute, storageSourcePollInterval, "source", "Waiting for a readable storage source", nil)
+				}
 				return taskengine.Fail(errors.New("stored content migration has no readable source or local cache"), "migration_cache_missing", nil)
 			}
 			return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
@@ -95,4 +104,33 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for a readable storage source", nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
+}
+
+func (h *CopyCoordinator) copyRetryAllowsCache(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput) (bool, error) {
+	current, err := h.deps.Repositories.Tasks.GetByID(ctx, execution.ID())
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, repository.ErrNotFound
+	}
+	if current.RetryOfTaskID != nil {
+		return true, nil
+	}
+	if current.Type != model.TaskTypeStoragePull || input.Generation <= 1 {
+		return false, nil
+	}
+	// A Pull phase keeps the authorization of the recovery plan that created it.
+	previous, err := h.deps.Repositories.Tasks.GetByIdentity(ctx, model.TaskTypeStorageTransferPlan, storagepipeline.TransferPlanKey(input.CopyID, input.Generation-1))
+	if err != nil || previous == nil || previous.RetryOfTaskID == nil {
+		return false, err
+	}
+	var previousInput storagepipeline.CopyGenerationInput
+	if err := json.Unmarshal(previous.Input, &previousInput); err != nil {
+		return false, err
+	}
+	if previousInput.CopyID != input.CopyID || previousInput.Generation != input.Generation-1 {
+		return false, repository.ErrTaskDataCorrupted
+	}
+	return true, nil
 }

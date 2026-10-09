@@ -542,9 +542,13 @@ func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T
 			}
 			cancel, done := runHandlerEngine(t, f.runtime)
 			defer stopHandlerEngine(t, cancel, done)
-			waitForTask(t, f.runtime.repos, planner.ID, func(task *model.Task) bool {
-				return task.ClaimGeneration > 0 && ((policy == cache.EvictionPolicyNone && task.Status == model.TaskStatusCompleted) || (policy == cache.EvictionPolicyLRU && task.Status == model.TaskStatusPending))
+			waiting := waitForTask(t, f.runtime.repos, planner.ID, func(task *model.Task) bool {
+				return task.ClaimGeneration > 0 && task.Status == model.TaskStatusPending &&
+					(policy == cache.EvictionPolicyLRU || (task.WaitReason != nil && *task.WaitReason == "scheduled"))
 			})
+			if policy == cache.EvictionPolicyNone && (waiting.FinishedAt != nil || waiting.RetryCount != 0) {
+				t.Fatalf("disabled cleanup completed or spent its failure budget: %#v", waiting)
+			}
 			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.WaitReason != nil && *task.WaitReason == "collecting" })
 			if f.request(t, requestID).Status != storagecommit.RequestStatusCollecting {
 				t.Fatal("safe cleanup unexpectedly ended collection")
@@ -956,9 +960,10 @@ func TestDroppedMemberIsTransferredAgainBeforeTheRequestIsResent(t *testing.T) {
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.FailureReason != nil && *task.FailureReason == storagecommit.ProviderRejectedWaitReason
-	})
+	waitForTask(t, f.runtime.repos, taskID, func(*model.Task) bool {
+		request := f.request(t, requestID)
+		return request.Status == storagecommit.RequestStatusReady && request.Refusals == 1
+	}, 5*time.Second)
 	// The member keeps its place in the signed request while its piece is
 	// transferred again; the other member waits with it.
 	dropped := waitForCopy(t, f.runtime, f.copies[0].ID, func(c *model.StorageCopy) bool { return c.ActiveTaskID != nil })
@@ -982,6 +987,95 @@ func TestDroppedMemberIsTransferredAgainBeforeTheRequestIsResent(t *testing.T) {
 	waitForCommitted(t, f.runtime, f.copies)
 	if sends, extras := f.provider.sent(); len(sends) != 2 || len(sends[0]) != 2 || !sameSends(sends, extras) {
 		t.Fatalf("submissions = %v, want the same two-piece request twice", sends)
+	}
+}
+
+func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
+	for _, scenario := range []string{"refused", "unknown", "conflict", "proof unavailable"} {
+		t.Run(scenario, func(t *testing.T) {
+			parked := &droppedPieces{missing: map[string]bool{}}
+			f := newRegistrationFixture(t, 2, parked, 0)
+			f.provider.script = []sendOutcome{sendRefuse}
+			if scenario == "unknown" {
+				f.provider.script = []sendOutcome{sendLost, sendRefuse}
+			} else {
+				parked.drop(f.pieceCID(t, f.copies[0]))
+			}
+			requestID, taskID := f.collect(t)
+			parent, err := f.runtime.repos.Tasks.GetByID(t.Context(), taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent = runOneStorageTask(t, f.runtime, parent, model.TaskStatusPending)
+			if scenario == "unknown" {
+				parked.drop(f.pieceCID(t, f.copies[0]))
+				f.makeResendDue(t, requestID)
+				for range 2 {
+					if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskID).Exec(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					parent = runOneStorageTask(t, f.runtime, parent, model.TaskStatusPending)
+				}
+			}
+			bad, err := f.runtime.repos.Contents.GetUploadCopyByID(t.Context(), f.copies[0].ID)
+			if err != nil || bad.ActiveTaskID == nil {
+				t.Fatalf("stalled member=%#v err=%v", bad, err)
+			}
+			owner := *bad.ActiveTaskID
+			checkpoint := []byte(`{"unresolved_effect":"preserved"}`)
+			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "invalid_checkpoint").Set("checkpoint_json = ?", checkpoint).Set("finished_at = ?", time.Now()).Where("id = ?", owner).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			sends, extras := f.provider.sent()
+			switch scenario {
+			case "conflict":
+				f.provider.nonces.ConsumeRequest(extras[0], sdktypes.NewBigInt(9999), sdktypes.NewBigInt(1), sends[0])
+			case "proof unavailable":
+				f.provider.nonces.Err = errors.New("chain unavailable")
+			}
+			before := f.request(t, requestID)
+			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			want := model.TaskStatusFailed
+			switch scenario {
+			case "refused":
+				want = model.TaskStatusCompleted
+			case "proof unavailable":
+				want = model.TaskStatusPending
+			}
+			runOneStorageTask(t, f.runtime, parent, want)
+			bad, err = f.runtime.repos.Contents.GetUploadCopyByID(t.Context(), bad.ID)
+			if err != nil || bad.ActiveTaskID == nil || *bad.ActiveTaskID != owner {
+				t.Fatalf("blocked member lost its protected owner: %#v %v", bad, err)
+			}
+			source, err := f.runtime.repos.Tasks.GetByID(t.Context(), owner)
+			if err != nil || !bytes.Equal(source.Checkpoint, checkpoint) || source.SupersededAt != nil {
+				t.Fatalf("blocked member lost its evidence: %#v %v", source, err)
+			}
+			after := f.request(t, requestID)
+			if after.ExtraDataHex == nil || *after.ExtraDataHex != *before.ExtraDataHex || after.Sends != before.Sends {
+				t.Fatalf("signed submission evidence changed: before=%#v after=%#v", before, after)
+			}
+			good, err := f.runtime.repos.Contents.GetUploadCopyByID(t.Context(), f.copies[1].ID)
+			if err != nil || good.CommitRequestID == nil {
+				t.Fatalf("healthy member=%#v err=%v", good, err)
+			}
+			if scenario == "refused" {
+				if after.Status != storagecommit.RequestStatusAbandoned || after.TaskID != nil || bad.CommitRequestID != nil || *good.CommitRequestID == requestID {
+					t.Fatalf("refused batch was not isolated: request=%#v bad=%#v good=%#v", after, bad, good)
+				}
+				cancel, done := runHandlerEngine(t, f.runtime)
+				defer stopHandlerEngine(t, cancel, done)
+				waitForCommitted(t, f.runtime, []*model.StorageCopy{good})
+				finalSends, _ := f.provider.sent()
+				if len(finalSends) != 2 || len(finalSends[1]) != 1 || finalSends[1][0].String() != f.pieceCID(t, good) {
+					t.Fatalf("healthy member was not registered alone: %v", finalSends)
+				}
+			} else if after.Status != before.Status || after.TaskID == nil || *after.TaskID != taskID || bad.CommitRequestID == nil || *bad.CommitRequestID != requestID || *good.CommitRequestID != requestID {
+				t.Fatalf("unresolved batch lost its membership: request=%#v bad=%#v good=%#v", after, bad, good)
+			}
+		})
 	}
 }
 

@@ -1,15 +1,19 @@
 package admin
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
@@ -122,16 +126,132 @@ func TestAPIStorageCopyUsesTaskRetryAndPreservesHistory(t *testing.T) {
 }
 
 func TestAPIStorageCopyTaskRetryRechecksAdmission(t *testing.T) {
-	f := newCopyRetryAPIFixture(t)
-	if err := f.server.repos.Objects.SetVersionCachePresence(t.Context(), f.version.VersionID, false); err != nil {
-		t.Fatal(err)
+	for _, replacement := range []bool{false, true} {
+		name, reason := "missing source", ""
+		if replacement {
+			name, reason = "replacement", "Provider replacement is in progress."
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newCopyRetryAPIFixture(t)
+			if replacement {
+				if err := f.startReplacement(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := f.server.repos.Objects.SetVersionCachePresence(t.Context(), f.version.VersionID, false); err != nil {
+				t.Fatal(err)
+			}
+			provenance := f.request(http.MethodGet, "/api/v1/buckets/retry-api/objects/provenance?version_id="+url.QueryEscape(f.version.VersionID))
+			var detail objectProvenanceResponse
+			decodeJSON(t, provenance, &detail)
+			wantRetryable := !replacement
+			if provenance.Code != http.StatusOK || len(detail.Copies) != 1 || detail.Copies[0].Retryable != wantRetryable || (detail.Copies[0].RetryTaskID != nil) != wantRetryable || detail.Copies[0].RetryUnavailableReason != reason {
+				t.Fatalf("recovery admission = %d %#v", provenance.Code, detail.Copies)
+			}
+			rr := f.request(http.MethodPost, fmt.Sprintf("/api/v1/tasks/%d/retry", f.oldTask.ID))
+			if !replacement {
+				if rr.Code != http.StatusAccepted || *detail.Copies[0].RetryTaskID != f.oldTask.ID {
+					t.Fatalf("source waiting recovery = %d %s", rr.Code, rr.Body.String())
+				}
+				next, err := f.server.repos.Tasks.GetDirectSuccessor(t.Context(), f.oldTask.ID)
+				if err != nil || next == nil || next.Type != model.TaskTypeStorageTransferPlan || next.Status != model.TaskStatusPending || next.RetryCount != 0 {
+					t.Fatalf("source waiting successor = %#v %v", next, err)
+				}
+				copyRow, err := f.server.repos.Contents.GetUploadCopyByID(t.Context(), f.copy.ID)
+				if err != nil || copyRow == nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != next.ID || copyRow.WorkGeneration != 2 {
+					t.Fatalf("source waiting ownership = %#v %v", copyRow, err)
+				}
+				old, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
+				if err != nil || old.SupersededAt == nil || old.Status != model.TaskStatusFailed {
+					t.Fatalf("accepted retry source = %#v %v", old, err)
+				}
+				return
+			}
+			if rr.Code != http.StatusConflict {
+				t.Fatalf("blocked retry = %d %s", rr.Code, rr.Body.String())
+			}
+			old, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
+			if err != nil || old.SupersededAt != nil {
+				t.Fatalf("rejected retry changed source = %#v %v", old, err)
+			}
+		})
 	}
+}
+
+func (f copyRetryAPIFixture) startReplacement(ctx context.Context) error {
+	return f.server.repos.WithTx(ctx, func(repos *repository.Repositories) error {
+		replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+			BucketID: f.version.BucketID, SourceDataSetID: f.copy.StorageDataSetID,
+			SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainIDValue("202"), ClientRequestID: "copy-retry-blocker",
+		})
+		if err != nil {
+			return err
+		}
+		row, _, err := f.server.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+			Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
+			Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
+		})
+		if err != nil {
+			return err
+		}
+		return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, row.ID)
+	})
+}
+
+type copyRetryFactsRepository struct {
+	repository.StorageContentRepository
+	read func(context.Context, []int64) (map[int64]repository.CopyRetryState, error)
+}
+
+func (r *copyRetryFactsRepository) CopyRetryStates(ctx context.Context, ids []int64) (map[int64]repository.CopyRetryState, error) {
+	return r.read(ctx, ids)
+}
+
+func TestAPIStorageCopyRetryRechecksReplacementInsideTransaction(t *testing.T) {
+	f := newCopyRetryAPIFixture(t)
+	contents := f.server.repos.Contents
+	f.server.repos.Contents = &copyRetryFactsRepository{StorageContentRepository: contents, read: func(ctx context.Context, ids []int64) (map[int64]repository.CopyRetryState, error) {
+		states, err := contents.CopyRetryStates(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		if !states[f.copy.ID].Available {
+			t.Fatal("retry was blocked before replacement started")
+		}
+		return states, f.startReplacement(ctx)
+	}}
 	rr := f.request(http.MethodPost, fmt.Sprintf("/api/v1/tasks/%d/retry", f.oldTask.ID))
-	if rr.Code != 409 {
-		t.Fatalf("missing source = %d %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("replacement admitted after inspection = %d %s", rr.Code, rr.Body.String())
 	}
 	old, err := f.server.repos.Tasks.GetByID(t.Context(), f.oldTask.ID)
 	if err != nil || old.SupersededAt != nil {
 		t.Fatalf("rejected retry changed source = %#v %v", old, err)
+	}
+	if next, err := f.server.repos.Tasks.GetDirectSuccessor(t.Context(), f.oldTask.ID); err != nil || next != nil {
+		t.Fatalf("rejected retry created a successor = %#v %v", next, err)
+	}
+}
+
+func TestAPIStorageCopyRetryPropagatesAdmissionErrors(t *testing.T) {
+	f := newCopyRetryAPIFixture(t)
+	failure := errors.New("copy retry facts unavailable")
+	f.server.repos.Contents = &copyRetryFactsRepository{StorageContentRepository: f.server.repos.Contents, read: func(context.Context, []int64) (map[int64]repository.CopyRetryState, error) {
+		return nil, failure
+	}}
+	id, reason, err := f.server.retryTaskForSubject(t.Context(), model.TaskSubjectStorageCopy, fmt.Sprint(f.copy.ID), model.TaskTypeStorageStore)
+	if !errors.Is(err, failure) || id != nil || reason != "" {
+		t.Fatalf("admission error was hidden = id=%v reason=%q error=%v", id, reason, err)
+	}
+	for _, request := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/buckets/retry-api/objects/provenance?version_id=" + url.QueryEscape(f.version.VersionID)},
+		{http.MethodPost, fmt.Sprintf("/api/v1/tasks/%d/retry", f.oldTask.ID)},
+	} {
+		rr := f.request(request.method, request.path)
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("admission error returned %d: %s", rr.Code, rr.Body.String())
+		}
 	}
 }

@@ -237,7 +237,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `completed` | 所需内容可从新提供方读取，存在的旧服务也已终止。 |
 | `superseded` | 更晚的一次确认取代了本次请求。 |
 
-`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 和 `target_rejected` 都要求改选提供方，重试接口会返回冲突并说明该操作。`retryable` 表示已有替换是否可以恢复。交接前应从原副本改选提供方。可重试的创建任务失败时，替换保持等待；重试该创建任务即可继续。已结束的创建不会因重试替换而重新执行。
+退役停止时还会返回 `retirement_attention` 和错误；恢复安全时，还会提供当前绑定的 `retry_task_id`，包括已被替代但仍需退役未使用目标的替换记录。其他情况下，`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 和 `target_rejected` 都要求改选提供方，重试接口会返回冲突并说明该操作。`retryable` 表示已有替换是否可以恢复。交接前应从原副本改选提供方。可恢复的创建失败会在替换的预算内重试；替换停止后，查看错误并使用 **Retry**。已结束的创建不会因重试替换而重新执行。
 
 `items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
 
@@ -276,22 +276,22 @@ Provenance 副本和替换详情提供 `retryable`、`retry_task_id`，使用该
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/tasks` | 列出后台任务。支持 `type`、`status`、`limit` 和基于 ID 的 `cursor`。 |
-| `GET` | `/api/v1/tasks/stats` | 按状态统计任务。 |
+| `GET` | `/api/v1/tasks` | 列出工作或历史。支持 `scope`、`type`、`status`、`limit` 和基于 ID 的 `cursor`。 |
+| `GET` | `/api/v1/tasks/stats` | 按状态统计 `scope=work` 或 `scope=history` 范围内的任务。 |
 | `GET` | `/api/v1/tasks/{id}` | 读取任务及冻结的执行策略。 |
 | `GET` | `/api/v1/tasks/{id}/history` | 用 `limit`、`cursor` 分页读取执行链。 |
 | `GET` | `/api/v1/tasks/{id}/events` | 用 `limit`、`cursor` 分页读取保留的关键事件。 |
 | `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | 读取一个任务主体及已知关联信息。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时创建新的执行轮次。 |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时确认已查看失败，结果与历史不变。 |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时将已核对的失败移入 History，保留结果和 Retry 资格。 |
 | `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
 | `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
 
-`POST /api/v1/tasks/{id}/retry` 无需请求体，返回 `202 {"task_id":456}`。自动重试留在原轮次；手动 Retry 创建后继，获得新的策略和独立预算。重复请求返回同一后继。任务不存在返回 404，来源已过时或不可重试返回 409。
+`POST /api/v1/tasks/{id}/retry` 无需请求体，返回 `202 {"task_id":456}`。自动重试留在原轮次；手动 Retry 创建后继，获得新的策略和独立预算。重复请求返回同一后继。任务不存在返回 404，来源已过时或恢复不安全返回 409，并说明原因。临时事务竞争返回 503，可重试请求。
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。登记需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表按已保存的结果计算重试资格；详情检查当前恢复条件，并可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。登记需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
-`status=failed` 包含已确认的失败；`acknowledged_at` 与状态独立，任务历史默认永久保存。
+列表和统计默认使用 `scope=work`：Pending、Running 和未确认失败。`scope=history` 包含完成、取消、已确认和已被替代的执行轮次，也包含周期任务。Work 的状态筛选支持 `pending`、`running`、`failed`；History 支持 `completed`、`cancelled`、`failed`。无效范围或不属于该范围的状态返回 400。确认将失败移入 History，保留 Failed 结果和 Retry 资格；历史永久保存。
 
 主体查询支持 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 和 `storage_commit_request`。本地资源 key 为正整数 ID，Provider key 为十进制 uint256 ID，存储确认 key 为请求 ID；分别编码两个路径参数。响应包含 `subject_type`、`subject_key` 和可用资源信息。`copy_index` 从 0 开始；`local_data_set_id` 与字符串 `data_set_id` 分别表示本地和链上 Dataset ID。文件样例包含 `key`、`source`（`current`、`historical` 或 `deleted`）及 `other_versions`。钱包金额保留为 USDFC 最小单位字符串。参数无效返回 `400`，主体信息不可用返回 `404`，查询失败返回 `500`；接口读取本地记录，可能返回部分信息。
 
@@ -319,7 +319,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 把返回的 `as_of` 作为 `failed_before` 回传，处理的就正好是统计到的那些。
 
-`/api/v1/overview` 的 `tasks.by_status` 按状态统计，failed 包含已确认失败；`tasks.attention.failed` 只统计未确认且未被替代的失败。
+`/api/v1/overview` 的 `tasks.by_status` 按状态统计，只统计当前工作；已确认和已被替代的失败位于 History。`tasks.attention.failed` 统计仍需处理的失败。
 
 分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换和失败测速共用任务 Retry 接口。是否允许重试取决于当前业务状态和持久证据；外部结果不确定时先观察，再决定是否可以安全重发。缺少任务历史时不能 Retry。
 

@@ -2,6 +2,7 @@ package bucketprovision
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -68,6 +69,21 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			return bucketlifecycle.ValidateProvisionInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+	}
+	definition.Subject = taskengine.SubjectFromInput("bucket", func(input bucketlifecycle.ProvisionInput) int64 { return input.BucketID })
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input bucketlifecycle.ProvisionInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		bucket, err := repos.Buckets.GetByID(ctx, input.BucketID)
+		if err != nil {
+			return err
+		}
+		if bucket == nil || source.IdempotencyKey != bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies) {
+			return repository.ErrConflict
+		}
+		return nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[bucketlifecycle.ProvisionInput](execution)

@@ -1,6 +1,7 @@
 import { Loader2, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useRetryTask } from '@/hooks/queries'
+import { taskRetryErrorMessage } from '@/lib/tasks'
 
 export function RetryButton({
   taskID,
@@ -30,7 +31,7 @@ export function RetryButton({
       </Button>
       {retry.error && (
         <span role="alert" className="text-xs text-destructive">
-          Could not retry. Refresh and try again.
+          {taskRetryErrorMessage(retry.error)}
         </span>
       )}
     </span>

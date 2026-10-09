@@ -153,7 +153,7 @@ func TestTaskRoundIdentityAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := repositorySuccessor(t, repos, source, false)
-	duplicate, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: child.Type, IdempotencyKey: child.IdempotencyKey, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test", RetryGroupKey: child.RetryGroupKey}))
+	duplicate, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: child.Type, IdempotencyKey: child.IdempotencyKey, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
 	if err != nil || created || duplicate.ID != child.ID {
 		t.Fatalf("current identity=%#v,%v,%v", duplicate, created, err)
 	}

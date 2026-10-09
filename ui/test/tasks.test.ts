@@ -1,6 +1,21 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { taskDetailsView, taskSubjectFields, taskSubjectLabel, taskTook } from '../src/lib/tasks.ts'
+import { APIError } from '../src/api/client.ts'
+import {
+  taskDetailsView,
+  taskRetryErrorMessage,
+  taskStatusesForScope,
+  taskSubjectFields,
+  taskSubjectLabel,
+  taskTook,
+} from '../src/lib/tasks.ts'
+
+test('Retry explains a rejected recovery without exposing server diagnostics', () => {
+  assert.equal(taskRetryErrorMessage(new APIError('Object has been deleted.', 409)), 'Object has been deleted.')
+  for (const error of [new APIError('private database diagnostics', 500), new Error('fetch failed'), null]) {
+    assert.equal(taskRetryErrorMessage(error), 'Could not retry. Refresh and try again.')
+  }
+})
 
 test('Details shows current progress and keeps earlier errors separate', () => {
   const last_error = 'Previous request failed'
@@ -101,4 +116,9 @@ test('Subject preserves identity, one-based replicas, provenance, and exact wall
       { label: 'Authorized service', value: 'FWSS' },
     ]
   )
+})
+
+test('work and history offer only their available outcomes', () => {
+  assert.deepEqual(taskStatusesForScope('work'), ['pending', 'running', 'failed'])
+  assert.deepEqual(taskStatusesForScope('history'), ['completed', 'failed', 'cancelled'])
 })

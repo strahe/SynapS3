@@ -362,7 +362,9 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 		return 37 * time.Second
 	}
 	now := time.Now()
-	transition := harness.engine.transitionFor(&model.Task{RetryCount: 3, RetryLimit: &limit}, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
+	row := enqueueTestTask(t, harness, "backoff", "backoff")
+	row.RetryCount = 3
+	transition := harness.engine.transitionFor(row, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
 	if transition.Status != model.TaskStatusPending || !transition.IncrementRetry {
 		t.Fatalf("transition = %#v, want pending retry", transition)
 	}
@@ -447,7 +449,7 @@ func TestServiceRetryCreatesIndependentRoundAndAcknowledgeKeepsFailed(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.ID <= row.ID || next.RetryOfTaskID == nil || *next.RetryOfTaskID != row.ID || next.RetryCount != 0 || next.ResumeMode != model.TaskResumeModeRecover || next.RetryGroupKey != original.RetryGroupKey {
+	if next.ID <= row.ID || next.RetryOfTaskID == nil || *next.RetryOfTaskID != row.ID || next.RetryCount != 0 || next.ResumeMode != model.TaskResumeModeRecover {
 		t.Fatalf("successor: %#v", next)
 	}
 	again, err := h.service.Retry(t.Context(), row.ID)
@@ -489,7 +491,7 @@ func TestServiceManualRetryPredicateUsesFailureEvidence(t *testing.T) {
 	if harness.service.Retryable(stored) {
 		t.Fatal("unsafe failed task is retryable")
 	}
-	if _, err := harness.service.Retry(t.Context(), row.ID); !errors.Is(err, repository.ErrConflict) {
+	if _, err := harness.service.Retry(t.Context(), row.ID); !errors.Is(err, ErrRetryUnsupported) {
 		t.Fatalf("Retry = %v, want ErrRetryUnsupported", err)
 	}
 }
@@ -630,7 +632,7 @@ func TestEngineAcceptsDatabaseJSONNormalizationAndUsesCanonicalInput(t *testing.
 		},
 	}, nil)
 	row := enqueueTestTask(t, harness, "normalized", "normalized")
-	if _, err := harness.db.NewRaw(`UPDATE task_payloads SET input_json = ? WHERE task_id = ?`, `{ "value" : "normalized" }`, row.ID).Exec(t.Context()); err != nil {
+	if _, err := harness.db.NewRaw(`UPDATE tasks SET input_json = ? WHERE id = ?`, `{ "value" : "normalized" }`, row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("normalize stored task JSON: %v", err)
 	}
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
@@ -1126,8 +1128,7 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	}
 	harness.repos.Tasks = ordered
 	if _, err := harness.db.ExecContext(t.Context(), `CREATE TRIGGER fail_task_settlement
-		BEFORE UPDATE OF status ON tasks
-		WHEN OLD.status = 'running' AND NEW.status <> 'running'
+		BEFORE INSERT ON task_history
 		BEGIN SELECT RAISE(FAIL, 'injected settlement failure'); END`); err != nil {
 		t.Fatalf("create settlement fault: %v", err)
 	}

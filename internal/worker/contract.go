@@ -103,20 +103,22 @@ type Definition struct {
 	// Subject derives the task's subject from its canonical input. Types whose
 	// tasks repository logic finds by subject declare it; enqueue then fills
 	// the subject and refuses one that names a different row.
-	Subject             SubjectFunc
-	InspectRetry        func(context.Context, *repository.Repositories, *model.Task) error
-	PrepareRetry        func(context.Context, *repository.Repositories, *model.Task) (RetryPreparation, error)
+	Subject      SubjectFunc
+	InspectRetry func(context.Context, *repository.Repositories, *model.Task) error
+	PrepareRetry func(context.Context, *repository.Repositories, *model.Task) (RetryPreparation, error)
+	// LegacyHandoff also binds same-type retries unless PrepareRetry overrides it.
 	LegacyHandoff       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
-	NextCycleCheckpoint func(*model.Task) json.RawMessage
+	NextCycleCheckpoint func(context.Context, *repository.Repositories, *model.Task) (json.RawMessage, error)
 }
 
 type RetryPreparation struct {
-	Request    EnqueueRequest
-	Checkpoint json.RawMessage
-	ResumeMode model.TaskResumeMode
-	Validate   func(context.Context, *repository.Repositories, *model.Task) error
-	Bind       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
-	Release    func()
+	Request              EnqueueRequest
+	Checkpoint           json.RawMessage
+	ResumeMode           model.TaskResumeMode
+	PreserveCancellation bool
+	Validate             func(context.Context, *repository.Repositories, *model.Task) error
+	Bind                 func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	Release              func()
 }
 
 // WorkStartPolicy identifies when a task begins its own work.

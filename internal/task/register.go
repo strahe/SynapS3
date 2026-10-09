@@ -155,7 +155,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("creating upload scheduler: %w", err)
 	}
-	replacementScheduler, err := service.Scheduler("replacement", model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+	replacementScheduler, err := service.Scheduler("replacement", model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull, model.TaskTypeStorageCommit)
 	if err != nil {
 		return points, fmt.Errorf("creating replacement scheduler: %w", err)
 	}
@@ -202,7 +202,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("creating binding selector: %w", err)
 	}
-	copies, err := transfer.NewCopyCoordinator(transfer.CoordinatorDependencies{Repositories: deps.Repositories, Scheduler: transferScheduler, Messenger: transferMessages})
+	copies, err := transfer.NewCopyCoordinator(transfer.CoordinatorDependencies{CacheGate: deps.CacheGate, Repositories: deps.Repositories, Scheduler: transferScheduler, Messenger: transferMessages})
 	if err != nil {
 		return points, fmt.Errorf("creating copy coordinator: %w", err)
 	}
@@ -279,7 +279,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 		return points, fmt.Errorf("constructing speed: %w", err)
 	}
 	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
-		if err := registry.Register(bindRetryContract(handler, deps)); err != nil {
+		if err := registry.Register(handler); err != nil {
 			return points, err
 		}
 	}

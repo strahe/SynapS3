@@ -109,7 +109,7 @@ func TestWriteCheckpointStoresJSONText(t *testing.T) {
 	}
 	// A BLOB would still pass json_valid(); the schema promises TEXT JSON.
 	var storageClass string
-	if err := db.NewRaw(`SELECT typeof(checkpoint_json) FROM task_payloads WHERE task_id = ?`, claimed.ID).Scan(t.Context(), &storageClass); err != nil || storageClass != "text" {
+	if err := db.NewRaw(`SELECT typeof(checkpoint_json) FROM tasks WHERE id = ?`, claimed.ID).Scan(t.Context(), &storageClass); err != nil || storageClass != "text" {
 		t.Fatalf("checkpoint storage class = %q, err=%v", storageClass, err)
 	}
 	stored, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
@@ -206,20 +206,19 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 	}
 }
 
-func TestWriteCheckpointRequiresPayloadRow(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	claimed := enqueueAndClaimTask(t, repos, "checkpoint-missing-payload", time.Minute)
-	if _, err := db.NewRaw(`DELETE FROM task_payloads WHERE task_id = ?`, claimed.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("delete payload: %v", err)
+func TestWriteCheckpointRequiresLiveClaim(t *testing.T) {
+	repos := repository.NewRepositories(testDB(t))
+	claimed := enqueueAndClaimTask(t, repos, "checkpoint-archived", time.Minute)
+	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute}); err != nil {
+		t.Fatal(err)
 	}
 	err := repos.Tasks.WriteCheckpoint(t.Context(), claimed.ID, claimed.ClaimGeneration, []byte(`{"attempted":true}`))
-	if !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("checkpoint without payload err = %v, want ErrNotFound", err)
+	if !errors.Is(err, repository.ErrTaskLeaseLost) {
+		t.Fatalf("archived checkpoint error = %v", err)
 	}
-	var resumeMode string
-	if err := db.NewRaw(`SELECT resume_mode FROM tasks WHERE id = ?`, claimed.ID).Scan(t.Context(), &resumeMode); err != nil || resumeMode != string(model.TaskResumeModeExecute) {
-		t.Fatalf("resume mode after rejected checkpoint = %q, err=%v", resumeMode, err)
+	stored, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
+	if err != nil || stored == nil || len(stored.Checkpoint) != 0 {
+		t.Fatalf("archived task changed: %#v, %v", stored, err)
 	}
 }
 

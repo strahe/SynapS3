@@ -44,8 +44,9 @@ func commitBatchQuery(db bun.IDB, dest any) *bun.SelectQuery {
 		ColumnExpr("batch_bucket.name AS bucket_name").
 		ColumnExpr("batch_data_set.provider_id").ColumnExpr("batch_data_set.data_set_id").
 		ColumnExpr("batch_provider.name AS provider_name").
-		ColumnExpr("batch_task.status AS task_status").
-		ColumnExpr("batch_task.status_message AS task_message").ColumnExpr("batch_task.last_error AS task_error").
+		ColumnExpr("COALESCE(batch_task.status, history_task.status) AS task_status").
+		ColumnExpr("COALESCE(batch_task.status_message, history_task.status_message) AS task_message").
+		ColumnExpr("COALESCE(batch_task.last_error, history_task.last_error) AS task_error").
 		ColumnExpr(`CASE WHEN commit_request.status = 'collecting' THEN
 			(SELECT COUNT(*) FROM storage_copies AS member WHERE member.commit_request_id = commit_request.request_id)
 			ELSE commit_request.piece_count END AS member_count`).
@@ -59,7 +60,8 @@ func commitBatchQuery(db bun.IDB, dest any) *bun.SelectQuery {
 		Join("JOIN storage_data_sets AS batch_data_set ON batch_data_set.id = commit_request.storage_data_set_id").
 		Join("JOIN buckets AS batch_bucket ON batch_bucket.id = batch_data_set.bucket_id").
 		Join("LEFT JOIN provider_profiles AS batch_provider ON batch_provider.provider_id = batch_data_set.provider_id").
-		Join("LEFT JOIN tasks AS batch_task ON batch_task.id = commit_request.task_id")
+		Join("LEFT JOIN tasks AS batch_task ON batch_task.id = commit_request.task_id").
+		Join("LEFT JOIN task_history AS history_task ON history_task.task_id = commit_request.task_id")
 }
 
 func (r *BunStorageContentRepo) ListCommitBatches(ctx context.Context, filter CommitBatchFilter) ([]CommitBatch, error) {

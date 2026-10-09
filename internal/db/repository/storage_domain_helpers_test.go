@@ -3,7 +3,9 @@ package repository_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -144,7 +146,8 @@ func TestFailForEngineTaskLeavesTheReplacementRetryable(t *testing.T) {
 			}
 			coordinator, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 				Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: "engine-failed-coordinator",
-				InputVersion: 1, Input: []byte(`{}`), InputHash: "engine-failed-coordinator",
+				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: "engine-failed-coordinator",
+				SubjectType: new("storage_replacement"), SubjectKey: new(strconv.FormatInt(replacement.ID, 10)),
 			}))
 			if err != nil {
 				t.Fatalf("enqueue coordinator: %v", err)
@@ -297,7 +300,8 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 	}
 	ensureTask, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "target-creating-ensure",
-		InputVersion: 1, Input: []byte(`{}`), InputHash: "target-creating-ensure",
+		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)), InputHash: "target-creating-ensure",
+		SubjectType: new("storage_data_set"), SubjectKey: new(strconv.FormatInt(first.TargetDataSetID, 10)),
 	}))
 	if err != nil {
 		t.Fatalf("enqueue target ensure: %v", err)
@@ -364,7 +368,8 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 			}
 			ensureTask, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 				Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "dead-fence-ensure",
-				InputVersion: 1, Input: []byte(`{}`), InputHash: "dead-fence-ensure",
+				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)), InputHash: "dead-fence-ensure",
+				SubjectType: new("storage_data_set"), SubjectKey: new(strconv.FormatInt(first.TargetDataSetID, 10)),
 			}))
 			if err != nil {
 				t.Fatalf("enqueue target ensure: %v", err)

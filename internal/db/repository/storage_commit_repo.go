@@ -1230,10 +1230,11 @@ func (r *BunStorageContentRepo) CountStoppedCommitAttentionByDataSet(ctx context
 		TableExpr("storage_commit_requests AS commit_request").
 		ColumnExpr("commit_request.storage_data_set_id").
 		ColumnExpr("COUNT(*) AS count").
-		Join("JOIN tasks AS owner_task ON owner_task.id = commit_request.task_id").
+		Join("LEFT JOIN tasks AS owner_task ON owner_task.id = commit_request.task_id").
+		Join("LEFT JOIN task_history AS history_owner ON history_owner.task_id = commit_request.task_id").
 		Where("commit_request.status = ?", storagecommit.RequestStatusSubmitted).
 		Where("commit_request.attention_at IS NOT NULL").
-		Where("owner_task.status = ?", model.TaskStatusFailed).
+		Where("COALESCE(owner_task.status, history_owner.status) = ?", model.TaskStatusFailed).
 		GroupExpr("commit_request.storage_data_set_id").
 		Scan(ctx, &rows)
 	if err != nil {

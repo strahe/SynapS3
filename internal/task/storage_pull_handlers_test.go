@@ -138,10 +138,14 @@ func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
 			var calls atomic.Int64
 			var firstExtra, firstSource, firstCID string
 			runtime, pipeline, row := newPullTask(t, func(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
-				if calls.Add(1) == 1 {
+				call := calls.Add(1)
+				if call == 1 {
 					firstExtra, firstSource, firstCID = hex.EncodeToString(request.ExtraData), request.From(request.Pieces[0]), request.Pieces[0].String()
 				} else if firstExtra != hex.EncodeToString(request.ExtraData) || firstSource != request.From(request.Pieces[0]) || firstCID != request.Pieces[0].String() {
 					t.Error("queue-full replay changed the request")
+				}
+				if call > 8 {
+					return pullStatusResult(request, storage.PullStatusPending), nil
 				}
 				err := fmt.Errorf("submit pull: %w", errors.Join(pdp.ErrPullQueueFull, &pdp.HTTPError{StatusCode: 429, RetryAfter: retryAfter}, io.ErrUnexpectedEOF))
 				return nil, synapse.NormalizeProviderOperationError(ctx, err)
@@ -152,9 +156,13 @@ func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
 			if delay <= 0 {
 				delay = time.Minute
 			}
-			if waiting.FailureReason == nil || *waiting.FailureReason != storagepull.WaitQueueFull || waiting.RetryCount != 1 || waiting.ResumeMode != model.TaskResumeModeRecover ||
+			if waiting.WaitReason == nil || *waiting.WaitReason != storagepull.WaitQueueFull || waiting.RetryCount != 0 || waiting.ResumeMode != model.TaskResumeModeRecover ||
 				waiting.AvailableAt.Before(before.Add(delay)) || waiting.AvailableAt.After(time.Now().Add(delay)) {
 				t.Fatalf("queue-full wait = %#v", waiting)
+			}
+			var operation model.TaskRuntime
+			if err := json.Unmarshal(waiting.Runtime, &operation); err != nil || operation.OperationKey != "" || operation.OperationStartedAt != nil || operation.LastAdmittedAttempt != 0 {
+				t.Fatalf("rejected request retained an external operation: %#v, error=%v", operation, err)
 			}
 			attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
 			if err != nil {
@@ -168,37 +176,47 @@ func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
 					t.Fatal(err)
 				}
 				waiting = runOneStorageTask(t, runtime, waiting, model.TaskStatusPending)
-				if waiting.RetryCount != 1 || calls.Load() != 1 || (step == 0 && waiting.ResumeMode != model.TaskResumeModeExecute) {
+				if waiting.RetryCount != 0 || calls.Load() != 1 || (step == 0 && waiting.ResumeMode != model.TaskResumeModeExecute) {
 					t.Fatalf("early queue-full wake changed the request or budget: count=%d calls=%d mode=%s", waiting.RetryCount, calls.Load(), waiting.ResumeMode)
 				}
 			}
-			var checkpoint map[string]json.RawMessage
-			if err := json.Unmarshal(waiting.Checkpoint, &checkpoint); err != nil {
-				t.Fatal(err)
-			}
-			expired, err := json.Marshal(time.Now().UTC().Add(-time.Second))
-			if err != nil {
-				t.Fatal(err)
-			}
-			checkpoint["next_request_at"] = expired
-			rawCheckpoint, err := json.Marshal(checkpoint)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("checkpoint_json = ?", json.RawMessage(rawCheckpoint)).Where("task_id = ?", row.ID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			for range 2 {
-				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
-					t.Fatal(err)
+			for call := int64(2); call <= 9; call++ {
+				expirePullQueueDeadline(t, runtime, waiting)
+				for step := 0; step < 4 && calls.Load() < call; step++ {
+					if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					waiting = runOneStorageTask(t, runtime, waiting, model.TaskStatusPending)
 				}
-				waiting = runOneStorageTask(t, runtime, waiting, model.TaskStatusPending)
+				if calls.Load() != call {
+					t.Fatalf("queue-full replay did not submit: want=%d calls=%d task=%#v", call, calls.Load(), waiting)
+				}
 			}
 			replayed, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
-			if err != nil || calls.Load() != 2 || replayed.AttemptID != attempt.AttemptID || !replayed.AttemptedAt.Equal(attempt.AttemptedAt) || waiting.RetryCount != 2 {
+			if err != nil || calls.Load() != 9 || replayed.AttemptID != attempt.AttemptID || !replayed.AttemptedAt.Equal(attempt.AttemptedAt) || waiting.RetryCount != 0 || waiting.WaitReason == nil || *waiting.WaitReason != "provider_confirmation" {
 				t.Fatalf("queue-full replay = %#v, %#v, %v; calls=%d", attempt, replayed, err, calls.Load())
 			}
 		})
+	}
+}
+
+func expirePullQueueDeadline(t *testing.T, runtime handlerTestRuntime, row *model.Task) {
+	t.Helper()
+	var checkpoint map[string]json.RawMessage
+	if err := json.Unmarshal(row.Checkpoint, &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := json.Marshal(time.Now().UTC().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint["next_request_at"] = expired
+	raw, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(raw)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -337,8 +355,8 @@ func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
 							}
 						}
 						retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
-						if err != nil || retried.CancellationRequested() || retried.CancellationReason != nil || retried.ID == source.ID || retried.RetryOfTaskID == nil || *retried.RetryOfTaskID != source.ID ||
-							retried.RetryCount != 0 || retried.RetryLimit == nil || *retried.RetryLimit != 5 || retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, source.Checkpoint) {
+						if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" || !retried.CancellationRequestedAt.Equal(*source.CancellationRequestedAt) || retried.ID == source.ID || retried.RetryOfTaskID == nil || *retried.RetryOfTaskID != source.ID ||
+							retried.RetryCount != 0 || handlerTaskMaxAttempts(t, retried) != 12 || retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, source.Checkpoint) {
 							t.Fatalf("manual retry did not create an independent recovery round: %#v, %v", retried, err)
 						}
 						storedSource, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
@@ -355,12 +373,13 @@ func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
 						t.Fatalf("blocked recovery reached provider: calls=%d, queries=%d", calls.Load(), queries.Load())
 					}
 					if exhausted {
-						row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+						status := model.TaskStatusCancelled
 						if attempted {
-							wantCalls++
+							status = model.TaskStatusFailed
 						}
-						if row.CancellationRequested() || calls.Load() != wantCalls || queries.Load() != 0 {
-							t.Fatalf("new recovery repeated the old cancellation: cancellation=%v, calls=%d, queries=%d", row.CancellationRequested(), calls.Load(), queries.Load())
+						row = runOneStorageTask(t, runtime, row, status)
+						if !row.CancellationRequested() || calls.Load() != wantCalls || (attempted && (queries.Load() != 1 || row.FailureReason == nil || *row.FailureReason != storagepull.FailureCancelOutcomeUnknown)) {
+							t.Fatalf("new recovery lost cancellation or repeated the transfer: cancellation=%v, calls=%d, queries=%d", row.CancellationRequested(), calls.Load(), queries.Load())
 						}
 						return
 					}
@@ -380,25 +399,30 @@ func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
 
 func TestPullCancellationPreservesUnresolvedOutcome(t *testing.T) {
 	for _, tt := range []struct {
-		name       string
-		attempted  bool
-		state      synapse.ParkedPieceState
-		queryError bool
-		wantStatus model.TaskStatus
+		name         string
+		attempted    bool
+		state        synapse.ParkedPieceState
+		queryError   bool
+		recoverReady bool
+		wantStatus   model.TaskStatus
 	}{
 		{name: "not attempted", wantStatus: model.TaskStatusCancelled},
 		{name: "ready", attempted: true, state: synapse.ParkedPieceReady, wantStatus: model.TaskStatusCompleted},
 		{name: "processing", attempted: true, state: synapse.ParkedPieceProcessing, wantStatus: model.TaskStatusFailed},
 		{name: "missing", attempted: true, state: synapse.ParkedPieceMissing, wantStatus: model.TaskStatusFailed},
 		{name: "query failed", attempted: true, queryError: true, wantStatus: model.TaskStatusFailed},
+		{name: "ready after retry", attempted: true, state: synapse.ParkedPieceMissing, recoverReady: true, wantStatus: model.TaskStatusFailed},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			limit := 1
-			var calls atomic.Int64
+			var calls, queries atomic.Int64
 			runtime, pipeline, row := newPullTask(t, func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
 				calls.Add(1)
 				return nil, errors.Join(pdp.ErrPullQueueFull, &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour})
 			}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+				if queries.Add(1) > 1 && tt.recoverReady {
+					return synapse.ParkedPieceReady, nil
+				}
 				if tt.queryError {
 					return "", errors.New("provider unavailable during cancellation")
 				}
@@ -407,7 +431,7 @@ func TestPullCancellationPreservesUnresolvedOutcome(t *testing.T) {
 			if tt.attempted {
 				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 			}
-			if tt.state == synapse.ParkedPieceReady {
+			if tt.state == synapse.ParkedPieceReady || tt.recoverReady {
 				version := &model.ObjectVersion{
 					VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID,
 					Key: "cancelled-ready-pull", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
@@ -449,16 +473,25 @@ func TestPullCancellationPreservesUnresolvedOutcome(t *testing.T) {
 				}
 			}
 			retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
-			if err != nil || retried.CancellationRequestedAt != nil || retried.CancellationReason != nil || retried.RetryCount != 0 ||
+			if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" || !retried.CancellationRequestedAt.Equal(*result.CancellationRequestedAt) || retried.RetryCount != 0 ||
 				retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, result.Checkpoint) {
 				t.Fatalf("cancelled pull retry = %#v, %v", retried, err)
 			}
-			afterRetry := runOneStorageTask(t, runtime, retried, model.TaskStatusPending)
-			if afterRetry.CancellationRequestedAt != nil || calls.Load() != 1 {
-				t.Fatalf("manual recovery repeated cancellation or POST: %#v, calls=%d", afterRetry, calls.Load())
+			recoveryStatus := model.TaskStatusFailed
+			if tt.recoverReady {
+				recoveryStatus = model.TaskStatusCompleted
 			}
-			if _, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID); err != nil {
-				t.Fatalf("manual recovery lost pull evidence: %v", err)
+			afterRetry := runOneStorageTask(t, runtime, retried, recoveryStatus)
+			if !afterRetry.CancellationRequested() || calls.Load() != 1 || queries.Load() != 2 {
+				t.Fatalf("manual recovery lost cancellation or repeated POST: %#v, calls=%d", afterRetry, calls.Load())
+			}
+			_, err = runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+			if tt.recoverReady {
+				if !errors.Is(err, repository.ErrNotFound) {
+					t.Fatalf("completed recovery retains unresolved pull: %v", err)
+				}
+			} else if err != nil || afterRetry.FailureReason == nil || *afterRetry.FailureReason != storagepull.FailureCancelOutcomeUnknown {
+				t.Fatalf("manual recovery lost pull evidence: task=%#v, error=%v", afterRetry, err)
 			}
 		})
 	}
@@ -711,7 +744,7 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("checkpoint_json = ?", json.RawMessage(`{"attempt_id":"existing-pull"}`)).Where("task_id = ?", row.ID).Exec(t.Context()); err != nil {
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(`{"attempt_id":"existing-pull"}`)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}

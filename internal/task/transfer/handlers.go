@@ -36,6 +36,7 @@ type EventPublisher interface {
 
 type CoordinatorDependencies struct {
 	Repositories *repository.Repositories
+	CacheGate    *cacheaccess.Gate
 	Scheduler    *taskengine.Scheduler
 	Messenger    *taskengine.Messenger
 }

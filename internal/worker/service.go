@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -90,7 +89,7 @@ func (s *Service) EnqueueOrReplaceTerminalInTransaction(
 			return nil, false, err
 		}
 		prepared.RetryOfTaskID = &stored.ID
-		prepared.RetryGroupKey = stored.RetryGroupKey
+		prepared.ID = 0
 		return s.enqueuePrepared(ctx, txRepos.Tasks, prepared)
 	case model.TaskStatusCompleted:
 		return nil, false, fmt.Errorf("completed task conflicts with cached content: %w", repository.ErrConflict)
@@ -163,8 +162,7 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 		InputVersion: definition.InputVersion, Input: canonical,
 		InputHash: hex.EncodeToString(sum[:]),
 		Status:    model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
-		AvailableAt: availableAt, RetryLimit: intPointer(definition.Policy.MaxAttempts - 1),
-		RetryGroupKey: newRetryGroupKey(), Runtime: json.RawMessage(`{}`),
+		AvailableAt: availableAt, Runtime: json.RawMessage(`{}`), Events: json.RawMessage(`[]`),
 	}
 	task.Policy, err = encodePolicy(definition.Policy)
 	if err != nil {
@@ -225,13 +223,4 @@ func (s *Service) Retryable(task *model.Task) bool {
 
 func (s *Service) Acknowledgeable(task *model.Task) bool {
 	return task != nil && task.Status == model.TaskStatusFailed && task.AcknowledgedAt == nil
-}
-
-func intPointer(value int) *int { return &value }
-func newRetryGroupKey() string {
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		panic(err)
-	}
-	return hex.EncodeToString(id[:])
 }

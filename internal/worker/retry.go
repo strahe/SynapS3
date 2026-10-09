@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -13,44 +12,49 @@ import (
 )
 
 func (s *Service) RetryableContext(ctx context.Context, task *model.Task) (bool, error) {
-	if !s.Retryable(task) {
+	err := s.InspectRetry(ctx, task)
+	if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) || errors.Is(err, ErrRetryUnsupported) {
 		return false, nil
+	}
+	return err == nil, err
+}
+
+// InspectRetry preserves domain rejection evidence for callers presenting an unavailable action.
+// Retry rechecks eligibility inside its transaction before creating a successor.
+func (s *Service) InspectRetry(ctx context.Context, task *model.Task) error {
+	if !s.Retryable(task) {
+		return ErrRetryUnsupported
 	}
 	definition, _ := s.registry.Definition(task.Type)
 	if !legacyPolicy(task) {
 		if _, err := DecodePolicy(task); err != nil {
-			return false, nil
+			return repository.ErrConflict
 		}
 	}
 	if task.InputVersion != definition.InputVersion {
-		return false, nil
+		return repository.ErrConflict
 	}
 	canonical, err := canonicalizeInput(definition.Codec, task.Input)
 	if err != nil {
-		return false, nil
+		return repository.ErrConflict
 	}
 	sum := sha256.Sum256(canonical)
 	if !bytes.Equal(sum[:], decodeHash(task.InputHash)) {
-		return false, nil
+		return repository.ErrConflict
 	}
 	if task.Type.IsRecurringSystem() {
 		schedule, err := s.repos.TaskSchedules.GetByTaskID(ctx, task.ID)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if schedule == nil {
-			return false, nil
+			return repository.ErrConflict
 		}
 	}
 	if definition.InspectRetry != nil {
-		if err := definition.InspectRetry(ctx, s.repos, task); err != nil {
-			if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) || errors.Is(err, ErrRetryUnsupported) {
-				return false, nil
-			}
-			return false, err
-		}
+		return definition.InspectRetry(ctx, s.repos, task)
 	}
-	return true, nil
+	return nil
 }
 
 func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
@@ -66,17 +70,13 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 	} else if successor != nil {
 		return successor, nil
 	}
-	eligible, err := s.RetryableContext(ctx, source)
-	if err != nil {
-		return nil, err
-	}
-	if !eligible {
-		return s.retryReplay(ctx, id, fmt.Errorf("retry source is no longer eligible: %w", repository.ErrConflict))
+	if err := s.InspectRetry(ctx, source); err != nil {
+		return s.retryReplay(ctx, id, err)
 	}
 	definition, _ := s.registry.Definition(source.Type)
 	preparation := RetryPreparation{
 		Request:    EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input, SubjectType: dereference(source.SubjectType), SubjectKey: dereference(source.SubjectKey)},
-		Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover,
+		Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: definition.LegacyHandoff,
 	}
 	if definition.PrepareRetry != nil {
 		preparation, err = definition.PrepareRetry(ctx, s.repos, source)
@@ -92,13 +92,16 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 		return nil, err
 	}
 	prepared.RetryOfTaskID = &source.ID
-	prepared.RetryGroupKey = source.RetryGroupKey
 	prepared.Checkpoint = preparation.Checkpoint
 	if preparation.ResumeMode != "" {
 		prepared.ResumeMode = preparation.ResumeMode
 	}
 	var successor *model.Task
 	err = s.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+		prepared.ID = 0
+		successor = nil
+		prepared.CancellationRequestedAt = nil
+		prepared.CancellationReason = nil
 		current, err := tx.Tasks.GetForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -126,6 +129,10 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 			if err := preparation.Validate(ctx, tx, current); err != nil {
 				return err
 			}
+		}
+		if preparation.PreserveCancellation {
+			prepared.CancellationRequestedAt = current.CancellationRequestedAt
+			prepared.CancellationReason = current.CancellationReason
 		}
 		var schedule *model.TaskSchedule
 		if current.Type.IsRecurringSystem() {

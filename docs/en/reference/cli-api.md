@@ -101,9 +101,9 @@ Admin global flags must appear after `admin` and before the subcommand:
 | `--json` | Return successful responses as JSON. |
 | `--timeout <duration>` | Set the Admin API request timeout. |
 
-Task listing supports `--type`, `--status`, `--limit`, and ID-based `--cursor`. Status filters are `pending`, `running`, `completed`, `failed`, and `cancelled`. Failed results include acknowledged failures.
+Task list and stats default to `--scope work`; use `--scope history` for completed, cancelled, acknowledged, and superseded executions. Listing supports `--type`, `--status`, `--limit`, and ID-based `--cursor`. Work accepts `pending`, `running`, or `failed`; History accepts `completed`, `cancelled`, or `failed`.
 
-`synaps3 admin task retry` creates a new execution for a retryable failed task and prints the new ID. Repeating the request returns the same successor. Use `synaps3 admin task acknowledge <id>` to mark a failure as viewed without changing its result or deleting history. For a backlog, use `--type`, `--before`, and `--yes` to acknowledge only matching failures recorded by that cutoff.
+`synaps3 admin task retry` creates a new execution for a retryable failed task and prints the new ID. Repeating the request returns the same successor. Use `synaps3 admin task acknowledge <id>` to move a reviewed failure to History without changing its result or Retry eligibility. For a backlog, use `--type`, `--before`, and `--yes` to acknowledge only matching failures recorded by that cutoff.
 
 `synaps3 admin storage-confirmation list` shows storage registrations that need attention: one row per registration, with its owning task ID, provider, data set, piece count, and the provider's response. Retry a stopped one with `synaps3 admin task retry <task-id>`: a new execution resumes from the saved registration evidence.
 

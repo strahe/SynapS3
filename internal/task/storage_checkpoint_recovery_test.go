@@ -72,7 +72,7 @@ func seedStoreCheckpoint(t *testing.T, runtime handlerTestRuntime, taskID, copyI
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, checkpoint, taskID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, checkpoint, taskID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = 'recover' WHERE id = ?`, taskID).Exec(t.Context()); err != nil {
@@ -147,7 +147,7 @@ func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) 
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET runtime_json = ? WHERE task_id = ?`, runtimeJSON, taskRow.ID).Exec(t.Context()); err != nil {
+				if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ? WHERE id = ?`, runtimeJSON, taskRow.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -215,7 +215,7 @@ func TestStoreManualRetryUsesFreshCurrentPolicyBudget(t *testing.T) {
 		}
 		return task.Status == model.TaskStatusFailed
 	})
-	if retrying.RetryLimit == nil || *retrying.RetryLimit != 5 || retrying.RetryCount != 5 || stores.Load() != 7 {
+	if handlerTaskMaxAttempts(t, retrying) != 6 || retrying.RetryCount != 5 || stores.Load() != 7 {
 		t.Fatalf("new Store round budget = task:%#v uploads:%d, want current policy's six attempts", retrying, stores.Load())
 	}
 }
@@ -295,7 +295,7 @@ func TestNewStoreTaskAdoptsPreviousCheckpoint(t *testing.T) {
 			}
 			newTask := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
 			if tc.identityConflict {
-				if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET input_json = ? WHERE task_id = ?`, newTask.Input, old.ID).Exec(t.Context()); err != nil {
+				if _, err := runtime.db.NewRaw(`UPDATE tasks SET input_json = ? WHERE id = ?`, newTask.Input, old.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}

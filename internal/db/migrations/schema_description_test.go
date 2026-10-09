@@ -142,10 +142,10 @@ func TestValidateCurrentSchemaComparesSQLiteDDL(t *testing.T) {
 		"CHECK bound": {"tasks", "claim_generation >= 0", "claim_generation >= -1"},
 		"CHECK grouping": {
 			"tasks",
-			"retry_count >= 0 AND (retry_limit IS NULL OR (retry_limit >= 0 AND retry_count <= retry_limit))",
-			"retry_count >= 0 AND retry_limit IS NULL OR retry_limit >= 0 AND retry_count <= retry_limit",
+			"(status = 'failed' AND finished_at IS NOT NULL) OR (status IN ('pending','running') AND finished_at IS NULL)",
+			"status = 'failed' AND (finished_at IS NOT NULL OR status IN ('pending','running')) AND finished_at IS NULL",
 		},
-		"JSON column type": {"task_payloads", `"input_json" text`, `"input_json" blob`},
+		"JSON column type": {"tasks", `"input_json" text`, `"input_json" blob`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := t.Context()

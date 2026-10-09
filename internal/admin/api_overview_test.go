@@ -309,8 +309,8 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	if body.Objects.TotalSizeBytes != 30 {
 		t.Fatalf("total_size_bytes = %d, want 30", body.Objects.TotalSizeBytes)
 	}
-	if body.Tasks.ByStatus[string(model.TaskStatusCompleted)] == 0 {
-		t.Fatal("overview should keep legacy task status counts")
+	if body.Tasks.ByStatus[string(model.TaskStatusCompleted)] != 0 {
+		t.Fatal("overview should only report current work")
 	}
 	if body.Objects.Attention.NeedsAttention != 1 {
 		t.Fatalf("needs_attention = %d, want 1", body.Objects.Attention.NeedsAttention)

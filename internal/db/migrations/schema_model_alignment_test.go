@@ -60,8 +60,7 @@ func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
 func runtimePersistentModels() []any {
 	return []any{
 		(*model.Task)(nil),
-		(*model.TaskPayload)(nil),
-		(*model.TaskEvent)(nil),
+		(*model.TaskHistory)(nil),
 		(*model.TaskSchedule)(nil),
 		(*model.S3Account)(nil),
 		(*model.Bucket)(nil),

@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
@@ -33,7 +35,7 @@ func (adminTaskHandler) Recover(context.Context, taskengine.Execution) taskengin
 	return taskengine.Complete("", nil)
 }
 
-func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *taskengine.Service {
+func newAdminTestTaskService(t *testing.T, repos *repository.Repositories, overrides ...func(*taskengine.Definition)) *taskengine.Service {
 	t.Helper()
 
 	registry := taskengine.NewRegistry()
@@ -78,6 +80,9 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *task
 			definition.CanManualRetry = func(task *model.Task) bool {
 				return task.FailureReason == nil || *task.FailureReason != "termination_outcome_unknown"
 			}
+		}
+		for _, override := range overrides {
+			override(&definition)
 		}
 		if err := registry.Register(adminTaskHandler{definition: definition}); err != nil {
 			t.Fatalf("Register(%s): %v", definition.Type, err)
@@ -140,12 +145,12 @@ func TestAPITasksPreservesDurationPrecision(t *testing.T) {
 	})
 	started := time.Date(2026, 10, 3, 0, 0, 0, 900_000_000, time.UTC)
 	finished := started.Add(200 * time.Millisecond)
-	if _, err := fixture.db.NewUpdate().Model((*model.Task)(nil)).
+	if _, err := fixture.db.NewUpdate().Table("task_history").
 		Set("started_at = ?", started.Add(-30*time.Minute)).Set("work_started_at = ?", started).Set("finished_at = ?", finished).
-		Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+		Where("task_id = ?", row.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	rr := fixture.request(http.MethodGet, "/api/v1/tasks?type=storage_store", nil)
+	rr := fixture.request(http.MethodGet, "/api/v1/tasks?scope=history&type=storage_store", nil)
 	var response taskListResponse
 	decodeJSON(t, rr, &response)
 	if rr.Code != http.StatusOK || len(response.Tasks) != 1 {
@@ -195,6 +200,11 @@ func TestAPITasksRejectsRemovedAndInvalidFilters(t *testing.T) {
 		"/api/v1/tasks?offset=10",
 		"/api/v1/tasks?type=future_task_type",
 		"/api/v1/tasks?status=waiting",
+		"/api/v1/tasks?scope=invalid",
+		"/api/v1/tasks?status=completed",
+		"/api/v1/tasks?scope=history&status=running",
+		"/api/v1/tasks/stats?scope=invalid",
+		"/api/v1/tasks/stats?scope=history&status=pending",
 		"/api/v1/tasks?limit=0",
 		"/api/v1/tasks?cursor=nope",
 	} {
@@ -233,8 +243,13 @@ func TestAPITaskStatsUsesPresentationStatusContract(t *testing.T) {
 		counts[[2]string{item.Type, item.Status}] = item.Count
 	}
 	if counts[[2]string{string(model.TaskTypeUploadPlan), string(model.TaskStatusPending)}] != 1 ||
-		counts[[2]string{string(model.TaskTypeUploadPlan), string(model.TaskStatusFailed)}] != 2 {
+		counts[[2]string{string(model.TaskTypeUploadPlan), string(model.TaskStatusFailed)}] != 1 {
 		t.Fatalf("counts = %#v", counts)
+	}
+	rr = fixture.request(http.MethodGet, "/api/v1/tasks/stats?scope=history", nil)
+	decodeJSON(t, rr, &body)
+	if rr.Code != http.StatusOK || len(body) != 1 || body[0].Status != "failed" || body[0].Count != 1 {
+		t.Fatalf("history counts = %d %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -251,13 +266,13 @@ func TestAPITasksAcknowledgementPreservesFailedStatus(t *testing.T) {
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks?status=failed", nil)
 	var page taskListResponse
 	decodeJSON(t, rr, &page)
-	if rr.Code != 200 || len(page.Tasks) != 2 {
-		t.Fatalf("failures = %d %s", rr.Code, rr.Body.String())
+	if rr.Code != 200 || len(page.Tasks) != 1 || page.Tasks[0].ID != failed.ID {
+		t.Fatalf("work failures = %d %s", rr.Code, rr.Body.String())
 	}
-	for _, item := range page.Tasks {
-		if item.Status != "failed" || item.Presentation != "failed" {
-			t.Fatalf("ack changed result: %#v", item)
-		}
+	rr = fixture.request(http.MethodGet, "/api/v1/tasks?scope=history&status=failed", nil)
+	decodeJSON(t, rr, &page)
+	if rr.Code != 200 || len(page.Tasks) != 1 || page.Tasks[0].ID != viewed.ID || page.Tasks[0].Status != "failed" || page.Tasks[0].AcknowledgedAt == nil || !page.Tasks[0].Retryable {
+		t.Fatalf("acknowledged history = %d %s", rr.Code, rr.Body.String())
 	}
 	if rr := fixture.request(http.MethodGet, "/api/v1/tasks?status=dismissed", nil); rr.Code != 400 {
 		t.Fatalf("removed status response = %d", rr.Code)
@@ -267,14 +282,39 @@ func TestAPITasksAcknowledgementPreservesFailedStatus(t *testing.T) {
 type commitAttentionTaskRepo struct {
 	repository.StorageContentRepository
 	records []storagecommit.AttentionRecord
+	err     error
 }
 
 func (r *commitAttentionTaskRepo) ListCommitAttentionForTasks(context.Context, []int64) ([]storagecommit.AttentionRecord, error) {
-	return r.records, nil
+	return r.records, r.err
 }
 
 type heldAcknowledgeTaskRepo struct {
 	repository.TaskRepository
+}
+
+type contendedTaskRepo struct {
+	repository.TaskRepository
+	err error
+}
+
+func (r contendedTaskRepo) GetDirectSuccessor(context.Context, int64) (*model.Task, error) {
+	return nil, r.err
+}
+
+func TestAPITaskRetryReportsTemporaryContention(t *testing.T) {
+	for _, contention := range []error{repository.ErrTaskIdentityContended, repository.ErrRepositoryContended} {
+		t.Run(contention.Error(), func(t *testing.T) {
+			f := newAdminTaskFixture(t)
+			source := f.enqueue(t, model.TaskTypeUploadPlan, "contended-retry", time.Now(), "bucket", "1")
+			f.transition(t, source.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
+			f.repos.Tasks = contendedTaskRepo{TaskRepository: f.repos.Tasks, err: contention}
+			rr := f.request(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(source.ID, 10)+"/retry", nil)
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("contention = %d %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
 }
 
 func (heldAcknowledgeTaskRepo) AcknowledgeFailed(context.Context, int64) error {
@@ -312,6 +352,29 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 		confirmation.PieceCount != 1 || confirmation.PieceCIDs[0] != "piece-1" || confirmation.TransactionID != "0xcommit" {
 		t.Fatalf("confirmation = %#v, want the confirmation with the provider reply", confirmation)
 	}
+	path := "/api/v1/tasks/" + strconv.FormatInt(stopped.ID, 10)
+	rr = fixture.request(http.MethodGet, path, nil)
+	var detail struct {
+		Task taskListItem `json:"task"`
+	}
+	decodeJSON(t, rr, &detail)
+	if rr.Code != http.StatusOK || detail.Task.Acknowledgeable || detail.Task.StorageConfirmation == nil {
+		t.Fatalf("details = %d %s", rr.Code, rr.Body.String())
+	}
+	rr = fixture.request(http.MethodGet, path+"/history", nil)
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || page.Tasks[0].StorageConfirmation == nil {
+		t.Fatalf("history = %d %s", rr.Code, rr.Body.String())
+	}
+	attentionRepo := fixture.repos.Contents.(*commitAttentionTaskRepo)
+	attentionRepo.err = errors.New("attention lookup failed")
+	for _, endpoint := range []string{"/api/v1/tasks", path, path + "/history"} {
+		rr = fixture.request(http.MethodGet, endpoint, nil)
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("%s lookup error = %d %s", endpoint, rr.Code, rr.Body.String())
+		}
+	}
+	attentionRepo.err = nil
 
 	fixture.repos.Tasks = heldAcknowledgeTaskRepo{TaskRepository: fixture.repos.Tasks}
 	rr = fixture.request(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(stopped.ID, 10)+"/acknowledge", nil)
@@ -320,7 +383,75 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	}
 }
 
-func TestAPITasksHideHealthyRecurringSystemWorkButKeepFailures(t *testing.T) {
+func TestAPITaskRetryCandidatesKeepDomainValidationAtDetailsAndAction(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		err          error
+		detailStatus int
+		actionStatus int
+		reason       string
+	}{
+		{"unsafe recovery", &repository.CopyRetryBlockedError{Block: storagepipeline.CopyRetryRecoveryRequiresAttention}, http.StatusOK, http.StatusConflict, "Previous transfer needs recovery."},
+		{"stale ownership", repository.ErrConflict, http.StatusOK, http.StatusConflict, "Retry is unavailable for this task."},
+		{"missing domain owner", repository.ErrNotFound, http.StatusOK, http.StatusConflict, "Retry is unavailable for this task."},
+		{"database failure", errors.New("private database diagnostics"), http.StatusInternalServerError, http.StatusInternalServerError, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAdminTaskFixture(t)
+			inspections := 0
+			f.service = newAdminTestTaskService(t, f.repos, func(definition *taskengine.Definition) {
+				if definition.Type == model.TaskTypeUploadPlan {
+					definition.InspectRetry = func(context.Context, *repository.Repositories, *model.Task) error {
+						inspections++
+						return tc.err
+					}
+				}
+			})
+			f.server.WithTaskService(f.service)
+			source := f.enqueue(t, model.TaskTypeUploadPlan, "retry-candidate", time.Now(), "bucket", "1")
+			f.transition(t, source.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
+			path := "/api/v1/tasks/" + strconv.FormatInt(source.ID, 10)
+			for _, endpoint := range []string{"/api/v1/tasks", path + "/history"} {
+				rr := f.request(http.MethodGet, endpoint, nil)
+				var page taskListResponse
+				decodeJSON(t, rr, &page)
+				if rr.Code != http.StatusOK || len(page.Tasks) != 1 || !page.Tasks[0].Retryable || inspections != 0 {
+					t.Fatalf("candidate list %s = %d %s, inspections=%d", endpoint, rr.Code, rr.Body.String(), inspections)
+				}
+			}
+			rr := f.request(http.MethodGet, path, nil)
+			if rr.Code != tc.detailStatus || inspections != 1 || strings.Contains(rr.Body.String(), "private database diagnostics") {
+				t.Fatalf("details = %d %s, inspections=%d", rr.Code, rr.Body.String(), inspections)
+			}
+			if tc.reason != "" {
+				var detail struct {
+					Task taskListItem `json:"task"`
+				}
+				decodeJSON(t, rr, &detail)
+				if detail.Task.Retryable || detail.Task.RetryTaskID != nil || detail.Task.RetryUnavailableReason != tc.reason {
+					t.Fatalf("unsafe details = %#v", detail.Task)
+				}
+			}
+			rr = f.request(http.MethodPost, path+"/retry", nil)
+			if rr.Code != tc.actionStatus || strings.Contains(rr.Body.String(), "private database diagnostics") {
+				t.Fatalf("action = %d %s", rr.Code, rr.Body.String())
+			}
+			if tc.reason != "" {
+				var actionError map[string]string
+				if err := json.Unmarshal(rr.Body.Bytes(), &actionError); err != nil || actionError["error"] != tc.reason {
+					t.Fatalf("action did not explain refusal: %s %v", rr.Body.String(), err)
+				}
+			}
+			child, err := f.repos.Tasks.GetDirectSuccessor(t.Context(), source.ID)
+			original, getErr := f.repos.Tasks.GetByID(t.Context(), source.ID)
+			if err != nil || getErr != nil || child != nil || original.SupersededAt != nil {
+				t.Fatalf("rejected retry changed source: child=%#v original=%#v errors=%v/%v", child, original, err, getErr)
+			}
+		})
+	}
+}
+
+func TestAPITasksShowsRecurringWorkAndArchivesAcknowledgedFailures(t *testing.T) {
 	fixture := newAdminTaskFixture(t)
 	healthy := fixture.enqueue(t, model.TaskTypeCacheCapacityReconcile, "healthy-system", time.Now().Add(time.Hour), "system", "cache-capacity")
 	failed := fixture.enqueue(t, model.TaskTypeObservabilityRefresh, "failed-system", time.Now(), "system", "observability")
@@ -328,35 +459,30 @@ func TestAPITasksHideHealthyRecurringSystemWorkButKeepFailures(t *testing.T) {
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
 		FailureReason: new("refresh_failed"), LastError: new("health refresh failed"),
 	})
-
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
-	}
 	var page taskListResponse
 	decodeJSON(t, rr, &page)
-	if len(page.Tasks) != 1 || page.Tasks[0].ID != failed.ID {
-		t.Fatalf("visible tasks = %#v; healthy task %d should be hidden", page.Tasks, healthy.ID)
-	}
-
-	rr = fixture.request(http.MethodGet, "/api/v1/tasks/stats", nil)
-	var stats []taskStatsItem
-	decodeJSON(t, rr, &stats)
-	if len(stats) != 1 || stats[0].Type != string(model.TaskTypeObservabilityRefresh) || stats[0].Status != string(model.TaskStatusFailed) {
-		t.Fatalf("visible task stats = %#v", stats)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 2 || page.Tasks[0].ID != failed.ID || page.Tasks[1].ID != healthy.ID {
+		t.Fatalf("recurring work = %d %s", rr.Code, rr.Body.String())
 	}
 	if err := fixture.repos.Tasks.AcknowledgeFailed(t.Context(), failed.ID); err != nil {
-		t.Fatalf("acknowledge recurring failure: %v", err)
+		t.Fatal(err)
 	}
 	rr = fixture.request(http.MethodGet, "/api/v1/tasks?status=failed", nil)
 	decodeJSON(t, rr, &page)
+	if len(page.Tasks) != 0 {
+		t.Fatalf("acknowledged failure remained in work: %#v", page.Tasks)
+	}
+	rr = fixture.request(http.MethodGet, "/api/v1/tasks?scope=history&status=failed", nil)
+	decodeJSON(t, rr, &page)
 	if len(page.Tasks) != 1 || page.Tasks[0].ID != failed.ID || page.Tasks[0].Presentation != "failed" {
-		t.Fatalf("dismissed recurring tasks = %#v", page.Tasks)
+		t.Fatalf("recurring history = %#v", page.Tasks)
 	}
 	rr = fixture.request(http.MethodGet, "/api/v1/tasks/stats", nil)
+	var stats []taskStatsItem
 	decodeJSON(t, rr, &stats)
-	if len(stats) != 1 || stats[0].Type != string(model.TaskTypeObservabilityRefresh) || stats[0].Status != "failed" {
-		t.Fatalf("dismissed recurring task stats = %#v", stats)
+	if len(stats) != 1 || stats[0].Type != string(model.TaskTypeCacheCapacityReconcile) || stats[0].Status != "pending" {
+		t.Fatalf("recurring work counts = %#v", stats)
 	}
 }
 
@@ -784,7 +910,7 @@ func TestAPITaskLegacyPolicyIsReadableAndRetryRequiresEmptyBody(t *testing.T) {
 	f := newAdminTaskFixture(t)
 	row := f.enqueue(t, model.TaskTypeUploadPlan, "legacy-detail", time.Now(), "bucket", "1")
 	f.transition(t, row.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
-	if _, err := f.db.NewRaw("UPDATE task_payloads SET policy_json = ? WHERE task_id = ?", `{"version":0,"legacy":true,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2}}`, row.ID).Exec(t.Context()); err != nil {
+	if _, err := f.db.NewRaw("UPDATE tasks SET policy_json = ? WHERE id = ?", `{"version":0,"legacy":true,"max_attempts":6,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2}}`, row.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	path := "/api/v1/tasks/" + strconv.FormatInt(row.ID, 10)
@@ -803,5 +929,61 @@ func TestAPITaskLegacyPolicyIsReadableAndRetryRequiresEmptyBody(t *testing.T) {
 	child, err := f.repos.Tasks.GetDirectSuccessor(t.Context(), row.ID)
 	if err != nil || child != nil {
 		t.Fatalf("invalid request created a successor: %#v %v", child, err)
+	}
+}
+
+func TestAPITaskScopesKeepAllTerminalRoundsAndSeparateWork(t *testing.T) {
+	f := newAdminTaskFixture(t)
+	completed := f.enqueue(t, model.TaskTypeObservabilityRefresh, "completed-periodic", time.Now(), "system", "observability")
+	f.transition(t, completed.ID, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute})
+	cancelled := f.enqueue(t, model.TaskTypeUploadPlan, "cancelled-plan", time.Now(), "bucket", "1")
+	f.transition(t, cancelled.ID, repository.TaskTransition{Status: model.TaskStatusCancelled, ResumeMode: model.TaskResumeModeExecute})
+	current := f.enqueue(t, model.TaskTypeUploadPlan, "current-plan", time.Now().Add(time.Hour), "bucket", "1")
+	var page taskListResponse
+	rr := f.request(http.MethodGet, "/api/v1/tasks", nil)
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].ID != current.ID {
+		t.Fatalf("work = %d %s", rr.Code, rr.Body.String())
+	}
+	rr = f.request(http.MethodGet, "/api/v1/tasks?scope=history&limit=1", nil)
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].ID != cancelled.ID || page.NextCursor == nil {
+		t.Fatalf("history first page = %d %s", rr.Code, rr.Body.String())
+	}
+	rr = f.request(http.MethodGet, "/api/v1/tasks?scope=history&limit=1&cursor="+strconv.FormatInt(*page.NextCursor, 10), nil)
+	page = taskListResponse{}
+	decodeJSON(t, rr, &page)
+	if len(page.Tasks) != 1 || page.Tasks[0].ID != completed.ID || page.NextCursor != nil || page.Tasks[0].MaxAttempts == nil || *page.Tasks[0].MaxAttempts != 6 {
+		t.Fatalf("periodic history = %d %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "retry_limit") || strings.Contains(rr.Body.String(), "events_json") || strings.Contains(rr.Body.String(), "checkpoint") {
+		t.Fatalf("list exposes internal payload: %s", rr.Body.String())
+	}
+}
+
+func TestAPITaskRetryReplaysArchivedSuccessorAfterAcknowledgement(t *testing.T) {
+	f := newAdminTaskFixture(t)
+	first := f.enqueue(t, model.TaskTypeUploadPlan, "acknowledged-retry", time.Now(), "bucket", "1")
+	f.transition(t, first.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, LastError: new("failed")})
+	if err := f.service.Acknowledge(t.Context(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/tasks/" + strconv.FormatInt(first.ID, 10) + "/retry"
+	rr := f.request(http.MethodPost, path, nil)
+	var response struct {
+		TaskID int64 `json:"task_id"`
+	}
+	decodeJSON(t, rr, &response)
+	if rr.Code != http.StatusAccepted || response.TaskID <= first.ID {
+		t.Fatalf("retry = %d %s", rr.Code, rr.Body.String())
+	}
+	f.transition(t, response.TaskID, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute})
+	rr = f.request(http.MethodPost, path, nil)
+	var replay struct {
+		TaskID int64 `json:"task_id"`
+	}
+	decodeJSON(t, rr, &replay)
+	if rr.Code != http.StatusAccepted || replay.TaskID != response.TaskID {
+		t.Fatalf("archived replay = %d %s", rr.Code, rr.Body.String())
 	}
 }

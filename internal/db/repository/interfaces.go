@@ -778,7 +778,9 @@ type TaskRepository interface {
 	GetDirectSuccessor(ctx context.Context, id int64) (*model.Task, error)
 	SupersedeTerminal(ctx context.Context, id int64) error
 	CloseLegacy(ctx context.Context, id, generation int64) error
+	FailLegacyPending(ctx context.Context, id, generation int64, cause string) error
 	LatestForSubject(ctx context.Context, subjectType, subjectKey string, types ...model.TaskType) (*model.Task, error)
+	ListCurrentFailedForSubject(ctx context.Context, subjectType, subjectKey string, beforeID int64, limit int, types ...model.TaskType) (TaskPage, error)
 	ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error)
 	AppendEvent(ctx context.Context, taskID int64, eventType string, details json.RawMessage) error
 	ListEvents(ctx context.Context, taskID, beforeSequence int64, limit int) ([]model.TaskEvent, error)
@@ -807,6 +809,7 @@ type TaskRepository interface {
 	CountFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter) (int, error)
 	List(ctx context.Context, filter TaskListFilter) (TaskPage, error)
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	CountByScope(ctx context.Context, scope TaskScope) ([]TaskStatusCount, error)
 	CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountUnacknowledgedFailed(ctx context.Context) (int64, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
@@ -842,13 +845,30 @@ type TaskAcknowledgeFilter struct {
 	FailedBefore time.Time
 }
 
+type TaskScope string
+
+const (
+	TaskScopeWork    TaskScope = "work"
+	TaskScopeHistory TaskScope = "history"
+)
+
+func (s TaskScope) Valid() bool {
+	//exhaustive:enforce
+	switch s {
+	case "", TaskScopeWork, TaskScopeHistory:
+		return true
+	default:
+		return false
+	}
+}
+
 type TaskListFilter struct {
-	Type                       model.TaskType
-	Status                     model.TaskStatus
-	Acknowledged               *bool
-	BeforeID                   int64
-	Limit                      int
-	HideHealthyRecurringSystem bool
+	Scope        TaskScope
+	Type         model.TaskType
+	Status       model.TaskStatus
+	Acknowledged *bool
+	BeforeID     int64
+	Limit        int
 }
 
 type TaskPage struct {

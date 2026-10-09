@@ -237,7 +237,7 @@ Replacement moves through these states:
 | `completed` | Required copies are readable on the new provider, and any old service has ended. |
 | `superseded` | A later confirmation replaced this request. |
 
-`last_error` is set only for `failed` and `cleanup_attention`, and is cleared by a retry. Waiting never sets it, because waiting is not a failure. A failed response may also include `failure_reason`. `target_in_use` and `target_rejected` require choosing another provider; the retry endpoint returns a conflict explaining that action. `retryable` reports whether the existing replacement can resume. Before handover, choose a different provider from the original replica. A retryable setup failure leaves the replacement waiting; retry the setup task to continue. A terminated setup cannot be recreated by retrying its replacement.
+A stopped retirement also exposes `retirement_attention`, an error, and, when recovery is safe, its bound `retry_task_id`, including for a superseded replacement whose unused target still needs retirement. `last_error` is otherwise set only for `failed` and `cleanup_attention`, and is cleared by a retry. Waiting never sets it, because waiting is not a failure. A failed response may also include `failure_reason`. `target_in_use` and `target_rejected` require choosing another provider; the retry endpoint returns a conflict explaining that action. `retryable` reports whether the existing replacement can resume. Before handover, choose a different provider from the original replica. Recoverable setup failures retry within the replacement budget; after the replacement stops, review its error and use **Retry**. A terminated setup cannot be recreated by retrying its replacement.
 
 `items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
 
@@ -276,22 +276,22 @@ Provenance replicas and replacement details expose `retryable` and `retry_task_i
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/tasks` | List background tasks. Supports `type`, `status`, `limit`, and ID-based `cursor`. |
-| `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
+| `GET` | `/api/v1/tasks` | List work or history. Supports `scope`, `type`, `status`, `limit`, and ID-based `cursor`. |
+| `GET` | `/api/v1/tasks/stats` | Count tasks by status within `scope=work` or `scope=history`. |
 | `GET` | `/api/v1/tasks/{id}` | Read the task and its frozen execution policy. |
 | `GET` | `/api/v1/tasks/{id}/history` | Read its execution chain with `limit` and `cursor`. |
 | `GET` | `/api/v1/tasks/{id}/events` | Read retained key events with `limit` and `cursor`. |
 | `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | Read one task subject and its known related information. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Create a new execution when `retryable` is true. |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | Mark a failed task as viewed when `acknowledgeable` is true. Its result and history remain unchanged. |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | Move a reviewed failure to History when `acknowledgeable` is true; preserve its result and Retry eligibility. |
 | `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk acknowledgement would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
 | `POST` | `/api/v1/tasks/acknowledge` | Acknowledge matching failures. Returns `acknowledged` with the number updated. |
 
-`POST /api/v1/tasks/{id}/retry` takes no body and returns `202 {"task_id":456}`. Automatic retries stay in the original execution; manual Retry creates a successor with a fresh policy and budget. Repeating the same request returns the same successor. Missing tasks return 404; obsolete or ineligible sources return 409.
+`POST /api/v1/tasks/{id}/retry` takes no body and returns `202 {"task_id":456}`. Automatic retries stay in the original execution; manual Retry creates a successor with a fresh policy and budget. Repeating the same request returns the same successor. Missing tasks return 404; obsolete or unsafe sources return 409 with an explanation. Temporary transaction contention returns 503; retry the request.
 
-`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`. Responses also include `operation`, optional subject identity, and server-computed `retryable`, `retry_task_id`, and `acknowledgeable` fields. A Confirm storage task whose registration needs attention also includes `storage_confirmation` with `request_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
+`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`. Responses also include `operation`, optional subject identity, and server-computed `retryable`, `retry_task_id`, and `acknowledgeable` fields. In task entries, `retry_task_id` identifies the source to pass to Retry; in a superseded event, it identifies the successor returned by Retry. Task lists calculate retry capability from the saved result; details check current recovery conditions and may include `retry_unavailable_reason`. Retry always rechecks safety and ownership before creating a successor. A Confirm storage task whose registration needs attention also includes `storage_confirmation` with `request_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
 
-`status=failed` includes acknowledged failures. `acknowledged_at` is independent of status; task history is retained indefinitely.
+List and statistics default to `scope=work`: pending, running, and unacknowledged failures. `scope=history` contains completed, cancelled, acknowledged, and superseded executions, including periodic work. Work accepts `pending`, `running`, or `failed`; History accepts `completed`, `cancelled`, or `failed`. An invalid scope or unavailable status returns 400. Acknowledgement moves a failure to History without changing its Failed result or Retry eligibility; history is retained indefinitely.
 
 Subject lookup accepts `storage_content`, `storage_copy`, `storage_data_set`, `bucket`, `provider`, `storage_replacement`, `wallet_operation`, and `storage_commit_request`. Local resource keys are positive integer IDs, provider keys are decimal uint256 IDs, and registration keys are request IDs; encode each path segment separately. The response includes `subject_type`, `subject_key`, and available resource fields. `copy_index` starts at zero; `local_data_set_id` and string `data_set_id` distinguish local and on-chain datasets. A file sample has `key`, `source` (`current`, `historical`, or `deleted`), and `other_versions`. Wallet amounts remain strings in USDFC base units. Invalid parameters return `400`, unavailable subjects return `404`, and query failures return `500`. Lookup uses local records and may return partial information.
 
@@ -319,7 +319,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 Passing that `as_of` back as `failed_before` acknowledges exactly what was counted.
 
-`/api/v1/overview` groups `tasks.by_status` by status. Its failed count includes acknowledged failures; `tasks.attention.failed` counts unacknowledged, unsuperseded failures.
+`/api/v1/overview` groups `tasks.by_status` by status. It reports current work; acknowledged and superseded failures are in History. `tasks.attention.failed` counts failures that still need attention.
 
 Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacements and failed speed tests use the same task Retry endpoint. Retry eligibility depends on the current operation and saved evidence; uncertain external effects are observed before any safe resend. Missing task history prevents Retry.
 

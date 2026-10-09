@@ -3,6 +3,8 @@ package repository_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -28,6 +30,8 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	}
 	row := commitTask("protected-pull")
 	row.Type = model.TaskTypeStoragePull
+	row.Input = []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copyRow.ID, generation))
+	row.SubjectType, row.SubjectKey = new(model.TaskSubjectStorageCopy), new(strconv.FormatInt(copyRow.ID, 10))
 	row, _, err = f.repos.Tasks.Enqueue(ctx, row)
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +148,8 @@ func testPullAuthorizationLedger(t *testing.T, f commitFixture) {
 	}
 	row := commitTask("pull-ledger")
 	row.Type = model.TaskTypeStoragePull
+	row.Input = []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copyRow.ID, generation))
+	row.SubjectType, row.SubjectKey = new(model.TaskSubjectStorageCopy), new(strconv.FormatInt(copyRow.ID, 10))
 	row, _, err = f.repos.Tasks.Enqueue(ctx, row)
 	if err != nil {
 		t.Fatal(err)

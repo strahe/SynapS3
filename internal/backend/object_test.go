@@ -30,6 +30,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
 	"github.com/uptrace/bun"
@@ -715,8 +716,9 @@ func TestPutObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	if task == nil {
 		t.Fatal("expected upload task")
 	}
-	if task.Type != model.TaskTypeUploadPlan || task.RetryLimit == nil || *task.RetryLimit != 5 {
-		t.Fatalf("task = %#v, want upload_plan with retry limit 5", task)
+	policy, policyErr := worker.DecodePolicy(task)
+	if task.Type != model.TaskTypeUploadPlan || policyErr != nil || policy.MaxAttempts != 6 {
+		t.Fatalf("task = %#v, policy = %#v, err = %v; want upload_plan with six attempts", task, policy, policyErr)
 	}
 }
 
@@ -1117,8 +1119,9 @@ func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) 
 	if task.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, input.Generation) {
 		t.Fatalf("evict task key = %q", task.IdempotencyKey)
 	}
-	if task.RetryLimit == nil || *task.RetryLimit != 5 {
-		t.Fatalf("evict task retry limit = %v, want 5", task.RetryLimit)
+	policy, policyErr := worker.DecodePolicy(task)
+	if policyErr != nil || policy.MaxAttempts != 6 {
+		t.Fatalf("evict task policy = %#v, err = %v; want six attempts", policy, policyErr)
 	}
 }
 
@@ -3104,8 +3107,9 @@ func TestCopyObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	}
 	for _, task := range page.Tasks {
 		if task.SubjectType != nil && task.SubjectKey != nil && *task.SubjectType == "storage_content" && *task.SubjectKey == contentSubjectForVersion(t, tb, dstObj.VersionID) {
-			if task.RetryLimit == nil || *task.RetryLimit != 5 {
-				t.Fatalf("copy upload task retry limit = %v, want 5", task.RetryLimit)
+			policy, policyErr := worker.DecodePolicy(&task)
+			if policyErr != nil || policy.MaxAttempts != 6 {
+				t.Fatalf("copy upload task policy = %#v, err = %v; want six attempts", policy, policyErr)
 			}
 			return
 		}

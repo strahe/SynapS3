@@ -19,27 +19,9 @@ import (
 )
 
 func (h *StoreHandler) storeHandler() *taskengine.FuncHandler {
-	definition := copyDefinition(model.TaskTypeStorageStore)
+	definition := h.copyDefinition(model.TaskTypeStorageStore)
 	definition.AllowRetry = true
 	definition.Policy.ObservationWindow = storeAttentionAfter
-	definition.CanManualRetry = func(task *model.Task) bool {
-		if task == nil || task.FailureReason == nil {
-			return false
-		}
-		if taskengine.RecoverableEngineFailure(*task.FailureReason) {
-			return true
-		}
-		switch *task.FailureReason {
-		case "store_not_started":
-			return len(task.Checkpoint) == 0
-		case "store_retry_limit", "store_cache_missing", "store_checkpoint_write_failed", "copy_authorization_failed":
-			return true
-		case "store_outcome_unknown", "store_processing_timeout", "store_check_failed", "store_result_invalid", "store_cache_read_failed", "store_identity_mismatch", "commit_presign_failed", "copy_owner_missing", "copy_context_failed":
-			return len(task.Checkpoint) > 0
-		default:
-			return false
-		}
-	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runStore(ctx, execution, true)
 	}, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {

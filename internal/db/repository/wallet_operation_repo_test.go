@@ -2,6 +2,8 @@ package repository_test
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -53,7 +55,7 @@ func TestWalletOperationRepoFencesBroadcastAndConfirmationByTask(t *testing.T) {
 	repos := repository.NewRepositories(testDB(t))
 	ctx := t.Context()
 	op := createWalletOperation(t, repos, model.WalletOperationTypeFund, "fenced", "100")
-	taskID := createWalletTask(t, repos, "fenced")
+	taskID := createWalletTask(t, repos, op.ID, "fenced")
 	if err := repos.WalletOperations.BindTask(ctx, op.ID, taskID); err != nil {
 		t.Fatalf("BindTask: %v", err)
 	}
@@ -82,7 +84,7 @@ func TestWalletOperationRepoUnknownRequiresAttemptEvidence(t *testing.T) {
 	repos := repository.NewRepositories(testDB(t))
 	ctx := t.Context()
 	op := createWalletOperation(t, repos, model.WalletOperationTypeWithdraw, "unknown", "100")
-	taskID := createWalletTask(t, repos, "unknown")
+	taskID := createWalletTask(t, repos, op.ID, "unknown")
 	if err := repos.WalletOperations.BindTask(ctx, op.ID, taskID); err != nil {
 		t.Fatalf("BindTask: %v", err)
 	}
@@ -105,7 +107,7 @@ func TestWalletOperationRepoConfirmedWithoutTransaction(t *testing.T) {
 	repos := repository.NewRepositories(testDB(t))
 	ctx := t.Context()
 	op := createWalletOperation(t, repos, model.WalletOperationTypeApprove, "approve-no-tx", "0")
-	taskID := createWalletTask(t, repos, "approve-no-tx")
+	taskID := createWalletTask(t, repos, op.ID, "approve-no-tx")
 	if err := repos.WalletOperations.BindTask(ctx, op.ID, taskID); err != nil {
 		t.Fatalf("BindTask: %v", err)
 	}
@@ -115,6 +117,46 @@ func TestWalletOperationRepoConfirmedWithoutTransaction(t *testing.T) {
 	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
 	if err != nil || got == nil || got.Status != model.WalletOperationStatusConfirmed || got.TxHash != nil || got.SubmittedAt != nil || got.TaskID != nil {
 		t.Fatalf("confirmed operation=%#v err=%v", got, err)
+	}
+}
+
+func TestWalletTaskBindingRejectsInvalidLogicalReferences(t *testing.T) {
+	for _, scenario := range []string{"missing", "wrong_type", "wrong_subject", "wrong_operation", "archived"} {
+		t.Run(scenario, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			op := createWalletOperation(t, repos, model.WalletOperationTypeFund, scenario, "100")
+			taskID := int64(1)
+			if scenario != "missing" {
+				taskID = createWalletTask(t, repos, op.ID, scenario)
+				query := db.NewUpdate().Model((*model.Task)(nil)).Where("id = ?", taskID)
+				switch scenario {
+				case "wrong_type":
+					query = query.Set("type = ?", model.TaskTypeCacheEvict)
+				case "wrong_subject":
+					query = query.Set("subject_key = ?", strconv.FormatInt(op.ID+1, 10))
+				case "wrong_operation":
+					query = query.Set("input_json = ?", []byte(fmt.Sprintf(`{"operation_id":%d}`, op.ID+1)))
+				case "archived":
+					query = query.Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "test_failure").Set("finished_at = ?", time.Now())
+				}
+				if _, err := query.Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "archived" {
+					if err := repos.Tasks.AcknowledgeFailed(t.Context(), taskID); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := repos.WalletOperations.BindTask(t.Context(), op.ID, taskID); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("BindTask = %v, want conflict", err)
+			}
+			stored, err := repos.WalletOperations.GetByID(t.Context(), op.ID)
+			if err != nil || stored == nil || stored.TaskID != nil || stored.Status != model.WalletOperationStatusPending {
+				t.Fatalf("rejected binding changed owner: %#v, %v", stored, err)
+			}
+		})
 	}
 }
 
@@ -129,11 +171,12 @@ func createWalletOperation(t *testing.T, repos *repository.Repositories, operati
 	return op
 }
 
-func createWalletTask(t *testing.T, repos *repository.Repositories, key string) int64 {
+func createWalletTask(t *testing.T, repos *repository.Repositories, operationID int64, key string) int64 {
 	t.Helper()
 	row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeWalletOperation, IdempotencyKey: "wallet:" + key,
-		InputVersion: 1, Input: []byte(`{"operation_id":1}`), InputHash: key,
+		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"operation_id":%d}`, operationID)), InputHash: key,
+		SubjectType: new("wallet_operation"), SubjectKey: new(strconv.FormatInt(operationID, 10)),
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 		AvailableAt: time.Now(),
 	}))

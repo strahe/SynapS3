@@ -388,6 +388,12 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 		e.abandonClaim(claimed)
 		return
 	}
+	if errors.Is(result.err, repository.ErrTaskIdentityContended) || errors.Is(result.err, repository.ErrRepositoryContended) {
+		// Database contention cannot allocate another business opportunity or
+		// authorize a failed settlement of an unresolved external effect.
+		result = ResourceWait("Waiting for resources")
+		result.resumeMode = model.TaskResumeModeRecover
+	}
 	if err := validateResult(result, claimed); err != nil {
 		logger.Error("task handler returned an invalid result", "error", err)
 		stopLeaseRenewal()
@@ -523,16 +529,10 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 					return err
 				}
 			}
-			if err := txRepos.Tasks.Settle(settlementCtx, claimed.ID, claimed.ClaimGeneration, transition); err != nil {
-				return err
-			}
 			if err := e.settleSchedule(settlementCtx, txRepos, claimed, result, transition); err != nil {
 				return err
 			}
-			if result.kind == resultWait {
-				return nil
-			}
-			return txRepos.Tasks.AppendEvent(settlementCtx, claimed.ID, string(transition.Status), mustEvent(map[string]any{"failure_reason": dereference(transition.FailureReason), "next_attempt": current.RetryCount + 1 + boolInt(transition.IncrementRetry)}))
+			return txRepos.Tasks.Settle(settlementCtx, claimed.ID, claimed.ClaimGeneration, transition)
 		})
 		cancel()
 		if lastErr == nil {
@@ -614,13 +614,17 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.ResumeMode = result.resumeMode
 		transition.AvailableAt = now.Add(delay)
 	case resultRetry:
-		if claimed.RetryLimit == nil || claimed.RetryCount >= *claimed.RetryLimit {
+		policy, err := DecodePolicy(claimed)
+		if err != nil {
+			transition.Status = model.TaskStatusFailed
+			transition.FailureReason = textPointer("invalid_policy")
+			transition.LastError = errorPointer(err)
+		} else if claimed.RetryCount >= policy.MaxAttempts-1 {
 			transition.Status = model.TaskStatusFailed
 			transition.FailureReason = textPointer("attempts_exhausted")
 		} else {
 			delay := result.delay
 			if result.retryBackoff {
-				policy, _ := DecodePolicy(claimed)
 				backoff := policy.Backoff.delay(claimed.RetryCount)
 				if e.retryDelay != nil {
 					backoff = e.retryDelay(claimed.RetryCount)
@@ -902,11 +906,4 @@ func decodeHash(value string) []byte {
 		return nil
 	}
 	return decoded
-}
-
-func boolInt(value bool) int {
-	if value {
-		return 1
-	}
-	return 0
 }

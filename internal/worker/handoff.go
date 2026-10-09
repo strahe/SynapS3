@@ -40,20 +40,15 @@ func (s *Service) handoff(ctx context.Context, source *model.Task) error {
 		}
 		prepared, err = s.prepare(EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input, SubjectType: dereference(source.SubjectType), SubjectKey: dereference(source.SubjectKey), AvailableAt: source.AvailableAt})
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errInvalidLegacyTask, err)
 		}
 		prepared.InputHash = hex.EncodeToString(sum[:])
 		prepared.RetryOfTaskID = &source.ID
-		prepared.RetryGroupKey = source.RetryGroupKey
-		prepared.ResumeMode = source.ResumeMode
-		if source.Status == model.TaskStatusRunning {
-			prepared.ResumeMode = model.TaskResumeModeRecover
-		}
-		prepared.Checkpoint = bytes.Clone(source.Checkpoint)
-		prepared.CancellationRequestedAt = source.CancellationRequestedAt
-		prepared.CancellationReason = source.CancellationReason
 	}
 	return s.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+		if prepared != nil {
+			prepared.ID = 0
+		}
 		current, err := tx.Tasks.GetForUpdate(ctx, source.ID)
 		if err != nil {
 			return err
@@ -69,6 +64,17 @@ func (s *Service) handoff(ctx context.Context, source *model.Task) error {
 		}
 		if current.Status != model.TaskStatusPending && current.Status != model.TaskStatusRunning {
 			return nil
+		}
+		if prepared != nil {
+			// Cancellation and wakes can commit without changing the claim generation.
+			prepared.AvailableAt = current.AvailableAt
+			prepared.ResumeMode = current.ResumeMode
+			if current.Status == model.TaskStatusRunning {
+				prepared.ResumeMode = model.TaskResumeModeRecover
+			}
+			prepared.Checkpoint = bytes.Clone(current.Checkpoint)
+			prepared.CancellationRequestedAt = current.CancellationRequestedAt
+			prepared.CancellationReason = current.CancellationReason
 		}
 		generation := current.ClaimGeneration
 		if current.Status == model.TaskStatusPending {
@@ -132,5 +138,25 @@ func (s *Service) handoff(ctx context.Context, source *model.Task) error {
 			}
 		}
 		return tx.Tasks.AppendEvent(ctx, current.ID, "legacy_handoff", mustEvent(map[string]any{"task_id": newTask.ID}))
+	})
+}
+
+func (s *Service) failInvalidLegacyPending(ctx context.Context, source *model.Task, cause error) error {
+	return s.repos.WithTx(ctx, func(tx *repository.Repositories) error {
+		current, err := tx.Tasks.GetForUpdate(ctx, source.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.Status != model.TaskStatusPending || current.SupersededAt != nil || !legacyPolicy(current) {
+			return nil
+		}
+		if current.InputVersion != source.InputVersion || current.InputHash != source.InputHash || !bytes.Equal(current.Input, source.Input) {
+			return repository.ErrConflict
+		}
+		// Invalid input cannot authorize domain settlement or release unresolved effects.
+		if err := tx.Tasks.FailLegacyPending(ctx, current.ID, current.ClaimGeneration, dereference(errorPointer(cause))); err != nil {
+			return err
+		}
+		return tx.Tasks.AppendEvent(ctx, current.ID, string(model.TaskStatusFailed), mustEvent(map[string]any{"failure_reason": "invalid_legacy_task", "next_attempt": current.RetryCount + 1}))
 	})
 }

@@ -606,7 +606,8 @@ func portableColumnType(name dialect.Name, table, column, value string) string {
 	if table == "storage_data_sets" && column == "creation_rejection" {
 		ok = true
 	}
-	if table == "task_payloads" && (column == "policy_json" || column == "runtime_json") ||
+	if (table == "tasks" || table == "task_history") && (column == "input_json" || column == "checkpoint_json" || column == "policy_json" || column == "runtime_json" || column == "events_json") ||
+		table == "task_payloads" && (column == "policy_json" || column == "runtime_json") ||
 		table == "task_events" && column == "details_json" {
 		ok = true
 	}

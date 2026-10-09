@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -56,6 +57,27 @@ func (h *EvictHandler) newHandler() *taskengine.FuncHandler {
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) int64 {
 			return input.ContentID
 		}),
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input cacheeviction.EvictInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		row, err := repos.CacheEvictions.GetCacheEntry(ctx, input.ContentID)
+		if err != nil {
+			return err
+		}
+		if row == nil || row.CacheActiveTaskID == nil || *row.CacheActiveTaskID != source.ID || row.CacheOperationGeneration != input.Generation {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input cacheeviction.EvictInput
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.CacheEvictions.TransferEvictionTaskOwner(ctx, input.ContentID, input.Generation, old.ID, next.ID)
 	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runCacheEviction(ctx, execution, true)

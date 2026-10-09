@@ -137,7 +137,6 @@ func seedCascadeChildren(t *testing.T, db *bun.DB) {
 
 func TestSQLiteRebuildKeepsCascadingChildRows(t *testing.T) {
 	for parent, child := range map[string]string{
-		"tasks":             "task_payloads",
 		"multipart_uploads": "multipart_parts",
 		"storage_data_sets": "observability_data_set_states",
 	} {
@@ -175,12 +174,12 @@ func TestSQLiteRebuildRollsBackWhenRowsDoNotFit(t *testing.T) {
 		"rows break the new CHECK": func(tasks, _ string) []sqliteTableRebuild {
 			return []sqliteTableRebuild{{table: "tasks", create: withConstraint(tasks, "CONSTRAINT chk_rebuild_probe CHECK (id < 0)")}}
 		},
-		"copy orphans child rows": func(tasks, _ string) []sqliteTableRebuild {
+		"copy orphans child rows": func(_, uploads string) []sqliteTableRebuild {
 			return []sqliteTableRebuild{{
-				table:  "tasks",
-				create: withConstraint(tasks, "CONSTRAINT chk_rebuild_probe CHECK (id > 0)"),
+				table:  "multipart_uploads",
+				create: withConstraint(uploads, "CONSTRAINT chk_rebuild_probe CHECK (upload_id <> '')"),
 				copy: func(ctx context.Context, tx bun.Tx, from, to string) error {
-					_, err := tx.ExecContext(ctx, "INSERT INTO "+quoteSQLiteName(to)+" SELECT * FROM "+quoteSQLiteName(from)+" WHERE id > (SELECT MIN(id) FROM "+quoteSQLiteName(from)+")")
+					_, err := tx.ExecContext(ctx, "INSERT INTO "+quoteSQLiteName(to)+" SELECT * FROM "+quoteSQLiteName(from)+" WHERE upload_id > (SELECT MIN(upload_id) FROM "+quoteSQLiteName(from)+")")
 					return err
 				},
 			}}
@@ -198,7 +197,7 @@ func TestSQLiteRebuildRollsBackWhenRowsDoNotFit(t *testing.T) {
 			seedCascadeChildren(t, db)
 			tasksDDL, uploadsDDL := currentTableDDL(t, db, "tasks"), currentTableDDL(t, db, "multipart_uploads")
 			before := make(map[string]string)
-			for _, table := range []string{"tasks", "task_payloads", "multipart_uploads", "multipart_parts"} {
+			for _, table := range []string{"tasks", "multipart_uploads", "multipart_parts"} {
 				before[table] = tableSnapshot(t, db, table)
 			}
 
@@ -270,7 +269,7 @@ func TestSQLiteRebuildMigrationRerunsAfterALostMarker(t *testing.T) {
 	db := newSQLiteRebuildDB(t)
 	seedCascadeChildren(t, db)
 	original := currentTableDDL(t, db, "tasks")
-	payloadsBefore := tableSnapshot(t, db, "task_payloads")
+	historyBefore := tableSnapshot(t, db, "task_history")
 
 	const name = "2026999998"
 	registry := migrate.NewMigrations()
@@ -298,8 +297,8 @@ func TestSQLiteRebuildMigrationRerunsAfterALostMarker(t *testing.T) {
 	if got := currentTableDDL(t, db, "tasks"); got != rebuilt {
 		t.Fatalf("tasks after the rerun:\n%s\nwant:\n%s", got, rebuilt)
 	}
-	if got := tableSnapshot(t, db, "task_payloads"); got != payloadsBefore {
-		t.Fatalf("task payloads after the rerun:\n%s\nwant:\n%s", got, payloadsBefore)
+	if got := tableSnapshot(t, db, "task_history"); got != historyBefore {
+		t.Fatalf("task history after the rerun:\n%s\nwant:\n%s", got, historyBefore)
 	}
 	assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted())+1)
 	assertPoolEnforcesForeignKeys(t, db)

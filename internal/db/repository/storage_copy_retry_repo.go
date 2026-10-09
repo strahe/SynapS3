@@ -29,6 +29,10 @@ func (e *CopyRetryBlockedError) Error() string {
 	return "storage copy retry blocked: " + string(e.Block)
 }
 
+func (e *CopyRetryBlockedError) Unwrap() error {
+	return ErrConflict
+}
+
 type copyRetryRow struct {
 	CopyID                         int64
 	storagepipeline.CopyRetryFacts `bun:"embed:"`

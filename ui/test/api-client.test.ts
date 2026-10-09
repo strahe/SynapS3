@@ -838,3 +838,26 @@ test('object upload rejects files outside FOC size limits before XHR', async () 
     restore()
   }
 })
+
+test('task list and statistics select work or history explicitly', async () => {
+  const originalFetch = globalThis.fetch
+  const requests: string[] = []
+  globalThis.fetch = (async (input) => {
+    requests.push(String(input))
+    return new Response(JSON.stringify({ tasks: [] }))
+  }) as typeof fetch
+  try {
+    await api.getTasks({})
+    await api.getTasks({ scope: 'history', type: 'storage_store', status: 'completed', cursor: 143, limit: 20 })
+    await api.getTaskStats()
+    await api.getTaskStats('history')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(requests, [
+    '/api/v1/tasks?scope=work',
+    '/api/v1/tasks?scope=history&type=storage_store&status=completed&limit=20&cursor=143',
+    '/api/v1/tasks/stats?scope=work',
+    '/api/v1/tasks/stats?scope=history',
+  ])
+})

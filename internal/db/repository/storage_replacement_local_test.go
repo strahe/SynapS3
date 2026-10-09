@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func localReplacementSource(t *testing.T, db *bun.DB, name string) (*repository.
 func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int64) *model.Task {
 	t.Helper()
 	key := fmt.Sprintf("local-ensure/%d", dataSetID)
-	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key}))
+	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"data_set_id":%d}`, dataSetID)), InputHash: key, SubjectType: new("storage_data_set"), SubjectKey: new(strconv.FormatInt(dataSetID, 10))}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,11 @@ func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int
 func localCoordinatorTask(t *testing.T, repos *repository.Repositories, row *storagereplacement.Replacement) *model.Task {
 	t.Helper()
 	key := fmt.Sprintf("local-coordinate/%d/%d", row.ID, row.TaskGeneration)
-	coordinator, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key}))
+	coordinator, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
+		Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1,
+		Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key,
+		SubjectType: new("storage_replacement"), SubjectKey: new(strconv.FormatInt(row.ID, 10)),
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +475,7 @@ func rejectedLocalTargetCanBeReplacedAgain(t *testing.T, db *bun.DB) {
 	if err != nil || count != 2 {
 		t.Fatalf("successor copies=%d err=%v", count, err)
 	}
-	if _, err := db.NewRaw("UPDATE tasks SET acknowledged_at = ? WHERE id = ?", time.Now().Add(-time.Hour), ensure.ID).Exec(t.Context()); err != nil {
+	if err := repos.Tasks.AcknowledgeFailed(t.Context(), ensure.ID); err != nil {
 		t.Fatal(err)
 	}
 	if stored, err := repos.Tasks.GetByID(t.Context(), ensure.ID); err != nil || stored == nil {

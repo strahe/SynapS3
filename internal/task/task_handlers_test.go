@@ -290,6 +290,15 @@ func taskTestMaxAttempts(retries *int) *int {
 	return new(*retries + 1)
 }
 
+func handlerTaskMaxAttempts(t *testing.T, row *model.Task) int {
+	t.Helper()
+	policy, err := taskengine.DecodePolicy(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy.MaxAttempts
+}
+
 func handlerTaskRetryable(t *testing.T, runtime handlerTestRuntime, row *model.Task) bool {
 	t.Helper()
 	eligible, err := runtime.service.RetryableContext(t.Context(), row)
@@ -305,14 +314,37 @@ func handlerTaskFixture(t *testing.T, runtime handlerTestRuntime, row *model.Tas
 	if !ok {
 		definition.Policy = taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}
 	}
-	row.RetryLimit = new(definition.Policy.MaxAttempts - 1)
-	row.RetryGroupKey = "test:" + row.IdempotencyKey
+	if definition.Subject != nil && row.SubjectType == nil && row.SubjectKey == nil {
+		subject, err := definition.Subject(row.Input)
+		if err == nil {
+			row.SubjectType, row.SubjectKey = &subject.Type, &subject.Key
+		}
+	}
 	var err error
-	row.Policy, err = json.Marshal(map[string]any{"version": 1, "backoff": definition.Policy.Backoff, "invocation_timeout": definition.Policy.InvocationTimeout, "observation_window": definition.Policy.ObservationWindow})
+	row.Policy, err = json.Marshal(map[string]any{"version": 2, "max_attempts": definition.Policy.MaxAttempts, "backoff": definition.Policy.Backoff, "invocation_timeout": definition.Policy.InvocationTimeout, "observation_window": definition.Policy.ObservationWindow})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return row
+}
+
+func settleHandlerTaskFixture(t *testing.T, runtime handlerTestRuntime, taskID int64, status model.TaskStatus, reason *string) {
+	t.Helper()
+	row, err := runtime.repos.Tasks.GetByID(t.Context(), taskID)
+	if err != nil || row == nil {
+		t.Fatalf("get task for fixture settlement: %v", err)
+	}
+	generation := row.ClaimGeneration + 1
+	now := time.Now()
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusRunning).Set("claim_generation = ?", generation).
+		Set("claimed_at = ?", now).Set("lease_until = ?", now.Add(time.Minute)).Set("started_at = ?", now).
+		Where("id = ?", taskID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.repos.Tasks.Settle(t.Context(), taskID, generation, repository.TaskTransition{Status: status, ResumeMode: model.TaskResumeModeRecover, FailureReason: reason}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func ageHandlerOperation(t *testing.T, runtime handlerTestRuntime, taskID int64, age time.Duration) {
@@ -333,7 +365,7 @@ func ageHandlerOperation(t *testing.T, runtime handlerTestRuntime, taskID int64,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("runtime_json = ?", json.RawMessage(raw)).Where("task_id = ?", taskID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("runtime_json = ?", json.RawMessage(raw)).Where("id = ?", taskID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -347,14 +379,12 @@ func prepareHandlerTaskFixtures(t *testing.T, runtime handlerTestRuntime) {
 			t.Fatal(err)
 		}
 		for _, row := range page.Tasks {
-			if runtime.testMaxAttempts != nil && row.RetryCount < *runtime.testMaxAttempts {
-				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("retry_limit = ?", *runtime.testMaxAttempts-1).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-			}
 			var snapshot map[string]json.RawMessage
 			if err := json.Unmarshal(row.Policy, &snapshot); err != nil {
 				t.Fatal(err)
+			}
+			if runtime.testMaxAttempts != nil && row.RetryCount < *runtime.testMaxAttempts {
+				snapshot["max_attempts"] = json.RawMessage(fmt.Sprint(*runtime.testMaxAttempts))
 			}
 			backoff, err := json.Marshal(taskengine.BackoffPolicy{InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond})
 			if err != nil {
@@ -365,7 +395,7 @@ func prepareHandlerTaskFixtures(t *testing.T, runtime handlerTestRuntime) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("policy_json = ?", json.RawMessage(raw)).Where("task_id = ?", row.ID).Exec(t.Context()); err != nil {
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("policy_json = ?", json.RawMessage(raw)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1057,8 +1087,8 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode cleanup checkpoint: %v", err)
 			}
-			if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-				Set("checkpoint_json = ?", encodedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("checkpoint_json = ?", encodedCheckpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 				t.Fatalf("set cleanup checkpoint: %v", err)
 			}
 			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
@@ -1372,9 +1402,9 @@ func TestStorageCleanupManualRetryWithoutHashDoesNotAutomaticallyResend(t *testi
 		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("prepare failed cleanup task: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
 		Set("checkpoint_json = ?", checkpoint).
-		Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("record unconfirmed retry checkpoint: %v", err)
 	}
 	{
@@ -1449,8 +1479,8 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode old retry checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-		Set("checkpoint_json = ?", checkpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("checkpoint_json = ?", checkpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("record old retry checkpoint: %v", err)
 	}
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
@@ -1477,8 +1507,8 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode aged retry checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-		Set("checkpoint_json = ?", agedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("checkpoint_json = ?", agedCheckpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("age old retry checkpoint: %v", err)
 	}
 	ageHandlerOperation(t, runtime, taskRow.ID, 25*time.Hour)
@@ -1629,7 +1659,7 @@ func TestStorageCleanupManualRetryCheckpointFailureDoesNotSend(t *testing.T) {
 		{name: "ledger reset", trigger: `CREATE TRIGGER fail_cleanup_retry BEFORE UPDATE OF status ON storage_cleanup_copies
 			WHEN OLD.status = 'failed' AND NEW.status = 'pending'
 			BEGIN SELECT RAISE(FAIL, 'injected cleanup retry failure'); END`},
-		{name: "checkpoint write", trigger: `CREATE TRIGGER fail_cleanup_checkpoint BEFORE UPDATE OF checkpoint_json ON task_payloads
+		{name: "checkpoint write", trigger: `CREATE TRIGGER fail_cleanup_checkpoint BEFORE UPDATE OF checkpoint_json ON tasks
 			BEGIN SELECT RAISE(FAIL, 'injected checkpoint failure'); END`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1737,8 +1767,8 @@ func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode aged checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
-		Set("checkpoint_json = ?", agedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("checkpoint_json = ?", agedCheckpoint).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
 		t.Fatalf("age cleanup checkpoint: %v", err)
 	}
 	ageHandlerOperation(t, runtime, taskRow.ID, 25*time.Hour)
@@ -1953,7 +1983,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	}
 }
 
-func TestCacheCapacityRoundCompletesWhenLRUDisabled(t *testing.T) {
+func TestCacheCapacityWaitsWhenLRUDisabled(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
 	planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
 		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
@@ -1966,10 +1996,10 @@ func TestCacheCapacityRoundCompletesWhenLRUDisabled(t *testing.T) {
 	defer stopHandlerEngine(t, cancel, done)
 
 	stored := waitForTask(t, runtime.repos, planner.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusCompleted
+		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "scheduled"
 	})
-	if stored.FinishedAt == nil || stored.RetryCount != 0 {
-		t.Fatalf("disabled recurring round did not complete: %#v", stored)
+	if stored.FinishedAt != nil || stored.RetryCount != 0 || stored.AvailableAt.Before(time.Now().Add(59*time.Minute)) {
+		t.Fatalf("disabled recurring round did not wait: %#v", stored)
 	}
 	same, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
 		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
@@ -2044,7 +2074,7 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
 			}
 			if tt.failCheckpoint {
-				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER fail_capacity_checkpoint BEFORE UPDATE OF checkpoint_json ON task_payloads
+				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER fail_capacity_checkpoint BEFORE UPDATE OF checkpoint_json ON tasks
 					BEGIN SELECT RAISE(FAIL, 'injected checkpoint failure'); END`); err != nil {
 					t.Fatalf("install checkpoint fault: %v", err)
 				}
@@ -2091,7 +2121,7 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				}
 			}
 			page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{
-				Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
+				Scope: repository.TaskScopeHistory, Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
 			})
 			if err != nil || len(page.Tasks) != tt.wantEvicted {
 				t.Fatalf("completed cache tasks = %#v, err=%v", page.Tasks, err)
@@ -3562,7 +3592,7 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode old store checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, checkpointJSON, taskRow.ID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, checkpointJSON, taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("age store checkpoint: %v", err)
 	}
 	wakeTask(t, runtime, taskRow.ID)
@@ -3695,7 +3725,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 		t.Fatalf("Commit requests before Pull completes = %d, %v", count, err)
 	}
 	if lostCheckpoint {
-		if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("checkpoint_json = NULL").Where("task_id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+		if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = NULL").Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -4593,7 +4623,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_copy_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || successor.RetryLimit == nil || *successor.RetryLimit != 5 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, successor) != 6 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
@@ -4730,7 +4760,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_source_write_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || successor.RetryLimit == nil || *successor.RetryLimit != 5 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, successor) != 6 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
@@ -4777,7 +4807,7 @@ func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 	// A coordinator written by a build whose input this one cannot read.
 	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, handlerTaskFixture(t, runtime, &model.Task{
 		Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: bucket.Name,
-		InputVersion: 99, Input: []byte(`{}`), InputHash: bucket.Name,
+		InputVersion: 99, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: bucket.Name,
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil {
@@ -5133,7 +5163,7 @@ func TestRetirementStopsWhenTheSigningIdentityChanged(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode checkpoint: %v", err)
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), taskRow.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), taskRow.ID).Exec(ctx); err != nil {
 				t.Fatalf("write checkpoint: %v", err)
 			}
 
@@ -5582,7 +5612,7 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), ensureTask.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
 
@@ -5755,7 +5785,7 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(aged), fixture.ensureTask.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(aged), fixture.ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("age checkpoint: %v", err)
 	}
 	wakeTask(t, runtime, fixture.ensureTask.ID)
@@ -5844,7 +5874,7 @@ func TestDataSetCreationRecoveryRecordsIndependentRoundStart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
 				t.Fatal(err)
 			}
 			var existingStart, expectedStart *time.Time
@@ -5988,7 +6018,7 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode checkpoint: %v", err)
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
 				t.Fatalf("write checkpoint: %v", err)
 			}
 			if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ? WHERE id = ?`, model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(ctx); err != nil {
@@ -6079,7 +6109,7 @@ func TestDataSetCreationRecoversFromAnUnusableCheckpointThroughTheRow(t *testing
 			}
 			// A checkpoint this build cannot decode: the ID arrives as a number
 			// where the record expects text.
-			if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`,
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`,
 				`{"client_data_set_id": 12}`, fixture.ensureTask.ID).Exec(ctx); err != nil {
 				t.Fatalf("write checkpoint: %v", err)
 			}
@@ -6195,7 +6225,7 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(checkpoint), fixture.ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ? WHERE id = ?`, model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(ctx); err != nil {
@@ -6244,11 +6274,8 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 		return runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, *row.TaskID)
 	}
 	key := fmt.Sprintf("activation-fixture/%d", id)
-	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: key}))
+	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key, SubjectType: new("storage_replacement"), SubjectKey: new(fmt.Sprint(row.ID))}))
 	if err != nil {
-		return err
-	}
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusCancelled).Set("finished_at = ?", time.Now()).Where("id = ?", task.ID).Exec(t.Context()); err != nil {
 		return err
 	}
 	if err := runtime.repos.Replacements.BindTask(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
@@ -6257,5 +6284,9 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 	if err := runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
 		return err
 	}
-	return runtime.repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID)
+	if err := runtime.repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID); err != nil {
+		return err
+	}
+	settleHandlerTaskFixture(t, runtime, task.ID, model.TaskStatusCancelled, nil)
+	return nil
 }

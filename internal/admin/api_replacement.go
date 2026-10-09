@@ -57,6 +57,7 @@ type providerReplacementResponse struct {
 	Retryable              bool   `json:"retryable"`
 	RetryTaskID            *int64 `json:"retry_task_id"`
 	RetryUnavailableReason string `json:"retry_unavailable_reason,omitempty"`
+	RetirementAttention    bool   `json:"retirement_attention,omitempty"`
 	SelectionMode          string `json:"selection_mode"`
 
 	Source replacementDataSetResponse `json:"source"`
@@ -656,15 +657,28 @@ func (s *Server) providerReplacementResponseWithProgress(
 	if err != nil {
 		return providerReplacementResponse{}, err
 	}
-	retryID, retryReason, err := s.retryTaskForSubject(ctx, "storage_replacement", strconv.FormatInt(row.ID, 10), model.TaskTypeProviderReplacementCoordinate)
-	if err != nil {
-		return providerReplacementResponse{}, err
-	}
-	if row.Status == storagereplacement.StatusCleanupAttention {
-		retryID, retryReason, err = s.retryTaskForSubject(ctx, "storage_data_set", strconv.FormatInt(row.SourceDataSetID, 10), model.TaskTypeStorageDataSetRetire)
+	var retryTask, retirementTask *model.Task
+	if row.Status == storagereplacement.StatusRetiring || row.Status == storagereplacement.StatusCleanupAttention || row.Status == storagereplacement.StatusSuperseded {
+		retirementDataSet := source
+		if row.Status == storagereplacement.StatusSuperseded {
+			retirementDataSet = target
+		}
+		if retirementDataSet != nil && retirementDataSet.RetirementTaskID != nil {
+			retirementTask, err = s.repos.Tasks.GetByID(ctx, *retirementDataSet.RetirementTaskID)
+			if err != nil {
+				return providerReplacementResponse{}, err
+			}
+		}
+		retryTask = retirementTask
+	} else if row.TaskID != nil {
+		retryTask, err = s.repos.Tasks.GetByID(ctx, *row.TaskID)
 		if err != nil {
 			return providerReplacementResponse{}, err
 		}
+	}
+	retryID, retryReason, err := s.inspectTaskRetry(ctx, retryTask)
+	if err != nil {
+		return providerReplacementResponse{}, err
 	}
 	identities := s.providerIdentities(ctx, replacementProviderIDs(source, target))
 	response := providerReplacementResponse{
@@ -702,6 +716,23 @@ func (s *Server) providerReplacementResponseWithProgress(
 	}
 	if row.FailureReason != nil {
 		response.FailureReason = string(*row.FailureReason)
+	}
+	if retirementTask != nil && retirementTask.Status == model.TaskStatusFailed && retirementTask.SupersededAt == nil {
+		response.RetirementAttention = true
+		response.LastError = retirementTask.LastError
+		response.WaitReason, response.WaitMessage = "", ""
+		response.Progress.Phase = string(storagereplacement.PhaseNone)
+		if row.Status != storagereplacement.StatusSuperseded {
+			response.Status = string(storagereplacement.StatusCleanupAttention)
+		}
+	} else if retirementTask != nil &&
+		(retirementTask.Status == model.TaskStatusPending || retirementTask.Status == model.TaskStatusRunning) {
+		response.LastError = nil
+		response.WaitReason, response.WaitMessage = "", ""
+		if row.Status == storagereplacement.StatusCleanupAttention {
+			response.Status = string(storagereplacement.StatusRetiring)
+			response.Progress.Phase = string(storagereplacement.PhaseRetire)
+		}
 	}
 	return response, nil
 }

@@ -583,7 +583,12 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 				if err := f.srv.repos.Contents.CompleteDataSetEnsureTask(t.Context(), target.ID, ensureID); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", model.TaskStatusCompleted, time.Now(), ensureID).Exec(t.Context()); err != nil {
+				now := time.Now()
+				var generation int64
+				if err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, claimed_at = ?, lease_until = ?, claim_generation = claim_generation + 1 WHERE id = ? RETURNING claim_generation", model.TaskStatusRunning, now, now.Add(time.Minute), ensureID).Scan(t.Context(), &generation); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.srv.repos.Tasks.Settle(t.Context(), ensureID, generation, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute}); err != nil {
 					t.Fatal(err)
 				}
 				switch phase {

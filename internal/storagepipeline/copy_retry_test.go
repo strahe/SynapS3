@@ -20,18 +20,14 @@ func TestCopyRetryDecision(t *testing.T) {
 						facts.ReadableSources = 1
 					}
 					want := model.StorageCopyTransferMethodCacheRestore
-					if source {
+					if source || !cached {
 						want = model.StorageCopyTransferMethodPeerPull
 					} else if method == model.StorageCopyTransferMethodIngress && !otherIngress {
 						want = model.StorageCopyTransferMethodIngress
 					}
 					next, block, ok := DecideCopyRetry(facts)
-					if source || cached {
-						if !ok || next != want || block != "" {
-							t.Fatalf("facts=%+v: next=%s block=%s ok=%v", facts, next, block, ok)
-						}
-					} else if ok || block != CopyRetryNoSource {
-						t.Fatalf("no source: next=%s block=%s ok=%v", next, block, ok)
+					if !ok || next != want || block != "" {
+						t.Fatalf("facts=%+v: next=%s block=%s ok=%v", facts, next, block, ok)
 					}
 				}
 			}

@@ -87,9 +87,11 @@ function CommitBatchesPage() {
           </Button>
         }
       />
-      <div className="flex flex-wrap items-end gap-3">
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="batch-status">Status</Label>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="batch-status" className="text-sm text-muted-foreground">
+            Status
+          </Label>
           <Select
             value={status}
             onValueChange={(next) => {

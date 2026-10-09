@@ -22,6 +22,8 @@ test('a stopped storage registration shows its identity and offers Retry instead
     status: 'failed',
     presentation_status: 'failed',
     retryable: true,
+    retry_task_id: 9001,
+    retry_of_task_id: null,
     acknowledgeable: false,
     retry_count: 0,
     available_at: '2026-10-01T00:00:00Z',
@@ -41,11 +43,15 @@ test('a stopped storage registration shows its identity and offers Retry instead
     },
   }
   let retries = 0
-  await page.route('**/api/v1/tasks?*', (route) => route.fulfill({ json: { tasks: retries ? [] : [task] } }))
+  await page.route('**/api/v1/tasks?*', (route) => route.fulfill({ json: { tasks: [task] } }))
   await page.route('**/api/v1/tasks/9001/retry', async (route) => {
     expect(route.request().method()).toBe('POST')
+    expect(route.request().postData()).toBeNull()
     retries++
-    await route.fulfill({ json: { id: 9001, status: 'pending' } })
+    task.retryable = false
+    task.retry_task_id = null
+    task.superseded_at = '2026-10-01T00:00:02Z'
+    await route.fulfill({ status: 202, json: { task_id: 9002 } })
   })
   await page.goto(systemServer.adminURL)
   await page.getByLabel('Username').fill('admin')
@@ -67,8 +73,9 @@ test('a stopped storage registration shows its identity and offers Retry instead
   }
   await expect(page.getByRole('button', { name: 'Release', exact: true })).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Dismiss', exact: true })).toHaveCount(0)
-  await page.getByRole('button', { name: 'Recover', exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Recover', exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Retry', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0)
+  await expect(page.getByText('Storage confirmation failed', { exact: true })).toBeVisible()
   expect(retries).toBe(1)
 })
 
@@ -136,7 +143,6 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
 
   const objectRow = page.getByRole('row').filter({ hasText: 'dashboard.bin' })
   await expect(objectRow).toBeVisible()
-  await expect(objectRow.getByText('Filecoin')).toBeVisible()
   const requestCounts = { bucket: 0, provenance: 0 }
   const countStorageRequests = (request: Request) => {
     const path = new URL(request.url()).pathname
@@ -154,6 +160,8 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   expect(requestCounts.provenance).toBeLessThan(100)
   await provenance.getByRole('button', { name: 'Close' }).click()
   await expect(provenance).toBeHidden()
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await expect(objectRow.getByText('Filecoin', { exact: true })).toBeVisible()
 
   await page.getByRole('button', { name: 'Details', exact: true }).click()
   const bucketDetails = page.getByRole('dialog', { name: 'Bucket details' })

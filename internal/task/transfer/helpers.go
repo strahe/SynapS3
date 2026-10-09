@@ -17,23 +17,19 @@ import (
 	"github.com/strahe/synapse-go/storage"
 )
 
-func copyDefinition(taskType model.TaskType) taskengine.Definition {
+func (h *CopyCoordinator) copyDefinition(taskType model.TaskType) taskengine.Definition {
 	return taskengine.Definition{
 		Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CopyGenerationInput) error {
 			return storagepipeline.ValidateCopyGenerationInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
-		// A copy task that the Engine failed itself still holds its copy, and
-		// only a retry can release it. Failures a handler settles keep their
-		// own policy.
-		CanManualRetry: func(task *model.Task) bool {
-			if task == nil || task.FailureReason == nil {
-				return false
-			}
-			return taskengine.RecoverableEngineFailure(*task.FailureReason) ||
-				(task.Type == model.TaskTypeStoragePull && (*task.FailureReason == storagepull.FailureOutcomeUnknown || *task.FailureReason == storagepull.FailureCancelOutcomeUnknown || *task.FailureReason == storagepull.FailureRecoveryBlocked))
+		CanManualRetry: func(source *model.Task) bool {
+			return source != nil && (source.FailureReason == nil || *source.FailureReason != "invalid_checkpoint")
 		},
+		InspectRetry:  h.inspectCopyRetry,
+		PrepareRetry:  h.prepareCopyRetry,
+		LegacyHandoff: transferCopyOwner,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
 			return input.CopyID
 		}),

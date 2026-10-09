@@ -102,7 +102,7 @@ func TestDataSetProviderRefusalStopsSendingAndPreservesReplacementEvidence(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := runtime.db.NewRaw("UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?", string(encoded), fixture.ensureTask.ID).Exec(t.Context()); err != nil {
+				if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = ? WHERE id = ?", string(encoded), fixture.ensureTask.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := runtime.db.NewRaw("UPDATE tasks SET resume_mode = ? WHERE id = ?", model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(t.Context()); err != nil {
@@ -281,7 +281,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if _, err := runtime.db.NewRaw("UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?", string(checkpoint), targetEnsure.ID).Exec(t.Context()); err != nil {
+					if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = ? WHERE id = ?", string(checkpoint), targetEnsure.ID).Exec(t.Context()); err != nil {
 						t.Fatal(err)
 					}
 					if _, err := runtime.db.NewRaw("UPDATE tasks SET resume_mode = ? WHERE id = ?", model.TaskResumeModeRecover, targetEnsure.ID).Exec(t.Context()); err != nil {
@@ -296,9 +296,11 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 					case "cancelled":
 						status, reason = model.TaskStatusCancelled, nil
 					}
-					if _, err := runtime.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, failure_reason = ? WHERE id = ?", status, time.Now(), reason, targetEnsure.ID).Exec(t.Context()); err != nil {
-						t.Fatal(err)
+					var failureReason *string
+					if reason != nil {
+						failureReason = new(reason.(string))
 					}
+					settleHandlerTaskFixture(t, runtime, targetEnsure.ID, status, failureReason)
 				}
 			}
 			switch state {

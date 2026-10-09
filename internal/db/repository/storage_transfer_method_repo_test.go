@@ -3,6 +3,7 @@ package repository_test
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	}
 	pullTask, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStoragePull, IdempotencyKey: "zero-piece-pull", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "zero-piece-pull", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copies[0].ID, generation)), SubjectType: new(model.TaskSubjectStorageCopy), SubjectKey: new(strconv.FormatInt(copies[0].ID, 10)), InputHash: "zero-piece-pull", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {
@@ -222,11 +223,11 @@ func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 	if candidates, err := repos.CacheEvictions.ListLRUCandidates(t.Context(), 10); err != nil || len(candidates) != 0 {
 		t.Fatalf("LRU candidates during pending migration = %#v, err=%v", candidates, err)
 	}
-	evict := enqueueAndClaimTask(t, repos, "cache-restore-eviction", time.Minute)
 	reservation, err := repos.CacheEvictions.PrepareEviction(t.Context(), content.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	evict := enqueueCacheEvictionTask(t, repos, content.ID, reservation.Generation, "cache-restore-eviction")
 	if err := repos.CacheEvictions.BindEvictionTask(t.Context(), content.ID, reservation.Generation, evict.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +236,7 @@ func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 	}
 	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: "cache-restore-plan", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "cache-restore-plan", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copyRow.ID)), SubjectType: new(model.TaskSubjectStorageCopy), SubjectKey: new(strconv.FormatInt(copyRow.ID, 10)), InputHash: "cache-restore-plan", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {

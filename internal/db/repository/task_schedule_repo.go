@@ -3,7 +3,9 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -57,20 +59,57 @@ func (r *BunTaskScheduleRepo) SetHead(ctx context.Context, key string, expectedG
 	if key == "" || generation < 0 || generation < expectedGeneration || nextRunAt.IsZero() {
 		return ErrInvalidInput
 	}
-	q := r.db.NewUpdate().Model((*model.TaskSchedule)(nil)).Set("latest_task_id = ?", taskID).Set("generation = ?", generation).Set("next_run_at = ?", nextRunAt).Where("key = ? AND generation = ?", key, expectedGeneration)
-	if expectedTaskID == nil {
-		q.Where("latest_task_id IS NULL")
-	} else {
-		q.Where("latest_task_id = ?", *expectedTaskID)
-	}
-	result, err := q.Exec(ctx)
-	if err != nil {
-		return err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return ErrConflict
-	}
-	return nil
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		if taskID != nil {
+			task, err := (&BunTaskRepo{db: db}).GetForUpdate(ctx, *taskID)
+			if err != nil {
+				return err
+			}
+			if task == nil || !task.Type.IsRecurringSystem() || task.SupersededAt != nil {
+				return ErrConflict
+			}
+			identity := fmt.Sprintf("%s:%d", key, generation)
+			if task.IdempotencyKey != identity && (generation != 0 || task.IdempotencyKey != key) {
+				return ErrConflict
+			}
+			if task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning {
+				var policy struct {
+					Version int  `json:"version"`
+					Legacy  bool `json:"legacy"`
+				}
+				// A legacy scheduled row remains the durable head until its first new cycle.
+				if task.Status != model.TaskStatusCancelled || generation != expectedGeneration || json.Unmarshal(task.Policy, &policy) != nil || policy.Version != 0 || !policy.Legacy {
+					return ErrConflict
+				}
+			}
+			if expectedTaskID != nil && *expectedTaskID != task.ID {
+				previous, err := (&BunTaskRepo{db: db}).GetByID(ctx, *expectedTaskID)
+				if err != nil {
+					return err
+				}
+				if previous == nil || previous.Type != task.Type {
+					return ErrConflict
+				}
+				if generation == expectedGeneration && (task.RetryOfTaskID == nil || *task.RetryOfTaskID != previous.ID) {
+					return ErrConflict
+				}
+			}
+		}
+		q := db.NewUpdate().Model((*model.TaskSchedule)(nil)).Set("latest_task_id = ?", taskID).Set("generation = ?", generation).Set("next_run_at = ?", nextRunAt).Where("key = ? AND generation = ?", key, expectedGeneration)
+		if expectedTaskID == nil {
+			q.Where("latest_task_id IS NULL")
+		} else {
+			q.Where("latest_task_id = ?", *expectedTaskID)
+		}
+		result, err := q.Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
 }
 
 func (r *BunTaskScheduleRepo) ScheduleNext(ctx context.Context, key string, taskID int64, nextRunAt time.Time) error {

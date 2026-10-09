@@ -39,6 +39,9 @@ func assertPeriodicRetryCompetition(t *testing.T, h taskHarness) {
 	t.Helper()
 	source := claimTestTask(t, h)
 	h.engine.executeClaim(t.Context(), source)
+	if err := h.service.Acknowledge(t.Context(), source.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.repos.TaskSchedules.ScheduleNext(t.Context(), "test-cycle", source.ID, time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +84,9 @@ func TestNewCycleRetainsFailureUntilItEndsAndDoesNotCatchUp(t *testing.T) {
 	h := periodicHarness(t)
 	source := claimTestTask(t, h)
 	h.engine.executeClaim(t.Context(), source)
+	if err := h.service.Acknowledge(t.Context(), source.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.repos.TaskSchedules.ScheduleNext(t.Context(), "test-cycle", source.ID, time.Now().Add(-24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}

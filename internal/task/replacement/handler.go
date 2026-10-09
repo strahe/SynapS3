@@ -2,6 +2,7 @@ package replacement
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -57,13 +58,56 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagereplacement.CoordinateInput) error {
 			return storagereplacement.ValidateCoordinateInput(*input)
 		}),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Subject: taskengine.SubjectFromInput("storage_replacement", func(input storagereplacement.CoordinateInput) int64 { return input.ReplacementID }),
+		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		OnEngineFailure: func(task *model.Task, _ string) taskengine.Settlement {
 			return func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.FailForEngineTask(ctx, task.ID,
 					"Replacement work stopped because of an internal error. Retry the replacement; if it stops again, check its task on the Tasks page.")
 			}
 		},
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input storagereplacement.CoordinateInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		row, err := repos.Replacements.GetByID(ctx, input.ReplacementID)
+		if err != nil {
+			return err
+		}
+		if row == nil || row.TaskID == nil || *row.TaskID != source.ID || row.TaskGeneration != input.Generation {
+			return repository.ErrConflict
+		}
+		if row.Status == storagereplacement.StatusFailed {
+			err := repos.Replacements.RetryEligibility(ctx, row.ID)
+			if errors.Is(err, storagereplacement.ErrNotRetryable) || errors.Is(err, storagereplacement.ErrSuperseded) || errors.Is(err, storagereplacement.ErrTargetInUse) {
+				return errors.Join(repository.ErrConflict, err)
+			}
+			return err
+		}
+		if row.Status == storagereplacement.StatusCompleted || row.Status == storagereplacement.StatusSuperseded || row.Status == storagereplacement.StatusRetiring || row.Status == storagereplacement.StatusCleanupAttention {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	bind := func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input storagereplacement.CoordinateInput
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.Replacements.ResumeCoordinatorTask(ctx, input.ReplacementID, input.Generation, old.ID, next.ID)
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input storagereplacement.CoordinateInput
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.Replacements.TransferTaskOwner(ctx, input.ReplacementID, input.Generation, old.ID, next.ID)
+	}
+
+	definition.PrepareRetry = func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
+		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: bind}, nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)

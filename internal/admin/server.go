@@ -478,13 +478,25 @@ func (s *Server) handleAPITaskRetry(w http.ResponseWriter, r *http.Request) {
 	}
 	row, err := s.taskService.Retry(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, taskengine.ErrRetryUnsupported) || errors.Is(err, repository.ErrConflict) {
+		if errors.Is(err, repository.ErrNotFound) {
+			source, sourceErr := s.repos.Tasks.GetByID(r.Context(), id)
+			if errors.Is(sourceErr, repository.ErrNotFound) || (sourceErr == nil && source == nil) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
+				return
+			}
+			if sourceErr != nil {
+				s.logger.Error("api: failed to read retry source", "taskID", id, "error", sourceErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+				return
+			}
+		}
+		if reason, known := taskRetryUnavailableReason(err); known {
 			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "This task cannot be retried in its current state.",
+				"error": reason,
 				"code":  "task_retry_unsupported",
 			})
-		} else if errors.Is(err, repository.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
+		} else if errors.Is(err, repository.ErrTaskIdentityContended) || errors.Is(err, repository.ErrRepositoryContended) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Service is busy. Try again."})
 		} else {
 			s.logger.Error("api: failed to retry task", "taskID", id, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -536,7 +548,7 @@ func (s *Server) refreshMetricsLoop(ctx context.Context) {
 }
 
 func (s *Server) refreshMetrics(ctx context.Context) {
-	taskCounts, err := s.repos.Tasks.CountByStatus(ctx)
+	taskCounts, err := s.repos.Tasks.CountByScope(ctx, repository.TaskScopeWork)
 	if err != nil {
 		s.logger.Warn("failed to refresh task queue metrics", "error", err)
 	} else {

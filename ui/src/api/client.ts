@@ -348,6 +348,7 @@ export interface ProviderReplacementDataSet {
 
 export interface ProviderReplacement {
   retry_unavailable_reason?: string
+  retirement_attention?: boolean
   id: number
   bucket_name: string
   copy_index: number
@@ -733,6 +734,8 @@ export interface CommitBatchDetails extends CommitBatch {
   }[]
 }
 
+export type TaskScope = 'work' | 'history'
+
 export interface TaskItem {
   id: number
   type: string
@@ -744,8 +747,9 @@ export interface TaskItem {
   retry_of_task_id: number | null
   superseded_at?: string
   retry_count: number
-  retry_limit?: number
+  max_attempts: number | null
   retryable: boolean
+  retry_unavailable_reason?: string
   retry_task_id: number | null
   acknowledgeable: boolean
   last_error?: string
@@ -1358,8 +1362,8 @@ export const api = {
     fetchJSON<CommitBatchDetails>(`/commit-batches/${encodeURIComponent(id)}`, { signal }),
   sealCommitBatch: (id: string) =>
     fetchJSON<CommitBatch>(`/commit-batches/${encodeURIComponent(id)}/seal`, { method: 'POST' }),
-  getTasks: (params: { type?: string; status?: string; limit?: number; cursor?: number }) => {
-    const sp = new URLSearchParams()
+  getTasks: (params: { scope?: TaskScope; type?: string; status?: string; limit?: number; cursor?: number }) => {
+    const sp = new URLSearchParams({ scope: params.scope ?? 'work' })
     if (params.type) sp.set('type', params.type)
     if (params.status) sp.set('status', params.status)
     if (params.limit) sp.set('limit', params.limit.toString())
@@ -1372,7 +1376,7 @@ export const api = {
     fetchJSON<TaskListResponse>(`/tasks/${id}/history?limit=20${cursor ? `&cursor=${cursor}` : ''}`),
   getTaskEvents: (id: number, cursor?: number) =>
     fetchJSON<TaskEvents>(`/tasks/${id}/events?limit=20${cursor ? `&cursor=${cursor}` : ''}`),
-  getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
+  getTaskStats: (scope: TaskScope = 'work') => fetchJSON<TaskStatusCount[]>(`/tasks/stats?scope=${scope}`),
   getTaskSubject: (type: TaskSubjectInfo['subject_type'], key: string, signal?: AbortSignal) =>
     fetchJSON<TaskSubjectInfo>(`/task-subjects/${encodeURIComponent(type)}/${encodeURIComponent(key)}`, { signal }),
   retryTask: (id: number) => fetchJSON<{ task_id: number }>(`/tasks/${id}/retry`, { method: 'POST' }),

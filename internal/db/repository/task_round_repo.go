@@ -2,16 +2,14 @@ package repository
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
+	"maps"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 var (
@@ -20,181 +18,136 @@ var (
 )
 
 func (r *BunTaskRepo) CloseLegacy(ctx context.Context, id, generation int64) error {
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		tx := &BunTaskRepo{db: db}
+		row, err := tx.GetForUpdate(ctx, id)
+		if err != nil {
+			return err
+		}
+		if row == nil || isHistoryTask(row) {
+			return ErrTaskLeaseLost
+		}
+		now := time.Now()
+		if generation == 0 {
+			if row.Status != model.TaskStatusPending {
+				return ErrTaskLeaseLost
+			}
+		} else if row.Status != model.TaskStatusRunning || row.ClaimGeneration != generation || row.LeaseUntil == nil || !row.LeaseUntil.After(now) {
+			return ErrTaskLeaseLost
+		}
+		row.Status, row.FinishedAt, row.UpdatedAt = model.TaskStatusCancelled, &now, now
+		row.ClaimedAt, row.LeaseUntil = nil, nil
+		return tx.archive(ctx, row, nil)
+	})
+}
+
+// FailLegacyPending isolates unverifiable input without changing recovery evidence.
+func (r *BunTaskRepo) FailLegacyPending(ctx context.Context, id, generation int64, cause string) error {
 	now := time.Now()
-	q := r.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusCancelled).Set("finished_at = ?", now).Set("claimed_at = NULL").Set("lease_until = NULL").Set("updated_at = ?", now).Where("id = ? AND superseded_at IS NULL", id)
-	if generation == 0 {
-		q.Where("status = ?", model.TaskStatusPending)
-	} else {
-		q.Where("status = ? AND claim_generation = ? AND lease_until > ?", model.TaskStatusRunning, generation, now)
-	}
-	result, err := q.Exec(ctx)
+	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusFailed).
+		Set("failure_reason = ?", "invalid_legacy_task").
+		Set("last_error = ?", cause).
+		Set("wait_reason = NULL").Set("status_message = NULL").
+		Set("finished_at = ?", now).
+		Set("claimed_at = NULL").Set("lease_until = NULL").
+		Set("updated_at = ?", now).
+		Where("id = ? AND status = ? AND claim_generation = ?", id, model.TaskStatusPending, generation).
+		Exec(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failing legacy pending task %d: %w", id, err)
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
-		return ErrTaskLeaseLost
-	}
-	return nil
-}
-
-func (r *BunTaskRepo) GetForUpdate(ctx context.Context, id int64) (*model.Task, error) {
-	row := new(model.Task)
-	q := withTaskPayload(r.db.NewSelect().Model(row)).Where("task.id = ?", id)
-	if r.db.Dialect().Name() == dialect.PG {
-		q.For("UPDATE OF task")
-	}
-	if err := q.Scan(ctx); errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	return row, nil
-}
-
-func (r *BunTaskRepo) GetDirectSuccessor(ctx context.Context, id int64) (*model.Task, error) {
-	row := new(model.Task)
-	if err := withTaskPayload(r.db.NewSelect().Model(row)).Where("task.retry_of_task_id = ?", id).Scan(ctx); errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	return row, nil
-}
-
-func (r *BunTaskRepo) SupersedeTerminal(ctx context.Context, id int64) error {
-	now := time.Now()
-	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).Set("superseded_at = ?", now).Set("updated_at = ?", now).Where("id = ? AND superseded_at IS NULL", id).Where("status IN (?, ?, ?)", model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled).Exec(ctx)
-	if err != nil {
-		return err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
 		return ErrConflict
 	}
 	return nil
-}
-
-func (r *BunTaskRepo) LatestForSubject(ctx context.Context, subjectType, subjectKey string, types ...model.TaskType) (*model.Task, error) {
-	row := new(model.Task)
-	q := withTaskPayload(r.db.NewSelect().Model(row)).Where("task.subject_type = ? AND task.subject_key = ?", subjectType, subjectKey).Where("task.superseded_at IS NULL").OrderExpr("task.id DESC").Limit(1)
-	if len(types) > 0 {
-		q.Where("task.type IN (?)", bun.List(types))
-	}
-	if err := q.Scan(ctx); errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	return row, nil
 }
 
 func (r *BunTaskRepo) ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	row, err := r.GetByID(ctx, anchorID)
-	if err != nil {
-		return TaskPage{}, err
+	var rows []struct {
+		ID          *int64
+		AnchorCount int
+		Corrupted   int
+		CursorFound int
 	}
-	if row == nil {
+	// Each recursive step reads adjacent rows through primary or successor keys;
+	// the entire history relation must not be materialized before traversal.
+	err := r.db.NewRaw(`WITH RECURSIVE
+		parameters AS (SELECT CAST(? AS BIGINT) AS anchor_id, CAST(? AS BIGINT) AS before_id),
+		seed AS (
+			SELECT id, retry_of_task_id FROM tasks WHERE id = (SELECT anchor_id FROM parameters)
+			UNION ALL
+			SELECT task_id AS id, retry_of_task_id FROM task_history WHERE task_id = (SELECT anchor_id FROM parameters)
+		),
+		chain(id, retry_of_task_id, direction, corrupted) AS (
+			SELECT seed.id, seed.retry_of_task_id, directions.direction,
+				CASE WHEN (SELECT COUNT(*) FROM seed) > 1 THEN 1 ELSE 0 END
+			FROM seed CROSS JOIN (SELECT -1 AS direction UNION ALL SELECT 1) AS directions
+			UNION ALL
+			SELECT
+				CASE WHEN current.direction < 0 THEN COALESCE(parent_work.id, parent_history.task_id, 0)
+					ELSE COALESCE(child_work.id, child_history.task_id, 0) END,
+				CASE WHEN current.direction < 0 THEN COALESCE(parent_work.retry_of_task_id, parent_history.retry_of_task_id)
+					ELSE COALESCE(child_work.retry_of_task_id, child_history.retry_of_task_id) END,
+				current.direction,
+				CASE WHEN current.direction < 0 THEN
+					CASE WHEN (parent_work.id IS NULL AND parent_history.task_id IS NULL)
+						OR (parent_work.id IS NOT NULL AND parent_history.task_id IS NOT NULL)
+						OR COALESCE(parent_work.id, parent_history.task_id) >= current.id THEN 1 ELSE 0 END
+				ELSE
+					CASE WHEN (child_work.id IS NOT NULL AND child_history.task_id IS NOT NULL)
+						OR COALESCE(child_work.id, child_history.task_id) <= current.id
+						OR EXISTS (SELECT 1 FROM task_history AS duplicate WHERE duplicate.task_id = child_work.id)
+						OR EXISTS (SELECT 1 FROM tasks AS duplicate WHERE duplicate.id = child_history.task_id)
+						THEN 1 ELSE 0 END
+				END
+			FROM chain AS current
+			LEFT JOIN tasks AS parent_work ON current.direction < 0 AND parent_work.id = current.retry_of_task_id
+			LEFT JOIN task_history AS parent_history ON current.direction < 0 AND parent_history.task_id = current.retry_of_task_id
+			LEFT JOIN tasks AS child_work ON current.direction > 0 AND child_work.retry_of_task_id = current.id
+			LEFT JOIN task_history AS child_history ON current.direction > 0 AND child_history.retry_of_task_id = current.id
+			WHERE current.corrupted = 0 AND (
+				(current.direction < 0 AND current.retry_of_task_id IS NOT NULL)
+				OR (current.direction > 0 AND (child_work.id IS NOT NULL OR child_history.task_id IS NOT NULL))
+			)
+		),
+		summary AS (
+			SELECT (SELECT COUNT(*) FROM seed) AS anchor_count, COALESCE(MAX(corrupted), 0) AS corrupted,
+				CASE WHEN (SELECT before_id FROM parameters) = 0
+					OR MAX(CASE WHEN id = (SELECT before_id FROM parameters) THEN 1 ELSE 0 END) = 1
+					THEN 1 ELSE 0 END AS cursor_found FROM chain
+		),
+		page AS (
+			SELECT DISTINCT id FROM chain WHERE corrupted = 0 AND id > 0
+				AND ((SELECT before_id FROM parameters) = 0 OR id < (SELECT before_id FROM parameters))
+			ORDER BY id DESC LIMIT ?
+		)
+		SELECT page.id, summary.anchor_count, summary.corrupted, summary.cursor_found
+		FROM summary LEFT JOIN page ON TRUE ORDER BY page.id DESC`, anchorID, beforeID, limit+1).Scan(ctx, &rows)
+	if err != nil {
+		return TaskPage{}, fmt.Errorf("listing task execution history: %w", err)
+	}
+	if len(rows) == 0 || rows[0].AnchorCount == 0 {
 		return TaskPage{}, ErrNotFound
 	}
-	for {
-		next, err := r.GetDirectSuccessor(ctx, row.ID)
-		if err != nil {
-			return TaskPage{}, err
-		}
-		if next == nil {
-			break
-		}
-		row = next
+	if rows[0].Corrupted != 0 {
+		return TaskPage{}, ErrTaskDataCorrupted
 	}
-	if beforeID > 0 {
-		for row.ID != beforeID {
-			if row.RetryOfTaskID == nil {
-				return TaskPage{}, ErrInvalidInput
-			}
-			row, err = r.GetByID(ctx, *row.RetryOfTaskID)
-			if err != nil {
-				return TaskPage{}, err
-			}
-			if row == nil {
-				return TaskPage{}, ErrInvalidInput
-			}
-		}
-		if row.RetryOfTaskID == nil {
-			return TaskPage{}, nil
-		}
-		row, err = r.GetByID(ctx, *row.RetryOfTaskID)
-		if err != nil {
-			return TaskPage{}, err
-		}
-		if row == nil {
-			return TaskPage{}, nil
+	if rows[0].CursorFound == 0 {
+		return TaskPage{}, ErrInvalidInput
+	}
+	tasks := make([]model.Task, 0, len(rows))
+	for _, row := range rows {
+		if row.ID != nil {
+			tasks = append(tasks, model.Task{ID: *row.ID})
 		}
 	}
-	page := TaskPage{}
-	for len(page.Tasks) < limit {
-		page.Tasks = append(page.Tasks, *row)
-		if row.RetryOfTaskID == nil {
-			return page, nil
-		}
-		row, err = r.GetByID(ctx, *row.RetryOfTaskID)
-		if err != nil {
-			return TaskPage{}, err
-		}
-		if row == nil {
-			return page, nil
-		}
-	}
-	page.NextBeforeID = page.Tasks[len(page.Tasks)-1].ID
-	return page, nil
+	return r.loadPage(ctx, taskPage(tasks, limit))
 }
 
-func (r *BunTaskRepo) AppendEvent(ctx context.Context, taskID int64, eventType string, details json.RawMessage) error {
-	if taskID < 1 || eventType == "" {
-		return ErrInvalidInput
-	}
-	if len(details) == 0 {
-		details = json.RawMessage(`{}`)
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(details, &object); err != nil || object == nil {
-		return ErrInvalidInput
-	}
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		row, err := (&BunTaskRepo{db: db}).GetForUpdate(ctx, taskID)
-		if err != nil {
-			return err
-		}
-		if row == nil {
-			return ErrNotFound
-		}
-		var sequence int64
-		if err := db.NewRaw("SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_events WHERE task_id = ?", taskID).Scan(ctx, &sequence); err != nil {
-			return err
-		}
-		if _, err := db.NewInsert().Model(&model.TaskEvent{TaskID: taskID, Sequence: sequence, Type: eventType, CreatedAt: time.Now(), Details: details}).Exec(ctx); err != nil {
-			return err
-		}
-		_, err = db.NewDelete().Model((*model.TaskEvent)(nil)).Where("task_id = ? AND sequence <= ?", taskID, sequence-128).Exec(ctx)
-		return err
-	})
-}
-
-func (r *BunTaskRepo) ListEvents(ctx context.Context, taskID, beforeSequence int64, limit int) ([]model.TaskEvent, error) {
-	if limit <= 0 || limit > 128 {
-		limit = 128
-	}
-	var events []model.TaskEvent
-	q := r.db.NewSelect().Model(&events).Where("task_id = ?", taskID).OrderExpr("sequence DESC").Limit(limit)
-	if beforeSequence > 0 {
-		q.Where("sequence < ?", beforeSequence)
-	}
-	err := q.Scan(ctx)
-	return events, err
-}
-
-// updateOperation preserves additive runtime fields while fencing every write.
 func (r *BunTaskRepo) updateOperation(ctx context.Context, id, generation int64, fn func(*BunTaskRepo, *model.Task, *model.TaskRuntime) error) error {
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		tx := &BunTaskRepo{db: db}
@@ -230,14 +183,12 @@ func (r *BunTaskRepo) updateOperation(ctx context.Context, id, generation int64,
 		for _, key := range []string{"operation_key", "operation_started_at", "last_admitted_attempt"} {
 			delete(fields, key)
 		}
-		for key, value := range changed {
-			fields[key] = value
-		}
+		maps.Copy(fields, changed)
 		raw, err := json.Marshal(fields)
 		if err != nil {
 			return err
 		}
-		result, err := db.NewUpdate().Model((*model.TaskPayload)(nil)).Set("runtime_json = ?", json.RawMessage(raw)).Where("task_id = ?", id).Exec(ctx)
+		result, err := db.NewUpdate().Model((*model.Task)(nil)).Set("runtime_json = ?", json.RawMessage(raw)).Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, time.Now()).Exec(ctx)
 		if err != nil {
 			return err
 		}
@@ -308,45 +259,5 @@ func (r *BunTaskRepo) ResolveOperation(ctx context.Context, id, generation int64
 		runtime.OperationStartedAt = nil
 		runtime.LastAdmittedAttempt = 0
 		return nil
-	})
-}
-
-func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transition TaskTransition) error {
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		tx := &BunTaskRepo{db: db}
-		previous, err := tx.GetForUpdate(ctx, id)
-		if err != nil {
-			return err
-		}
-		if previous == nil {
-			return ErrTaskLeaseLost
-		}
-		if err := tx.settle(ctx, id, generation, transition); err != nil {
-			return err
-		}
-		eventType := ""
-		if transition.IncrementRetry {
-			eventType = "retry_scheduled"
-		} else if transition.Status != model.TaskStatusPending {
-			eventType = string(transition.Status)
-		} else if transition.WaitReason != nil && (previous.WaitReason == nil || *previous.WaitReason != *transition.WaitReason) {
-			eventType = "waiting"
-		}
-		if eventType != "" {
-			return tx.AppendEvent(ctx, id, eventType, json.RawMessage(`{}`))
-		}
-		return nil
-	})
-}
-
-func sortTasksDescending(tasks []model.Task) {
-	slices.SortFunc(tasks, func(a, b model.Task) int {
-		if a.ID > b.ID {
-			return -1
-		}
-		if a.ID < b.ID {
-			return 1
-		}
-		return 0
 	})
 }

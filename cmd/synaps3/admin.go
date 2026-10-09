@@ -378,6 +378,7 @@ func adminTaskCommand() *cli.Command {
 				Name:  "list",
 				Usage: "list background tasks",
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "scope", Value: "work", Usage: "list work or history"},
 					&cli.StringFlag{Name: "type", Usage: "filter by task type"},
 					&cli.StringFlag{Name: "status", Usage: "filter by status (pending, running, completed, failed, or cancelled)"},
 					&cli.IntFlag{Name: "limit", Value: 20, Usage: "maximum tasks to return"},
@@ -389,7 +390,7 @@ func adminTaskCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					query := url.Values{}
+					query := url.Values{"scope": {cmd.String("scope")}}
 					if taskType != "" {
 						query.Set("type", taskType)
 					}
@@ -419,13 +420,14 @@ func adminTaskCommand() *cli.Command {
 			{
 				Name:  "stats",
 				Usage: "show task status counts",
+				Flags: []cli.Flag{&cli.StringFlag{Name: "scope", Value: "work", Usage: "count work or history"}},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					client, opts, err := newAdminClientFromCommand(ctx, cmd)
 					if err != nil {
 						return err
 					}
 					var stats []adminTaskStatusCount
-					if err := client.getJSON(ctx, "/api/v1/tasks/stats", &stats); err != nil {
+					if err := client.getJSON(ctx, "/api/v1/tasks/stats?"+url.Values{"scope": {cmd.String("scope")}}.Encode(), &stats); err != nil {
 						return err
 					}
 					if opts.JSON {
@@ -459,7 +461,7 @@ func adminTaskCommand() *cli.Command {
 					if opts.JSON {
 						return writeAdminJSON(cmd.Root().Writer, resp)
 					}
-					_, err = fmt.Fprintf(cmd.Root().Writer, "Task %d created\n", resp.TaskID)
+					_, err = fmt.Fprintf(cmd.Root().Writer, "Retry task %d\n", resp.TaskID)
 					return err
 				},
 			},
@@ -975,7 +977,10 @@ type adminTaskItem struct {
 	SubjectType        *string `json:"subject_type,omitempty"`
 	SubjectKey         *string `json:"subject_key,omitempty"`
 	RetryCount         int     `json:"retry_count"`
-	RetryLimit         *int    `json:"retry_limit,omitempty"`
+	RetryOfTaskID      *int64  `json:"retry_of_task_id"`
+	RetryTaskID        *int64  `json:"retry_task_id"`
+	SupersededAt       *string `json:"superseded_at,omitempty"`
+	MaxAttempts        *int    `json:"max_attempts"`
 	Retryable          bool    `json:"retryable"`
 	Acknowledgeable    bool    `json:"acknowledgeable"`
 	LastError          *string `json:"last_error,omitempty"`
@@ -1480,8 +1485,8 @@ func writeAdminTasksTable(w io.Writer, tasks []adminTaskItem) error {
 			subject = *task.SubjectType + ":" + *task.SubjectKey
 		}
 		retries := strconv.Itoa(task.RetryCount)
-		if task.RetryLimit != nil {
-			retries = fmt.Sprintf("%d/%d", task.RetryCount, *task.RetryLimit)
+		if task.MaxAttempts != nil {
+			retries = fmt.Sprintf("%d/%d", task.RetryCount, *task.MaxAttempts-1)
 		}
 		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", task.ID, task.Operation, task.PresentationStatus, retries, subject, task.AvailableAt, details)
 	}

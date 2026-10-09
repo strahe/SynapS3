@@ -3,8 +3,11 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/strahe/synaps3/internal/model"
 
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/uptrace/bun"
@@ -13,48 +16,70 @@ import (
 type BunProviderUploadSpeedRepo struct{ db bun.IDB }
 
 func (r *BunProviderUploadSpeedRepo) BeginIfAbsent(ctx context.Context, providerID, hash string, taskID int64) error {
-	now := time.Now().UTC()
-	row := &providerbenchmark.Result{
-		ProviderID: providerID, State: providerbenchmark.StateTesting, ServiceURLHash: hash,
-		SampleBytes: providerbenchmark.SampleBytes, ActiveTaskID: &taskID, CreatedAt: now, UpdatedAt: now,
-	}
-	result, err := r.db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(ctx)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return ErrConflict
-	}
-	return nil
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "provider", providerID, model.TaskTypeProviderUploadSpeedTest)
+		if err != nil {
+			return err
+		}
+		var input providerbenchmark.Input
+		if json.Unmarshal(task.Input, &input) != nil || input.ProviderID != providerID || input.ServiceURLHash != hash {
+			return ErrConflict
+		}
+
+		now := time.Now().UTC()
+		row := &providerbenchmark.Result{
+			ProviderID: providerID, State: providerbenchmark.StateTesting, ServiceURLHash: hash,
+			SampleBytes: providerbenchmark.SampleBytes, ActiveTaskID: &taskID, CreatedAt: now, UpdatedAt: now,
+		}
+		result, err := db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
 }
 
 func (r *BunProviderUploadSpeedRepo) Begin(ctx context.Context, providerID, hash string, taskID int64) error {
-	now := time.Now().UTC()
-	row := &providerbenchmark.Result{
-		ProviderID: providerID, State: providerbenchmark.StateTesting, ServiceURLHash: hash,
-		SampleBytes: providerbenchmark.SampleBytes, ActiveTaskID: &taskID, CreatedAt: now, UpdatedAt: now,
-	}
-	result, err := r.db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(ctx)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count == 1 {
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		task, err := taskForBinding(ctx, db, taskID, "provider", providerID, model.TaskTypeProviderUploadSpeedTest)
+		if err != nil {
+			return err
+		}
+		var input providerbenchmark.Input
+		if json.Unmarshal(task.Input, &input) != nil || input.ProviderID != providerID || input.ServiceURLHash != hash {
+			return ErrConflict
+		}
+
+		now := time.Now().UTC()
+		row := &providerbenchmark.Result{
+			ProviderID: providerID, State: providerbenchmark.StateTesting, ServiceURLHash: hash,
+			SampleBytes: providerbenchmark.SampleBytes, ActiveTaskID: &taskID, CreatedAt: now, UpdatedAt: now,
+		}
+		result, err := db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count == 1 {
+			return nil
+		}
+		result, err = db.NewUpdate().Model((*providerbenchmark.Result)(nil)).
+			Set("state = ?", providerbenchmark.StateTesting).
+			Set("service_url_hash = ?", hash).
+			Set("sample_bytes = ?", providerbenchmark.SampleBytes).
+			Set("duration_ms = NULL").Set("bytes_per_second = NULL").Set("tested_at = NULL").Set("failure_code = NULL").
+			Set("active_task_id = ?", taskID).Set("updated_at = ?", now).
+			Where("provider_id = ? AND state <> ?", providerID, providerbenchmark.StateTesting).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return ErrConflict
+		}
 		return nil
-	}
-	result, err = r.db.NewUpdate().Model((*providerbenchmark.Result)(nil)).
-		Set("state = ?", providerbenchmark.StateTesting).
-		Set("service_url_hash = ?", hash).
-		Set("sample_bytes = ?", providerbenchmark.SampleBytes).
-		Set("duration_ms = NULL").Set("bytes_per_second = NULL").Set("tested_at = NULL").Set("failure_code = NULL").
-		Set("active_task_id = ?", taskID).Set("updated_at = ?", now).
-		Where("provider_id = ? AND state <> ?", providerID, providerbenchmark.StateTesting).Exec(ctx)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return ErrConflict
-	}
-	return nil
+	})
 }
 
 func (r *BunProviderUploadSpeedRepo) Finish(ctx context.Context, providerID string, taskID int64, state providerbenchmark.State, durationMS, bytesPerSecond int64, failureCode string) error {

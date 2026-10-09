@@ -73,8 +73,8 @@ const (
 	TaskResumeModeRecover TaskResumeMode = "recover"
 )
 
-// Task is a permanently retained execution round. Domain tables own external
-// effect safety independently of its execution history.
+// Task is a live execution round. Terminal snapshots live in TaskHistory.
+// Domain tables own external-effect safety independently of task retention.
 type Task struct {
 	bun.BaseModel `bun:"table:tasks"`
 
@@ -86,22 +86,61 @@ type Task struct {
 	SubjectType    *string    `bun:"type:text,nullzero"`
 	SubjectKey     *string    `bun:"type:text,nullzero"`
 	RetryOfTaskID  *int64     `bun:",nullzero"`
-	RetryGroupKey  string     `bun:"type:text,notnull"`
-	SupersededAt   *time.Time `bun:",nullzero"`
+	SupersededAt   *time.Time `bun:",scanonly"`
 
-	// Input and Checkpoint live in task_payloads and are projected on read, so
-	// renewing a lease never rewrites the JSON a task carries.
-	Input      json.RawMessage `bun:",scanonly"`
-	Checkpoint json.RawMessage `bun:",scanonly"`
-	Policy     json.RawMessage `bun:",scanonly"`
-	Runtime    json.RawMessage `bun:",scanonly"`
+	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
+	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
+	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
+	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
+	Events     json.RawMessage `bun:"events_json,type:jsonb,notnull"`
 
 	Status        TaskStatus     `bun:"type:text,notnull,default:'pending'"`
 	ResumeMode    TaskResumeMode `bun:"type:text,notnull,default:'execute'"`
 	AvailableAt   time.Time      `bun:",nullzero,notnull"`
 	WaitReason    *string        `bun:"type:text,nullzero"`
 	RetryCount    int            `bun:"type:integer,notnull,default:0"`
-	RetryLimit    *int           `bun:"type:integer,nullzero"`
+	FailureReason *string        `bun:"type:text,nullzero"`
+	LastError     *string        `bun:"type:text,nullzero"`
+	StatusMessage *string        `bun:"type:text,nullzero"`
+
+	CancellationRequestedAt *time.Time `bun:",nullzero"`
+	CancellationReason      *string    `bun:"type:text,nullzero"`
+	ClaimGeneration         int64      `bun:",notnull,default:0"`
+	ClaimedAt               *time.Time `bun:",nullzero"`
+	LeaseUntil              *time.Time `bun:",nullzero"`
+	StartedAt               *time.Time `bun:",nullzero"`
+	FinishedAt              *time.Time `bun:",nullzero"`
+	AcknowledgedAt          *time.Time `bun:",scanonly"`
+	CreatedAt               time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
+	WorkStartedAt           *time.Time `bun:",nullzero"`
+}
+
+// TaskHistory preserves one archived execution round under its original task ID.
+type TaskHistory struct {
+	bun.BaseModel `bun:"table:task_history"`
+
+	TaskID         int64      `bun:",pk"`
+	Type           TaskType   `bun:"type:text,notnull"`
+	IdempotencyKey string     `bun:"type:text,notnull"`
+	InputVersion   int        `bun:"type:integer,notnull"`
+	InputHash      string     `bun:"type:text,notnull"`
+	SubjectType    *string    `bun:"type:text,nullzero"`
+	SubjectKey     *string    `bun:"type:text,nullzero"`
+	RetryOfTaskID  *int64     `bun:",nullzero"`
+	SupersededAt   *time.Time `bun:",nullzero"`
+
+	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
+	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
+	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
+	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
+	Events     json.RawMessage `bun:"events_json,type:jsonb,notnull"`
+
+	Status        TaskStatus     `bun:"type:text,notnull"`
+	ResumeMode    TaskResumeMode `bun:"type:text,notnull,default:'execute'"`
+	AvailableAt   time.Time      `bun:",nullzero,notnull"`
+	WaitReason    *string        `bun:"type:text,nullzero"`
+	RetryCount    int            `bun:"type:integer,notnull,default:0"`
 	FailureReason *string        `bun:"type:text,nullzero"`
 	LastError     *string        `bun:"type:text,nullzero"`
 	StatusMessage *string        `bun:"type:text,nullzero"`
@@ -119,17 +158,46 @@ type Task struct {
 	WorkStartedAt           *time.Time `bun:",nullzero"`
 }
 
-// TaskPayload carries a task's input and checkpoint JSON. It is a separate row
-// because tasks.lease_until is indexed and renewed on every heartbeat, which on
-// PostgreSQL rewrites the whole row.
-type TaskPayload struct {
-	bun.BaseModel `bun:"table:task_payloads"`
-
-	TaskID     int64           `bun:",pk"`
-	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
-	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
-	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
-	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
+// TaskHistoryFromTask copies the locked round without changing execution evidence.
+func TaskHistoryFromTask(task *Task) *TaskHistory {
+	if task == nil {
+		return nil
+	}
+	return &TaskHistory{
+		TaskID:                  task.ID,
+		Type:                    task.Type,
+		IdempotencyKey:          task.IdempotencyKey,
+		InputVersion:            task.InputVersion,
+		InputHash:               task.InputHash,
+		SubjectType:             task.SubjectType,
+		SubjectKey:              task.SubjectKey,
+		RetryOfTaskID:           task.RetryOfTaskID,
+		SupersededAt:            task.SupersededAt,
+		Input:                   task.Input,
+		Checkpoint:              task.Checkpoint,
+		Policy:                  task.Policy,
+		Runtime:                 task.Runtime,
+		Events:                  task.Events,
+		Status:                  task.Status,
+		ResumeMode:              task.ResumeMode,
+		AvailableAt:             task.AvailableAt,
+		WaitReason:              task.WaitReason,
+		RetryCount:              task.RetryCount,
+		FailureReason:           task.FailureReason,
+		LastError:               task.LastError,
+		StatusMessage:           task.StatusMessage,
+		CancellationRequestedAt: task.CancellationRequestedAt,
+		CancellationReason:      task.CancellationReason,
+		ClaimGeneration:         task.ClaimGeneration,
+		ClaimedAt:               task.ClaimedAt,
+		LeaseUntil:              task.LeaseUntil,
+		StartedAt:               task.StartedAt,
+		FinishedAt:              task.FinishedAt,
+		AcknowledgedAt:          task.AcknowledgedAt,
+		CreatedAt:               task.CreatedAt,
+		UpdatedAt:               task.UpdatedAt,
+		WorkStartedAt:           task.WorkStartedAt,
+	}
 }
 
 // TaskRuntime is durable admission evidence, independent of diagnostic events.
@@ -139,13 +207,13 @@ type TaskRuntime struct {
 	LastAdmittedAttempt int        `json:"last_admitted_attempt,omitempty"`
 }
 
+// TaskEvent is a bounded diagnostic entry owned by its containing task.
 type TaskEvent struct {
-	bun.BaseModel `bun:"table:task_events"`
-	TaskID        int64           `bun:",pk"`
-	Sequence      int64           `bun:",pk"`
-	Type          string          `bun:"type:text,notnull"`
-	CreatedAt     time.Time       `bun:",notnull"`
-	Details       json.RawMessage `bun:"details_json,type:jsonb,notnull"`
+	TaskID    int64           `json:"-"`
+	Sequence  int64           `json:"sequence"`
+	Type      string          `json:"type"`
+	CreatedAt time.Time       `json:"created_at"`
+	Details   json.RawMessage `json:"details"`
 }
 
 type TaskSchedule struct {

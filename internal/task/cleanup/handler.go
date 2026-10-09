@@ -2,6 +2,7 @@ package cleanup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -84,6 +85,21 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 			return input.ContentID
 		}),
 	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input storagecleanup.Input
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		_, err := repos.StorageCleanup.AuthorizeTask(ctx, input.ContentID, input.Generation, source.ID)
+		return err
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input storagecleanup.Input
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.StorageCleanup.TransferTaskOwner(ctx, input.ContentID, input.Generation, old.ID, next.ID)
+	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runStorageCleanup(ctx, execution, true)
 	},
@@ -134,15 +150,11 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		// A deletion the provider cannot perform stays recorded as unsupported
 		// and does not keep the content from being finalized.
 		case model.StorageCleanupCopyStatusRemoved, model.StorageCleanupCopyStatusUnsupported:
-			if hasCheckpoint && checkpoint.CopyID == copyRow.ID {
-				key := fmt.Sprintf("cleanup:%d", copyRow.ID)
-				if _, err := execution.ObserveOperation(ctx, key); err != nil {
-					return retryTask(err, "cleanup_observation_failed")
-				}
-				if err := execution.ResolveOperation(ctx, key, checkpoint, nil); err != nil {
-					return retryTask(err, "cleanup_operation_complete_failed")
-				}
+			checkpoint, err = h.resolveCopyOperation(ctx, execution, copyRow.ID, checkpoint, nil)
+			if err != nil {
+				return retryTask(err, "cleanup_operation_complete_failed")
 			}
+			hasCheckpoint = checkpoint.CopyID != 0
 			continue
 		case model.StorageCleanupCopyStatusPending, model.StorageCleanupCopyStatusDeleteScheduled, model.StorageCleanupCopyStatusFailed:
 			// Resolved against the chain below.
@@ -156,9 +168,13 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		// identity gap that prevents an exact piece-ID lookup.
 		if copyRow.DataSetID == nil {
 			message := "Storage provider details are incomplete"
-			if err := h.deps.Repositories.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message); err != nil {
+			checkpoint, err = h.resolveCopyOperation(ctx, execution, copyRow.ID, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message)
+			})
+			if err != nil {
 				return retryTask(err, "cleanup_evidence_failed")
 			}
+			hasCheckpoint = checkpoint.CopyID != 0
 			continue
 		}
 		if _, err := execution.ObserveOperation(ctx, fmt.Sprintf("cleanup:%d", copyRow.ID)); err != nil {
@@ -169,12 +185,13 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			return retryTask(err, "cleanup_status_failed")
 		}
 		if !state.Live {
-			if err := h.deps.Repositories.StorageCleanup.MarkCopyRemoved(ctx, copyRow.ID); err != nil {
-				return retryTask(err, "cleanup_evidence_failed")
-			}
-			if err := execution.ResolveOperation(ctx, fmt.Sprintf("cleanup:%d", copyRow.ID), checkpoint, nil); err != nil {
+			checkpoint, err = h.resolveCopyOperation(ctx, execution, copyRow.ID, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.StorageCleanup.MarkCopyRemoved(ctx, copyRow.ID)
+			})
+			if err != nil {
 				return retryTask(err, "cleanup_operation_complete_failed")
 			}
+			hasCheckpoint = checkpoint.CopyID != 0
 			continue
 		}
 		if state.Queued {
@@ -264,6 +281,38 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}
 	return h.finishStorageCleanup(ctx, execution, input)
+}
+
+func (h *Handler) resolveCopyOperation(ctx context.Context, execution taskengine.Execution, copyID int64, checkpoint cleanupCheckpoint, settlement taskengine.Settlement) (cleanupCheckpoint, error) {
+	if checkpoint.CopyID == copyID {
+		checkpoint = cleanupCheckpoint{}
+	}
+	err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+		row, err := repos.Tasks.GetByID(ctx, execution.ID())
+		if err != nil {
+			return err
+		}
+		if row == nil {
+			return repository.ErrNotFound
+		}
+		var runtime model.TaskRuntime
+		if err := json.Unmarshal(row.Runtime, &runtime); err != nil {
+			return err
+		}
+		key := fmt.Sprintf("cleanup:%d", copyID)
+		// A preceding copy's checkpoint may outlive its operation; preserve the
+		// next copy's admission and observation clock while dropping that checkpoint.
+		if runtime.OperationKey == key {
+			if err := repos.Tasks.ResolveOperation(ctx, execution.ID(), execution.ClaimGeneration(), key); err != nil {
+				return err
+			}
+		}
+		if settlement != nil {
+			return settlement(ctx, repos)
+		}
+		return nil
+	})
+	return checkpoint, err
 }
 
 func waitForStorageCleanupOutcome(ctx context.Context, execution taskengine.Execution, copyRow model.StorageCleanupCopy, checkpoint cleanupCheckpoint, hasCheckpoint bool, waitingMessage string) taskengine.Result {

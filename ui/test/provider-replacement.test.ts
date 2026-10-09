@@ -84,6 +84,18 @@ test('confirmation uses referenced versions and bytes', () => {
   assert.equal(replacementConfirmationSummary(dataSet()), '12 versions · 1 MB')
 })
 
+test('a superseded replacement retains its identity while unused storage retirement needs attention', () => {
+  const stopped = replacement({ status: 'superseded', retirement_attention: true, retryable: true, retry_task_id: 42 })
+  assert.deepEqual(activeReplacements([stopped]), [stopped])
+  assert.equal(stopped.status, 'superseded')
+  assert.equal(replacementRetryable(stopped), true)
+  assert.equal(
+    replacementNextStep(stopped),
+    'The unused storage service could not be shut down. Check its retirement task.'
+  )
+  assert.deepEqual(activeReplacements([replacement({ status: 'superseded' })]), [])
+})
+
 test('confirmation discloses late paid services only after a creation request', () => {
   const unsent = dataSet({ status: 'pending', data_set_id: undefined, client_data_set_id: undefined })
   assert.equal(replacementConfirmationDescription(unsent).includes('earlier request'), false)

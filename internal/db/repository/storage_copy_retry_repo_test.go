@@ -157,6 +157,13 @@ func copyRetryAdmissionAndHistory(t *testing.T, db *bun.DB) *model.StorageCopy {
 	if states[copies[0].ID].Available || !states[copyRow.ID].Available || states[copyRow.ID].NextMethod != model.StorageCopyTransferMethodCacheRestore {
 		t.Fatalf("states=%+v", states)
 	}
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
+		t.Fatal(err)
+	}
+	states, err = repos.Contents.CopyRetryStates(ctx, []int64{copyRow.ID})
+	if err != nil || !states[copyRow.ID].Available || states[copyRow.ID].NextMethod != model.StorageCopyTransferMethodPeerPull {
+		t.Fatalf("retry without a current source=%+v, error=%v", states, err)
+	}
 	attempt := &storagepull.Attempt{
 		AttemptID: "unresolved", ContentID: content.ID, StorageDataSetID: copyRow.StorageDataSetID, Status: storagepull.AttemptStatusAttempted,
 		SourceProviderID: onChainID(t, "100"), SourceDataSetID: onChainID(t, "200"), SourcePieceID: onChainID(t, "0"), SourcePieceCID: "piece", SourceRetrievalURL: "https://source.example", ExtraDataHex: "abcd", AttemptedAt: time.Now(),
@@ -178,11 +185,18 @@ func copyRetryAdmissionAndHistory(t *testing.T, db *bun.DB) *model.StorageCopy {
 	}
 	rollback := errors.New("rollback")
 	if err := repos.WithTx(ctx, func(tx *repository.Repositories) error {
-		if _, err := tx.Contents.RetryFailedCopy(ctx, copyRow.ID); err != nil {
+		reopened, err := tx.Contents.RetryFailedCopy(ctx, copyRow.ID)
+		if err != nil {
 			return err
+		}
+		if reopened.Status != model.StorageCopyStatusPending || reopened.TransferMethod != model.StorageCopyTransferMethodPeerPull {
+			t.Fatalf("retry without a source=%+v", reopened)
 		}
 		return rollback
 	}); !errors.Is(err, rollback) {
+		t.Fatal(err)
+	}
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, true); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := repos.Contents.RetryFailedCopy(ctx, copyRow.ID)
@@ -197,8 +211,11 @@ func copyRetryAdmissionAndHistory(t *testing.T, db *bun.DB) *model.StorageCopy {
 	}
 	subjectType, subjectKey := "storage_copy", fmt.Sprint(copyRow.ID)
 	finishedAt := time.Now()
-	old := repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, IdempotencyKey: "old-copy-pull", SubjectType: &subjectType, SubjectKey: &subjectKey, InputVersion: 1, Input: []byte(`{}`), InputHash: "old", Status: model.TaskStatusFailed, FinishedAt: &finishedAt, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
+	old := repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, IdempotencyKey: "old-copy-pull", SubjectType: &subjectType, SubjectKey: &subjectKey, InputVersion: 1, Input: []byte(`{}`), InputHash: "old", Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
 	if _, _, err := repos.Tasks.Enqueue(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", finishedAt).Where("id = ?", old.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	count, err := repos.Tasks.AcknowledgeFailedForSubject(ctx, "storage_copy", fmt.Sprint(copyRow.ID))
@@ -238,7 +255,7 @@ func ordinaryCacheRestoreProtectsCache(t *testing.T, db *bun.DB) {
 	if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	work, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, IdempotencyKey: "restore-pull", InputVersion: 1, Input: []byte(`{}`), InputHash: "restore"}))
+	work, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, IdempotencyKey: "restore-pull", InputVersion: 1, Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copyRow.ID)), SubjectType: new(model.TaskSubjectStorageCopy), SubjectKey: new(fmt.Sprint(copyRow.ID)), InputHash: "restore"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,14 +265,11 @@ func ordinaryCacheRestoreProtectsCache(t *testing.T, db *bun.DB) {
 	if err := repos.Contents.SetCopyCacheRestore(ctx, copyRow.ID, 1, work.ID, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	evict, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeCacheEvict, IdempotencyKey: "restore-evict", InputVersion: 1, Input: []byte(`{}`), InputHash: "evict"}))
-	if err != nil {
-		t.Fatal(err)
-	}
 	reservation, err := repos.CacheEvictions.PrepareEviction(ctx, copyRow.ContentID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	evict := enqueueCacheEvictionTask(t, repos, copyRow.ContentID, reservation.Generation, "restore-evict")
 	if err := repos.CacheEvictions.BindEvictionTask(ctx, copyRow.ContentID, reservation.Generation, evict.ID); err != nil {
 		t.Fatal(err)
 	}

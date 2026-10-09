@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/worker"
+	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -194,7 +195,16 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		}); ok {
 			observed, pending, err := observer.ObserveTermination(ctx, dataSet.DataSetID.SDK())
 			if err != nil {
-				return retryTask(err, "termination_observation_failed")
+				if ctx.Err() != nil || !errors.Is(err, synapse.ErrTerminationObservationUnavailable) {
+					if httpErr, ok := errors.AsType[*pdp.HTTPError](err); ok && httpErr.RetryAfter > 0 {
+						return taskengine.RetryInMode(synapse.SummarizedError(err), "termination_observation_failed",
+							model.TaskResumeModeRecover, httpErr.RetryAfter, nil)
+					}
+					return retryTask(err, "termination_observation_failed")
+				}
+				h.deps.Logger.Warn("storage service termination status unavailable",
+					"task_id", execution.ID(), "storage_data_set_id", dataSet.ID,
+					"error", synapse.ErrorSummary(err))
 			}
 			if observed != nil {
 				return taskengine.Wait(model.TaskResumeModeRecover, 0, "termination_epoch", "Recording storage service retirement", retirementEvidenceSettlement(abandoned, row.ID, observed.EndEpoch, observed.TxHash))

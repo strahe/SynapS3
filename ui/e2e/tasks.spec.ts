@@ -21,6 +21,9 @@ function task(id: number, key = '128'): TaskItem {
     subject_type: 'storage_content',
     subject_key: key,
     retry_count: 0,
+    max_attempts: 6,
+    retry_of_task_id: null,
+    retry_task_id: null,
     retryable: false,
     acknowledgeable: false,
     available_at: '2026-10-03T00:00:00Z',
@@ -34,7 +37,14 @@ function task(id: number, key = '128'): TaskItem {
 async function openTasks(page: Page, adminURL: string, rows = [task(201), task(200), task(199, '129')]) {
   await page.route('**/api/v1/tasks?*', (route) =>
     route.fulfill({
-      json: route.request().url().includes('cursor=100') ? { tasks: [task(100)] } : { tasks: rows, next_cursor: 100 },
+      json: route.request().url().includes('cursor=100')
+        ? { tasks: [task(100)] }
+        : {
+            tasks: rows.filter(
+              (row) => !row.acknowledged_at || new URL(route.request().url()).searchParams.get('scope') === 'history'
+            ),
+            next_cursor: 100,
+          },
     })
   )
   await page.goto(adminURL)
@@ -49,6 +59,79 @@ async function openTasks(page: Page, adminURL: string, rows = [task(201), task(2
 async function pauseClock(page: Page) {
   await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000))
 }
+
+test('Work and History reset filters and pagination while preserving Retry and round navigation', async ({
+  page,
+  systemServer,
+}) => {
+  const work = task(201)
+  work.status = 'failed'
+  work.presentation_status = 'failed'
+  const completed = task(200)
+  const acknowledged = task(199)
+  acknowledged.status = 'failed'
+  acknowledged.presentation_status = 'failed'
+  acknowledged.acknowledged_at = '2026-10-03T00:03:00Z'
+  acknowledged.retryable = true
+  acknowledged.retry_task_id = 199
+  let retried = false
+  const requests: URL[] = []
+  await openTasks(page, systemServer.adminURL, [work])
+  await page.route('**/api/v1/tasks?*', (route) => {
+    const url = new URL(route.request().url())
+    requests.push(url)
+    const scope = url.searchParams.get('scope')
+    const rows = scope === 'history' ? [completed, acknowledged] : [work]
+    const status = url.searchParams.get('status')
+    return route.fulfill({
+      json: {
+        tasks: rows.filter((row) => !status || row.status === status),
+        next_cursor: scope === 'work' && !url.searchParams.has('cursor') ? 100 : undefined,
+      },
+    })
+  })
+  await page.getByRole('button', { name: 'Next', exact: true }).click()
+  await expect.poll(() => requests.at(-1)?.searchParams.get('cursor')).toBe('100')
+  await page.getByRole('combobox', { name: 'Status', exact: true }).click()
+  await page.getByRole('option', { name: 'Failed', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Acknowledge all', exact: true })).toBeVisible()
+  await page.getByRole('tab', { name: 'History', exact: true }).click()
+  await expect.poll(() => requests.at(-1)?.searchParams.get('scope')).toBe('history')
+  expect(requests.at(-1)?.searchParams.has('status')).toBe(false)
+  expect(requests.at(-1)?.searchParams.has('cursor')).toBe(false)
+  await expect(page).toHaveURL(/scope=history/)
+  await expect(page.getByRole('button', { name: 'Acknowledge all', exact: true })).toHaveCount(0)
+  await expect(page.getByText('Completed', { exact: true })).toBeVisible()
+  await expect(page.getByText('Acknowledged', { exact: true })).toBeVisible()
+  await page.getByRole('combobox', { name: 'Status', exact: true }).click()
+  await expect(page.getByRole('option', { name: 'Running', exact: true })).toHaveCount(0)
+  await page.getByRole('option', { name: 'Failed', exact: true }).click()
+  await expect(page.getByText('Completed', { exact: true })).toHaveCount(0)
+  await page.route('**/api/v1/tasks/199/retry', (route) => {
+    retried = true
+    acknowledged.retryable = false
+    acknowledged.retry_task_id = null
+    acknowledged.superseded_at = '2026-10-03T00:04:00Z'
+    return route.fulfill({ status: 202, json: { task_id: 202 } })
+  })
+  await page.getByRole('button', { name: 'Retry', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0)
+  expect(retried).toBe(true)
+  await page.route('**/api/v1/tasks/199', (route) => route.fulfill({ json: { task: acknowledged, policy: null } }))
+  await page.route('**/api/v1/tasks/200', (route) => route.fulfill({ json: { task: completed, policy: null } }))
+  for (const id of [199, 200]) {
+    await page.route(`**/api/v1/tasks/${id}/history*`, (route) =>
+      route.fulfill({ json: { tasks: [completed, acknowledged] } })
+    )
+    await page.route(`**/api/v1/tasks/${id}/events*`, (route) => route.fulfill({ json: { events: [] } }))
+  }
+  await page.getByRole('button', { name: 'View', exact: true }).click()
+  const details = page.getByRole('dialog')
+  await details.getByRole('tab', { name: 'History', exact: true }).click()
+  await details.getByRole('button', { name: 'Task 200', exact: true }).click()
+  await expect(details.getByRole('heading', { name: 'Task 200', exact: true })).toBeVisible()
+  await expect(details.getByText('Completed', { exact: true }).first()).toBeVisible()
+})
 
 test('task details keep historical errors separate and show the actual upload start', async ({
   page,
@@ -124,6 +207,8 @@ test('subject popovers close on the next mouse or keyboard click after dragging 
     await heading.hover()
     await trigger.hover()
     await expect(page.getByRole('tooltip').getByText(fileKey)).toBeVisible()
+    // Raw mouse presses reuse the previous coordinates.
+    await trigger.hover()
     await page.mouse.down()
     await expect(page.getByRole('dialog').getByText(fileKey)).toBeVisible()
     await heading.hover()
@@ -309,7 +394,7 @@ test('an unfinished subject read survives overlay switching and cancels after it
   await expect.poll(state).toEqual({ requests: 3, aborted: 3 })
 })
 
-test('touch opens the same subject information and Took follows recovery and dismissal', async ({
+test('touch opens the same subject information and acknowledgement preserves failure and duration', async ({
   browser,
   systemServer,
 }) => {
@@ -335,13 +420,26 @@ test('touch opens the same subject information and Took follows recovery and dis
     row.status = 'failed'
     row.presentation_status = 'failed'
     row.finished_at = '2026-10-03T01:04:00Z'
+    row.acknowledgeable = true
     await page.getByRole('button', { name: 'Refresh', exact: true }).tap()
+    await expect(page.getByText('Failed', { exact: true })).toBeVisible()
     await expect(page.getByText('1h 4m', { exact: true })).toBeVisible()
-    row.presentation_status = 'dismissed'
-    row.acknowledged_at = '2026-10-04T00:00:00Z'
-    await page.getByRole('button', { name: 'Refresh', exact: true }).tap()
-    await expect(page.getByText('Dismissed', { exact: true })).toBeVisible()
+    let acknowledgements = 0
+    await page.route('**/api/v1/tasks/201/acknowledge', (route) => {
+      expect(route.request().method()).toBe('POST')
+      acknowledgements++
+      row.acknowledged_at = '2026-10-04T00:00:00Z'
+      row.acknowledgeable = false
+      return route.fulfill({ json: { status: 'ok' } })
+    })
+    await page.getByRole('button', { name: 'Acknowledge', exact: true }).tap()
+    await expect(page.getByText('1h 4m', { exact: true })).toHaveCount(0)
+    await page.getByRole('tab', { name: 'History', exact: true }).click()
+    await expect(page.getByText('Acknowledged', { exact: true })).toBeVisible()
+    await expect(page.getByText('Failed', { exact: true })).toBeVisible()
     await expect(page.getByText('1h 4m', { exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Acknowledge', exact: true })).toHaveCount(0)
+    expect(acknowledgements).toBe(1)
     expect(requests).toBe(1)
   } finally {
     await context.close()

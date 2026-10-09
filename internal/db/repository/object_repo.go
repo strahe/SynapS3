@@ -1190,7 +1190,7 @@ func prepareObjectVersionsForPermanentDelete(
 					model.StorageCopyStatusCommitting,
 				})).
 				Where(`active_task_id IS NULL OR EXISTS (
-					SELECT 1 FROM tasks AS terminal_task
+					SELECT 1 FROM (SELECT id,status FROM tasks UNION ALL SELECT task_id AS id,status FROM task_history) AS terminal_task
 					WHERE terminal_task.id = storage_copy.active_task_id
 					  AND terminal_task.status IN (?, ?, ?)
 				)`, model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled).

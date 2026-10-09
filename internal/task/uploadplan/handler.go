@@ -2,6 +2,7 @@ package uploadplan
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -73,6 +74,27 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) int64 {
 			return input.ContentID
 		}),
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input storagepipeline.UploadPlanInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		content, err := repos.Contents.GetByID(ctx, input.ContentID)
+		if err != nil {
+			return err
+		}
+		if content == nil || content.AcceptedAt != nil {
+			return repository.ErrConflict
+		}
+		unreferenced, err := repos.Objects.ContentIsUnreferenced(ctx, input.ContentID)
+		if err != nil {
+			return err
+		}
+		if unreferenced {
+			return repository.ErrConflict
+		}
+		return nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagepipeline.UploadPlanInput](execution)

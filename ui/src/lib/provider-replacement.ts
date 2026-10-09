@@ -56,7 +56,11 @@ export function replacementRetryable(replacement: ProviderReplacement) {
 export function activeReplacements(replacements: ProviderReplacement[] | undefined) {
   if (!replacements?.length) return []
   return replacements.filter(
-    (row) => replacementInProgress(row) || row.status === 'failed' || row.status === 'cleanup_attention'
+    (row) =>
+      replacementInProgress(row) ||
+      row.status === 'failed' ||
+      row.status === 'cleanup_attention' ||
+      row.retirement_attention
   )
 }
 
@@ -128,6 +132,9 @@ const replacementErrorMessages: Record<string, string> = {
  * developer diagnostics and belongs behind a detail view, not on the card.
  */
 export function replacementNextStep(replacement: ProviderReplacement) {
+  if (replacement.status === 'superseded' && replacement.retirement_attention) {
+    return 'The unused storage service could not be shut down. Check its retirement task.'
+  }
   switch (replacement.status) {
     case 'failed':
       if (replacement.failure_reason === 'target_rejected') {

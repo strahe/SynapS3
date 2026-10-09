@@ -62,11 +62,15 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	}
 	taskRow, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageCleanup, IdempotencyKey: "cleanup-finalize", InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "cleanup-finalize", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"content_id":%d,"generation":%d}`, contentID, cleanup.Generation)), InputHash: "cleanup-finalize", Status: model.TaskStatusPending,
+		SubjectType: new(model.TaskSubjectStorageContent), SubjectKey: new(strconv.FormatInt(contentID, 10)),
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {
 		t.Fatalf("Enqueue = %#v, created=%v, err=%v", taskRow, created, err)
+	}
+	if err := repos.StorageCleanup.BindTask(ctx, contentID, cleanup.Generation+1, taskRow.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("BindTask with different generation = %v, want ErrConflict", err)
 	}
 	if err := repos.StorageCleanup.BindTask(ctx, contentID, cleanup.Generation, taskRow.ID); err != nil {
 		t.Fatalf("BindTask: %v", err)

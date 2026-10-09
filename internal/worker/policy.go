@@ -29,10 +29,10 @@ type ExecutionPolicy struct {
 	ObservationWindow time.Duration `json:"observation_window"`
 }
 
-// The budget has one persisted source: tasks.retry_limit.
 type policySnapshot struct {
 	Version           int           `json:"version"`
 	Legacy            bool          `json:"legacy,omitempty"`
+	MaxAttempts       *int          `json:"max_attempts"`
 	Backoff           BackoffPolicy `json:"backoff"`
 	InvocationTimeout time.Duration `json:"invocation_timeout"`
 	ObservationWindow time.Duration `json:"observation_window"`
@@ -54,7 +54,7 @@ func encodePolicy(p ExecutionPolicy) (json.RawMessage, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
-	return json.Marshal(policySnapshot{Version: 1, Backoff: p.Backoff, InvocationTimeout: p.InvocationTimeout, ObservationWindow: p.ObservationWindow})
+	return json.Marshal(policySnapshot{Version: 2, MaxAttempts: &p.MaxAttempts, Backoff: p.Backoff, InvocationTimeout: p.InvocationTimeout, ObservationWindow: p.ObservationWindow})
 }
 
 func readPolicySnapshot(raw json.RawMessage) (policySnapshot, error) {
@@ -67,6 +67,9 @@ func readPolicySnapshot(raw json.RawMessage) (policySnapshot, error) {
 		if len(fields[key]) == 0 || bytes.Equal(fields[key], []byte("null")) {
 			return snapshot, ErrInvalidPolicy
 		}
+	}
+	if len(fields["max_attempts"]) == 0 {
+		return snapshot, ErrInvalidPolicy
 	}
 	var backoff map[string]json.RawMessage
 	if err := json.Unmarshal(fields["backoff"], &backoff); err != nil {
@@ -89,26 +92,39 @@ func readPolicySnapshot(raw json.RawMessage) (policySnapshot, error) {
 }
 
 func DecodePolicy(task *model.Task) (ExecutionPolicy, error) {
-	if task == nil || task.RetryLimit == nil || *task.RetryLimit < 0 {
+	if task == nil || task.RetryCount < 0 {
 		return ExecutionPolicy{}, ErrInvalidPolicy
 	}
 	snapshot, err := readPolicySnapshot(task.Policy)
 	if err != nil {
 		return ExecutionPolicy{}, err
 	}
-	if snapshot.Version != 1 || snapshot.Legacy {
+	if snapshot.Version != 2 || snapshot.Legacy || snapshot.MaxAttempts == nil {
 		return ExecutionPolicy{}, fmt.Errorf("%w: unsupported snapshot", ErrInvalidPolicy)
 	}
-	p := ExecutionPolicy{MaxAttempts: *task.RetryLimit + 1, Backoff: snapshot.Backoff, InvocationTimeout: snapshot.InvocationTimeout, ObservationWindow: snapshot.ObservationWindow}
+	p := ExecutionPolicy{MaxAttempts: *snapshot.MaxAttempts, Backoff: snapshot.Backoff, InvocationTimeout: snapshot.InvocationTimeout, ObservationWindow: snapshot.ObservationWindow}
 	if err := p.validate(); err != nil {
 		return ExecutionPolicy{}, err
+	}
+	if task.RetryCount >= p.MaxAttempts {
+		return ExecutionPolicy{}, ErrInvalidPolicy
 	}
 	return p, nil
 }
 
 func legacyPolicy(task *model.Task) bool {
+	if task == nil {
+		return false
+	}
 	snapshot, err := readPolicySnapshot(task.Policy)
-	return err == nil && snapshot.Version == 0 && snapshot.Legacy
+	if err != nil || snapshot.Version != 0 || !snapshot.Legacy {
+		return false
+	}
+	maxAttempts := 1
+	if snapshot.MaxAttempts != nil {
+		maxAttempts = *snapshot.MaxAttempts
+	}
+	return (ExecutionPolicy{MaxAttempts: maxAttempts, Backoff: snapshot.Backoff, InvocationTimeout: snapshot.InvocationTimeout, ObservationWindow: snapshot.ObservationWindow}).validate() == nil
 }
 
 func (p BackoffPolicy) delay(retryCount int) time.Duration {

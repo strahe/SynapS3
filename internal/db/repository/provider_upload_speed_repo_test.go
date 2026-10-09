@@ -14,24 +14,18 @@ import (
 func TestProviderUploadSpeedKeepsOnlyLatestResultAcrossHealthRefresh(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
-	newTask := func(key string) int64 {
-		t.Helper()
-		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-			Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: key, InputVersion: 1,
-			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
-			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		}))
-		if err != nil || !created {
-			t.Fatalf("enqueue task: %v, created=%v", err, created)
-		}
-		return row.ID
-	}
-	first := newTask("first-speed-test")
 	hash := providerbenchmark.URLHash("https://provider.example")
+	first := enqueueProviderSpeedTask(t, repos, "101", hash, "first-speed-test").ID
+	if err := repos.ProviderUploadSpeed.Begin(t.Context(), "101", providerbenchmark.URLHash("https://changed.example"), first); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("Begin with mismatched URL = %v, want conflict", err)
+	}
+	if result, err := repos.ProviderUploadSpeed.Get(t.Context(), "101"); err != nil || result != nil {
+		t.Fatalf("rejected test created result: %#v, %v", result, err)
+	}
 	if err := repos.ProviderUploadSpeed.Begin(t.Context(), "101", hash, first); err != nil {
 		t.Fatal(err)
 	}
-	second := newTask("second-speed-test")
+	second := enqueueProviderSpeedTask(t, repos, "101", hash, "second-speed-test").ID
 	if err := repos.ProviderUploadSpeed.Begin(t.Context(), "101", hash, second); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("concurrent Begin = %v, want conflict", err)
 	}
@@ -75,7 +69,11 @@ func TestProviderUploadSpeedKeepsOnlyLatestResultAcrossHealthRefresh(t *testing.
 func TestProviderUploadSpeedCompletionPreservesTaskHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
-	claimed := enqueueAndClaimTask(t, repos, "speed-task-gc", time.Minute)
+	enqueueProviderSpeedTask(t, repos, "101", providerbenchmark.URLHash("https://provider.example"), "speed-task-history")
+	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim speed task = %#v, %v", claimed, err)
+	}
 	if err := repos.ProviderUploadSpeed.Begin(t.Context(), "101", providerbenchmark.URLHash("https://provider.example"), claimed.ID); err != nil {
 		t.Fatal(err)
 	}

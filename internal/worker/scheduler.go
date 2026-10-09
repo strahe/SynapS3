@@ -58,7 +58,6 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 		return nil, err
 	}
 	prepared.RetryOfTaskID = &source.ID
-	prepared.RetryGroupKey = source.RetryGroupKey
 	prepared.Checkpoint = source.Checkpoint
 	prepared.CancellationRequestedAt = source.CancellationRequestedAt
 	prepared.CancellationReason = source.CancellationReason
@@ -116,7 +115,6 @@ func (s *Scheduler) EnqueueRecoveryInTransaction(ctx context.Context, tx *reposi
 		return nil, err
 	}
 	prepared.RetryOfTaskID = &source.ID
-	prepared.RetryGroupKey = source.RetryGroupKey
 	if err := tx.Tasks.SupersedeTerminal(ctx, source.ID); err != nil {
 		return nil, err
 	}

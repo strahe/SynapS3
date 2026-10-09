@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -49,6 +50,58 @@ func (h *UploadSpeedTestHandler) newHandler() *taskengine.FuncHandler {
 				return repos.ProviderUploadSpeed.FailActiveTask(ctx, task.ID, reason)
 			}
 		},
+	}
+	definition.Subject = func(raw json.RawMessage) (taskengine.Subject, error) {
+		var input providerbenchmark.Input
+		if err := json.Unmarshal(raw, &input); err != nil {
+			return taskengine.Subject{}, err
+		}
+		return taskengine.Subject{Type: "provider", Key: input.ProviderID}, nil
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input providerbenchmark.Input
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		latest, err := repos.Tasks.LatestForSubject(ctx, "provider", input.ProviderID, model.TaskTypeProviderUploadSpeedTest)
+		if err != nil {
+			return err
+		}
+		if latest == nil || latest.ID != source.ID {
+			return repository.ErrConflict
+		}
+		row, err := repos.ProviderUploadSpeed.Get(ctx, input.ProviderID)
+		if err != nil {
+			return err
+		}
+		if row != nil && row.State == providerbenchmark.StateTesting {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	definition.PrepareRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
+		var input providerbenchmark.Input
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return taskengine.RetryPreparation{}, err
+		}
+		id, err := types.ParseOnChainID("provider_id", input.ProviderID)
+		if err != nil {
+			return taskengine.RetryPreparation{}, err
+		}
+		url, eligible, err := providerbenchmark.CurrentServiceURL(ctx, h.deps.Observability, id)
+		if err != nil {
+			return taskengine.RetryPreparation{}, err
+		}
+		if !eligible {
+			return taskengine.RetryPreparation{}, repository.ErrConflict
+		}
+		input.ServiceURLHash = providerbenchmark.URLHash(url)
+		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: input}, ResumeMode: model.TaskResumeModeExecute, Bind: func(ctx context.Context, repos *repository.Repositories, _, next *model.Task) error {
+			return repos.ProviderUploadSpeed.Begin(ctx, input.ProviderID, input.ServiceURLHash, next.ID)
+		}}, nil
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		return repos.ProviderUploadSpeed.TransferTaskOwner(ctx, old.ID, next.ID)
 	}
 	return taskengine.NewFuncHandler(definition, h.executeProviderUploadSpeed, h.recoverProviderUploadSpeed)
 }

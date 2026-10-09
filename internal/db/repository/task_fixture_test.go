@@ -2,7 +2,6 @@ package repository_test
 
 import (
 	"encoding/json"
-	"fmt"
 	"testing"
 	"time"
 
@@ -11,14 +10,8 @@ import (
 )
 
 func repositoryTestTask(task *model.Task) *model.Task {
-	if task.RetryGroupKey == "" {
-		task.RetryGroupKey = fmt.Sprintf("test:%s:%s", task.Type, task.IdempotencyKey)
-	}
-	if task.RetryLimit == nil {
-		task.RetryLimit = new(5)
-	}
 	if len(task.Policy) == 0 {
-		task.Policy = json.RawMessage(`{"version":1,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2},"invocation_timeout":0,"observation_window":0}`)
+		task.Policy = json.RawMessage(`{"version":2,"max_attempts":6,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2},"invocation_timeout":0,"observation_window":0}`)
 	}
 	if len(task.Runtime) == 0 {
 		task.Runtime = json.RawMessage(`{}`)
@@ -38,7 +31,7 @@ func repositorySuccessor(t *testing.T, repos *repository.Repositories, source *m
 		if err := tx.Tasks.SupersedeTerminal(t.Context(), source.ID); err != nil {
 			return err
 		}
-		child := repositoryTestTask(&model.Task{Type: source.Type, IdempotencyKey: source.IdempotencyKey, InputVersion: source.InputVersion, InputHash: source.InputHash, Input: source.Input, Checkpoint: source.Checkpoint, Policy: source.Policy, Runtime: json.RawMessage(`{}`), RetryOfTaskID: &source.ID, RetryGroupKey: source.RetryGroupKey, SubjectType: source.SubjectType, SubjectKey: source.SubjectKey, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
+		child := repositoryTestTask(&model.Task{Type: source.Type, IdempotencyKey: source.IdempotencyKey, InputVersion: source.InputVersion, InputHash: source.InputHash, Input: source.Input, Checkpoint: source.Checkpoint, Policy: source.Policy, Runtime: json.RawMessage(`{}`), RetryOfTaskID: &source.ID, SubjectType: source.SubjectType, SubjectKey: source.SubjectKey, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
 		if retainCancellation {
 			child.CancellationRequestedAt = source.CancellationRequestedAt
 			child.CancellationReason = source.CancellationReason

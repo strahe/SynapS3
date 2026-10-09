@@ -41,13 +41,8 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 			return storagepipeline.ValidateCommitRequestInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
-		// Retry runs in recover mode, which checks a stopped registration on
-		// chain again and sends nothing until the chain shows its request
-		// unused. A request stops under the first attention code it was
-		// flagged with, so every known code allows it.
-		CanManualRetry: func(task *model.Task) bool {
-			return task != nil && task.FailureReason != nil &&
-				(taskengine.RecoverableEngineFailure(*task.FailureReason) || storagecommit.AttentionCode(*task.FailureReason).Valid())
+		CanManualRetry: func(source *model.Task) bool {
+			return source != nil && source.FailureReason != nil && *source.FailureReason != "invalid_checkpoint"
 		},
 		Subject: func(canonical json.RawMessage) (taskengine.Subject, error) {
 			var input storagepipeline.CommitRequestInput
@@ -59,6 +54,31 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 			}
 			return taskengine.Subject{Type: model.TaskSubjectStorageCommitRequest, Key: input.RequestID}, nil
 		},
+	}
+
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input storagepipeline.CommitRequestInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		row, err := repos.Contents.GetCommitRequest(ctx, input.RequestID)
+		if err != nil {
+			return err
+		}
+		if row == nil || row.TaskID == nil || *row.TaskID != source.ID {
+			return repository.ErrConflict
+		}
+		if row.AttentionCode != nil && !storagecommit.AttentionCode(*row.AttentionCode).Valid() {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input storagepipeline.CommitRequestInput
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.Contents.TransferCommitTaskOwner(ctx, input.RequestID, old.ID, next.ID)
 	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runCommit(ctx, execution, true)
@@ -1021,6 +1041,10 @@ func commitAttentionError(request *storagecommit.Request) error {
 }
 
 func (h *Handler) retryStalledMembers(ctx context.Context, run commitRun, stalled []int64, observed taskengine.Settlement) taskengine.Result {
+	canResign := run.request.Status == storagecommit.RequestStatusReady && run.request.Sends == 0 && run.request.TransactionID == nil
+	if canResign && run.execution.RetryCount()+1 >= run.execution.Policy().MaxAttempts {
+		return h.giveUpUnacceptedCommit(ctx, run)
+	}
 	for _, copyID := range stalled {
 		copyRow, err := h.deps.Repositories.Contents.GetUploadCopyByID(ctx, copyID)
 		if err != nil {
@@ -1041,8 +1065,33 @@ func (h *Handler) retryStalledMembers(ctx context.Context, run commitRun, stalle
 			}
 		}
 		if !eligible {
+			if canResign {
+				return h.giveUpUnacceptedCommit(ctx, run)
+			}
 			return taskengine.Fail(errors.New("storage registration member cannot be recovered safely"), "commit_member_recovery_blocked", observed)
 		}
 	}
 	return taskengine.RetryInMode(errors.New("storage registration member transfer failed"), "commit_member_retry", model.TaskResumeModeRecover, commitMemberRetransferDelay, nil).WithRetrySettlements(h.retransferStalledMembers(run, stalled, observed), observed)
+}
+
+func (h *Handler) giveUpUnacceptedCommit(ctx context.Context, run commitRun) taskengine.Result {
+	target, commit, result, ok := h.loadCommit(ctx, run)
+	if !ok {
+		return result
+	}
+	proof, err := run.advancer.Prove(ctx, commit)
+	if err != nil {
+		return retryTask(err, "commit_member_proof_failed")
+	}
+	//exhaustive:enforce
+	switch proof.Outcome {
+	case storagecommit.ProofLanded:
+		return h.confirmCommit(run, target, commit, storagecommit.Confirmation{FirstPieceID: proof.FirstPieceID})
+	case storagecommit.ProofUnused:
+		return h.resignCommit(run, "a member could not be transferred again; the other pieces are signed again")
+	case storagecommit.ProofConflict:
+		return taskengine.Fail(errors.New("storage registration evidence conflicts with the chain"), "commit_member_recovery_blocked", nil)
+	default:
+		return taskengine.Fail(fmt.Errorf("unknown storage registration proof %d", proof.Outcome), "commit_proof_invalid", nil)
+	}
 }

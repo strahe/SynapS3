@@ -25,6 +25,8 @@ Stop incoming S3 traffic and SynapS3 before creating a backup. Keep the database
 
 Replace the executable, package, or container image through the same installation method used for the deployment. Docker-specific commands are documented on the [Docker Deployment](../getting-started/docker.md) page.
 
+Deprecated `worker.upload`, `worker.provider_replacement`, `worker.evictor`, and `worker.storage_cleanup` configuration sections are rejected; replace them with `worker.tasks` settings. Remove `worker.tasks.max_retries`, `worker.tasks.retention`, `SYNAPS3_WORKER_TASKS_MAX_RETRIES`, and `SYNAPS3_WORKER_TASKS_RETENTION` before starting the upgraded version; these settings are rejected. Retry budgets belong to each task type, and history is retained permanently.
+
 Start SynapS3 with the intended database and cache. If startup reports that the database is incompatible, stop the process, leave the database unchanged, and follow [If the Database Is Incompatible](#if-the-database-is-incompatible).
 
 After startup, run:
@@ -54,7 +56,7 @@ sqlite3 -readonly /backup/path/synaps3-pre-upgrade.db "PRAGMA integrity_check;"
 
 The integrity check must print `ok`. Protect the backup, its WAL/SHM files when retained, the matching cache, and the configuration as one recovery set. PostgreSQL deployments should use `pg_dump` or the deployment's approved database snapshot and verify that artifact separately.
 
-SynapS3 leaves an incompatible database unchanged. Deprecated `worker.upload`, `worker.provider_replacement`, `worker.evictor`, and `worker.storage_cleanup` configuration sections are also rejected; replace them with `worker.tasks` settings.
+SynapS3 leaves an incompatible database unchanged.
 
 Starting with an empty database does not import existing buckets, objects, users, storage data sets, wallet operations, provider replacements, or tasks. Existing paid remote storage services remain active. Keep the verified backup so those services and records can be reviewed and handled separately.
 
@@ -64,13 +66,14 @@ Do not run the preserved installation and its replacement against the same datab
 
 After a restart, unfinished work becomes eligible to continue automatically.
 
-- Retry a failed task only when the dashboard or API marks it retryable.
+- Use **Retry** for a stopped task. The task list shows whether its result permits retry; opening details checks the current conditions. If another operation has taken over or recovery is unsafe, Retry explains why and refreshes the list.
 - Recover provider replacements from **Details** → **Storage** → **Data Sets**.
 - A storage transfer task that stopped because of an internal error stays retryable. Retry checks what the earlier attempt already did before continuing. If the error came from a version that cannot run the task, install a compatible version first.
 - A wallet operation can be retried from Tasks when no broadcast started, or when it stopped because of an internal error. Retry checks the operation first: it sends the transaction only if none was ever broadcast, and otherwise checks the transaction already sent. If a broadcast may have gone out without a recorded transaction, the operation is marked unknown and cannot be retried.
 - **Retry** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
-- `status=failed` includes acknowledged failures. Acknowledgement does not delete history.
-- When the provider rejects a storage registration, gives no reply, or still cannot be asked about it 15 minutes after it was sent, SynapS3 checks on chain whether its pieces were registered and submits the original request again if they were not; that request can be registered only once. A piece the provider dropped before registration is transferred again, then the whole request is sent again. If it cannot be copied again from another provider, a request the provider never accepted is signed again without it and that copy fails, while a request the provider accepted tries the copy again later. An upload from local cache that stops and offers Retry on the Tasks page holds its registration until you retry it. A request the provider never accepted is signed again with a new nonce if the chain already used its nonce elsewhere. For a request the provider accepted, a chain record that does not match keeps the confirmation stopped: find it in **Tasks** (Confirm storage, Failed) or with `synaps3 admin storage-confirmation list`, with the provider's response, and use **Retry** to check the chain again. Retry completes it once its request is registered.
+- Acknowledgement moves a failure to History; use `scope=history&status=failed` to view it.
+- Storage registration recovery preserves the signed request and checks the chain before resubmitting. Missing pieces are transferred again when safe. Provider errors and failed transfers use a finite budget. If registration was conclusively refused and the chain confirms it did not land, the remaining pieces can continue when one cannot be recovered. When recovery stops, confirmation retains the saved evidence. Find it in **Tasks** (Confirm storage, Failed) or with `synaps3 admin storage-confirmation list`, restore its dependencies, and use **Retry**. An accepted request with conflicting chain evidence remains stopped for review.
+- A provider with a full Pull queue is tried again after its requested delay without using the retry budget. Other failures use up to 12 opportunities in new or manually retried Pull rounds; existing rounds keep their original policy.
 
 Useful commands:
 

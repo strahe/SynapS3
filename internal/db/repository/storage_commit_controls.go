@@ -84,11 +84,13 @@ func (r *BunStorageContentRepo) RequestCommitSeal(ctx context.Context, requestID
 		if request.SealRequestedAt != nil {
 			return wakeCommitTasks(ctx, db, []int64{*request.TaskID})
 		}
-		var task model.Task
-		if err := db.NewSelect().Model(&task).Column("status").Where("id = ?", *request.TaskID).Scan(ctx); err != nil {
+		active, err := db.NewSelect().Model((*model.Task)(nil)).
+			Where("id = ?", *request.TaskID).
+			Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).Exists(ctx)
+		if err != nil {
 			return err
 		}
-		if task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning {
+		if !active {
 			return ErrConflict
 		}
 		count, err := countCommitMembers(ctx, db, requestID)

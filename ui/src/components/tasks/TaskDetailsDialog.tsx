@@ -34,10 +34,8 @@ const eventLabels: Record<string, string> = {
   superseded: 'New execution created',
   acknowledged: 'Acknowledged',
   effect_admitted: 'Operation started',
-  legacy_handoff: 'Execution upgraded',
   pending: 'Retry scheduled',
   retired: 'Retired',
-  policy_replaced: 'Execution upgraded',
   waiting: 'Waiting',
   wait: 'Waiting',
 }
@@ -86,27 +84,39 @@ function LoadError({ label, onRetry }: { label: string; onRetry: () => void }) {
 
 export function TaskDetailsDialog({ taskID }: { taskID: number }) {
   const [open, setOpen] = useState(false)
+  const [selectedTaskID, setSelectedTaskID] = useState(taskID)
   const [historyCursor, setHistoryCursor] = useState<number>()
   const [eventCursor, setEventCursor] = useState<number>()
-  const detail = useQuery({ queryKey: ['task', taskID], queryFn: () => api.getTask(taskID), enabled: open })
-  const history = useQuery({
-    queryKey: ['taskHistory', taskID, historyCursor],
-    queryFn: () => api.getTaskHistory(taskID, historyCursor),
+  const detail = useQuery({
+    queryKey: ['task', selectedTaskID],
+    queryFn: () => api.getTask(selectedTaskID),
     enabled: open,
+    refetchInterval: open ? 10_000 : false,
+  })
+  const history = useQuery({
+    queryKey: ['taskHistory', selectedTaskID, historyCursor],
+    queryFn: () => api.getTaskHistory(selectedTaskID, historyCursor),
+    enabled: open,
+    refetchInterval: open ? 10_000 : false,
   })
   const events = useQuery({
-    queryKey: ['taskEvents', taskID, eventCursor],
-    queryFn: () => api.getTaskEvents(taskID, eventCursor),
+    queryKey: ['taskEvents', selectedTaskID, eventCursor],
+    queryFn: () => api.getTaskEvents(selectedTaskID, eventCursor),
     enabled: open,
+    refetchInterval: open ? 10_000 : false,
   })
   const task = detail.data?.task
   const policy = detail.data?.policy
   const message = task ? taskDetailsView(task) : undefined
+  const visibleEvents = events.data?.events.filter(
+    (event) => event.type !== 'legacy_handoff' && event.type !== 'policy_replaced'
+  )
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
         setOpen(next)
+        if (next) setSelectedTaskID(taskID)
         if (!next) {
           setHistoryCursor(undefined)
           setEventCursor(undefined)
@@ -120,7 +130,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
       </DialogTrigger>
       <DialogContent className="flex h-[min(38rem,calc(100dvh-2rem))] flex-col gap-4 overflow-hidden sm:max-w-2xl">
         <DialogHeader className="shrink-0 pr-8">
-          <DialogTitle>Task {taskID}</DialogTitle>
+          <DialogTitle>Task {selectedTaskID}</DialogTitle>
           <DialogDescription>{task ? taskOperationLabel(task.type) : 'Task details'}</DialogDescription>
         </DialogHeader>
         {detail.isPending && <LoadingDetails />}
@@ -135,6 +145,9 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
               </div>
               {task.retryable && <RetryButton taskID={task.retry_task_id} />}
             </div>
+            {task.retry_unavailable_reason && (
+              <p className="shrink-0 text-sm text-muted-foreground">{task.retry_unavailable_reason}</p>
+            )}
             {message?.value && (
               <Alert variant={task.status === 'failed' ? 'destructive' : 'default'} className="shrink-0">
                 {task.status === 'failed' ? <CircleX /> : <Clock3 />}
@@ -170,14 +183,20 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                     <section className="flex flex-col gap-3">
                       <div className="flex items-center justify-between gap-2">
                         <h3 className="font-medium">Execution policy</h3>
-                        {policy?.legacy && <Badge variant="outline">Legacy</Badge>}
                       </div>
                       {policy ? (
                         <dl className="grid gap-3 sm:grid-cols-2">
                           {[
-                            ['Current attempt', `${task.retry_count + 1} / ${policy.max_attempts ?? 'Legacy limit'}`],
-                            ['Automatic retries', policy.max_attempts === 1 ? 'Disabled' : 'Enabled'],
-                            ...(policy.max_attempts === 1
+                            ['Current attempt', `${task.retry_count + 1} / ${policy.max_attempts ?? 'Unknown'}`],
+                            [
+                              'Automatic retries',
+                              policy.max_attempts == null
+                                ? 'Unknown'
+                                : policy.max_attempts === 1
+                                  ? 'Disabled'
+                                  : 'Enabled',
+                            ],
+                            ...(policy.max_attempts == null || policy.max_attempts === 1
                               ? []
                               : [
                                   [
@@ -191,7 +210,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                               policy.invocation_timeout === '0s' ? 'Not set' : policy.invocation_timeout,
                             ],
                             [
-                              'Observation window',
+                              'Result wait limit',
                               policy.observation_window === '0s' ? 'Not set' : policy.observation_window,
                             ],
                           ].map(([label, value]) => (
@@ -226,8 +245,18 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                           <div className="flex items-start justify-between gap-4 py-3">
                             <div className="flex min-w-0 flex-col gap-1.5">
                               <div className="flex flex-wrap items-center gap-2">
-                                <span className="font-medium">Task {round.id}</span>
-                                {round.id === taskID && <Badge variant="secondary">Current</Badge>}
+                                <Button
+                                  variant="link"
+                                  size="sm"
+                                  onClick={() => {
+                                    setSelectedTaskID(round.id)
+                                    setHistoryCursor(undefined)
+                                    setEventCursor(undefined)
+                                  }}
+                                >
+                                  Task {round.id}
+                                </Button>
+                                {round.id === selectedTaskID && <Badge variant="secondary">Current</Badge>}
                               </div>
                               <span className="text-muted-foreground">{taskOperationLabel(round.type)}</span>
                               <span className="text-xs text-muted-foreground">
@@ -259,7 +288,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                   <div className="flex flex-col gap-4 pr-3">
                     {events.isPending && <LoadingDetails />}
                     {events.isError && <LoadError label="events" onRetry={() => void events.refetch()} />}
-                    {events.data?.events.length === 0 && (
+                    {visibleEvents?.length === 0 && (
                       <Empty>
                         <EmptyHeader>
                           <EmptyMedia variant="icon">
@@ -270,14 +299,14 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                       </Empty>
                     )}
                     <ol>
-                      {events.data?.events.map((event, index) => {
+                      {visibleEvents?.map((event, index) => {
                         const EventIcon =
                           event.type === 'failed' ? CircleX : event.type === 'completed' ? CircleCheck : Circle
                         return (
                           <li key={event.sequence} className="flex gap-3">
                             <div className="flex w-5 shrink-0 flex-col items-center gap-1 py-1">
                               <EventIcon aria-hidden="true" className="size-4 text-muted-foreground" />
-                              {index < (events.data?.events.length ?? 0) - 1 && (
+                              {index < (visibleEvents?.length ?? 0) - 1 && (
                                 <Separator orientation="vertical" className="min-h-5 flex-1" />
                               )}
                             </div>

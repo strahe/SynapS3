@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/strahe/synaps3/internal/cache"
@@ -33,8 +34,30 @@ func NewDurabilityHandler(deps DurabilityDependencies) (*DurabilityHandler, erro
 func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeCacheReconcileDurability, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:  taskengine.StrictJSONCodec(cacheeviction.ValidateDurabilityInput),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Codec:   taskengine.StrictJSONCodec(cacheeviction.ValidateDurabilityInput),
+		Subject: taskengine.SubjectFromInput("bucket", func(input cacheeviction.DurabilityInput) int64 { return input.BucketID }),
+		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+	}
+	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
+		var input cacheeviction.DurabilityInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return err
+		}
+		bucket, err := repos.Buckets.GetByID(ctx, input.BucketID)
+		if err != nil {
+			return err
+		}
+		if bucket == nil || bucket.DurabilityTaskID == nil || *bucket.DurabilityTaskID != source.ID || bucket.DurabilityGeneration != input.Generation {
+			return repository.ErrConflict
+		}
+		return nil
+	}
+	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+		var input cacheeviction.DurabilityInput
+		if err := json.Unmarshal(old.Input, &input); err != nil {
+			return err
+		}
+		return repos.CacheEvictions.TransferDurabilityTaskOwner(ctx, input.BucketID, input.Generation, old.ID, next.ID)
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[cacheeviction.DurabilityInput](execution)

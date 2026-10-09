@@ -2,7 +2,6 @@ package transfer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -132,32 +131,16 @@ func (h *CopyCoordinator) enqueueRecoveryCopyTaskAt(ctx context.Context, repos *
 	if err != nil {
 		return err
 	}
-	if source == nil || copyRow == nil || copyRow.ActiveTaskID != nil {
-		return repository.ErrConflict
-	}
-	var previous storagepipeline.CopyGenerationInput
-	if err := json.Unmarshal(source.Input, &previous); err != nil {
-		return err
-	}
-	if previous.CopyID != copyID || previous.Generation != copyRow.WorkGeneration {
-		return repository.ErrConflict
-	}
-	latest, err := repos.Tasks.LatestForSubject(ctx, model.TaskSubjectStorageCopy, strconv.FormatInt(copyID, 10), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+	preparation, err := h.prepareCopyRecovery(ctx, repos, source, copyRow)
 	if err != nil {
 		return err
 	}
-	if latest == nil || latest.ID != sourceID {
-		return repository.ErrConflict
-	}
-	input := storagepipeline.CopyGenerationInput{CopyID: copyID, Generation: previous.Generation + 1}
-	taskRow, err := h.deps.Scheduler.EnqueueRecoveryInTransaction(ctx, repos, sourceID, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(copyID, input.Generation), Input: input,
-		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyID, 10), AvailableAt: availableAt,
-	})
+	preparation.Request.AvailableAt = availableAt
+	taskRow, err := h.deps.Scheduler.EnqueueRecoveryInTransaction(ctx, repos, sourceID, preparation.Request)
 	if err != nil {
 		return err
 	}
-	return repos.Contents.BindCopyTask(ctx, copyID, input.Generation, taskRow.ID)
+	return preparation.Bind(ctx, repos, source, taskRow)
 }
 
 func (h *CopyCoordinator) enqueueSuccessorCopyTask(

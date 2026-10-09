@@ -1,6 +1,16 @@
-import type { TaskItem, TaskSubjectInfo, TaskSubjectProvider } from '../api/client.ts'
+import type { TaskItem, TaskScope, TaskSubjectInfo, TaskSubjectProvider } from '../api/client.ts'
+import { APIError } from '../api/client.ts'
+
+export function taskRetryErrorMessage(error: unknown) {
+  return error instanceof APIError && error.status === 409 ? error.message : 'Could not retry. Refresh and try again.'
+}
+
 import { replicaLabel } from './storage-status-labels.ts'
 import { formatBytes, formatTokenAmount } from './utils.ts'
+
+export function taskStatusesForScope(scope: TaskScope): TaskItem['status'][] {
+  return scope === 'history' ? ['completed', 'failed', 'cancelled'] : ['pending', 'running', 'failed']
+}
 
 export const taskOperationLabels: Record<string, string> = {
   bucket_provision: 'Prepare bucket',

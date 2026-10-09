@@ -45,6 +45,13 @@ var ErrContentCleanupNotReady = errors.New("storage content cleanup is waiting f
 // no longer be proven valid.
 var ErrTaskLeaseLost = errors.New("task lease lost")
 
+// Cross-table corruption is distinct from retryable transaction contention.
+var (
+	ErrTaskDataCorrupted     = errors.New("task data is corrupted")
+	ErrTaskIdentityContended = errors.New("task identity is busy")
+	ErrRepositoryContended   = errors.New("database transaction is busy")
+)
+
 // ErrAlreadyCurrent is returned when a restore would not change the current object representation.
 var ErrAlreadyCurrent = errors.New("already current")
 
@@ -72,5 +79,15 @@ func shouldRetryObjectWrite(err error, canRestartTx bool) bool {
 }
 
 func shouldRetryRepositoryTx(err error) bool {
-	return errors.Is(err, errConcurrentObjectCreate)
+	if errors.Is(err, errConcurrentObjectCreate) || errors.Is(err, ErrTaskIdentityContended) {
+		return true
+	}
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
+		return true
+	}
+	sqliteErr, ok := errors.AsType[interface {
+		error
+		Code() int
+	}](err)
+	return ok && (sqliteErr.Code()&255 == 5 || sqliteErr.Code()&255 == 6)
 }
