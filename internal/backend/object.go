@@ -33,6 +33,8 @@ import (
 )
 
 func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
 	if err := validateObjectKey(keyName); err != nil {
@@ -151,6 +153,8 @@ func objectSizeAPIError(err error) s3err.APIError {
 }
 
 func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return nil, invalidArgument("Bucket")
 	}
@@ -233,6 +237,8 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 }
 
 func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return nil, invalidArgument("Bucket")
 	}
@@ -265,6 +271,8 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 
 // GetObjectAttributes returns object metadata and honors an explicit versionId.
 func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return s3response.GetObjectAttributesResponse{}, invalidArgument("Bucket")
 	}
@@ -305,6 +313,8 @@ func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetO
 }
 
 func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return s3response.ListObjectsResult{}, invalidArgument("Bucket")
 	}
@@ -375,6 +385,8 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 
 // ListObjectVersions lists object versions and delete markers with S3 markers and delimiter grouping.
 func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return s3response.ListVersionsResult{}, invalidArgument("Bucket")
 	}
@@ -452,6 +464,8 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 const deleteObjectsMaxObjects = 1000
 
 func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return nil, invalidArgument("Bucket")
 	}
@@ -470,6 +484,8 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 }
 
 func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return s3response.DeleteResult{}, invalidArgument("Bucket")
 	}
@@ -640,6 +656,8 @@ func (b *SynapseBackend) releaseContentCache(ctx context.Context, bucketName str
 }
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input.Bucket == nil || input.Key == nil || input.CopySource == nil {
 		return s3response.CopyObjectOutput{}, missingRequiredArgument(
 			requiredArg("Bucket", input.Bucket == nil),
@@ -831,6 +849,8 @@ func (b *SynapseBackend) copyObjectError(err error) error {
 
 // RestoreObjectVersion copies a selected data version to a new current version of the same object.
 func (b *SynapseBackend) RestoreObjectVersion(ctx context.Context, bucketName, key, sourceVersionID, expectedCurrentVersionID string) (string, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if bucketName == "" || key == "" || sourceVersionID == "" || expectedCurrentVersionID == "" {
 		return "", fmt.Errorf("restoring object version: %w", repository.ErrInvalidInput)
 	}
@@ -946,6 +966,8 @@ func parseCopySource(src string) (bucket, key, versionID string, err error) {
 }
 
 func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return s3response.ListObjectsV2Result{}, invalidArgument("Bucket")
 	}
@@ -1395,6 +1417,8 @@ const orphanedContentScanBatch = 500
 // between resolving its content and committing its version. Each content is
 // handled on its own; one that fails is logged and retried on the next start.
 func (b *SynapseBackend) DiscardOrphanedContents(ctx context.Context, createdBefore time.Time) (discarded, failed int, err error) {
+	ctx = snapshotRequestContext(ctx)
+
 	var afterID int64
 	for {
 		page, err := b.repos.Contents.ListOrphanedContents(ctx, createdBefore, afterID, orphanedContentScanBatch)

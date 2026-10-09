@@ -47,7 +47,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 	if _, err := s3Client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	waitForRegistrationBucket(t, admin, bucket)
+	waitForBucketReady(t, admin, bucket)
 
 	group, ctx := errgroup.WithContext(t.Context())
 	for i := range objects {
@@ -149,7 +149,7 @@ func TestSystemManualSealBypassesLongCollectionWindow(t *testing.T) {
 		if _, err := client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatal(err)
 		}
-		waitForRegistrationBucket(t, admin, bucket)
+		waitForBucketReady(t, admin, bucket)
 		if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("manual.bin"), Body: bytes.NewReader(bytes.Repeat([]byte(bucket), 8000))}); err != nil {
 			t.Fatal(err)
 		}
@@ -210,15 +210,4 @@ func TestSystemManualSealBypassesLongCollectionWindow(t *testing.T) {
 			return raw, len(list.Objects) == 1 && list.Objects[0].State == "stored" && list.Objects[0].Location.Filecoin, err
 		})
 	}
-}
-
-func waitForRegistrationBucket(t *testing.T, admin *e2e.AdminClient, bucket string) {
-	t.Helper()
-	e2e.Eventually(t, t.Context(), 60*time.Second, "bucket ready for uploads", func(ctx context.Context) (string, bool, error) {
-		var detail struct {
-			Status string `json:"status"`
-		}
-		_, err := admin.GetJSON(ctx, "/api/v1/buckets/"+url.PathEscape(bucket), &detail)
-		return detail.Status, detail.Status == "ready", err
-	})
 }

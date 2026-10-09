@@ -24,6 +24,8 @@ import (
 const multipartRollbackTimeout = 10 * time.Second
 
 func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3response.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
 	if err := validateObjectKey(keyName); err != nil {
@@ -63,6 +65,8 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 }
 
 func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return nil, invalidArgument("Bucket")
 	}
@@ -120,6 +124,8 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 }
 
 func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyInput) (s3response.CopyPartResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return s3response.CopyPartResult{}, invalidArgument("Bucket")
 	}
@@ -196,6 +202,8 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 }
 
 func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return s3response.CompleteMultipartUploadResult{}, "", invalidArgument("Bucket")
 	}
@@ -388,10 +396,14 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 // left completing be completed or aborted again. It must run before the S3
 // server accepts requests, while no completion can be in flight.
 func (b *SynapseBackend) ReleaseInterruptedMultipartCompletions(ctx context.Context) (int64, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	return b.repos.Multiparts.ReleaseInterruptedCompletions(ctx)
 }
 
 func (b *SynapseBackend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return invalidArgument("Bucket")
 	}
@@ -425,6 +437,8 @@ func (b *SynapseBackend) AbortMultipartUpload(ctx context.Context, input *s3.Abo
 }
 
 func (b *SynapseBackend) ListMultipartUploads(ctx context.Context, input *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return s3response.ListMultipartUploadsResult{}, invalidArgument("Bucket")
 	}
@@ -477,6 +491,8 @@ func (b *SynapseBackend) ListMultipartUploads(ctx context.Context, input *s3.Lis
 }
 
 func (b *SynapseBackend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil {
 		return s3response.ListPartsResult{}, invalidArgument("Bucket")
 	}

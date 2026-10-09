@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,10 +14,28 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/strahe/synaps3/internal/s3access"
+	"github.com/valyala/fasthttp"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3log"
 )
+
+func TestLoggerDoesNotMutateRequestContext(t *testing.T) {
+	app := fiber.New()
+	requestCtx := &fasthttp.RequestCtx{}
+	ctx := app.AcquireCtx(requestCtx)
+	defer app.ReleaseCtx(ctx)
+	requestCtx.SetUserValue("request-marker", "preserved")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	s3access.NewLogger(logger, "info").Log(ctx, nil, nil, s3log.LogMeta{Action: "GetObject"})
+
+	var values int
+	requestCtx.VisitUserValues(func(_ []byte, _ any) { values++ })
+	if values != 1 || requestCtx.UserValue("request-marker") != "preserved" {
+		t.Fatalf("request context changed during access logging: values=%d", values)
+	}
+}
 
 func TestLoggerLogsStructuredSuccessfulRequest(t *testing.T) {
 	record := captureRequestLog(t, http.MethodPut, "/test1/Pencil-mac-arm64.dmg?x-id=UploadPart&partNumber=1&uploadId=u1", nil, []byte("response"), s3log.LogMeta{

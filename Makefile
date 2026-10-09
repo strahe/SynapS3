@@ -13,7 +13,7 @@ DOCKER_DEPLOYMENT ?= sh docker/deployment.sh
 # concurrency is covered by the PostgreSQL tests, which the race detector
 # cannot observe.
 RACE_PACKAGES := ./internal/admin ./internal/app ./internal/backend ./internal/cache ./internal/cacheaccess \
-                 ./internal/objectreader ./internal/observability ./internal/provider \
+                 ./internal/objectreader ./internal/observability ./internal/provider ./internal/s3access \
                  ./internal/storagecommit ./internal/synapse ./internal/task ./internal/task/transfer ./internal/worker
 
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -62,9 +62,9 @@ test-race:
 # Keep PR race checks focused on shared-memory contracts; run test-race for
 # the complete package suites when investigating concurrency changes.
 test-race-ci:
-	$(CGO) go test -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/task/transfer
+	$(CGO) go test -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/s3access ./internal/task/transfer
 	$(CGO) go test -race -tags dev -count=1 -run '^Test(AdminEventHub.*|CachedWalletQuerier_(CoalescesConcurrentMisses|WaiterContextCanCancel))$$' ./internal/admin
-	$(CGO) go test -race -tags dev -count=1 -run '^Test(PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction$$' ./internal/backend
+	$(CGO) go test -race -tags dev -count=1 -run '^Test((PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction|RequestContext.*)$$' ./internal/backend
 	$(CGO) go test -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task
 	$(CGO) go test -race -tags dev -count=1 -run '^TestEngine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork|TypeConcurrencyPreservesQueueAndFairness|GlobalConcurrencyIncludesUnrestrictedTypes|ActiveClaimCannotBeReclaimedBeforeInvocationReturns|ConcurrencyHeldThroughSettlement|ShutdownWaitsForInvocations)$$' ./internal/worker
 

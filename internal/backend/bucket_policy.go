@@ -16,6 +16,8 @@ import (
 
 // GetBucketAcl returns the persisted ACL for the specified bucket.
 func (b *SynapseBackend) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
@@ -30,6 +32,8 @@ func (b *SynapseBackend) GetBucketAcl(ctx context.Context, input *s3.GetBucketAc
 
 // PutBucketAcl persists bucket ACL updates used by VersityGW access control.
 func (b *SynapseBackend) PutBucketAcl(ctx context.Context, bucket string, data []byte) error {
+	ctx = snapshotRequestContext(ctx)
+
 	bkt, err := b.getBucket(ctx, bucket)
 	if err != nil {
 		return err
@@ -92,10 +96,14 @@ func aclPreservingOwner(data []byte, owner string) ([]byte, error) {
 }
 
 func (b *SynapseBackend) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
+	ctx = snapshotRequestContext(ctx)
+
 	return auth.UpdateBucketACLOwner(ctx, b, bucket, owner)
 }
 
 func (b *SynapseBackend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return nil, err
 	}
@@ -103,6 +111,8 @@ func (b *SynapseBackend) GetBucketPolicy(ctx context.Context, bucket string) ([]
 }
 
 func (b *SynapseBackend) DeleteBucketPolicy(ctx context.Context, bucket string) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return err
 	}
@@ -111,6 +121,8 @@ func (b *SynapseBackend) DeleteBucketPolicy(ctx context.Context, bucket string) 
 
 // PutBucketVersioning accepts Enabled because SynapS3 enforces versioning for every bucket.
 func (b *SynapseBackend) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return err
 	}
@@ -130,6 +142,8 @@ func (b *SynapseBackend) PutBucketVersioning(ctx context.Context, bucket string,
 
 // GetBucketVersioning reports that SynapS3 buckets are always versioning-enabled.
 func (b *SynapseBackend) GetBucketVersioning(ctx context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return s3response.GetBucketVersioningOutput{}, err
 	}
@@ -140,6 +154,8 @@ func (b *SynapseBackend) GetBucketVersioning(ctx context.Context, bucket string)
 
 // GetObjectLockConfiguration reports that object lock is not configured.
 func (b *SynapseBackend) GetObjectLockConfiguration(ctx context.Context, bucket string) ([]byte, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return nil, err
 	}
@@ -149,6 +165,8 @@ func (b *SynapseBackend) GetObjectLockConfiguration(ctx context.Context, bucket 
 
 // GetBucketOwnershipControls returns an ACL-compatible ownership mode.
 func (b *SynapseBackend) GetBucketOwnershipControls(ctx context.Context, bucket string) (types.ObjectOwnership, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return "", err
 	}
@@ -157,6 +175,8 @@ func (b *SynapseBackend) GetBucketOwnershipControls(ctx context.Context, bucket 
 }
 
 func (b *SynapseBackend) PutBucketOwnershipControls(ctx context.Context, bucket string, ownership types.ObjectOwnership) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return err
 	}
@@ -169,6 +189,8 @@ func (b *SynapseBackend) PutBucketOwnershipControls(ctx context.Context, bucket 
 }
 
 func (b *SynapseBackend) DeleteBucketOwnershipControls(ctx context.Context, bucket string) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return err
 	}
@@ -178,6 +200,8 @@ func (b *SynapseBackend) DeleteBucketOwnershipControls(ctx context.Context, buck
 // GetObjectAcl returns an empty ACL for the specified object.
 // TODO: verify object exists and return NoSuchKey for missing keys.
 func (b *SynapseBackend) GetObjectAcl(ctx context.Context, input *s3.GetObjectAclInput) (*s3.GetObjectAclOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
@@ -192,6 +216,8 @@ func (b *SynapseBackend) GetObjectAcl(ctx context.Context, input *s3.GetObjectAc
 // PutObjectAcl accepts and discards object-level ACL updates.
 // TODO: verify object exists and return NoSuchKey for missing keys.
 func (b *SynapseBackend) PutObjectAcl(ctx context.Context, input *s3.PutObjectAclInput) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
@@ -209,6 +235,8 @@ func (b *SynapseBackend) PutObjectAcl(ctx context.Context, input *s3.PutObjectAc
 
 // GetBucketTagging returns no tags for the specified bucket.
 func (b *SynapseBackend) GetBucketTagging(ctx context.Context, bucket string) (map[string]string, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return nil, err
 	}

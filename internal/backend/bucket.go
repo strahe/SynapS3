@@ -14,6 +14,8 @@ import (
 )
 
 func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, defaultACL []byte) error {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
@@ -72,6 +74,8 @@ func ownerFromACL(data []byte) (string, error) {
 }
 
 func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	if input == nil || input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
@@ -88,6 +92,8 @@ func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInp
 }
 
 func (b *SynapseBackend) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	buckets, err := b.repos.Buckets.ListActive(ctx)
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, fmt.Errorf("listing buckets: %w", err)
@@ -118,6 +124,8 @@ func (b *SynapseBackend) ListBuckets(ctx context.Context, input s3response.ListB
 }
 
 func (b *SynapseBackend) ListBucketsAndOwners(ctx context.Context) ([]s3response.Bucket, error) {
+	ctx = snapshotRequestContext(ctx)
+
 	buckets, err := b.repos.Buckets.ListActive(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing buckets: %w", err)
