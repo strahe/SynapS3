@@ -2092,11 +2092,24 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				wakeTask(t, runtime, planner.ID)
 			}
 
-			wantUsed := tt.used - int64(tt.wantEvicted)*11
 			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) && used.Load() > wantUsed {
+			var page repository.TaskPage
+			for time.Now().Before(deadline) {
+				page, err = runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{
+					Scope: repository.TaskScopeHistory, Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
+				})
+				if err != nil {
+					t.Fatalf("list completed cache tasks: %v", err)
+				}
+				if len(page.Tasks) >= tt.wantEvicted {
+					break
+				}
 				time.Sleep(5 * time.Millisecond)
 			}
+			if len(page.Tasks) != tt.wantEvicted {
+				t.Fatalf("completed cache tasks = %#v, want %d", page.Tasks, tt.wantEvicted)
+			}
+			wantUsed := tt.used - int64(tt.wantEvicted)*11
 			if used.Load() != wantUsed {
 				t.Fatalf("cache usage = %d, want %d", used.Load(), wantUsed)
 			}
@@ -2119,12 +2132,6 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				if evicted := index < tt.wantEvicted; stored.InCache == evicted {
 					t.Fatalf("version %d in cache = %v, want %v", index, stored.InCache, !evicted)
 				}
-			}
-			page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{
-				Scope: repository.TaskScopeHistory, Type: model.TaskTypeCacheEvict, Status: model.TaskStatusCompleted, Limit: 10,
-			})
-			if err != nil || len(page.Tasks) != tt.wantEvicted {
-				t.Fatalf("completed cache tasks = %#v, err=%v", page.Tasks, err)
 			}
 		})
 	}
