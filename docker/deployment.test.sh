@@ -438,13 +438,15 @@ test_compose_and_caddy_config() {
 
   docker compose --project-directory "$case_dir" config >"$case_dir/rendered.yaml"
   assert_not_contains "$case_dir/rendered.yaml" "image: caddy:2.11.4-alpine"
-  assert_contains "$case_dir/rendered.yaml" "image: postgres:17"
+  assert_contains "$case_dir/rendered.yaml" "image: postgres:18"
   assert_contains "$case_dir/rendered.yaml" "host_ip: 127.0.0.1"
   assert_contains "$case_dir/rendered.yaml" 'published: "15432"'
   assert_contains "$case_dir/rendered.yaml" "@127.0.0.1:15432/synaps3?sslmode=disable"
   assert_contains "$case_dir/rendered.yaml" "target: /docker-entrypoint-initdb.d/10-synaps3.sql"
   assert_contains "$case_dir/rendered.yaml" "source: postgres-admin-password"
   assert_contains "$case_dir/rendered.yaml" "name: synaps3-postgres-data"
+  assert_contains "$case_dir/rendered.yaml" "target: /var/lib/postgresql"
+  assert_not_contains "$case_dir/rendered.yaml" "target: /var/lib/postgresql/data"
   assert_contains "$case_dir/rendered.yaml" "condition: service_healthy"
 
   sed '/^POSTGRES_APP_PASSWORD=/d' "$case_dir/.env" >"$case_dir/.env.invalid"

@@ -16,7 +16,7 @@ description: 在本地构建 SynapS3，初始化运行数据，并验证内嵌�
 - cgo 所需的 C toolchain，例如 `gcc` 或 `clang`。
 - Node.js 22.12 或更高版本。
 - pnpm 11。
-- PostgreSQL 17，或用于本地运行它的 Docker。
+- PostgreSQL 18，或用于本地运行它的 Docker。
 
 ## 构建
 
@@ -42,13 +42,13 @@ printf '\n'
 export POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 docker run -d --name synaps3-postgres --restart unless-stopped \
   -e POSTGRES_DB=synaps3 -e POSTGRES_PASSWORD -e POSTGRES_APP_PASSWORD \
-  -p 127.0.0.1:5432:5432 -v synaps3-postgres-local:/var/lib/postgresql/data \
+  -p 127.0.0.1:5432:5432 -v synaps3-postgres-local:/var/lib/postgresql \
   -v "$PWD/docker/postgres-init.sql:/docker-entrypoint-initdb.d/synaps3.sql:ro" \
-  postgres:17
+  postgres:18
 unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 ```
 
-只有 volume 为空时才会创建角色和设置密码。
+只有 volume 为空时才会创建角色和设置密码。升级已有 PostgreSQL 17 volume 时，先用 17 备份，再恢复到新的 18 volume；验证恢复成功后再处理原 volume。
 
 ## 初始化运行数据
 

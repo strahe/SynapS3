@@ -34,7 +34,7 @@ cd SynapS3
 
 The default uses the published image and keeps Admin on `127.0.0.1:9090`. `IMAGE_SOURCE=local` makes `make docker-up` build from the current checkout. `ADMIN_DOMAIN` loads Caddy, manages certificate issuance and renewal, and redirects HTTP to HTTPS. Both options can be used together.
 
-Each combination also starts PostgreSQL 17 for metadata. `docker-init` generates its passwords: the application password goes to `.env`, and the administrator password goes to `.postgres-admin-password`. PostgreSQL listens only on `127.0.0.1:15432`; add `POSTGRES_PORT=<port>` to the initialization command to use another port. SynapS3 connects as the `synaps3` role, which owns the database but is not a superuser.
+Each combination also starts PostgreSQL 18 for metadata. `docker-init` generates its passwords: the application password goes to `.env`, and the administrator password goes to `.postgres-admin-password`. PostgreSQL listens only on `127.0.0.1:15432`; add `POSTGRES_PORT=<port>` to the initialization command to use another port. SynapS3 connects as the `synaps3` role, which owns the database but is not a superuser.
 
 To use an existing PostgreSQL server instead, add `DATABASE_SOURCE=external` to the initialization command, then set `SYNAPS3_DATABASE_DSN` in `.env` to its connection URL.
 
@@ -150,6 +150,8 @@ make docker-down
 Logs show the latest 100 lines by default. `docker-down` removes containers but preserves `.env`, `.postgres-admin-password`, the data volumes, and any existing Caddy certificate volumes.
 
 Passwords are not rotated automatically. To change the application password, change it for the `synaps3` role in PostgreSQL, update `POSTGRES_APP_PASSWORD` in `.env`, then run `make docker-up`. To change the port, edit `POSTGRES_PORT` in `.env` and run `make docker-up`.
+
+For an existing PostgreSQL 17 deployment, back up with 17 using the steps below. Change `volumes.postgres-data.name` in `compose.postgres.yaml` to a new volume name before restoring on 18; keep the original volume until the restored deployment is verified.
 
 PostgreSQL creates the database and the `synaps3` role only when its volume is empty. If that first start fails, read `make docker-logs DOCKER_SERVICE=postgres`, fix the cause, remove the `synaps3-postgres-data` volume, and run `make docker-up` again.
 

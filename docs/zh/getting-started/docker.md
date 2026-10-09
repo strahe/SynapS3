@@ -34,7 +34,7 @@ cd SynapS3
 
 默认使用发布镜像，Admin 只监听 `127.0.0.1:9090`。`IMAGE_SOURCE=local` 让 `make docker-up` 从当前 checkout 构建镜像；`ADMIN_DOMAIN` 会加载 Caddy，自动签发和续签证书，并把 HTTP 重定向到 HTTPS。两项可以同时使用。
 
-每种组合都会同时启动 PostgreSQL 17 保存元数据。`docker-init` 会生成其密码：应用密码写入 `.env`，管理员密码写入 `.postgres-admin-password`。PostgreSQL 只监听 `127.0.0.1:15432`；需要其他端口时，在初始化命令中加上 `POSTGRES_PORT=<端口>`。SynapS3 以 `synaps3` 角色连接，该角色拥有数据库，但不是超级用户。
+每种组合都会同时启动 PostgreSQL 18 保存元数据。`docker-init` 会生成其密码：应用密码写入 `.env`，管理员密码写入 `.postgres-admin-password`。PostgreSQL 只监听 `127.0.0.1:15432`；需要其他端口时，在初始化命令中加上 `POSTGRES_PORT=<端口>`。SynapS3 以 `synaps3` 角色连接，该角色拥有数据库，但不是超级用户。
 
 改用已有的 PostgreSQL 服务器时，在初始化命令中加上 `DATABASE_SOURCE=external`，然后在 `.env` 中把 `SYNAPS3_DATABASE_DSN` 设为其连接 URL。
 
@@ -150,6 +150,8 @@ make docker-down
 日志默认显示最近 100 行。`docker-down` 会移除容器，但保留 `.env`、`.postgres-admin-password`、数据 volume 和已有的 Caddy 证书 volume。
 
 密码不会自动轮换。修改应用密码时，先在 PostgreSQL 中修改 `synaps3` 角色的密码，再更新 `.env` 中的 `POSTGRES_APP_PASSWORD`，然后运行 `make docker-up`。修改端口时，编辑 `.env` 中的 `POSTGRES_PORT` 并运行 `make docker-up`。
+
+已有 PostgreSQL 17 部署应先用 17 按下文步骤备份。恢复到 18 前，把 `compose.postgres.yaml` 中的 `volumes.postgres-data.name` 改为新的 volume 名称；验证恢复成功后再处理原 volume。
 
 PostgreSQL 只在 volume 为空时创建数据库和 `synaps3` 角色。如果首次启动失败，查看 `make docker-logs DOCKER_SERVICE=postgres`，修复原因后删除 `synaps3-postgres-data` volume，再运行 `make docker-up`。
 

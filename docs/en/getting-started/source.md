@@ -16,7 +16,7 @@ For a container installation, see [Docker Deployment](./docker.md). This page co
 - A C toolchain for cgo, such as `gcc` or `clang`.
 - Node.js 22.12 or later.
 - pnpm 11.
-- PostgreSQL 17, or Docker to run it locally.
+- PostgreSQL 18, or Docker to run it locally.
 
 ## Build
 
@@ -42,13 +42,13 @@ printf '\n'
 export POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 docker run -d --name synaps3-postgres --restart unless-stopped \
   -e POSTGRES_DB=synaps3 -e POSTGRES_PASSWORD -e POSTGRES_APP_PASSWORD \
-  -p 127.0.0.1:5432:5432 -v synaps3-postgres-local:/var/lib/postgresql/data \
+  -p 127.0.0.1:5432:5432 -v synaps3-postgres-local:/var/lib/postgresql \
   -v "$PWD/docker/postgres-init.sql:/docker-entrypoint-initdb.d/synaps3.sql:ro" \
-  postgres:17
+  postgres:18
 unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 ```
 
-The role and passwords are created only when the volume is empty.
+The role and passwords are created only when the volume is empty. To upgrade an existing PostgreSQL 17 volume, back up with 17 and restore into a new 18 volume; keep the original until the restored database is verified.
 
 ## Initialize Runtime Data
 

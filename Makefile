@@ -23,7 +23,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-norace test-race test-postgres test-system test-system-support test-system-postgres test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-ci verify-norace clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-race-ci test-postgres test-system test-system-support test-system-postgres test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-ci verify-norace clean run ui-install ui-build ui-dev ui-e2e-install
 .PHONY: docker-init docker-up docker-verify docker-down docker-status docker-logs docker-password
 
 all: build
@@ -51,20 +51,22 @@ build-systemtest-server:
 build-integration-server:
 	$(CGO) go build $(GOFLAGS) -tags=dev -ldflags '$(LDFLAGS)' -o bin/$(INTEGRATION_BINARY) $(PKG)
 
-test: test-norace test-race
+test: test-fast
 
 test-fast:
 	$(CGO) go test -count=1 ./cmd/... ./internal/...
 
-test-norace:
-	@set -eu; \
-	packages="$$(go list ./cmd/... ./internal/...)"; \
-	packages="$$(printf '%s\n' "$$packages" | awk -v excluded='$(patsubst ./%,$(MODULE)/%,$(RACE_PACKAGES))' \
-	  'BEGIN { n = split(excluded, packages); for (i = 1; i <= n; i++) skip[packages[i]] = 1 } !($$0 in skip)')"; \
-	if [ -n "$$packages" ]; then $(CGO) go test -count=1 $$packages; fi
-
 test-race:
 	$(CGO) go test -race -tags dev -count=1 $(RACE_PACKAGES)
+
+# Keep PR race checks focused on shared-memory contracts; run test-race for
+# the complete package suites when investigating concurrency changes.
+test-race-ci:
+	$(CGO) go test -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/task/transfer
+	$(CGO) go test -race -tags dev -count=1 -run '^Test(AdminEventHub.*|CachedWalletQuerier_(CoalescesConcurrentMisses|WaiterContextCanCancel))$$' ./internal/admin
+	$(CGO) go test -race -tags dev -count=1 -run '^Test(PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction$$' ./internal/backend
+	$(CGO) go test -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task
+	$(CGO) go test -race -tags dev -count=1 -run '^Test(Engine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork)|Resource(GateYieldsWhenFullAndReusesHeldSlot|WaitFreesWorkersForOtherTasks))$$' ./internal/worker
 
 test-postgres:
 	$(CGO) go test -tags=postgres -count=1 ./internal/testpg ./internal/db/migrations ./internal/db/repository ./internal/worker

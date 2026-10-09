@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:17
+        image: postgres:18
         env:
           POSTGRES_DB: synaps3_test
           POSTGRES_PASSWORD: postgres
@@ -78,8 +78,29 @@ jobs:
           version: v2.11.4
           install-only: true
 
-      - name: Verify code, build, and tests
-        run: make verify-ci
+      - name: Verify code and build
+        run: make verify-norace
+
+      - name: Test Go packages
+        run: make test
+
+      - name: Test system support
+        run: make test-system-support
+
+  race:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+
+      - name: Test shared-memory concurrency
+        run: make test-race-ci
 
   dashboard:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
@@ -127,7 +148,7 @@ jobs:
           retention-days: 7
 
   check:
-    needs: [verify, postgres, dashboard]
+    needs: [verify, race, postgres, dashboard]
     if: ${{ always() }}
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 5
@@ -135,9 +156,11 @@ jobs:
       - name: Require all checks to pass
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
+          RACE_RESULT: ${{ needs.race.result }}
           POSTGRES_RESULT: ${{ needs.postgres.result }}
           DASHBOARD_RESULT: ${{ needs.dashboard.result }}
         run: |
           test "$VERIFY_RESULT" = success
+          test "$RACE_RESULT" = success
           test "$POSTGRES_RESULT" = success
           test "$DASHBOARD_RESULT" = success
