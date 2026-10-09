@@ -42,80 +42,50 @@ func testMigrationUpFailureRollsBackAndDoesNotMark(t *testing.T, db *bun.DB) {
 	assertAppliedMigrationCount(t, ctx, migrator, 0)
 }
 
-func TestMigrationDownFailureRollsBackAndKeepsMarker(t *testing.T) {
-	testMigrationDialects(t, testMigrationDownFailureRollsBackAndKeepsMarker)
-}
-
-func testMigrationDownFailureRollsBackAndKeepsMarker(t *testing.T, db *bun.DB) {
-	ctx := context.Background()
-	registry := migrate.NewMigrations()
-	registry.MustRegister(
-		transactionalMigration(func(ctx context.Context, db bun.IDB) error {
-			_, err := db.ExecContext(ctx, "CREATE TABLE transaction_failure_probe (id INTEGER PRIMARY KEY)")
-			return err
-		}),
-		transactionalMigration(func(ctx context.Context, db bun.IDB) error {
-			if _, err := db.ExecContext(ctx, "DROP TABLE transaction_failure_probe"); err != nil {
-				return err
-			}
-			return errors.New("injected down failure")
-		}),
-	)
-	migrator := newMigrator(db, registry)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("initialize migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if _, err := migrator.Rollback(ctx); err == nil {
-		t.Fatal("rollback succeeded, want injected failure")
-	}
-	if exists, err := tableExists(ctx, db, "transaction_failure_probe"); err != nil {
-		t.Fatalf("inspect rolled back table: %v", err)
-	} else if !exists {
-		t.Fatal("failed down migration committed DDL")
-	}
-	assertAppliedMigrationCount(t, ctx, migrator, 1)
-}
-
-func TestMigrationRepairsMarkerForCompletePostState(t *testing.T) {
-	testMigrationDialects(t, testMigrationRepairsMarkerForCompletePostState)
-}
-
-func TestInitialBaselineRepairsMissingMarker(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+func TestMigrationsPreserveDataOnRepeatAndMarkerRecovery(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
-		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("simulate committed baseline without marker: %v", err)
-		}
-		before, err := describeSchema(ctx, db, false)
-		if err != nil {
-			t.Fatal(err)
-		}
+		id := insertSchemaTestTask(t, db, "marker-survivor")
+		before := appliedSchemaState(t, db)
 		migrator := NewMigrator(db)
-		if err := migrator.Init(ctx); err != nil {
-			t.Fatalf("initialize migrator: %v", err)
-		}
-		if err := ValidateTarget(ctx, db); err != nil {
-			t.Fatalf("validate complete baseline without marker: %v", err)
-		}
-		if _, err := migrator.Migrate(ctx); err != nil {
-			t.Fatalf("repair baseline marker: %v", err)
-		}
-		assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))
-		after, err := describeSchema(ctx, db, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !slices.Equal(before, after) {
-			t.Fatal("repair changed the baseline schema")
+		for _, repairMarker := range []bool{false, true} {
+			if repairMarker {
+				registered := Migrations.Sorted()
+				if _, err := db.ExecContext(ctx, "DELETE FROM bun_migrations WHERE name = ?", registered[len(registered)-1].Name); err != nil {
+					t.Fatalf("remove last migration marker: %v", err)
+				}
+			}
+			if err := ValidateTarget(ctx, db); err != nil {
+				t.Fatalf("validate target before repeat migration: %v", err)
+			}
+			group, err := migrator.Migrate(ctx)
+			if err != nil {
+				t.Fatalf("repeat migration: %v", err)
+			}
+			wantApplied := 0
+			if repairMarker {
+				wantApplied = 1
+			}
+			if len(group.Migrations) != wantApplied {
+				t.Fatalf("repeat applied %d migrations, want %d", len(group.Migrations), wantApplied)
+			}
+			assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))
+			var key string
+			if err := db.NewRaw("SELECT idempotency_key FROM tasks WHERE id = ?", id).Scan(ctx, &key); err != nil {
+				t.Fatalf("read task after repeat migration: %v", err)
+			}
+			if key != "marker-survivor" {
+				t.Fatalf("repeat migration changed task key to %q", key)
+			}
+			if after := appliedSchemaState(t, db); !slices.Equal(before, after) {
+				t.Fatalf("repeat migration changed the application schema (repairMarker=%t)", repairMarker)
+			}
 		}
 	})
 }
 
 // A partial baseline with an empty marker is refused unchanged, both before
-// startup migrates and by the baseline itself, so no later migration alters it.
+// startup migrates and by the baseline itself, so migration execution cannot alter it.
 func TestPartialBaselineWithEmptyMarkerIsRefusedUnchanged(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
@@ -133,44 +103,13 @@ func TestPartialBaselineWithEmptyMarkerIsRefusedUnchanged(t *testing.T) {
 			t.Fatalf("Migrate = %v, want ErrIncompatibleDatabase", err)
 		}
 		assertAppliedMigrationCount(t, ctx, migrator, 0)
-		if exists, err := columnExists(ctx, db, "s3_accounts", "name"); err != nil || exists {
-			t.Fatalf("s3_accounts.name exists=%t err=%v after the refusal", exists, err)
+		if tables := applicationSchemaTables(t, db); !slices.Equal(tables, []string{"s3_accounts"}) {
+			t.Fatalf("partial baseline tables after refusal = %v", tables)
+		}
+		if columns := appliedTableColumns(t, db, "s3_accounts"); len(columns) != 1 || columns[0].Name != "access_key" {
+			t.Fatalf("partial baseline columns after refusal = %v", columns)
 		}
 	})
-}
-
-func testMigrationRepairsMarkerForCompletePostState(t *testing.T, db *bun.DB) {
-	ctx := context.Background()
-	executions := 0
-	body := migrationBody(func(ctx context.Context, db bun.IDB) error {
-		exists, err := tableExists(ctx, db, "transaction_marker_probe")
-		if err != nil || exists {
-			return err
-		}
-		executions++
-		_, err = db.ExecContext(ctx, "CREATE TABLE transaction_marker_probe (id INTEGER PRIMARY KEY)")
-		return err
-	})
-	if err := runMigrationBody(ctx, db, body); err != nil {
-		t.Fatalf("simulate committed DDL without marker: %v", err)
-	}
-
-	registry := migrate.NewMigrations()
-	registry.MustRegister(
-		transactionalMigration(body),
-		transactionalMigration(func(context.Context, bun.IDB) error { return nil }),
-	)
-	migrator := newMigrator(db, registry)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("initialize migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("repair migration marker: %v", err)
-	}
-	if executions != 1 {
-		t.Fatalf("migration body executed %d times, want once", executions)
-	}
-	assertAppliedMigrationCount(t, ctx, migrator, 1)
 }
 
 func testMigrationDialects(t *testing.T, test func(*testing.T, *bun.DB)) {

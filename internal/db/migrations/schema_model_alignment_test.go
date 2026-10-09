@@ -22,11 +22,11 @@ import (
 	"github.com/uptrace/bun/dialect"
 )
 
-func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
+func TestRuntimeModelsMatchCurrentSchema(t *testing.T) {
 	models := runtimePersistentModels()
 	runtimeTablesFromAST := runtimePersistentModelTablesFromAST(t)
 
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
 		registeredTables := make([]string, 0, len(models))
 		for _, runtimeModel := range models {
 			typ := reflect.TypeOf(runtimeModel)
@@ -40,13 +40,6 @@ func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
 			t.Fatalf("runtime model registry tables = %v, AST-discovered tables = %v", registeredTables, runtimeTablesFromAST)
 		}
 
-		migrator := NewMigrator(db)
-		if err := migrator.Init(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := migrator.Migrate(t.Context()); err != nil {
-			t.Fatal(err)
-		}
 		appliedTables := applicationSchemaTables(t, db)
 		if !slices.Equal(appliedTables, registeredTables) {
 			t.Fatalf("applied tables = %v, runtime model tables = %v", appliedTables, registeredTables)
@@ -194,4 +187,38 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 			t.Errorf("%s column %d mismatch\n got: %#v\nwant: %#v", table.Name, i+1, got, want)
 		}
 	}
+}
+
+func TestCurrentSchemaColumnContracts(t *testing.T) {
+	// A DEFAULT current_timestamp column is written by the database whenever bun
+	// omits it, and SQLite renders that as second-granularity local text while
+	// bun renders a fractional offset timestamp. One column would then hold two
+	// encodings whose lexical order disagrees with time inside the same second.
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		for _, table := range applicationSchemaTables(t, db) {
+			for _, column := range appliedTableColumns(t, db, table) {
+				if strings.Contains(strings.ToLower(column.Default), "current_timestamp") {
+					t.Errorf("%s.%s still defaults to the database clock: %s", table, column.Name, column.Default)
+				}
+			}
+		}
+		if db.Dialect().Name() == dialect.PG {
+			var collations []string
+			if err := db.NewRaw(`SELECT c.relname || '.' || a.attname || '=' || co.collname
+				FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_collation co ON co.oid = a.attcollation
+				WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+				AND ((c.relname = 'buckets' AND a.attname = 'name') OR (c.relname IN ('objects','object_versions','multipart_uploads','object_deletions') AND a.attname = 'key'))
+				ORDER BY c.relname`).Scan(t.Context(), &collations); err != nil {
+				t.Fatal(err)
+			}
+			if len(collations) != 5 {
+				t.Fatalf("missing key columns: %v", collations)
+			}
+			for _, value := range collations {
+				if !strings.HasSuffix(value, "=C") {
+					t.Errorf("key collation %s, want C", value)
+				}
+			}
+		}
+	})
 }

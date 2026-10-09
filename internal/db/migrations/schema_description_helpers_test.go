@@ -3,10 +3,10 @@ package migrations
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"testing"
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
@@ -109,38 +109,6 @@ func postgresColumns(ctx context.Context, db bun.IDB, table string) ([]appliedCo
 	return columns, nil
 }
 
-// closingParenthesis finds the parenthesis closing the one at open, skipping
-// quoted text such as a GLOB pattern.
-func closingParenthesis(text string, open int) (int, error) {
-	depth := 0
-	var quote byte
-	for i := open; i < len(text); i++ {
-		c := text[i]
-		if quote != 0 {
-			if c == quote {
-				if i+1 < len(text) && text[i+1] == quote {
-					i++
-					continue
-				}
-				quote = 0
-			}
-			continue
-		}
-		switch c {
-		case '\'', '"', '`':
-			quote = c
-		case '(':
-			depth++
-		case ')':
-			depth--
-			if depth == 0 {
-				return i, nil
-			}
-		}
-	}
-	return 0, errors.New("unbalanced parentheses")
-}
-
 func sqliteTableDDL(ctx context.Context, db bun.IDB, table string) (string, error) {
 	var ddl string
 	if err := db.NewRaw(`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?`, table).Scan(ctx, &ddl); err != nil {
@@ -172,18 +140,86 @@ func normalizedSQLDefault(value string) string {
 	return value
 }
 
-func columnExists(ctx context.Context, db bun.IDB, table, column string) (bool, error) {
-	if db.Dialect().Name() == dialect.PG {
-		return queryExists(ctx, db, `SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`, table, column)
+func applicationSchemaTables(t *testing.T, db *bun.DB) []string {
+	t.Helper()
+	tables, err := applicationTableNames(t.Context(), db)
+	if err != nil {
+		t.Fatalf("read application schema tables: %v", err)
 	}
-	return queryExists(ctx, db, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", table, column)
+	return tables
 }
 
-func indexExists(ctx context.Context, db bun.IDB, name string) (bool, error) {
-	query := `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?`
-	if db.Dialect().Name() == dialect.PG {
-		query = `SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ?`
+func appliedTableColumns(t *testing.T, db *bun.DB, table string) []appliedColumn {
+	t.Helper()
+	columns, err := tableColumns(t.Context(), db, table)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return queryExists(ctx, db, query, name)
+	return columns
+}
+
+func testSchemaDialects(t *testing.T, test func(*testing.T, *bun.DB)) {
+	t.Helper()
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		if err := ValidateTarget(ctx, db); err != nil {
+			t.Fatalf("validate empty target: %v", err)
+		}
+		migrator := NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			t.Fatalf("initialize migrator: %v", err)
+		}
+		if _, err := migrator.Migrate(ctx); err != nil {
+			t.Fatalf("apply complete migration chain: %v", err)
+		}
+		test(t, db)
+	})
+}
+
+// Compare native definitions within one database; no cross-dialect rendering is needed.
+func appliedSchemaState(t *testing.T, db *bun.DB) []string {
+	t.Helper()
+	query := `SELECT type || '|' || name || '|' || sql FROM sqlite_schema
+		WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+		AND tbl_name NOT IN ('bun_migrations', 'bun_migration_locks') ORDER BY 1`
+	if db.Dialect().Name() == dialect.PG {
+		query = `WITH app_tables AS (
+			SELECT c.oid, c.relname, c.relkind FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = current_schema() AND c.relkind IN ('r','p','v','m')
+			AND c.relname NOT IN ('bun_migrations', 'bun_migration_locks')
+		)
+		SELECT 'table|' || t.relname || '|' || t.relkind::text FROM app_tables t
+		UNION ALL
+		SELECT 'column|' || json_build_array(t.relname, a.attnum, a.attname,
+			format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity, a.attgenerated,
+			a.attcollation::regcollation::text, pg_get_expr(d.adbin, d.adrelid))::text
+		FROM app_tables t JOIN pg_attribute a ON a.attrelid = t.oid
+		LEFT JOIN pg_attrdef d ON d.adrelid = t.oid AND d.adnum = a.attnum
+		WHERE a.attnum > 0 AND NOT a.attisdropped
+		UNION ALL
+		SELECT 'constraint|' || t.relname || '|' || c.conname || '|' || pg_get_constraintdef(c.oid)
+		FROM app_tables t JOIN pg_constraint c ON c.conrelid = t.oid
+		UNION ALL
+		SELECT 'index|' || pg_get_indexdef(i.indexrelid) || '|' || i.indisvalid || '|' || i.indisready
+		FROM app_tables t JOIN pg_index i ON i.indrelid = t.oid
+		UNION ALL
+		SELECT 'sequence|' || json_build_array(c.relname, format_type(s.seqtypid, -1),
+			s.seqstart, s.seqincrement, s.seqmax, s.seqmin, s.seqcache, s.seqcycle)::text
+		FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid
+		JOIN pg_depend d ON d.objid = s.seqrelid AND d.classid = 'pg_class'::regclass
+			AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
+		JOIN app_tables t ON t.oid = d.refobjid
+		UNION ALL
+		SELECT 'view|' || t.relname || '|' || pg_get_viewdef(t.oid) FROM app_tables t WHERE t.relkind IN ('v','m')
+		UNION ALL
+		SELECT 'trigger|' || pg_get_triggerdef(g.oid) FROM app_tables t
+		JOIN pg_trigger g ON g.tgrelid = t.oid WHERE NOT g.tgisinternal
+		ORDER BY 1`
+	}
+	var state []string
+	if err := db.NewRaw(query).Scan(t.Context(), &state); err != nil {
+		t.Fatalf("read application schema state: %v", err)
+	}
+	return state
 }

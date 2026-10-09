@@ -74,15 +74,6 @@ func initialJSONColumns(table string) []initialJSONColumnSpec {
 	}
 }
 
-func initialJSONColumn(table, column string) (initialJSONColumnSpec, bool) {
-	for _, candidate := range initialJSONColumns(table) {
-		if candidate.name == column {
-			return candidate, true
-		}
-	}
-	return initialJSONColumnSpec{}, false
-}
-
 func createInitialTable(ctx context.Context, db bun.IDB, spec initialTableSpec) error {
 	query := db.NewCreateTable().Model(spec.model)
 	for _, constraint := range spec.constraints {

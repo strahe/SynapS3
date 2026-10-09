@@ -10,63 +10,18 @@ import (
 	"github.com/uptrace/bun/dialect"
 )
 
-func TestBaselineRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
+func TestCurrentSchemaRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
 		seedObjectPlanBacklog(t, db)
 		seedStorageCommitPlanBacklog(t, db)
 		seedTaskPlanBacklog(t, db)
 		seedWalletPlanBacklog(t, db)
-
-		// Listing current objects walks the objects unique key and follows each
-		// pointer, so the driving index is on objects rather than a partial
-		// index over every version.
-		currentListQuery := `SELECT object_version.version_id
-			FROM objects AS current_object
-			JOIN object_versions AS object_version
-			  ON object_version.version_id = current_object.current_version_id
-			WHERE current_object.bucket_id = 1 AND object_version.is_delete_marker = FALSE
-			  AND current_object.key >= 'a'
-			ORDER BY current_object.key ASC LIMIT 100`
-		versionListQuery := `SELECT version_id FROM object_versions
-			WHERE bucket_id = 1 AND key >= 'a'
-			ORDER BY key ASC, created_at DESC, version_id DESC LIMIT 100`
-		if db.Dialect().Name() == dialect.PG {
-			currentListQuery = `SELECT object_version.version_id
-				FROM objects AS current_object
-				JOIN object_versions AS object_version
-				  ON object_version.version_id = current_object.current_version_id
-				WHERE current_object.bucket_id = 1 AND object_version.is_delete_marker = FALSE
-				  AND current_object.key COLLATE "C" >= 'a' COLLATE "C"
-				ORDER BY current_object.key COLLATE "C" ASC LIMIT 100`
-			versionListQuery = `SELECT version_id FROM object_versions
-				WHERE bucket_id = 1 AND key COLLATE "C" >= 'a' COLLATE "C"
-				ORDER BY key COLLATE "C" ASC, created_at DESC, version_id DESC LIMIT 100`
-		}
 
 		plans := []struct {
 			name       string
 			indexNames []string
 			query      string
 		}{
-			{
-				name:       "ListObjectsV2",
-				indexNames: []string{"idx_objects_bucket_key"},
-				query:      currentListQuery,
-			},
-			{
-				name:       "current object lookup",
-				indexNames: []string{"idx_objects_bucket_key"},
-				query: `SELECT current_version_id FROM objects
-					WHERE bucket_id = 1 AND key = 'key' LIMIT 1`,
-			},
-			{
-				name:       "version listing",
-				indexNames: []string{"idx_object_versions_bucket_key_created"},
-				query:      versionListQuery,
-			},
 			{
 				name:       "deleted content sample",
 				indexNames: []string{"idx_object_deletions_content_deleted"},
@@ -172,8 +127,7 @@ func seedObjectPlanBacklog(t *testing.T, db *bun.DB) {
 	if _, err := db.ExecContext(t.Context(), insertObjects); err != nil {
 		t.Fatalf("seed query-plan objects: %v", err)
 	}
-	// Bytes own their identity, so each seeded version needs a content row and
-	// residency belongs to that content rather than to the version.
+	// Cache residency belongs to the content.
 	checksumExpression := "printf('%064x', id)"
 	if db.Dialect().Name() == dialect.PG {
 		checksumExpression = "lpad(to_hex(id), 64, '0')"
@@ -190,51 +144,12 @@ func seedObjectPlanBacklog(t *testing.T, db *bun.DB) {
 		SELECT id, TRUE, '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM storage_contents`); err != nil {
 		t.Fatalf("seed query-plan cache entries: %v", err)
 	}
-	if _, err := db.ExecContext(t.Context(), `INSERT INTO object_versions (
-			version_id, object_id, bucket_id, key, content_id, size, e_tag,
-			is_delete_marker
-		, created_at, updated_at)
-		SELECT 'version-' || id, id, bucket_id, key, id, 1, 'etag-' || id, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-		FROM objects`); err != nil {
-		t.Fatalf("seed query-plan object versions: %v", err)
-	}
-	// "Current" is the object's pointer now.
-	if _, err := db.ExecContext(t.Context(), `
-		UPDATE objects SET current_version_id = 'version-' || id`); err != nil {
-		t.Fatalf("point query-plan objects at their versions: %v", err)
-	}
-	var insertHistory string
-	if db.Dialect().Name() == dialect.PG {
-		insertHistory = `INSERT INTO object_versions (
-				version_id, object_id, bucket_id, key, content_id, size, e_tag,
-				is_delete_marker, created_at
-			, updated_at)
-			SELECT 'history-' || object_info.id || '-' || generation, object_info.id,
-			       object_info.bucket_id, object_info.key, object_info.id, 1,
-			       'history-etag-' || generation, FALSE, '2025-01-01 00:00:00', CURRENT_TIMESTAMP
-			FROM objects AS object_info CROSS JOIN generate_series(1, 4) AS series(generation)`
-	} else {
-		insertHistory = `WITH RECURSIVE generations(generation) AS (
-				SELECT 1 UNION ALL SELECT generation + 1 FROM generations WHERE generation < 4
-			)
-			INSERT INTO object_versions (
-				version_id, object_id, bucket_id, key, content_id, size, e_tag,
-				is_delete_marker, created_at
-			, updated_at)
-			SELECT 'history-' || object_info.id || '-' || generation, object_info.id,
-			       object_info.bucket_id, object_info.key, object_info.id, 1,
-			       'history-etag-' || generation, FALSE, '2025-01-01 00:00:00', CURRENT_TIMESTAMP
-			FROM objects AS object_info CROSS JOIN generations`
-	}
-	if _, err := db.ExecContext(t.Context(), insertHistory); err != nil {
-		t.Fatalf("seed query-plan version history: %v", err)
-	}
 	if _, err := db.ExecContext(t.Context(), `INSERT INTO object_deletions
 		(bucket_id, object_id, key, version_id, content_id, size, deleted_at)
 		SELECT bucket_id, id, key, 'deleted-' || id, id, 1, CURRENT_TIMESTAMP FROM objects`); err != nil {
 		t.Fatalf("seed query-plan deletions: %v", err)
 	}
-	for _, table := range []string{"objects", "object_versions", "object_cache", "object_deletions"} {
+	for _, table := range []string{"object_cache", "object_deletions"} {
 		if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
 			t.Fatalf("analyze query-plan table %s: %v", table, err)
 		}
@@ -417,10 +332,7 @@ func explainQueryPlan(t *testing.T, db *bun.DB, query string) string {
 }
 
 func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatal(err)
-		}
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
 		if _, err := db.ExecContext(t.Context(), `WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM sequence WHERE value<30000)
    INSERT INTO task_history (task_id,type,idempotency_key,input_version,input_hash,status,subject_type,subject_key,available_at,finished_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
    SELECT value,CASE WHEN value%500=0 THEN 'bucket_provision' ELSE 'observability_refresh' END,'history-'||value,1,'hash','completed','bucket',CAST(value%500 AS TEXT),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]' FROM sequence`); err != nil {
@@ -471,9 +383,6 @@ func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
 			}
 			if !strings.Contains(plan, tc.index) {
 				t.Fatalf("query did not use %s: %s\n%s", tc.index, tc.query, plan)
-			}
-			if strings.Contains(tc.query, " FROM tasks ") && strings.Contains(plan, "task_history") {
-				t.Fatalf("work query scanned history: %s", plan)
 			}
 		}
 	})

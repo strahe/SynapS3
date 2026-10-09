@@ -41,10 +41,7 @@ func TestClosedLifecycleEnumsMatchAppliedChecks(t *testing.T) {
 		{directory: "storagereplacement", typeName: "ItemStatus", table: "storage_replacement_items", constraint: "chk_storage_replacement_items_status"},
 	}
 
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
 		for _, check := range checks {
 			t.Run(check.table+"/"+check.typeName, func(t *testing.T) {
 				goValues := typedStringConstants(t, filepath.Join("..", "..", check.directory), check.typeName)

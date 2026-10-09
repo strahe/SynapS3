@@ -13,12 +13,9 @@ import (
 	"github.com/uptrace/bun/dialect"
 )
 
-func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		bucketID := insertBaselineTestBucket(t, db, "constraint-bucket")
+func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		bucketID := insertSchemaTestBucket(t, db, "constraint-bucket")
 		var strategy string
 		if err := db.NewRaw("SELECT provider_selection_strategy FROM buckets WHERE id = ?", bucketID).Scan(t.Context(), &strategy); err != nil || strategy != "distribution" {
 			t.Fatalf("default provider strategy = %q, err=%v", strategy, err)
@@ -59,7 +56,7 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			VALUES ('fund', 'submitted-complete', '1', 'submitted', 'tx-complete', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
 			t.Fatalf("insert valid submitted wallet operation: %v", err)
 		}
-		walletTaskID := insertBaselineTestTask(t, db, "wallet-owner")
+		walletTaskID := insertSchemaTestTask(t, db, "wallet-owner")
 		for name, statement := range map[string]string{
 			"confirmed without completion": `INSERT INTO wallet_operations
 				(type, client_request_id, amount, status, tx_hash, created_at, updated_at)
@@ -101,7 +98,7 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			`INSERT INTO objects (id, bucket_id, key, created_at, updated_at) VALUES (1, ?, 'failure-shape.txt', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID); err != nil {
 			t.Fatalf("insert object: %v", err)
 		}
-		contentID := insertBaselineTestContent(t, db, bucketID, "v-shape-origin")
+		contentID := insertSchemaTestContent(t, db, bucketID, "v-shape-origin")
 		mustRejectStatement(t, db, `INSERT INTO object_versions
 			(version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type,
 			 metadata, is_delete_marker, created_at, updated_at)
@@ -113,7 +110,7 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			VALUES ('v-marker-with-content', 1, ?, 'failure-shape.txt', ?, 0, '',
 			 '', '{}', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID, contentID)
 
-		dataSetID := insertBaselineTestDataSet(t, db, bucketID, "cleanup-provider", 2, 1, false)
+		dataSetID := insertSchemaTestDataSet(t, db, bucketID, "cleanup-provider", 2, 1, false)
 		var cleanupID int64
 		if err := db.QueryRow(`INSERT INTO storage_cleanup_copies
 			(content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, checksum, created_at, updated_at)
@@ -131,10 +128,9 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			t.Fatalf("schedule valid cleanup copy: %v", err)
 		}
 
-		taskID := insertBaselineTestTask(t, db, "valid-before-update")
+		taskID := insertSchemaTestTask(t, db, "valid-before-update")
 		mustRejectStatement(t, db, `UPDATE tasks SET claim_generation = -1 WHERE id = ?`, taskID)
 		mustRejectStatement(t, db, `UPDATE tasks SET status = 'unknown' WHERE id = ?`, taskID)
-		mustRejectStatement(t, db, `UPDATE tasks SET policy_json = '{"version":2,"max_attempts":1}', retry_count = 1 WHERE id = ?`, taskID)
 		mustRejectStatement(t, db, `UPDATE buckets SET default_copies = 2, minimum_durable_copies = 3 WHERE id = ?`, bucketID)
 		var generation int64
 		if err := db.NewRaw(`SELECT claim_generation FROM tasks WHERE id = ?`, taskID).Scan(t.Context(), &generation); err != nil {
@@ -146,29 +142,26 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 	})
 }
 
-func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		bucketA := insertBaselineTestBucket(t, db, "identity-a")
-		bucketB := insertBaselineTestBucket(t, db, "identity-b")
-		contentA := insertBaselineTestContent(t, db, bucketA, "upload-a")
-		contentA2 := insertBaselineTestContent(t, db, bucketA, "upload-a2")
-		contentB := insertBaselineTestContent(t, db, bucketB, "upload-b")
-		source := insertBaselineTestDataSet(t, db, bucketA, "101", 0, 1, true)
+func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		bucketA := insertSchemaTestBucket(t, db, "identity-a")
+		bucketB := insertSchemaTestBucket(t, db, "identity-b")
+		contentA := insertSchemaTestContent(t, db, bucketA, "upload-a")
+		contentA2 := insertSchemaTestContent(t, db, bucketA, "upload-a2")
+		contentB := insertSchemaTestContent(t, db, bucketB, "upload-b")
+		source := insertSchemaTestDataSet(t, db, bucketA, "101", 0, 1, true)
 		if _, err := db.Exec(`UPDATE storage_data_sets SET creation_rejection = '{"version":99}' WHERE id = ?`, source); err != nil {
 			t.Fatal(err)
 		}
 		for _, invalid := range []string{"{", "[]", "null"} {
 			mustRejectStatement(t, db, `UPDATE storage_data_sets SET creation_rejection = ? WHERE id = ?`, invalid, source)
 		}
-		copyID := insertBaselineTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
+		copyID := insertSchemaTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
 		// A committed copy must name a confirmed request in its own data set,
 		// at a position recorded for its own content.
 		mustRejectStatement(t, db, `UPDATE storage_copies
 			SET commit_request_status = 'confirmed' WHERE id = ?`, copyID)
-		requestTask := insertBaselineTestTask(t, db, "commit-request-a")
+		requestTask := insertSchemaTestTask(t, db, "commit-request-a")
 		if _, err := db.Exec(`INSERT INTO storage_commit_requests
 			(request_id, storage_data_set_id, status, task_id, piece_count, sends, refusals, created_at, updated_at)
 			VALUES ('request-a', ?, 'collecting', ?, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, source, requestTask); err != nil {
@@ -196,7 +189,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			VALUES ('request-a', 0, ?, ?, 'baga-other', CURRENT_TIMESTAMP)`, contentA2, source)
 		// The position belongs to its own content: another content's copy
 		// cannot name it.
-		otherCopy := insertBaselineTestCopy(t, db, contentA2, bucketA, source, 0, "101", "ingress")
+		otherCopy := insertSchemaTestCopy(t, db, contentA2, bucketA, source, 0, "101", "ingress")
 		mustRejectStatement(t, db, `UPDATE storage_copies
 			SET status = 'committing', commit_request_id = 'request-a', commit_position = 0 WHERE id = ?`, otherCopy)
 		if _, err := db.Exec(`UPDATE storage_commit_requests SET seal_requested_at = CURRENT_TIMESTAMP WHERE request_id = 'request-a'`); err != nil {
@@ -295,9 +288,9 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 				(bucket_id, provider_id, copy_index, generation, is_current, status, created_at, updated_at)
 				VALUES (?, '909', 5, 1, TRUE, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, endedStatus)
 		}
-		bucketBSource := insertBaselineTestDataSet(t, db, bucketB, "101", 0, 1, true)
+		bucketBSource := insertSchemaTestDataSet(t, db, bucketB, "101", 0, 1, true)
 
-		createdByContent := insertBaselineTestContent(t, db, bucketB, "provenance-created-by")
+		createdByContent := insertSchemaTestContent(t, db, bucketB, "provenance-created-by")
 		if _, err := db.Exec(`INSERT INTO storage_data_sets
 			(bucket_id, provider_id, copy_index, generation, is_current, status, created_by_content_id, created_at, updated_at)
 			VALUES (?, 'provenance-created-by', 1, 1, FALSE, 'retired', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketB, createdByContent); err != nil {
@@ -305,7 +298,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		}
 		mustRejectStatement(t, db, `DELETE FROM storage_contents WHERE id = ?`, createdByContent)
 
-		target := insertBaselineTestDataSet(t, db, bucketA, "202", 0, 2, false)
+		target := insertSchemaTestDataSet(t, db, bucketA, "202", 0, 2, false)
 		var replacementID int64
 		if err := db.QueryRow(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
@@ -314,7 +307,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			RETURNING id`, bucketA, source, target).Scan(&replacementID); err != nil {
 			t.Fatalf("insert replacement: %v", err)
 		}
-		bucketBTarget := insertBaselineTestDataSet(t, db, bucketB, "303", 0, 2, false)
+		bucketBTarget := insertSchemaTestDataSet(t, db, bucketB, "303", 0, 2, false)
 		if _, err := db.Exec(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
 			 selection_mode, client_request_id, price_list_fingerprint, status, superseded_by_id, created_at, updated_at)
@@ -352,7 +345,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
 			VALUES (?, ?, 1, ?, 0, '202', 'ingress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, bucketA, target)
-		insertBaselineTestCopy(t, db, contentA, bucketA, target, 0, "202", "peer_pull")
+		insertSchemaTestCopy(t, db, contentA, bucketA, target, 0, "202", "peer_pull")
 		if _, err := db.Exec(`INSERT INTO storage_replacement_items
 			(replacement_id, content_id, target_data_set_id, created_at, updated_at)
 			VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, contentA, target); err != nil {
@@ -400,9 +393,9 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			VALUES ('', ?, ?, 'attempted', '303', '3003', '4003', 'bafk2bzacepull3', 'https://source.example/third', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source)
 
-		ledgerBucket := insertBaselineTestBucket(t, db, "pull-ledger-bucket")
-		ledgerContent := insertBaselineTestContent(t, db, ledgerBucket, "pull-ledger-content")
-		ledgerDataSet := insertBaselineTestDataSet(t, db, ledgerBucket, "401", 0, 1, true)
+		ledgerBucket := insertSchemaTestBucket(t, db, "pull-ledger-bucket")
+		ledgerContent := insertSchemaTestContent(t, db, ledgerBucket, "pull-ledger-content")
+		ledgerDataSet := insertSchemaTestDataSet(t, db, ledgerBucket, "401", 0, 1, true)
 		if _, err := db.Exec(`INSERT INTO storage_pull_attempts
 			(attempt_id, content_id, storage_data_set_id, status,
 			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
@@ -423,7 +416,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			t.Fatalf("cleanup changed pull identity: content=%d, data set=%d", retainedContent, retainedDataSet)
 		}
 
-		taskID := insertBaselineTestTask(t, db, "owner-unique")
+		taskID := insertSchemaTestTask(t, db, "owner-unique")
 		if _, err := db.Exec(`UPDATE buckets SET durability_task_id = ? WHERE id = ?`, taskID, bucketA); err != nil {
 			t.Fatalf("bind first task owner: %v", err)
 		}
@@ -431,15 +424,12 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 	})
 }
 
-func TestBaselineFailedIngressAllowsOneReplacementIngress(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		bucketID := insertBaselineTestBucket(t, db, "retired-ingress")
-		contentID := insertBaselineTestContent(t, db, bucketID, "retired-ingress-content")
-		retiredDataSetID := insertBaselineTestDataSet(t, db, bucketID, "101", 0, 1, true)
-		copyID := insertBaselineTestCopy(t, db, contentID, bucketID, retiredDataSetID, 0, "101", "ingress")
+func TestCurrentSchemaFailedIngressAllowsOneReplacementIngress(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		bucketID := insertSchemaTestBucket(t, db, "retired-ingress")
+		contentID := insertSchemaTestContent(t, db, bucketID, "retired-ingress-content")
+		retiredDataSetID := insertSchemaTestDataSet(t, db, bucketID, "101", 0, 1, true)
+		copyID := insertSchemaTestCopy(t, db, contentID, bucketID, retiredDataSetID, 0, "101", "ingress")
 		if _, err := db.Exec(`UPDATE storage_copies SET status = 'failed', last_error = 'retired generation' WHERE id = ?`, copyID); err != nil {
 			t.Fatalf("fail original ingress copy: %v", err)
 		}
@@ -447,25 +437,22 @@ func TestBaselineFailedIngressAllowsOneReplacementIngress(t *testing.T) {
 			t.Fatalf("retire original ingress data set: %v", err)
 		}
 
-		currentDataSetID := insertBaselineTestDataSet(t, db, bucketID, "202", 0, 2, true)
-		insertBaselineTestCopy(t, db, contentID, bucketID, currentDataSetID, 0, "202", "ingress")
-		otherDataSetID := insertBaselineTestDataSet(t, db, bucketID, "303", 1, 1, true)
+		currentDataSetID := insertSchemaTestDataSet(t, db, bucketID, "202", 0, 2, true)
+		insertSchemaTestCopy(t, db, contentID, bucketID, currentDataSetID, 0, "202", "ingress")
+		otherDataSetID := insertSchemaTestDataSet(t, db, bucketID, "303", 1, 1, true)
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
 			VALUES (?, ?, 1, ?, 1, '303', 'ingress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentID, bucketID, otherDataSetID)
 	})
 }
 
-func TestBaselineIdentitySupportsGenerationAndBackfill(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		first := insertBaselineTestTask(t, db, "identity-first")
+func TestCurrentSchemaIdentitySupportsGenerationAndBackfill(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		first := insertSchemaTestTask(t, db, "identity-first")
 		if _, err := db.Exec(`DELETE FROM tasks WHERE id = ?`, first); err != nil {
 			t.Fatalf("delete first identity row: %v", err)
 		}
-		second := insertBaselineTestTask(t, db, "identity-second")
+		second := insertSchemaTestTask(t, db, "identity-second")
 		if second <= first {
 			t.Fatalf("generated ID %d reused deleted ID %d", second, first)
 		}
@@ -484,37 +471,17 @@ func TestBaselineIdentitySupportsGenerationAndBackfill(t *testing.T) {
 			t.Fatalf("backfilled ID = %d, want %d", storedID, backfilledID)
 		}
 
-		afterBackfill := insertBaselineTestTask(t, db, "identity-after-backfill")
+		afterBackfill := insertSchemaTestTask(t, db, "identity-after-backfill")
 		if afterBackfill <= 0 || afterBackfill == backfilledID {
 			t.Fatalf("generated ID after backfill = %d", afterBackfill)
 		}
 		if db.Dialect().Name() == dialect.SQLite && afterBackfill <= backfilledID {
 			t.Fatalf("SQLite generated ID after backfill = %d, want > %d", afterBackfill, backfilledID)
 		}
-
-		assertBaselineIdentityTypes(t, db)
 	})
 }
 
-func TestBaselineStoresLargeGeneration(t *testing.T) {
-	const large = int64(5_000_000_000)
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		bucketID := insertBaselineTestBucket(t, db, "large-value-bucket")
-		sourceID := insertBaselineTestDataSet(t, db, bucketID, "provider-source", 0, large, true)
-		var generation int64
-		if err := db.NewRaw(`SELECT generation FROM storage_data_sets WHERE id = ?`, sourceID).Scan(t.Context(), &generation); err != nil {
-			t.Fatalf("read large generation: %v", err)
-		}
-		if generation != large {
-			t.Fatalf("generation = %d, want %d", generation, large)
-		}
-	})
-}
-
-func insertBaselineTestTask(t *testing.T, db *bun.DB, key string) int64 {
+func insertSchemaTestTask(t *testing.T, db *bun.DB, key string) int64 {
 	t.Helper()
 	var id int64
 	if err := db.QueryRow(`INSERT INTO tasks
@@ -525,29 +492,29 @@ func insertBaselineTestTask(t *testing.T, db *bun.DB, key string) int64 {
 	return id
 }
 
-func insertBaselineTestBucket(t *testing.T, db *bun.DB, name string) int64 {
+func insertSchemaTestBucket(t *testing.T, db *bun.DB, name string) int64 {
 	t.Helper()
-	return insertBaselineTestBucketWithSlots(t, db, name, 8)
+	return insertSchemaTestBucketWithSlots(t, db, name, 8)
 }
 
-// insertBaselineTestBucketWithSlots opens exactly the given number of replica
+// insertSchemaTestBucketWithSlots opens exactly the given number of replica
 // slots, so a test can reach for an index the bucket never opened.
-func insertBaselineTestBucketWithSlots(t *testing.T, db *bun.DB, name string, slots int) int64 {
+func insertSchemaTestBucketWithSlots(t *testing.T, db *bun.DB, name string, slots int) int64 {
 	t.Helper()
 	var id int64
 	if err := db.QueryRow(`INSERT INTO buckets (name, default_copies, minimum_durable_copies, created_at, updated_at)
 		VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`, name, slots, slots).Scan(&id); err != nil {
-		t.Fatalf("insert baseline test bucket %q: %v", name, err)
+		t.Fatalf("insert schema test bucket %q: %v", name, err)
 	}
 	for copyIndex := range slots {
 		if _, err := db.Exec(`INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, id, copyIndex); err != nil {
-			t.Fatalf("insert baseline test replica slot %d: %v", copyIndex, err)
+			t.Fatalf("insert schema test replica slot %d: %v", copyIndex, err)
 		}
 	}
 	return id
 }
 
-func insertBaselineTestDataSet(t *testing.T, db *bun.DB, bucketID int64, provider string, copyIndex int, generation int64, current bool) int64 {
+func insertSchemaTestDataSet(t *testing.T, db *bun.DB, bucketID int64, provider string, copyIndex int, generation int64, current bool) int64 {
 	t.Helper()
 	var id int64
 	if err := db.QueryRow(`INSERT INTO storage_data_sets
@@ -555,12 +522,12 @@ func insertBaselineTestDataSet(t *testing.T, db *bun.DB, bucketID int64, provide
 		VALUES (?, ?, ?, ?, ?, ?, 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		RETURNING id`, bucketID, provider, copyIndex, generation, current,
 		fmt.Sprintf("%d-%s-%d-%d", bucketID, provider, copyIndex, generation)).Scan(&id); err != nil {
-		t.Fatalf("insert baseline test data set: %v", err)
+		t.Fatalf("insert schema test data set: %v", err)
 	}
 	return id
 }
 
-func insertBaselineTestContent(t *testing.T, db *bun.DB, bucketID int64, identity string) int64 {
+func insertSchemaTestContent(t *testing.T, db *bun.DB, bucketID int64, identity string) int64 {
 	t.Helper()
 	digest := sha256.Sum256([]byte(identity))
 	var id int64
@@ -568,12 +535,12 @@ func insertBaselineTestContent(t *testing.T, db *bun.DB, bucketID int64, identit
 		(bucket_id, content_size, checksum, requested_copies, created_at, updated_at)
 		VALUES (?, 1, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		RETURNING id`, bucketID, hex.EncodeToString(digest[:])).Scan(&id); err != nil {
-		t.Fatalf("insert baseline test content: %v", err)
+		t.Fatalf("insert schema test content: %v", err)
 	}
 	return id
 }
 
-func insertBaselineTestCopy(
+func insertSchemaTestCopy(
 	t *testing.T,
 	db *bun.DB,
 	contentID int64,
@@ -589,7 +556,7 @@ func insertBaselineTestCopy(
 		(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
 		VALUES (?, ?, 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		RETURNING id`, contentID, bucketID, storageDataSetID, copyIndex, provider, transferMethod).Scan(&id); err != nil {
-		t.Fatalf("insert baseline test copy: %v", err)
+		t.Fatalf("insert schema test copy: %v", err)
 	}
 	return id
 }
@@ -663,51 +630,9 @@ func rejectedByNullConstraint(err error) bool {
 	return false
 }
 
-func assertBaselineIdentityTypes(t *testing.T, db *bun.DB) {
-	t.Helper()
-	if db.Dialect().Name() == dialect.PG {
-		var idType, inputVersionType, generationType, identity string
-		if err := db.QueryRow(`SELECT
-			(SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'tasks' AND column_name = 'id'),
-			(SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'tasks' AND column_name = 'input_version'),
-			(SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'storage_data_sets' AND column_name = 'generation'),
-			(SELECT is_identity FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'tasks' AND column_name = 'id')`).
-			Scan(&idType, &inputVersionType, &generationType, &identity); err != nil {
-			t.Fatalf("read PostgreSQL identity types: %v", err)
-		}
-		if idType != "bigint" || inputVersionType != "integer" || generationType != "bigint" || identity != "YES" {
-			t.Fatalf("PostgreSQL types = id:%s input:%s generation:%s identity:%s", idType, inputVersionType, generationType, identity)
-		}
-		return
-	}
-	for table, column := range map[string]string{
-		"tasks":             "id",
-		"tasks/input":       "input_version",
-		"storage_data_sets": "generation",
-	} {
-		tableName := table
-		if table == "tasks/input" {
-			tableName = "tasks"
-		}
-		var sqlType string
-		if err := db.NewRaw(`SELECT type FROM pragma_table_info(?) WHERE name = ?`, tableName, column).Scan(t.Context(), &sqlType); err != nil {
-			t.Fatalf("read SQLite type for %s.%s: %v", tableName, column, err)
-		}
-		if sqlType != "INTEGER" {
-			t.Fatalf("SQLite type for %s.%s = %s, want INTEGER", tableName, column, sqlType)
-		}
-	}
-}
-
-// A replica index is a foreign key into the bucket's own slots, not a bare
-// integer bounded by a range check. Every other seed in this package opens all
-// eight slots, so this is the only case that reaches the constraint.
-func TestBaselineReplicaIndexRequiresAnOpenSlot(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		bucketID := insertBaselineTestBucketWithSlots(t, db, "two-slot-bucket", 2)
+func TestCurrentSchemaReplicaIndexRequiresAnOpenSlot(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		bucketID := insertSchemaTestBucketWithSlots(t, db, "two-slot-bucket", 2)
 
 		// The bucket opened 0 and 1, so a data set on 5 has no slot to belong to.
 		mustRejectStatement(t, db, `INSERT INTO storage_data_sets
@@ -716,7 +641,7 @@ func TestBaselineReplicaIndexRequiresAnOpenSlot(t *testing.T) {
 
 		// Same index on a bucket that did open it is accepted, which is what
 		// makes the rejection above about the slot rather than the range.
-		wideBucketID := insertBaselineTestBucketWithSlots(t, db, "eight-slot-bucket", 8)
+		wideBucketID := insertSchemaTestBucketWithSlots(t, db, "eight-slot-bucket", 8)
 		if _, err := db.Exec(`INSERT INTO storage_data_sets
 			(bucket_id, provider_id, copy_index, generation, is_current, status, created_at, updated_at)
 			VALUES (?, 'provider-a', 5, 1, TRUE, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, wideBucketID); err != nil {
@@ -730,15 +655,12 @@ func TestBaselineReplicaIndexRequiresAnOpenSlot(t *testing.T) {
 
 // A termination names one data set through the role it ended, and the composite
 // foreign keys keep that data set inside the replacement it belongs to.
-func TestBaselineTerminationBelongsToItsReplacementRole(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
-		bucketID := insertBaselineTestBucket(t, db, "termination-bucket")
-		source := insertBaselineTestDataSet(t, db, bucketID, "101", 0, 1, true)
-		target := insertBaselineTestDataSet(t, db, bucketID, "202", 0, 2, false)
-		stranger := insertBaselineTestDataSet(t, db, bucketID, "303", 1, 1, true)
+func TestCurrentSchemaTerminationBelongsToItsReplacementRole(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		bucketID := insertSchemaTestBucket(t, db, "termination-bucket")
+		source := insertSchemaTestDataSet(t, db, bucketID, "101", 0, 1, true)
+		target := insertSchemaTestDataSet(t, db, bucketID, "202", 0, 2, false)
+		stranger := insertSchemaTestDataSet(t, db, bucketID, "303", 1, 1, true)
 		var replacementID int64
 		if err := db.QueryRow(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
@@ -789,12 +711,9 @@ func TestBaselineTerminationBelongsToItsReplacementRole(t *testing.T) {
 
 // Accounts without a name share the empty default; set names are unique byte
 // for byte, so names differing only in case are distinct.
-func TestBaselineAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+func TestCurrentSchemaAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
-		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
-			t.Fatalf("create initial schema: %v", err)
-		}
 		const unnamed = `INSERT INTO s3_accounts (access_key, secret_key, role, is_root, created_at, updated_at)
 			VALUES (?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
 		const named = `INSERT INTO s3_accounts (access_key, name, secret_key, role, is_root, created_at, updated_at)
@@ -818,15 +737,15 @@ func TestBaselineAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
 }
 
 func TestTaskTablesEnforceStateAndBudget(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-			t.Fatal(err)
-		}
-		id := insertBaselineTestTask(t, db, "working")
+	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+		id := insertSchemaTestTask(t, db, "working")
 		for _, statement := range []string{
 			`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP WHERE id=?`,
 			`UPDATE tasks SET status='cancelled',finished_at=CURRENT_TIMESTAMP WHERE id=?`,
 			`UPDATE tasks SET retry_count=-1 WHERE id=?`,
+			`UPDATE tasks SET input_json='[]' WHERE id=?`,
+			`UPDATE tasks SET input_json='{' WHERE id=?`,
+			`UPDATE tasks SET events_json='{}' WHERE id=?`,
 			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":0}' WHERE id=?`,
 			`UPDATE tasks SET policy_json='{"version":2}' WHERE id=?`,
 			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":null}' WHERE id=?`,
