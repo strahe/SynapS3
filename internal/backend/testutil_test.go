@@ -198,7 +198,6 @@ func newBackendTaskRuntime(t *testing.T, repos *repository.Repositories) (*taske
 	}
 	if _, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Minute,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}, repos, registry, nil); err != nil {
 		t.Fatal(err)
 	}

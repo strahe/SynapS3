@@ -780,6 +780,9 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 				if tasks["poll_interval"] != "9s" {
 					t.Fatalf("worker.tasks.poll_interval = %#v, want 9s", tasks["poll_interval"])
 				}
+				if tasks["upload_concurrency"] != float64(6) {
+					t.Fatalf("worker.tasks.upload_concurrency = %#v, want 6", tasks["upload_concurrency"])
+				}
 				filecoin := body["filecoin"].(map[string]any)
 				if filecoin["with_cdn"] != true {
 					t.Fatalf("filecoin.with_cdn = %#v, want true", filecoin["with_cdn"])
@@ -806,6 +809,7 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 			"synaps3", "admin", "--admin-url", ts.URL,
 			"settings", "set", "cache.max_size_gb=8", "cache.lru_high_watermark_percent=85",
 			"cache.lru_low_watermark_percent=70", "worker.tasks.poll_interval=9s",
+			"worker.tasks.upload_concurrency=6",
 			"filecoin.with_cdn=true", "logging.level=debug",
 			"logging.s3_access.enabled=false", "logging.s3_access.level=debug",
 		})
@@ -1117,16 +1121,15 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 			},
 			"worker": map[string]any{
 				"tasks": map[string]any{
-					"concurrency":                      12,
-					"poll_interval":                    "5s",
-					"lease_duration":                   "5m0s",
-					"max_retries":                      5,
-					"retention":                        "168h0m0s",
-					"provider_mutation_concurrency":    4,
-					"destructive_mutation_concurrency": 2,
-					"commit_max_pieces":                32,
-					"commit_max_wait":                  "30s",
-					"commit_max_backlog":               256,
+					"concurrency":        12,
+					"poll_interval":      "5s",
+					"lease_duration":     "5m0s",
+					"max_retries":        5,
+					"retention":          "168h0m0s",
+					"upload_concurrency": 4,
+					"commit_max_pieces":  32,
+					"commit_max_wait":    "30s",
+					"commit_max_backlog": 256,
 				},
 			},
 			"logging": map[string]any{

@@ -98,8 +98,7 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `worker.tasks.concurrency` | `12` |
 | `worker.tasks.poll_interval` | `5s` |
 | `worker.tasks.lease_duration` | `5m` |
-| `worker.tasks.provider_mutation_concurrency` | `4` |
-| `worker.tasks.destructive_mutation_concurrency` | `2` |
+| `worker.tasks.upload_concurrency` | `4` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
 | `worker.tasks.commit_seal_on_cache_pressure` | `false` |
@@ -110,9 +109,9 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。操作遇到对应额度已满时会先让出、稍后自动再试，不占用 `concurrency` 名额，其他后台任务照常运行。任务设置修改后必须重启 SynapS3。每类任务声明有限重试策略，每轮执行保留创建时记录的策略。任务历史永久保存。
+`worker.tasks.concurrency` 限制全部正在运行的后台任务，包括恢复任务。`upload_concurrency` 额外限制同时上传的数量，读取和哈希本地缓存也计入其中。两项都必须大于零；上传上限可以高于总上限，实际仍受总上限约束。没有空闲名额的任务保持排队，保留原有到期顺序，其他类型任务可以继续执行。钱包操作和上传测速各自一次执行一个。任务设置修改后必须重启 SynapS3。每类任务声明有限重试策略，每轮执行保留创建时记录的策略。任务历史永久保存。
 
-写入同一存储服务的上传和复制副本会一起收集，直到可以提交。`commit_max_pieces`（1–200）只限制一笔交易的 piece 数，不限制收集数量；Mainnet 上 data set ID 小于 1,559、Calibration 上小于 32,331 的存储服务每次最多 80 个。收集数量达到该服务适用的单笔上限、存储服务不再接受新数据、手动提交或最早的 piece 等待达到 `commit_max_wait`（0–30m）后，下一批达到提交条件；`0s` 表示无需等待收集窗口。所有批次都要等该服务的 4 个在途名额空出，并让更早的可提交已签名批次先发送。轮到下一批时，取最早准备好的 piece，最多取单笔上限，签名后立即尝试发送；剩余数据继续收集，保留原来的等待起点。已签名批次仍可能等待共享发送资源。等待提交的上传数据保留在本地缓存。更长的窗口会推迟提交、需要已登记来源的副本复制及本地缓存淘汰。
+写入同一存储服务的上传和复制副本会一起收集，直到可以提交。`commit_max_pieces`（1–200）只限制一笔交易的 piece 数，不限制收集数量；Mainnet 上 data set ID 小于 1,559、Calibration 上小于 32,331 的存储服务每次最多 80 个。收集数量达到该服务适用的单笔上限、存储服务不再接受新数据、手动提交或最早的 piece 等待达到 `commit_max_wait`（0–30m）后，下一批达到提交条件；`0s` 表示无需等待收集窗口。所有批次都要等该服务的 4 个在途名额空出，并让更早的可提交已签名批次先发送。轮到下一批时，取最早准备好的 piece，最多取单笔上限，签名后立即尝试发送；剩余数据继续收集，保留原来的等待起点。等待提交的上传数据保留在本地缓存。更长的窗口会推迟提交、需要已登记来源的副本复制及本地缓存淘汰。
 
 某个存储服务上等待未提交批次的已传输 piece（包括上传和复制的副本）达到 `commit_max_backlog`（不小于 `commit_max_pieces`）后，写入该存储服务的新上传和新复制都会等待。一个批次超出单条 add-pieces 消息大小时，会拆分后用更少的 piece 重新签名。
 

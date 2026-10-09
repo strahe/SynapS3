@@ -280,8 +280,7 @@ func applyTaskWorkerUpdate(
 	setInt("worker.tasks.concurrency", &target.Concurrency, req.Concurrency)
 	setDuration("worker.tasks.poll_interval", &target.PollInterval, req.PollInterval)
 	setDuration("worker.tasks.lease_duration", &target.LeaseDuration, req.LeaseDuration)
-	setInt("worker.tasks.provider_mutation_concurrency", &target.ProviderMutationConcurrency, req.ProviderMutationConcurrency)
-	setInt("worker.tasks.destructive_mutation_concurrency", &target.DestructiveMutationConcurrency, req.DestructiveMutationConcurrency)
+	setInt("worker.tasks.upload_concurrency", &target.UploadConcurrency, req.UploadConcurrency)
 	setInt("worker.tasks.commit_max_pieces", &target.CommitMaxPieces, req.CommitMaxPieces)
 	setDuration("worker.tasks.commit_max_wait", &target.CommitMaxWait, req.CommitMaxWait)
 	setInt("worker.tasks.commit_max_backlog", &target.CommitMaxBacklog, req.CommitMaxBacklog)
@@ -412,15 +411,14 @@ type settingsWorkerConfig struct {
 }
 
 type settingsTaskWorkerConfig struct {
-	Concurrency                    int    `json:"concurrency"`
-	PollInterval                   string `json:"poll_interval"`
-	LeaseDuration                  string `json:"lease_duration"`
-	ProviderMutationConcurrency    int    `json:"provider_mutation_concurrency"`
-	DestructiveMutationConcurrency int    `json:"destructive_mutation_concurrency"`
-	CommitMaxPieces                int    `json:"commit_max_pieces"`
-	CommitMaxWait                  string `json:"commit_max_wait"`
-	CommitMaxBacklog               int    `json:"commit_max_backlog"`
-	CommitSealOnCachePressure      bool   `json:"commit_seal_on_cache_pressure"`
+	Concurrency               int    `json:"concurrency"`
+	PollInterval              string `json:"poll_interval"`
+	LeaseDuration             string `json:"lease_duration"`
+	UploadConcurrency         int    `json:"upload_concurrency"`
+	CommitMaxPieces           int    `json:"commit_max_pieces"`
+	CommitMaxWait             string `json:"commit_max_wait"`
+	CommitMaxBacklog          int    `json:"commit_max_backlog"`
+	CommitSealOnCachePressure bool   `json:"commit_seal_on_cache_pressure"`
 }
 
 type settingsLoggingConfig struct {
@@ -523,15 +521,14 @@ type settingsWorkerUpdate struct {
 }
 
 type settingsTaskWorkerUpdate struct {
-	Concurrency                    *int    `json:"concurrency,omitempty"`
-	PollInterval                   *string `json:"poll_interval,omitempty"`
-	LeaseDuration                  *string `json:"lease_duration,omitempty"`
-	ProviderMutationConcurrency    *int    `json:"provider_mutation_concurrency,omitempty"`
-	DestructiveMutationConcurrency *int    `json:"destructive_mutation_concurrency,omitempty"`
-	CommitMaxPieces                *int    `json:"commit_max_pieces,omitempty"`
-	CommitMaxWait                  *string `json:"commit_max_wait,omitempty"`
-	CommitMaxBacklog               *int    `json:"commit_max_backlog,omitempty"`
-	CommitSealOnCachePressure      *bool   `json:"commit_seal_on_cache_pressure,omitempty"`
+	Concurrency               *int    `json:"concurrency,omitempty"`
+	PollInterval              *string `json:"poll_interval,omitempty"`
+	LeaseDuration             *string `json:"lease_duration,omitempty"`
+	UploadConcurrency         *int    `json:"upload_concurrency,omitempty"`
+	CommitMaxPieces           *int    `json:"commit_max_pieces,omitempty"`
+	CommitMaxWait             *string `json:"commit_max_wait,omitempty"`
+	CommitMaxBacklog          *int    `json:"commit_max_backlog,omitempty"`
+	CommitSealOnCachePressure *bool   `json:"commit_seal_on_cache_pressure,omitempty"`
 }
 
 type settingsLoggingUpdate struct {
@@ -596,15 +593,14 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 
 func toSettingsTaskWorkerConfig(cfg config.TaskWorkerConfig) settingsTaskWorkerConfig {
 	return settingsTaskWorkerConfig{
-		Concurrency:                    cfg.Concurrency,
-		PollInterval:                   cfg.PollInterval.String(),
-		LeaseDuration:                  cfg.LeaseDuration.String(),
-		ProviderMutationConcurrency:    cfg.ProviderMutationConcurrency,
-		DestructiveMutationConcurrency: cfg.DestructiveMutationConcurrency,
-		CommitMaxPieces:                cfg.CommitMaxPieces,
-		CommitMaxWait:                  cfg.CommitMaxWait.String(),
-		CommitMaxBacklog:               cfg.CommitMaxBacklog,
-		CommitSealOnCachePressure:      cfg.CommitSealOnCachePressure,
+		Concurrency:               cfg.Concurrency,
+		PollInterval:              cfg.PollInterval.String(),
+		LeaseDuration:             cfg.LeaseDuration.String(),
+		UploadConcurrency:         cfg.UploadConcurrency,
+		CommitMaxPieces:           cfg.CommitMaxPieces,
+		CommitMaxWait:             cfg.CommitMaxWait.String(),
+		CommitMaxBacklog:          cfg.CommitMaxBacklog,
+		CommitSealOnCachePressure: cfg.CommitSealOnCachePressure,
 	}
 }
 
@@ -636,37 +632,36 @@ func toSettingsSecretStatus(cfg *config.Config) settingsSecretStatus {
 
 func editableValidationErrors(cfg *config.Config) []config.FieldError {
 	editable := map[string]struct{}{
-		"server.port":                                   {},
-		"server.max_connections":                        {},
-		"server.max_requests":                           {},
-		"server.tls.cert_file":                          {},
-		"server.tls.key_file":                           {},
-		"s3.region":                                     {},
-		"cache.dir":                                     {},
-		"cache.max_size_gb":                             {},
-		"cache.eviction_policy":                         {},
-		"cache.lru_high_watermark_percent":              {},
-		"cache.lru_low_watermark_percent":               {},
-		"filecoin.network":                              {},
-		"filecoin.rpc_url":                              {},
-		"filecoin.default_copies":                       {},
-		"filecoin.anchor_provider_tier":                 {},
-		"filecoin.observability.interval":               {},
-		"filecoin.observability.timeout":                {},
-		"filecoin.observability.concurrency":            {},
-		"worker.tasks.concurrency":                      {},
-		"worker.tasks.poll_interval":                    {},
-		"worker.tasks.lease_duration":                   {},
-		"worker.tasks.provider_mutation_concurrency":    {},
-		"worker.tasks.destructive_mutation_concurrency": {},
-		"worker.tasks.commit_max_pieces":                {},
-		"worker.tasks.commit_max_wait":                  {},
-		"worker.tasks.commit_max_backlog":               {},
-		"worker.tasks.commit_seal_on_cache_pressure":    {},
-		"logging.level":                                 {},
-		"logging.format":                                {},
-		"logging.s3_access.enabled":                     {},
-		"logging.s3_access.level":                       {},
+		"server.port":                                {},
+		"server.max_connections":                     {},
+		"server.max_requests":                        {},
+		"server.tls.cert_file":                       {},
+		"server.tls.key_file":                        {},
+		"s3.region":                                  {},
+		"cache.dir":                                  {},
+		"cache.max_size_gb":                          {},
+		"cache.eviction_policy":                      {},
+		"cache.lru_high_watermark_percent":           {},
+		"cache.lru_low_watermark_percent":            {},
+		"filecoin.network":                           {},
+		"filecoin.rpc_url":                           {},
+		"filecoin.default_copies":                    {},
+		"filecoin.anchor_provider_tier":              {},
+		"filecoin.observability.interval":            {},
+		"filecoin.observability.timeout":             {},
+		"filecoin.observability.concurrency":         {},
+		"worker.tasks.concurrency":                   {},
+		"worker.tasks.poll_interval":                 {},
+		"worker.tasks.lease_duration":                {},
+		"worker.tasks.upload_concurrency":            {},
+		"worker.tasks.commit_max_pieces":             {},
+		"worker.tasks.commit_max_wait":               {},
+		"worker.tasks.commit_max_backlog":            {},
+		"worker.tasks.commit_seal_on_cache_pressure": {},
+		"logging.level":                              {},
+		"logging.format":                             {},
+		"logging.s3_access.enabled":                  {},
+		"logging.s3_access.level":                    {},
 	}
 
 	var out []config.FieldError

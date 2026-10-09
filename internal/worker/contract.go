@@ -23,7 +23,6 @@ var (
 	ErrInvalidResult         = errors.New("invalid task result")
 	ErrRegistryFrozen        = errors.New("task registry is frozen")
 	ErrEffectForbidden       = errors.New("external effects are forbidden during recovery")
-	ErrResourceBusy          = errors.New("task resource is busy")
 	ErrCodecPanic            = errors.New("task input codec panicked")
 	ErrInvalidCanonical      = errors.New("task input codec returned invalid canonical JSON")
 )
@@ -86,14 +85,16 @@ func StrictJSONCodec[T any](validate func(*T) error) Codec {
 	})
 }
 
-// Definition is the complete persistent contract for a task type.
+// Definition is the runtime contract for a task type.
 type Definition struct {
-	Type         model.TaskType
-	WorkStart    WorkStartPolicy
-	InputVersion int
-	Codec        Codec
-	Policy       ExecutionPolicy
-	AllowRetry   bool
+	Type model.TaskType
+	// MaxConcurrency limits simultaneous executions of this type; zero uses only the global limit.
+	MaxConcurrency int
+	WorkStart      WorkStartPolicy
+	InputVersion   int
+	Codec          Codec
+	Policy         ExecutionPolicy
+	AllowRetry     bool
 	// CanManualRetry optionally narrows AllowRetry for one failed task based on
 	// its durable failure evidence. Nil preserves the type-wide policy.
 	CanManualRetry func(*model.Task) bool
@@ -162,7 +163,7 @@ func (d Definition) manualRetryAllowed(task *model.Task) bool {
 }
 
 func (d Definition) validate() error {
-	if d.Type == "" || d.InputVersion < 1 || d.Codec == nil {
+	if d.Type == "" || d.InputVersion < 1 || d.Codec == nil || d.MaxConcurrency < 0 {
 		return fmt.Errorf("incomplete definition for %q", d.Type)
 	}
 	if err := d.Policy.validate(); err != nil {
@@ -201,7 +202,6 @@ type Result struct {
 	kind          ResultKind
 	delay         time.Duration
 	retryBackoff  bool
-	resourceWait  bool
 	resumeMode    model.TaskResumeMode
 	waitReason    string
 	failureReason string
@@ -235,16 +235,6 @@ func Wait(mode model.TaskResumeMode, delay time.Duration, reason, message string
 	}
 }
 
-// ResourceWait yields a task that found its resource gate full. It resumes in
-// execute mode after a backoff that grows with the task's consecutive waits,
-// and it consumes no retry budget.
-func ResourceWait(message string) Result {
-	return Result{
-		kind: resultWait, resumeMode: model.TaskResumeModeExecute, resourceWait: true,
-		waitReason: "resource", message: message,
-	}
-}
-
 func Retry(err error, failureReason string, delay time.Duration, settlement Settlement) Result {
 	return Result{
 		kind: resultRetry, resumeMode: model.TaskResumeModeRecover, delay: delay, retryBackoff: true,
@@ -268,25 +258,12 @@ func Cancel(message string, settlement Settlement) Result {
 	return Result{kind: resultCancel, message: message, settlement: settlement}
 }
 
-type Resource string
-
-const (
-	ResourceProviderMutation    Resource = "provider_mutation"
-	ResourceProviderUploadSpeed Resource = "provider_upload_speed"
-	ResourceDestructiveMutation Resource = "destructive_mutation"
-	ResourceWallet              Resource = "wallet"
-)
-
-type (
-	checkpointWriter func(context.Context, any, Settlement, bool) error
-	resourceRunner   func(context.Context, Resource, func(context.Context) error) error
-)
+type checkpointWriter func(context.Context, any, Settlement, bool) error
 
 // Execution is an immutable view of one fenced claim.
 type Execution struct {
 	task       model.Task
 	checkpoint checkpointWriter
-	resource   resourceRunner
 	admit      func(context.Context, string, any, Settlement) error
 	observe    func(context.Context, string) (time.Time, error)
 	resolve    func(context.Context, string, any, Settlement) error
@@ -317,27 +294,12 @@ func (e Execution) WriteCheckpointWith(ctx context.Context, value any, settlemen
 	return e.checkpoint(ctx, value, settlement, false)
 }
 
-// WithResource runs fn while holding one slot of resource. It never waits for a
-// slot: a full gate returns ErrResourceBusy, which handlers turn into
-// ResourceWait. A nested call for a resource the context already holds reuses
-// that slot.
-func (e Execution) WithResource(ctx context.Context, resource Resource, fn func(context.Context) error) error {
-	if e.Mode() != model.TaskResumeModeExecute {
-		return ErrEffectForbidden
-	}
-	if e.resource == nil {
-		return errors.New("resource gate is unavailable")
-	}
-	return e.resource(ctx, resource, fn)
-}
-
 // WithCheckpointedEffect admits an external effect, persists its recovery
 // evidence, and only then invokes effect. A false attempted result guarantees
 // that effect was not called; recovery after a process crash must still rely on
 // the durable checkpoint rather than this return value.
 func (e Execution) WithCheckpointedEffect(
 	ctx context.Context,
-	resource Resource,
 	operationKey string,
 	checkpoint any,
 	settlement Settlement,
@@ -346,17 +308,19 @@ func (e Execution) WithCheckpointedEffect(
 	if effect == nil {
 		return false, errors.New("external effect is required")
 	}
-	err = e.WithResource(ctx, resource, func(ctx context.Context) error {
-		if e.admit == nil {
-			return errors.New("effect admission is unavailable")
-		}
-		if err := e.admit(ctx, operationKey, checkpoint, settlement); err != nil {
-			return err
-		}
-		attempted = true
-		return effect(ctx)
-	})
-	return attempted, err
+	if e.Mode() != model.TaskResumeModeExecute {
+		return false, ErrEffectForbidden
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if e.admit == nil {
+		return false, errors.New("effect admission is unavailable")
+	}
+	if err := e.admit(ctx, operationKey, checkpoint, settlement); err != nil {
+		return false, err
+	}
+	return true, effect(ctx)
 }
 
 func DecodeInput[T any](execution Execution) (T, error) {

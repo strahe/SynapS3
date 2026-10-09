@@ -118,12 +118,11 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	cfg.Filecoin.Observability.Timeout = time.Second
 	cfg.Filecoin.Observability.Concurrency = 3
 	cfg.Worker.Tasks = config.TaskWorkerConfig{
-		Concurrency:                    4,
-		PollInterval:                   15 * time.Millisecond,
-		LeaseDuration:                  time.Second,
-		ProviderMutationConcurrency:    4,
-		DestructiveMutationConcurrency: 2,
-		CommitMaxPieces:                config.DefaultCommitMaxPieces,
+		Concurrency:       4,
+		PollInterval:      15 * time.Millisecond,
+		LeaseDuration:     time.Second,
+		UploadConcurrency: 4,
+		CommitMaxPieces:   config.DefaultCommitMaxPieces,
 		// Uploads made together still register together, without the
 		// production wait for stragglers.
 		CommitMaxWait:    time.Second,

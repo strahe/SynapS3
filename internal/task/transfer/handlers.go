@@ -73,14 +73,15 @@ func NewPlanHandler(deps PlanDependencies) (*PlanHandler, error) {
 }
 
 type StoreDependencies struct {
-	Coordinator      *CopyCoordinator
-	Resolver         ReadyDataSetResolver
-	Cache            cache.Cache
-	CacheGate        *cacheaccess.Gate
-	Events           EventPublisher
-	ParkedPieces     synapse.ParkedPieceChecker
-	CommitMaxBacklog int
-	Logger           *slog.Logger
+	Coordinator       *CopyCoordinator
+	Resolver          ReadyDataSetResolver
+	Cache             cache.Cache
+	CacheGate         *cacheaccess.Gate
+	Events            EventPublisher
+	ParkedPieces      synapse.ParkedPieceChecker
+	CommitMaxBacklog  int
+	UploadConcurrency int
+	Logger            *slog.Logger
 }
 
 type StoreHandler struct {
@@ -92,6 +93,12 @@ type StoreHandler struct {
 func NewStoreHandler(deps StoreDependencies) (*StoreHandler, error) {
 	if deps.Coordinator == nil {
 		return nil, errors.New("store requires a copy coordinator")
+	}
+	if deps.UploadConcurrency < 0 {
+		return nil, errors.New("upload concurrency cannot be negative")
+	}
+	if deps.UploadConcurrency == 0 {
+		deps.UploadConcurrency = config.DefaultUploadConcurrency
 	}
 	if deps.CommitMaxBacklog == 0 {
 		deps.CommitMaxBacklog = config.DefaultCommitMaxBacklog

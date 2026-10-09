@@ -41,7 +41,7 @@ func assertTaskOperationAdmissionAndRollback(t *testing.T, db *bun.DB) {
 	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now(), IncrementRetry: true}); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := repos.Tasks.ClaimNext(ctx, time.Minute)
+	recovered, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || recovered == nil {
 		t.Fatalf("recover=%#v,%v", recovered, err)
 	}
@@ -136,7 +136,7 @@ func TestTaskCancellationPreservesRecoveryBackoff(t *testing.T) {
 	if err != nil || !stored.AvailableAt.Equal(due) || stored.RetryCount != 1 {
 		t.Fatalf("cancel reset backoff=%#v,%v", stored, err)
 	}
-	if claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute); err != nil || claimed != nil {
+	if claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{}); err != nil || claimed != nil {
 		t.Fatalf("claimed delayed cancellation=%#v,%v", claimed, err)
 	}
 }

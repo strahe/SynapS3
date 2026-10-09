@@ -182,13 +182,9 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Label: "Task Lease Duration", Description: "Time another process waits before recovering interrupted background work. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_LEASE_DURATION", Editable: true,
 	},
-	"worker.tasks.provider_mutation_concurrency": {
-		Label: "Storage Mutation Concurrency", Description: "Maximum concurrent requests that change remote storage. Restart required.",
-		Env: "SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", Editable: true,
-	},
-	"worker.tasks.destructive_mutation_concurrency": {
-		Label: "Removal Concurrency", Description: "Maximum concurrent remote cleanup and retirement requests. Restart required.",
-		Env: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", Editable: true,
+	"worker.tasks.upload_concurrency": {
+		Label: "Upload Concurrency", Description: "Maximum uploads that may run at once. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY", Editable: true,
 	},
 	"worker.tasks.commit_max_pieces": {
 		Label: "Registration Size", Description: "Maximum pieces registered on chain in one transaction for a storage service. Restart required.",

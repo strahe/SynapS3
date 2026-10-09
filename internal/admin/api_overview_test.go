@@ -438,7 +438,7 @@ func overviewSeedTask(
 	if status == model.TaskStatusPending {
 		return taskRow
 	}
-	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("ClaimNext(%s) = %#v, err=%v", key, claimed, err)
 	}

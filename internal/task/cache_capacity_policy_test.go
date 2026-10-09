@@ -304,7 +304,7 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 	if err := registry.RegisterSchedule(taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Subject: taskengine.Subject{Type: "system", Key: "cache-capacity"}, Input: systemtask.Input{}, Interval: 5 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2}, runtime.repos, registry, slog.Default())
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, registry, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 			settled := make(chan repository.TaskTransition, 1)
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
-				ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+
 				OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
 					if claimed.ID == planner.ID {
 						settled <- transition

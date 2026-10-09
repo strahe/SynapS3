@@ -424,7 +424,6 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	stopHandlerEngine(t, cancel, done)
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, f.runtime.repos, f.runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("restart engine: %v", err)
@@ -571,7 +570,7 @@ func (f registrationFixture) holdSubmissionSlots(t *testing.T) int64 {
 	var heldTaskID int64
 	for i, copyRow := range f.copies[:4] {
 		requestID, taskID := f.collectAt(t, fmt.Sprintf("held-%d", i), readyAt, copyRow)
-		claimed, err := f.runtime.repos.Tasks.ClaimNext(ctx, time.Minute)
+		claimed, err := f.runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 		if err != nil || claimed == nil || claimed.ID != taskID {
 			t.Fatalf("claim held task = %#v, %v, want %d", claimed, err, taskID)
 		}
@@ -602,6 +601,99 @@ func (f registrationFixture) holdSubmissionSlots(t *testing.T) int64 {
 		}
 	}
 	return heldTaskID
+}
+
+type commitQueueSnapshot struct {
+	repository.StorageContentRepository
+	once     sync.Once
+	observed chan struct{}
+	release  chan struct{}
+}
+
+func (r *commitQueueSnapshot) CommitQueueState(ctx context.Context, dataSetID int64, now time.Time) (repository.CommitQueueState, error) {
+	state, err := r.StorageContentRepository.CommitQueueState(ctx, dataSetID, now)
+	if err == nil {
+		r.once.Do(func() {
+			close(r.observed)
+			<-r.release
+		})
+	}
+	return state, err
+}
+
+func TestReadyCommitQueueWakeAndFallbackDoNotConsumeRetries(t *testing.T) {
+	for _, wakeWhileRunning := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wake while running=%v", wakeWhileRunning), func(t *testing.T) {
+			f := newRegistrationFixture(t, 5, nil, 0)
+			heldTaskID := f.holdSubmissionSlots(t)
+			requestID, taskID := f.collectAt(t, "ready-queued", time.Now(), f.copies[4])
+			if _, err := f.runtime.repos.Contents.SealCommitRequest(t.Context(), repository.SealCommitRequestInput{
+				RequestID: requestID, TaskID: taskID, ExtraDataHex: fmt.Sprintf("%x", testutil.CommitExtraData(50)),
+				Members: []repository.SealMember{{CopyID: f.copies[4].ID, ContentID: f.copies[4].ContentID, PieceCID: f.pieceCID(t, f.copies[4])}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := &commitQueueSnapshot{StorageContentRepository: f.runtime.repos.Contents, observed: make(chan struct{}), release: make(chan struct{})}
+			f.runtime.repos.Contents = snapshot
+			cancel, done := runHandlerEngine(t, f.runtime)
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-snapshot.release:
+				default:
+					close(snapshot.release)
+				}
+				<-done
+			})
+			select {
+			case <-snapshot.observed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("ready registration did not check its submission queue")
+			}
+			confirm := func() {
+				if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(t.Context(), repository.ConfirmCommitRequestInput{
+					RequestID: "held-0", TaskID: heldTaskID, FirstPieceID: testOnChainID(t, 50),
+					ConfirmedTransactionID: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if wakeWhileRunning {
+				confirm()
+			}
+			waitStartedAt := time.Now()
+			close(snapshot.release)
+			waiting := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == storagecommit.CommitQueueWaitReason
+			})
+			cancel()
+			<-done
+			if waiting.ResumeMode != model.TaskResumeModeExecute || waiting.RetryCount != 0 || waiting.WorkStartedAt != nil ||
+				len(waiting.Checkpoint) != 0 || waiting.AvailableAt.Before(waitStartedAt.Add(30*time.Second)) || waiting.AvailableAt.After(time.Now().Add(30*time.Second)) {
+				t.Fatalf("queue wait = %#v, want unchanged budget and a 30-second execution wait", waiting)
+			}
+			if sends, _ := f.provider.sent(); len(sends) != 0 || f.provider.nonces.Reads() != 0 {
+				t.Fatalf("blocked request sent %d times or read the chain %d times", len(sends), f.provider.nonces.Reads())
+			}
+			if wakeWhileRunning {
+				// Advance the fallback deadline after the earlier wake found Running.
+				if _, err := f.runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				confirm()
+				woken, err := f.runtime.repos.Tasks.GetByID(t.Context(), taskID)
+				if err != nil || woken.AvailableAt.After(time.Now()) {
+					t.Fatalf("confirmation did not wake the ready request: %#v, %v", woken, err)
+				}
+			}
+			resumed := runOneStorageTask(t, f.runtime, waiting, model.TaskStatusPending)
+			sends, _ := f.provider.sent()
+			if len(sends) != 1 || resumed.RetryCount != 0 || f.request(t, requestID).Sends != 1 {
+				t.Fatalf("resumed registration = %#v; sends = %d", resumed, len(sends))
+			}
+		})
+	}
 }
 
 func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {

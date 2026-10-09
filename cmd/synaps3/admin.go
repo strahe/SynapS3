@@ -941,15 +941,14 @@ type adminSettingsWorkerConfig struct {
 }
 
 type adminSettingsTaskWorkerConfig struct {
-	Concurrency                    int    `json:"concurrency"`
-	PollInterval                   string `json:"poll_interval"`
-	LeaseDuration                  string `json:"lease_duration"`
-	ProviderMutationConcurrency    int    `json:"provider_mutation_concurrency"`
-	DestructiveMutationConcurrency int    `json:"destructive_mutation_concurrency"`
-	CommitMaxPieces                int    `json:"commit_max_pieces"`
-	CommitMaxWait                  string `json:"commit_max_wait"`
-	CommitMaxBacklog               int    `json:"commit_max_backlog"`
-	CommitSealOnCachePressure      bool   `json:"commit_seal_on_cache_pressure"`
+	Concurrency               int    `json:"concurrency"`
+	PollInterval              string `json:"poll_interval"`
+	LeaseDuration             string `json:"lease_duration"`
+	UploadConcurrency         int    `json:"upload_concurrency"`
+	CommitMaxPieces           int    `json:"commit_max_pieces"`
+	CommitMaxWait             string `json:"commit_max_wait"`
+	CommitMaxBacklog          int    `json:"commit_max_backlog"`
+	CommitSealOnCachePressure bool   `json:"commit_seal_on_cache_pressure"`
 }
 
 type adminSettingsLoggingConfig struct {
@@ -1030,37 +1029,36 @@ type adminSettingSpec struct {
 }
 
 var adminEditableSettings = map[string]adminSettingSpec{
-	"server.port":                                   {path: []string{"server", "port"}, kind: adminSettingString},
-	"server.max_connections":                        {path: []string{"server", "max_connections"}, kind: adminSettingInt},
-	"server.max_requests":                           {path: []string{"server", "max_requests"}, kind: adminSettingInt},
-	"server.tls.enabled":                            {path: []string{"server", "tls", "enabled"}, kind: adminSettingBool},
-	"server.tls.cert_file":                          {path: []string{"server", "tls", "cert_file"}, kind: adminSettingString},
-	"server.tls.key_file":                           {path: []string{"server", "tls", "key_file"}, kind: adminSettingString},
-	"s3.region":                                     {path: []string{"s3", "region"}, kind: adminSettingString},
-	"filecoin.network":                              {path: []string{"filecoin", "network"}, kind: adminSettingString},
-	"filecoin.rpc_url":                              {path: []string{"filecoin", "rpc_url"}, kind: adminSettingString},
-	"filecoin.with_cdn":                             {path: []string{"filecoin", "with_cdn"}, kind: adminSettingBool},
-	"filecoin.allow_private_networks":               {path: []string{"filecoin", "allow_private_networks"}, kind: adminSettingBool},
-	"filecoin.anchor_provider_tier":                 {path: []string{"filecoin", "anchor_provider_tier"}, kind: adminSettingString},
-	"filecoin.default_copies":                       {path: []string{"filecoin", "default_copies"}, kind: adminSettingInt},
-	"cache.dir":                                     {path: []string{"cache", "dir"}, kind: adminSettingString},
-	"cache.max_size_gb":                             {path: []string{"cache", "max_size_gb"}, kind: adminSettingInt},
-	"cache.eviction_policy":                         {path: []string{"cache", "eviction_policy"}, kind: adminSettingString},
-	"cache.lru_high_watermark_percent":              {path: []string{"cache", "lru_high_watermark_percent"}, kind: adminSettingInt},
-	"cache.lru_low_watermark_percent":               {path: []string{"cache", "lru_low_watermark_percent"}, kind: adminSettingInt},
-	"worker.tasks.concurrency":                      {path: []string{"worker", "tasks", "concurrency"}, kind: adminSettingInt},
-	"worker.tasks.poll_interval":                    {path: []string{"worker", "tasks", "poll_interval"}, kind: adminSettingString},
-	"worker.tasks.lease_duration":                   {path: []string{"worker", "tasks", "lease_duration"}, kind: adminSettingString},
-	"worker.tasks.provider_mutation_concurrency":    {path: []string{"worker", "tasks", "provider_mutation_concurrency"}, kind: adminSettingInt},
-	"worker.tasks.destructive_mutation_concurrency": {path: []string{"worker", "tasks", "destructive_mutation_concurrency"}, kind: adminSettingInt},
-	"worker.tasks.commit_max_pieces":                {path: []string{"worker", "tasks", "commit_max_pieces"}, kind: adminSettingInt},
-	"worker.tasks.commit_max_wait":                  {path: []string{"worker", "tasks", "commit_max_wait"}, kind: adminSettingString},
-	"worker.tasks.commit_max_backlog":               {path: []string{"worker", "tasks", "commit_max_backlog"}, kind: adminSettingInt},
-	"worker.tasks.commit_seal_on_cache_pressure":    {path: []string{"worker", "tasks", "commit_seal_on_cache_pressure"}, kind: adminSettingBool},
-	"logging.level":                                 {path: []string{"logging", "level"}, kind: adminSettingString},
-	"logging.format":                                {path: []string{"logging", "format"}, kind: adminSettingString},
-	"logging.s3_access.enabled":                     {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
-	"logging.s3_access.level":                       {path: []string{"logging", "s3_access", "level"}, kind: adminSettingString},
+	"server.port":                                {path: []string{"server", "port"}, kind: adminSettingString},
+	"server.max_connections":                     {path: []string{"server", "max_connections"}, kind: adminSettingInt},
+	"server.max_requests":                        {path: []string{"server", "max_requests"}, kind: adminSettingInt},
+	"server.tls.enabled":                         {path: []string{"server", "tls", "enabled"}, kind: adminSettingBool},
+	"server.tls.cert_file":                       {path: []string{"server", "tls", "cert_file"}, kind: adminSettingString},
+	"server.tls.key_file":                        {path: []string{"server", "tls", "key_file"}, kind: adminSettingString},
+	"s3.region":                                  {path: []string{"s3", "region"}, kind: adminSettingString},
+	"filecoin.network":                           {path: []string{"filecoin", "network"}, kind: adminSettingString},
+	"filecoin.rpc_url":                           {path: []string{"filecoin", "rpc_url"}, kind: adminSettingString},
+	"filecoin.with_cdn":                          {path: []string{"filecoin", "with_cdn"}, kind: adminSettingBool},
+	"filecoin.allow_private_networks":            {path: []string{"filecoin", "allow_private_networks"}, kind: adminSettingBool},
+	"filecoin.anchor_provider_tier":              {path: []string{"filecoin", "anchor_provider_tier"}, kind: adminSettingString},
+	"filecoin.default_copies":                    {path: []string{"filecoin", "default_copies"}, kind: adminSettingInt},
+	"cache.dir":                                  {path: []string{"cache", "dir"}, kind: adminSettingString},
+	"cache.max_size_gb":                          {path: []string{"cache", "max_size_gb"}, kind: adminSettingInt},
+	"cache.eviction_policy":                      {path: []string{"cache", "eviction_policy"}, kind: adminSettingString},
+	"cache.lru_high_watermark_percent":           {path: []string{"cache", "lru_high_watermark_percent"}, kind: adminSettingInt},
+	"cache.lru_low_watermark_percent":            {path: []string{"cache", "lru_low_watermark_percent"}, kind: adminSettingInt},
+	"worker.tasks.concurrency":                   {path: []string{"worker", "tasks", "concurrency"}, kind: adminSettingInt},
+	"worker.tasks.poll_interval":                 {path: []string{"worker", "tasks", "poll_interval"}, kind: adminSettingString},
+	"worker.tasks.lease_duration":                {path: []string{"worker", "tasks", "lease_duration"}, kind: adminSettingString},
+	"worker.tasks.upload_concurrency":            {path: []string{"worker", "tasks", "upload_concurrency"}, kind: adminSettingInt},
+	"worker.tasks.commit_max_pieces":             {path: []string{"worker", "tasks", "commit_max_pieces"}, kind: adminSettingInt},
+	"worker.tasks.commit_max_wait":               {path: []string{"worker", "tasks", "commit_max_wait"}, kind: adminSettingString},
+	"worker.tasks.commit_max_backlog":            {path: []string{"worker", "tasks", "commit_max_backlog"}, kind: adminSettingInt},
+	"worker.tasks.commit_seal_on_cache_pressure": {path: []string{"worker", "tasks", "commit_seal_on_cache_pressure"}, kind: adminSettingBool},
+	"logging.level":                              {path: []string{"logging", "level"}, kind: adminSettingString},
+	"logging.format":                             {path: []string{"logging", "format"}, kind: adminSettingString},
+	"logging.s3_access.enabled":                  {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
+	"logging.s3_access.level":                    {path: []string{"logging", "s3_access", "level"}, kind: adminSettingString},
 }
 
 type adminSettingsUpdates struct {
@@ -1439,8 +1437,7 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "worker.tasks.concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.Concurrency)},
 				{Name: "worker.tasks.poll_interval", Value: settings.Config.Worker.Tasks.PollInterval},
 				{Name: "worker.tasks.lease_duration", Value: settings.Config.Worker.Tasks.LeaseDuration},
-				{Name: "worker.tasks.provider_mutation_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.ProviderMutationConcurrency)},
-				{Name: "worker.tasks.destructive_mutation_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.DestructiveMutationConcurrency)},
+				{Name: "worker.tasks.upload_concurrency", Value: strconv.Itoa(settings.Config.Worker.Tasks.UploadConcurrency)},
 				{Name: "worker.tasks.commit_max_pieces", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxPieces)},
 				{Name: "worker.tasks.commit_max_wait", Value: settings.Config.Worker.Tasks.CommitMaxWait},
 				{Name: "worker.tasks.commit_max_backlog", Value: strconv.Itoa(settings.Config.Worker.Tasks.CommitMaxBacklog)},

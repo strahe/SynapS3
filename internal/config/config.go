@@ -26,6 +26,7 @@ import (
 const (
 	DefaultFilecoinCopies    = 3
 	MaxFilecoinDefaultCopies = model.StorageCopiesMax
+	DefaultUploadConcurrency = 4
 
 	// Registration batching. 200 pieces without metadata stay inside the
 	// add-pieces message size limit; legacy data sets are capped lower at run
@@ -102,15 +103,14 @@ type WorkerConfig struct {
 }
 
 type TaskWorkerConfig struct {
-	Concurrency                    int           `koanf:"concurrency"`
-	PollInterval                   time.Duration `koanf:"poll_interval"`
-	LeaseDuration                  time.Duration `koanf:"lease_duration"`
-	ProviderMutationConcurrency    int           `koanf:"provider_mutation_concurrency"`
-	DestructiveMutationConcurrency int           `koanf:"destructive_mutation_concurrency"`
-	CommitMaxPieces                int           `koanf:"commit_max_pieces"`
-	CommitMaxWait                  time.Duration `koanf:"commit_max_wait"`
-	CommitMaxBacklog               int           `koanf:"commit_max_backlog"`
-	CommitSealOnCachePressure      bool          `koanf:"commit_seal_on_cache_pressure"`
+	Concurrency               int           `koanf:"concurrency"`
+	PollInterval              time.Duration `koanf:"poll_interval"`
+	LeaseDuration             time.Duration `koanf:"lease_duration"`
+	UploadConcurrency         int           `koanf:"upload_concurrency"`
+	CommitMaxPieces           int           `koanf:"commit_max_pieces"`
+	CommitMaxWait             time.Duration `koanf:"commit_max_wait"`
+	CommitMaxBacklog          int           `koanf:"commit_max_backlog"`
+	CommitSealOnCachePressure bool          `koanf:"commit_seal_on_cache_pressure"`
 }
 
 type LoggingConfig struct {
@@ -202,15 +202,14 @@ func defaultConfig() *Config {
 		},
 		Worker: WorkerConfig{
 			Tasks: TaskWorkerConfig{
-				Concurrency:                    12,
-				PollInterval:                   5 * time.Second,
-				LeaseDuration:                  5 * time.Minute,
-				ProviderMutationConcurrency:    4,
-				DestructiveMutationConcurrency: 2,
-				CommitMaxPieces:                DefaultCommitMaxPieces,
-				CommitMaxWait:                  DefaultCommitMaxWait,
-				CommitMaxBacklog:               DefaultCommitMaxBacklog,
-				CommitSealOnCachePressure:      false,
+				Concurrency:               12,
+				PollInterval:              5 * time.Second,
+				LeaseDuration:             5 * time.Minute,
+				UploadConcurrency:         DefaultUploadConcurrency,
+				CommitMaxPieces:           DefaultCommitMaxPieces,
+				CommitMaxWait:             DefaultCommitMaxWait,
+				CommitMaxBacklog:          DefaultCommitMaxBacklog,
+				CommitSealOnCachePressure: false,
 			},
 		},
 		Logging: LoggingConfig{
@@ -515,11 +514,8 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	if tasks.LeaseDuration <= tasks.PollInterval {
 		add("worker.tasks.lease_duration", "must be greater than worker.tasks.poll_interval")
 	}
-	if tasks.ProviderMutationConcurrency < 1 {
-		add("worker.tasks.provider_mutation_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.ProviderMutationConcurrency))
-	}
-	if tasks.DestructiveMutationConcurrency < 1 {
-		add("worker.tasks.destructive_mutation_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.DestructiveMutationConcurrency))
+	if tasks.UploadConcurrency < 1 {
+		add("worker.tasks.upload_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.UploadConcurrency))
 	}
 	if tasks.CommitMaxPieces < 1 || tasks.CommitMaxPieces > MaxCommitMaxPieces {
 		add("worker.tasks.commit_max_pieces", fmt.Sprintf("must be between 1 and %d, got %d", MaxCommitMaxPieces, tasks.CommitMaxPieces))

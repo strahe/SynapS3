@@ -20,6 +20,7 @@ import (
 
 func (h *StoreHandler) storeHandler() *taskengine.FuncHandler {
 	definition := h.copyDefinition(model.TaskTypeStorageStore)
+	definition.MaxConcurrency = h.deps.UploadConcurrency
 	definition.AllowRetry = true
 	definition.Policy.ObservationWindow = storeAttentionAfter
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
@@ -124,15 +125,12 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 	cacheKey := model.ContentCacheKey(content.ID)
 	releaseCache := h.deps.CacheGate.HoldRead(cacheKey)
 	defer releaseCache()
-	// One provider slot spans identity calculation and the transfer, so a task
-	// that has to wait for a slot never hashes the bytes first.
-	var outcome taskengine.Result
-	err = execution.WithResource(ctx, taskengine.ResourceProviderMutation, func(ctx context.Context) error {
-		outcome = h.storeWithProviderSlot(ctx, execution, input, copyRow, target, content, bucket, cacheKey, checkpoint, hasCheckpoint)
-		return nil
-	})
-	if errors.Is(err, taskengine.ErrResourceBusy) {
-		return taskengine.ResourceWait("Waiting for other storage operations to finish")
+	err = ctx.Err()
+	if err == nil {
+		err = h.CopyCoordinator.deps.Repositories.Tasks.ValidateClaim(ctx, execution.ID(), execution.ClaimGeneration())
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	if err != nil {
 		if hasCheckpoint {
@@ -140,10 +138,10 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 		}
 		return h.retryStoreNotStarted(execution, err)
 	}
-	return outcome
+	return h.storePiece(ctx, execution, input, copyRow, target, content, bucket, cacheKey, checkpoint, hasCheckpoint)
 }
 
-func (h *StoreHandler) storeWithProviderSlot(
+func (h *StoreHandler) storePiece(
 	ctx context.Context,
 	execution taskengine.Execution,
 	input storagepipeline.CopyGenerationInput,
@@ -248,7 +246,7 @@ func (h *StoreHandler) storeWithProviderSlot(
 	}
 	var stored *storage.StoreResult
 	var progress *uploadProgressReporter
-	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "store:"+checkpoint.IntendedPieceCID, checkpoint, checkpointSettlement, func(ctx context.Context) error {
+	attempted, err := execution.WithCheckpointedEffect(ctx, "store:"+checkpoint.IntendedPieceCID, checkpoint, checkpointSettlement, func(ctx context.Context) error {
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 			progress = h.newIngressProgressReporter(ctx, execution.ID(), input.Generation, copyRow.ID, checkpoint.IngressAttempt, content, bucket)
 		}

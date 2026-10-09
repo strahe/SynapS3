@@ -25,6 +25,9 @@ func validConfig() *Config {
 
 func TestValidate_DefaultConfig(t *testing.T) {
 	cfg := validConfig()
+	if cfg.Worker.Tasks.Concurrency != 12 || cfg.Worker.Tasks.UploadConcurrency != 4 {
+		t.Fatalf("default task concurrency = %d/%d, want 12/4", cfg.Worker.Tasks.Concurrency, cfg.Worker.Tasks.UploadConcurrency)
+	}
 	if cfg.Cache.EvictionPolicy != "lru" ||
 		cfg.Cache.LRUHighWatermarkPercent != 80 ||
 		cfg.Cache.LRULowWatermarkPercent != 50 {
@@ -195,16 +198,34 @@ func TestValidate_InvalidNetwork(t *testing.T) {
 	}
 }
 
-func TestValidate_WorkerConcurrency_Zero(t *testing.T) {
-	cfg := validConfig()
-	cfg.Worker.Tasks.Concurrency = 0
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error for concurrency=0")
-	}
-	if !strings.Contains(err.Error(), "concurrency") {
-		t.Fatalf("expected concurrency error, got: %v", err)
+func TestValidate_WorkerConcurrency(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		concurrency int
+		upload      int
+		field       string
+	}{
+		{name: "global zero", concurrency: 0, upload: 4, field: "worker.tasks.concurrency"},
+		{name: "global negative", concurrency: -1, upload: 4, field: "worker.tasks.concurrency"},
+		{name: "upload zero", concurrency: 12, upload: 0, field: "worker.tasks.upload_concurrency"},
+		{name: "upload negative", concurrency: 12, upload: -1, field: "worker.tasks.upload_concurrency"},
+		{name: "upload above global", concurrency: 2, upload: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Worker.Tasks.Concurrency = tt.concurrency
+			cfg.Worker.Tasks.UploadConcurrency = tt.upload
+			err := cfg.Validate()
+			if tt.field == "" {
+				if err != nil {
+					t.Fatalf("expected valid concurrency, got: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("expected %s error, got: %v", tt.field, err)
+			}
+		})
 	}
 }
 
@@ -589,8 +610,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_WORKER_TASKS_CONCURRENCY", "7")
 	t.Setenv("SYNAPS3_WORKER_TASKS_POLL_INTERVAL", "9s")
 	t.Setenv("SYNAPS3_WORKER_TASKS_LEASE_DURATION", "2m")
-	t.Setenv("SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", "3")
-	t.Setenv("SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", "2")
+	t.Setenv("SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY", "3")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", "16")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", "5s")
 	t.Setenv("SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", "true")
@@ -632,8 +652,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	if cfg.Worker.Tasks.Concurrency != 7 ||
 		cfg.Worker.Tasks.PollInterval != 9*time.Second ||
 		cfg.Worker.Tasks.LeaseDuration != 2*time.Minute ||
-		cfg.Worker.Tasks.ProviderMutationConcurrency != 3 ||
-		cfg.Worker.Tasks.DestructiveMutationConcurrency != 2 ||
+		cfg.Worker.Tasks.UploadConcurrency != 3 ||
 		cfg.Worker.Tasks.CommitMaxPieces != 16 ||
 		cfg.Worker.Tasks.CommitMaxWait != 5*time.Second ||
 		!cfg.Worker.Tasks.CommitSealOnCachePressure ||

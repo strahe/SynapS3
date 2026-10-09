@@ -709,7 +709,7 @@ func TestPutObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 		t.Fatalf("PutObject: %v", err)
 	}
 
-	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil {
 		t.Fatalf("ClaimNext: %v", err)
 	}
@@ -1003,7 +1003,7 @@ func TestPutObjectCreatesSuccessorForTerminalUploadPlan(t *testing.T) {
 			if err != nil || taskRow == nil {
 				t.Fatalf("upload plan = %#v, err=%v", taskRow, err)
 			}
-			claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+			claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 			if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 				t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
 			}
@@ -1061,7 +1061,7 @@ func TestPutObjectRejectsCompletedUploadPlanForCachedContent(t *testing.T) {
 	if err != nil || taskRow == nil {
 		t.Fatalf("upload plan = %#v, err=%v", taskRow, err)
 	}
-	claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+	claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
 	}
@@ -1220,7 +1220,7 @@ func TestPutObjectDuringContentCleanupAsksClientToRetry(t *testing.T) {
 	if err != nil || plan == nil {
 		t.Fatalf("upload plan = %#v, err=%v", plan, err)
 	}
-	claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+	claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != plan.ID {
 		t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
 	}

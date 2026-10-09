@@ -770,6 +770,12 @@ type RetirementGate struct {
 // Passed reports whether every predicate is satisfied.
 func (g RetirementGate) Passed() bool { return len(g.Blockers) == 0 }
 
+// TaskClaimFilter excludes tasks that cannot be admitted by the local engine.
+type TaskClaimFilter struct {
+	ExcludedTypes   []string
+	ExcludedTaskIDs []int64
+}
+
 // TaskRepository defines persistence operations for Task entities.
 type TaskRepository interface {
 	Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error)
@@ -789,7 +795,7 @@ type TaskRepository interface {
 	ResolveOperation(ctx context.Context, id, generation int64, key string) error
 	GetByIdentity(ctx context.Context, taskType model.TaskType, idempotencyKey string) (*model.Task, error)
 	PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error)
-	ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error)
+	ClaimNext(ctx context.Context, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error)
 	RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error)
 	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error
 	ValidateClaim(ctx context.Context, id, generation int64) error

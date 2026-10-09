@@ -1040,8 +1040,7 @@ export interface SettingsTaskWorkerConfig {
   concurrency: number
   poll_interval: string
   lease_duration: string
-  provider_mutation_concurrency: number
-  destructive_mutation_concurrency: number
+  upload_concurrency: number
   commit_max_pieces: number
   commit_max_wait: string
   commit_max_backlog: number

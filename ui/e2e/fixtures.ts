@@ -21,7 +21,7 @@ async function waitForExit(child: ChildProcessWithoutNullStreams, timeout: numbe
   })
 }
 
-async function stopProcess(child: ChildProcessWithoutNullStreams, timeout: number) {
+export async function stopProcess(child: ChildProcessWithoutNullStreams, timeout: number) {
   if (child.exitCode !== null) return { exitCode: child.exitCode, forced: false }
   child.kill('SIGTERM')
   try {
@@ -36,7 +36,7 @@ async function stopProcess(child: ChildProcessWithoutNullStreams, timeout: numbe
   }
 }
 
-async function startServer(commitMaxWait: string) {
+export async function startServer(commitMaxWait: string) {
   const child = spawn(serverBinary, ['--commit-max-wait', commitMaxWait], { stdio: ['ignore', 'pipe', 'pipe'] })
   child.stderr.on('data', (chunk) => {
     process.stderr.write(chunk)

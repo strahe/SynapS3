@@ -42,7 +42,6 @@ func communicationHarness(t *testing.T, db *bun.DB, types []model.TaskType, conf
 	configure(registry, service)
 	engine, err := NewEngine(EngineConfig{
 		Concurrency: 1, PollInterval: time.Millisecond, LeaseDuration: time.Minute,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}, repos, registry, nil)
 	if err != nil {
 		t.Fatal(err)

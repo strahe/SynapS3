@@ -102,6 +102,7 @@ type handlerRuntimeOptions struct {
 	highPercent          int
 	lowPercent           int
 	concurrency          int
+	uploadConcurrency    int
 	maxAttempts          *int
 	leaseDuration        time.Duration
 	observabilityChecker observability.RefreshChecker
@@ -176,7 +177,8 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 			Terminator:             options.terminator, Epochs: options.epochs,
 			ParkedPieces: options.parkedPieces, CommitNonces: options.commitNonces,
 			Observability: observabilityService, UploadSpeedProbe: options.uploadSpeedProbe,
-			EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
+			UploadConcurrency: options.uploadConcurrency,
+			EvictionPolicy:    options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 			LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 			DefaultCopies: 2, Logger: logger,
 			CommitMaxWait:             options.commitMaxWait,
@@ -199,7 +201,6 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, repos, registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new task engine: %v", err)
@@ -1962,9 +1963,8 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	if err := runtime.repos.StorageCleanup.BindTask(t.Context(), content.ID, 1, taskRow.ID); err != nil {
 		t.Fatalf("bind cleanup admission task: %v", err)
 	}
-	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
-	failing.remaining.Store(1)
-	runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: failing, maximum: 1}
+	rejectTaskCheckpoint(t, runtime.db, taskRow.ID)
+	runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
@@ -2175,7 +2175,6 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstPass, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -2422,6 +2421,15 @@ type validateFailureRepository struct {
 	err       error
 }
 
+func rejectTaskCheckpoint(t *testing.T, db *bun.DB, taskID int64) {
+	t.Helper()
+	if _, err := db.ExecContext(t.Context(), fmt.Sprintf(`
+		CREATE TRIGGER reject_checkpoint_admission BEFORE UPDATE OF checkpoint_json ON tasks
+		WHEN NEW.id = %d BEGIN SELECT RAISE(ABORT, 'temporary database failure'); END`, taskID)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (r *validateFailureRepository) ValidateClaim(ctx context.Context, id, generation int64) error {
 	if r.remaining.Add(-1) >= 0 {
 		return r.err
@@ -2429,11 +2437,11 @@ func (r *validateFailureRepository) ValidateClaim(ctx context.Context, id, gener
 	return r.TaskRepository.ValidateClaim(ctx, id, generation)
 }
 
-func (r *limitedClaimRepository) ClaimNext(ctx context.Context, lease time.Duration) (*model.Task, error) {
+func (r *limitedClaimRepository) ClaimNext(ctx context.Context, lease time.Duration, filter repository.TaskClaimFilter) (*model.Task, error) {
 	if r.claims.Load() >= r.maximum {
 		return nil, nil
 	}
-	claimed, err := r.TaskRepository.ClaimNext(ctx, lease)
+	claimed, err := r.TaskRepository.ClaimNext(ctx, lease, filter)
 	if claimed != nil && err == nil && (r.countType == "" || claimed.Type == r.countType) {
 		r.claims.Add(1)
 	}
@@ -2720,7 +2728,6 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-				ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 			}, &limitedRepos, runtime.registry, slog.Default())
 			if err != nil {
 				t.Fatal(err)
@@ -3239,9 +3246,8 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue data set ensure: %v", err)
 	}
-	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
-	failing.remaining.Store(1)
-	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	rejectTaskCheckpoint(t, runtime.db, taskRow.ID)
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
 	runtime.repos.Tasks = limited
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
@@ -3280,7 +3286,7 @@ func TestTaskHistorySurvivesReleasedStorageOwner(t *testing.T) {
 	})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
-	claimed, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claimed, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("claim copy task = %#v, err=%v", claimed, err)
 	}
@@ -3303,118 +3309,107 @@ func TestTaskHistorySurvivesReleasedStorageOwner(t *testing.T) {
 	}
 }
 
-func TestStoreTasksReachAndRespectProviderMutationLimit(t *testing.T) {
-	var running, maximum, cacheOpens atomic.Int64
-	entered := make(chan struct{}, 6)
-	release := make(chan struct{})
-	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
-		cacheOpens.Add(1)
-		return io.NopCloser(strings.NewReader(strings.Repeat("s", 128))), &cache.ObjectInfo{Size: 128}, nil
-	}}
-	storageClient := &testutil.MockStorageClient{}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		cache: cacheStore, storage: storageClient, policy: cache.EvictionPolicyNone, concurrency: 8,
-		// The holders wait on the provider for as long as the test keeps them. A
-		// lease they cannot lose keeps a slow race run from claiming them again
-		// mid-wait, which is not what this test is about.
-		leaseDuration: 5 * time.Second,
-	})
-	clients := make(map[string]sdktypes.BigInt)
-	tasks := make([]*model.Task, 0, 6)
-	for range 6 {
-		pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
-		clients[pipeline.targetSet.DataSetID.String()] = pipeline.targetClient.Copy()
-		tasks = append(tasks, bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore))
-	}
-	storageClient.OpenDataSetTargetFunc = func(_ context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
-		if opts.ProviderID == nil {
-			return nil, errors.New("missing provider identity")
-		}
-		clientID, ok := clients[dataSetID.String()]
-		if !ok {
-			return nil, errors.New("unknown data set identity")
-		}
-		targetDataSetID := dataSetID.Copy()
-		return &testutil.MockStorageTarget{
-			ProviderIDValue: opts.ProviderID.Copy(), DataSetIDValue: &targetDataSetID,
-			ClientDataSetIDValue: clientID, ServiceURLValue: "https://store-limit.example",
-			StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
-				current := running.Add(1)
-				for {
-					observed := maximum.Load()
-					if current <= observed || maximum.CompareAndSwap(observed, current) {
-						break
-					}
+func TestStoreTasksReachAndRespectTypeConcurrency(t *testing.T) {
+	for _, configuredLimit := range []int{0, 2} {
+		t.Run(fmt.Sprintf("configured=%d", configuredLimit), func(t *testing.T) {
+			limit := configuredLimit
+			if limit == 0 {
+				limit = 4
+			}
+			var running, maximum, cacheOpens atomic.Int64
+			entered := make(chan struct{}, limit+2)
+			release := make(chan struct{})
+			cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+				cacheOpens.Add(1)
+				return io.NopCloser(strings.NewReader(strings.Repeat("s", 128))), &cache.ObjectInfo{Size: 128}, nil
+			}}
+			storageClient := &testutil.MockStorageClient{}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				cache: cacheStore, storage: storageClient, policy: cache.EvictionPolicyNone, concurrency: 8, uploadConcurrency: configuredLimit,
+				// Keep blocked provider calls fenced under the race detector.
+				leaseDuration: 5 * time.Second,
+			})
+			clients := make(map[string]sdktypes.BigInt)
+			tasks := make([]*model.Task, 0, limit+2)
+			for range limit + 2 {
+				pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+				clients[pipeline.targetSet.DataSetID.String()] = pipeline.targetClient.Copy()
+				tasks = append(tasks, bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore))
+			}
+			storageClient.OpenDataSetTargetFunc = func(_ context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				if opts.ProviderID == nil {
+					return nil, errors.New("missing provider identity")
 				}
-				entered <- struct{}{}
-				<-release
-				running.Add(-1)
-				return nil, errors.New("injected ambiguous store result")
-			},
-		}, nil
-	}
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	for range 4 {
-		select {
-		case <-entered:
-		case <-time.After(3 * time.Second):
-			close(release)
-			t.Fatal("store tasks did not reach provider mutation concurrency")
-		}
-	}
-	select {
-	case <-entered:
-		close(release)
-		t.Fatal("store tasks exceeded provider mutation concurrency")
-	case <-time.After(50 * time.Millisecond):
-	}
-	// Tasks beyond the limit give their workers back instead of blocking on the
-	// gate, and they neither hash the bytes, checkpoint, nor spend retries.
-	yielded := make(map[int64]bool)
-	deadline := time.Now().Add(3 * time.Second)
-	for len(yielded) != 2 && time.Now().Before(deadline) {
-		clear(yielded)
-		for _, taskRow := range tasks {
-			stored, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID)
-			if err != nil {
+				clientID, ok := clients[dataSetID.String()]
+				if !ok {
+					return nil, errors.New("unknown data set identity")
+				}
+				targetDataSetID := dataSetID.Copy()
+				return &testutil.MockStorageTarget{
+					ProviderIDValue: opts.ProviderID.Copy(), DataSetIDValue: &targetDataSetID,
+					ClientDataSetIDValue: clientID, ServiceURLValue: "https://store-limit.example",
+					StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+						current := running.Add(1)
+						for {
+							observed := maximum.Load()
+							if current <= observed || maximum.CompareAndSwap(observed, current) {
+								break
+							}
+						}
+						entered <- struct{}{}
+						<-release
+						running.Add(-1)
+						return nil, errors.New("injected ambiguous store result")
+					},
+				}, nil
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			for range limit {
+				select {
+				case <-entered:
+				case <-time.After(3 * time.Second):
+					close(release)
+					t.Fatal("store tasks did not reach upload concurrency")
+				}
+			}
+			// Capacity waits never claim or prepare bytes; their original due time stays intact.
+			waiting := make(map[int64]bool)
+			for _, taskRow := range tasks {
+				stored, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID)
+				if err != nil {
+					close(release)
+					t.Fatalf("load store task: %v", err)
+				}
+				if stored.Status == model.TaskStatusPending && stored.ClaimGeneration == 0 &&
+					stored.WaitReason == nil && stored.RetryCount == 0 && len(stored.Checkpoint) == 0 &&
+					stored.WorkStartedAt == nil && stored.AvailableAt.Equal(taskRow.AvailableAt) {
+					waiting[stored.ID] = true
+				}
+			}
+			if len(waiting) != 2 || cacheOpens.Load() != int64(2*limit) {
 				close(release)
-				t.Fatalf("load store task: %v", err)
+				t.Fatalf("store tasks beyond the limit = waiting:%d cache opens:%d, want 2 unclaimed and %d opens", len(waiting), cacheOpens.Load(), 2*limit)
 			}
-			if stored.Status == model.TaskStatusPending && stored.ResumeMode == model.TaskResumeModeExecute &&
-				stored.WaitReason != nil && *stored.WaitReason == "resource" && stored.RetryCount == 0 && len(stored.Checkpoint) == 0 && stored.WorkStartedAt == nil {
-				yielded[stored.ID] = true
+			close(release)
+			for _, taskRow := range tasks {
+				if waiting[taskRow.ID] {
+					continue
+				}
+				waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+				})
 			}
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if len(yielded) != 2 || cacheOpens.Load() != 8 {
-		close(release)
-		t.Fatalf("store tasks beyond the limit = yielded:%d cache opens:%d, want 2 yielded and 8 opens", len(yielded), cacheOpens.Load())
-	}
-	close(release)
-	for _, taskRow := range tasks {
-		if yielded[taskRow.ID] {
-			continue
-		}
-		waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-			return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+			for id := range waiting {
+				waitForTask(t, runtime.repos, id, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+				})
+			}
+			// Identification and upload each read the cache; recovery may read it again.
+			if maximum.Load() != int64(limit) || cacheOpens.Load() < int64(2*len(tasks)) {
+				t.Fatalf("store upload concurrency = maximum:%d cache opens:%d, want %d and at least %d", maximum.Load(), cacheOpens.Load(), limit, 2*len(tasks))
+			}
 		})
-	}
-	for id := range yielded {
-		if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), id).Exec(t.Context()); err != nil {
-			t.Fatalf("wake yielded store task: %v", err)
-		}
-		waitForTask(t, runtime.repos, id, func(task *model.Task) bool {
-			return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-		})
-	}
-	// Every task read its bytes twice after taking a slot, once to identify them
-	// and once to send them. A store whose lease became uncertain while it waited
-	// on the provider is claimed again and may read them again, so the total is
-	// only a floor.
-	if maximum.Load() != 4 || cacheOpens.Load() < 12 {
-		t.Fatalf("store provider mutation = maximum:%d cache opens:%d, want 4 and at least 12", maximum.Load(), cacheOpens.Load())
 	}
 }
 
@@ -3691,7 +3686,6 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	limitedRepos.Tasks = limited
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -3940,7 +3934,6 @@ func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -4032,7 +4025,7 @@ func TestPullRecoverWithoutCheckpointReturnsToExecute(t *testing.T) {
 		return target, nil
 	}
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
-	claimed, err := runtime.repos.Tasks.ClaimNext(t.Context(), 100*time.Millisecond)
+	claimed, err := runtime.repos.Tasks.ClaimNext(t.Context(), 100*time.Millisecond, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("seed expired pull claim = %#v, err=%v", claimed, err)
 	}
@@ -4234,9 +4227,8 @@ func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 		}},
 	})
 	operation, taskRow := seedWalletTask(t, runtime, "wallet-admission-failure")
-	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
-	failing.remaining.Store(1)
-	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	rejectTaskCheckpoint(t, runtime.db, taskRow.ID)
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
 	runtime.repos.Tasks = limited
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
@@ -4453,7 +4445,6 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
@@ -4575,7 +4566,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 			}
 			// The migration task for the target copy has stopped.
 			storeTask := bindCopyTask(t, runtime, targetCopy, model.TaskTypeStorageStore)
-			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute)
+			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 			if err != nil || claimed == nil || claimed.ID != storeTask.ID {
 				t.Fatalf("claim migration task = %#v, err=%v", claimed, err)
 			}
@@ -4699,7 +4690,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 			}
 			// The write to the source has stopped before the replacement starts.
 			storeTask := bindCopyTask(t, runtime, sourceCopy, model.TaskTypeStorageStore)
-			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute)
+			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 			if err != nil || claimed == nil || claimed.ID != storeTask.ID {
 				t.Fatalf("claim source write = %#v, err=%v", claimed, err)
 			}
@@ -4898,9 +4889,8 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 	if err := runtime.repos.Contents.BindDataSetRetirementTask(ctx, target.ID, generation, taskRow.ID); err != nil {
 		t.Fatalf("bind retirement admission task: %v", err)
 	}
-	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
-	failing.remaining.Store(1)
-	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	rejectTaskCheckpoint(t, runtime.db, taskRow.ID)
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
 	runtime.repos.Tasks = limited
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)

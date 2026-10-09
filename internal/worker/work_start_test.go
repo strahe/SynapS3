@@ -37,7 +37,7 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 						t.Fatalf("start before actual effect = %#v, err=%v", prepared, err)
 					}
 					ready := time.Now()
-					attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", map[string]bool{"attempted": true}, nil, func(ctx context.Context) error {
+					attempted, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]bool{"attempted": true}, nil, func(ctx context.Context) error {
 						stored, err := harness.repos.Tasks.GetByID(ctx, execution.ID())
 						if err != nil || stored.WorkStartedAt == nil {
 							t.Fatalf("start during effect = %#v, err=%v", stored, err)
@@ -75,7 +75,7 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: func(context.Context, Execution) Result {
 		calls++
 		if calls == 1 {
-			return ResourceWait("Waiting for capacity")
+			return Wait(model.TaskResumeModeExecute, 0, "dependency", "Waiting for a dependency", nil)
 		}
 		return CompleteCycle(time.Hour, "Done", nil)
 	}}, nil)
@@ -83,7 +83,6 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 		t.Fatal(err)
 	}
 	row, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "test-cycle:1")
-	h.engine.resourceWaitDelay = func(int) time.Duration { return 0 }
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	waiting, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	if waiting.WorkStartedAt == nil {

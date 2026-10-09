@@ -70,7 +70,7 @@ func TestProviderUploadSpeedCompletionPreservesTaskHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	enqueueProviderSpeedTask(t, repos, "101", providerbenchmark.URLHash("https://provider.example"), "speed-task-history")
-	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil {
 		t.Fatalf("claim speed task = %#v, %v", claimed, err)
 	}
