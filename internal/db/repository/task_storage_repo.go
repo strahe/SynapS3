@@ -388,7 +388,10 @@ func (r *BunTaskRepo) ListCurrentFailedForSubject(ctx context.Context, subjectTy
 		limit = 100
 	}
 	var rows []model.Task
-	q := taskRoundsQuery(r.db, &rows, false).Where("task.status = ? AND task.superseded_at IS NULL", model.TaskStatusFailed).OrderExpr("task.id DESC").Limit(limit + 1)
+	// These leading order columns are fixed by the filters. Keeping them in
+	// the order lets PostgreSQL use the subject index even for NULL subjects.
+	q := taskRoundsQuery(r.db, &rows, false).Where("task.status = ? AND task.superseded_at IS NULL", model.TaskStatusFailed).
+		OrderExpr("task.subject_type DESC, task.subject_key DESC, task.superseded_at DESC, task.id DESC").Limit(limit + 1)
 	if subjectType == "" && subjectKey == "" {
 		q.Where("task.subject_type IS NULL AND task.subject_key IS NULL")
 	} else {

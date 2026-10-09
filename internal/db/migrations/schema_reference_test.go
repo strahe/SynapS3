@@ -149,10 +149,12 @@ func describeSchema(ctx context.Context, db bun.IDB, portable bool) ([]string, e
 	lines = append(lines, indexes...)
 	if portable {
 		// CHECK expressions are written per dialect, and only PostgreSQL has the
-		// C-collated companion indexes, whose names end in _c.
+		// C-collated companion indexes, whose names end in _c. The current-failed
+		// index also has a dialect-specific contract, checked separately.
 		lines = slices.DeleteFunc(lines, func(line string) bool {
 			fields := strings.Split(line, "|")
-			return fields[0] == "check" || (fields[0] == "index" && strings.HasSuffix(fields[2], "_c"))
+			return fields[0] == "check" || (fields[0] == "index" &&
+				(strings.HasSuffix(fields[2], "_c") || fields[2] == "idx_task_history_current_failed_subject"))
 		})
 	}
 	slices.Sort(lines)

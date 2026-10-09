@@ -17,7 +17,7 @@ const currentPolicyBeforeWorkHistory = `{"version":1,"backoff":{"initial_delay":
 
 func TestTaskWorkHistoryMigrationPreservesRoundsAndReferences(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted())-1)
+		migrateToLevel(t, db, migrationLevel(t, "2026100803"))
 		now := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 		ids := map[string]int64{}
 		for _, state := range []string{"pending", "running", "failed", "acknowledged", "completed", "cancelled", "superseded", "invalid", "unknown", "legacy"} {
@@ -211,7 +211,7 @@ func assertTaskMigrationJSON(t *testing.T, actual json.RawMessage, want string) 
 
 func TestTaskWorkHistoryMigrationRejectsPartialPostStateWithoutWrites(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted())-1)
+		migrateToLevel(t, db, migrationLevel(t, "2026100803"))
 		id := insertBaselineTestTask(t, db, "unchanged")
 		if _, err := db.ExecContext(t.Context(), `CREATE TABLE task_history (task_id BIGINT PRIMARY KEY)`); err != nil {
 			t.Fatal(err)
@@ -231,7 +231,7 @@ func TestTaskWorkHistoryMigrationRejectsPartialPostStateWithoutWrites(t *testing
 
 func TestTaskWorkHistoryConstraintsAndExactIndexSet(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted()))
+		migrateThrough(t, db, "2026100804")
 		id := insertBaselineTestTask(t, db, "working")
 		for _, statement := range []string{
 			`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP WHERE id=?`,

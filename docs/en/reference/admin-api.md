@@ -327,7 +327,7 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/wallet` | Wallet identity, balances, contract state, and business counters. |
+| `GET` | `/api/v1/wallet` | Wallet identity, balances, and contract state. |
 | `POST` | `/api/v1/wallet/fund` | Create a wallet funding operation. |
 | `POST` | `/api/v1/wallet/withdraw` | Create a wallet withdrawal operation. |
 | `POST` | `/api/v1/wallet/approve` | Create an explicit FWSS approval operation. Payload only accepts `client_request_id`. |

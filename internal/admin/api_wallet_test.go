@@ -29,30 +29,6 @@ func (s *stubWalletQuerier) GetWalletInfo(_ context.Context) (*synapse.WalletInf
 func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{
-		Name:          "wallet-proofset",
-		Status:        model.BucketStatusActive,
-		DefaultCopies: 1, MinimumDurableCopies: 1,
-	}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("creating bucket: %v", err)
-	}
-	upload := insertAdminStorageContentSnapshot(t, db, bucket.ID, "01J000000000000000WALLET0", 1, "wallet-checksum", 1)
-	pieceCID := "piece-wallet"
-	seedAdminCommittedCopies(t, db, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{{
-		ProviderID:     onChainID(t, "101"),
-		DataSetID:      onChainID(t, "1001"),
-		PieceID:        onChainIDPtr(t, "1"),
-		TransferMethod: model.StorageCopyTransferMethodIngress,
-		RetrievalURL:   "https://provider.example/wallet",
-	}})
-
-	taskService := newAdminTestTaskService(t, repos)
-	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "wallet-store-pending", model.TaskStatusPending)
-	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageCommit, "wallet-commit-completed", model.TaskStatusCompleted)
-	overviewSeedTask(t, taskService, repos, model.TaskTypeCacheEvict, "wallet-evict-pending", model.TaskStatusPending)
 
 	nonce := uint64(7)
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
@@ -79,7 +55,7 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 				LockupRatePerMonth:  big.NewInt(172800),
 			},
 		},
-	}, config.DefaultFilecoinCopies, testLogger()).WithTaskService(taskService)
+	}, config.DefaultFilecoinCopies, testLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/wallet", nil)
 	rr := httptest.NewRecorder()
@@ -95,6 +71,9 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	}
 	if _, ok := raw["fil_account"]; ok {
 		t.Fatal("response contains fil_account, want new wallet schema without FIL payment account")
+	}
+	if _, ok := raw["business"]; ok {
+		t.Fatal("response contains removed business statistics")
 	}
 
 	var resp walletResponse
@@ -121,18 +100,6 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	}
 	if resp.PaymentAccount == nil || resp.PaymentAccount.LockupRatePerMonth == nil || *resp.PaymentAccount.LockupRatePerMonth != "172800" {
 		t.Fatalf("payment_account.lockup_rate_per_month = %#v, want 172800", resp.PaymentAccount)
-	}
-	if resp.Business == nil {
-		t.Fatal("business = nil, want populated")
-	}
-	if resp.Business.DataSetCount != 1 {
-		t.Fatalf("data_set_count = %d, want 1", resp.Business.DataSetCount)
-	}
-	if resp.Business.OnchainTasksPending != 1 {
-		t.Fatalf("onchain_tasks_pending = %d, want 1", resp.Business.OnchainTasksPending)
-	}
-	if resp.Business.OnchainTasksCompleted != 1 {
-		t.Fatalf("onchain_tasks_completed = %d, want 1", resp.Business.OnchainTasksCompleted)
 	}
 }
 

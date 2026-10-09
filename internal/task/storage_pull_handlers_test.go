@@ -726,7 +726,7 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 				case "foreign content":
 					_, err = query.Set("content_id = ?", pipeline.upload.ID+1).Exec(t.Context())
 				case "foreign data set":
-					_, err = query.Set("storage_data_set_id = ?", pipeline.target.StorageDataSetID+1).Exec(t.Context())
+					_, err = query.Set("storage_data_set_id = ?", pipeline.source.StorageDataSetID).Exec(t.Context())
 				case "invalid authorization":
 					_, err = query.Set("extra_data_hex = ?", "invalid").Exec(t.Context())
 				case "invalid CID":

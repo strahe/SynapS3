@@ -27,7 +27,6 @@ type walletResponse struct {
 	WalletBalances *walletBalancesDTO  `json:"wallet_balances,omitempty"`
 	PaymentAccount *paymentAccountDTO  `json:"payment_account,omitempty"`
 	Contracts      *walletContractsDTO `json:"contracts,omitempty"`
-	Business       *walletBusinessDTO  `json:"business,omitempty"`
 	PartialErrors  map[string]string   `json:"partial_errors,omitempty"`
 }
 
@@ -66,12 +65,6 @@ type paymentAccountDTO struct {
 	LockupRatePerDay    *string `json:"lockup_rate_per_day"`
 	LockupRatePerMonth  *string `json:"lockup_rate_per_month"`
 	NoActiveSpend       bool    `json:"no_active_spend"`
-}
-
-type walletBusinessDTO struct {
-	DataSetCount          int `json:"data_set_count"`
-	OnchainTasksPending   int `json:"onchain_tasks_pending"`
-	OnchainTasksCompleted int `json:"onchain_tasks_completed"`
 }
 
 type walletOperationRequest struct {
@@ -149,51 +142,7 @@ func (s *Server) handleAPIWallet(w http.ResponseWriter, r *http.Request) {
 		resp.PartialErrors = info.Errors
 	}
 
-	// Business stats (best-effort, from local DB).
-	biz := &walletBusinessDTO{}
-	if cnt, dbErr := s.repos.Buckets.CountStorageDataSets(r.Context()); dbErr != nil {
-		s.logger.Warn("failed to count storage data sets", "error", dbErr)
-		if resp.PartialErrors == nil {
-			resp.PartialErrors = make(map[string]string)
-		}
-		resp.PartialErrors["data_set_count"] = "database query failed"
-	} else {
-		biz.DataSetCount = cnt
-	}
-
-	taskCounts, dbErr := s.repos.Tasks.CountByStatus(r.Context())
-	if dbErr != nil {
-		s.logger.Warn("failed to count tasks by status", "error", dbErr)
-		if resp.PartialErrors == nil {
-			resp.PartialErrors = make(map[string]string)
-		}
-		resp.PartialErrors["task_counts"] = "database query failed"
-	}
-	for _, tc := range taskCounts {
-		if !walletStorageTaskType(model.TaskType(tc.Type)) {
-			continue
-		}
-		switch tc.Status {
-		case string(model.TaskStatusPending), string(model.TaskStatusRunning):
-			biz.OnchainTasksPending += int(tc.Count)
-		case string(model.TaskStatusCompleted):
-			biz.OnchainTasksCompleted += int(tc.Count)
-		}
-	}
-	resp.Business = biz
-
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func walletStorageTaskType(taskType model.TaskType) bool {
-	switch taskType {
-	case model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageStore, model.TaskTypeStoragePull,
-		model.TaskTypeStorageCommit, model.TaskTypeStorageDataSetRetire,
-		model.TaskTypeProviderReplacementCoordinate:
-		return true
-	default:
-		return false
-	}
 }
 
 func (s *Server) handleAPIWalletFund(w http.ResponseWriter, r *http.Request) {

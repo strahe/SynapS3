@@ -39,7 +39,27 @@ func TestPostgresPrefixPlan(t *testing.T) {
 		t.Fatalf("ListCurrentVersionsByBucket: %v", err)
 	}
 	requireObjectVersionKeys(t, current, []string{"prefix/00010000.txt"})
-	assertPostgresPlanUsesIndex(t, db, "idx_objects_bucket_key_c", capture.last(t))
+	assertPostgresPlanUsesIndex(t, db, "idx_objects_bucket_key", capture.last(t))
+
+	capture.reset()
+	version, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "prefix/00010000.txt")
+	if err != nil || version == nil || version.Key != "prefix/00010000.txt" {
+		t.Fatalf("GET/HEAD current version=%+v, err=%v", version, err)
+	}
+	getPlan := assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.last(t))
+	if !strings.Contains(getPlan, "AND (key = 'prefix/00010000.txt'::text)") {
+		t.Fatalf("GET/HEAD key is not an index condition:\n%s", getPlan)
+	}
+
+	capture.reset()
+	keyVersions, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "prefix/00010000.txt", "", 10)
+	if err != nil || len(keyVersions) != 1 || keyVersions[0].Key != "prefix/00010000.txt" {
+		t.Fatalf("key version page=%+v, err=%v", keyVersions, err)
+	}
+	keyPlan := assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.last(t))
+	if !strings.Contains(keyPlan, "AND (key = 'prefix/00010000.txt'::text)") {
+		t.Fatalf("version-list key is not an index condition:\n%s", keyPlan)
+	}
 
 	capture.reset()
 	versions, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "under", "underX/literal.txt", "01J000000000000000PG000003", 10)
@@ -268,7 +288,7 @@ func (h *postgresQueryCapture) match(t *testing.T, fragment string) string {
 	return ""
 }
 
-func assertPostgresPlanUsesIndex(t *testing.T, db *bun.DB, indexName string, query string) {
+func assertPostgresPlanUsesIndex(t *testing.T, db *bun.DB, indexName string, query string) string {
 	t.Helper()
 	var plan []string
 	if err := db.NewRaw("EXPLAIN (ANALYZE, BUFFERS) "+query).Scan(context.Background(), &plan); err != nil {
@@ -279,6 +299,7 @@ func assertPostgresPlanUsesIndex(t *testing.T, db *bun.DB, indexName string, que
 		t.Fatalf("plan does not use %s:\n%s", indexName, joined)
 	}
 	t.Logf("plan for %s:\n%s", indexName, joined)
+	return joined
 }
 
 func bindStorageHealthVersion(

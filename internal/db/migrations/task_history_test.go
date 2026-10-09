@@ -13,7 +13,7 @@ import (
 
 func TestTaskHistoryMigrationsPreserveLegacyEvidence(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted())-4)
+		migrateToLevel(t, db, migrationLevel(t, "2026100601"))
 		store := insertBaselineTestTask(t, db, "legacy-store")
 		cleanup := insertBaselineTestTask(t, db, "legacy-cleanup")
 		deleted := insertBaselineTestTask(t, db, "deleted-high-water")
@@ -30,8 +30,8 @@ func TestTaskHistoryMigrationsPreserveLegacyEvidence(t *testing.T) {
 		if _, err := db.NewRaw("UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?", json.RawMessage(`{"submitted":true,"transaction":"0x123"}`), store).Exec(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		migrateToLevel(t, db, len(Migrations.Sorted())-1)
-		if err := validateSchema(t.Context(), db, Migrations, len(Migrations.Sorted())-1); err != nil {
+		migrateToLevel(t, db, migrationLevel(t, "2026100803"))
+		if err := validateSchema(t.Context(), db, Migrations, migrationLevel(t, "2026100803")); err != nil {
 			t.Fatal(err)
 		}
 		var stored struct {
@@ -103,7 +103,7 @@ func TestTaskHistoryMigrationsPreserveLegacyEvidence(t *testing.T) {
 
 func TestTaskHistoryConstraintsAndMinimalIndexes(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted())-1)
+		migrateToLevel(t, db, migrationLevel(t, "2026100803"))
 		source := insertBaselineTestTask(t, db, "source")
 		if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET acknowledged_at=CURRENT_TIMESTAMP WHERE id=?`, source); err == nil {
 			t.Fatal("non-failed task accepted acknowledgement")
@@ -153,7 +153,7 @@ func TestTaskHistoryConstraintsAndMinimalIndexes(t *testing.T) {
 
 func TestLegacyTaskSubjectsAreRepairedOnlyFromVerifiedInput(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted())-4)
+		migrateToLevel(t, db, migrationLevel(t, "2026100601"))
 		tests := []struct {
 			kind, input, oldType, oldKey, wantType, wantKey string
 		}{
@@ -181,7 +181,7 @@ func TestLegacyTaskSubjectsAreRepairedOnlyFromVerifiedInput(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		migrateToLevel(t, db, len(Migrations.Sorted())-1)
+		migrateToLevel(t, db, migrationLevel(t, "2026100803"))
 		for i, tc := range tests {
 			var actual struct{ SubjectType, SubjectKey *string }
 			if err := db.NewRaw(`SELECT subject_type,subject_key FROM tasks WHERE id=?`, ids[i]).Scan(t.Context(), &actual); err != nil {
@@ -261,7 +261,7 @@ func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
 
 func TestTaskPolicyMigrationRejectsPartialPostState(t *testing.T) {
 	db := newSQLiteMigrationDB(t, "task_partial")
-	migrateToLevel(t, db, len(Migrations.Sorted())-4)
+	migrateToLevel(t, db, migrationLevel(t, "2026100601"))
 	if _, err := db.ExecContext(t.Context(), "ALTER TABLE task_payloads ADD COLUMN policy_json TEXT"); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestTaskPolicyMigrationRejectsPartialPostState(t *testing.T) {
 
 func TestTaskScheduleMigrationRejectsPartialPostState(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted())-2)
+		migrateToLevel(t, db, migrationLevel(t, "2026100802"))
 		if _, err := db.ExecContext(t.Context(), `CREATE TABLE task_schedules (key TEXT PRIMARY KEY)`); err != nil {
 			t.Fatal(err)
 		}

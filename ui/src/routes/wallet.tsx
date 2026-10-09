@@ -397,21 +397,6 @@ function WalletPage() {
         </CardContent>
       </Card>
 
-      {data.business && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Business</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-4 sm:grid-cols-3">
-              <StatItem label="Data Sets" value={data.business.data_set_count} />
-              <StatItem label="On-chain Tasks Pending" value={data.business.onchain_tasks_pending} />
-              <StatItem label="On-chain Tasks Completed" value={data.business.onchain_tasks_completed} />
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       {data.contracts && (
         <Card>
           <CardHeader>
@@ -738,15 +723,6 @@ function OperationsTable({
         })}
       </TableBody>
     </Table>
-  )
-}
-
-function StatItem({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="text-center">
-      <div className="text-2xl font-bold">{value}</div>
-      <div className="mt-1 text-xs text-muted-foreground">{label}</div>
-    </div>
   )
 }
 
