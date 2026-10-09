@@ -24,10 +24,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
+        uses: ./.github/actions/setup-go
 
       - name: Validate report rules
         run: python3 -m unittest discover -s scripts -p 'test_s3_compatibility_report.py'
@@ -58,14 +55,16 @@ jobs:
 
       - name: Test documented S3 operations
         run: |
+          set -o pipefail
           go test -json -trimpath -tags='dev systemtest s3compat' -count=1 \
-            -run '^TestS3CompatibilityMatrix$' ./tests/system > "$RUNNER_TEMP/s3-matrix.json"
+            -run '^TestS3CompatibilityMatrix$' ./tests/system | tee "$RUNNER_TEMP/s3-matrix.json"
 
       - name: Test AWS CLI, rclone, and MinIO Client
         if: ${{ !cancelled() }}
         run: |
+          set -o pipefail
           go test -json -trimpath -tags='dev systemtest s3compat' -count=1 \
-            -run '^TestS3Clients$' ./tests/system > "$RUNNER_TEMP/s3-clients.json"
+            -run '^TestS3Clients$' ./tests/system | tee "$RUNNER_TEMP/s3-clients.json"
 
       - name: Publish compatibility summary
         if: ${{ always() }}

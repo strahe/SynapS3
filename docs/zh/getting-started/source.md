@@ -16,6 +16,7 @@ description: 在本地构建 SynapS3，初始化运行数据，并验证内嵌�
 - cgo 所需的 C toolchain，例如 `gcc` 或 `clang`。
 - Node.js 22.12 或更高版本。
 - pnpm 11。
+- PostgreSQL 18，或用于本地运行它的 Docker。
 
 ## 构建
 
@@ -27,6 +28,28 @@ make build
 
 命令会构建 React 仪表盘，将其嵌入二进制，并生成 `bin/synaps3`。
 
+## 准备 PostgreSQL
+
+SynapS3 把元数据存储在 PostgreSQL 中。可以使用归非超级用户角色所有的已有数据库，也可以在本地启动服务器用于评估。下面的示例创建名为 `synaps3` 的数据库和应用角色；其他名称通过连接 URL 指定。
+
+```bash
+printf 'PostgreSQL administrator password: '
+read -rs POSTGRES_PASSWORD
+printf '\n'
+printf 'SynapS3 database password: '
+read -rs POSTGRES_APP_PASSWORD
+printf '\n'
+export POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
+docker run -d --name synaps3-postgres --restart unless-stopped \
+  -e POSTGRES_DB=synaps3 -e POSTGRES_PASSWORD -e POSTGRES_APP_PASSWORD \
+  -p 127.0.0.1:5432:5432 -v synaps3-postgres-local:/var/lib/postgresql \
+  -v "$PWD/docker/postgres-init.sql:/docker-entrypoint-initdb.d/synaps3.sql:ro" \
+  postgres:18
+unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
+```
+
+只有 volume 为空时才会创建角色和设置密码。升级已有 PostgreSQL 17 volume 时，先用 17 备份，再恢复到新的 18 volume；验证恢复成功后再处理原 volume。
+
 ## 初始化运行数据
 
 ```bash
@@ -34,16 +57,19 @@ make build
 ./bin/synaps3 wallet generate
 ```
 
-`synaps3 init` 会创建 `~/.synaps3/config.toml`、`db/`、`cache/` 和 Admin 认证。请把命令打印出的 Admin 密码保存到密码管理器。非交互 init 可以在私密终端中从 `~/.synaps3/admin-initial-password` 读取密码。配置文件和密码文件都应保持 `0600` 权限。
+`synaps3 init` 会创建 `~/.synaps3/config.toml`、`cache/` 和 Admin 认证。请把命令打印出的 Admin 密码保存到密码管理器。非交互 init 可以在私密终端中从 `~/.synaps3/admin-initial-password` 读取密码。配置文件和密码文件都应保持 `0600` 权限。
 
-把生成的钱包私钥写入 `~/.synaps3/config.toml`：
+把使用应用密码的 PostgreSQL 连接 URL 和生成的钱包私钥写入 `~/.synaps3/config.toml`。使用已有数据库时，替换其中的角色和数据库名称：
 
 ```toml
+[database]
+dsn = "postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable"
+
 [filecoin]
 private_key = "0x..."
 ```
 
-不要让私钥进入 shell history。配置文件包含钱包材料，只应允许 SynapS3 运行账户读取。
+不要让数据库密码或私钥进入 shell history。配置文件包含凭据和钱包材料，只应允许 SynapS3 运行账户读取。
 
 在 Calibration 测试时，为钱包充值：
 
@@ -115,4 +141,5 @@ mc cat synaps3/demo/hello.txt
 | UI 构建失败 | 确认 Node.js 22.12 或更高版本，以及 pnpm 11 已安装。 |
 | Go 构建因 cgo 失败 | 确认 C toolchain 已安装并在 `PATH` 中。 |
 | `serve` 因 Admin 认证校验失败 | 新配置运行 `./bin/synaps3 init`；已有配置运行 `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml`。 |
+| `serve` 报告 `database.dsn is not set` | 在配置中设置 `database.dsn`，或设置 `SYNAPS3_DATABASE_DSN`。 |
 | `serve` 进入 setup 模式 | 设置 `filecoin.private_key` 或 `SYNAPS3_FILECOIN_PRIVATE_KEY`。 |

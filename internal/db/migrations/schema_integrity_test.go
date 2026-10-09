@@ -258,6 +258,18 @@ func TestInitialSchemaTaskOwnerForeignKeysAreRestrictive(t *testing.T) {
 	}
 }
 
+// The baseline recognizes its own committed post-state by this table list.
+func TestInitialSchemaTableListMatchesBaseline(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		migrateToLevel(t, db, 1)
+		tables := applicationSchemaTables(t, db)
+		slices.Sort(tables)
+		if !slices.Equal(tables, initialSchemaTables2026090101) {
+			t.Fatalf("baseline tables = %v, want %v", tables, initialSchemaTables2026090101)
+		}
+	})
+}
+
 func TestValidateTargetRejectsLegacyDatabaseWithoutModification(t *testing.T) {
 	db := newSQLiteMigrationDB(t, "legacy_rejection")
 	if _, err := db.Exec(`CREATE TABLE tasks (id INTEGER PRIMARY KEY, status TEXT)`); err != nil {
@@ -402,57 +414,6 @@ func TestFreshBaselineIsIdempotentAndCannotRollback(t *testing.T) {
 			t.Fatalf("tasks table exists=%t err=%v after rejected rollback", exists, err)
 		}
 	})
-}
-
-func TestValidateCurrentSchemaRejectsObsoleteCommitLedgerShape(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		ctx := t.Context()
-		migrator := NewMigrator(db)
-		if err := migrator.Init(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := migrator.Migrate(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if err := ValidateCurrentSchema(ctx, db); err != nil {
-			t.Fatalf("validate current schema: %v", err)
-		}
-		if _, err := db.ExecContext(ctx, `ALTER TABLE storage_commit_requests RENAME COLUMN status_url TO submission_json`); err != nil {
-			t.Fatalf("simulate obsolete commit ledger: %v", err)
-		}
-		if err := ValidateCurrentSchema(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
-			t.Fatalf("validate obsolete commit ledger = %v, want incompatible database", err)
-		}
-	})
-}
-
-// A database created from an earlier edit of the unreleased baseline carries a
-// shape the current baseline no longer has, and must be rebuilt.
-func TestValidateCurrentSchemaRejectsEarlierBaselineShapes(t *testing.T) {
-	for name, earlierShape := range map[string]string{
-		"without provider profiles":        `ALTER TABLE provider_profiles RENAME TO old_provider_profiles`,
-		"with replacement counters":        `ALTER TABLE storage_replacements ADD COLUMN items_total INTEGER NOT NULL DEFAULT 0`,
-		"with collection audit timestamps": `ALTER TABLE observability_collection_states ADD COLUMN created_at TIMESTAMP`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-				ctx := t.Context()
-				migrator := NewMigrator(db)
-				if err := migrator.Init(ctx); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := migrator.Migrate(ctx); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := db.ExecContext(ctx, earlierShape); err != nil {
-					t.Fatal(err)
-				}
-				if err := ValidateCurrentSchema(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
-					t.Fatalf("validate earlier baseline = %v, want rebuild guidance", err)
-				}
-			})
-		})
-	}
 }
 
 func runMigrationBody(ctx context.Context, db *bun.DB, body migrationBody) error {

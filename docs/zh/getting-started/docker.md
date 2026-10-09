@@ -10,7 +10,7 @@ Docker 默认让仪表盘和 Admin API 监听 `127.0.0.1:9090`。需要公网 Ad
 ## 前置条件
 
 - 安装了 Git、Make、curl、Docker Engine 和 Docker Compose v2.24 或更高版本的 Linux 主机。
-- 为 `synaps3-data` volume 准备可靠的本地磁盘。
+- 为 `synaps3-data` 和 `synaps3-postgres-data` volume 准备可靠的本地磁盘。
 - 从其他机器访问本机 Admin 时，需要 SSH 权限或可用的公网 HTTPS 域名。
 - 可充值的 Calibration 钱包；没有钱包时可以按本文步骤生成。
 
@@ -34,7 +34,11 @@ cd SynapS3
 
 默认使用发布镜像，Admin 只监听 `127.0.0.1:9090`。`IMAGE_SOURCE=local` 让 `make docker-up` 从当前 checkout 构建镜像；`ADMIN_DOMAIN` 会加载 Caddy，自动签发和续签证书，并把 HTTP 重定向到 HTTPS。两项可以同时使用。
 
-`docker-init` 拒绝覆盖已有 `.env`。创建后检查文件内容，并始终保持 `0600` 权限。
+每种组合都会同时启动 PostgreSQL 18 保存元数据。`docker-init` 会生成其密码：应用密码写入 `.env`，管理员密码写入 `.postgres-admin-password`。PostgreSQL 只监听 `127.0.0.1:15432`；需要其他端口时，在初始化命令中加上 `POSTGRES_PORT=<端口>`。SynapS3 以 `synaps3` 角色连接，该角色拥有数据库，但不是超级用户。
+
+改用已有的 PostgreSQL 服务器时，在初始化命令中加上 `DATABASE_SOURCE=external`，然后在 `.env` 中把 `SYNAPS3_DATABASE_DSN` 设为其连接 URL。
+
+`docker-init` 拒绝覆盖已有 `.env` 或 `.postgres-admin-password`。创建后检查这两个文件，并始终保持 `0600` 权限。
 
 ### Admin HTTPS 要求
 
@@ -100,6 +104,8 @@ make docker-verify
 | 本机 Admin | `http://127.0.0.1:9090` |
 | 公网 Admin | 仅 HTTPS 模式：`https://admin.example.com` |
 | SynapS3 运行数据 | Docker volume `synaps3-data` |
+| PostgreSQL 数据 | Docker volume `synaps3-postgres-data`（仅托管数据库） |
+| 数据库密码 | `.env` 和 `.postgres-admin-password` |
 | Caddy 状态 | 仅 HTTPS 模式：`synaps3-caddy-data`、`synaps3-caddy-config` |
 
 读取初始 Admin 密码：
@@ -136,11 +142,18 @@ Caddy 只保护仪表盘和 Admin API，不处理 S3 API。
 make docker-status
 make docker-logs
 make docker-logs DOCKER_SERVICE=synaps3
+make docker-logs DOCKER_SERVICE=postgres
 make docker-logs DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 # 仅 HTTPS 模式
 make docker-down
 ```
 
-日志默认显示最近 100 行。`docker-down` 会移除容器，但保留 `.env`、`synaps3-data` 和已有的 Caddy 证书 volume。
+日志默认显示最近 100 行。`docker-down` 会移除容器，但保留 `.env`、`.postgres-admin-password`、数据 volume 和已有的 Caddy 证书 volume。
+
+密码不会自动轮换。修改应用密码时，先在 PostgreSQL 中修改 `synaps3` 角色的密码，再更新 `.env` 中的 `POSTGRES_APP_PASSWORD`，然后运行 `make docker-up`。修改端口时，编辑 `.env` 中的 `POSTGRES_PORT` 并运行 `make docker-up`。
+
+已有 PostgreSQL 17 部署应先用 17 按下文步骤备份。恢复到 18 前，把 `compose.postgres.yaml` 中的 `volumes.postgres-data.name` 改为新的 volume 名称；验证恢复成功后再处理原 volume。
+
+PostgreSQL 只在 volume 为空时创建数据库和 `synaps3` 角色。如果首次启动失败，查看 `make docker-logs DOCKER_SERVICE=postgres`，修复原因后删除 `synaps3-postgres-data` volume，再运行 `make docker-up`。
 
 ## HTTPS 故障排查
 
@@ -159,16 +172,17 @@ make docker-logs DOCKER_SERVICE=caddy
 
 ## 备份 Docker 数据
 
-先检查健康状态并停止容器：
+先检查健康状态，再停止 SynapS3，保持 PostgreSQL 运行：
 
 ```bash
 make docker-verify
-make docker-down
+docker compose stop synaps3
 ```
 
-默认 SQLite 部署可以归档完整运行数据 volume：
+导出托管数据库，并归档保存配置和缓存的运行数据 volume：
 
 ```bash
+docker compose exec -T postgres pg_dump --username=synaps3 --dbname=synaps3 --format=custom > synaps3-db.dump
 docker run --rm \
   -v synaps3-data:/data:ro \
   -v "$PWD":/backup \
@@ -177,12 +191,28 @@ docker run --rm \
 docker run --rm \
   -v "$PWD":/backup \
   alpine:3 \
-  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256 && sha256sum -c synaps3-data.tgz.sha256'
+  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-db.dump synaps3-data.tgz > synaps3-backup.sha256 && sha256sum -c synaps3-backup.sha256'
 ```
 
-PostgreSQL 部署需要数据库原生备份，并保存同一时间点的配置和缓存。详细一致性与恢复顺序见[运行数据](../configuration/runtime-data.md)。Caddy volume 不属于数据库与缓存的一致性恢复点，但应保留以避免替换证书和 ACME 账户。
+把 `.env` 和 `.postgres-admin-password` 与备份一起保存。使用 `DATABASE_SOURCE=external` 时，改用该数据库服务器自己的工具备份，不要使用上面的 `pg_dump`。Caddy volume 不属于数据库与缓存的一致性恢复点，但应保留以避免替换证书和 ACME 账户。
 
 备份完成后运行 `make docker-up` 和 `make docker-verify`。
+
+恢复时，使用备份的 `.env` 和 `.postgres-admin-password`，从空 volume 开始，先导入数据库，再恢复运行数据：
+
+```bash
+docker compose up -d --wait postgres
+docker compose exec -T postgres pg_restore --username=synaps3 --dbname=synaps3 --no-owner --exit-on-error < synaps3-db.dump
+docker run --rm \
+  -v synaps3-data:/data \
+  -v "$PWD":/backup \
+  alpine:3 \
+  tar xzf /backup/synaps3-data.tgz -C /data
+make docker-up
+make docker-verify
+```
+
+详细一致性与恢复顺序见[运行数据](../configuration/runtime-data.md)。
 
 ## 升级
 

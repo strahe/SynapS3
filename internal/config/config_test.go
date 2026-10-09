@@ -2,7 +2,6 @@ package config
 
 import (
 	"errors"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +17,7 @@ func validConfig() *Config {
 		panic(err)
 	}
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
+	cfg.Database.DSN = "postgres://synaps3:password@127.0.0.1:5432/synaps3?sslmode=disable"
 	cfg.Admin.Auth.PasswordHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W"
 	cfg.Admin.Auth.SessionSecret = "admin-session-secret-with-enough-entropy"
 	return cfg
@@ -151,7 +151,7 @@ func TestValidate_InvalidDriver(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid driver")
 	}
-	if !strings.Contains(err.Error(), "database.driver") {
+	if !strings.Contains(err.Error(), "database.driver must be postgres") {
 		t.Fatalf("expected database.driver error, got: %v", err)
 	}
 }
@@ -484,7 +484,9 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	}
 
 	wantAppDir := filepath.Join(home, ".synaps3")
-	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
+	if cfg.Database.Driver != "postgres" || cfg.Database.DSN != "" {
+		t.Errorf("Database = %q %q, want postgres without a default DSN", cfg.Database.Driver, cfg.Database.DSN)
+	}
 	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
 	}
@@ -531,7 +533,7 @@ func TestLoad_CommitMaxWait(t *testing.T) {
 
 func TestLoad_EnvOverride(t *testing.T) {
 	t.Setenv("SYNAPS3_SERVER_PORT", ":9999")
-	t.Setenv("SYNAPS3_DATABASE_DRIVER", "postgres")
+	t.Setenv("SYNAPS3_DATABASE_DRIVER", "sqlite")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -540,8 +542,8 @@ func TestLoad_EnvOverride(t *testing.T) {
 	if cfg.Server.Port != ":9999" {
 		t.Errorf("Server.Port = %q, want %q", cfg.Server.Port, ":9999")
 	}
-	if cfg.Database.Driver != "postgres" {
-		t.Errorf("Database.Driver = %q, want %q", cfg.Database.Driver, "postgres")
+	if cfg.Database.Driver != "sqlite" {
+		t.Errorf("Database.Driver = %q, want %q", cfg.Database.Driver, "sqlite")
 	}
 }
 
@@ -700,7 +702,9 @@ port = ":9999"
 		t.Fatalf("Server.Port = %q, want :9999", cfg.Server.Port)
 	}
 	wantAppDir := filepath.Join(home, ".synaps3")
-	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
+	if cfg.Database.Driver != "postgres" || cfg.Database.DSN != "" {
+		t.Errorf("Database = %q %q, want postgres without a default DSN", cfg.Database.Driver, cfg.Database.DSN)
+	}
 	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
 	}
@@ -1030,28 +1034,6 @@ func withUserHomeDir(t *testing.T, home string) {
 		return home, nil
 	}
 	t.Cleanup(func() { userHomeDir = original })
-}
-
-func assertSQLiteDSNPath(t *testing.T, dsn, wantPath string) {
-	t.Helper()
-
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("parsing DSN %q: %v", dsn, err)
-	}
-	if u.Scheme != "file" {
-		t.Fatalf("DSN scheme = %q, want file", u.Scheme)
-	}
-	parsedPath := u.Path
-	if parsedPath == "" {
-		parsedPath = u.Opaque
-	}
-	if filepath.Clean(filepath.FromSlash(parsedPath)) != filepath.Clean(wantPath) {
-		t.Fatalf("DSN path = %q, want %q", filepath.FromSlash(parsedPath), wantPath)
-	}
-	if u.RawQuery != "" {
-		t.Fatalf("DSN query = %q, want empty", u.RawQuery)
-	}
 }
 
 func hasConfigFieldError(errs []FieldError, field string) bool {

@@ -5,7 +5,7 @@ description: 理解 SynapS3 配置、元数据、缓存数据的存放位置和�
 
 # 运行数据
 
-SynapS3 将配置、元数据和缓存对象数据存储在本地磁盘。应把这些数据放在可靠存储上。可用的备份必须让数据库和缓存处于同一恢复时间点。
+SynapS3 将配置和缓存对象数据存储在本地磁盘，元数据存储在 PostgreSQL 中。应把它们都放在可靠存储上。可用的备份必须让数据库和缓存处于同一恢复时间点。
 
 ## 默认本地布局
 
@@ -13,14 +13,10 @@ SynapS3 将配置、元数据和缓存对象数据存储在本地磁盘。应把
 ~/.synaps3/
   config.toml
   admin-initial-password
-  db/
-    synaps3.db
-    synaps3.db-shm
-    synaps3.db-wal
   cache/
 ```
 
-SQLite WAL 和 SHM 文件是正常现象。显式配置的 `database.dsn` 和 `cache.dir` 优先于默认值。
+显式配置的 `cache.dir` 优先于默认值。
 
 ## Docker 布局
 
@@ -30,11 +26,10 @@ SQLite WAL 和 SHM 文件是正常现象。显式配置的 `database.dsn` 和 `c
 /var/lib/synaps3/
   config.toml
   admin-initial-password
-  db/
   cache/
 ```
 
-Docker 部署通过 `synaps3-data` volume 挂载该路径。Docker 专用的生命周期和备份命令见 [Docker 部署](../getting-started/docker.md)。
+Docker 部署通过 `synaps3-data` volume 挂载该路径，托管 PostgreSQL 数据库保存在 `synaps3-postgres-data` volume 中。Docker 专用的生命周期和备份命令见 [Docker 部署](../getting-started/docker.md)。
 
 ## 必须持久保存的数据
 
@@ -42,7 +37,7 @@ Docker 部署通过 `synaps3-data` volume 挂载该路径。Docker 专用的生�
 | --- | --- |
 | `config.toml` | 保存未由环境变量管理的稳定运行设置。 |
 | `admin-initial-password` | 保存非交互 init 和密码重置生成的 Admin 密码。保持 `0600` 权限；安全保存密码后，只在本地 CLI 仍需自动读取时保留。 |
-| `db/` | 保存存储桶、对象、版本、后台任务、S3 用户和存储元数据。 |
+| PostgreSQL 数据库 | 保存存储桶、对象、版本、后台任务、S3 用户和存储元数据。 |
 | `cache/` | 保存本地持久化的对象字节，用于 Filecoin 上传和读取回填。 |
 | 环境密钥 | 可能保存 Filecoin 私钥和部署特定覆盖项。 |
 
@@ -56,29 +51,16 @@ Docker 部署通过 `synaps3-data` volume 挂载该路径。Docker 专用的生�
 
 不要在 SynapS3 仍在运行时创建文件系统归档。
 
-## SQLite 备份
+## 备份
 
-SQLite 是默认数据库。停止 SynapS3 后，备份完整运行数据目录，让数据库、WAL/SHM 文件、配置和缓存处于同一恢复时间点。以下示例使用源码部署的默认路径：
-
-```bash
-tar czf synaps3-data.tgz -C "$HOME/.synaps3" .
-tar tzf synaps3-data.tgz >/dev/null
-sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256
-sha256sum -c synaps3-data.tgz.sha256
-```
-
-当 `database.dsn` 或 `cache.dir` 指向其他路径时，替换上述路径，并把这些位置纳入同一恢复时间点。归档列表和校验和验证必须成功退出。将 `synaps3-data.tgz` 与 `synaps3-data.tgz.sha256` 一起保存到受保护的备份存储。
-
-## PostgreSQL 备份
-
-如果部署使用 PostgreSQL，停止 SynapS3 后：
+停止 SynapS3 后：
 
 1. 使用 `pg_dump`、托管数据库快照，或部署批准的 PostgreSQL 备份工具创建数据库原生备份。
-2. 单独备份 SynapS3 配置和缓存数据卷。
-3. 为数据库备份和数据卷归档标记相同的恢复时间点。
+2. 备份 SynapS3 配置和缓存目录。
+3. 为数据库备份以及配置和缓存归档标记相同的恢复时间点。
 4. 验证两个备份产物后再重启服务。
 
-PostgreSQL 原生备份代替复制 SQLite 数据库目录，但不能代替配置和缓存备份。
+托管数据库的具体命令见 [Docker 部署](../getting-started/docker.md#备份-docker-数据)。
 
 ## 重启并验证
 
@@ -93,15 +75,9 @@ synaps3 admin task stats
 
 ## 恢复顺序
 
-恢复 SQLite 归档前，先验证保存的副本：
-
-```bash
-sha256sum -c synaps3-data.tgz.sha256
-```
-
 1. 停止 SynapS3，并保持 S3 流量关闭。
-2. 验证归档校验和，确认数据库与缓存带有相同的恢复时间点标记。
-3. 把运行数据卷恢复到空的替换位置。PostgreSQL 部署先恢复数据库原生备份，再连接匹配的配置和缓存数据。
+2. 验证备份校验和，确认数据库与缓存带有相同的恢复时间点标记。
+3. 先把数据库原生备份恢复到空数据库，再把匹配的配置和缓存数据恢复到空位置。
 4. 确认恢复后的配置和凭据文件权限为 `0600`，并允许 SynapS3 运行账户读取。
 5. 启动 SynapS3，检查 `/healthz`、任务统计和失败任务，再通过 S3 API 读取一个已知对象。
 

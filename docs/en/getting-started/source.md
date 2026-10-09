@@ -16,6 +16,7 @@ For a container installation, see [Docker Deployment](./docker.md). This page co
 - A C toolchain for cgo, such as `gcc` or `clang`.
 - Node.js 22.12 or later.
 - pnpm 11.
+- PostgreSQL 18, or Docker to run it locally.
 
 ## Build
 
@@ -27,6 +28,28 @@ make build
 
 The command builds the React dashboard, embeds it, and writes `bin/synaps3`.
 
+## Prepare PostgreSQL
+
+SynapS3 stores metadata in PostgreSQL. Use an existing database owned by a non-superuser role, or start a local server for evaluation. The example creates a database and application role named `synaps3`; other names are supported through the connection URL.
+
+```bash
+printf 'PostgreSQL administrator password: '
+read -rs POSTGRES_PASSWORD
+printf '\n'
+printf 'SynapS3 database password: '
+read -rs POSTGRES_APP_PASSWORD
+printf '\n'
+export POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
+docker run -d --name synaps3-postgres --restart unless-stopped \
+  -e POSTGRES_DB=synaps3 -e POSTGRES_PASSWORD -e POSTGRES_APP_PASSWORD \
+  -p 127.0.0.1:5432:5432 -v synaps3-postgres-local:/var/lib/postgresql \
+  -v "$PWD/docker/postgres-init.sql:/docker-entrypoint-initdb.d/synaps3.sql:ro" \
+  postgres:18
+unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
+```
+
+The role and passwords are created only when the volume is empty. To upgrade an existing PostgreSQL 17 volume, back up with 17 and restore into a new 18 volume; keep the original until the restored database is verified.
+
 ## Initialize Runtime Data
 
 ```bash
@@ -34,16 +57,19 @@ The command builds the React dashboard, embeds it, and writes `bin/synaps3`.
 ./bin/synaps3 wallet generate
 ```
 
-`synaps3 init` creates `~/.synaps3/config.toml`, `db/`, `cache/`, and Admin auth. Save the printed Admin password in a password manager. If init is non-interactive, read it from `~/.synaps3/admin-initial-password` in a private terminal. Keep the configuration and password file at permission mode `0600`.
+`synaps3 init` creates `~/.synaps3/config.toml`, `cache/`, and Admin auth. Save the printed Admin password in a password manager. If init is non-interactive, read it from `~/.synaps3/admin-initial-password` in a private terminal. Keep the configuration and password file at permission mode `0600`.
 
-Add the generated wallet private key to `~/.synaps3/config.toml`:
+Add the PostgreSQL connection URL with the application password and the generated wallet private key to `~/.synaps3/config.toml`. For an existing database, use its role and database name:
 
 ```toml
+[database]
+dsn = "postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable"
+
 [filecoin]
 private_key = "0x..."
 ```
 
-Do not place the private key in shell history. The configuration file contains wallet material and must remain readable only by the SynapS3 account.
+Do not place the database password or private key in shell history. The configuration file contains credentials and wallet material and must remain readable only by the SynapS3 account.
 
 For Calibration testing, fund the wallet:
 
@@ -115,4 +141,5 @@ mc cat synaps3/demo/hello.txt
 | UI build fails | Confirm Node.js 22.12 or later and pnpm 11 are installed. |
 | Go build fails on cgo | Confirm a C toolchain is installed and visible in `PATH`. |
 | `serve` fails with Admin auth validation | Run `./bin/synaps3 init` for a fresh config, or `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml` for an existing config. |
+| `serve` reports `database.dsn is not set` | Set `database.dsn` in config or `SYNAPS3_DATABASE_DSN`. |
 | `serve` starts in setup mode | Set `filecoin.private_key` in config or `SYNAPS3_FILECOIN_PRIVATE_KEY`. |

@@ -47,14 +47,7 @@ synaps3 admin task stats
 4. 为替换安装配置空数据库和空缓存目录。
 5. 启动 SynapS3；验证健康状态、生效设置和后台任务处理后，再恢复流量。
 
-SQLite 在停止进程后创建一致性备份，并验证能够打开：
-
-```bash
-sqlite3 /old/path/synaps3.db ".backup '/backup/path/synaps3-pre-upgrade.db'"
-sqlite3 -readonly /backup/path/synaps3-pre-upgrade.db "PRAGMA integrity_check;"
-```
-
-完整性检查必须输出 `ok`。把备份、需要保留的 WAL/SHM 文件、匹配的缓存和配置作为同一恢复集保护。PostgreSQL 部署应使用 `pg_dump` 或部署批准的数据库快照，并单独验证该备份产物。
+停止进程后，使用 `pg_dump` 或部署批准的数据库快照备份数据库，并验证该备份产物。把备份、匹配的缓存和配置作为同一恢复集保护。
 
 SynapS3 不会修改不兼容的数据库。
 
@@ -103,7 +96,7 @@ synaps3 admin settings get
 
 1. 停止 S3 流量和 SynapS3。
 2. 验证备份校验和，选择同一恢复点的数据库和缓存产物。
-3. SQLite 恢复完整运行数据卷。PostgreSQL 先恢复数据库原生备份，再恢复匹配的配置和缓存数据。
+3. 先恢复数据库原生备份，再恢复匹配的配置和缓存数据。
 4. 回滚应用时，只使用与所选版本兼容的数据。无法确认兼容性时，恢复升级前的恢复点。
 5. 启动 SynapS3，然后检查 `/healthz`、生效设置、任务统计、failed 任务、钱包准备状态和已知 S3 对象。
 

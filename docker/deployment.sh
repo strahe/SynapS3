@@ -4,6 +4,7 @@ set -eu
 DOCKER_COMPOSE=${DOCKER_COMPOSE:-docker compose}
 CURL=${CURL:-curl}
 ENV_FILE=.env
+POSTGRES_ADMIN_PASSWORD_FILE=.postgres-admin-password
 DOCKER_WAIT_TIMEOUT=${DOCKER_WAIT_TIMEOUT:-120}
 DOCKER_VERIFY_ATTEMPTS=${DOCKER_VERIFY_ATTEMPTS:-10}
 DOCKER_VERIFY_DELAY=${DOCKER_VERIFY_DELAY:-3}
@@ -32,30 +33,75 @@ valid_domain() {
   printf '%s\n' "${domain##*.}" | grep -Eq '[A-Za-z]'
 }
 
-write_deployment_env() {
+valid_port() {
+  case "$1" in
+    '' | *[!0-9]* | 0*) return 1 ;;
+  esac
+  [ "${#1}" -le 5 ] && [ "$1" -le 65535 ]
+}
+
+random_secret() {
+  secret=$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')
+  [ "${#secret}" -eq 48 ] || {
+    echo "Could not generate a random password from /dev/urandom." >&2
+    exit 1
+  }
+  printf '%s' "$secret"
+}
+
+# publish_file links a fully written temporary file into place, so an existing
+# target is never overwritten and a failure leaves no partial file.
+publish_file() {
+  if ! ln "$1" "$2" 2>/dev/null; then
+    if [ -e "$2" ] || [ -L "$2" ]; then
+      echo "$2 appeared while Docker initialization was running; no changes were made." >&2
+    else
+      echo "Could not create $2 atomically. Check the current directory permissions and filesystem hard-link support." >&2
+    fi
+    return 1
+  fi
+}
+
+cleanup_init() {
+  rm -f "${env_temp:-}" "${password_temp:-}"
+  if [ "${created_password_file:-0}" = 1 ]; then
+    rm -f "$POSTGRES_ADMIN_PASSWORD_FILE"
+  fi
+}
+
+write_deployment_files() {
   umask 077
-  temp_file=$(mktemp "./.env.tmp.XXXXXX")
-  trap 'rm -f "$temp_file"' EXIT HUP INT TERM
+  created_password_file=0
+  trap cleanup_init EXIT HUP INT TERM
+  if [ "$database_source" = managed ]; then
+    password_temp=$(mktemp "./.postgres-admin-password.tmp.XXXXXX")
+    random_secret >"$password_temp"
+    chmod 600 "$password_temp"
+    app_password=$(random_secret)
+  fi
+  env_temp=$(mktemp "./.env.tmp.XXXXXX")
   {
     printf '# Docker deployment selection. Managed by make docker-init.\n'
     printf 'COMPOSE_FILE=%s\n' "$compose_files"
     if [ -n "$domain" ]; then
       printf 'ADMIN_DOMAIN=%s\n' "$domain"
     fi
+    if [ "$database_source" = managed ]; then
+      printf 'POSTGRES_APP_PASSWORD=%s\n' "$app_password"
+      printf 'POSTGRES_PORT=%s\n' "$postgres_port"
+    fi
     printf '\n'
     cat .env.example
-  } >"$temp_file"
-  chmod 600 "$temp_file"
+  } >"$env_temp"
+  chmod 600 "$env_temp"
 
-  if ! ln "$temp_file" "$ENV_FILE" 2>/dev/null; then
-    if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
-      echo "$ENV_FILE appeared while Docker initialization was running; no changes were made." >&2
-    else
-      echo "Could not create $ENV_FILE atomically. Check the current directory permissions and filesystem hard-link support." >&2
-    fi
-    exit 1
+  if [ "$database_source" = managed ]; then
+    publish_file "$password_temp" "$POSTGRES_ADMIN_PASSWORD_FILE" || exit 1
+    created_password_file=1
   fi
-  rm -f "$temp_file"
+  publish_file "$env_temp" "$ENV_FILE" || exit 1
+  created_password_file=0
+  cleanup_init
   trap - EXIT HUP INT TERM
 }
 
@@ -64,6 +110,25 @@ init_deployment() {
     echo "$ENV_FILE already exists; refusing to overwrite it." >&2
     exit 1
   fi
+  database_source=${DATABASE_SOURCE:-managed}
+  case "$database_source" in
+    managed)
+      if [ -e "$POSTGRES_ADMIN_PASSWORD_FILE" ] || [ -L "$POSTGRES_ADMIN_PASSWORD_FILE" ]; then
+        echo "$POSTGRES_ADMIN_PASSWORD_FILE already exists; refusing to overwrite it." >&2
+        exit 1
+      fi
+      postgres_port=${POSTGRES_PORT:-15432}
+      if ! valid_port "$postgres_port"; then
+        echo "POSTGRES_PORT must be a TCP port from 1 to 65535." >&2
+        exit 1
+      fi
+      ;;
+    external) ;;
+    *)
+      echo "DATABASE_SOURCE must be managed or external." >&2
+      exit 1
+      ;;
+  esac
 
   domain=${ADMIN_DOMAIN:-}
   if [ -n "$domain" ] && ! valid_domain "$domain"; then
@@ -71,9 +136,13 @@ init_deployment() {
     exit 1
   fi
 
+  compose_files=compose.yaml
+  if [ "$database_source" = managed ]; then
+    compose_files=$compose_files:compose.postgres.yaml
+  fi
   case "${IMAGE_SOURCE:-published}" in
-    published) compose_files=compose.yaml ;;
-    local) compose_files=compose.yaml:compose.local.yaml ;;
+    published) ;;
+    local) compose_files=$compose_files:compose.local.yaml ;;
     *)
       echo "IMAGE_SOURCE must be published or local." >&2
       exit 1
@@ -83,12 +152,17 @@ init_deployment() {
     compose_files=$compose_files:compose.admin-https.yaml
   fi
 
-  write_deployment_env
+  write_deployment_files
 
   if [ -n "$domain" ]; then
     echo "Created $ENV_FILE. Admin HTTPS will use https://$domain/."
   else
     echo "Created $ENV_FILE. Admin remains local at http://127.0.0.1:9090/."
+  fi
+  if [ "$database_source" = managed ]; then
+    echo "Managed PostgreSQL will listen on 127.0.0.1:$postgres_port; its administrator password is in $POSTGRES_ADMIN_PASSWORD_FILE."
+  else
+    echo "Next: set SYNAPS3_DATABASE_DSN in $ENV_FILE to your PostgreSQL connection URL."
   fi
   echo "Next: set SYNAPS3_FILECOIN_PRIVATE_KEY in $ENV_FILE before serving normal S3 traffic."
 }
@@ -152,6 +226,33 @@ check_deployment() {
       exit 1
     fi
   fi
+
+  case ":$compose_files:" in
+    *:compose.postgres.yaml:*)
+      if [ ! -f "$POSTGRES_ADMIN_PASSWORD_FILE" ]; then
+        echo "$POSTGRES_ADMIN_PASSWORD_FILE not found. It holds the managed PostgreSQL administrator password created by make docker-init." >&2
+        exit 1
+      fi
+      mode=$(file_mode "$POSTGRES_ADMIN_PASSWORD_FILE")
+      if [ "$mode" != 600 ]; then
+        echo "$POSTGRES_ADMIN_PASSWORD_FILE permissions are $mode; run: chmod 600 $POSTGRES_ADMIN_PASSWORD_FILE" >&2
+        exit 1
+      fi
+      password_count=$(grep -c '^POSTGRES_APP_PASSWORD=' "$ENV_FILE" || true)
+      if [ "$password_count" -ne 1 ]; then
+        echo "$ENV_FILE must contain exactly one POSTGRES_APP_PASSWORD entry." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      dsn_count=$(grep -c '^SYNAPS3_DATABASE_DSN=' "$ENV_FILE" || true)
+      dsn_set_count=$(grep -c '^SYNAPS3_DATABASE_DSN=.' "$ENV_FILE" || true)
+      if [ "$dsn_count" -ne 1 ] || [ "$dsn_set_count" -ne 1 ]; then
+        echo "$ENV_FILE must contain exactly one SYNAPS3_DATABASE_DSN entry with your PostgreSQL connection URL." >&2
+        exit 1
+      fi
+      ;;
+  esac
 
   compose config --quiet
 }
@@ -291,9 +392,9 @@ logs_deployment() {
       ;;
   esac
   case "$DOCKER_SERVICE" in
-    '' | synaps3 | caddy) ;;
+    '' | synaps3 | postgres | caddy) ;;
     *)
-      echo "DOCKER_SERVICE must be synaps3, caddy, or empty." >&2
+      echo "DOCKER_SERVICE must be synaps3, postgres, caddy, or empty." >&2
       exit 1
       ;;
   esac
@@ -311,11 +412,12 @@ logs_deployment() {
 command=${1:-}
 case "$command" in
   check | up | verify | down | status | logs | password)
-    if [ "${ADMIN_DOMAIN+x}" = x ] || [ "${COMPOSE_FILE+x}" = x ]; then
-      echo "This command reads ADMIN_DOMAIN and COMPOSE_FILE from $ENV_FILE. Unset the environment variables and retry; edit $ENV_FILE first to change the deployment selection." >&2
-      exit 1
-    fi
-    unset ADMIN_DOMAIN COMPOSE_FILE
+    for name in ADMIN_DOMAIN COMPOSE_FILE POSTGRES_APP_PASSWORD POSTGRES_PORT; do
+      if eval "[ \"\${$name+x}\" = x ]"; then
+        echo "This command reads ADMIN_DOMAIN, COMPOSE_FILE, POSTGRES_APP_PASSWORD, and POSTGRES_PORT from $ENV_FILE. Unset the environment variables and retry; edit $ENV_FILE first to change the deployment." >&2
+        exit 1
+      fi
+    done
     ;;
 esac
 
@@ -326,7 +428,7 @@ case "$command" in
   verify) verify_deployment ;;
   down)
     compose down --remove-orphans
-    echo "Containers removed. $ENV_FILE, runtime data, and any certificate volumes were preserved."
+    echo "Containers removed. $ENV_FILE, credential files, runtime data, the PostgreSQL volume, and any certificate volumes were preserved."
     ;;
   status) compose ps ;;
   logs) logs_deployment ;;

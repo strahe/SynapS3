@@ -29,6 +29,11 @@ const sqlitePreflightTimeout = 5 * time.Second
 
 // New creates a Bun database connection based on the provided configuration.
 func New(cfg config.DatabaseConfig) (*bun.DB, error) {
+	// A blank DSN would make pgx fall back to libpq environment defaults.
+	if strings.TrimSpace(cfg.DSN) == "" {
+		return nil, errors.New("database.dsn is not set; set it to a PostgreSQL connection URL in the config file or SYNAPS3_DATABASE_DSN")
+	}
+
 	var (
 		sqldb *sql.DB
 		err   error
@@ -151,10 +156,6 @@ func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
 	} else {
 		slog.Info("no new migrations to apply")
 	}
-	if err := migrations.ValidateCurrentSchema(ctx, db); err != nil {
-		return err
-	}
-
 	// Statistics are an operational concern, not part of the frozen DDL, and the
 	// initial migration returns early on an already-migrated database. Refreshing
 	// them here means a partial index such as idx_tasks_pending is costed against

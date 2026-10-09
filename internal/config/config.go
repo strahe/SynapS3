@@ -162,7 +162,7 @@ func DefaultFilecoinRPCURLs() map[string]string {
 
 func DefaultConfig() (*Config, error) {
 	cfg := defaultConfig()
-	if err := applyDefaultRuntimePaths(cfg, false, false); err != nil {
+	if err := applyDefaultRuntimePaths(cfg, false); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -190,7 +190,7 @@ func defaultConfig() *Config {
 			},
 		},
 		Database: DatabaseConfig{
-			Driver:       "sqlite",
+			Driver:       "postgres",
 			MaxOpenConns: 32,
 			MaxIdleConns: 2,
 		},
@@ -243,24 +243,8 @@ func defaultAppDataDir() (string, error) {
 	return filepath.Join(home, appDataDirName), nil
 }
 
-func defaultSQLiteDSN(appDataDir string) string {
-	dbPath := filepath.Join(appDataDir, "db", "synaps3.db")
-	urlPath := filepath.ToSlash(dbPath)
-	if filepath.VolumeName(dbPath) != "" && !strings.HasPrefix(urlPath, "/") {
-		urlPath = "/" + urlPath
-	}
-
-	u := url.URL{
-		Scheme: "file",
-		Path:   urlPath,
-	}
-	return u.String()
-}
-
-func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir bool) error {
-	hasDatabaseDSN = hasDatabaseDSN || strings.TrimSpace(cfg.Database.DSN) != ""
-	hasCacheDir = hasCacheDir || strings.TrimSpace(cfg.Cache.Dir) != ""
-	if hasDatabaseDSN && hasCacheDir {
+func applyDefaultRuntimePaths(cfg *Config, hasCacheDir bool) error {
+	if hasCacheDir || strings.TrimSpace(cfg.Cache.Dir) != "" {
 		return nil
 	}
 
@@ -268,12 +252,7 @@ func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir bool) err
 	if err != nil {
 		return err
 	}
-	if !hasDatabaseDSN {
-		cfg.Database.DSN = defaultSQLiteDSN(appDataDir)
-	}
-	if !hasCacheDir {
-		cfg.Cache.Dir = filepath.Join(appDataDir, "cache")
-	}
+	cfg.Cache.Dir = filepath.Join(appDataDir, "cache")
 	return nil
 }
 
@@ -355,7 +334,7 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 	}
 	cfg.Normalize()
 	if applyRuntimeDefaults {
-		if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
+		if err := applyDefaultRuntimePaths(cfg, k.Exists("cache.dir")); err != nil {
 			return nil, PersistedFieldPresence{}, fmt.Errorf("loading default runtime paths: %w", err)
 		}
 	}
@@ -468,12 +447,12 @@ func (c *Config) FieldValidationErrors() []FieldError {
 
 	// Database.
 	if strings.TrimSpace(c.Database.DSN) == "" {
-		add("database.dsn", "must be non-empty")
+		add("database.dsn", "must be set to a PostgreSQL connection URL")
 	}
 	switch c.Database.Driver {
 	case "postgres", "sqlite":
 	default:
-		add("database.driver", fmt.Sprintf("must be postgres or sqlite, got %q", c.Database.Driver))
+		add("database.driver", fmt.Sprintf("must be postgres, got %q", c.Database.Driver))
 	}
 	if c.Database.MaxOpenConns < 1 {
 		add("database.max_open_conns", fmt.Sprintf("must be >= 1, got %d", c.Database.MaxOpenConns))

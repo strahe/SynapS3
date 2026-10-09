@@ -86,6 +86,7 @@ func validServeConfig(t *testing.T) *config.Config {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
+	cfg.Database.DSN = "postgres://synaps3:password@127.0.0.1:5432/synaps3?sslmode=disable"
 	cfg.Admin.Auth.PasswordHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W"
 	cfg.Admin.Auth.SessionSecret = "admin-session-secret-with-enough-entropy"
 	return cfg

@@ -53,7 +53,7 @@ func initialize() {
 	defer cancel()
 	baseDSN = os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
 	if baseDSN == "" {
-		container, startErr = postgres.Run(ctx, "postgres:17",
+		container, startErr = postgres.Run(ctx, "postgres:18",
 			postgres.WithDatabase("synaps3_test"),
 			postgres.WithUsername("postgres"),
 			postgres.WithPassword("postgres"),

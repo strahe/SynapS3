@@ -87,7 +87,7 @@ func TestTaskWorkHistoryMigrationPreservesRoundsAndReferences(t *testing.T) {
 			t.Fatal(err)
 		}
 		migrateToLevel(t, db, len(Migrations.Sorted()))
-		if err := ValidateCurrentSchema(t.Context(), db); err != nil {
+		if err := validateCurrentSchema(t.Context(), db); err != nil {
 			t.Fatal(err)
 		}
 		for state, id := range ids {

@@ -112,7 +112,7 @@ func TestInitAppDataDir_DefaultCreatesReferenceConfigAndRuntimeDirs(t *testing.T
 	if !result.DefaultDir {
 		t.Fatal("DefaultDir = false, want true")
 	}
-	for _, path := range []string{result.Dir, result.DatabaseDir, result.CacheDir} {
+	for _, path := range []string{result.Dir, result.CacheDir} {
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatalf("Stat(%q): %v", path, err)
@@ -136,7 +136,12 @@ func TestInitAppDataDir_DefaultCreatesReferenceConfigAndRuntimeDirs(t *testing.T
 	if err != nil {
 		t.Fatalf("Load(%q): %v", result.ConfigPath, err)
 	}
-	assertSQLiteDSNPath(t, loaded.Database.DSN, filepath.Join(wantDir, "db", "synaps3.db"))
+	if _, err := os.Stat(filepath.Join(wantDir, "db")); !os.IsNotExist(err) {
+		t.Fatalf("init created a database directory: %v", err)
+	}
+	if loaded.Database.Driver != "postgres" || loaded.Database.DSN != "" {
+		t.Fatalf("Database = %q %q, want postgres with the DSN left to the operator", loaded.Database.Driver, loaded.Database.DSN)
+	}
 	if loaded.Cache.Dir != filepath.Join(wantDir, "cache") {
 		t.Fatalf("Cache.Dir = %q, want %q", loaded.Cache.Dir, filepath.Join(wantDir, "cache"))
 	}
@@ -195,7 +200,6 @@ func TestInitAppDataDir_CustomDirCreatesReferenceConfigForThatDir(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Load(%q): %v", result.ConfigPath, err)
 	}
-	assertSQLiteDSNPath(t, loaded.Database.DSN, filepath.Join(dir, "db", "synaps3.db"))
 	if loaded.Cache.Dir != filepath.Join(dir, "cache") {
 		t.Fatalf("Cache.Dir = %q, want %q", loaded.Cache.Dir, filepath.Join(dir, "cache"))
 	}
@@ -251,8 +255,8 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"private_key = \"\"",
 		"# network = \"calibration\"",
 		"[database]",
-		"driver = \"sqlite\"",
-		"dsn = ",
+		"# driver = \"postgres\"",
+		"dsn = \"\"",
 		"# max_open_conns = 32",
 		"[cache]",
 		"dir = ",
@@ -431,10 +435,10 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 	}
 	text := string(data)
 	for _, want := range []string{
-		"# Database connection string.",
+		"# PostgreSQL connection URL for the metadata database.",
 		"# dsn = \"\"",
 		"# max_open_conns = 32",
-		"driver = \"sqlite\"",
+		"driver = \"postgres\"",
 		"anchor_provider_tier = \"endorsed\"",
 		"dir = \"/var/lib/synaps3/cache\"",
 	} {
@@ -489,8 +493,7 @@ func assertGeneratedTOMLOnlyEnablesInitFields(t *testing.T, text string) {
 		"[filecoin]\n# Filecoin network used by synapse-go.",
 		"private_key = \"\"",
 		"[database]\n# Database backend used for metadata persistence.",
-		"driver = \"sqlite\"",
-		"dsn = ",
+		"dsn = \"\"",
 		"[cache]\n# Filesystem directory used for cached object data.",
 		"dir = ",
 		"[admin.auth]\n# Requires login for the Admin UI and Admin API.",

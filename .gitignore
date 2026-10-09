@@ -40,3 +40,6 @@ config.yaml
 ui/playwright-report/
 ui/test-results/
 .pnpm-store/
+
+# Generated PostgreSQL administrator password for the managed Docker database
+.postgres-admin-password

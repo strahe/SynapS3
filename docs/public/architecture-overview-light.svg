@@ -53,8 +53,8 @@
   <text class="small" x="472" y="275" text-anchor="middle">bucket, object, multipart</text>
 
   <rect class="node" x="628" y="202" width="198" height="92" rx="12"/>
-  <text class="label" x="727" y="235" text-anchor="middle">Local Cache + DB</text>
-  <text class="small" x="727" y="258" text-anchor="middle">write success after local save</text>
+  <text class="label" x="727" y="235" text-anchor="middle">Cache + PostgreSQL</text>
+  <text class="small" x="727" y="258" text-anchor="middle">write OK after cache + DB</text>
   <text class="small" x="727" y="275" text-anchor="middle">serve reads from cache first</text>
 
   <rect class="dash" x="374" y="384" width="196" height="92" rx="12"/>

@@ -55,6 +55,8 @@ type Harness struct {
 
 type HarnessOptions struct {
 	CommitMaxWait *time.Duration
+	// Database replaces the default private SQLite database.
+	Database *config.DatabaseConfig
 }
 
 // NewHarness creates and starts an isolated production runtime.
@@ -129,6 +131,9 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	}
 	if len(options) > 0 && options[0].CommitMaxWait != nil {
 		cfg.Worker.Tasks.CommitMaxWait = *options[0].CommitMaxWait
+	}
+	if len(options) > 0 && options[0].Database != nil {
+		cfg.Database = *options[0].Database
 	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(AdminPassword), bcrypt.MinCost)
 	if err != nil {

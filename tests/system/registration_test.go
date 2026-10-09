@@ -27,7 +27,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 	const objects = 12
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	harness, err := systemtest.NewHarness(t.Context(), logger)
+	harness, err := newSystemHarness(t, logger, systemtest.HarnessOptions{})
 	if err != nil {
 		t.Fatalf("NewHarness: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestSystemSmallObjectsRegisterTogether(t *testing.T) {
 func TestSystemManualSealBypassesLongCollectionWindow(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	wait := 30 * time.Minute
-	harness, err := systemtest.NewHarness(t.Context(), logger, systemtest.HarnessOptions{CommitMaxWait: &wait})
+	harness, err := newSystemHarness(t, logger, systemtest.HarnessOptions{CommitMaxWait: &wait})
 	if err != nil {
 		t.Fatal(err)
 	}

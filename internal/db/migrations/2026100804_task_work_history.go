@@ -196,24 +196,17 @@ func up2026100804TaskWorkHistory(ctx context.Context, db *bun.DB) error {
 	if err != nil {
 		return err
 	}
-	level := 0
-	for i, m := range Migrations.Sorted() {
-		if m.Name == "2026100804" {
-			level = i + 1
-			break
-		}
-	}
-	if level == 0 {
-		return ErrIncompatibleDatabase
-	}
 	if history {
-		if err := validateSchema(ctx, db, Migrations, level); err != nil {
-			return err
+		for _, index := range taskIndexes2026100804() {
+			ok, err := indexExists(ctx, db, index.name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return incompatibleDatabaseError()
+			}
 		}
 		return validateTaskReferences2026100804(ctx, db, "tasks")
-	}
-	if err := validateSchema(ctx, db, Migrations, level-1); err != nil {
-		return fmt.Errorf("task work/history migration requires a complete pre-state: %w", err)
 	}
 	if db.Dialect().Name() == dialect.PG {
 		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error { return migrateTaskWorkHistoryPostgres2026100804(ctx, tx) })
