@@ -122,6 +122,95 @@ func TestStoreWorkStartsAfterHashPreparation(t *testing.T) {
 	})
 }
 
+type storeClaimObserver struct {
+	repository.TaskRepository
+	lost chan struct{}
+}
+
+func (r *storeClaimObserver) ValidateClaim(ctx context.Context, id, generation int64) error {
+	err := r.TaskRepository.ValidateClaim(ctx, id, generation)
+	if errors.Is(err, repository.ErrTaskLeaseLost) {
+		select {
+		case r.lost <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
+
+func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
+	for _, scenario := range []string{"cancelled", "claim lost"} {
+		t.Run(scenario, func(t *testing.T) {
+			var reads, uploads atomic.Int64
+			cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+				reads.Add(1)
+				return io.NopCloser(strings.NewReader(strings.Repeat("h", 128))), &cache.ObjectInfo{Size: 128}, nil
+			}}
+			target := &testutil.MockStorageTarget{
+				ServiceURLValue: "https://store.example",
+				StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+					uploads.Add(1)
+					return nil, errors.New("unexpected upload")
+				},
+			}
+			runtime, pipeline, _ := storeRecoveryFixture(t, 1, strings.Repeat("h", 128), nil, cacheStore, target)
+			row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+			observer := &storeClaimObserver{TaskRepository: runtime.repos.Tasks, lost: make(chan struct{}, 1)}
+			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: observer, maximum: 1}
+			prepared := make(chan struct{}, 1)
+			runtime.storage.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				prepared <- struct{}{}
+				return target, nil
+			}
+			locked, release, unlocked := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			go func() {
+				runtime.gate.GuardDeletion(model.ContentCacheKey(pipeline.upload.ID), func() {
+					close(locked)
+					<-release
+				})
+				close(unlocked)
+			}()
+			<-locked
+			cancel, done := runHandlerEngine(t, runtime)
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+				<-unlocked
+				<-done
+			})
+			select {
+			case <-prepared:
+			case <-time.After(3 * time.Second):
+				t.Fatal("store did not prepare its target")
+			}
+			if scenario == "cancelled" {
+				cancel()
+			} else {
+				if _, err := runtime.db.NewRaw(`UPDATE tasks SET claim_generation = claim_generation + 1 WHERE id = ?`, row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(release)
+			if scenario == "claim lost" {
+				select {
+				case <-observer.lost:
+				case <-time.After(3 * time.Second):
+					t.Fatal("store did not revalidate its lost claim")
+				}
+				cancel()
+			}
+			<-done
+			if reads.Load() != 0 || uploads.Load() != 0 {
+				t.Fatalf("stopped store read cache %d times and uploaded %d times", reads.Load(), uploads.Load())
+			}
+		})
+	}
+}
+
 func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -486,7 +575,6 @@ func TestStoreRestartBeforeRetryCheckpointRechecksOldPiece(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstEngine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +651,6 @@ func TestStoreRestartAfterRetryCheckpointOnlyQueriesProvider(t *testing.T) {
 	}
 	restarted, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, runtime.repos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatal(err)

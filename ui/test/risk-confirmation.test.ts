@@ -29,8 +29,7 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'worker.tasks.concurrency': meta('Background Work Concurrency'),
   'worker.tasks.poll_interval': meta('Background Work Poll Interval'),
   'worker.tasks.lease_duration': meta('Recovery Lease Duration'),
-  'worker.tasks.provider_mutation_concurrency': meta('Remote Storage Concurrency'),
-  'worker.tasks.destructive_mutation_concurrency': meta('Remote Cleanup Concurrency'),
+  'worker.tasks.upload_concurrency': meta('Upload Concurrency'),
   'worker.tasks.commit_max_pieces': meta('Registration Size'),
   'worker.tasks.commit_max_wait': meta('Registration Wait'),
   'worker.tasks.commit_max_backlog': meta('Registration Backlog'),
@@ -75,8 +74,7 @@ function baseConfig(): SettingsEditableConfig {
         concurrency: 12,
         poll_interval: '5s',
         lease_duration: '5m0s',
-        provider_mutation_concurrency: 4,
-        destructive_mutation_concurrency: 2,
+        upload_concurrency: 4,
         commit_max_pieces: 32,
         commit_max_wait: '30s',
         commit_seal_on_cache_pressure: false,
@@ -157,8 +155,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.worker.tasks.concurrency = 16
   next.worker.tasks.poll_interval = '1s'
   next.worker.tasks.lease_duration = '2m0s'
-  next.worker.tasks.provider_mutation_concurrency = 6
-  next.worker.tasks.destructive_mutation_concurrency = 3
+  next.worker.tasks.upload_concurrency = 6
   next.worker.tasks.commit_max_pieces = 64
 
   const changes = collectSettingsRiskChanges(initial, next, {}, metadata)
@@ -189,8 +186,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['worker.tasks.concurrency', 'Background Work Concurrency', '12', '16', 'medium'],
       ['worker.tasks.poll_interval', 'Background Work Poll Interval', '5s', '1s', 'medium'],
       ['worker.tasks.lease_duration', 'Recovery Lease Duration', '5m0s', '2m0s', 'medium'],
-      ['worker.tasks.provider_mutation_concurrency', 'Remote Storage Concurrency', '4', '6', 'medium'],
-      ['worker.tasks.destructive_mutation_concurrency', 'Remote Cleanup Concurrency', '2', '3', 'medium'],
+      ['worker.tasks.upload_concurrency', 'Upload Concurrency', '4', '6', 'medium'],
       ['worker.tasks.commit_max_pieces', 'Registration Size', '32', '64', 'medium'],
     ]
   )

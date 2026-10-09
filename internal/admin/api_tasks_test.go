@@ -796,7 +796,7 @@ func (f *adminTaskFixture) enqueue(t *testing.T, taskType model.TaskType, key st
 
 func (f *adminTaskFixture) transition(t *testing.T, id int64, transition repository.TaskTransition) {
 	t.Helper()
-	claimed, err := f.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claimed, err := f.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil {
 		t.Fatalf("ClaimNext: %v", err)
 	}

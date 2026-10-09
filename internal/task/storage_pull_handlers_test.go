@@ -506,13 +506,7 @@ func (p *pullSlotProbe) Definition() taskengine.Definition {
 }
 
 func (p *pullSlotProbe) Execute(ctx context.Context, execution taskengine.Execution) taskengine.Result {
-	err := execution.WithResource(ctx, taskengine.ResourceProviderMutation, func(context.Context) error {
-		close(p.called)
-		return nil
-	})
-	if err != nil {
-		return taskengine.Fail(err, "probe_failed", nil)
-	}
+	close(p.called)
 	return taskengine.Complete("", nil)
 }
 
@@ -520,7 +514,7 @@ func (p *pullSlotProbe) Recover(context.Context, taskengine.Execution) taskengin
 	return taskengine.Fail(errors.New("probe unexpectedly recovered"), "probe_failed", nil)
 }
 
-func TestPullWaitReleasesWorkerAndMutationSlot(t *testing.T) {
+func TestPullWaitReleasesExecutionSlot(t *testing.T) {
 	for _, queueFull := range []bool{false, true} {
 		t.Run(fmt.Sprintf("queue full=%v", queueFull), func(t *testing.T) {
 			probe := &pullSlotProbe{called: make(chan struct{})}
@@ -547,7 +541,7 @@ func TestPullWaitReleasesWorkerAndMutationSlot(t *testing.T) {
 			}
 			row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-				Concurrency: 1, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+				Concurrency:  1,
 				PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 			}, runtime.repos, runtime.registry, slog.Default())
 			if err != nil {
@@ -565,7 +559,7 @@ func TestPullWaitReleasesWorkerAndMutationSlot(t *testing.T) {
 			select {
 			case <-probe.called:
 			case <-time.After(3 * time.Second):
-				t.Fatal("waiting pull retained the sole worker or provider mutation slot")
+				t.Fatal("waiting pull retained the sole execution slot")
 			}
 			waitForTask(t, runtime.repos, probeTask.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
 		})
@@ -644,7 +638,6 @@ func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-		ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
 	}, &limitedRepos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -751,7 +744,7 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 			prepareHandlerTaskFixtures(t, runtime)
 			limitedRepos := *runtime.repos
 			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1}, &limitedRepos, runtime.registry, slog.Default())
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &limitedRepos, runtime.registry, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -855,7 +848,7 @@ func runOneStorageTask(t *testing.T, runtime handlerTestRuntime, row *model.Task
 	prepareHandlerTaskFixtures(t, runtime)
 	repos := *runtime.repos
 	repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1}, &repos, runtime.registry, slog.Default())
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &repos, runtime.registry, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -993,7 +986,7 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 				t.Fatalf("released member owner = %#v, %v", released, err)
 			}
 			// Hold the registration owner while the other schedulers inspect its sealed members.
-			commitClaim, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Hour)
+			commitClaim, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Hour, repository.TaskClaimFilter{})
 			if err != nil || commitClaim == nil || commitClaim.ID != *original.TaskID {
 				t.Fatalf("claim original Commit owner: %#v, %v", commitClaim, err)
 			}
@@ -1016,7 +1009,7 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 3, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, ProviderMutationConcurrency: 2, DestructiveMutationConcurrency: 1}, runtime.repos, runtime.registry, slog.Default())
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 3, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, runtime.registry, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}

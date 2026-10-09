@@ -37,6 +37,7 @@ func NewUploadSpeedTestHandler(deps UploadSpeedTestDependencies) (*UploadSpeedTe
 func (h *UploadSpeedTestHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeProviderUploadSpeedTest, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
+		MaxConcurrency: 1,
 		Codec: taskengine.StrictJSONCodec(func(input *providerbenchmark.Input) error {
 			if input.ProviderID == "" || len(input.ServiceURLHash) != 64 {
 				return errors.New("invalid provider upload speed input")
@@ -126,18 +127,12 @@ func (h *UploadSpeedTestHandler) executeProviderUploadSpeed(ctx context.Context,
 		return h.failProviderUploadSpeed(execution, input, errors.New("provider is no longer available at the tested address"), "provider_changed")
 	}
 	var duration time.Duration
-	err = execution.WithResource(ctx, taskengine.ResourceProviderUploadSpeed, func(ctx context.Context) error {
-		_, effectErr := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "speed:"+input.ProviderID,
-			providerbenchmark.Checkpoint{Attempted: true}, nil, func(ctx context.Context) error {
-				var probeErr error
-				duration, probeErr = h.deps.UploadSpeedProbe.Probe(ctx, serviceURL)
-				return probeErr
-			})
-		return effectErr
-	})
-	if errors.Is(err, taskengine.ErrResourceBusy) {
-		return taskengine.ResourceWait("Waiting for another speed test or storage operation to finish")
-	}
+	_, err = execution.WithCheckpointedEffect(ctx, "speed:"+input.ProviderID,
+		providerbenchmark.Checkpoint{Attempted: true}, nil, func(ctx context.Context) error {
+			var probeErr error
+			duration, probeErr = h.deps.UploadSpeedProbe.Probe(ctx, serviceURL)
+			return probeErr
+		})
 	if err != nil {
 		code := "upload_failed"
 		if errors.Is(err, context.DeadlineExceeded) {

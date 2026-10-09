@@ -174,6 +174,9 @@ func TestInitAppDataDir_DefaultCreatesReferenceConfigAndRuntimeDirs(t *testing.T
 	if loaded.Worker.Tasks.Concurrency != defaults.Worker.Tasks.Concurrency {
 		t.Fatalf("Worker.Tasks.Concurrency = %d, want default %d", loaded.Worker.Tasks.Concurrency, defaults.Worker.Tasks.Concurrency)
 	}
+	if loaded.Worker.Tasks.UploadConcurrency != defaults.Worker.Tasks.UploadConcurrency {
+		t.Fatalf("Worker.Tasks.UploadConcurrency = %d, want default %d", loaded.Worker.Tasks.UploadConcurrency, defaults.Worker.Tasks.UploadConcurrency)
+	}
 	if loaded.Logging.Level != defaults.Logging.Level {
 		t.Fatalf("Logging.Level = %q, want default %q", loaded.Logging.Level, defaults.Logging.Level)
 	}
@@ -332,6 +335,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Cache.LRUHighWatermarkPercent = 87
 	cfg.Cache.LRULowWatermarkPercent = 72
 	cfg.Worker.Tasks.PollInterval = 7 * time.Second
+	cfg.Worker.Tasks.UploadConcurrency = 6
 	cfg.Worker.Tasks.LeaseDuration = 2 * time.Minute
 	cfg.Worker.Tasks.CommitSealOnCachePressure = true
 	cfg.Logging.S3Access.Enabled = false
@@ -369,6 +373,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"concurrency = 8",
 		"[worker.tasks]",
 		"poll_interval = \"7s\"",
+		"upload_concurrency = 6",
 		"commit_max_wait = \"30m0s\"",
 		"commit_seal_on_cache_pressure = true",
 		"[cache]",
@@ -397,6 +402,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	}
 	if loaded.Worker.Tasks.PollInterval != cfg.Worker.Tasks.PollInterval {
 		t.Fatalf("Task poll interval = %s, want %s", loaded.Worker.Tasks.PollInterval, cfg.Worker.Tasks.PollInterval)
+	}
+	if loaded.Worker.Tasks.UploadConcurrency != cfg.Worker.Tasks.UploadConcurrency {
+		t.Fatalf("Task upload concurrency = %d, want %d", loaded.Worker.Tasks.UploadConcurrency, cfg.Worker.Tasks.UploadConcurrency)
 	}
 	if loaded.Worker.Tasks.LeaseDuration != cfg.Worker.Tasks.LeaseDuration {
 		t.Fatalf("Task lease duration = %s, want %s", loaded.Worker.Tasks.LeaseDuration, cfg.Worker.Tasks.LeaseDuration)
@@ -538,6 +546,7 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", field: "filecoin.observability.timeout"},
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", field: "filecoin.observability.concurrency"},
 		{env: "SYNAPS3_CACHE_MAX_SIZE_GB", field: "cache.max_size_gb"},
+		{env: "SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY", field: "worker.tasks.upload_concurrency"},
 		{env: "SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", field: "cache.lru_high_watermark_percent"},
 		{env: "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", field: "cache.lru_low_watermark_percent"},
 		{env: "SYNAPS3_LOGGING_S3_ACCESS_ENABLED", field: "logging.s3_access.enabled"},

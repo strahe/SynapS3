@@ -51,6 +51,7 @@ type Dependencies struct {
 	Epochs                 synapse.ChainEpochReader
 	Observability          *observability.Service
 	UploadSpeedProbe       providerbenchmark.UploadProbe
+	UploadConcurrency      int
 	ParkedPieces           synapse.ParkedPieceChecker
 	CommitNonces           synapse.CommitNonceReader
 	EvictionPolicy         cache.EvictionPolicy
@@ -226,7 +227,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing plan: %w", err)
 	}
-	store, err := transfer.NewStoreHandler(transfer.StoreDependencies{Cache: deps.Cache, CacheGate: deps.CacheGate, Events: deps.Events, ParkedPieces: deps.ParkedPieces, CommitMaxBacklog: deps.CommitMaxBacklog, Logger: deps.Logger, Coordinator: copies, Resolver: resolver})
+	store, err := transfer.NewStoreHandler(transfer.StoreDependencies{Cache: deps.Cache, CacheGate: deps.CacheGate, Events: deps.Events, ParkedPieces: deps.ParkedPieces, CommitMaxBacklog: deps.CommitMaxBacklog, UploadConcurrency: deps.UploadConcurrency, Logger: deps.Logger, Coordinator: copies, Resolver: resolver})
 	if err != nil {
 		return points, fmt.Errorf("constructing store: %w", err)
 	}

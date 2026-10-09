@@ -254,11 +254,10 @@ func (r *calibrationRuntime) PrepareConfig() error {
 	cfg.Cache.MaxSizeGB = 1
 	cfg.Cache.EvictionPolicy = "after_upload"
 	cfg.Worker.Tasks = config.TaskWorkerConfig{
-		Concurrency:                    4,
-		PollInterval:                   5 * time.Second,
-		LeaseDuration:                  5 * time.Minute,
-		ProviderMutationConcurrency:    4,
-		DestructiveMutationConcurrency: 2,
+		Concurrency:       4,
+		PollInterval:      5 * time.Second,
+		LeaseDuration:     5 * time.Minute,
+		UploadConcurrency: config.DefaultUploadConcurrency,
 	}
 	cfg.Logging.Level = "warn"
 	cfg.Logging.Format = "text"

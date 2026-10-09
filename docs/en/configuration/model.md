@@ -73,7 +73,7 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `filecoin.observability` | Provider and local data set health checks. |
 | `database` | PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
-| `worker.tasks` | Shared background task execution and provider mutation limits. |
+| `worker.tasks` | Global background task and upload concurrency limits. |
 | `logging` | Runtime log level, format, and S3 access logs. |
 | `admin` | Dashboard, Admin API listener, and Admin auth settings. |
 
@@ -98,8 +98,7 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `worker.tasks.concurrency` | `12` |
 | `worker.tasks.poll_interval` | `5s` |
 | `worker.tasks.lease_duration` | `5m` |
-| `worker.tasks.provider_mutation_concurrency` | `4` |
-| `worker.tasks.destructive_mutation_concurrency` | `2` |
+| `worker.tasks.upload_concurrency` | `4` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
 | `worker.tasks.commit_seal_on_cache_pressure` | `false` |
@@ -110,9 +109,9 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` limits all background operations. Remote storage creation, Store, Pull, and commit submission additionally share `provider_mutation_concurrency`; remote cleanup and service retirement share `destructive_mutation_concurrency`. Status and confirmation checks do not consume either mutation limit. Wallet mutations are serialized. An operation that finds its limit full steps aside and tries again shortly instead of holding a `concurrency` slot, so other background work keeps running. Task settings require a SynapS3 restart. Each task type declares its finite retry policy; each execution retains the policy recorded when created. Task history is retained indefinitely.
+`worker.tasks.concurrency` limits all running background tasks, including recovery. `upload_concurrency` additionally limits simultaneous uploads, including reading and hashing cached data. Both must be positive; an upload limit above the global limit is valid. Tasks without a free slot remain queued in due order while other task types can proceed. Wallet operations and upload measurements each run one at a time. Task settings require a SynapS3 restart. Each task type declares its finite retry policy; each execution retains the policy recorded when created. Task history is retained indefinitely.
 
-Uploads and replicas copied to the same storage service collect together until submission can proceed. `commit_max_pieces` (1–200) limits pieces per transaction, not the collection size; storage services with a data set ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. The next batch becomes eligible when collected pieces reach the applicable per-transaction limit, the service stops accepting new data, submission is requested manually, or the oldest piece has waited `commit_max_wait` (0–30m); `0s` removes the collection delay. Every batch waits for one of the service's four in-flight slots and for earlier signed batches ready to submit. It then signs the oldest pieces up to the limit and immediately attempts submission; remaining pieces keep collecting with their original wait times. A signed batch may still wait for shared sending resources. Upload data awaiting submission stays in the local cache. Longer windows delay submission, replica copies that need a committed source, and local cache eviction.
+Uploads and replicas copied to the same storage service collect together until submission can proceed. `commit_max_pieces` (1–200) limits pieces per transaction, not the collection size; storage services with a data set ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. The next batch becomes eligible when collected pieces reach the applicable per-transaction limit, the service stops accepting new data, submission is requested manually, or the oldest piece has waited `commit_max_wait` (0–30m); `0s` removes the collection delay. Every batch waits for one of the service's four in-flight slots and for earlier signed batches ready to submit. It then signs the oldest pieces up to the limit and immediately attempts submission; remaining pieces keep collecting with their original wait times. Upload data awaiting submission stays in the local cache. Longer windows delay submission, replica copies that need a committed source, and local cache eviction.
 
 Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one storage service for an unsent batch, new uploads and replica copies to it wait. A batch that does not fit one add-pieces message is split and signed again with fewer pieces.
 

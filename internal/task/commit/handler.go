@@ -37,6 +37,7 @@ type commitCheckpoint struct {
 func (h *Handler) commitHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeStorageCommit, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
+		MaxConcurrency: 4,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CommitRequestInput) error {
 			return storagepipeline.ValidateCommitRequestInput(*input)
 		}),
@@ -315,7 +316,7 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 		return retryTask(err, "commit_queue_load_failed")
 	}
 	if queue.Submitted >= storagecommit.MaxSubmittedRequestsPerDataSet || queue.ReadyHead != request.RequestID {
-		return taskengine.ResourceWait(commitQueueMessage)
+		return taskengine.Wait(model.TaskResumeModeExecute, commitCollectionPollInterval, storagecommit.CommitQueueWaitReason, commitQueueMessage, nil)
 	}
 	target, commit, result, ok := h.loadCommit(ctx, run)
 	if !ok {
@@ -342,7 +343,7 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 
 	var sent storagecommit.SendResult
 	now := time.Now().UTC()
-	attempted, err := run.execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "commit:"+request.RequestID,
+	attempted, err := run.execution.WithCheckpointedEffect(ctx, "commit:"+request.RequestID,
 		commitCheckpoint{RequestID: request.RequestID, Sends: 1, SentAt: now},
 		func(ctx context.Context, repos *repository.Repositories) error {
 			if err := repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{
@@ -357,14 +358,10 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 			return nil
 		})
 	if !attempted {
-		switch {
-		case errors.Is(err, taskengine.ErrResourceBusy):
-			return taskengine.ResourceWait("Waiting for other storage operations to finish")
-		case errors.Is(err, storagecommit.ErrNotEligible):
-			return taskengine.ResourceWait(commitQueueMessage)
-		default:
-			return retryTask(err, "commit_submit_not_started")
+		if errors.Is(err, storagecommit.ErrNotEligible) {
+			return taskengine.Wait(model.TaskResumeModeExecute, commitCollectionPollInterval, storagecommit.CommitQueueWaitReason, commitQueueMessage, nil)
 		}
+		return retryTask(err, "commit_submit_not_started")
 	}
 	return h.settleFirstSend(ctx, run, target, commit, sent)
 }
@@ -497,7 +494,7 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 	sends := request.Sends + 1
 	now := time.Now().UTC()
 	var sent storagecommit.SendResult
-	attempted, err := run.execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "commit:"+request.RequestID,
+	attempted, err := run.execution.WithCheckpointedEffect(ctx, "commit:"+request.RequestID,
 		commitCheckpoint{RequestID: request.RequestID, Sends: sends, SentAt: now},
 		func(ctx context.Context, repos *repository.Repositories) error {
 			if noted != nil {
@@ -517,9 +514,6 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 			return nil
 		})
 	if !attempted {
-		if errors.Is(err, taskengine.ErrResourceBusy) {
-			return taskengine.ResourceWait("Waiting for other storage operations to finish")
-		}
 		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, nil)
 	}
 	//exhaustive:enforce

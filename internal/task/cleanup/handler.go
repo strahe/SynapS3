@@ -79,8 +79,9 @@ type cleanupCheckpoint struct {
 func (h *Handler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeStorageCleanup, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
-		Codec:  taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(), ObservationWindow: cleanupAttentionAfter}, AllowRetry: true,
+		MaxConcurrency: 2,
+		Codec:          taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
+		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(), ObservationWindow: cleanupAttentionAfter}, AllowRetry: true,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) int64 {
 			return input.ContentID
 		}),
@@ -251,7 +252,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			}
 		}
 		var txHash string
-		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, fmt.Sprintf("cleanup:%d", copyRow.ID), checkpoint, settlement, func(ctx context.Context) error {
+		attempted, err := execution.WithCheckpointedEffect(ctx, fmt.Sprintf("cleanup:%d", copyRow.ID), checkpoint, settlement, func(ctx context.Context) error {
 			result, deleteErr := cleanupContext.DeletePieceByID(ctx, copyRow.PieceID.SDK())
 			if result != nil && result.Hash != (common.Hash{}) {
 				txHash = result.Hash.String()
@@ -266,9 +267,6 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		}
 		if err != nil {
 			if !attempted {
-				if errors.Is(err, taskengine.ErrResourceBusy) {
-					return taskengine.ResourceWait("Waiting for other removal operations to finish")
-				}
 				return retryTask(err, "cleanup_not_started")
 			}
 			if ctx.Err() == nil {

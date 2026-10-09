@@ -66,7 +66,7 @@ test-race-ci:
 	$(CGO) go test -race -tags dev -count=1 -run '^Test(AdminEventHub.*|CachedWalletQuerier_(CoalescesConcurrentMisses|WaiterContextCanCancel))$$' ./internal/admin
 	$(CGO) go test -race -tags dev -count=1 -run '^Test(PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction$$' ./internal/backend
 	$(CGO) go test -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task
-	$(CGO) go test -race -tags dev -count=1 -run '^Test(Engine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork)|Resource(GateYieldsWhenFullAndReusesHeldSlot|WaitFreesWorkersForOtherTasks))$$' ./internal/worker
+	$(CGO) go test -race -tags dev -count=1 -run '^TestEngine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork|TypeConcurrencyPreservesQueueAndFairness|GlobalConcurrencyIncludesUnrestrictedTypes|ActiveClaimCannotBeReclaimedBeforeInvocationReturns|ConcurrencyHeldThroughSettlement|ShutdownWaitsForInvocations)$$' ./internal/worker
 
 test-postgres:
 	$(CGO) go test -tags=postgres -count=1 ./internal/testpg ./internal/db/migrations ./internal/db/repository ./internal/worker

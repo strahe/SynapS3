@@ -102,8 +102,7 @@ const tabFields = {
     'worker.tasks.concurrency',
     'worker.tasks.poll_interval',
     'worker.tasks.lease_duration',
-    'worker.tasks.provider_mutation_concurrency',
-    'worker.tasks.destructive_mutation_concurrency',
+    'worker.tasks.upload_concurrency',
     'worker.tasks.commit_max_pieces',
     'worker.tasks.commit_max_wait',
     'worker.tasks.commit_seal_on_cache_pressure',
@@ -957,20 +956,12 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, lease_duration: next })}
         />
         <NumberField
-          label="Storage Mutation Concurrency"
-          field="worker.tasks.provider_mutation_concurrency"
-          value={value.provider_mutation_concurrency}
+          label="Upload Concurrency"
+          field="worker.tasks.upload_concurrency"
+          value={value.upload_concurrency}
           data={data}
           errors={errors}
-          onChange={(next) => onChange({ ...value, provider_mutation_concurrency: next })}
-        />
-        <NumberField
-          label="Removal Concurrency"
-          field="worker.tasks.destructive_mutation_concurrency"
-          value={value.destructive_mutation_concurrency}
-          data={data}
-          errors={errors}
-          onChange={(next) => onChange({ ...value, destructive_mutation_concurrency: next })}
+          onChange={(next) => onChange({ ...value, upload_concurrency: next })}
         />
         <NumberField
           label="Registration Size"

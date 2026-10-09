@@ -93,6 +93,7 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		{field: "filecoin.default_copies", env: "SYNAPS3_FILECOIN_DEFAULT_COPIES"},
 		{field: "filecoin.anchor_provider_tier", env: "SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER"},
 		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
+		{field: "worker.tasks.upload_concurrency", env: "SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY"},
 	}
 	for _, tt := range tests {
 		meta, ok := resp.Metadata[tt.field]
@@ -449,7 +450,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 			"lru_high_watermark_percent":86,
 			"lru_low_watermark_percent":71
 		},
-		"worker":{"tasks":{"poll_interval":"9s"}},
+		"worker":{"tasks":{"poll_interval":"9s","concurrency":2,"upload_concurrency":4}},
 		"logging":{"format":"text","s3_access":{"enabled":false,"level":"debug"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -472,6 +473,8 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 		resp.Config.Cache.EvictionPolicy != "after_upload" ||
 		resp.Config.Cache.LRUHighWatermarkPercent != 86 ||
 		resp.Config.Cache.LRULowWatermarkPercent != 71 ||
+		resp.Config.Worker.Tasks.Concurrency != 2 ||
+		resp.Config.Worker.Tasks.UploadConcurrency != 4 ||
 		resp.Config.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("updated config = %#v", resp.Config)
 	}
@@ -485,6 +488,9 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Worker.Tasks.PollInterval.String() != "9s" {
 		t.Fatalf("saved worker.tasks.poll_interval = %s, want 9s", loaded.Worker.Tasks.PollInterval)
+	}
+	if loaded.Worker.Tasks.Concurrency != 2 || loaded.Worker.Tasks.UploadConcurrency != 4 {
+		t.Fatalf("saved task concurrency = %d/%d, want 2/4", loaded.Worker.Tasks.Concurrency, loaded.Worker.Tasks.UploadConcurrency)
 	}
 	if loaded.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("saved filecoin.default_copies = %d, want 3", loaded.Filecoin.DefaultCopies)
@@ -753,8 +759,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "task concurrency", envName: "SYNAPS3_WORKER_TASKS_CONCURRENCY", payload: `{"worker":{"tasks":{"concurrency":2}}}`, field: "worker.tasks.concurrency"},
 		{name: "task poll interval", envName: "SYNAPS3_WORKER_TASKS_POLL_INTERVAL", payload: `{"worker":{"tasks":{"poll_interval":"9s"}}}`, field: "worker.tasks.poll_interval"},
 		{name: "task lease duration", envName: "SYNAPS3_WORKER_TASKS_LEASE_DURATION", payload: `{"worker":{"tasks":{"lease_duration":"9m"}}}`, field: "worker.tasks.lease_duration"},
-		{name: "provider mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"provider_mutation_concurrency":2}}}`, field: "worker.tasks.provider_mutation_concurrency"},
-		{name: "destructive mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"destructive_mutation_concurrency":2}}}`, field: "worker.tasks.destructive_mutation_concurrency"},
+		{name: "upload concurrency", envName: "SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY", payload: `{"worker":{"tasks":{"upload_concurrency":2}}}`, field: "worker.tasks.upload_concurrency"},
 		{name: "commit max pieces", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", payload: `{"worker":{"tasks":{"commit_max_pieces":16}}}`, field: "worker.tasks.commit_max_pieces"},
 		{name: "commit max wait", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", payload: `{"worker":{"tasks":{"commit_max_wait":"5s"}}}`, field: "worker.tasks.commit_max_wait"},
 		{name: "pressure sealing", envName: "SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", payload: `{"worker":{"tasks":{"commit_seal_on_cache_pressure":true}}}`, field: "worker.tasks.commit_seal_on_cache_pressure", envValue: "false"},
@@ -803,7 +808,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"server":{"port":"not-a-port"},
 		"s3":{"region":""},
 		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","default_copies":0},
-		"worker":{"tasks":{"concurrency":0}},
+		"worker":{"tasks":{"concurrency":0,"upload_concurrency":0}},
 		"logging":{"level":"verbose","format":"xml","s3_access":{"level":"verbose"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -821,6 +826,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"filecoin.rpc_url",
 		"filecoin.default_copies",
 		"worker.tasks.concurrency",
+		"worker.tasks.upload_concurrency",
 		"logging.level",
 		"logging.format",
 		"logging.s3_access.level",

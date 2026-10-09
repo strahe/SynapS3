@@ -120,7 +120,7 @@ func TestCommittedSourceWakesPeerPullPlanWaitingForSource(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+		Concurrency:  1,
 		PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 		OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
 			if claimed.ID == sourceTaskID && transition.Status == model.TaskStatusCompleted {

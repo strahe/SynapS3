@@ -37,7 +37,7 @@ func TestCopyTaskBindingValidatesLogicalReference(t *testing.T) {
 				}
 				taskID = row.ID
 				if mismatch == "archived" {
-					claimed, err := f.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+					claimed, err := f.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 					if err != nil || claimed == nil || claimed.ID != row.ID {
 						t.Fatalf("claim = %#v, %v", claimed, err)
 					}

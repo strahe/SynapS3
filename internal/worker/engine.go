@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -21,21 +20,11 @@ import (
 )
 
 type EngineConfig struct {
-	Concurrency                    int
-	PollInterval                   time.Duration
-	LeaseDuration                  time.Duration
-	ProviderMutationConcurrency    int
-	DestructiveMutationConcurrency int
-	OnTaskSettled                  func(*model.Task, repository.TaskTransition)
+	Concurrency   int
+	PollInterval  time.Duration
+	LeaseDuration time.Duration
+	OnTaskSettled func(*model.Task, repository.TaskTransition)
 }
-
-const (
-	retryBaseDelay           = 10 * time.Second
-	retryMaximumDelay        = 5 * time.Minute
-	resourceWaitBaseDelay    = 2 * time.Second
-	resourceWaitMaximumDelay = time.Minute
-	backoffJitterFraction    = 0.20
-)
 
 // Engine is the only task claimant and lease owner.
 type Engine struct {
@@ -43,19 +32,13 @@ type Engine struct {
 	repos                 *repository.Repositories
 	registry              *Registry
 	logger                *slog.Logger
-	gates                 map[Resource]chan struct{}
 	recoveryMu            sync.Mutex
 	recovery              map[recoveryRequest]struct{}
 	recoveryWake          chan struct{}
 	settlementRetryDelays []time.Duration
 	renewalRetryDelays    []time.Duration
 	retryDelay            func(int) time.Duration
-	resourceWaitDelay     func(int) time.Duration
-	resourceWaitMu        sync.Mutex
-	// resourceWaits counts each task's consecutive resource waits. It is kept
-	// in memory only; a restart merely restarts the backoff.
-	resourceWaits map[int64]int
-	lastTick      atomic.Int64
+	lastTick              atomic.Int64
 }
 
 type recoveryRequest struct {
@@ -64,8 +47,7 @@ type recoveryRequest struct {
 }
 
 func NewEngine(config EngineConfig, repos *repository.Repositories, registry *Registry, logger *slog.Logger) (*Engine, error) {
-	if config.Concurrency < 1 || config.PollInterval <= 0 || config.LeaseDuration <= config.PollInterval ||
-		config.ProviderMutationConcurrency < 1 || config.DestructiveMutationConcurrency < 1 {
+	if config.Concurrency < 1 || config.PollInterval <= 0 || config.LeaseDuration <= config.PollInterval {
 		return nil, errors.New("invalid task engine configuration")
 	}
 	if repos == nil || repos.Tasks == nil || registry == nil {
@@ -79,18 +61,10 @@ func NewEngine(config EngineConfig, repos *repository.Repositories, registry *Re
 	}
 	return &Engine{
 		config: config, repos: repos, registry: registry, logger: logger,
-		gates: map[Resource]chan struct{}{
-			ResourceProviderMutation:    make(chan struct{}, config.ProviderMutationConcurrency),
-			ResourceProviderUploadSpeed: make(chan struct{}, 1),
-			ResourceDestructiveMutation: make(chan struct{}, config.DestructiveMutationConcurrency),
-			ResourceWallet:              make(chan struct{}, 1),
-		},
 		recovery:              make(map[recoveryRequest]struct{}),
 		recoveryWake:          make(chan struct{}, 1),
 		settlementRetryDelays: []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second},
 		renewalRetryDelays:    []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second},
-		resourceWaitDelay:     defaultResourceWaitDelay,
-		resourceWaits:         make(map[int64]int),
 	}, nil
 }
 
@@ -107,11 +81,6 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 	var workers sync.WaitGroup
-	for range e.config.Concurrency {
-		workers.Go(func() {
-			e.runSlot(ctx)
-		})
-	}
 	workers.Go(func() {
 		e.runRecoveryQueue(ctx)
 	})
@@ -125,30 +94,74 @@ func (e *Engine) Run(ctx context.Context) error {
 			}
 		}
 	})
+	e.runDispatcher(ctx)
 	workers.Wait()
 	return nil
 }
 
-func (e *Engine) runSlot(ctx context.Context) {
+func (e *Engine) runDispatcher(ctx context.Context) {
+	active := make(map[int64]model.TaskType)
+	activeByType := make(map[model.TaskType]int)
+	finished := make(chan int64, e.config.Concurrency)
+	var invocations sync.WaitGroup
+	defer invocations.Wait()
+	ticker := time.NewTicker(e.config.PollInterval)
+	defer ticker.Stop()
+	release := func(id int64) {
+		taskType := active[id]
+		delete(active, id)
+		activeByType[taskType]--
+		if activeByType[taskType] == 0 {
+			delete(activeByType, taskType)
+		}
+	}
 	for ctx.Err() == nil {
 		e.lastTick.Store(time.Now().UnixNano())
-		claimed, err := e.repos.Tasks.ClaimNext(ctx, e.config.LeaseDuration)
-		if err != nil {
-			if ctx.Err() == nil {
-				e.logger.Error("claiming task", "error", err)
+		for draining := true; draining; {
+			select {
+			case id := <-finished:
+				release(id)
+			default:
+				draining = false
 			}
-			if !sleepContext(ctx, e.config.PollInterval) {
-				return
-			}
-			continue
 		}
-		if claimed == nil {
-			if !sleepContext(ctx, e.config.PollInterval) {
-				return
+		for len(active) < e.config.Concurrency && ctx.Err() == nil {
+			filter := repository.TaskClaimFilter{}
+			for taskType, count := range activeByType {
+				definition, ok := e.registry.Definition(taskType)
+				if ok && definition.MaxConcurrency > 0 && count >= definition.MaxConcurrency {
+					filter.ExcludedTypes = append(filter.ExcludedTypes, string(taskType))
+				}
 			}
-			continue
+			for id := range active {
+				filter.ExcludedTaskIDs = append(filter.ExcludedTaskIDs, id)
+			}
+			claimed, err := e.repos.Tasks.ClaimNext(ctx, e.config.LeaseDuration, filter)
+			if err != nil {
+				if ctx.Err() == nil {
+					e.logger.Error("claiming task", "error", err)
+				}
+				break
+			}
+			if claimed == nil {
+				break
+			}
+			// Only this loop admits executions, so the filtered type's capacity
+			// remains available until its claim is registered here.
+			active[claimed.ID] = claimed.Type
+			activeByType[claimed.Type]++
+			invocations.Go(func() {
+				defer func() { finished <- claimed.ID }()
+				e.executeClaimSafely(ctx, claimed)
+			})
 		}
-		e.executeClaimSafely(ctx, claimed)
+		select {
+		case <-ctx.Done():
+			return
+		case id := <-finished:
+			release(id)
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -337,23 +350,6 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 				return nil
 			})
 		},
-		resource: func(ctx context.Context, resource Resource, fn func(context.Context) error) error {
-			if !leaseSafe.Load() {
-				return repository.ErrTaskLeaseLost
-			}
-			return e.withResource(ctx, resource, func(ctx context.Context) error {
-				if !leaseSafe.Load() {
-					return repository.ErrTaskLeaseLost
-				}
-				if err := e.repos.Tasks.ValidateClaim(ctx, claimed.ID, claimed.ClaimGeneration); err != nil {
-					return err
-				}
-				if !leaseSafe.Load() {
-					return repository.ErrTaskLeaseLost
-				}
-				return fn(ctx)
-			})
-		},
 	}
 
 	if definition.WorkStart == WorkStartOnHandler {
@@ -391,8 +387,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if errors.Is(result.err, repository.ErrTaskIdentityContended) || errors.Is(result.err, repository.ErrRepositoryContended) {
 		// Database contention cannot allocate another business opportunity or
 		// authorize a failed settlement of an unresolved external effect.
-		result = ResourceWait("Waiting for resources")
-		result.resumeMode = model.TaskResumeModeRecover
+		result = Wait(model.TaskResumeModeRecover, e.config.PollInterval, "database_contention", "Waiting to continue", nil)
 	}
 	if err := validateResult(result, claimed); err != nil {
 		logger.Error("task handler returned an invalid result", "error", err)
@@ -536,7 +531,6 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 		})
 		cancel()
 		if lastErr == nil {
-			e.recordResourceWait(claimed.ID, result.resourceWait)
 			e.notifyTaskSettled(claimed, transition)
 			return nil
 		}
@@ -606,13 +600,9 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 	case resultComplete:
 		transition.Status = model.TaskStatusCompleted
 	case resultWait:
-		delay := result.delay
-		if result.resourceWait {
-			delay = e.resourceWaitDelay(e.consecutiveResourceWaits(claimed.ID))
-		}
 		transition.Status = model.TaskStatusPending
 		transition.ResumeMode = result.resumeMode
-		transition.AvailableAt = now.Add(delay)
+		transition.AvailableAt = now.Add(result.delay)
 	case resultRetry:
 		policy, err := DecodePolicy(claimed)
 		if err != nil {
@@ -642,45 +632,6 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.Status = model.TaskStatusCancelled
 	}
 	return transition
-}
-
-func defaultResourceWaitDelay(waits int) time.Duration {
-	return backoffDelay(waits, resourceWaitBaseDelay, resourceWaitMaximumDelay, rand.Float64())
-}
-
-func backoffDelay(attempt int, base, maximum time.Duration, jitterUnit float64) time.Duration {
-	if attempt < 0 {
-		attempt = 0
-	}
-	delay := base
-	for range attempt {
-		if delay >= maximum/2 {
-			delay = maximum
-			break
-		}
-		delay *= 2
-	}
-	jitterUnit = min(max(jitterUnit, 0), 1)
-	jitter := 1 + backoffJitterFraction*(2*jitterUnit-1)
-	return min(time.Duration(float64(delay)*jitter), maximum)
-}
-
-func (e *Engine) consecutiveResourceWaits(id int64) int {
-	e.resourceWaitMu.Lock()
-	defer e.resourceWaitMu.Unlock()
-	return e.resourceWaits[id]
-}
-
-// recordResourceWait extends a task's wait streak after a settled resource
-// wait; any other settled result ends the streak.
-func (e *Engine) recordResourceWait(id int64, waited bool) {
-	e.resourceWaitMu.Lock()
-	defer e.resourceWaitMu.Unlock()
-	if waited {
-		e.resourceWaits[id]++
-		return
-	}
-	delete(e.resourceWaits, id)
 }
 
 func (e *Engine) renewLease(
@@ -822,31 +773,6 @@ func (e *Engine) nextRecovery() (recoveryRequest, bool) {
 		return request, true
 	}
 	return recoveryRequest{}, false
-}
-
-// heldResource marks a context whose claim already holds a slot of a gate.
-type heldResource struct{ resource Resource }
-
-// withResource never waits for a slot: a full gate returns ErrResourceBusy so
-// the worker is free to claim other tasks instead of idling behind the gate.
-func (e *Engine) withResource(ctx context.Context, resource Resource, fn func(context.Context) error) error {
-	gate, ok := e.gates[resource]
-	if !ok || fn == nil {
-		return fmt.Errorf("unknown task resource %q", resource)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if ctx.Value(heldResource{resource}) != nil {
-		return fn(ctx)
-	}
-	select {
-	case gate <- struct{}{}:
-	default:
-		return ErrResourceBusy
-	}
-	defer func() { <-gate }()
-	return fn(context.WithValue(ctx, heldResource{resource}, true))
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) bool {

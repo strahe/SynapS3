@@ -108,7 +108,7 @@ func TestFinalOpportunityMayAdmitAndCompleteEffect(t *testing.T) {
 	limit := 0
 	called := false
 	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(ctx context.Context, e Execution) Result {
-		attempted, err := e.WithCheckpointedEffect(ctx, ResourceProviderMutation, "one-operation", map[string]bool{"prepared": true}, nil, func(context.Context) error { called = true; return nil })
+		attempted, err := e.WithCheckpointedEffect(ctx, "one-operation", map[string]bool{"prepared": true}, nil, func(context.Context) error { called = true; return nil })
 		if err != nil || !attempted {
 			return Fail(errors.New("effect was not admitted"), "admission_failed", nil)
 		}
@@ -148,13 +148,17 @@ func TestTaskContentionPreservesFinalOpportunityAndRecovery(t *testing.T) {
 				})
 			}}, nil)
 			row := enqueueTestTask(t, h, "contention", "contention")
+			before := time.Now()
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, err := h.repos.Tasks.GetByID(t.Context(), row.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if settled || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover || stored.RetryCount != 0 || dereference(stored.WaitReason) != "resource" {
+			if settled || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover || stored.RetryCount != 0 || dereference(stored.WaitReason) != "database_contention" {
 				t.Fatalf("contention consumed or settled a business opportunity: %#v", stored)
+			}
+			if stored.AvailableAt.Before(before.Add(h.engine.config.PollInterval)) || stored.AvailableAt.After(time.Now().Add(h.engine.config.PollInterval)) {
+				t.Fatalf("contention wait did not use the poll interval: %s", stored.AvailableAt)
 			}
 		})
 	}

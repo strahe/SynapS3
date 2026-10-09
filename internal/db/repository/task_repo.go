@@ -28,7 +28,7 @@ SET status = 'running',
 WHERE id = (
     SELECT id
     FROM tasks
-    WHERE status = 'running' AND lease_until <= ?
+    WHERE status = 'running' AND lease_until <= ?%s
     ORDER BY lease_until, id
     LIMIT 1
 )
@@ -48,7 +48,7 @@ SET status = 'running',
 WHERE id = (
     SELECT id
     FROM tasks
-    WHERE status = 'pending' AND available_at <= ?
+    WHERE status = 'pending' AND available_at <= ?%s
     ORDER BY available_at, id
     LIMIT 1
 )
@@ -69,7 +69,7 @@ SET status = 'running',
 WHERE id = (
     SELECT id
     FROM tasks
-    WHERE status = 'running' AND lease_until <= ?
+    WHERE status = 'running' AND lease_until <= ?%s
     ORDER BY lease_until, id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -90,7 +90,7 @@ SET status = 'running',
 WHERE id = (
     SELECT id
     FROM tasks
-    WHERE status = 'pending' AND available_at <= ?
+    WHERE status = 'pending' AND available_at <= ?%s
     ORDER BY available_at, id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -125,7 +125,7 @@ func (r *BunTaskRepo) MarkWorkStarted(ctx context.Context, id, generation int64,
 	return nil
 }
 
-func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error) {
+func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error) {
 	if leaseDuration <= 0 {
 		return nil, fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
 	}
@@ -134,51 +134,63 @@ func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration
 		var claimed *model.Task
 		err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 			var err error
-			claimed, err = r.claimNextSQLite(ctx, db, leaseDuration)
+			claimed, err = r.claimNextSQLite(ctx, db, leaseDuration, filter)
 			return err
 		})
 		return claimed, err
 	}
 	db, ok := r.db.(*bun.DB)
 	if !ok {
-		return r.claimNextPostgres(ctx, r.db, leaseDuration)
+		return r.claimNextPostgres(ctx, r.db, leaseDuration, filter)
 	}
 	var claimed *model.Task
 	err := db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		claimed, err = r.claimNextPostgres(ctx, tx, leaseDuration)
+		claimed, err = r.claimNextPostgres(ctx, tx, leaseDuration, filter)
 		return err
 	})
 	return claimed, err
 }
 
-func (r *BunTaskRepo) claimNextPostgres(ctx context.Context, db bun.IDB, leaseDuration time.Duration) (*model.Task, error) {
-	return claimNextTask(ctx, db, leaseDuration, claimExpiredTaskPostgresSQL, claimPendingTaskPostgresSQL)
+func (r *BunTaskRepo) claimNextPostgres(ctx context.Context, db bun.IDB, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error) {
+	return claimNextTask(ctx, db, leaseDuration, filter, claimExpiredTaskPostgresSQL, claimPendingTaskPostgresSQL)
 }
 
-func (r *BunTaskRepo) claimNextSQLite(ctx context.Context, db bun.IDB, leaseDuration time.Duration) (*model.Task, error) {
-	return claimNextTask(ctx, db, leaseDuration, claimExpiredTaskSQLiteSQL, claimPendingTaskSQLiteSQL)
+func (r *BunTaskRepo) claimNextSQLite(ctx context.Context, db bun.IDB, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error) {
+	return claimNextTask(ctx, db, leaseDuration, filter, claimExpiredTaskSQLiteSQL, claimPendingTaskSQLiteSQL)
 }
 
 func claimNextTask(
 	ctx context.Context,
 	db bun.IDB,
 	leaseDuration time.Duration,
+	filter TaskClaimFilter,
 	recoverySQL string,
 	pendingSQL string,
 ) (*model.Task, error) {
 	now := time.Now()
 	leaseUntil := now.Add(leaseDuration)
-	task, err := claimTaskWithSQL(ctx, db, recoverySQL, now, leaseUntil)
+	task, err := claimTaskWithSQL(ctx, db, recoverySQL, now, leaseUntil, filter)
 	if err != nil || task != nil {
 		return task, err
 	}
-	return claimTaskWithSQL(ctx, db, pendingSQL, now, leaseUntil)
+	return claimTaskWithSQL(ctx, db, pendingSQL, now, leaseUntil, filter)
 }
 
-func claimTaskWithSQL(ctx context.Context, db bun.IDB, query string, now, leaseUntil time.Time) (*model.Task, error) {
+func claimTaskWithSQL(ctx context.Context, db bun.IDB, query string, now, leaseUntil time.Time, filter TaskClaimFilter) (*model.Task, error) {
+	conditions := ""
+	args := []any{now, leaseUntil, now, now, now}
+	if len(filter.ExcludedTypes) > 0 {
+		conditions += " AND type NOT IN (?)"
+		args = append(args, bun.List(filter.ExcludedTypes))
+	}
+	if len(filter.ExcludedTaskIDs) > 0 {
+		conditions += " AND id NOT IN (?)"
+		args = append(args, bun.List(filter.ExcludedTaskIDs))
+	}
+	args = append(args, now)
 	task := new(model.Task)
-	err := db.NewRaw(query, now, leaseUntil, now, now, now, now).Scan(ctx, task)
+	err := db.NewRaw(fmt.Sprintf(query, conditions), args...).Scan(ctx, task)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

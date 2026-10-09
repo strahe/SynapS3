@@ -73,17 +73,22 @@ type taskHarness struct {
 	engine   *Engine
 }
 
-func newTaskHarness(t *testing.T, handler Handler, config *EngineConfig) taskHarness {
+func newTaskHarness(t *testing.T, handler Handler, config *EngineConfig, others ...Handler) taskHarness {
 	t.Helper()
-	return newTaskHarnessWithDB(t, testutil.NewTestFileDB(t), handler, config)
+	return newTaskHarnessWithDB(t, testutil.NewTestFileDB(t), handler, config, others...)
 }
 
-func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *EngineConfig) taskHarness {
+func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *EngineConfig, others ...Handler) taskHarness {
 	t.Helper()
 	repos := repository.NewRepositories(db)
 	registry := NewRegistry()
 	if err := registry.Register(handler); err != nil {
 		t.Fatalf("register handler: %v", err)
+	}
+	for _, other := range others {
+		if err := registry.Register(other); err != nil {
+			t.Fatalf("register handler: %v", err)
+		}
 	}
 	if handler.Definition().Type.IsRecurringSystem() {
 		if err := registry.RegisterSchedule(ScheduleDefinition{Key: "test-cycle", Type: handler.Definition().Type, Input: testInput{Value: "cycle"}, Interval: time.Hour}); err != nil {
@@ -98,9 +103,6 @@ func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *Eng
 		Concurrency:   4,
 		PollInterval:  10 * time.Millisecond,
 		LeaseDuration: 5 * time.Second,
-
-		ProviderMutationConcurrency:    4,
-		DestructiveMutationConcurrency: 2,
 	}
 	if config != nil {
 		engineConfig = *config
@@ -133,7 +135,7 @@ func enqueueTestTask(t *testing.T, harness taskHarness, key, value string) *mode
 
 func claimTestTask(t *testing.T, harness taskHarness) *model.Task {
 	t.Helper()
-	claimed, err := harness.repos.Tasks.ClaimNext(t.Context(), harness.engine.config.LeaseDuration)
+	claimed, err := harness.repos.Tasks.ClaimNext(t.Context(), harness.engine.config.LeaseDuration, repository.TaskClaimFilter{})
 	if err != nil {
 		t.Fatalf("claim task: %v", err)
 	}
@@ -222,7 +224,7 @@ func TestServiceWakeMakesFuturePendingTaskReady(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("enqueue future task = %#v created=%v err=%v", row, created, err)
 	}
-	if claimed, err := harness.repos.Tasks.ClaimNext(t.Context(), time.Minute); err != nil || claimed != nil {
+	if claimed, err := harness.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{}); err != nil || claimed != nil {
 		t.Fatalf("claim before wake = %#v err=%v", claimed, err)
 	}
 	if err := harness.repos.WithTx(t.Context(), func(txRepos *repository.Repositories) error {
@@ -313,7 +315,7 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 				t.Fatal("terminal task has no finished time")
 			}
 			if stored.Status == model.TaskStatusCompleted || stored.Status == model.TaskStatusCancelled {
-				again, claimErr := harness.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+				again, claimErr := harness.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 				if claimErr != nil || again != nil {
 					t.Fatalf("terminal task revived = %#v, err=%v", again, claimErr)
 				}
@@ -335,7 +337,6 @@ func TestEngineNotifiesAfterSettlementCommits(t *testing.T) {
 	var notified atomic.Int64
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 		OnTaskSettled: func(taskRow *model.Task, transition repository.TaskTransition) {
 			if taskRow.IdempotencyKey != "notify" || transition.Status != model.TaskStatusCompleted {
 				t.Errorf("settlement notification = task:%#v transition:%#v", taskRow, transition)
@@ -373,69 +374,27 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 	}
 }
 
-func TestBackoffDelayIsExponentialJitteredAndCapped(t *testing.T) {
+func TestBackoffPolicyDelayIsExponentialJitteredAndCapped(t *testing.T) {
 	tests := []struct {
-		name          string
-		attempt       int
-		base, maximum time.Duration
-		jitter        float64
-		want          time.Duration
+		name             string
+		attempt          int
+		jitter           float64
+		minimum, maximum time.Duration
 	}{
-		{name: "first retry low jitter", attempt: 0, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0, want: 8 * time.Second},
-		{name: "first retry midpoint", attempt: 0, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0.5, want: 10 * time.Second},
-		{name: "third retry midpoint", attempt: 2, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0.5, want: 40 * time.Second},
-		{name: "negative count", attempt: -1, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0.5, want: 10 * time.Second},
-		{name: "retry hard cap", attempt: 20, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 1, want: 5 * time.Minute},
-		{name: "first resource wait", attempt: 0, base: resourceWaitBaseDelay, maximum: resourceWaitMaximumDelay, jitter: 0.5, want: 2 * time.Second},
-		{name: "resource wait hard cap", attempt: 20, base: resourceWaitBaseDelay, maximum: resourceWaitMaximumDelay, jitter: 1, want: time.Minute},
+		{name: "first retry", attempt: 0, minimum: 10 * time.Second, maximum: 10 * time.Second},
+		{name: "third retry", attempt: 2, minimum: 40 * time.Second, maximum: 40 * time.Second},
+		{name: "capped retry", attempt: 20, minimum: 5 * time.Minute, maximum: 5 * time.Minute},
+		{name: "first retry with jitter", attempt: 0, jitter: .2, minimum: 8 * time.Second, maximum: 12 * time.Second},
+		{name: "capped retry with jitter", attempt: 20, jitter: .2, minimum: 4 * time.Minute, maximum: 5 * time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := backoffDelay(tt.attempt, tt.base, tt.maximum, tt.jitter); got != tt.want {
-				t.Fatalf("delay = %s, want %s", got, tt.want)
+			policy := DefaultBackoffPolicy()
+			policy.Jitter = tt.jitter
+			if got := policy.delay(tt.attempt); got < tt.minimum || got > tt.maximum {
+				t.Fatalf("delay = %s, want between %s and %s", got, tt.minimum, tt.maximum)
 			}
 		})
-	}
-}
-
-func TestResourceWaitBacksOffWithoutConsumingRetries(t *testing.T) {
-	noRetries := 0
-	var executions atomic.Int64
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&noRetries, true),
-		execute: func(context.Context, Execution) Result {
-			switch executions.Add(1) {
-			case 3:
-				return Wait(model.TaskResumeModeExecute, 0, "dependency", "Waiting for something else", nil)
-			case 5:
-				return Complete("admitted", nil)
-			default:
-				return ResourceWait("Waiting for capacity")
-			}
-		},
-	}, nil)
-	var streaks []int
-	harness.engine.resourceWaitDelay = func(consecutive int) time.Duration {
-		streaks = append(streaks, consecutive)
-		return 0
-	}
-	row := enqueueTestTask(t, harness, "resource-wait", "resource-wait")
-
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	waiting, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || waiting.Status != model.TaskStatusPending || waiting.ResumeMode != model.TaskResumeModeExecute ||
-		waiting.WaitReason == nil || *waiting.WaitReason != "resource" || waiting.RetryCount != 0 || len(waiting.Checkpoint) != 0 {
-		t.Fatalf("waiting task = %#v, err=%v", waiting, err)
-	}
-	for range 4 {
-		harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	}
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusCompleted || stored.RetryCount != 0 {
-		t.Fatalf("task after resource waits = %#v, err=%v", stored, err)
-	}
-	if fmt.Sprint(streaks) != "[0 1 0]" {
-		t.Fatalf("resource wait streaks = %v, want [0 1 0]: consecutive waits back off and any other outcome resets", streaks)
 	}
 }
 
@@ -764,8 +723,15 @@ func TestEngineShutdownDiscardsHandlerResultAndForcesRecovery(t *testing.T) {
 	cancel()
 	harness.engine.executeClaim(ctx, claimed)
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusRunning || stored.ResumeMode != model.TaskResumeModeRecover {
+	if err != nil || stored.Status != model.TaskStatusRunning || stored.ClaimGeneration != claimed.ClaimGeneration || stored.FinishedAt != nil {
 		t.Fatalf("shutdown task = %#v, err=%v", stored, err)
+	}
+	if _, err := harness.db.ExecContext(t.Context(), `UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), row.ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered := claimTestTask(t, harness)
+	if recovered.ID != row.ID || recovered.ResumeMode != model.TaskResumeModeRecover || recovered.ClaimGeneration != claimed.ClaimGeneration+1 {
+		t.Fatalf("shutdown recovery claim = %#v", recovered)
 	}
 }
 
@@ -775,12 +741,12 @@ func TestRecoverCannotStartExternalEffect(t *testing.T) {
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		recover: func(ctx context.Context, execution Execution) Result {
-			err := execution.WithResource(ctx, ResourceProviderMutation, func(context.Context) error {
+			_, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]bool{"attempted": true}, nil, func(context.Context) error {
 				called.Store(true)
 				return nil
 			})
 			if !errors.Is(err, ErrEffectForbidden) {
-				return Fail(fmt.Errorf("resource error = %v", err), "unexpected_resource_error", nil)
+				return Fail(fmt.Errorf("effect error = %v", err), "unexpected_effect_error", nil)
 			}
 			return Complete("recovery remained read-only", nil)
 		},
@@ -805,65 +771,41 @@ func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
 	tests := []struct {
 		name            string
 		mode            model.TaskResumeMode
-		resource        resourceRunner
-		checkpoint      checkpointWriter
+		cancelled       bool
+		admit           func(context.Context, string, any, Settlement) error
 		wantAttempted   bool
 		wantEffectCalls int
 		wantError       error
 	}{
-		{
-			name: "resource admission fails", mode: model.TaskResumeModeExecute,
-			resource: func(context.Context, Resource, func(context.Context) error) error { return context.Canceled },
-			checkpoint: func(context.Context, any, Settlement, bool) error {
-				t.Fatal("checkpoint ran before resource admission")
-				return nil
-			},
-			wantError: context.Canceled,
-		},
+		{name: "cancelled context", mode: model.TaskResumeModeExecute, cancelled: true, wantError: context.Canceled},
 		{
 			name: "checkpoint fails", mode: model.TaskResumeModeExecute,
-			resource: func(ctx context.Context, _ Resource, fn func(context.Context) error) error { return fn(ctx) },
-			checkpoint: func(context.Context, any, Settlement, bool) error {
-				return injected
-			},
-			wantError: injected,
+			admit: func(context.Context, string, any, Settlement) error { return injected }, wantError: injected,
 		},
 		{
 			name: "effect fails", mode: model.TaskResumeModeExecute,
-			resource: func(ctx context.Context, _ Resource, fn func(context.Context) error) error { return fn(ctx) },
-			checkpoint: func(ctx context.Context, _ any, settlement Settlement, _ bool) error {
-				return settlement(ctx, nil)
-			},
+			admit:         func(context.Context, string, any, Settlement) error { return nil },
 			wantAttempted: true, wantEffectCalls: 1, wantError: injected,
 		},
-		{
-			name: "recovery is forbidden", mode: model.TaskResumeModeRecover,
-			resource: func(context.Context, Resource, func(context.Context) error) error {
-				t.Fatal("recovery reached resource runner")
-				return nil
-			},
-			checkpoint: func(context.Context, any, Settlement, bool) error {
-				t.Fatal("recovery wrote checkpoint")
-				return nil
-			},
-			wantError: ErrEffectForbidden,
-		},
+		{name: "recovery is forbidden", mode: model.TaskResumeModeRecover, wantError: ErrEffectForbidden},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			effectCalls := 0
-			execution := Execution{
-				task: model.Task{ResumeMode: tt.mode}, checkpoint: tt.checkpoint, resource: tt.resource,
-				admit: func(ctx context.Context, _ string, value any, settlement Settlement) error {
-					return tt.checkpoint(ctx, value, settlement, true)
-				},
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancelled {
+				cancel()
 			}
-			attempted, err := execution.WithCheckpointedEffect(t.Context(), ResourceProviderMutation, "test-effect", map[string]bool{"attempted": true}, func(context.Context, *repository.Repositories) error {
-				return nil
-			}, func(context.Context) error {
-				effectCalls++
-				return injected
-			})
+			execution := Execution{task: model.Task{ResumeMode: tt.mode}, admit: tt.admit}
+			if execution.admit == nil {
+				execution.admit = func(context.Context, string, any, Settlement) error {
+					t.Fatal("forbidden effect reached admission")
+					return nil
+				}
+			}
+			attempted, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]bool{"attempted": true}, nil,
+				func(context.Context) error { effectCalls++; return injected })
 			if attempted != tt.wantAttempted || effectCalls != tt.wantEffectCalls || !errors.Is(err, tt.wantError) {
 				t.Fatalf("result = attempted:%v calls:%d err:%v, want attempted:%v calls:%d err:%v", attempted, effectCalls, err, tt.wantAttempted, tt.wantEffectCalls, tt.wantError)
 			}
@@ -877,7 +819,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(ctx context.Context, execution Execution) Result {
-			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", map[string]bool{"attempted": true}, func(ctx context.Context, repos *repository.Repositories) error {
+			attempted, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]bool{"attempted": true}, func(ctx context.Context, repos *repository.Repositories) error {
 				if err := repos.Tasks.RequestCancellation(ctx, execution.ID(), "must roll back"); err != nil {
 					return err
 				}
@@ -918,7 +860,7 @@ func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun
 	harness := newTaskHarnessWithDB(t, db, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(ctx context.Context, execution Execution) Result {
-			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
+			attempted, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
 				stored, err := repos.Tasks.GetByID(ctx, execution.ID())
 				if err != nil {
 					return err
@@ -954,18 +896,18 @@ func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun
 	}
 }
 
-func TestExternalEffectRevalidatesClaimAfterResourceAdmission(t *testing.T) {
+func TestExternalEffectRejectsStaleClaim(t *testing.T) {
 	limit := 5
 	var called atomic.Bool
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(ctx context.Context, execution Execution) Result {
-			err := execution.WithResource(ctx, ResourceProviderMutation, func(context.Context) error {
+			_, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]bool{"attempted": true}, nil, func(context.Context) error {
 				called.Store(true)
 				return nil
 			})
 			if err != nil {
-				return Fail(err, "resource_claim_lost", nil)
+				return Fail(err, "effect_claim_lost", nil)
 			}
 			return Complete("effect completed", nil)
 		},
@@ -1044,7 +986,6 @@ func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
@@ -1072,7 +1013,6 @@ func TestEngineSuccessfulRenewalKeepsHealthCurrent(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, &config)
 	enqueueTestTask(t, harness, "renewal-health", "renewal-health")
@@ -1110,7 +1050,6 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	var recovers atomic.Int64
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
@@ -1190,7 +1129,6 @@ func TestEngineRecoveryQueueDoesNotDropLeaseShorteningWork(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: time.Minute,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, &config)
 	controlled := &controlledShortenRepository{TaskRepository: harness.repos.Tasks}
@@ -1243,7 +1181,6 @@ func TestEngineRenewsLeaseWhileSettlementIsRetried(t *testing.T) {
 	var settlements atomic.Int64
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
 	}
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
@@ -1322,7 +1259,7 @@ func TestClaimNextConcurrentClaimsAreUnique(t *testing.T) {
 	for range 8 {
 		workers.Go(func() {
 			for ctx.Err() == nil {
-				claimed, err := harness.repos.Tasks.ClaimNext(ctx, time.Minute)
+				claimed, err := harness.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 				if err != nil {
 					continue
 				}
@@ -1344,157 +1281,6 @@ func TestClaimNextConcurrentClaimsAreUnique(t *testing.T) {
 	}
 	if len(seen) != total {
 		t.Fatalf("unique claims = %d, want %d", len(seen), total)
-	}
-}
-
-func TestResourceGateYieldsWhenFullAndReusesHeldSlot(t *testing.T) {
-	limit := 5
-	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
-	capacity := harness.engine.config.ProviderMutationConcurrency
-	entered := make(chan struct{}, capacity)
-	nest := make(chan struct{})
-	nested := make(chan error, capacity)
-	release := make(chan struct{})
-	held := make(chan error, capacity)
-	var holders sync.WaitGroup
-	for range capacity {
-		holders.Go(func() {
-			held <- harness.engine.withResource(t.Context(), ResourceProviderMutation, func(ctx context.Context) error {
-				entered <- struct{}{}
-				<-nest
-				nested <- harness.engine.withResource(ctx, ResourceProviderMutation, func(context.Context) error { return nil })
-				<-release
-				return nil
-			})
-		})
-	}
-	for range capacity {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			t.Fatal("provider mutation gate did not admit its configured capacity")
-		}
-	}
-	called := false
-	err := harness.engine.withResource(t.Context(), ResourceProviderMutation, func(context.Context) error {
-		called = true
-		return nil
-	})
-	if !errors.Is(err, ErrResourceBusy) || called {
-		t.Fatalf("full gate = called:%v err:%v, want immediate ErrResourceBusy", called, err)
-	}
-	close(nest)
-	for range capacity {
-		if err := <-nested; err != nil {
-			t.Fatalf("nested use of a held slot on a full gate: %v", err)
-		}
-	}
-	close(release)
-	holders.Wait()
-	close(held)
-	for err := range held {
-		if err != nil {
-			t.Fatalf("slot holder: %v", err)
-		}
-	}
-	if err := harness.engine.withResource(t.Context(), ResourceProviderMutation, func(context.Context) error { return nil }); err != nil {
-		t.Fatalf("gate after release: %v", err)
-	}
-}
-
-func TestResourceWaitFreesWorkersForOtherTasks(t *testing.T) {
-	noRetries := 0
-	holding := make(chan string, 3)
-	release := make(chan struct{})
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&noRetries, true),
-		execute: func(ctx context.Context, execution Execution) Result {
-			input, err := DecodeInput[testInput](execution)
-			if err != nil {
-				return Fail(err, "invalid_input", nil)
-			}
-			if input.Value == "plain" {
-				return Complete("plain work finished", nil)
-			}
-			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, "test-effect", input, nil, func(ctx context.Context) error {
-				holding <- input.Value
-				select {
-				case <-release:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			})
-			if !attempted && errors.Is(err, ErrResourceBusy) {
-				return ResourceWait("Waiting for capacity")
-			}
-			if err != nil {
-				return Fail(err, "unexpected_effect_error", nil)
-			}
-			return Complete("gated work finished", nil)
-		},
-	}, &EngineConfig{
-		Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
-		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
-	})
-	harness.engine.resourceWaitDelay = func(int) time.Duration { return 50 * time.Millisecond }
-	gated := map[string]*model.Task{}
-	for _, key := range []string{"gated-1", "gated-2", "gated-3"} {
-		gated[key] = enqueueTestTask(t, harness, key, key)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	stopped := make(chan struct{})
-	go func() {
-		_ = harness.engine.Run(ctx)
-		close(stopped)
-	}()
-	defer func() {
-		cancel()
-		<-stopped
-	}()
-	waitFor := func(id int64, predicate func(*model.Task) bool) *model.Task {
-		t.Helper()
-		deadline := time.Now().Add(3 * time.Second)
-		for {
-			stored, err := harness.repos.Tasks.GetByID(t.Context(), id)
-			if err != nil {
-				t.Fatalf("load task %d: %v", id, err)
-			}
-			if predicate(stored) {
-				return stored
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("task %d did not reach the expected state: %#v", id, stored)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-
-	var holder string
-	select {
-	case holder = <-holding:
-	case <-time.After(3 * time.Second):
-		t.Fatal("no gated task acquired the provider slot")
-	}
-	// With both workers saturated by gated work, a blocking gate would starve
-	// this task until the slot holder finished.
-	plain := enqueueTestTask(t, harness, "plain", "plain")
-	waitFor(plain.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-	for key, row := range gated {
-		if key == holder {
-			continue
-		}
-		waitFor(row.ID, func(task *model.Task) bool {
-			return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute &&
-				task.WaitReason != nil && *task.WaitReason == "resource" && task.RetryCount == 0 && len(task.Checkpoint) == 0
-		})
-	}
-	close(release)
-	for _, row := range gated {
-		stored := waitFor(row.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-		if stored.RetryCount != 0 {
-			t.Fatalf("gated task consumed retries while waiting: %#v", stored)
-		}
 	}
 }
 

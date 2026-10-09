@@ -10,6 +10,81 @@ import (
 	"github.com/uptrace/bun"
 )
 
+func TestTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T) {
+	assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, testDB(t))
+}
+
+func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db *bun.DB) {
+	t.Helper()
+	repos := repository.NewRepositories(db)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	seed := func(key, taskType string, availableAt time.Time, expired bool) *model.Task {
+		t.Helper()
+		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
+			Type: model.TaskType(taskType), IdempotencyKey: key, InputVersion: 1,
+			Input: []byte(`{}`), InputHash: key, AvailableAt: availableAt,
+		}))
+		if err != nil || !created {
+			t.Fatalf("enqueue %s: created=%v err=%v", key, created, err)
+		}
+		if expired {
+			if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET status='running',
+				claim_generation=5, claimed_at=?, lease_until=?, started_at=? WHERE id=?`,
+				availableAt.Add(-time.Minute), availableAt, availableAt.Add(-time.Minute), row.ID); err != nil {
+				t.Fatalf("expire %s: %v", key, err)
+			}
+		}
+		stored, err := repos.Tasks.GetByID(t.Context(), row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stored
+	}
+	blocked := []*model.Task{
+		seed("full-recover", "full", now.Add(-2*time.Hour), true),
+		seed("active-recover", "available", now.Add(-3*time.Hour), true),
+		seed("full-pending", "full", now.Add(-4*time.Hour), false),
+		seed("active-pending", "available", now.Add(-5*time.Hour), false),
+		seed("future-pending", "available", now.Add(time.Hour), false),
+	}
+	firstRecovery := seed("recovery-first", "available", now.Add(-time.Minute), true)
+	secondRecovery := seed("recovery-tie", "available", now.Add(-time.Minute), true)
+	firstPending := seed("pending-unknown", "unregistered_type", now.Add(-time.Hour), false)
+	secondPending := seed("pending-tie", "available", now.Add(-time.Hour), false)
+	filter := repository.TaskClaimFilter{
+		ExcludedTypes: []string{"full"}, ExcludedTaskIDs: []int64{blocked[1].ID, blocked[3].ID},
+	}
+	for index, want := range []*model.Task{firstRecovery, secondRecovery, firstPending, secondPending} {
+		got, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, filter)
+		if err != nil || got == nil || got.ID != want.ID {
+			t.Fatalf("claim %d = %#v, err=%v; want task %d", index, got, err, want.ID)
+		}
+		if got.ClaimGeneration != want.ClaimGeneration+1 {
+			t.Fatalf("claim %d generation = %d, want %d", got.ID, got.ClaimGeneration, want.ClaimGeneration+1)
+		}
+		if index < 2 && got.ResumeMode != model.TaskResumeModeRecover {
+			t.Fatalf("expired task %d resumed in %s", got.ID, got.ResumeMode)
+		}
+	}
+	if got, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, filter); err != nil || got != nil {
+		t.Fatalf("claim excluded/future tasks = %#v, err=%v", got, err)
+	}
+	for _, before := range blocked {
+		after, err := repos.Tasks.GetByID(t.Context(), before.ID)
+		if err != nil || after.Status != before.Status || after.ClaimGeneration != before.ClaimGeneration ||
+			!after.AvailableAt.Equal(before.AvailableAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Fatalf("filtered task %d changed: before=%#v after=%#v err=%v", before.ID, before, after, err)
+		}
+	}
+	// Clearing the local exclusions restores the original recovery and pending order.
+	for _, want := range []*model.Task{blocked[1], blocked[0], blocked[3], blocked[2]} {
+		got, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
+		if err != nil || got == nil || got.ID != want.ID {
+			t.Fatalf("unfiltered claim = %#v, err=%v; want task %d", got, err, want.ID)
+		}
+	}
+}
+
 func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key string, lease time.Duration) *model.Task {
 	t.Helper()
 	if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
@@ -19,7 +94,7 @@ func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key strin
 	})); err != nil || !created {
 		t.Fatalf("enqueue task %s: created=%v err=%v", key, created, err)
 	}
-	claimed, err := repos.Tasks.ClaimNext(t.Context(), lease)
+	claimed, err := repos.Tasks.ClaimNext(t.Context(), lease, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil {
 		t.Fatalf("claim task %s = %#v err=%v", key, claimed, err)
 	}
@@ -37,14 +112,14 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	row, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 		Type: model.TaskTypeUploadPlan, IdempotencyKey: "claim-timing", InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", AvailableAt: time.Now(),
-		WaitReason: new("resource"), StatusMessage: new("Old wait"), LastError: new("Old error"),
+		WaitReason: new("dependency"), StatusMessage: new("Old wait"), LastError: new("Old error"),
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	claim := func() *model.Task {
 		t.Helper()
-		claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute)
+		claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 		if err != nil || claimed == nil || claimed.WaitReason != nil || claimed.StatusMessage != nil {
 			t.Fatalf("claim retained wait details: %#v, err=%v", claimed, err)
 		}
@@ -63,7 +138,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	}
 	if err := repos.Tasks.Settle(ctx, row.ID, first.ClaimGeneration, repository.TaskTransition{
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		WaitReason: new("resource"), StatusMessage: new("New wait"), LastError: new("Old error"),
+		WaitReason: new("dependency"), StatusMessage: new("New wait"), LastError: new("Old error"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +146,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	if second.WorkStartedAt == nil || !second.WorkStartedAt.Equal(actual) {
 		t.Fatalf("reclaim reset actual work start: %#v", second)
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE tasks SET lease_until = ?, wait_reason = 'resource', status_message = 'Expired wait' WHERE id = ?`, time.Now().Add(-time.Second), row.ID); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE tasks SET lease_until = ?, wait_reason = 'dependency', status_message = 'Expired wait' WHERE id = ?`, time.Now().Add(-time.Second), row.ID); err != nil {
 		t.Fatal(err)
 	}
 	recovered := claim()
@@ -156,7 +231,7 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 		if err != nil || !created {
 			t.Fatalf("enqueue %s: created=%v err=%v", key, created, err)
 		}
-		claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute)
+		claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 		if err != nil || claimed == nil || claimed.ID != row.ID {
 			t.Fatalf("claim %s = %#v err=%v", key, claimed, err)
 		}

@@ -57,9 +57,10 @@ const externalPollInterval = 5 * time.Second
 func (h *Handler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeWalletOperation, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
-		Codec:   taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
-		Subject: taskengine.SubjectFromInput("wallet_operation", func(input walletoperation.Input) int64 { return input.OperationID }),
-		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		MaxConcurrency: 1,
+		Codec:          taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
+		Subject:        taskengine.SubjectFromInput("wallet_operation", func(input walletoperation.Input) int64 { return input.OperationID }),
+		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		CanManualRetry: func(source *model.Task) bool {
 			return source != nil && (source.FailureReason == nil || (*source.FailureReason != "invalid_checkpoint" && *source.FailureReason != "wallet_broadcast_unknown" && *source.FailureReason != "wallet_transaction_reverted"))
 		},
@@ -125,7 +126,7 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 	checkpoint := walletoperation.Checkpoint{BroadcastAttempted: true}
 	var txHash string
 	var alreadyComplete bool
-	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceWallet, fmt.Sprintf("wallet:%d", op.ID), checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+	attempted, err := execution.WithCheckpointedEffect(ctx, fmt.Sprintf("wallet:%d", op.ID), checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, execution.ID())
 	}, func(ctx context.Context) error {
 		requestCtx, cancel := context.WithTimeout(ctx, h.deps.WalletBroadcastTimeout)
@@ -136,9 +137,6 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 	})
 	if err != nil {
 		if !attempted {
-			if errors.Is(err, taskengine.ErrResourceBusy) {
-				return taskengine.ResourceWait("Waiting for another wallet operation to finish")
-			}
 			return retryTask(err, "wallet_broadcast_not_started")
 		}
 		message := fmt.Sprintf("wallet broadcast outcome is unknown: %v", err)

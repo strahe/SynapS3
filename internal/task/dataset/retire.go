@@ -63,6 +63,7 @@ func NewRetireHandler(deps RetireDependencies) (*RetireHandler, error) {
 func (h *RetireHandler) dataSetRetireHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeStorageDataSetRetire, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
+		MaxConcurrency: 1,
 		Codec: taskengine.StrictJSONCodec(func(input *storagereplacement.RetireInput) error {
 			return storagereplacement.ValidateRetireInput(*input)
 		}),
@@ -245,7 +246,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		}
 		var terminationEpochValue int64
 		var txHash string
-		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, fmt.Sprintf("retire:%d", dataSet.ID), checkpoint, nil, func(ctx context.Context) error {
+		attempted, err := execution.WithCheckpointedEffect(ctx, fmt.Sprintf("retire:%d", dataSet.ID), checkpoint, nil, func(ctx context.Context) error {
 			result, terminateErr := h.deps.Terminator.TerminateService(ctx, dataSet.DataSetID.SDK())
 			if result != nil {
 				terminationEpochValue = result.EndEpoch
@@ -254,9 +255,6 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			return terminateErr
 		})
 		if err != nil && !attempted {
-			if errors.Is(err, taskengine.ErrResourceBusy) {
-				return taskengine.ResourceWait("Waiting for other removal operations to finish")
-			}
 			return retryTask(err, "termination_not_started")
 		}
 		if synapse.IsTerminationBlocked(err) {

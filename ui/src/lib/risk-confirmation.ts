@@ -170,22 +170,13 @@ export function collectSettingsRiskChanges(
     'medium',
     'Changes how quickly interrupted work can be recovered.'
   )
-  if (next.worker.tasks.provider_mutation_concurrency > initial.worker.tasks.provider_mutation_concurrency) {
+  if (next.worker.tasks.upload_concurrency > initial.worker.tasks.upload_concurrency) {
     addChanged(
-      'worker.tasks.provider_mutation_concurrency',
-      initial.worker.tasks.provider_mutation_concurrency,
-      next.worker.tasks.provider_mutation_concurrency,
+      'worker.tasks.upload_concurrency',
+      initial.worker.tasks.upload_concurrency,
+      next.worker.tasks.upload_concurrency,
       'medium',
-      'Increases concurrent requests that change remote storage.'
-    )
-  }
-  if (next.worker.tasks.destructive_mutation_concurrency > initial.worker.tasks.destructive_mutation_concurrency) {
-    addChanged(
-      'worker.tasks.destructive_mutation_concurrency',
-      initial.worker.tasks.destructive_mutation_concurrency,
-      next.worker.tasks.destructive_mutation_concurrency,
-      'medium',
-      'Increases concurrent remote cleanup and retirement requests.'
+      'Increases concurrent uploads.'
     )
   }
   if (next.worker.tasks.commit_max_pieces > initial.worker.tasks.commit_max_pieces) {

@@ -428,7 +428,7 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 			prepareHandlerTaskFixtures(t, runtime)
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-				ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+
 				OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
 					if claimed.Type == model.TaskTypeStorageStore && transition.Status == model.TaskStatusPending && stores.Load() > 0 {
 						// Advance the parking poll after submission without waiting for the production interval.

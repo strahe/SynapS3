@@ -39,7 +39,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	if err := f.repos.Contents.BindCopyTask(ctx, copyRow.ID, generation, row.ID); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	claimed, err := f.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != row.ID {
 		t.Fatalf("claim = %#v, %v", claimed, err)
 	}
@@ -73,7 +73,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	if err := f.repos.Tasks.RequestCancellation(ctx, row.ID, "cancel pull"); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != row.ID || !claimed.CancellationRequested() {
 		t.Fatalf("cancel did not wake recovery: %#v, %v", claimed, err)
 	}
@@ -97,7 +97,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 		retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
 		t.Fatalf("dependency retry lost cancellation or evidence: %#v, %v", retried, err)
 	}
-	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != row.ID || !claimed.CancellationRequested() {
 		t.Fatalf("retry did not resume cancellation recovery: %#v, %v", claimed, err)
 	}
@@ -157,7 +157,7 @@ func testPullAuthorizationLedger(t *testing.T, f commitFixture) {
 	if err := f.repos.Contents.BindCopyTask(ctx, copyRow.ID, generation, row.ID); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := f.repos.Tasks.ClaimNext(ctx, time.Minute)
+	claimed, err := f.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != row.ID {
 		t.Fatalf("claim = %#v, %v", claimed, err)
 	}

@@ -31,7 +31,8 @@ func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Ti
 		if err != nil {
 			return in, err
 		}
-		if offset == 0 && page.Total == 0 && s.checker != nil {
+		// Rows and totals can observe different sides of a concurrent refresh.
+		if offset == 0 && len(page.Items) == 0 && s.checker != nil {
 			if err := s.RefreshProviderStates(ctx); err != nil {
 				return in, err
 			}

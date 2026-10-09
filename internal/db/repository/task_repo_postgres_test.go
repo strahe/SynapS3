@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,7 +47,7 @@ func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
 	var workers sync.WaitGroup
 	for range taskCount {
 		workers.Go(func() {
-			row, err := repos.Tasks.ClaimNext(ctx, time.Minute)
+			row, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 			if err != nil {
 				errorsFound <- err
 				return
@@ -77,6 +79,98 @@ func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
 
 func TestPostgresTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T) {
 	assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t, newPostgresTaskDB(t))
+}
+
+func TestPostgresTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T) {
+	assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, newPostgresTaskDB(t))
+}
+
+type claimQueryRecorder struct {
+	queries []string
+}
+
+func (h *claimQueryRecorder) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *claimQueryRecorder) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	if strings.HasPrefix(event.Query, "UPDATE tasks\nSET status = 'running'") {
+		h.queries = append(h.queries, event.Query)
+	}
+}
+
+var taskClaimDiagnostics = flag.Bool("task-claim-diagnostics", false, "Record PostgreSQL task claim plans with an excluded backlog")
+
+func TestPostgresTaskClaimFilteredBacklogDiagnostics(t *testing.T) {
+	if !*taskClaimDiagnostics {
+		t.Skip("run with -args -task-claim-diagnostics")
+	}
+	db := newPostgresTaskDB(t)
+	ctx := t.Context()
+	const backlogPerMode = 5000
+	old := time.Now().UTC().Add(-time.Hour)
+	if _, err := db.ExecContext(ctx, `INSERT INTO tasks
+		(id,type,idempotency_key,input_version,input_hash,status,resume_mode,available_at,
+		claim_generation,claimed_at,lease_until,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
+		SELECT id,'full','backlog-'||id,1,'hash',CASE WHEN id <= ? THEN 'running' ELSE 'pending' END,
+		'execute',?,CASE WHEN id <= ? THEN 1 ELSE 0 END,
+		CASE WHEN id <= ? THEN ?::timestamptz ELSE NULL END,CASE WHEN id <= ? THEN ?::timestamptz ELSE NULL END,
+		?,?,'{}','{"version":2,"max_attempts":6}','{}','[]' FROM generate_series(1, ?) AS id`,
+		backlogPerMode, old, backlogPerMode, backlogPerMode, old, backlogPerMode, old,
+		old, old, 2*backlogPerMode); err != nil {
+		t.Fatal(err)
+	}
+	for index, status := range []model.TaskStatus{model.TaskStatusRunning, model.TaskStatusPending} {
+		row := repositoryTestTask(&model.Task{
+			ID: int64(2*backlogPerMode + index + 1), Type: "available", IdempotencyKey: fmt.Sprintf("eligible-%d", index),
+			InputVersion: 1, Input: []byte(`{}`), InputHash: "hash", Status: status, Events: []byte(`[]`),
+			ResumeMode: model.TaskResumeModeExecute, AvailableAt: old.Add(time.Minute),
+		})
+		if status == model.TaskStatusRunning {
+			row.ClaimGeneration, row.ClaimedAt, row.LeaseUntil = 1, &old, new(old.Add(time.Minute))
+		}
+		if _, err := db.NewInsert().Model(row).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "ANALYZE tasks"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := new(claimQueryRecorder)
+	db.AddQueryHook(recorder)
+	repos := repository.NewRepositories(db)
+	for index, mode := range []string{"recovery", "pending"} {
+		before := len(recorder.queries)
+		row, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{ExcludedTypes: []string{"full"}})
+		if err != nil || row == nil || row.ID != int64(2*backlogPerMode+index+1) {
+			t.Fatalf("%s claim = %#v, err=%v", mode, row, err)
+		}
+		if len(recorder.queries) <= before {
+			t.Fatal("claim query was not recorded")
+		}
+		query := recorder.queries[len(recorder.queries)-1]
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Replay the real claim under rollback so EXPLAIN measures candidate selection and mutation.
+		if index == 0 {
+			_, err = tx.ExecContext(ctx, "UPDATE tasks SET lease_until=? WHERE id=?", old.Add(time.Minute), row.ID)
+		} else {
+			_, err = tx.ExecContext(ctx, "UPDATE tasks SET status='pending',claimed_at=NULL,lease_until=NULL WHERE id=?", row.ID)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		var plan []string
+		err = tx.NewRaw("EXPLAIN (ANALYZE, BUFFERS) "+query).Scan(ctx, &plan)
+		rollbackErr := tx.Rollback()
+		if err != nil || rollbackErr != nil {
+			t.Fatalf("explain %s: %v, rollback: %v", mode, err, rollbackErr)
+		}
+		t.Logf("%s claim with %d older excluded rows:\n%s", mode, backlogPerMode, strings.Join(plan, "\n"))
+	}
 }
 
 func TestPostgresTaskOperationAdmissionAndRollback(t *testing.T) {
@@ -127,7 +221,7 @@ func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T)
 	}
 	result := make(chan claimResult, 1)
 	go func() {
-		claimed, claimErr := repos.Tasks.ClaimNext(ctx, time.Minute)
+		claimed, claimErr := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 		result <- claimResult{task: claimed, err: claimErr}
 	}()
 	select {

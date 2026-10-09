@@ -62,7 +62,7 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 	if err := repos.Contents.BindCopyTask(t.Context(), copies[0].ID, 1, firstTask.ID); err != nil {
 		t.Fatalf("BindCopyTask(first): %v", err)
 	}
-	staleClaim, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	staleClaim, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || staleClaim == nil || staleClaim.ID != firstTask.ID {
 		t.Fatalf("ClaimNext(first) = %#v, err=%v", staleClaim, err)
 	}
@@ -72,7 +72,7 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 	if _, err := db.NewRaw(`UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), firstTask.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("expire first copy claim: %v", err)
 	}
-	freshClaim, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	freshClaim, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || freshClaim == nil || freshClaim.ID != firstTask.ID {
 		t.Fatalf("ClaimNext(fresh) = %#v, err=%v", freshClaim, err)
 	}
@@ -181,7 +181,7 @@ func TestPermanentDeleteClearsTerminalStoreFence(t *testing.T) {
 	if err := repos.Contents.BindCopyTask(t.Context(), copies[0].ID, 1, taskRow.ID); err != nil {
 		t.Fatalf("BindCopyTask: %v", err)
 	}
-	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("ClaimNext = %#v, err=%v", claimed, err)
 	}

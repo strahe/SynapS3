@@ -86,6 +86,7 @@ func (h *PullHandler) recoverPullFromCache(ctx context.Context, execution tasken
 
 func (h *PullHandler) pullHandler() *taskengine.FuncHandler {
 	definition := h.copyDefinition(model.TaskTypeStoragePull)
+	definition.MaxConcurrency = 4
 	definition.Policy.MaxAttempts = 12
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runPull(ctx, execution, true)
@@ -241,15 +242,12 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		return err
 	}
 	if !checkpoint.Accepted {
-		attempted, err = execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, "pull:"+attempt.AttemptID, checkpoint,
+		attempted, err = execution.WithCheckpointedEffect(ctx, "pull:"+attempt.AttemptID, checkpoint,
 			func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Contents.ReservePullRequest(ctx, pullReservation(input, execution.ID(), attempt))
 			}, submit)
 	} else {
 		err = submit(ctx)
-	}
-	if errors.Is(err, taskengine.ErrResourceBusy) {
-		return taskengine.ResourceWait("Waiting for other storage operations to finish")
 	}
 	if !checkpoint.Accepted && !attempted && err != nil {
 		return h.retryUnsubmittedPull(execution, input, copyRow, attempt, err)

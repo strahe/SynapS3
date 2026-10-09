@@ -261,11 +261,13 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 
 	var busyCount atomic.Int64
 	var claimedCount atomic.Int64
+	seenIDs := make(map[int64]bool)
+	var claimsMu sync.Mutex
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
 			for {
-				task, err := repos.Tasks.ClaimNext(ctx, time.Minute)
+				task, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 				if err != nil {
 					if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
 						busyCount.Add(1)
@@ -275,6 +277,14 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 					return
 				}
 				if task == nil {
+					return
+				}
+				claimsMu.Lock()
+				duplicate := seenIDs[task.ID]
+				seenIDs[task.ID] = true
+				claimsMu.Unlock()
+				if duplicate {
+					t.Errorf("task %d was claimed more than once", task.ID)
 					return
 				}
 				claimedCount.Add(1)
@@ -288,6 +298,9 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	}
 	if claimedCount.Load() != 100 {
 		t.Fatalf("expected all tasks claimed, got %d", claimedCount.Load())
+	}
+	if len(seenIDs) != 100 {
+		t.Fatalf("unique claims = %d, want 100", len(seenIDs))
 	}
 }
 

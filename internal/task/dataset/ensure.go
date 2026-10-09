@@ -83,6 +83,7 @@ func NewEnsureHandler(deps EnsureDependencies) (*EnsureHandler, error) {
 func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeStorageDataSetEnsure, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
+		MaxConcurrency: 2,
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.DataSetInput) error {
 			return storagepipeline.ValidateDataSetInput(*input)
 		}),
@@ -286,7 +287,7 @@ func (h *EnsureHandler) sendDataSetCreation(
 		submission  storage.CreateDataSetSubmission
 	)
 	createCtx, cancelCreate := context.WithCancel(ctx)
-	attempted, createErr := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, fmt.Sprintf("ensure:%d", binding.ID), checkpoint,
+	attempted, createErr := execution.WithCheckpointedEffect(ctx, fmt.Sprintf("ensure:%d", binding.ID), checkpoint,
 		func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.Contents.RecordDataSetClientID(ctx, binding.ID, execution.ID(), recordedID)
 		},
@@ -313,9 +314,6 @@ func (h *EnsureHandler) sendDataSetCreation(
 	if createErr != nil && !attempted {
 		if errors.Is(createErr, repository.ErrConflict) || errors.Is(createErr, repository.ErrNotFound) {
 			return taskengine.Cancel("Storage service setup was superseded", nil)
-		}
-		if errors.Is(createErr, taskengine.ErrResourceBusy) {
-			return taskengine.ResourceWait("Waiting for other storage operations to finish")
 		}
 		return retryTask(createErr, "dataset_creation_not_started")
 	}

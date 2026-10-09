@@ -124,7 +124,7 @@ func TestManualRetryCreatesIndependentCopyRound(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 	source := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
-	claim, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claim, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claim == nil || claim.ID != source.ID {
 		t.Fatalf("claim source = %#v, %v", claim, err)
 	}
@@ -180,7 +180,7 @@ func TestHistoricalCopyFailureCannotAcquireNewerOwner(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 	source := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
-	claim, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claim, err := runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestHistoricalCopyFailureCannotAcquireNewerOwner(t *testing.T) {
 		t.Fatalf("historical source eligible=%v err=%v", allowed, err)
 	}
 	// A repeated request names its original child even after that child starts.
-	claim, err = runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claim, err = runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claim.ID != child.ID {
 		t.Fatalf("claim child=%#v %v", claim, err)
 	}
@@ -232,7 +232,7 @@ func TestCommitFailedOwnedMemberUsesCoordinatorBudget(t *testing.T) {
 			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", failedID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			claim, err := f.runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute)
+			claim, err := f.runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 			if err != nil || claim == nil || claim.ID != failedID {
 				t.Fatalf("claim member=%#v err=%v", claim, err)
 			}

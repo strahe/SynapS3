@@ -172,6 +172,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		LRUHighPercent:            cfg.Cache.LRUHighWatermarkPercent,
 		LRULowPercent:             cfg.Cache.LRULowWatermarkPercent,
 		DefaultCopies:             cfg.Filecoin.DefaultCopies,
+		UploadConcurrency:         cfg.Worker.Tasks.UploadConcurrency,
 		AnchorProviderTier:        providerselect.Tier(cfg.Filecoin.AnchorProviderTier),
 		CommitMaxPieces:           cfg.Worker.Tasks.CommitMaxPieces,
 		CommitMaxWait:             cfg.Worker.Tasks.CommitMaxWait,
@@ -198,11 +199,9 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		}
 	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency:                    cfg.Worker.Tasks.Concurrency,
-		PollInterval:                   cfg.Worker.Tasks.PollInterval,
-		LeaseDuration:                  cfg.Worker.Tasks.LeaseDuration,
-		ProviderMutationConcurrency:    cfg.Worker.Tasks.ProviderMutationConcurrency,
-		DestructiveMutationConcurrency: cfg.Worker.Tasks.DestructiveMutationConcurrency,
+		Concurrency:   cfg.Worker.Tasks.Concurrency,
+		PollInterval:  cfg.Worker.Tasks.PollInterval,
+		LeaseDuration: cfg.Worker.Tasks.LeaseDuration,
 		OnTaskSettled: func(taskRow *model.Task, transition repository.TaskTransition) {
 			publishUploadTaskSettlement(events, taskRow, transition)
 		},

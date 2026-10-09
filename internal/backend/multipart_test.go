@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
@@ -352,7 +353,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	if obj.MultipartUploadID == nil || *obj.MultipartUploadID != uploadID {
 		t.Fatalf("object multipart_upload_id = %v, want %s", obj.MultipartUploadID, uploadID)
 	}
-	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil {
 		t.Fatalf("ClaimNext: %v", err)
 	}

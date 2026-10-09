@@ -25,7 +25,7 @@ func TestSupersededReplacementReschedulesArchivedCoordinator(t *testing.T) {
 	if err := repos.Replacements.MarkFailed(t.Context(), first.ID, nil, "confirmation stopped"); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	claimed, err := repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	if err != nil || claimed == nil {
 		t.Fatalf("claim = %#v, %v", claimed, err)
 	}
@@ -34,7 +34,7 @@ func TestSupersededReplacementReschedulesArchivedCoordinator(t *testing.T) {
 		if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusCancelled, ResumeMode: model.TaskResumeModeRecover}); err != nil {
 			t.Fatal(err)
 		}
-		claimed, err = repos.Tasks.ClaimNext(t.Context(), time.Minute)
+		claimed, err = repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
 	}
 	if err != nil || claimed == nil || claimed.ID != coordinator.ID {
 		t.Fatalf("coordinator claim = %#v, %v", claimed, err)

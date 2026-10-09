@@ -14,13 +14,31 @@ import (
 
 type selectionTierStore struct {
 	*tierTestStore
-	snapshots map[string]*ProviderTierSnapshot
-	readErr   error
-	reads     int
+	snapshots         map[string]*ProviderTierSnapshot
+	readErr           error
+	reads             int
+	firstProviderPage *ProviderStatePage
 }
 
-func (s *selectionTierStore) ProviderProfiles(context.Context, []types.OnChainID) (map[string]ProviderProfile, error) {
-	return nil, nil
+func (s *selectionTierStore) ProviderProfiles(_ context.Context, ids []types.OnChainID) (map[string]ProviderProfile, error) {
+	profiles := make(map[string]ProviderProfile, len(ids))
+	for _, id := range ids {
+		for _, state := range s.providers {
+			if state.Profile != nil && state.ProviderID.Equal(id) {
+				profiles[id.String()] = *state.Profile
+			}
+		}
+	}
+	return profiles, nil
+}
+
+func (s *selectionTierStore) ListProviderStates(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {
+	if s.firstProviderPage != nil {
+		page := *s.firstProviderPage
+		s.firstProviderPage = nil
+		return page, nil
+	}
+	return s.fakeStateStore.ListProviderStates(ctx, opts)
 }
 
 func (s *selectionTierStore) GetProviderTierSnapshot(_ context.Context, tier string) (*ProviderTierSnapshot, error) {
@@ -82,5 +100,38 @@ func TestSelectionAdmissionFreshnessAndIndependentTiers(t *testing.T) {
 				t.Fatalf("refresh writes = %d, want 1", store.endorsedCalls)
 			}
 		})
+	}
+}
+
+func TestSelectionInventoryRefreshesEmptyFirstPageWithNonzeroTotal(t *testing.T) {
+	now := time.Now().UTC()
+	id := types.NewOnChainID(101)
+	active, hasPDP := true, true
+	url := "https://provider.test"
+	states := []ProviderState{{
+		ProviderID: id, Status: StatusAvailable, Active: &active, HasPDP: &hasPDP,
+		ServiceURL: &url, LastCheckedAt: now,
+		Profile: &ProviderProfile{ProviderID: id, Active: true, ServiceURL: url},
+	}}
+	store := &selectionTierStore{
+		tierTestStore: &tierTestStore{fakeStateStore: &fakeStateStore{providers: states}},
+		snapshots: map[string]*ProviderTierSnapshot{
+			"approved": {CheckedAt: now, ProviderIDs: json.RawMessage(`["101"]`)},
+		},
+		// The initial rows were read before the first refresh committed, and
+		// the total was read afterwards.
+		firstProviderPage: &ProviderStatePage{Total: 1},
+	}
+	checker := &fakeRefreshChecker{checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
+		return states, nil
+	}}
+	service := NewService(ServiceOptions{Store: store, Checker: checker, RefreshInterval: time.Minute, Now: func() time.Time { return now }})
+	in, err := service.SelectionInventory(t.Context(), providerselect.TierApproved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := providerselect.Select(in, providerselect.StrategyDistribution, 1, nil, false)
+	if err != nil || len(selected) != 1 || !selected[0].ID.Equal(id) {
+		t.Fatalf("selected providers = %#v, err=%v, want trusted provider %s", selected, err, id.String())
 	}
 }
