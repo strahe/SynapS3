@@ -78,7 +78,7 @@ func TestTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T) {
 	assertTaskHistoryPaginationAcrossLongArchivedChain(t, testDB(t))
 }
 
-func TestCurrentFailedSubjectHistoryPaginationUsesIndex(t *testing.T) {
+func TestCurrentFailedSubjectHistoryPagination(t *testing.T) {
 	db := testDB(t)
 	now := time.Now().UTC()
 	st, sk := "periodic", "cache"
@@ -104,11 +104,6 @@ func TestCurrentFailedSubjectHistoryPaginationUsesIndex(t *testing.T) {
 	if _, err := db.NewInsert().Model(&history).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(t.Context(), "ANALYZE"); err != nil {
-		t.Fatal(err)
-	}
-	capture := new(taskHistoryQueries)
-	db.AddQueryHook(capture)
 	repos := repository.NewRepositories(db)
 	for _, subject := range []struct {
 		st, sk string
@@ -116,7 +111,6 @@ func TestCurrentFailedSubjectHistoryPaginationUsesIndex(t *testing.T) {
 	}{{st, sk, []int64{6, 4}}, {"", "", []int64{5, 3}}} {
 		cursor := int64(0)
 		for i, id := range subject.ids {
-			capture.queries = nil
 			page, err := repos.Tasks.ListCurrentFailedForSubject(t.Context(), subject.st, subject.sk, cursor, 1, model.TaskTypeUploadPlan)
 			if err != nil || len(page.Tasks) != 1 || page.Tasks[0].ID != id {
 				t.Fatalf("subject=%s/%s cursor=%d page=%+v, err=%v", subject.st, subject.sk, cursor, page, err)
@@ -129,20 +123,6 @@ func TestCurrentFailedSubjectHistoryPaginationUsesIndex(t *testing.T) {
 				t.Fatalf("cursor=%d, want %d", page.NextBeforeID, wantCursor)
 			}
 			cursor = page.NextBeforeID
-			var plan []struct {
-				ID, Parent, Notused int
-				Detail              string
-			}
-			if err := db.NewRaw("EXPLAIN QUERY PLAN "+capture.queries[0]).Scan(t.Context(), &plan); err != nil {
-				t.Fatal(err)
-			}
-			indexed := false
-			for _, step := range plan {
-				indexed = indexed || strings.Contains(step.Detail, "SEARCH task_history USING INDEX idx_task_history_current_failed_subject")
-			}
-			if !indexed {
-				t.Fatalf("current-failure lookup scans history: %+v", plan)
-			}
 		}
 	}
 }

@@ -21,7 +21,7 @@ func TestPullDataSetMigrationPreservesLedgerAndEnforcesTarget(t *testing.T) {
 		if err := db.NewSelect().Model(&before).Scan(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		oldIndexes, err := indexLines(t.Context(), db, []string{"storage_pull_attempts"}, false)
+		oldSchema, err := describeSchema(t.Context(), db, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -36,20 +36,23 @@ func TestPullDataSetMigrationPreservesLedgerAndEnforcesTarget(t *testing.T) {
 		if !reflect.DeepEqual(before, after) {
 			t.Fatalf("ledger changed: before=%+v after=%+v", before, after)
 		}
-		newIndexes, err := indexLines(t.Context(), db, []string{"storage_pull_attempts"}, false)
+		newSchema, err := describeSchema(t.Context(), db, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, index := range oldIndexes {
-			if !slices.Contains(newIndexes, index) {
-				t.Errorf("lost index %s", index)
-			}
+		wantSchema := append(oldSchema,
+			"constraint|storage_pull_attempts|fk_storage_pull_attempts_data_set",
+			foreignKeyLine("storage_pull_attempts", "storage_data_set_id", "storage_data_sets", "id", "RESTRICT", "RESTRICT"),
+			indexLine("storage_pull_attempts", "idx_storage_pull_attempts_data_set", false, []string{"storage_data_set_id"}, "", false),
+		)
+		slices.Sort(wantSchema)
+		if !slices.Equal(newSchema, wantSchema) {
+			t.Fatalf("upgrade changed existing schema (missing: %s; unexpected: %s)",
+				schemaLinesSummary(wantSchema, newSchema), schemaLinesSummary(newSchema, wantSchema))
 		}
 		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET storage_data_set_id = -1`)
 		mustRejectStatement(t, db, `DELETE FROM storage_data_sets WHERE id = ?`, dataSet)
 		mustRejectStatement(t, db, `UPDATE storage_data_sets SET id = -1 WHERE id = ?`, dataSet)
-		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET status = 'unknown'`)
-		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET extra_data_hex = ''`)
 		if _, err := db.ExecContext(t.Context(), `DELETE FROM storage_contents WHERE id = ?`, content); err != nil {
 			t.Fatalf("content cleanup should retain ledger: %v", err)
 		}

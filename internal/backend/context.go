@@ -7,7 +7,8 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// snapshotRequestContext keeps request reuse and shutdown out of asynchronous consumers.
+// snapshotRequestContext copies values out of fasthttp's pooled RequestCtx and
+// retains its server shutdown signal after the handler returns.
 func snapshotRequestContext(ctx context.Context) context.Context {
 	requestCtx, ok := ctx.(*fasthttp.RequestCtx)
 	if !ok {
