@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -47,7 +48,8 @@ var initialSchemaTables2026090101 = []string{
 	"storage_pull_attempts",
 	"storage_replacement_items",
 	"storage_replacements",
-	"task_payloads",
+	"task_history",
+	"task_schedules",
 	"tasks",
 	"wallet_operations",
 }
@@ -87,17 +89,6 @@ func up2026090101InitialSchema(ctx context.Context, db bun.IDB) error {
 	return nil
 }
 
-// taskPayload2026090101 holds the JSON a task carries. It lives beside the task
-// rather than in it because lease renewal updates an indexed column on every
-// heartbeat, and PostgreSQL copies the whole row — JSON included — each time.
-type taskPayload2026090101 struct {
-	bun.BaseModel `bun:"table:task_payloads"`
-
-	TaskID     int64           `bun:",pk"`
-	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
-	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb"`
-}
-
 type task2026090101 struct {
 	bun.BaseModel `bun:"table:tasks"`
 
@@ -106,81 +97,181 @@ type task2026090101 struct {
 	IdempotencyKey string  `bun:"type:text,notnull"`
 	InputVersion   int     `bun:"type:integer,notnull"`
 	InputHash      string  `bun:"type:text,notnull"`
-	SubjectType    *string `bun:"type:text"`
-	SubjectKey     *string `bun:"type:text"`
+	SubjectType    *string `bun:"type:text,nullzero"`
+	SubjectKey     *string `bun:"type:text,nullzero"`
+	RetryOfTaskID  *int64  `bun:",nullzero"`
+
+	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
+	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
+	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
+	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
+	Events     json.RawMessage `bun:"events_json,type:jsonb,notnull"`
 
 	Status        string    `bun:"type:text,notnull,default:'pending'"`
 	ResumeMode    string    `bun:"type:text,notnull,default:'execute'"`
-	AvailableAt   time.Time `bun:",notnull"`
-	WaitReason    *string   `bun:"type:text"`
+	AvailableAt   time.Time `bun:",nullzero,notnull"`
+	WaitReason    *string   `bun:"type:text,nullzero"`
 	RetryCount    int       `bun:"type:integer,notnull,default:0"`
-	RetryLimit    *int      `bun:"type:integer"`
-	FailureReason *string   `bun:"type:text"`
-	LastError     *string   `bun:"type:text"`
-	StatusMessage *string   `bun:"type:text"`
+	FailureReason *string   `bun:"type:text,nullzero"`
+	LastError     *string   `bun:"type:text,nullzero"`
+	StatusMessage *string   `bun:"type:text,nullzero"`
 
-	CancellationRequestedAt *time.Time
-	CancellationReason      *string `bun:"type:text"`
-	ClaimGeneration         int64   `bun:",notnull,default:0"`
-	ClaimedAt               *time.Time
-	LeaseUntil              *time.Time
-	StartedAt               *time.Time
-	FinishedAt              *time.Time
+	CancellationRequestedAt *time.Time `bun:",nullzero"`
+	CancellationReason      *string    `bun:"type:text,nullzero"`
+	ClaimGeneration         int64      `bun:",notnull,default:0"`
+	ClaimedAt               *time.Time `bun:",nullzero"`
+	LeaseUntil              *time.Time `bun:",nullzero"`
+	StartedAt               *time.Time `bun:",nullzero"`
+	FinishedAt              *time.Time `bun:",nullzero"`
+	CreatedAt               time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
+	WorkStartedAt           *time.Time `bun:",nullzero"`
+}
+
+type taskHistory2026090101 struct {
+	bun.BaseModel `bun:"table:task_history"`
+
+	TaskID         int64   `bun:",pk"`
+	Type           string  `bun:"type:text,notnull"`
+	IdempotencyKey string  `bun:"type:text,notnull"`
+	InputVersion   int     `bun:"type:integer,notnull"`
+	InputHash      string  `bun:"type:text,notnull"`
+	SubjectType    *string `bun:"type:text,nullzero"`
+	SubjectKey     *string `bun:"type:text,nullzero"`
+	RetryOfTaskID  *int64  `bun:",nullzero"`
+
+	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
+	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
+	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
+	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
+	Events     json.RawMessage `bun:"events_json,type:jsonb,notnull"`
+
+	Status        string    `bun:"type:text,notnull"`
+	ResumeMode    string    `bun:"type:text,notnull,default:'execute'"`
+	AvailableAt   time.Time `bun:",nullzero,notnull"`
+	WaitReason    *string   `bun:"type:text,nullzero"`
+	RetryCount    int       `bun:"type:integer,notnull,default:0"`
+	FailureReason *string   `bun:"type:text,nullzero"`
+	LastError     *string   `bun:"type:text,nullzero"`
+	StatusMessage *string   `bun:"type:text,nullzero"`
+
+	CancellationRequestedAt *time.Time `bun:",nullzero"`
+	CancellationReason      *string    `bun:"type:text,nullzero"`
+	ClaimGeneration         int64      `bun:",notnull,default:0"`
+	ClaimedAt               *time.Time `bun:",nullzero"`
+	LeaseUntil              *time.Time `bun:",nullzero"`
+	StartedAt               *time.Time `bun:",nullzero"`
+	FinishedAt              *time.Time `bun:",nullzero"`
+	CreatedAt               time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
+	WorkStartedAt           *time.Time `bun:",nullzero"`
 	AcknowledgedAt          *time.Time
-	RetentionUntil          *time.Time
-	CreatedAt               time.Time `bun:",notnull"`
-	UpdatedAt               time.Time `bun:",notnull"`
+	SupersededAt            *time.Time
+}
+
+type taskSchedule2026090101 struct {
+	bun.BaseModel `bun:"table:task_schedules"`
+	Key           string    `bun:"type:text,pk"`
+	NextRunAt     time.Time `bun:",notnull"`
+	LatestTaskID  *int64
+	Generation    int64 `bun:",notnull"`
+}
+
+func taskConstraints2026090101(name string, d dialect.Name) []string {
+	id := "id"
+	if name == "task_history" {
+		id = "task_id"
+	}
+	prefix := "CONSTRAINT chk_" + name + "_"
+	constraints := []string{
+		prefix + "identity CHECK (type <> '' AND idempotency_key <> '' AND input_hash <> '' AND input_version >= 1)",
+		prefix + "resume_mode CHECK (resume_mode IN ('execute','recover'))",
+		prefix + "subject CHECK ((subject_type IS NULL AND subject_key IS NULL) OR (subject_type IS NOT NULL AND subject_type <> '' AND subject_key IS NOT NULL AND subject_key <> ''))",
+		prefix + "reason_codes CHECK ((wait_reason IS NULL OR wait_reason <> '') AND (failure_reason IS NULL OR failure_reason <> ''))",
+		prefix + "retry CHECK (retry_count >= 0)",
+		prefix + "generation CHECK (claim_generation >= 0)",
+		prefix + "retry_parent CHECK (retry_of_task_id IS NULL OR retry_of_task_id < " + id + ")",
+	}
+	if name == "tasks" {
+		constraints = append(constraints,
+			prefix+"status CHECK (status IN ('pending','running','failed'))",
+			prefix+"claim CHECK ((status = 'running' AND claimed_at IS NOT NULL AND lease_until IS NOT NULL AND claim_generation > 0) OR (status <> 'running' AND claimed_at IS NULL AND lease_until IS NULL))",
+			prefix+"finished CHECK ((status = 'failed' AND finished_at IS NOT NULL) OR (status IN ('pending','running') AND finished_at IS NULL))")
+	} else {
+		constraints = append(constraints,
+			prefix+"status CHECK (status IN ('completed','failed','cancelled'))",
+			prefix+"claim CHECK (claimed_at IS NULL AND lease_until IS NULL)",
+			prefix+"finished CHECK (finished_at IS NOT NULL)",
+			prefix+"acknowledged CHECK (acknowledged_at IS NULL OR status = 'failed')",
+			prefix+"placement CHECK (status <> 'failed' OR acknowledged_at IS NOT NULL OR superseded_at IS NOT NULL)")
+	}
+	if d == dialect.PG {
+		constraints = append(constraints,
+			prefix+"events_count CHECK (jsonb_array_length(events_json) <= 128)",
+			prefix+"policy_budget CHECK (CASE WHEN policy_json->>'version' = '2' THEN COALESCE(jsonb_typeof(policy_json->'max_attempts') = 'number' AND (policy_json->>'max_attempts') ~ '^[1-9][0-9]*$' AND retry_count < (policy_json->>'max_attempts')::BIGINT,FALSE) ELSE TRUE END)")
+	} else {
+		constraints = append(constraints,
+			prefix+"events_count CHECK (CASE WHEN json_valid(events_json) AND json_type(events_json) = 'array' THEN json_array_length(events_json) <= 128 ELSE FALSE END)",
+			prefix+"policy_budget CHECK (CASE WHEN json_valid(policy_json) AND json_extract(policy_json,'$.version') = 2 THEN COALESCE(json_type(policy_json,'$.max_attempts') = 'integer' AND json_extract(policy_json,'$.max_attempts') > 0 AND retry_count < json_extract(policy_json,'$.max_attempts'),FALSE) ELSE TRUE END)")
+	}
+	return constraints
+}
+
+func taskIndexes2026090101(d dialect.Name) []initialIndexSpec {
+	indexes := []initialIndexSpec{
+		{name: "uq_tasks_type_key", table: "tasks", columns: []string{"type", "idempotency_key"}, unique: true},
+		{name: "uq_tasks_retry_parent", table: "tasks", columns: []string{"retry_of_task_id"}, where: "retry_of_task_id IS NOT NULL", unique: true},
+		{name: "idx_tasks_pending", table: "tasks", columns: []string{"available_at", "id"}, where: "status = 'pending'"},
+		{name: "idx_tasks_recovery", table: "tasks", columns: []string{"lease_until", "id"}, where: "status = 'running'"},
+		{name: "idx_tasks_status_id", table: "tasks", columns: []string{"status", "id"}},
+		{name: "idx_tasks_status_type_id", table: "tasks", columns: []string{"status", "type", "id"}},
+		{name: "idx_tasks_type_id", table: "tasks", columns: []string{"type", "id"}},
+		{name: "idx_tasks_subject", table: "tasks", columns: []string{"subject_type", "subject_key", "id"}},
+		{name: "uq_task_history_type_key", table: "task_history", columns: []string{"type", "idempotency_key"}, where: "superseded_at IS NULL", unique: true},
+		{name: "uq_task_history_retry_parent", table: "task_history", columns: []string{"retry_of_task_id"}, where: "retry_of_task_id IS NOT NULL", unique: true},
+		{name: "idx_task_history_type_id", table: "task_history", columns: []string{"type", "task_id"}},
+		{name: "idx_task_history_subject", table: "task_history", columns: []string{"subject_type", "subject_key", "task_id"}},
+		{name: "idx_task_history_status_id", table: "task_history", columns: []string{"status", "task_id"}},
+	}
+	failed := initialIndexSpec{name: "idx_task_history_current_failed_subject", table: "task_history", columns: []string{"subject_type", "subject_key", "status", "superseded_at", "task_id"}}
+	if d == dialect.PG {
+		failed.columns = []string{"subject_type", "subject_key", "superseded_at", "task_id"}
+		failed.where = "status = 'failed' AND superseded_at IS NULL"
+	}
+	return append(indexes, failed)
 }
 
 func createTaskSchema(ctx context.Context, db bun.IDB) error {
-	if err := createInitialTable(ctx, db, initialTableSpec{
-		name:  "tasks",
-		model: (*task2026090101)(nil),
-		constraints: []string{
-			"CONSTRAINT uq_tasks_type_key UNIQUE (type, idempotency_key)",
-			"CONSTRAINT chk_tasks_identity CHECK (type <> '' AND idempotency_key <> '' AND input_hash <> '' AND input_version >= 1)",
-			"CONSTRAINT chk_tasks_status CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled'))",
-			"CONSTRAINT chk_tasks_resume_mode CHECK (resume_mode IN ('execute', 'recover'))",
-			"CONSTRAINT chk_tasks_subject CHECK ((subject_type IS NULL AND subject_key IS NULL) OR (subject_type IS NOT NULL AND subject_type <> '' AND subject_key IS NOT NULL AND subject_key <> ''))",
-			"CONSTRAINT chk_tasks_reason_codes CHECK ((wait_reason IS NULL OR wait_reason <> '') AND (failure_reason IS NULL OR failure_reason <> ''))",
-			"CONSTRAINT chk_tasks_retry CHECK (retry_count >= 0 AND (retry_limit IS NULL OR (retry_limit >= 0 AND retry_count <= retry_limit)))",
-			"CONSTRAINT chk_tasks_generation CHECK (claim_generation >= 0)",
-			`CONSTRAINT chk_tasks_claim CHECK (
-				(status = 'running' AND claimed_at IS NOT NULL AND lease_until IS NOT NULL AND claim_generation > 0)
-				OR (status <> 'running' AND claimed_at IS NULL AND lease_until IS NULL)
-			)`,
-			`CONSTRAINT chk_tasks_finished CHECK (
-				(status IN ('completed', 'failed', 'cancelled') AND finished_at IS NOT NULL)
-				OR (status IN ('pending', 'running') AND finished_at IS NULL)
-			)`,
-			`CONSTRAINT chk_tasks_retention CHECK (
-				(status IN ('completed', 'cancelled') AND retention_until IS NOT NULL)
-				OR (status = 'failed' AND ((acknowledged_at IS NULL AND retention_until IS NULL) OR (acknowledged_at IS NOT NULL AND retention_until IS NOT NULL)))
-				OR (status IN ('pending', 'running') AND acknowledged_at IS NULL AND retention_until IS NULL)
-			)`,
+	for _, table := range []initialTableSpec{
+		{name: "tasks", model: (*task2026090101)(nil), constraints: taskConstraints2026090101("tasks", db.Dialect().Name()), jsonColumns: initialJSONColumns("tasks")},
+		{name: "task_history", model: (*taskHistory2026090101)(nil), constraints: taskConstraints2026090101("task_history", db.Dialect().Name()), jsonColumns: initialJSONColumns("task_history")},
+		{
+			name: "task_schedules", model: (*taskSchedule2026090101)(nil),
+			constraints: []string{
+				"CONSTRAINT chk_task_schedules_key CHECK (key <> '')",
+				"CONSTRAINT chk_task_schedules_generation CHECK (generation >= 0)",
+				"CONSTRAINT uq_task_schedules_latest UNIQUE (latest_task_id)",
+			},
 		},
-	}); err != nil {
-		return err
+	} {
+		if err := createInitialTable(ctx, db, table); err != nil {
+			return err
+		}
 	}
-	if err := createInitialTable(ctx, db, initialTableSpec{
-		name:        "task_payloads",
-		model:       (*taskPayload2026090101)(nil),
-		jsonColumns: initialJSONColumns("task_payloads"),
-		foreignKeys: []string{
-			"(task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE CASCADE",
-		},
-	}); err != nil {
-		return err
+	if db.Dialect().Name() == dialect.PG {
+		// PostgreSQL 18 retains a rebuilt table's generated NOT NULL names.
+		var names []string
+		if err := db.NewRaw(`SELECT conname FROM pg_constraint WHERE conrelid = 'tasks'::regclass AND contype = 'n'`).Scan(ctx, &names); err != nil {
+			return err
+		}
+		for _, name := range names {
+			frozenName := strings.Replace(name, "tasks_", "tasks__rebuild_", 1)
+			if _, err := db.NewRaw("ALTER TABLE tasks RENAME CONSTRAINT ? TO ?", bun.Ident(name), bun.Ident(frozenName)).Exec(ctx); err != nil {
+				return err
+			}
+		}
 	}
-	return createInitialIndexes(ctx, db,
-		initialIndexSpec{name: "idx_tasks_pending", table: "tasks", columns: []string{"available_at", "id"}, where: "status = 'pending'"},
-		initialIndexSpec{name: "idx_tasks_recovery", table: "tasks", columns: []string{"lease_until", "id"}, where: "status = 'running'"},
-		initialIndexSpec{name: "idx_tasks_gc", table: "tasks", columns: []string{"retention_until", "id"}, where: "retention_until IS NOT NULL"},
-		initialIndexSpec{name: "idx_tasks_type_status_id", table: "tasks", columns: []string{"type", "status", "id"}},
-		initialIndexSpec{name: "idx_tasks_type_id", table: "tasks", columns: []string{"type", "id"}},
-		initialIndexSpec{name: "idx_tasks_status_id", table: "tasks", columns: []string{"status", "id"}},
-		initialIndexSpec{name: "idx_tasks_subject", table: "tasks", columns: []string{"subject_type", "subject_key", "id"}},
-	)
+	return createInitialIndexes(ctx, db, taskIndexes2026090101(db.Dialect().Name())...)
 }
 
 type s3Account2026090101 struct {
@@ -198,17 +289,18 @@ type s3Account2026090101 struct {
 type bucket2026090101 struct {
 	bun.BaseModel `bun:"table:buckets"`
 
-	ID                   int64  `bun:",pk,autoincrement,identity"`
-	Name                 string `bun:"type:text,notnull,unique"`
-	ACL                  []byte
-	OwnerAccessKey       *string `bun:"type:text"`
-	DefaultCopies        int     `bun:"type:integer,notnull"`
-	MinimumDurableCopies int     `bun:"type:integer,notnull"`
-	DurabilityGeneration int64   `bun:",notnull,default:0"`
-	DurabilityTaskID     *int64
-	Status               string    `bun:"type:text,notnull,default:'provisioning'"`
-	CreatedAt            time.Time `bun:",notnull"`
-	UpdatedAt            time.Time `bun:",notnull"`
+	ID                        int64  `bun:",pk,autoincrement,identity"`
+	Name                      string `bun:"type:text,notnull,unique"`
+	ACL                       []byte
+	OwnerAccessKey            *string `bun:"type:text"`
+	DefaultCopies             int     `bun:"type:integer,notnull"`
+	MinimumDurableCopies      int     `bun:"type:integer,notnull"`
+	DurabilityGeneration      int64   `bun:",notnull,default:0"`
+	DurabilityTaskID          *int64
+	Status                    string    `bun:"type:text,notnull,default:'provisioning'"`
+	CreatedAt                 time.Time `bun:",notnull"`
+	UpdatedAt                 time.Time `bun:",notnull"`
+	ProviderSelectionStrategy string    `bun:"type:text,notnull,default:'distribution'"`
 }
 
 // bucketReplicaSlot2026090101 gives a replica slot a row of its own. copy_index
@@ -275,8 +367,9 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			},
 		},
 		{
-			name:  "buckets",
-			model: (*bucket2026090101)(nil),
+			name:           "buckets",
+			bytewiseColumn: "name",
+			model:          (*bucket2026090101)(nil),
 			constraints: []string{
 				"CONSTRAINT chk_buckets_identity CHECK (name <> '' AND (owner_access_key IS NULL OR owner_access_key <> ''))",
 				// The durability policy is materialised from configuration when
@@ -286,10 +379,10 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 				"CONSTRAINT chk_buckets_minimum_durable_copies CHECK (minimum_durable_copies >= 1)",
 				"CONSTRAINT chk_buckets_explicit_copy_policy CHECK (minimum_durable_copies <= default_copies)",
 				"CONSTRAINT chk_buckets_durability_generation CHECK (durability_generation >= 0)",
+				"CHECK (provider_selection_strategy IN ('distribution', 'speed'))",
 			},
 			foreignKeys: []string{
 				"(owner_access_key) REFERENCES s3_accounts (access_key) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"(durability_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
 		},
 		{
@@ -304,8 +397,9 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			},
 		},
 		{
-			name:  "objects",
-			model: (*object2026090101)(nil),
+			name:           "objects",
+			bytewiseColumn: "key",
+			model:          (*object2026090101)(nil),
 			constraints: []string{
 				"CONSTRAINT uq_objects_identity UNIQUE (id, bucket_id, key)",
 				"CONSTRAINT chk_objects_identity CHECK (key <> '')",
@@ -316,9 +410,10 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			forwardForeignKeys: []initialForwardForeignKey{objectCurrentVersionForeignKey2026090101()},
 		},
 		{
-			name:        "multipart_uploads",
-			model:       (*multipartUpload2026090101)(nil),
-			jsonColumns: initialJSONColumns("multipart_uploads"),
+			name:           "multipart_uploads",
+			bytewiseColumn: "key",
+			model:          (*multipartUpload2026090101)(nil),
+			jsonColumns:    initialJSONColumns("multipart_uploads"),
 			constraints: []string{
 				"CONSTRAINT uq_multipart_uploads_identity UNIQUE (upload_id, bucket_id, key)",
 				"CONSTRAINT chk_multipart_uploads_identity CHECK (key <> '' AND upload_id <> '')",
@@ -423,9 +518,10 @@ type objectDeletion2026090101 struct {
 
 func createObjectLifecycleSchema(ctx context.Context, db bun.IDB) error {
 	if err := createInitialTable(ctx, db, initialTableSpec{
-		name:        "object_versions",
-		model:       (*objectVersion2026090101)(nil),
-		jsonColumns: initialJSONColumns("object_versions"),
+		name:           "object_versions",
+		bytewiseColumn: "key",
+		model:          (*objectVersion2026090101)(nil),
+		jsonColumns:    initialJSONColumns("object_versions"),
 		constraints: []string{
 			"CONSTRAINT chk_object_versions_identity CHECK (version_id <> '' AND key <> '' AND (multipart_upload_id IS NULL OR multipart_upload_id <> ''))",
 			"CONSTRAINT chk_object_versions_size CHECK (size >= 0)",
@@ -453,14 +549,14 @@ func createObjectLifecycleSchema(ctx context.Context, db bun.IDB) error {
 		},
 		foreignKeys: []string{
 			"(content_id) REFERENCES storage_contents (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"(cache_active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 	}); err != nil {
 		return err
 	}
 	if err := createInitialTable(ctx, db, initialTableSpec{
-		name:  "object_deletions",
-		model: (*objectDeletion2026090101)(nil),
+		name:           "object_deletions",
+		bytewiseColumn: "key",
+		model:          (*objectDeletion2026090101)(nil),
 		constraints: []string{
 			"CONSTRAINT chk_object_deletions_identity CHECK (key <> '' AND version_id <> '')",
 			"CONSTRAINT chk_object_deletions_size CHECK (size >= 0)",
@@ -510,9 +606,6 @@ func createPostgresPrefixIndexes(ctx context.Context, db bun.IDB) error {
 		return nil
 	}
 	return createInitialIndexes(ctx, db,
-		// Listing current objects orders by a C-collated key, so the objects
-		// unique index needs a C-collated companion to drive it.
-		initialIndexSpec{name: "idx_objects_bucket_key_c", table: "objects", columns: []string{"bucket_id", `(key COLLATE "C")`}},
 		initialIndexSpec{name: "idx_object_versions_bucket_key_created", table: "object_versions", columns: []string{"bucket_id", `(key COLLATE "C")`, "created_at DESC", "version_id DESC"}},
 		initialIndexSpec{name: "idx_multipart_uploads_bucket_status_key_upload", table: "multipart_uploads", columns: []string{"bucket_id", "status", `(key COLLATE "C")`, "upload_id"}},
 	)
@@ -558,8 +651,9 @@ type storageDataSet2026090101 struct {
 	EnsureTaskID         *int64
 	RetirementGeneration int64 `bun:",notnull,default:0"`
 	RetirementTaskID     *int64
-	CreatedAt            time.Time `bun:",notnull"`
-	UpdatedAt            time.Time `bun:",notnull"`
+	CreatedAt            time.Time       `bun:",notnull"`
+	UpdatedAt            time.Time       `bun:",notnull"`
+	CreationRejection    json.RawMessage `bun:"type:jsonb"`
 }
 
 type storageCopy2026090101 struct {
@@ -627,6 +721,7 @@ type storageCommitRequest2026090101 struct {
 	AttentionAt            *time.Time
 	CreatedAt              time.Time `bun:",notnull"`
 	UpdatedAt              time.Time `bun:",notnull"`
+	SealRequestedAt        *time.Time
 }
 
 // storageCommitRequestPiece2026090101 names one piece of a sealed request at
@@ -794,12 +889,12 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 			},
 			foreignKeys: []string{
 				"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"(cleanup_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
 		},
 		{
-			name:  "storage_data_sets",
-			model: (*storageDataSet2026090101)(nil),
+			name:        "storage_data_sets",
+			model:       (*storageDataSet2026090101)(nil),
+			jsonColumns: initialJSONColumns("storage_data_sets"),
 			constraints: []string{
 				"CONSTRAINT uq_storage_data_sets_id_bucket_slot UNIQUE (id, bucket_id, copy_index)",
 				"CONSTRAINT uq_storage_data_sets_identity UNIQUE (id, bucket_id, copy_index, provider_id)",
@@ -814,8 +909,6 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 			foreignKeys: []string{
 				"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"(created_by_content_id, bucket_id) REFERENCES storage_contents (id, bucket_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"(ensure_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"(retirement_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
 		},
 		storageCommitRequestTable2026090101(),
@@ -860,7 +953,6 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 			foreignKeys: []string{
 				"(content_id, bucket_id, content_size) REFERENCES storage_contents (id, bucket_id, content_size) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"(storage_data_set_id, bucket_id, copy_index, provider_id) REFERENCES storage_data_sets (id, bucket_id, copy_index, provider_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"(active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
 		},
 		storagePullAttemptTable2026090101(),
@@ -889,8 +981,8 @@ func storageCommitRequestTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_commit_requests_identity CHECK (request_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (submit_error IS NULL OR submit_error <> '') AND (first_piece_id IS NULL OR first_piece_id <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (last_error IS NULL OR last_error <> '') AND (attention_code IS NULL OR attention_code <> ''))",
 			"CONSTRAINT chk_storage_commit_requests_status CHECK (status IN ('collecting', 'ready', 'submitted', 'confirmed', 'abandoned'))",
 			"CONSTRAINT chk_storage_commit_requests_counts CHECK (piece_count >= 0 AND sends >= 0 AND refusals >= 0)",
-			// The task drives the request until it is settled, and is released
-			// then so task retention can delete it.
+			"CONSTRAINT chk_storage_commit_requests_seal_intent CHECK (seal_requested_at IS NULL OR status = 'collecting')",
+			// The task owns the request until it is settled.
 			"CONSTRAINT chk_storage_commit_requests_task CHECK ((status IN ('confirmed', 'abandoned')) = (task_id IS NULL))",
 			`CONSTRAINT chk_storage_commit_requests_shape CHECK (
 				(status = 'collecting' AND piece_count = 0 AND extra_data_hex IS NULL AND sealed_at IS NULL AND first_sent_at IS NULL AND sends = 0 AND submitted_at IS NULL AND last_sent_at IS NULL AND transaction_id IS NULL AND first_piece_id IS NULL AND confirmed_transaction_id IS NULL AND confirmed_at IS NULL)
@@ -905,7 +997,6 @@ func storageCommitRequestTable2026090101() initialTableSpec {
 		},
 		foreignKeys: []string{
 			"(storage_data_set_id) REFERENCES storage_data_sets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"(task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 	}
 }
@@ -941,6 +1032,7 @@ func storagePullAttemptTable2026090101() initialTableSpec {
 			// reopening a copy carries no error string.
 			"CONSTRAINT chk_storage_pull_attempts_error CHECK (last_error IS NULL OR (status = 'abandoned' AND last_error <> ''))",
 			"CONSTRAINT chk_storage_pull_attempts_abandoned CHECK (status <> 'abandoned' OR resolved_at IS NOT NULL)",
+			"CONSTRAINT fk_storage_pull_attempts_data_set FOREIGN KEY (storage_data_set_id) REFERENCES storage_data_sets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 		// Like commit requests, pull attempts keep the copy identity as values
 		// once cleanup has deleted the copy.
@@ -974,7 +1066,6 @@ func storageReplacementTable2026090101() initialTableSpec {
 			"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			"(source_data_set_id, bucket_id, copy_index) REFERENCES storage_data_sets (id, bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			"(target_data_set_id, bucket_id, copy_index) REFERENCES storage_data_sets (id, bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"(task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			"(superseded_by_id) REFERENCES storage_replacements (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 	}
@@ -1038,6 +1129,8 @@ func storageIndexes2026090101() []initialIndexSpec {
 		{name: "idx_storage_copies_active_task", table: "storage_copies", columns: []string{"active_task_id"}, where: "active_task_id IS NOT NULL", unique: true},
 		{name: "idx_storage_commit_requests_data_set_status", table: "storage_commit_requests", columns: []string{"storage_data_set_id", "status", "created_at", "request_id"}},
 		{name: "idx_storage_commit_requests_task", table: "storage_commit_requests", columns: []string{"task_id"}, where: "task_id IS NOT NULL", unique: true},
+		{name: "idx_storage_commit_requests_created", table: "storage_commit_requests", columns: []string{"created_at", "request_id"}},
+		{name: "idx_storage_commit_requests_status_created", table: "storage_commit_requests", columns: []string{"status", "created_at", "request_id"}},
 		{name: "idx_storage_commit_requests_attention", table: "storage_commit_requests", columns: []string{"attention_at", "request_id"}, where: "attention_code IS NOT NULL"},
 		{name: "idx_storage_commit_request_pieces_member", table: "storage_commit_request_pieces", columns: []string{"content_id", "storage_data_set_id"}},
 		{name: "idx_storage_cleanup_copies_replica_slot", table: "storage_cleanup_copies", columns: []string{"bucket_id", "copy_index"}},
@@ -1045,6 +1138,7 @@ func storageIndexes2026090101() []initialIndexSpec {
 		// One unresolved attempt per copy: a second source can only be tried
 		// after the first is abandoned.
 		{name: "idx_storage_pull_attempts_unresolved_copy", table: "storage_pull_attempts", columns: []string{"content_id", "storage_data_set_id"}, where: "resolved_at IS NULL", unique: true},
+		{name: "idx_storage_pull_attempts_data_set", table: "storage_pull_attempts", columns: []string{"storage_data_set_id"}},
 		{name: "idx_storage_pull_attempts_copy_history", table: "storage_pull_attempts", columns: []string{"content_id", "storage_data_set_id", "created_at DESC", "attempt_id"}},
 		{name: "idx_storage_replacements_active_source", table: "storage_replacements", columns: []string{"source_data_set_id"}, where: "status NOT IN ('completed', 'superseded')", unique: true},
 		{name: "idx_storage_replacements_active_target", table: "storage_replacements", columns: []string{"target_data_set_id"}, where: "status NOT IN ('completed', 'superseded')", unique: true},
@@ -1106,9 +1200,6 @@ func createWalletSchema(ctx context.Context, db bun.IDB) error {
 			// A uint256 in base 10 is at most 78 digits. The column stays text
 			// because the value is returned and compared verbatim.
 			"CONSTRAINT chk_wallet_operations_amount_length CHECK (length(amount) BETWEEN 1 AND 78)",
-		},
-		foreignKeys: []string{
-			"(task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 	}); err != nil {
 		return err
@@ -1232,7 +1323,6 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 				"CONSTRAINT chk_provider_upload_speed_tests_identity CHECK (provider_id <> '' AND length(service_url_hash) = 64 AND sample_bytes > 0)",
 				"CONSTRAINT chk_provider_upload_speed_tests_result CHECK ((state = 'testing' AND active_task_id IS NOT NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NULL AND failure_code IS NULL) OR (state = 'succeeded' AND active_task_id IS NULL AND duration_ms IS NOT NULL AND duration_ms > 0 AND bytes_per_second IS NOT NULL AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL) OR (state = 'failed' AND active_task_id IS NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL))",
 			},
-			foreignKeys: []string{"(active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT"},
 		},
 		{
 			name:        "observability_data_set_states",

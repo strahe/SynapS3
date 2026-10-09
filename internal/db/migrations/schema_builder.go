@@ -10,10 +10,11 @@ import (
 )
 
 type initialTableSpec struct {
-	name        string
-	model       any
-	constraints []string
-	foreignKeys []string
+	bytewiseColumn string
+	name           string
+	model          any
+	constraints    []string
+	foreignKeys    []string
 	// forwardForeignKeys reference a table this one is created before. SQLite
 	// resolves a foreign key parent when rows are written, so the constraint can
 	// be declared inline; PostgreSQL requires the parent to exist already, so
@@ -47,11 +48,16 @@ type initialJSONColumnSpec struct {
 
 func initialJSONColumns(table string) []initialJSONColumnSpec {
 	switch table {
-	case "task_payloads":
+	case "tasks", "task_history":
 		return []initialJSONColumnSpec{
 			{name: "input_json", shape: initialJSONObject},
 			{name: "checkpoint_json", shape: initialJSONObject, nullable: true},
+			{name: "policy_json", shape: initialJSONObject},
+			{name: "runtime_json", shape: initialJSONObject},
+			{name: "events_json", shape: initialJSONArray},
 		}
+	case "storage_data_sets":
+		return []initialJSONColumnSpec{{name: "creation_rejection", shape: initialJSONObject, nullable: true}}
 	case "multipart_uploads", "object_versions":
 		return []initialJSONColumnSpec{{name: "metadata", shape: initialJSONObject}}
 	case "provider_profiles":
@@ -95,7 +101,15 @@ func createInitialTable(ctx context.Context, db bun.IDB, spec initialTableSpec) 
 	}
 
 	var err error
-	if db.Dialect().Name() == dialect.SQLite && len(spec.jsonColumns) > 0 {
+	if db.Dialect().Name() == dialect.PG && spec.bytewiseColumn != "" {
+		ddl := query.String()
+		column := fmt.Sprintf(`"%s" text`, spec.bytewiseColumn)
+		if strings.Count(ddl, column) != 1 {
+			return fmt.Errorf("rendering PostgreSQL collation for %s.%s", spec.name, spec.bytewiseColumn)
+		}
+		ddl = strings.Replace(ddl, column, column+` COLLATE "C"`, 1)
+		_, err = db.ExecContext(ctx, ddl)
+	} else if db.Dialect().Name() == dialect.SQLite && len(spec.jsonColumns) > 0 {
 		ddl := query.String()
 		for _, column := range spec.jsonColumns {
 			if column.text {

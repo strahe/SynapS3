@@ -3,6 +3,7 @@ package migrations
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -88,6 +89,10 @@ func TestInitialBaselineRepairsMissingMarker(t *testing.T) {
 		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
 			t.Fatalf("simulate committed baseline without marker: %v", err)
 		}
+		before, err := describeSchema(ctx, db, false)
+		if err != nil {
+			t.Fatal(err)
+		}
 		migrator := NewMigrator(db)
 		if err := migrator.Init(ctx); err != nil {
 			t.Fatalf("initialize migrator: %v", err)
@@ -99,8 +104,12 @@ func TestInitialBaselineRepairsMissingMarker(t *testing.T) {
 			t.Fatalf("repair baseline marker: %v", err)
 		}
 		assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))
-		if err := validateCurrentSchema(ctx, db); err != nil {
-			t.Fatalf("validate repaired schema: %v", err)
+		after, err := describeSchema(ctx, db, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(before, after) {
+			t.Fatal("repair changed the baseline schema")
 		}
 	})
 }

@@ -49,6 +49,11 @@ func TestClosedLifecycleEnumsMatchAppliedChecks(t *testing.T) {
 			t.Run(check.table+"/"+check.typeName, func(t *testing.T) {
 				goValues := typedStringConstants(t, filepath.Join("..", "..", check.directory), check.typeName)
 				ddlValues := appliedCheckStringValues(t, db, check.table, check.constraint)
+				if check.typeName == "TaskStatus" {
+					ddlValues = append(ddlValues, appliedCheckStringValues(t, db, "task_history", "chk_task_history_status")...)
+					slices.Sort(ddlValues)
+					ddlValues = slices.Compact(ddlValues)
+				}
 				if !slices.Equal(goValues, ddlValues) {
 					t.Fatalf("%s constants = %v, %s.%s values = %v", check.typeName, goValues, check.table, check.constraint, ddlValues)
 				}

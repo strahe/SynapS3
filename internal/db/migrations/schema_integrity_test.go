@@ -69,7 +69,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		"storage_copies", "storage_commit_requests", "storage_commit_request_pieces", "storage_replacements",
 		"storage_pull_attempts", "storage_replacement_items", "storage_cleanup_copies", "wallet_operations", "tasks",
 		"observability_collection_states", "observability_provider_states", "observability_data_set_states", "provider_profiles", "provider_tier_snapshots", "provider_upload_speed_tests",
-		"task_payloads", "storage_data_set_terminations",
+		"task_history", "task_schedules", "storage_data_set_terminations",
 	} {
 		if exists, err := tableExists(t.Context(), db, table); err != nil || !exists {
 			t.Errorf("table %s exists=%t err=%v", table, exists, err)
@@ -78,7 +78,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 	for _, column := range []struct{ table, name string }{
 		{"tasks", "claim_generation"},
 		{"provider_upload_speed_tests", "active_task_id"},
-		{"task_payloads", "checkpoint_json"},
+		{"tasks", "checkpoint_json"},
 		{"storage_data_set_terminations", "epoch"},
 		{"storage_copies", "active_task_id"},
 		{"storage_copies", "bucket_id"},
@@ -109,7 +109,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 	for _, index := range []string{
 		"idx_tasks_pending",
 		"idx_tasks_recovery",
-		"idx_tasks_gc",
+		"idx_tasks_status_type_id",
 		"idx_storage_copies_commit_request",
 		"idx_storage_commit_requests_data_set_status",
 		"idx_storage_commit_requests_task",
@@ -193,11 +193,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		{"observability_data_set_states", "updated_at"},
 		{"object_deletions", "cache_cleanup_status"},
 		{"object_deletions", "cache_error"},
-		// The JSON a task carries and the terminations a replacement records
-		// are rows of their own; putting either back re-creates the write
-		// amplification and the repeated column group they were split out of.
-		{"tasks", "input_json"},
-		{"tasks", "checkpoint_json"},
+		// Termination evidence belongs to its own ledger.
 		{"storage_replacements", "termination_tx_hash"},
 		{"storage_replacements", "termination_epoch"},
 		{"storage_replacements", "termination_observed_at"},
@@ -212,56 +208,12 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 	}
 }
 
-func TestInitialSchemaTaskOwnerForeignKeysAreRestrictive(t *testing.T) {
-	db := newSQLiteMigrationDB(t, "task_owner_foreign_keys")
-	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-		t.Fatalf("create initial schema: %v", err)
-	}
-	want := map[string]map[string]bool{
-		"buckets":                 {"durability_task_id": false},
-		"object_cache":            {"cache_active_task_id": false},
-		"storage_contents":        {"cleanup_task_id": false},
-		"storage_data_sets":       {"ensure_task_id": false, "retirement_task_id": false},
-		"storage_copies":          {"active_task_id": false},
-		"storage_commit_requests": {"task_id": false},
-		"storage_replacements":    {"task_id": false},
-		"wallet_operations":       {"task_id": false},
-	}
-	for table, columns := range want {
-		rows, err := db.Query(`SELECT "from", "table", on_delete FROM pragma_foreign_key_list(?)`, table)
-		if err != nil {
-			t.Fatalf("query foreign keys for %s: %v", table, err)
-		}
-		for rows.Next() {
-			var from, target, onDelete string
-			if err := rows.Scan(&from, &target, &onDelete); err != nil {
-				_ = rows.Close()
-				t.Fatalf("scan foreign key for %s: %v", table, err)
-			}
-			if _, tracked := columns[from]; !tracked || target != "tasks" {
-				continue
-			}
-			if onDelete != "RESTRICT" {
-				_ = rows.Close()
-				t.Fatalf("%s.%s ON DELETE = %s, want RESTRICT", table, from, onDelete)
-			}
-			columns[from] = true
-		}
-		if err := rows.Close(); err != nil {
-			t.Fatalf("close foreign keys for %s: %v", table, err)
-		}
-		for column, found := range columns {
-			if !found {
-				t.Errorf("missing task ownership foreign key %s.%s", table, column)
-			}
-		}
-	}
-}
-
 // The baseline recognizes its own committed post-state by this table list.
 func TestInitialSchemaTableListMatchesBaseline(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, 1)
+		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+			t.Fatal(err)
+		}
 		tables := applicationSchemaTables(t, db)
 		slices.Sort(tables)
 		if !slices.Equal(tables, initialSchemaTables2026090101) {

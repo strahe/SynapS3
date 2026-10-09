@@ -10,92 +10,9 @@ import (
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
-	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/migrate"
 
 	_ "modernc.org/sqlite"
 )
-
-// validateSchema requires exactly the schema the first level registered
-// migrations build. The expected schema comes from running them on a private
-// in-memory SQLite database; PostgreSQL is compared on what the two dialects
-// share.
-func validateSchema(ctx context.Context, db bun.IDB, registry *migrate.Migrations, level int) error {
-	portable := db.Dialect().Name() == dialect.PG
-	got, err := describeSchema(ctx, db, portable)
-	if err != nil {
-		return fmt.Errorf("describing database schema: %w", err)
-	}
-	want, err := referenceSchema(ctx, registry, level, portable)
-	if err != nil {
-		return err
-	}
-	if !slices.Equal(got, want) {
-		return incompatibleSchemaError(want, got)
-	}
-	return nil
-}
-
-// referenceSchema describes the schema the first level registered migrations
-// build on a new private in-memory SQLite database.
-func referenceSchema(ctx context.Context, registry *migrate.Migrations, level int, portable bool) ([]string, error) {
-	if level == 0 {
-		return nil, nil
-	}
-	sqldb, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		return nil, fmt.Errorf("opening schema reference: %w", err)
-	}
-	sqldb.SetMaxOpenConns(1)
-	reference := bun.NewDB(sqldb, sqlitedialect.New())
-	defer func() { _ = reference.Close() }()
-	applied := migrate.NewMigrations()
-	for _, migration := range registry.Sorted()[:level] {
-		applied.Add(migration)
-	}
-	migrator := newMigrator(reference, applied)
-	if err := migrator.Init(ctx); err != nil {
-		return nil, fmt.Errorf("building schema reference: %w", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		return nil, fmt.Errorf("building schema reference: %w", err)
-	}
-	schema, err := describeSchema(ctx, reference, portable)
-	if err != nil {
-		return nil, fmt.Errorf("describing schema reference: %w", err)
-	}
-	return schema, nil
-}
-
-func incompatibleSchemaError(want, got []string) error {
-	return fmt.Errorf("%w: the schema differs from what its recorded migrations build (missing: %s; unexpected: %s); keep the existing database as a read-only backup and configure a new empty database",
-		ErrIncompatibleDatabase, schemaLinesSummary(want, got), schemaLinesSummary(got, want))
-}
-
-// schemaLinesSummary names the first lines of lines that others lacks.
-func schemaLinesSummary(lines, others []string) string {
-	const shown = 5
-	var absent []string
-	for _, line := range lines {
-		if !slices.Contains(others, line) {
-			absent = append(absent, line)
-		}
-	}
-	switch {
-	case len(absent) == 0:
-		return "none"
-	case len(absent) > shown:
-		return fmt.Sprintf("%s and %d more", strings.Join(absent[:shown], ", "), len(absent)-shown)
-	default:
-		return strings.Join(absent, ", ")
-	}
-}
-
-// validateCurrentSchema requires exactly the schema every registered migration
-// builds.
-func validateCurrentSchema(ctx context.Context, db bun.IDB) error {
-	return validateSchema(ctx, db, Migrations, len(Migrations.Sorted()))
-}
 
 // describeSchema lists the application schema as sorted lines: tables,
 // columns, named constraints with the expression of every CHECK, unique
@@ -529,14 +446,6 @@ func portableSQLExpression(value string) string {
 // family only while it has the type its dialect declares.
 func portableColumnType(name dialect.Name, table, column, value string) string {
 	spec, ok := initialJSONColumn(table, column)
-	if table == "storage_data_sets" && column == "creation_rejection" {
-		ok = true
-	}
-	if (table == "tasks" || table == "task_history") && (column == "input_json" || column == "checkpoint_json" || column == "policy_json" || column == "runtime_json" || column == "events_json") ||
-		table == "task_payloads" && (column == "policy_json" || column == "runtime_json") ||
-		table == "task_events" && column == "details_json" {
-		ok = true
-	}
 	if ok {
 		declared := "jsonb"
 		if name == dialect.SQLite || spec.text {

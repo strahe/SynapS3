@@ -11,7 +11,9 @@ import (
 
 func TestEveryForeignKeyHasLeadingChildIndexCoverage(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, len(Migrations.Sorted()))
+		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+			t.Fatal(err)
+		}
 		for _, table := range applicationSchemaTables(t, db) {
 			indexed := appliedLeadingIndexColumns(t, db, table)
 			for _, foreignKey := range appliedForeignKeyLeadingColumns(t, db, table) {

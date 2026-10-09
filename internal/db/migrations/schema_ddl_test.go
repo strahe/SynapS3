@@ -2,11 +2,13 @@ package migrations
 
 import (
 	"database/sql"
+	"slices"
 	"strings"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 )
@@ -39,11 +41,12 @@ func TestFrozenBaselineDDLUsesNativeIdentityAndExplicitTypes(t *testing.T) {
 	postgresDataSetDDL := postgres.NewCreateTable().Model((*storageDataSet2026090101)(nil)).String()
 	postgresObjectVersionDDL := postgres.NewCreateTable().Model((*objectVersion2026090101)(nil)).String()
 	postgresReplacementDDL := postgres.NewCreateTable().Model((*storageReplacement2026090101)(nil)).String()
-	postgresTaskPayloadDDL := postgres.NewCreateTable().Model((*taskPayload2026090101)(nil)).String()
-	assertDDLContains(t, postgresTaskDDL, `"type" text not null`, `"input_version" integer not null`, `"retry_limit" integer`)
-	assertDDLNotContains(t, postgresTaskDDL, `"input_json"`, `"checkpoint_json"`, `"retry_limit" integer not null`)
-	assertDDLContains(t, postgresTaskPayloadDDL, `"input_json" jsonb not null`, `"checkpoint_json" jsonb`)
-	assertDDLNotContains(t, postgresTaskPayloadDDL, `"checkpoint_json" jsonb not null`)
+	postgresTaskHistoryDDL := postgres.NewCreateTable().Model((*taskHistory2026090101)(nil)).String()
+	assertDDLContains(t, postgresTaskDDL, `"type" text not null`, `"input_version" integer not null`, `"retry_count" integer`)
+	assertDDLNotContains(t, postgresTaskDDL, `"retry_limit"`, `"retention_until"`)
+	assertDDLContains(t, postgresTaskDDL, `"input_json" jsonb not null`, `"policy_json" jsonb not null`, `"runtime_json" jsonb not null`, `"events_json" jsonb not null`)
+	assertDDLContains(t, postgresTaskHistoryDDL, `"input_json" jsonb not null`, `"checkpoint_json" jsonb`)
+	assertDDLNotContains(t, postgresTaskHistoryDDL, `"checkpoint_json" jsonb not null`)
 	assertDDLContains(t, postgresDataSetDDL, `"generation" bigint not null default 1`, `"copy_index" integer not null`)
 	assertDDLContains(t, postgresReplacementDDL, `"copy_index" integer not null`, `"seed_cursor_content_id" bigint not null default 0`)
 	assertDDLContains(t, postgresObjectVersionDDL, `"metadata" jsonb not null default '{}'`)
@@ -61,8 +64,8 @@ func TestFrozenBaselineDDLUsesNativeIdentityAndExplicitTypes(t *testing.T) {
 	sqliteMultipartDDL := sqlite.NewCreateTable().Model((*multipartUpload2026090101)(nil)).String()
 	sqliteDataSetDDL := sqlite.NewCreateTable().Model((*storageDataSet2026090101)(nil)).String()
 	sqliteReplacementDDL := sqlite.NewCreateTable().Model((*storageReplacement2026090101)(nil)).String()
-	assertDDLContains(t, sqliteTaskDDL, `"type" text not null`, `"input_version" integer not null`, `"retry_limit" integer`)
-	assertDDLNotContains(t, sqliteTaskDDL, `"retry_limit" integer not null`)
+	assertDDLContains(t, sqliteTaskDDL, `"type" text not null`, `"input_version" integer not null`, `"retry_count" integer`)
+	assertDDLNotContains(t, sqliteTaskDDL, `"retry_limit"`, `"retention_until"`)
 	assertDDLContains(t, sqliteDataSetDDL, `"generation" integer not null default 1`, `"copy_index" integer not null`)
 	assertDDLContains(t, sqliteReplacementDDL, `"copy_index" integer not null`, `"seed_cursor_content_id" integer not null default 0`)
 	assertDDLContains(t, sqliteMultipartDDL, `primary key ("upload_id")`)
@@ -76,7 +79,9 @@ func TestSQLiteBaselineJSONUsesTextAndValidatesShape(t *testing.T) {
 	}
 
 	for table, columns := range map[string][]string{
-		"task_payloads":                 {"input_json", "checkpoint_json"},
+		"tasks":                         {"input_json", "checkpoint_json", "policy_json", "runtime_json", "events_json"},
+		"task_history":                  {"input_json", "checkpoint_json", "policy_json", "runtime_json", "events_json"},
+		"storage_data_sets":             {"creation_rejection"},
 		"multipart_uploads":             {"metadata"},
 		"object_versions":               {"metadata"},
 		"provider_tier_snapshots":       {"provider_ids_json"},
@@ -100,23 +105,14 @@ func TestSQLiteBaselineJSONUsesTextAndValidatesShape(t *testing.T) {
 		}
 	}
 
-	if _, err := db.Exec(`INSERT INTO tasks
-		(id, type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at)
-		VALUES (1, 'json-test', 'valid', 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
-		t.Fatalf("insert task: %v", err)
+	task := insertBaselineTestTask(t, db, "json-input")
+	for _, invalid := range []string{"[]", "{"} {
+		mustRejectStatement(t, db, `UPDATE tasks SET input_json = ? WHERE id = ?`, invalid, task)
 	}
-	if _, err := db.Exec(`INSERT INTO task_payloads (task_id, input_json) VALUES (1, '{}')`); err != nil {
-		t.Fatalf("insert valid object JSON: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO task_payloads (task_id, input_json) VALUES (1, '[]')`); err == nil {
-		t.Fatal("object-shaped task input accepted an array")
-	}
-	if _, err := db.Exec(`INSERT INTO task_payloads (task_id, input_json) VALUES (1, '{')`); err == nil {
-		t.Fatal("task input accepted invalid JSON")
-	}
+	mustRejectStatement(t, db, `UPDATE tasks SET events_json = '{}' WHERE id = ?`, task)
 }
 
-func TestAppliedBaselineCarriesNoTimestampDefaults(t *testing.T) {
+func TestAppliedBaselineColumnContracts(t *testing.T) {
 	// A DEFAULT current_timestamp column is written by the database whenever bun
 	// omits it, and SQLite renders that as second-granularity local text while
 	// bun renders a fractional offset timestamp. One column would then hold two
@@ -132,29 +128,51 @@ func TestAppliedBaselineCarriesNoTimestampDefaults(t *testing.T) {
 				}
 			}
 		}
+		if db.Dialect().Name() == dialect.PG {
+			var collations []string
+			if err := db.NewRaw(`SELECT c.relname || '.' || a.attname || '=' || co.collname
+				FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_collation co ON co.oid = a.attcollation
+				WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+				AND ((c.relname = 'buckets' AND a.attname = 'name') OR (c.relname IN ('objects','object_versions','multipart_uploads','object_deletions') AND a.attname = 'key'))
+				ORDER BY c.relname`).Scan(t.Context(), &collations); err != nil {
+				t.Fatal(err)
+			}
+			if len(collations) != 5 {
+				t.Fatalf("missing key columns: %v", collations)
+			}
+			for _, value := range collations {
+				if !strings.HasSuffix(value, "=C") {
+					t.Errorf("key collation %s, want C", value)
+				}
+			}
+		}
 	})
 }
 
-func TestFrozenBaselineIndexDDLRetainsPredicates(t *testing.T) {
-	for name, db := range map[string]*bun.DB{
-		"Postgres": newOfflinePostgresDDLDB(t),
-		"SQLite":   newOfflineSQLiteDDLDB(t),
-	} {
-		t.Run(name, func(t *testing.T) {
-			query := db.NewCreateIndex().
-				Index("idx_tasks_pending").
-				Table("tasks").
-				ColumnExpr("available_at").
-				ColumnExpr("id").
-				Where("status = 'pending'")
-			buf, err := query.AppendQuery(db.QueryGen(), nil)
-			if err != nil {
-				t.Fatalf("render index DDL: %v", err)
+func TestBaselineHistoryIndexesRetainQueryPredicates(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+			t.Fatal(err)
+		}
+		lines, err := indexLines(t.Context(), db, []string{"task_history"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns := []string{"subject_type", "subject_key", "status", "superseded_at", "task_id"}
+		predicate := ""
+		if db.Dialect().Name() == dialect.PG {
+			columns = []string{"subject_type", "subject_key", "superseded_at", "task_id"}
+			predicate = "status = 'failed' AND superseded_at IS NULL"
+		}
+		for _, want := range []string{
+			indexLine("task_history", "idx_task_history_status_id", false, []string{"status", "task_id"}, "", true),
+			indexLine("task_history", "idx_task_history_current_failed_subject", false, columns, predicate, true),
+		} {
+			if !slices.Contains(lines, want) {
+				t.Errorf("missing history query index %s in %v", want, lines)
 			}
-			ddl := string(buf)
-			assertDDLContains(t, ddl, `"idx_tasks_pending"`, `available_at, id`, `where (status = 'pending')`)
-		})
-	}
+		}
+	})
 }
 
 func newOfflinePostgresDDLDB(t *testing.T) *bun.DB {

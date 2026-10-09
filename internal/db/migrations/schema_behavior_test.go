@@ -3,6 +3,7 @@ package migrations
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -18,10 +19,15 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			t.Fatalf("create initial schema: %v", err)
 		}
 		bucketID := insertBaselineTestBucket(t, db, "constraint-bucket")
+		var strategy string
+		if err := db.NewRaw("SELECT provider_selection_strategy FROM buckets WHERE id = ?", bucketID).Scan(t.Context(), &strategy); err != nil || strategy != "distribution" {
+			t.Fatalf("default provider strategy = %q, err=%v", strategy, err)
+		}
+		if _, err := db.Exec("UPDATE buckets SET provider_selection_strategy = 'speed' WHERE id = ?", bucketID); err != nil {
+			t.Fatal(err)
+		}
+		mustRejectStatement(t, db, `UPDATE buckets SET provider_selection_strategy = 'unknown' WHERE id = ?`, bucketID)
 
-		mustRejectStatement(t, db, `INSERT INTO tasks
-			(type, idempotency_key, input_version, input_hash, status, available_at, created_at, updated_at)
-			VALUES ('test', 'invalid-status', 1, 'hash', 'unknown', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 		for _, checksum := range []string{
 			"",
 			"checksum",
@@ -127,7 +133,8 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 
 		taskID := insertBaselineTestTask(t, db, "valid-before-update")
 		mustRejectStatement(t, db, `UPDATE tasks SET claim_generation = -1 WHERE id = ?`, taskID)
-		mustRejectStatement(t, db, `UPDATE tasks SET retry_limit = 0, retry_count = 1 WHERE id = ?`, taskID)
+		mustRejectStatement(t, db, `UPDATE tasks SET status = 'unknown' WHERE id = ?`, taskID)
+		mustRejectStatement(t, db, `UPDATE tasks SET policy_json = '{"version":2,"max_attempts":1}', retry_count = 1 WHERE id = ?`, taskID)
 		mustRejectStatement(t, db, `UPDATE buckets SET default_copies = 2, minimum_durable_copies = 3 WHERE id = ?`, bucketID)
 		var generation int64
 		if err := db.NewRaw(`SELECT claim_generation FROM tasks WHERE id = ?`, taskID).Scan(t.Context(), &generation); err != nil {
@@ -150,6 +157,12 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		contentA2 := insertBaselineTestContent(t, db, bucketA, "upload-a2")
 		contentB := insertBaselineTestContent(t, db, bucketB, "upload-b")
 		source := insertBaselineTestDataSet(t, db, bucketA, "101", 0, 1, true)
+		if _, err := db.Exec(`UPDATE storage_data_sets SET creation_rejection = '{"version":99}' WHERE id = ?`, source); err != nil {
+			t.Fatal(err)
+		}
+		for _, invalid := range []string{"{", "[]", "null"} {
+			mustRejectStatement(t, db, `UPDATE storage_data_sets SET creation_rejection = ? WHERE id = ?`, invalid, source)
+		}
 		copyID := insertBaselineTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
 		// A committed copy must name a confirmed request in its own data set,
 		// at a position recorded for its own content.
@@ -186,6 +199,13 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		otherCopy := insertBaselineTestCopy(t, db, contentA2, bucketA, source, 0, "101", "ingress")
 		mustRejectStatement(t, db, `UPDATE storage_copies
 			SET status = 'committing', commit_request_id = 'request-a', commit_position = 0 WHERE id = ?`, otherCopy)
+		if _, err := db.Exec(`UPDATE storage_commit_requests SET seal_requested_at = CURRENT_TIMESTAMP WHERE request_id = 'request-a'`); err != nil {
+			t.Fatal(err)
+		}
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET status = 'ready', piece_count = 1, extra_data_hex = 'abcd', sealed_at = CURRENT_TIMESTAMP WHERE request_id = 'request-a'`)
+		if _, err := db.Exec(`UPDATE storage_commit_requests SET seal_requested_at = NULL WHERE request_id = 'request-a'`); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := db.Exec(`UPDATE storage_commit_requests
 			SET status = 'ready', piece_count = 1, extra_data_hex = 'abcd', sealed_at = CURRENT_TIMESTAMP
 			WHERE request_id = 'request-a'`); err != nil {
@@ -353,6 +373,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
 			VALUES ('pull-2', ?, ?, 'attempted', '302', '3002', '4002', 'bafk2bzacepull2', 'https://source.example/other', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source)
+		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET storage_data_set_id = -1 WHERE attempt_id = 'pull-1'`)
 		mustRejectRequiredColumn(t, db, `UPDATE storage_pull_attempts SET extra_data_hex = NULL WHERE attempt_id = 'pull-1'`)
 		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET extra_data_hex = '' WHERE attempt_id = 'pull-1'`)
 		mustRejectStatement(t, db, `UPDATE storage_pull_attempts SET status = 'abandoned' WHERE attempt_id = 'pull-1'`)
@@ -378,6 +399,29 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
 			VALUES ('', ?, ?, 'attempted', '303', '3003', '4003', 'bafk2bzacepull3', 'https://source.example/third', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			contentA, source)
+
+		ledgerBucket := insertBaselineTestBucket(t, db, "pull-ledger-bucket")
+		ledgerContent := insertBaselineTestContent(t, db, ledgerBucket, "pull-ledger-content")
+		ledgerDataSet := insertBaselineTestDataSet(t, db, ledgerBucket, "401", 0, 1, true)
+		if _, err := db.Exec(`INSERT INTO storage_pull_attempts
+			(attempt_id, content_id, storage_data_set_id, status,
+			 source_provider_id, source_data_set_id, source_piece_id, source_piece_cid, source_retrieval_url, extra_data_hex, attempted_at, created_at, updated_at)
+			VALUES ('pull-ledger', ?, ?, 'attempted', '301', '3001', '4001', 'bafk2bzacepull', 'https://source.example/piece', 'ab', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			ledgerContent, ledgerDataSet); err != nil {
+			t.Fatalf("insert retained pull ledger: %v", err)
+		}
+		mustRejectStatement(t, db, `DELETE FROM storage_data_sets WHERE id = ?`, ledgerDataSet)
+		mustRejectStatement(t, db, `UPDATE storage_data_sets SET id = -1 WHERE id = ?`, ledgerDataSet)
+		if _, err := db.Exec(`DELETE FROM storage_contents WHERE id = ?`, ledgerContent); err != nil {
+			t.Fatalf("content cleanup should retain pull ledger: %v", err)
+		}
+		var retainedContent, retainedDataSet int64
+		if err := db.QueryRow(`SELECT content_id, storage_data_set_id FROM storage_pull_attempts WHERE attempt_id = 'pull-ledger'`).Scan(&retainedContent, &retainedDataSet); err != nil {
+			t.Fatalf("read retained pull ledger: %v", err)
+		}
+		if retainedContent != ledgerContent || retainedDataSet != ledgerDataSet {
+			t.Fatalf("cleanup changed pull identity: content=%d, data set=%d", retainedContent, retainedDataSet)
+		}
 
 		taskID := insertBaselineTestTask(t, db, "owner-unique")
 		if _, err := db.Exec(`UPDATE buckets SET durability_task_id = ? WHERE id = ?`, taskID, bucketA); err != nil {
@@ -428,8 +472,8 @@ func TestBaselineIdentitySupportsGenerationAndBackfill(t *testing.T) {
 
 		const backfilledID int64 = 5_000_000_000
 		if _, err := db.Exec(`INSERT INTO tasks
-			(id, type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at)
-			VALUES (?, 'test', 'identity-backfill', 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, backfilledID); err != nil {
+			(id, type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
+			VALUES (?, 'test', 'identity-backfill', 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]')`, backfilledID); err != nil {
 			t.Fatalf("backfill explicit identity: %v", err)
 		}
 		var storedID int64
@@ -472,35 +516,11 @@ func TestBaselineStoresLargeGeneration(t *testing.T) {
 
 func insertBaselineTestTask(t *testing.T, db *bun.DB, key string) int64 {
 	t.Helper()
-
 	var id int64
-	query := `INSERT INTO tasks (type,idempotency_key,input_version,input_hash,available_at,created_at,updated_at) VALUES ('test',?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id`
-	args := []any{key}
-	current, err := columnExists(t.Context(), db, "tasks", "retry_group_key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current {
-		query = `INSERT INTO tasks (type,idempotency_key,retry_group_key,input_version,input_hash,available_at,created_at,updated_at) VALUES ('test',?,?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id`
-		args = append(args, "test:"+key)
-	}
-	body, err := columnExists(t.Context(), db, "tasks", "input_json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if body {
-		query = `INSERT INTO tasks (type,idempotency_key,input_version,input_hash,available_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json) VALUES ('test',?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":-1}','{}','[]') RETURNING id`
-		args = []any{key}
-	}
-	if err := db.QueryRow(query, args...).Scan(&id); err != nil {
+	if err := db.QueryRow(`INSERT INTO tasks
+		(type,idempotency_key,input_version,input_hash,available_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
+		VALUES ('test',?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]') RETURNING id`, key).Scan(&id); err != nil {
 		t.Fatalf("insert task %q: %v", key, err)
-	}
-
-	if body {
-		return id
-	}
-	if _, err := db.Exec(`INSERT INTO task_payloads (task_id, input_json) VALUES (?, '{}')`, id); err != nil {
-		t.Fatalf("insert baseline test task payload %q: %v", key, err)
 	}
 	return id
 }
@@ -794,5 +814,37 @@ func TestBaselineAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
 			}
 		}
 		mustRejectStatement(t, db, named, "alice-again", "Alice")
+	})
+}
+
+func TestTaskTablesEnforceStateAndBudget(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+			t.Fatal(err)
+		}
+		id := insertBaselineTestTask(t, db, "working")
+		for _, statement := range []string{
+			`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET status='cancelled',finished_at=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET retry_count=-1 WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":0}' WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"version":2}' WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":null}' WHERE id=?`,
+		} {
+			mustRejectStatement(t, db, statement, id)
+		}
+		if _, err := db.NewRaw(`UPDATE tasks SET policy_json=? WHERE id=?`, json.RawMessage(`{"version":2,"max_attempts":6}`), id).Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		mustRejectStatement(t, db, `UPDATE tasks SET retry_count=6 WHERE id=?`, id)
+		if _, err := db.Exec(`INSERT INTO task_history
+			(task_id,type,idempotency_key,input_version,input_hash,input_json,policy_json,runtime_json,events_json,status,available_at,finished_at,created_at,updated_at)
+			VALUES (1001,'test','history',1,'hash','{}','{"version":2,"max_attempts":6}','{}','[]','completed',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
+			t.Fatal(err)
+		}
+		for _, status := range []string{"pending", "running", "failed"} {
+			mustRejectStatement(t, db, `UPDATE task_history SET status = ? WHERE task_id = 1001`, status)
+		}
+		mustRejectStatement(t, db, `UPDATE task_history SET acknowledged_at = CURRENT_TIMESTAMP WHERE task_id = 1001`)
 	})
 }

@@ -177,22 +177,6 @@ func tableExists(ctx context.Context, db bun.IDB, table string) (bool, error) {
 	return queryExists(ctx, db, query, table)
 }
 
-func columnExists(ctx context.Context, db bun.IDB, table, column string) (bool, error) {
-	if db.Dialect().Name() == dialect.PG {
-		return queryExists(ctx, db, `SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`, table, column)
-	}
-	return queryExists(ctx, db, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", table, column)
-}
-
-func indexExists(ctx context.Context, db bun.IDB, name string) (bool, error) {
-	query := `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?`
-	if db.Dialect().Name() == dialect.PG {
-		query = `SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ?`
-	}
-	return queryExists(ctx, db, query, name)
-}
-
 func queryExists(ctx context.Context, db bun.IDB, query string, args ...any) (bool, error) {
 	var count int
 	if err := db.NewRaw(query, args...).Scan(ctx, &count); err != nil {
