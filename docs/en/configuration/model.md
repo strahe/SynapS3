@@ -59,9 +59,9 @@ The Admin endpoint has separate exposure controls. Keep `admin.addr` on loopback
 
 ## Database Choice
 
-SQLite is the default and recommended database for SynapS3 single-node deployments. PostgreSQL remains available when a deployment already operates an external PostgreSQL service or needs an external metadata database. Keep its DSN in protected configuration or secret storage.
+SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL such as `postgres://synaps3:PASSWORD@db.example.com:5432/synaps3?sslmode=require`; it has no default. The role must be able to create tables in the database, because SynapS3 applies its migrations at startup. Keep the DSN in protected configuration or secret storage.
 
-`database.max_open_conns` sizes the connection pool. SQLite still writes through one connection at a time; the other connections serve reads, and a write that finds the database busy waits up to five seconds (`busy_timeout`) before it fails with `SQLITE_BUSY`.
+`database.max_open_conns` sizes the connection pool.
 
 ## Main Sections
 
@@ -71,7 +71,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `s3` | Region reported to S3 clients. |
 | `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and copy policy. |
 | `filecoin.observability` | Provider and local data set health checks. |
-| `database` | SQLite or PostgreSQL metadata database. |
+| `database` | PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
 | `worker.tasks` | Shared background task execution and provider mutation limits. |
 | `logging` | Runtime log level, format, and S3 access logs. |
@@ -88,7 +88,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
 | `filecoin.anchor_provider_tier` | `approved` |
-| `database.driver` | `sqlite` |
+| `database.driver` | `postgres` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
@@ -137,7 +137,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 - `filecoin.network`: `calibration`, `mainnet`.
 - `filecoin.default_copies`: `1` through `8`.
 - `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
-- `database.driver`: `sqlite`, `postgres`.
+- `database.driver`: `postgres`.
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`.
 - `logging.level`: `debug`, `info`, `warn`, `error`.
 - `logging.format`: `json`, `text`.

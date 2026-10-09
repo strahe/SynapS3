@@ -4,7 +4,7 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/synaps3-deployment-test.XXXXXX")
 trap 'rm -rf "$TEST_ROOT"' EXIT HUP INT TERM
-unset ADMIN_DOMAIN COMPOSE_FILE IMAGE_SOURCE SYNAPS3_CONFIG
+unset ADMIN_DOMAIN COMPOSE_FILE IMAGE_SOURCE SYNAPS3_CONFIG DATABASE_SOURCE POSTGRES_APP_PASSWORD POSTGRES_PORT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -50,8 +50,9 @@ copy_deployment_files() {
     "$ROOT_DIR/compose.yaml" \
     "$ROOT_DIR/compose.local.yaml" \
     "$ROOT_DIR/compose.admin-https.yaml" \
+    "$ROOT_DIR/compose.postgres.yaml" \
     "$target/"
-  cp "$ROOT_DIR/docker/Caddyfile" "$ROOT_DIR/docker/deployment.sh" "$target/docker/"
+  cp "$ROOT_DIR/docker/Caddyfile" "$ROOT_DIR/docker/deployment.sh" "$ROOT_DIR/docker/postgres-init.sql" "$target/docker/"
 }
 
 install_fake_tools() {
@@ -137,9 +138,17 @@ test_init_contract() {
 
   make --no-print-directory -C "$case_dir" docker-init >"$out_file"
   [ "$(file_mode "$case_dir/.env")" = 600 ] || fail ".env was not created with mode 600"
-  assert_contains "$case_dir/.env" "COMPOSE_FILE=compose.yaml"
+  [ "$(file_mode "$case_dir/.postgres-admin-password")" = 600 ] || fail ".postgres-admin-password was not created with mode 600"
+  grep -Eq '^[0-9a-f]{48}$' "$case_dir/.postgres-admin-password" || fail "PostgreSQL administrator password is not 48 hex characters"
+  assert_contains "$case_dir/.env" "COMPOSE_FILE=compose.yaml:compose.postgres.yaml"
+  grep -Eq '^POSTGRES_APP_PASSWORD=[0-9a-f]{48}$' "$case_dir/.env" || fail "application database password is missing from .env"
+  assert_contains "$case_dir/.env" "POSTGRES_PORT=15432"
+  if grep -Fq "$(cat "$case_dir/.postgres-admin-password")" "$case_dir/.env"; then
+    fail "the PostgreSQL administrator password leaked into .env"
+  fi
   assert_not_contains "$case_dir/.env" "ADMIN_DOMAIN="
   assert_contains "$out_file" "Admin remains local at http://127.0.0.1:9090/"
+  assert_contains "$out_file" "Managed PostgreSQL will listen on 127.0.0.1:15432"
   assert_contains "$out_file" "set SYNAPS3_FILECOIN_PRIVATE_KEY in .env"
 
   printf '%s\n' 'SYNAPS3_FILECOIN_PRIVATE_KEY=preserve-this-value' >>"$case_dir/.env"
@@ -166,14 +175,47 @@ test_init_contract() {
   [ ! -e "$injection_dir/.env" ] || fail "docker-init created .env from a multiline ADMIN_DOMAIN"
 
   make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN=admin.example.test >"$out_file"
-  assert_contains "$https_dir/.env" "COMPOSE_FILE=compose.yaml:compose.admin-https.yaml"
+  assert_contains "$https_dir/.env" "COMPOSE_FILE=compose.yaml:compose.postgres.yaml:compose.admin-https.yaml"
   assert_contains "$https_dir/.env" "ADMIN_DOMAIN=admin.example.test"
   assert_contains "$out_file" "Admin HTTPS will use https://admin.example.test/"
 
   local_dir=$(new_case_dir)
   copy_deployment_files "$local_dir"
   make --no-print-directory -C "$local_dir" docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.test >"$out_file"
-  assert_contains "$local_dir/.env" "COMPOSE_FILE=compose.yaml:compose.local.yaml:compose.admin-https.yaml"
+  assert_contains "$local_dir/.env" "COMPOSE_FILE=compose.yaml:compose.postgres.yaml:compose.local.yaml:compose.admin-https.yaml"
+
+  external_dir=$(new_case_dir)
+  copy_deployment_files "$external_dir"
+  make --no-print-directory -C "$external_dir" docker-init DATABASE_SOURCE=external >"$out_file"
+  assert_contains "$external_dir/.env" "COMPOSE_FILE=compose.yaml"
+  assert_not_contains "$external_dir/.env" "compose.postgres.yaml"
+  assert_not_contains "$external_dir/.env" "POSTGRES_"
+  [ ! -e "$external_dir/.postgres-admin-password" ] || fail "external database initialization created a PostgreSQL password file"
+  assert_contains "$out_file" "set SYNAPS3_DATABASE_DSN in .env"
+
+  port_dir=$(new_case_dir)
+  copy_deployment_files "$port_dir"
+  make --no-print-directory -C "$port_dir" docker-init POSTGRES_PORT=25432 >"$out_file"
+  assert_contains "$port_dir/.env" "POSTGRES_PORT=25432"
+  for invalid in 'DATABASE_SOURCE=sqlite' 'POSTGRES_PORT=0' 'POSTGRES_PORT=65536' 'POSTGRES_PORT=5432x'; do
+    invalid_dir=$(new_case_dir)
+    copy_deployment_files "$invalid_dir"
+    if make --no-print-directory -C "$invalid_dir" docker-init "$invalid" >"$out_file" 2>"$err_file"; then
+      fail "docker-init accepted $invalid"
+    fi
+    [ ! -e "$invalid_dir/.env" ] && [ ! -e "$invalid_dir/.postgres-admin-password" ] || fail "docker-init with $invalid left deployment files"
+  done
+  assert_contains "$err_file" "POSTGRES_PORT must be a TCP port"
+
+  password_exists_dir=$(new_case_dir)
+  copy_deployment_files "$password_exists_dir"
+  printf '%s' preserve-this-password >"$password_exists_dir/.postgres-admin-password"
+  if make --no-print-directory -C "$password_exists_dir" docker-init >"$out_file" 2>"$err_file"; then
+    fail "docker-init overwrote an existing PostgreSQL password file"
+  fi
+  assert_contains "$err_file" ".postgres-admin-password already exists"
+  assert_contains "$password_exists_dir/.postgres-admin-password" "preserve-this-password"
+  [ ! -e "$password_exists_dir/.env" ] || fail "docker-init created .env next to an existing PostgreSQL password file"
 
   failure_dir=$(new_case_dir)
   copy_deployment_files "$failure_dir"
@@ -182,16 +224,21 @@ test_init_contract() {
     fail "docker-init succeeded without its environment template"
   fi
   [ ! -e "$failure_dir/.env" ] || fail "failed docker-init left a partial .env"
-  for leftover in "$failure_dir"/.env.tmp.*; do
-    [ ! -e "$leftover" ] || fail "failed docker-init left a temporary environment file"
+  [ ! -e "$failure_dir/.postgres-admin-password" ] || fail "failed docker-init left a PostgreSQL password file"
+  for leftover in "$failure_dir"/.env.tmp.* "$failure_dir"/.postgres-admin-password.tmp.*; do
+    [ ! -e "$leftover" ] || fail "failed docker-init left a temporary file"
   done
 
   link_failure_dir=$(new_case_dir)
   copy_deployment_files "$link_failure_dir"
   mkdir -p "$link_failure_dir/test-bin"
+  # Only publishing .env fails, after the password file is already in place.
   cat >"$link_failure_dir/test-bin/ln" <<'EOF'
 #!/usr/bin/env sh
-exit 1
+case "$2" in
+  .env) exit 1 ;;
+esac
+exec /bin/ln "$@"
 EOF
   chmod +x "$link_failure_dir/test-bin/ln"
   if PATH="$link_failure_dir/test-bin:$PATH" make --no-print-directory -C "$link_failure_dir" docker-init >"$out_file" 2>"$err_file"; then
@@ -199,8 +246,9 @@ EOF
   fi
   assert_contains "$err_file" "Could not create .env atomically"
   [ ! -e "$link_failure_dir/.env" ] || fail "failed .env publication left a partial .env"
-  for leftover in "$link_failure_dir"/.env.tmp.*; do
-    [ ! -e "$leftover" ] || fail "failed .env publication left a temporary environment file"
+  [ ! -e "$link_failure_dir/.postgres-admin-password" ] || fail "failed .env publication left the PostgreSQL password file"
+  for leftover in "$link_failure_dir"/.env.tmp.* "$link_failure_dir"/.postgres-admin-password.tmp.*; do
+    [ ! -e "$leftover" ] || fail "failed .env publication left a temporary file"
   done
 }
 
@@ -239,16 +287,33 @@ test_make_lifecycle_contract() {
   assert_contains "$error_log" ".env permissions are 644"
   chmod 600 "$case_dir/.env"
 
-  for deployment_override in ADMIN_DOMAIN COMPOSE_FILE; do
+  for deployment_override in ADMIN_DOMAIN COMPOSE_FILE POSTGRES_APP_PASSWORD POSTGRES_PORT; do
     : >"$compose_log"
     if env "$deployment_override=override.example.test" SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
       make --no-print-directory -C "$case_dir" docker-up \
         DOCKER_COMPOSE="$bin_dir/docker-compose" >"$output_log" 2>"$error_log"; then
       fail "docker-up accepted the $deployment_override override"
     fi
-    assert_contains "$error_log" "reads ADMIN_DOMAIN and COMPOSE_FILE from .env"
+    assert_contains "$error_log" "reads ADMIN_DOMAIN, COMPOSE_FILE, POSTGRES_APP_PASSWORD, and POSTGRES_PORT from .env"
     [ ! -s "$compose_log" ] || fail "docker-up invoked Compose after rejecting the $deployment_override override"
   done
+
+  chmod 644 "$case_dir/.postgres-admin-password"
+  if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+    make --no-print-directory -C "$case_dir" docker-up \
+      DOCKER_COMPOSE="$bin_dir/docker-compose" >"$output_log" 2>"$error_log"; then
+    fail "docker-up accepted an unprotected PostgreSQL password file"
+  fi
+  assert_contains "$error_log" ".postgres-admin-password permissions are 644"
+  chmod 600 "$case_dir/.postgres-admin-password"
+  mv "$case_dir/.postgres-admin-password" "$case_dir/password.moved"
+  if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+    make --no-print-directory -C "$case_dir" docker-up \
+      DOCKER_COMPOSE="$bin_dir/docker-compose" >"$output_log" 2>"$error_log"; then
+    fail "docker-up started without the PostgreSQL password file"
+  fi
+  assert_contains "$error_log" ".postgres-admin-password not found"
+  mv "$case_dir/password.moved" "$case_dir/.postgres-admin-password"
 
   SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
     make --no-print-directory -C "$case_dir" docker-up \
@@ -273,6 +338,28 @@ test_make_lifecycle_contract() {
     make --no-print-directory -C "$case_dir" docker-logs \
       DOCKER_COMPOSE="$bin_dir/docker-compose" DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 >"$output_log"
   assert_contains "$compose_log" "logs --tail=100 -f caddy"
+  SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+    make --no-print-directory -C "$case_dir" docker-logs \
+      DOCKER_COMPOSE="$bin_dir/docker-compose" DOCKER_SERVICE=postgres >"$output_log"
+  assert_contains "$compose_log" "logs --tail=100 postgres"
+
+  external_dir=$(new_case_dir)
+  copy_deployment_files "$external_dir"
+  make --no-print-directory -C "$external_dir" docker-init DATABASE_SOURCE=external >/dev/null
+  external_bin_dir=$(install_fake_tools "$external_dir")
+  external_compose_log="$external_dir/compose.log"
+  : >"$external_compose_log"
+  if SYNAPS3_TEST_COMPOSE_LOG="$external_compose_log" \
+    make --no-print-directory -C "$external_dir" docker-up \
+      DOCKER_COMPOSE="$external_bin_dir/docker-compose" >"$output_log" 2>"$error_log"; then
+    fail "docker-up started an external deployment without a database URL"
+  fi
+  assert_contains "$error_log" "exactly one SYNAPS3_DATABASE_DSN entry"
+  printf '%s\n' 'SYNAPS3_DATABASE_DSN=postgres://synaps3:secret@db.example.test:5432/synaps3' >>"$external_dir/.env"
+  SYNAPS3_TEST_COMPOSE_LOG="$external_compose_log" \
+    make --no-print-directory -C "$external_dir" docker-up \
+      DOCKER_COMPOSE="$external_bin_dir/docker-compose" >"$output_log"
+  assert_contains "$external_compose_log" "up -d --remove-orphans --wait"
 
   local_dir=$(new_case_dir)
   copy_deployment_files "$local_dir"
@@ -351,6 +438,27 @@ test_compose_and_caddy_config() {
 
   docker compose --project-directory "$case_dir" config >"$case_dir/rendered.yaml"
   assert_not_contains "$case_dir/rendered.yaml" "image: caddy:2.11.4-alpine"
+  assert_contains "$case_dir/rendered.yaml" "image: postgres:17"
+  assert_contains "$case_dir/rendered.yaml" "host_ip: 127.0.0.1"
+  assert_contains "$case_dir/rendered.yaml" 'published: "15432"'
+  assert_contains "$case_dir/rendered.yaml" "@127.0.0.1:15432/synaps3?sslmode=disable"
+  assert_contains "$case_dir/rendered.yaml" "target: /docker-entrypoint-initdb.d/10-synaps3.sql"
+  assert_contains "$case_dir/rendered.yaml" "source: postgres-admin-password"
+  assert_contains "$case_dir/rendered.yaml" "name: synaps3-postgres-data"
+  assert_contains "$case_dir/rendered.yaml" "condition: service_healthy"
+
+  sed '/^POSTGRES_APP_PASSWORD=/d' "$case_dir/.env" >"$case_dir/.env.invalid"
+  chmod 600 "$case_dir/.env.invalid"
+  if docker compose --project-directory "$case_dir" --env-file "$case_dir/.env.invalid" config --quiet 2>"$case_dir/error.log"; then
+    fail "Compose accepted a managed database without POSTGRES_APP_PASSWORD"
+  fi
+  assert_contains "$case_dir/error.log" "Set POSTGRES_APP_PASSWORD in .env"
+
+  external_dir=$(new_case_dir)
+  copy_deployment_files "$external_dir"
+  make --no-print-directory -C "$external_dir" docker-init DATABASE_SOURCE=external >/dev/null
+  docker compose --project-directory "$external_dir" config >"$external_dir/rendered.yaml"
+  assert_not_contains "$external_dir/rendered.yaml" "image: postgres"
 
   https_dir=$(new_case_dir)
   copy_deployment_files "$https_dir"

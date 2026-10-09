@@ -6,14 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
-	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/migrate"
-
-	_ "modernc.org/sqlite"
 )
 
 // Bun stores the numeric migration name and derives "initial_schema" as its
@@ -35,24 +31,19 @@ func NewMigrator(db *bun.DB) *migrate.Migrator {
 
 // ValidateTarget refuses, before anything is written, a database that is not
 // this application's: its recorded migrations must be an ordered prefix of the
-// registry and its schema what they build, and without the marker table it
-// must hold no application tables.
+// registry, and with no recorded migration it may hold no application tables
+// other than exactly the baseline's. Whether migrations build the intended
+// schema is verified by tests, not here.
 func ValidateTarget(ctx context.Context, db bun.IDB) error {
 	return validateTarget(ctx, db, Migrations)
-}
-
-// ValidateCurrentSchema requires exactly the schema the registered migrations
-// build, so the process never runs against a schema it was not built for.
-func ValidateCurrentSchema(ctx context.Context, db bun.IDB) error {
-	return validateSchema(ctx, db, Migrations, len(Migrations.Sorted()))
 }
 
 func validateTarget(ctx context.Context, db bun.IDB, registry *migrate.Migrations) error {
 	if !validMigrationRegistry(registry) {
 		return incompatibleDatabaseError()
 	}
-	// The markers and the schema come from one snapshot, so a runner migrating
-	// at the same time cannot make them disagree.
+	// The marker table and the table count come from one snapshot, so a runner
+	// migrating at the same time cannot make them disagree.
 	options := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 	return db.RunInTx(ctx, options, func(ctx context.Context, tx bun.Tx) error {
 		return validateTargetSnapshot(ctx, tx, registry)
@@ -72,14 +63,18 @@ func validateTargetSnapshot(ctx context.Context, db bun.IDB, registry *migrate.M
 		if !appliedMigrationPrefix(names, registry) {
 			return incompatibleDatabaseError()
 		}
-		err := validateSchema(ctx, db, registry, len(names))
-		// Bun records a migration only after it commits, so a crash in between
-		// leaves the next migration's schema; that migration reruns as a no-op.
-		if errors.Is(err, ErrIncompatibleDatabase) && len(names) < len(registry.Sorted()) &&
-			validateSchema(ctx, db, registry, len(names)+1) == nil {
+		if len(names) > 0 {
 			return nil
 		}
-		return err
+		// Bun records the baseline only after its DDL commits, so a database
+		// with no recorded migration may already hold the complete baseline.
+		complete, err := initialSchemaPostStateComplete(ctx, db)
+		if err != nil {
+			return fmt.Errorf("checking database contents: %w", err)
+		}
+		if complete {
+			return nil
+		}
 	}
 	count, err := applicationTableCount(ctx, db)
 	if err != nil {
@@ -89,57 +84,6 @@ func validateTargetSnapshot(ctx context.Context, db bun.IDB, registry *migrate.M
 		return incompatibleDatabaseError()
 	}
 	return nil
-}
-
-// validateSchema requires exactly the schema the first level registered
-// migrations build. The expected schema comes from running them on a private
-// in-memory SQLite database; PostgreSQL is compared on what the two dialects
-// share.
-func validateSchema(ctx context.Context, db bun.IDB, registry *migrate.Migrations, level int) error {
-	portable := db.Dialect().Name() == dialect.PG
-	got, err := describeSchema(ctx, db, portable)
-	if err != nil {
-		return fmt.Errorf("describing database schema: %w", err)
-	}
-	want, err := referenceSchema(ctx, registry, level, portable)
-	if err != nil {
-		return err
-	}
-	if !slices.Equal(got, want) {
-		return incompatibleSchemaError(want, got)
-	}
-	return nil
-}
-
-// referenceSchema describes the schema the first level registered migrations
-// build on a new private in-memory SQLite database.
-func referenceSchema(ctx context.Context, registry *migrate.Migrations, level int, portable bool) ([]string, error) {
-	if level == 0 {
-		return nil, nil
-	}
-	sqldb, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		return nil, fmt.Errorf("opening schema reference: %w", err)
-	}
-	sqldb.SetMaxOpenConns(1)
-	reference := bun.NewDB(sqldb, sqlitedialect.New())
-	defer func() { _ = reference.Close() }()
-	applied := migrate.NewMigrations()
-	for _, migration := range registry.Sorted()[:level] {
-		applied.Add(migration)
-	}
-	migrator := newMigrator(reference, applied)
-	if err := migrator.Init(ctx); err != nil {
-		return nil, fmt.Errorf("building schema reference: %w", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		return nil, fmt.Errorf("building schema reference: %w", err)
-	}
-	schema, err := describeSchema(ctx, reference, portable)
-	if err != nil {
-		return nil, fmt.Errorf("describing schema reference: %w", err)
-	}
-	return schema, nil
 }
 
 func appliedMigrationPrefix(names []string, registry *migrate.Migrations) bool {
@@ -194,46 +138,19 @@ func applicationTableNames(ctx context.Context, db bun.IDB) ([]string, error) {
 }
 
 // initialSchemaPostStateComplete reports whether the database holds exactly
-// the schema the baseline builds, which lets it repair a marker Bun lost after
+// the tables the baseline builds, which lets it repair a marker Bun lost after
 // its DDL committed.
 func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, error) {
-	count, err := applicationTableCount(ctx, db)
-	if err != nil || count == 0 {
+	names, err := applicationTableNames(ctx, db)
+	if err != nil || len(names) == 0 {
 		return false, err
 	}
-	err = validateSchema(ctx, db, Migrations, 1)
-	if errors.Is(err, ErrIncompatibleDatabase) {
-		return false, nil
-	}
-	return err == nil, err
+	slices.Sort(names)
+	return slices.Equal(names, initialSchemaTables2026090101), nil
 }
 
 func incompatibleDatabaseError() error {
 	return fmt.Errorf("%w; keep the existing database as a read-only backup and configure a new empty database", ErrIncompatibleDatabase)
-}
-
-func incompatibleSchemaError(want, got []string) error {
-	return fmt.Errorf("%w: the schema differs from what its recorded migrations build (missing: %s; unexpected: %s); keep the existing database as a read-only backup and configure a new empty database",
-		ErrIncompatibleDatabase, schemaLinesSummary(want, got), schemaLinesSummary(got, want))
-}
-
-// schemaLinesSummary names the first lines of lines that others lacks.
-func schemaLinesSummary(lines, others []string) string {
-	const shown = 5
-	var absent []string
-	for _, line := range lines {
-		if !slices.Contains(others, line) {
-			absent = append(absent, line)
-		}
-	}
-	switch {
-	case len(absent) == 0:
-		return "none"
-	case len(absent) > shown:
-		return fmt.Sprintf("%s and %d more", strings.Join(absent[:shown], ", "), len(absent)-shown)
-	default:
-		return strings.Join(absent, ", ")
-	}
 }
 
 func newMigrator(db *bun.DB, registry *migrate.Migrations) *migrate.Migrator {

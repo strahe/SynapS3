@@ -25,7 +25,7 @@ import (
 // The SDK sends signed HTTP requests to the real gateway over the harness socket.
 func TestS3CompatibilityMatrix(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	harness, err := systemtest.NewHarness(t.Context(), logger)
+	harness, err := newSystemHarness(t, logger, systemtest.HarnessOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,7 +28,6 @@ type InitOptions struct {
 type InitResult struct {
 	Dir                  string
 	ConfigPath           string
-	DatabaseDir          string
 	CacheDir             string
 	DefaultDir           bool
 	AdminInitialPassword string
@@ -92,11 +91,10 @@ func InitAppDataDir(opts InitOptions) (InitResult, error) {
 	}
 
 	result := InitResult{
-		Dir:         appDir,
-		ConfigPath:  filepath.Join(appDir, generatedConfigFileName),
-		DatabaseDir: filepath.Join(appDir, "db"),
-		CacheDir:    filepath.Join(appDir, "cache"),
-		DefaultDir:  defaultDir,
+		Dir:        appDir,
+		ConfigPath: filepath.Join(appDir, generatedConfigFileName),
+		CacheDir:   filepath.Join(appDir, "cache"),
+		DefaultDir: defaultDir,
 	}
 
 	exists, err := fileExists(result.ConfigPath)
@@ -112,7 +110,7 @@ func InitAppDataDir(opts InitOptions) (InitResult, error) {
 	}
 	result.AdminInitialPassword = auth.Password
 
-	for _, dir := range []string{result.Dir, result.DatabaseDir, result.CacheDir} {
+	for _, dir := range []string{result.Dir, result.CacheDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return InitResult{}, fmt.Errorf("creating directory %s: %w", dir, err)
 		}
@@ -202,13 +200,11 @@ type initFieldDescriptor struct {
 
 func renderInitConfig(appDir string, auth AdminAuthBootstrap) string {
 	defaults := defaultConfig()
-	defaults.Database.DSN = defaultSQLiteDSN(appDir)
 	defaults.Cache.Dir = filepath.Join(appDir, "cache")
 	defaults.Admin.Auth.PasswordHash = auth.PasswordHash
 	defaults.Admin.Auth.SessionSecret = auth.SessionSecret
 	return renderTOMLConfig(defaults, PersistedFieldPresence{
 		FilecoinPrivateKey:     true,
-		DatabaseDriver:         true,
 		DatabaseDSN:            true,
 		CacheDir:               true,
 		AdminAuthEnabled:       true,
@@ -269,8 +265,8 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 		{
 			Name: "database",
 			Fields: []initFieldDescriptor{
-				{Field: "database.driver", Key: "driver", Value: quoteTOMLString(cfg.Database.Driver), Enabled: !saveMode || presence.DatabaseDriver, Notes: []string{"Enabled with database.dsn so this installation uses SQLite at the initialized path.", "Allowed: sqlite, postgres."}},
-				{Field: "database.dsn", Key: "dsn", Value: quoteTOMLString(cfg.Database.DSN), Enabled: !saveMode || presence.DatabaseDSN, Notes: []string{"For SQLite, provide only the database file URL; SynapS3 manages SQLite pragmas."}},
+				{Field: "database.driver", Key: "driver", Value: quoteTOMLString(cfg.Database.Driver), Enabled: presence.DatabaseDriver, Notes: []string{"Allowed: postgres."}},
+				{Field: "database.dsn", Key: "dsn", Value: quoteTOMLString(cfg.Database.DSN), Enabled: !saveMode || presence.DatabaseDSN, Notes: []string{"Example: postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable", "Required before serving unless SYNAPS3_DATABASE_DSN is set."}},
 				{Field: "database.max_open_conns", Key: "max_open_conns", Value: strconv.Itoa(cfg.Database.MaxOpenConns), Enabled: saveMode && presence.DatabaseMaxOpen},
 				{Field: "database.max_idle_conns", Key: "max_idle_conns", Value: strconv.Itoa(cfg.Database.MaxIdleConns), Enabled: saveMode && presence.DatabaseMaxIdle},
 			},

@@ -10,7 +10,7 @@ Docker keeps the dashboard and Admin API on `127.0.0.1:9090` by default. When a 
 ## Prerequisites
 
 - A Linux host with Git, Make, curl, Docker Engine, and Docker Compose v2.24 or later.
-- Durable local disk for the `synaps3-data` volume.
+- Durable local disk for the `synaps3-data` and `synaps3-postgres-data` volumes.
 - SSH access or a usable public HTTPS hostname when Admin is accessed from another machine.
 - A fundable Calibration wallet. If you do not have one, follow the wallet generation steps below.
 
@@ -34,7 +34,11 @@ cd SynapS3
 
 The default uses the published image and keeps Admin on `127.0.0.1:9090`. `IMAGE_SOURCE=local` makes `make docker-up` build from the current checkout. `ADMIN_DOMAIN` loads Caddy, manages certificate issuance and renewal, and redirects HTTP to HTTPS. Both options can be used together.
 
-`docker-init` refuses to overwrite an existing `.env`. Review the file after creation and keep its permission mode at `0600`.
+Each combination also starts PostgreSQL 17 for metadata. `docker-init` generates its passwords: the application password goes to `.env`, and the administrator password goes to `.postgres-admin-password`. PostgreSQL listens only on `127.0.0.1:15432`; add `POSTGRES_PORT=<port>` to the initialization command to use another port. SynapS3 connects as the `synaps3` role, which owns the database but is not a superuser.
+
+To use an existing PostgreSQL server instead, add `DATABASE_SOURCE=external` to the initialization command, then set `SYNAPS3_DATABASE_DSN` in `.env` to its connection URL.
+
+`docker-init` refuses to overwrite an existing `.env` or `.postgres-admin-password`. Review both files after creation and keep their permission mode at `0600`.
 
 ### Admin HTTPS Requirements
 
@@ -100,6 +104,8 @@ Only `ok` is ready for normal S3 traffic.
 | Local Admin | `http://127.0.0.1:9090` |
 | Public Admin | HTTPS mode only: `https://admin.example.com` |
 | SynapS3 runtime data | Docker volume `synaps3-data` |
+| PostgreSQL data | Docker volume `synaps3-postgres-data` (managed database only) |
+| Database passwords | `.env` and `.postgres-admin-password` |
 | Caddy state | HTTPS mode only: `synaps3-caddy-data` and `synaps3-caddy-config` |
 
 Read the initial Admin password:
@@ -136,11 +142,16 @@ For production S3 traffic, either configure native TLS with `SYNAPS3_SERVER_TLS_
 make docker-status
 make docker-logs
 make docker-logs DOCKER_SERVICE=synaps3
+make docker-logs DOCKER_SERVICE=postgres
 make docker-logs DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 # HTTPS mode only
 make docker-down
 ```
 
-Logs show the latest 100 lines by default. `docker-down` removes containers but preserves `.env`, `synaps3-data`, and any existing Caddy certificate volumes.
+Logs show the latest 100 lines by default. `docker-down` removes containers but preserves `.env`, `.postgres-admin-password`, the data volumes, and any existing Caddy certificate volumes.
+
+Passwords are not rotated automatically. To change the application password, change it for the `synaps3` role in PostgreSQL, update `POSTGRES_APP_PASSWORD` in `.env`, then run `make docker-up`. To change the port, edit `POSTGRES_PORT` in `.env` and run `make docker-up`.
+
+PostgreSQL creates the database and the `synaps3` role only when its volume is empty. If that first start fails, read `make docker-logs DOCKER_SERVICE=postgres`, fix the cause, remove the `synaps3-postgres-data` volume, and run `make docker-up` again.
 
 ## HTTPS Troubleshooting
 
@@ -159,16 +170,17 @@ Caddy continues retrying after the problem is fixed. Do not delete `synaps3-cadd
 
 ## Back Up Docker Data
 
-Check health and stop the containers first:
+Check health, then stop SynapS3 while PostgreSQL keeps running:
 
 ```bash
 make docker-verify
-make docker-down
+docker compose stop synaps3
 ```
 
-For the default SQLite deployment, archive the complete runtime data volume:
+Dump the managed database and archive the runtime data volume, which holds the configuration and cache:
 
 ```bash
+docker compose exec -T postgres pg_dump --username=synaps3 --dbname=synaps3 --format=custom > synaps3-db.dump
 docker run --rm \
   -v synaps3-data:/data:ro \
   -v "$PWD":/backup \
@@ -177,12 +189,28 @@ docker run --rm \
 docker run --rm \
   -v "$PWD":/backup \
   alpine:3 \
-  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256 && sha256sum -c synaps3-data.tgz.sha256'
+  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-db.dump synaps3-data.tgz > synaps3-backup.sha256 && sha256sum -c synaps3-backup.sha256'
 ```
 
-PostgreSQL deployments require a database-native backup plus configuration and cache data from the same recovery point. See [Runtime Data](../configuration/runtime-data.md) for consistency and restore order. Caddy volumes are outside the database-and-cache recovery point, but retain them to avoid replacing certificates and the ACME account.
+Keep `.env` and `.postgres-admin-password` with the backup. With `DATABASE_SOURCE=external`, back up the database with that server's own tools instead of `pg_dump` above. Caddy volumes are outside the database-and-cache recovery point, but retain them to avoid replacing certificates and the ACME account.
 
 After the backup, run `make docker-up` and `make docker-verify`.
+
+To restore, start from the backed-up `.env` and `.postgres-admin-password` with empty volumes, then load the database before the runtime data:
+
+```bash
+docker compose up -d --wait postgres
+docker compose exec -T postgres pg_restore --username=synaps3 --dbname=synaps3 --no-owner --exit-on-error < synaps3-db.dump
+docker run --rm \
+  -v synaps3-data:/data \
+  -v "$PWD":/backup \
+  alpine:3 \
+  tar xzf /backup/synaps3-data.tgz -C /data
+make docker-up
+make docker-verify
+```
+
+See [Runtime Data](../configuration/runtime-data.md) for consistency and restore order.
 
 ## Upgrade
 

@@ -126,7 +126,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"database.dsn": {
 		Label:       "Database DSN",
-		Description: "Database connection string. SQLite only needs a file URL; SynapS3 manages SQLite runtime parameters.",
+		Description: "PostgreSQL connection URL for the metadata database.",
 		Env:         "SYNAPS3_DATABASE_DSN",
 		Secret:      true,
 	},

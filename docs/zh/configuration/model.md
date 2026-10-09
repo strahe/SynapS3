@@ -59,9 +59,9 @@ Admin 端点有独立的暴露范围控制。让 `admin.addr` 保持回环地址
 
 ## 数据库选择
 
-SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL 运维体系或需要外置元数据数据库时，可以使用 PostgreSQL；其 DSN 必须保存在受保护的配置或密钥存储中。
+SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 URL，例如 `postgres://synaps3:PASSWORD@db.example.com:5432/synaps3?sslmode=require`；它没有默认值。SynapS3 启动时会执行迁移，因此该角色必须能在数据库中建表。DSN 必须保存在受保护的配置或密钥存储中。
 
-`database.max_open_conns` 决定连接池大小。SQLite 同一时刻仍只有一个连接能写入，其余连接用于读取；写入遇到数据库忙时最多等待 5 秒（`busy_timeout`），超时则以 `SQLITE_BUSY` 失败。
+`database.max_open_conns` 决定连接池大小。
 
 ## 主要配置段
 
@@ -71,7 +71,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `s3` | 返回给 S3 客户端的 region。 |
 | `filecoin` | 网络、RPC、钱包、存储提供方 URL 策略、CDN hints 和副本策略。 |
 | `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
-| `database` | SQLite 或 PostgreSQL 元数据数据库。 |
+| `database` | PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
 | `worker.tasks` | 统一后台任务执行和存储变更并发限制。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
@@ -88,7 +88,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
 | `filecoin.anchor_provider_tier` | `approved` |
-| `database.driver` | `sqlite` |
+| `database.driver` | `postgres` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
@@ -137,7 +137,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 - `filecoin.network`: `calibration`, `mainnet`。
 - `filecoin.default_copies`: `1` 到 `8`。
 - `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
-- `database.driver`: `sqlite`, `postgres`。
+- `database.driver`: `postgres`。
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`。
 - `logging.level`: `debug`, `info`, `warn`, `error`。
 - `logging.format`: `json`, `text`。

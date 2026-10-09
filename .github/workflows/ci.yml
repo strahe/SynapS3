@@ -39,15 +39,15 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
+        uses: ./.github/actions/setup-go
 
       - name: Test PostgreSQL persistence contracts
         run: make test-postgres
 
-  check:
+      - name: Test system runtime on PostgreSQL
+        run: make test-system-postgres
+
+  verify:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
@@ -58,28 +58,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up Go
-        id: setup-go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Resolve Go cache paths
-        id: go-cache
-        run: |
-          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
-          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
-          echo "goversion=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore Go cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ${{ steps.go-cache.outputs.gocache }}
-            ${{ steps.go-cache.outputs.gomodcache }}
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go-cache.outputs.goversion }}-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go-cache.outputs.goversion }}-
+        uses: ./.github/actions/setup-go
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
@@ -99,24 +78,35 @@ jobs:
           version: v2.11.4
           install-only: true
 
-      - name: Verify fast
-        if: github.event_name == 'pull_request'
-        run: make verify-fast
+      - name: Verify code, build, and tests
+        run: make verify-ci
 
-      - name: Verify database race
-        if: github.event_name == 'pull_request'
-        run: CGO_ENABLED=1 go test -race -tags dev -count=1 ./internal/db
+  dashboard:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - name: Verify no race
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: make verify-norace
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
 
-      - name: Verify race
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: make verify-race
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
 
-      - name: Test system runtime
-        run: make test-system
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build dashboard
+        run: make ui-build
 
       - name: Build dashboard systemtest server
         run: make build-systemtest-server
@@ -135,3 +125,19 @@ jobs:
           path: ui/test-results/e2e
           if-no-files-found: ignore
           retention-days: 7
+
+  check:
+    needs: [verify, postgres, dashboard]
+    if: ${{ always() }}
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require all checks to pass
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          POSTGRES_RESULT: ${{ needs.postgres.result }}
+          DASHBOARD_RESULT: ${{ needs.dashboard.result }}
+        run: |
+          test "$VERIFY_RESULT" = success
+          test "$POSTGRES_RESULT" = success
+          test "$DASHBOARD_RESULT" = success

@@ -107,7 +107,7 @@ func writeInitResult(cmd *cli.Command, result config.InitResult) error {
 		adminPasswordLine = fmt.Sprintf("Admin username: admin\nAdmin initial password file: %s\n", passwordPath)
 	}
 	output := fmt.Sprintf(
-		"Initialized SynapS3 app data directory: %s\nConfig: %s\n%sSet filecoin.private_key in the config file or SYNAPS3_FILECOIN_PRIVATE_KEY before serving.\n",
+		"Initialized SynapS3 app data directory: %s\nConfig: %s\n%sBefore serving, set database.dsn (a PostgreSQL connection URL) and filecoin.private_key in the config file, or SYNAPS3_DATABASE_DSN and SYNAPS3_FILECOIN_PRIVATE_KEY.\n",
 		result.Dir,
 		result.ConfigPath,
 		adminPasswordLine,

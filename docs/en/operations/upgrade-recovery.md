@@ -47,14 +47,7 @@ Expected result: health is `ok`, effective settings match the deployment, and ba
 4. Configure an empty database and cache directory for the replacement installation.
 5. Start SynapS3 and verify health, effective settings, and background task processing before restoring traffic.
 
-For SQLite, create a consistent backup after the process stops and verify that it opens:
-
-```bash
-sqlite3 /old/path/synaps3.db ".backup '/backup/path/synaps3-pre-upgrade.db'"
-sqlite3 -readonly /backup/path/synaps3-pre-upgrade.db "PRAGMA integrity_check;"
-```
-
-The integrity check must print `ok`. Protect the backup, its WAL/SHM files when retained, the matching cache, and the configuration as one recovery set. PostgreSQL deployments should use `pg_dump` or the deployment's approved database snapshot and verify that artifact separately.
+Back up the database with `pg_dump` or the deployment's approved database snapshot after the process stops, and verify that artifact. Protect the backup, the matching cache, and the configuration as one recovery set.
 
 SynapS3 leaves an incompatible database unchanged.
 
@@ -103,7 +96,7 @@ Restore failed dependencies before retrying work. Use the dashboard, Admin API, 
 
 1. Stop S3 traffic and SynapS3.
 2. Verify backup checksums and select database and cache artifacts from the same recovery point.
-3. For SQLite, restore the complete runtime data volume. For PostgreSQL, restore the database-native backup first, then the matching configuration and cache data.
+3. Restore the database-native backup first, then the matching configuration and cache data.
 4. If rolling back the application, use only data compatible with the selected version. When compatibility is uncertain, restore the pre-upgrade recovery point.
 5. Start SynapS3, then check `/healthz`, effective settings, task statistics, failed tasks, wallet readiness, and a known S3 object.
 

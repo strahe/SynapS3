@@ -47,6 +47,19 @@ func (h *migrationLockBarrier) AfterQuery(ctx context.Context, event *bun.QueryE
 	})
 }
 
+func TestNewRejectsBlankDSNBeforeConnecting(t *testing.T) {
+	for _, driver := range []string{"postgres", "sqlite"} {
+		database, err := New(config.DatabaseConfig{Driver: driver, DSN: " ", MaxOpenConns: 1})
+		if database != nil {
+			_ = database.Close()
+			t.Fatalf("New(%s) returned a connection for a blank DSN", driver)
+		}
+		if err == nil || !strings.Contains(err.Error(), "database.dsn") {
+			t.Fatalf("New(%s) error = %v, want a database.dsn error", driver, err)
+		}
+	}
+}
+
 func TestForceUnlockMigrationsClearsALockLeftByAKilledRun(t *testing.T) {
 	cfg := config.DatabaseConfig{
 		Driver:       "sqlite",

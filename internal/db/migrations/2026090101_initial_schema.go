@@ -20,6 +20,38 @@ func init() {
 	)
 }
 
+// initialSchemaTables2026090101 lists, sorted, the tables the baseline creates.
+var initialSchemaTables2026090101 = []string{
+	"bucket_replica_slots",
+	"buckets",
+	"multipart_parts",
+	"multipart_uploads",
+	"object_cache",
+	"object_deletions",
+	"object_versions",
+	"objects",
+	"observability_collection_states",
+	"observability_data_set_states",
+	"observability_provider_states",
+	"provider_profiles",
+	"provider_tier_snapshots",
+	"provider_upload_speed_tests",
+	"s3_accounts",
+	"storage_cleanup_copies",
+	"storage_commit_request_pieces",
+	"storage_commit_requests",
+	"storage_contents",
+	"storage_copies",
+	"storage_data_set_terminations",
+	"storage_data_sets",
+	"storage_pull_attempts",
+	"storage_replacement_items",
+	"storage_replacements",
+	"task_payloads",
+	"tasks",
+	"wallet_operations",
+}
+
 func up2026090101InitialSchema(ctx context.Context, db bun.IDB) error {
 	complete, err := initialSchemaPostStateComplete(ctx, db)
 	if err != nil {

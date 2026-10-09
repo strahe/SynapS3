@@ -53,7 +53,7 @@ type bucketReplacementView struct {
 // surfaces: confirm, migrate, retire, with reads working throughout.
 func TestSystemProviderReplacement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	harness, err := systemtest.NewHarness(t.Context(), logger)
+	harness, err := newSystemHarness(t, logger, systemtest.HarnessOptions{})
 	if err != nil {
 		t.Fatalf("NewHarness: %v", err)
 	}

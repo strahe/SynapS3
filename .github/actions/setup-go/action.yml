@@ -1,0 +1,44 @@
+name: Set up Go
+description: Install the repository Go version and cache modules separately from compiled packages.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+        cache: false
+
+    - name: Resolve Go cache paths
+      id: paths
+      shell: bash
+      run: |
+        echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+        echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+        echo "goversion=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Go modules
+      id: modules
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.paths.outputs.gomodcache }}
+        key: go-modules-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}
+
+    - name: Restore existing Go cache
+      if: steps.modules.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          ${{ steps.paths.outputs.gocache }}
+          ${{ steps.paths.outputs.gomodcache }}
+        key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}
+        restore-keys: |
+          go-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-
+
+    - name: Cache compiled Go packages
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.paths.outputs.gocache }}
+        key: go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ hashFiles('cmd/**/*.go', 'internal/**/*.go', 'ui/*.go', 'ui/src/**', 'ui/pnpm-lock.yaml', 'go.mod', 'Makefile', '.github/actions/setup-go/action.yml', '.github/workflows/ci.yml', '.github/workflows/s3-compatibility.yml') }}
+        restore-keys: |
+          go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}-${{ github.job }}-
+          go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}-

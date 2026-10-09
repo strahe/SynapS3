@@ -556,7 +556,7 @@ region = "us-east-1"
 private_key = "manual-filecoin-private-key"
 
 [database]
-driver = "sqlite"
+driver = "postgres"
 
 [cache]
 dir = "/tmp/synaps3-cache"

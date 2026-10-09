@@ -20,11 +20,11 @@ Do not bind the Admin listener or port 9090 to a public interface. For internet 
 ## Runtime Data
 
 - Put `/var/lib/synaps3` or `~/.synaps3` on durable storage.
-- Use the default SQLite database unless deployment requirements call for an external PostgreSQL service.
-- Stop SynapS3 before backup. For SQLite, back up the complete runtime data volume. For PostgreSQL, use a database-native backup plus matching configuration and cache data.
+- Keep PostgreSQL on durable storage, and keep its DSN in protected configuration or `.env`.
+- Stop SynapS3 before backup. Use a database-native backup plus matching configuration and cache data.
 - Keep the database and cache at the same recovery point, verify backup archives, and test the documented restore order.
 - Watch free space on the database volume and cache volume.
-- Keep `config.toml`, `.env`, databases, cache data, and wallet material out of git. Protect configuration, secret, and credential files with `0600` permissions.
+- Keep `config.toml`, `.env`, `.postgres-admin-password`, databases, cache data, and wallet material out of git. Protect configuration, secret, and credential files with `0600` permissions.
 
 ## Secrets and Wallet
 
