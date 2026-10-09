@@ -814,9 +814,7 @@ type TaskRepository interface {
 	// bulk confirmation can be previewed before it is confirmed.
 	CountFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter) (int, error)
 	List(ctx context.Context, filter TaskListFilter) (TaskPage, error)
-	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountByScope(ctx context.Context, scope TaskScope) ([]TaskStatusCount, error)
-	CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountUnacknowledgedFailed(ctx context.Context) (int64, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
 }

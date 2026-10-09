@@ -327,7 +327,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/wallet` | 钱包身份、余额、合约状态和业务计数。 |
+| `GET` | `/api/v1/wallet` | 钱包身份、余额和合约状态。 |
 | `POST` | `/api/v1/wallet/fund` | 创建钱包充值操作。 |
 | `POST` | `/api/v1/wallet/withdraw` | 创建钱包提现操作。 |
 | `POST` | `/api/v1/wallet/approve` | 创建显式 FWSS approval 操作。payload 只接受 `client_request_id`。 |

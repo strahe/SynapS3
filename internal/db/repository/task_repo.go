@@ -409,10 +409,6 @@ func (r *BunTaskRepo) CountFailedMatching(ctx context.Context, filter TaskAcknow
 	return count, nil
 }
 
-func (r *BunTaskRepo) CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error) {
-	return r.CountByStatus(ctx)
-}
-
 func (r *BunTaskRepo) CountUnacknowledgedFailed(ctx context.Context) (int64, error) {
 	count, err := r.db.NewSelect().
 		Model((*model.Task)(nil)).

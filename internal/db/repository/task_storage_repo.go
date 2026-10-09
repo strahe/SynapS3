@@ -388,7 +388,10 @@ func (r *BunTaskRepo) ListCurrentFailedForSubject(ctx context.Context, subjectTy
 		limit = 100
 	}
 	var rows []model.Task
-	q := taskRoundsQuery(r.db, &rows, false).Where("task.status = ? AND task.superseded_at IS NULL", model.TaskStatusFailed).OrderExpr("task.id DESC").Limit(limit + 1)
+	// These leading order columns are fixed by the filters. Keeping them in
+	// the order lets PostgreSQL use the subject index even for NULL subjects.
+	q := taskRoundsQuery(r.db, &rows, false).Where("task.status = ? AND task.superseded_at IS NULL", model.TaskStatusFailed).
+		OrderExpr("task.subject_type DESC, task.subject_key DESC, task.superseded_at DESC, task.id DESC").Limit(limit + 1)
 	if subjectType == "" && subjectKey == "" {
 		q.Where("task.subject_type IS NULL AND task.subject_key IS NULL")
 	} else {
@@ -486,25 +489,15 @@ func (r *BunTaskRepo) CountByScope(ctx context.Context, scope TaskScope) ([]Task
 	if !scope.Valid() {
 		return nil, ErrInvalidInput
 	}
-	return r.countTaskRows(ctx, scope, false)
-}
-
-func (r *BunTaskRepo) countTaskRows(ctx context.Context, scope TaskScope, current bool) ([]TaskStatusCount, error) {
 	var counts []TaskStatusCount
 	var q *bun.SelectQuery
-	if current {
-		q = r.db.NewSelect().TableExpr("(?) AS task", bun.Safe(taskRelationSQL(false))).Where("task.superseded_at IS NULL")
-	} else if scope == TaskScopeHistory {
+	if scope == TaskScopeHistory {
 		q = r.db.NewSelect().TableExpr("task_history AS task")
 	} else {
 		q = r.db.NewSelect().TableExpr("tasks AS task")
 	}
 	err := q.ColumnExpr("task.type,task.status,COUNT(*) AS count").GroupExpr("task.type,task.status").Scan(ctx, &counts)
 	return counts, err
-}
-
-func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, error) {
-	return r.countTaskRows(ctx, "", true)
 }
 
 func (r *BunTaskRepo) PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error) {

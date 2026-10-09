@@ -40,3 +40,19 @@ func migrateToLevel(t *testing.T, db *bun.DB, level int) {
 		t.Fatalf("migrate to level %d: %v", level, err)
 	}
 }
+
+func migrationLevel(t *testing.T, name string) int {
+	t.Helper()
+	for i, migration := range Migrations.Sorted() {
+		if migration.Name == name {
+			return i + 1
+		}
+	}
+	t.Fatalf("migration %s is not registered", name)
+	return 0
+}
+
+func migrateThrough(t *testing.T, db *bun.DB, name string) {
+	t.Helper()
+	migrateToLevel(t, db, migrationLevel(t, name))
+}

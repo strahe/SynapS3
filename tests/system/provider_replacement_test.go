@@ -74,10 +74,13 @@ func TestSystemProviderReplacement(t *testing.T) {
 	if _, err := s3Client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
+	waitForBucketReady(t, admin, bucket)
 	content := bytes.Repeat([]byte("synaps3-provider-replacement\n"), 2000)
 	checksum := sha256.Sum256(content)
 	if _, err := s3Client.PutObject(t.Context(), &awss3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(content),
+	}, func(options *awss3.Options) {
+		options.Retryer = aws.NopRetryer{}
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}

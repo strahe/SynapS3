@@ -78,6 +78,55 @@ func TestTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T) {
 	assertTaskHistoryPaginationAcrossLongArchivedChain(t, testDB(t))
 }
 
+func TestCurrentFailedSubjectHistoryPagination(t *testing.T) {
+	db := testDB(t)
+	now := time.Now().UTC()
+	st, sk := "periodic", "cache"
+	var history []*model.TaskHistory
+	for id := int64(1); id <= 512; id++ {
+		row := repositoryTestTask(&model.Task{
+			ID: id, Type: model.TaskTypeUploadPlan, IdempotencyKey: fmt.Sprintf("subject-%d", id),
+			InputVersion: 1, InputHash: "subject", Input: json.RawMessage(`{}`), Events: json.RawMessage(`[]`),
+			Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute,
+			AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
+		})
+		if id%2 == 0 {
+			row.SubjectType, row.SubjectKey = &st, &sk
+		}
+		if id <= 6 {
+			row.Status, row.AcknowledgedAt = model.TaskStatusFailed, &now
+		}
+		if id <= 2 {
+			row.SupersededAt = &now
+		}
+		history = append(history, model.TaskHistoryFromTask(row))
+	}
+	if _, err := db.NewInsert().Model(&history).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	repos := repository.NewRepositories(db)
+	for _, subject := range []struct {
+		st, sk string
+		ids    []int64
+	}{{st, sk, []int64{6, 4}}, {"", "", []int64{5, 3}}} {
+		cursor := int64(0)
+		for i, id := range subject.ids {
+			page, err := repos.Tasks.ListCurrentFailedForSubject(t.Context(), subject.st, subject.sk, cursor, 1, model.TaskTypeUploadPlan)
+			if err != nil || len(page.Tasks) != 1 || page.Tasks[0].ID != id {
+				t.Fatalf("subject=%s/%s cursor=%d page=%+v, err=%v", subject.st, subject.sk, cursor, page, err)
+			}
+			wantCursor := id
+			if i == len(subject.ids)-1 {
+				wantCursor = 0
+			}
+			if page.NextBeforeID != wantCursor {
+				t.Fatalf("cursor=%d, want %d", page.NextBeforeID, wantCursor)
+			}
+			cursor = page.NextBeforeID
+		}
+	}
+}
+
 func assertTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T, db *bun.DB) {
 	t.Helper()
 	const length = 128

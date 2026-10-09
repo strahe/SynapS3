@@ -863,12 +863,6 @@ export interface PaymentAccountData {
   no_active_spend: boolean
 }
 
-export interface WalletBusiness {
-  data_set_count: number
-  onchain_tasks_pending: number
-  onchain_tasks_completed: number
-}
-
 export interface WalletData {
   configured: boolean
   identity?: {
@@ -891,7 +885,6 @@ export interface WalletData {
     usdfc_address: string
     usdfc_decimals: number
   }
-  business?: WalletBusiness
   partial_errors?: Record<string, string>
 }
 

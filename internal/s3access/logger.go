@@ -1,6 +1,7 @@
 package s3access
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -46,7 +47,8 @@ func (l *Logger) Log(ctx *fiber.Ctx, err error, _ []byte, meta s3log.LogMeta) {
 			attrs = append(attrs, "error_code", s3Err.BaseError().Code)
 		}
 	}
-	l.logger.Log(ctx.UserContext(), l.level, "s3 request completed", attrs...)
+	// UserContext lazily mutates request values still used by streamed reads.
+	l.logger.Log(context.Background(), l.level, "s3 request completed", attrs...)
 }
 
 func (l *Logger) HangUp() error {

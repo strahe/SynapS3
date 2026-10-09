@@ -334,7 +334,7 @@ func TestNew_SQLiteReadWriteTransactionsAcquireWriteLockAtBegin(t *testing.T) {
 	}
 
 	readThenEnqueue := func(txRepos *repository.Repositories, wantCount int64) error {
-		counts, err := txRepos.Tasks.CountByStatus(ctx)
+		counts, err := txRepos.Tasks.CountByScope(ctx, repository.TaskScopeWork)
 		if err != nil {
 			return err
 		}
