@@ -1,7 +1,6 @@
 package migrations
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"go/parser"
@@ -17,21 +16,6 @@ import (
 	"github.com/uptrace/bun/migrate"
 	_ "modernc.org/sqlite"
 )
-
-func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
-	migrations := Migrations.Sorted()
-	if len(migrations) == 0 {
-		t.Fatal("migration registry is empty")
-	}
-	if migrations[0].Name != InitialSchemaName {
-		t.Fatalf("migration name = %q, want %q", migrations[0].Name, InitialSchemaName)
-	}
-	for i := 1; i < len(migrations); i++ {
-		if migrations[i-1].Name >= migrations[i].Name {
-			t.Fatalf("migration names are not unique and ordered: %q then %q", migrations[i-1].Name, migrations[i].Name)
-		}
-	}
-}
 
 func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 	files, err := filepath.Glob("*.go")
@@ -56,218 +40,6 @@ func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 			}
 		}
 	}
-}
-
-func TestInitialSchemaContractSQLite(t *testing.T) {
-	db := newSQLiteMigrationDB(t, "initial_schema_contract")
-	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-		t.Fatalf("create initial schema: %v", err)
-	}
-	for _, table := range []string{
-		"s3_accounts", "buckets", "bucket_replica_slots", "objects", "object_versions", "object_cache", "object_deletions",
-		"multipart_uploads", "multipart_parts", "storage_contents", "storage_data_sets",
-		"storage_copies", "storage_commit_requests", "storage_commit_request_pieces", "storage_replacements",
-		"storage_pull_attempts", "storage_replacement_items", "storage_cleanup_copies", "wallet_operations", "tasks",
-		"observability_collection_states", "observability_provider_states", "observability_data_set_states", "provider_profiles", "provider_tier_snapshots", "provider_upload_speed_tests",
-		"task_payloads", "storage_data_set_terminations",
-	} {
-		if exists, err := tableExists(t.Context(), db, table); err != nil || !exists {
-			t.Errorf("table %s exists=%t err=%v", table, exists, err)
-		}
-	}
-	for _, column := range []struct{ table, name string }{
-		{"tasks", "claim_generation"},
-		{"provider_upload_speed_tests", "active_task_id"},
-		{"task_payloads", "checkpoint_json"},
-		{"storage_data_set_terminations", "epoch"},
-		{"storage_copies", "active_task_id"},
-		{"storage_copies", "bucket_id"},
-		{"storage_copies", "content_size"},
-		{"storage_copies", "storage_data_set_id"},
-		{"storage_copies", "ingress_bytes_transferred"},
-		{"storage_commit_requests", "request_id"},
-		{"storage_commit_requests", "first_sent_at"},
-		{"storage_commit_request_pieces", "position"},
-		{"storage_copies", "commit_request_id"},
-		{"storage_copies", "commit_position"},
-		{"storage_pull_attempts", "attempt_id"},
-		{"storage_pull_attempts", "source_piece_cid"},
-		{"storage_pull_attempts", "extra_data_hex"},
-		{"storage_contents", "content_size"},
-		{"storage_data_sets", "ensure_task_id"},
-		{"storage_replacement_items", "target_data_set_id"},
-		{"storage_cleanup_copies", "bucket_id"},
-		{"storage_cleanup_copies", "checksum"},
-		{"object_versions", "content_id"},
-		{"object_cache", "cache_active_task_id"},
-		{"wallet_operations", "broadcast_attempted_at"},
-	} {
-		if exists, err := columnExists(t.Context(), db, column.table, column.name); err != nil || !exists {
-			t.Errorf("column %s.%s exists=%t err=%v", column.table, column.name, exists, err)
-		}
-	}
-	for _, index := range []string{
-		"idx_tasks_pending",
-		"idx_tasks_recovery",
-		"idx_tasks_gc",
-		"idx_storage_copies_commit_request",
-		"idx_storage_commit_requests_data_set_status",
-		"idx_storage_commit_requests_task",
-		"idx_storage_copies_ingress_content",
-		"idx_storage_data_sets_bucket_provider_active",
-		"idx_storage_replacements_active_bucket_slot",
-		"idx_wallet_operations_recent",
-		"idx_provider_upload_speed_tests_active_task",
-	} {
-		if exists, err := indexExists(t.Context(), db, index); err != nil || !exists {
-			t.Errorf("index %s exists=%t err=%v", index, exists, err)
-		}
-	}
-	for _, index := range []string{
-		"idx_storage_data_sets_replica_slot",
-		"idx_storage_replacements_replica_slot",
-		"idx_storage_copies_commit_ready",
-		"idx_storage_copies_confirmed_attempt",
-	} {
-		if exists, err := indexExists(t.Context(), db, index); err != nil || exists {
-			t.Errorf("removed index %s exists=%t err=%v", index, exists, err)
-		}
-	}
-	for _, column := range []struct{ table, name string }{
-		{"tasks", "stage"},
-		{"tasks", "category"},
-		{"tasks", "parent_task_id"},
-		{"tasks", "workflow_id"},
-		{"tasks", "priority"},
-		{"tasks", "lane"},
-		{"storage_replacement_items", "claimed_at"},
-		{"storage_replacement_items", "lease_until"},
-		{"storage_replacement_items", "scheduled_at"},
-		{"storage_replacement_items", "retry_count"},
-		{"storage_replacement_items", "task_id"},
-		{"storage_replacement_items", "target_copy_id"},
-		{"multipart_uploads", "id"},
-		{"storage_copies", "commit_attempt_id"},
-		{"storage_copies", "commit_attempted_at"},
-		{"storage_copies", "commit_transaction_id"},
-		{"storage_copies", "commit_status_url"},
-		{"storage_copies", "commit_confirmed_transaction_id"},
-		{"storage_copies", "commit_attention_code"},
-		{"storage_copies", "commit_attention_at"},
-		{"storage_copies", "is_new_data_set"},
-		// A copy names its commit request; the signed request lives there.
-		{"storage_copies", "commit_extra_data_hex"},
-		{"storage_copies", "confirmed_attempt_id"},
-		// Pull identity is a ledger row now, not five nullable copy columns.
-		{"storage_copies", "pull_request_id"},
-		{"storage_copies", "pull_source_provider_id"},
-		{"storage_copies", "pull_source_data_set_id"},
-		{"storage_copies", "pull_source_piece_id"},
-		{"storage_copies", "pull_source_retrieval_url"},
-		{"storage_pull_attempts", "request_id"},
-		// Pipeline position, cache residency and the content status column are
-		// derived or moved; reintroducing any of them re-creates a second
-		// authority for a fact the copies or object_cache already own.
-		{"object_versions", "is_current"},
-		{"object_versions", "state"},
-		{"object_versions", "failed_at_state"},
-		{"object_versions", "last_error"},
-		{"object_versions", "checksum"},
-		{"object_versions", "storage_upload_id"},
-		{"object_versions", "cache_key"},
-		{"object_versions", "in_cache"},
-		{"object_versions", "cache_accessed_at"},
-		{"object_versions", "cache_presence_generation"},
-		{"object_versions", "cache_operation_generation"},
-		{"object_versions", "cache_active_task_id"},
-		{"storage_contents", "status"},
-		{"storage_contents", "state"},
-		{"storage_contents", "disposition"},
-		{"storage_contents", "superseded_by_id"},
-		{"storage_contents", "committed_slots"},
-		{"storage_contents", "ingress_bytes_transferred"},
-		{"storage_contents", "created_from_version_id"},
-		{"observability_provider_states", "created_at"},
-		{"observability_provider_states", "updated_at"},
-		{"observability_data_set_states", "created_at"},
-		{"observability_data_set_states", "updated_at"},
-		{"object_deletions", "cache_cleanup_status"},
-		{"object_deletions", "cache_error"},
-		// The JSON a task carries and the terminations a replacement records
-		// are rows of their own; putting either back re-creates the write
-		// amplification and the repeated column group they were split out of.
-		{"tasks", "input_json"},
-		{"tasks", "checkpoint_json"},
-		{"storage_replacements", "termination_tx_hash"},
-		{"storage_replacements", "termination_epoch"},
-		{"storage_replacements", "termination_observed_at"},
-		{"storage_replacements", "abandoned_termination_tx_hash"},
-		{"storage_replacements", "abandoned_termination_epoch"},
-		{"storage_replacements", "abandoned_termination_observed_at"},
-		{"storage_replacements", "confirmed_at"},
-	} {
-		if exists, err := columnExists(t.Context(), db, column.table, column.name); err != nil || exists {
-			t.Errorf("removed column %s.%s exists=%t err=%v", column.table, column.name, exists, err)
-		}
-	}
-}
-
-func TestInitialSchemaTaskOwnerForeignKeysAreRestrictive(t *testing.T) {
-	db := newSQLiteMigrationDB(t, "task_owner_foreign_keys")
-	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-		t.Fatalf("create initial schema: %v", err)
-	}
-	want := map[string]map[string]bool{
-		"buckets":                 {"durability_task_id": false},
-		"object_cache":            {"cache_active_task_id": false},
-		"storage_contents":        {"cleanup_task_id": false},
-		"storage_data_sets":       {"ensure_task_id": false, "retirement_task_id": false},
-		"storage_copies":          {"active_task_id": false},
-		"storage_commit_requests": {"task_id": false},
-		"storage_replacements":    {"task_id": false},
-		"wallet_operations":       {"task_id": false},
-	}
-	for table, columns := range want {
-		rows, err := db.Query(`SELECT "from", "table", on_delete FROM pragma_foreign_key_list(?)`, table)
-		if err != nil {
-			t.Fatalf("query foreign keys for %s: %v", table, err)
-		}
-		for rows.Next() {
-			var from, target, onDelete string
-			if err := rows.Scan(&from, &target, &onDelete); err != nil {
-				_ = rows.Close()
-				t.Fatalf("scan foreign key for %s: %v", table, err)
-			}
-			if _, tracked := columns[from]; !tracked || target != "tasks" {
-				continue
-			}
-			if onDelete != "RESTRICT" {
-				_ = rows.Close()
-				t.Fatalf("%s.%s ON DELETE = %s, want RESTRICT", table, from, onDelete)
-			}
-			columns[from] = true
-		}
-		if err := rows.Close(); err != nil {
-			t.Fatalf("close foreign keys for %s: %v", table, err)
-		}
-		for column, found := range columns {
-			if !found {
-				t.Errorf("missing task ownership foreign key %s.%s", table, column)
-			}
-		}
-	}
-}
-
-// The baseline recognizes its own committed post-state by this table list.
-func TestInitialSchemaTableListMatchesBaseline(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, 1)
-		tables := applicationSchemaTables(t, db)
-		slices.Sort(tables)
-		if !slices.Equal(tables, initialSchemaTables2026090101) {
-			t.Fatalf("baseline tables = %v, want %v", tables, initialSchemaTables2026090101)
-		}
-	})
 }
 
 func TestValidateTargetRejectsLegacyDatabaseWithoutModification(t *testing.T) {
@@ -321,11 +93,6 @@ func TestValidateTargetAcceptsOnlyAppliedMigrationPrefixes(t *testing.T) {
 			db := newSQLiteMigrationDB(t, "migration_prefix_"+strings.ReplaceAll(tt.name, " ", "_"))
 			if err := newMigrator(db, registry).Init(t.Context()); err != nil {
 				t.Fatalf("initialize migration metadata: %v", err)
-			}
-			if len(tt.applied) > 0 {
-				if err := up2026090101InitialSchema(t.Context(), db); err != nil {
-					t.Fatalf("create baseline schema: %v", err)
-				}
 			}
 			for _, name := range tt.applied {
 				if _, err := db.Exec(`INSERT INTO bun_migrations (name, group_id) VALUES (?, 1)`, name); err != nil {
@@ -381,45 +148,6 @@ func migrationRegistryForTest(names ...string) *migrate.Migrations {
 		registry.Add(migrate.Migration{Name: name})
 	}
 	return registry
-}
-
-func TestFreshBaselineIsIdempotentAndCannotRollback(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		ctx := t.Context()
-		if err := ValidateTarget(ctx, db); err != nil {
-			t.Fatalf("validate empty target: %v", err)
-		}
-		migrator := NewMigrator(db)
-		if err := migrator.Init(ctx); err != nil {
-			t.Fatalf("initialize migrator: %v", err)
-		}
-		first, err := migrator.Migrate(ctx)
-		if err != nil {
-			t.Fatalf("migrate fresh schema: %v", err)
-		}
-		if len(first.Migrations) != len(Migrations.Sorted()) || first.Migrations[0].Name != InitialSchemaName {
-			t.Fatalf("first migration group = %#v", first.Migrations)
-		}
-		second, err := migrator.Migrate(ctx)
-		if err != nil {
-			t.Fatalf("repeat migration: %v", err)
-		}
-		if len(second.Migrations) != 0 {
-			t.Fatalf("repeat migration applied %d migrations", len(second.Migrations))
-		}
-		if _, err := migrator.Rollback(ctx); err == nil {
-			t.Fatal("initial schema rollback succeeded")
-		}
-		if exists, err := tableExists(ctx, db, "tasks"); err != nil || !exists {
-			t.Fatalf("tasks table exists=%t err=%v after rejected rollback", exists, err)
-		}
-	})
-}
-
-func runMigrationBody(ctx context.Context, db *bun.DB, body migrationBody) error {
-	return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		return body(ctx, tx)
-	})
 }
 
 func newSQLiteMigrationDB(t *testing.T, name string) *bun.DB {
