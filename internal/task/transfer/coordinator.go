@@ -211,7 +211,7 @@ func (h *CopyCoordinator) finishPieceTransfer(
 }
 
 func (h *CopyCoordinator) handOffToCommit(input storagepipeline.CopyGenerationInput, taskID int64) taskengine.Result {
-	return taskengine.Complete("Storage copy is ready to register", func(ctx context.Context, repos *repository.Repositories) error {
+	return taskengine.Complete("Replica is ready to submit", func(ctx context.Context, repos *repository.Repositories) error {
 		if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, taskID); err != nil {
 			return err
 		}

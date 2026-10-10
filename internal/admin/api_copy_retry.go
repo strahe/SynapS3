@@ -67,7 +67,7 @@ func copyRetryUnavailableReason(block storagepipeline.CopyRetryBlock) string {
 	case storagepipeline.CopyRetryReplacementInProgress:
 		return "Provider replacement is in progress."
 	case storagepipeline.CopyRetryStorageServiceUnavailable:
-		return "Storage service is unavailable."
+		return "Filecoin storage is unavailable."
 	case storagepipeline.CopyRetryNoSource:
 		return "No available source."
 	case storagepipeline.CopyRetryRecoveryRequiresAttention:

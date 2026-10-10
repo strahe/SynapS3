@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as BucketsRouteImport } from './routes/buckets'
 import { Route as CommitBatchesRouteImport } from './routes/commit-batches'
+import { Route as S3UsersRouteImport } from './routes/s3-users'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as StorageTopologyRouteImport } from './routes/storage-topology'
 import { Route as TasksRouteImport } from './routes/tasks'
@@ -32,6 +33,11 @@ const BucketsRoute = BucketsRouteImport.update({
 const CommitBatchesRoute = CommitBatchesRouteImport.update({
   id: '/commit-batches',
   path: '/commit-batches',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const S3UsersRoute = S3UsersRouteImport.update({
+  id: '/s3-users',
+  path: '/s3-users',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsRoute = SettingsRouteImport.update({
@@ -69,6 +75,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
   '/commit-batches': typeof CommitBatchesRoute
+  '/s3-users': typeof S3UsersRoute
   '/settings': typeof SettingsRoute
   '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
@@ -79,6 +86,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/commit-batches': typeof CommitBatchesRoute
+  '/s3-users': typeof S3UsersRoute
   '/settings': typeof SettingsRoute
   '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
@@ -91,6 +99,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
   '/commit-batches': typeof CommitBatchesRoute
+  '/s3-users': typeof S3UsersRoute
   '/settings': typeof SettingsRoute
   '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
@@ -104,6 +113,7 @@ export interface FileRouteTypes {
     | '/'
     | '/buckets'
     | '/commit-batches'
+    | '/s3-users'
     | '/settings'
     | '/storage-topology'
     | '/tasks'
@@ -114,6 +124,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/commit-batches'
+    | '/s3-users'
     | '/settings'
     | '/storage-topology'
     | '/tasks'
@@ -125,6 +136,7 @@ export interface FileRouteTypes {
     | '/'
     | '/buckets'
     | '/commit-batches'
+    | '/s3-users'
     | '/settings'
     | '/storage-topology'
     | '/tasks'
@@ -137,6 +149,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   BucketsRoute: typeof BucketsRouteWithChildren
   CommitBatchesRoute: typeof CommitBatchesRoute
+  S3UsersRoute: typeof S3UsersRoute
   SettingsRoute: typeof SettingsRoute
   StorageTopologyRoute: typeof StorageTopologyRoute
   TasksRoute: typeof TasksRoute
@@ -164,6 +177,13 @@ declare module '@tanstack/react-router' {
       path: '/commit-batches'
       fullPath: '/commit-batches'
       preLoaderRoute: typeof CommitBatchesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/s3-users': {
+      id: '/s3-users'
+      path: '/s3-users'
+      fullPath: '/s3-users'
+      preLoaderRoute: typeof S3UsersRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/settings': {
@@ -228,6 +248,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   BucketsRoute: BucketsRouteWithChildren,
   CommitBatchesRoute: CommitBatchesRoute,
+  S3UsersRoute: S3UsersRoute,
   SettingsRoute: SettingsRoute,
   StorageTopologyRoute: StorageTopologyRoute,
   TasksRoute: TasksRoute,

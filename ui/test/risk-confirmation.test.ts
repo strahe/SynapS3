@@ -30,9 +30,9 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'worker.tasks.poll_interval': meta('Background Work Poll Interval'),
   'worker.tasks.lease_duration': meta('Recovery Lease Duration'),
   'worker.tasks.upload_concurrency': meta('Upload Concurrency'),
-  'worker.tasks.commit_max_pieces': meta('Registration Size'),
-  'worker.tasks.commit_max_wait': meta('Registration Wait'),
-  'worker.tasks.commit_max_backlog': meta('Registration Backlog'),
+  'worker.tasks.commit_max_pieces': meta('Batch size'),
+  'worker.tasks.commit_max_wait': meta('Batch wait'),
+  'worker.tasks.commit_max_backlog': meta('Batch backlog'),
 }
 
 function meta(label: string): SettingsFieldMetadata {
@@ -187,7 +187,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['worker.tasks.poll_interval', 'Background Work Poll Interval', '5s', '1s', 'medium'],
       ['worker.tasks.lease_duration', 'Recovery Lease Duration', '5m0s', '2m0s', 'medium'],
       ['worker.tasks.upload_concurrency', 'Upload Concurrency', '4', '6', 'medium'],
-      ['worker.tasks.commit_max_pieces', 'Registration Size', '32', '64', 'medium'],
+      ['worker.tasks.commit_max_pieces', 'Batch size', '32', '64', 'medium'],
     ]
   )
   assert.deepEqual([...new Set(changes.map(classifySettingsRisk))], ['review'])

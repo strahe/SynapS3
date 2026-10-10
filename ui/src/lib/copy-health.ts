@@ -22,7 +22,7 @@ export function copyHealthStatusLabel(status: CopyHealthStatus) {
 
 export function copyHealthSummaryTitle(health: CopyHealthSummary) {
   if (health.status === 'available' && !health.stale && health.unhealthy_objects === 0) {
-    return 'All requested object copies are readable'
+    return 'All requested replicas are readable'
   }
 
   const parts: string[] = []
@@ -30,7 +30,7 @@ export function copyHealthSummaryTitle(health: CopyHealthSummary) {
     parts.push(`${formatNumber(health.unhealthy_objects)} objects need attention`)
   }
   if (health.requested_copies > health.readable_copies) {
-    parts.push(`${formatNumber(health.requested_copies - health.readable_copies)} object copies are not readable`)
+    parts.push(`${formatNumber(health.requested_copies - health.readable_copies)} replicas are not readable`)
   }
   if (health.pending_copies > 0) parts.push(`${formatNumber(health.pending_copies)} pending`)
   if (health.failed_copies > 0) parts.push(`${formatNumber(health.failed_copies)} failed`)
@@ -82,7 +82,7 @@ function copyHealthReasonLabel(reason: string) {
     case 'copy_pending':
       return 'Replica is waiting to start'
     case 'copy_committing':
-      return 'Replica is registering storage'
+      return 'Replica is being submitted'
     case 'copy_failed':
       return 'Replica failed'
     case 'copy_missing_provider':

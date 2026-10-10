@@ -95,7 +95,7 @@ export default function TopologyGraphCanvas({
   const laneNodes = useMemo<LaneFlowNode[]>(
     () => [
       laneHeaderNode('lane:buckets', 'Buckets', graph.buckets[0]?.x ?? storageTopologyGraphLayout.bucketX),
-      laneHeaderNode('lane:data-sets', 'Data Sets', graph.dataSets[0]?.x ?? storageTopologyGraphLayout.dataSetX),
+      laneHeaderNode('lane:data-sets', 'Data sets', graph.dataSets[0]?.x ?? storageTopologyGraphLayout.dataSetX),
       laneHeaderNode('lane:providers', 'Providers', graph.providers[0]?.x ?? storageTopologyGraphLayout.providerX),
     ],
     [graph.buckets, graph.dataSets, graph.providers]
@@ -283,7 +283,7 @@ function ProviderGraphNode({ data, selected }: TopologyFlowNodeProps) {
 
 function LaneHeaderGraphNode({ data }: LaneFlowNodeProps) {
   return (
-    <div className="w-64 rounded-md border bg-card/90 px-4 py-2 text-sm font-semibold text-muted-foreground shadow-xs">
+    <div className="w-64 border-b border-border px-1 pb-2 text-sm font-semibold text-muted-foreground">
       {data.label}
     </div>
   )

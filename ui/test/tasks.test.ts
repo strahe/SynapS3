@@ -64,8 +64,8 @@ test('Took measures completed work from first start and rejects incomplete or in
 test('Subject preserves identity, one-based replicas, provenance, and exact wallet amounts', () => {
   assert.equal(taskSubjectLabel({}), '—')
   assert.equal(taskSubjectLabel({ subject_type: 'system' }), 'System')
-  assert.equal(taskSubjectLabel({ subject_type: 'storage_data_set', subject_key: '23' }), 'Dataset #23')
-  assert.equal(taskSubjectLabel({ subject_type: 'storage_copy', subject_key: '447' }), 'Copy #447')
+  assert.equal(taskSubjectLabel({ subject_type: 'storage_data_set', subject_key: '23' }), 'Data set #23')
+  assert.equal(taskSubjectLabel({ subject_type: 'storage_copy', subject_key: '447' }), 'Replica #447')
   assert.equal(
     taskSubjectLabel({ subject_type: 'provider', subject_key: '184467440737095516160' }),
     'Provider #184467440737095516160'
@@ -90,7 +90,7 @@ test('Subject preserves identity, one-based replicas, provenance, and exact wall
     local_data_set_id: 23,
     data_set_id: '801',
   })
-  assert.equal(dataset[3]?.label, 'On-chain Dataset ID')
+  assert.equal(dataset[3]?.label, 'On-chain data set ID')
   assert.equal(dataset[3]?.value, '801')
   const registration = taskSubjectFields({
     subject_type: 'storage_commit_request',

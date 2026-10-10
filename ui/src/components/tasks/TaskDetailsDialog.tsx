@@ -1,28 +1,22 @@
 import { useQuery } from '@tanstack/react-query'
 import { Circle, CircleCheck, CircleX, Clock3, History } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, type TaskItem } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { CursorPagination } from '@/components/app/CursorPagination'
+import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { taskDetailsView, taskOperationLabel, taskSubjectLabel, taskTook } from '@/lib/tasks'
-import { timeAgo, titleCaseEnum } from '@/lib/utils'
+import { enumLabel } from '@/lib/utils'
 
 const eventLabels: Record<string, string> = {
   created: 'Created',
@@ -42,17 +36,11 @@ const eventLabels: Record<string, string> = {
 
 function TaskStatus({ task }: { task: TaskItem }) {
   const status = task.presentation_status ?? task.status
-  return <StatusBadge tone={taskStatusTone(status)}>{titleCaseEnum(status)}</StatusBadge>
+  return <StatusBadge tone={taskStatusTone(status)}>{enumLabel(status)}</StatusBadge>
 }
 
 function TaskTime({ value }: { value?: string }) {
-  return value ? (
-    <time dateTime={value} title={new Date(value).toLocaleString()}>
-      {timeAgo(value)}
-    </time>
-  ) : (
-    <>—</>
-  )
+  return <RelativeTime value={value} />
 }
 
 function LoadingDetails() {
@@ -82,11 +70,28 @@ function LoadError({ label, onRetry }: { label: string; onRetry: () => void }) {
   )
 }
 
-export function TaskDetailsDialog({ taskID }: { taskID: number }) {
-  const [open, setOpen] = useState(false)
-  const [selectedTaskID, setSelectedTaskID] = useState(taskID)
-  const [historyCursor, setHistoryCursor] = useState<number>()
-  const [eventCursor, setEventCursor] = useState<number>()
+/** Details for one task; switching to another execution of it stays inside the dialog. */
+export function TaskDetailsDialog({
+  taskID,
+  onOpenChange,
+}: {
+  taskID: number | null
+  onOpenChange: (open: boolean) => void
+}) {
+  const open = taskID !== null
+  const [selectedTaskID, setSelectedTaskID] = useState(taskID ?? 0)
+  const [historyCursors, setHistoryCursors] = useState<number[]>([])
+  const [eventCursors, setEventCursors] = useState<number[]>([])
+  const historyCursor = historyCursors[historyCursors.length - 1]
+  const eventCursor = eventCursors[eventCursors.length - 1]
+
+  useEffect(() => {
+    if (taskID === null) return
+    setSelectedTaskID(taskID)
+    setHistoryCursors([])
+    setEventCursors([])
+  }, [taskID])
+
   const detail = useQuery({
     queryKey: ['task', selectedTaskID],
     queryFn: () => api.getTask(selectedTaskID),
@@ -112,22 +117,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
     (event) => event.type !== 'legacy_handoff' && event.type !== 'policy_replaced'
   )
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next)
-        if (next) setSelectedTaskID(taskID)
-        if (!next) {
-          setHistoryCursor(undefined)
-          setEventCursor(undefined)
-        }
-      }}
-    >
-      <DialogTrigger asChild>
-        <Button variant="ghost" size="sm">
-          View
-        </Button>
-      </DialogTrigger>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(38rem,calc(100dvh-2rem))] flex-col gap-4 overflow-hidden sm:max-w-2xl">
         <DialogHeader className="shrink-0 pr-8">
           <DialogTitle>Task {selectedTaskID}</DialogTitle>
@@ -140,7 +130,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
             <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2">
                 <TaskStatus task={task} />
-                {task.acknowledged_at && <Badge variant="secondary">Acknowledged</Badge>}
+                {task.acknowledged_at && <StatusBadge tone="neutral">Acknowledged</StatusBadge>}
                 <span className="text-xs text-muted-foreground">{taskSubjectLabel(task)}</span>
               </div>
               {task.retryable && <RetryButton taskID={task.retry_task_id} />}
@@ -250,13 +240,13 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                                   size="sm"
                                   onClick={() => {
                                     setSelectedTaskID(round.id)
-                                    setHistoryCursor(undefined)
-                                    setEventCursor(undefined)
+                                    setHistoryCursors([])
+                                    setEventCursors([])
                                   }}
                                 >
                                   Task {round.id}
                                 </Button>
-                                {round.id === selectedTaskID && <Badge variant="secondary">Current</Badge>}
+                                {round.id === selectedTaskID && <StatusBadge tone="neutral">Current</StatusBadge>}
                               </div>
                               <span className="text-muted-foreground">{taskOperationLabel(round.type)}</span>
                               <span className="text-xs text-muted-foreground">
@@ -268,18 +258,15 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                         </li>
                       ))}
                     </ol>
-                    <div className="flex items-center gap-2">
-                      {historyCursor && (
-                        <Button variant="ghost" size="sm" onClick={() => setHistoryCursor(undefined)}>
-                          Latest executions
-                        </Button>
-                      )}
-                      {history.data?.next_cursor && (
-                        <Button variant="outline" size="sm" onClick={() => setHistoryCursor(history.data?.next_cursor)}>
-                          Older executions
-                        </Button>
-                      )}
-                    </div>
+                    <CursorPagination
+                      hasPrevious={historyCursors.length > 0}
+                      hasNext={Boolean(history.data?.next_cursor)}
+                      onPrevious={() => setHistoryCursors((cursors) => cursors.slice(0, -1))}
+                      onNext={() => {
+                        const next = history.data?.next_cursor
+                        if (next) setHistoryCursors((cursors) => [...cursors, next])
+                      }}
+                    />
                   </div>
                 </ScrollArea>
               </TabsContent>
@@ -294,7 +281,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                           <EmptyMedia variant="icon">
                             <History />
                           </EmptyMedia>
-                          <EmptyTitle>No events recorded.</EmptyTitle>
+                          <EmptyTitle>No events recorded</EmptyTitle>
                         </EmptyHeader>
                       </Empty>
                     )}
@@ -334,18 +321,15 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
                         )
                       })}
                     </ol>
-                    <div className="flex items-center gap-2">
-                      {eventCursor && (
-                        <Button variant="ghost" size="sm" onClick={() => setEventCursor(undefined)}>
-                          Latest events
-                        </Button>
-                      )}
-                      {events.data?.next_cursor && (
-                        <Button variant="outline" size="sm" onClick={() => setEventCursor(events.data?.next_cursor)}>
-                          Older events
-                        </Button>
-                      )}
-                    </div>
+                    <CursorPagination
+                      hasPrevious={eventCursors.length > 0}
+                      hasNext={Boolean(events.data?.next_cursor)}
+                      onPrevious={() => setEventCursors((cursors) => cursors.slice(0, -1))}
+                      onNext={() => {
+                        const next = events.data?.next_cursor
+                        if (next) setEventCursors((cursors) => [...cursors, next])
+                      }}
+                    />
                   </div>
                 </ScrollArea>
               </TabsContent>

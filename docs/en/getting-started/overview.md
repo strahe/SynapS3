@@ -15,7 +15,7 @@ S3 clients need an endpoint, credentials, and bucket/object operations. Filecoin
 
 - Accepts common S3 bucket, object, versioning, and multipart requests.
 - Persists object data and metadata locally before returning write success.
-- Uses background tasks to complete the initial target copies, retry failed work, and safely evict cache.
+- Uses background tasks to complete the initial target replicas, retry failed work, and safely evict cache.
 - Shows buckets, tasks, wallet operations, topology, settings, and health in the dashboard and Admin API.
 
 ## Architecture
@@ -23,9 +23,9 @@ S3 clients need an endpoint, credentials, and bucket/object operations. Filecoin
 <img class="architecture-overview architecture-overview--light" src="/architecture-overview-light.svg" alt="SynapS3 architecture">
 <img class="architecture-overview architecture-overview--dark" src="/architecture-overview.svg" alt="SynapS3 architecture">
 
-A successful S3 write means the object is durable in local cache and its metadata has been recorded. Reads use local cache first; on a cache miss, SynapS3 can fetch an available remote copy. After the S3 response, background tasks complete the initial target copies, retry failures, and clean cache when the configured policy allows it.
+A successful S3 write means the object is durable in local cache and its metadata has been recorded. Reads use local cache first; on a cache miss, SynapS3 can fetch an available replica. After the S3 response, background tasks complete the initial target replicas, retry failures, and clean cache when the configured policy allows it.
 
-Repairing copies affected by a storage provider becoming unavailable is a separate product capability that is coming soon. See [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
+Repairing replicas affected by a storage provider becoming unavailable is a separate product capability that is coming soon. See [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
 
 SynapS3 supports single-node deployments. The cache disk and database are runtime data; do not treat them as scratch storage.
 

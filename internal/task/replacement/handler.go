@@ -122,7 +122,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			return h.retryReplacement(execution, input.ReplacementID, err, "replacement_authorization_failed")
 		}
 		if row.Status == storagereplacement.StatusSuperseded {
-			return h.scheduleReplacementRetirement(input, execution.ID(), row, row.TargetDataSetID, "Unused storage service cleanup scheduled")
+			return h.scheduleReplacementRetirement(input, execution.ID(), row, row.TargetDataSetID, "Unused data set cleanup scheduled")
 		}
 		if row.Status == storagereplacement.StatusCompleted {
 			return taskengine.Complete("Provider replacement completed", func(ctx context.Context, repos *repository.Repositories) error {
@@ -189,17 +189,17 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 					})
 			}
 			if target.Status == model.StorageDataSetStatusFailed {
-				return h.failReplacement(row.ID, errors.New("replacement target storage service failed"), "replacement_target_failed")
+				return h.failReplacement(row.ID, errors.New("replacement target data set failed"), "replacement_target_failed")
 			}
 			if target.EnsureTaskID == nil {
-				return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "target", "Preparing replacement storage service", func(ctx context.Context, repos *repository.Repositories) error {
+				return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "target", "Preparing replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 					if err := h.enqueueDataSetEnsure(ctx, repos, target); err != nil {
 						return err
 					}
 					return repos.Replacements.MarkWaiting(ctx, row.ID, storagereplacement.WaitReasonTargetCreating)
 				})
 			}
-			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "target", "Waiting for replacement storage service", func(ctx context.Context, repos *repository.Repositories) error {
+			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "target", "Waiting for replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.MarkWaiting(ctx, row.ID, storagereplacement.WaitReasonTargetCreating)
 			})
 		}
@@ -214,7 +214,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 					return h.waitForSourceWrites(ctx, execution, row, incomplete)
 				}
 			}
-			return taskengine.Wait(model.TaskResumeModeRecover, 0, "activation", "Activating replacement storage service", func(ctx context.Context, repos *repository.Repositories) error {
+			return taskengine.Wait(model.TaskResumeModeRecover, 0, "activation", "Activating replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 				if err := repos.Replacements.Activate(ctx, row.ID, input.Generation, execution.ID()); err != nil {
 					return err
 				}
@@ -256,7 +256,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 				return repos.Replacements.CompleteWithoutRemoteSource(ctx, row.ID, input.Generation, execution.ID())
 			})
 		}
-		return h.scheduleReplacementRetirement(input, execution.ID(), row, row.SourceDataSetID, "Old storage service retirement scheduled")
+		return h.scheduleReplacementRetirement(input, execution.ID(), row, row.SourceDataSetID, "Old data set retirement scheduled")
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }

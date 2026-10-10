@@ -140,7 +140,7 @@ function SubjectSession({
     content = (
       <div className="flex min-w-0 flex-col gap-2">
         {type === 'storage_commit_request' && (
-          <CopyableValue label="Registration ID" value={subjectKey} monospace maxLength={24} />
+          <CopyableValue label="Batch ID" value={subjectKey} monospace maxLength={24} />
         )}
         <dl className="flex min-w-0 flex-col gap-2">
           {taskSubjectFields(query.data).map((field) => (

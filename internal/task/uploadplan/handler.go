@@ -128,7 +128,7 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 			return taskengine.Fail(repository.ErrNotFound, "upload_bucket_missing", nil)
 		}
 		if upload.AcceptedAt != nil {
-			return taskengine.Complete("Storage copies are ready", nil)
+			return taskengine.Complete("Replicas are ready", nil)
 		}
 
 		plan, err := h.deps.Selector.SelectBucketBindings(ctx, bucket, model.ClampStorageCopies(upload.RequestedCopies))

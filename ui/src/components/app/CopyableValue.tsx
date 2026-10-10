@@ -82,3 +82,28 @@ export function CopyableValue({
     </span>
   )
 }
+
+/** A copyable monospace identifier, or an em dash when there is none. */
+export function OptionalCopyableValue({
+  label,
+  value,
+  linkHref,
+  maxLength = 24,
+}: {
+  label: string
+  value?: string | null
+  linkHref?: string
+  maxLength?: number
+}) {
+  if (!value || value === '—') return <span className="font-mono text-xs">—</span>
+  return (
+    <CopyableValue
+      label={label}
+      value={value}
+      monospace
+      maxLength={maxLength}
+      linkHref={linkHref}
+      external={Boolean(linkHref)}
+    />
+  )
+}

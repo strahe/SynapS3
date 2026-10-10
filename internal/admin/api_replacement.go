@@ -30,7 +30,7 @@ type providerReplacementSelector interface {
 }
 
 // WithProviderReplacement enables the provider replacement endpoints. Without it
-// they report that the storage service is unavailable.
+// they report that Filecoin storage is unavailable.
 func (s *Server) WithProviderReplacement(selector providerReplacementSelector) *Server {
 	s.replacementSelector = selector
 	return s
@@ -333,7 +333,7 @@ func (s *Server) checkReplacementRefusal(ctx context.Context, bucket *model.Buck
 	}
 	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, evidence.ClientDataSetID.SDK())
 	if err != nil {
-		return nil, &storagereplacement.SourceOutcomeError{Message: "Could not check the original storage service. Try again when the network is available."}
+		return nil, &storagereplacement.SourceOutcomeError{Message: "Could not check the original data set. Try again when the network is available."}
 	}
 	if !found {
 		verified := *evidence
@@ -360,9 +360,9 @@ func (s *Server) checkReplacementRefusal(ctx context.Context, bucket *model.Buck
 		return nil, err
 	}
 	if binding.ID == check.Source.ID {
-		return nil, &storagereplacement.SourceOutcomeError{Message: "The original storage service was found. Refresh and review the replacement again."}
+		return nil, &storagereplacement.SourceOutcomeError{Message: "The original data set was found. Refresh and review the replacement again."}
 	}
-	return nil, &storagereplacement.SourceOutcomeError{Message: "The previous provider's storage service was found. Retry its replacement to continue."}
+	return nil, &storagereplacement.SourceOutcomeError{Message: "The previous provider's data set was found. Retry its replacement to continue."}
 }
 
 func (s *Server) writeReplacementReplay(w http.ResponseWriter, ctx context.Context, bucket *model.Bucket, dataSetID int64, req startReplacementRequest, mode storagereplacement.SelectionMode) bool {
@@ -538,7 +538,7 @@ func (s *Server) replacementProviderCandidatesFor(
 }
 
 var (
-	errReplacementUnavailable   = errors.New("storage service is unavailable")
+	errReplacementUnavailable   = errors.New("filecoin storage is unavailable")
 	errApprovalCheckUnavailable = errors.New("provider requirement check is unavailable")
 )
 
@@ -559,7 +559,7 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 		s.logger.Warn("api: provider requirement check failed", "error", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Could not confirm the provider requirement. Try again.", "code": "approval_check_unavailable"})
 	case errors.Is(err, errReplacementUnavailable):
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage service is unavailable"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Filecoin storage is unavailable"})
 	case errors.Is(err, storagereplacement.ErrInvalidTarget):
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "choose a different provider for this replica",
@@ -576,7 +576,7 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 		})
 	case errors.Is(err, storagereplacement.ErrTargetCreating):
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "the earlier replacement of this replica is still setting up its storage service",
+			"error": "the earlier replacement of this replica is still setting up its data set",
 			"code":  code,
 		})
 	case errors.Is(err, storagereplacement.ErrTargetInUse):

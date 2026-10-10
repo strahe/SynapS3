@@ -134,7 +134,7 @@ synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
 ```
 
-API 会标明每个失败任务是否可使用 Retry。存储提供方替换从 **Details** → **Storage** → **Data Sets** 恢复。尚未发出广播、或因内部错误停止的钱包操作可以从 Tasks 恢复；只有从未广播过的交易才会被发出，广播结果不确定时仍不可重试。Store 失败时可使用 **Retry**；它先检查提供方，确认分片缺失才重新上传。远端副本删除超过 24 小时仍无法确认时，**Retry** 会先检查链上状态；若副本仍存在且未排队删除，可能再次提交付费请求，而先前的请求仍可能成功。若数据集在链上不再活跃，链上无法据此确认这份副本已删除，任务会继续核查，不会将其记为已删除。只有在核对失败结果后才使用 **Acknowledge** 或 `synaps3 admin task acknowledge <id>`；确认不改变失败结果，任务历史默认永久保存。失败任务积压时，在任务页选择 **Work** 和 **Failed** 后使用 **Acknowledge all**；操作类型筛选可进一步缩小处理范围，命令行对应 `synaps3 admin task acknowledge --type <操作> --yes`；在你确认之后才记录的失败仍会留在列表里。
+API 会标明每个失败任务是否可使用 Retry。存储提供方替换从存储桶的 **Storage** 标签页恢复。尚未发出广播、或因内部错误停止的钱包操作可以从 Tasks 恢复；只有从未广播过的交易才会被发出，广播结果不确定时仍不可重试。**Upload data** 任务失败时可使用 **Retry**；它先检查提供方，确认分片缺失才重新上传。远端副本删除超过 24 小时仍无法确认时，**Retry** 会先检查链上状态；若副本仍存在且未排队删除，可能再次提交付费请求，而先前的请求仍可能成功。若数据集在链上不再活跃，链上无法据此确认这份副本已删除，任务会继续核查，不会将其记为已删除。只有在核对失败结果后才使用 **Acknowledge** 或 `synaps3 admin task acknowledge <id>`；确认不改变失败结果，任务历史默认永久保存。失败任务积压时，在任务页选择 **Open** 和 **Failed** 后使用 **Acknowledge all**；操作类型筛选可进一步缩小处理范围，命令行对应 `synaps3 admin task acknowledge --type <操作> --yes`；在你确认之后才记录的失败仍会留在列表里。
 
 失败副本可从 **Tasks** 或对象的 **Provenance → Replicas** 表使用 **Retry**。它会创建新的恢复任务，并保留该副本此前的失败记录。Provenance 中显示 **Stored** 才表示恢复完成。确认的副本同步失败会在本地缓存可用时自动重新上传；否则恢复需要可读的远端副本或本地缓存。操作不可用时，按副本旁显示的原因处理。
 
@@ -152,7 +152,7 @@ curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 恢复方式：
 
 - 恢复配置中的 `filecoin.rpc_url`。
-- 确认 SynapS3 主机能访问存储提供方 URL。**Storage Topology** 中的存储提供方详情会显示最近一次健康检查失败的原因。
+- 确认 SynapS3 主机能访问存储提供方 URL。**Storage topology** 中的存储提供方详情会显示最近一次健康检查失败的原因。
 - 除非明确需要并信任私有存储提供方 URL，否则保持 `filecoin.allow_private_networks = false`。
 
 ## S3 客户端无法上传

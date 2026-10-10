@@ -112,7 +112,7 @@ export function collectSettingsRiskChanges(
     initial.filecoin.default_copies,
     next.filecoin.default_copies,
     'medium',
-    'Changes the default Filecoin copy count for buckets without an explicit policy.'
+    'Changes the default Filecoin replica target for buckets without their own replica policy.'
   )
 
   addChanged('cache.dir', initial.cache.dir, next.cache.dir, 'medium', 'Changes where cached object data is stored.')

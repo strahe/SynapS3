@@ -51,7 +51,7 @@ func copyTaskKey(taskType model.TaskType, copyID, generation int64) string {
 
 func waitForCommitBacklog() taskengine.Result {
 	return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "commit_backlog",
-		"Waiting for earlier transfers to this storage service to be registered", nil)
+		"Waiting for earlier transfers to this data set to be submitted", nil)
 }
 
 func validateStoreCheckpoint(checkpoint storeCheckpoint, contentSize int64) error {

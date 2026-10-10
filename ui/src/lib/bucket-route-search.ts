@@ -1,7 +1,12 @@
+export const bucketTabs = ['objects', 'trash', 'storage', 'settings'] as const
+export type BucketTab = (typeof bucketTabs)[number]
+
 export type BucketRouteSearch = {
+  tab?: BucketTab
   prefix?: string
   marker?: string
-  version_marker?: string
+  /** Shows the Storage tab's affected-versions view instead of its data sets. */
+  risk?: true
   risk_prefix?: string
   risk_dataset?: string
   risk_key?: string
@@ -9,15 +14,21 @@ export type BucketRouteSearch = {
   risk_version_marker?: string
   risk_created_at_marker?: string
   risk_stale_before?: string
-  view?: 'objects' | 'deleted' | 'storage-risk'
-  details?: 'storage'
 }
 
 export function normalizeBucketRouteSearch(search: Record<string, unknown>): BucketRouteSearch {
+  // Links written before the bucket page had tabs used `view` and `details`.
+  const legacyRisk = search.view === 'storage-risk'
+  const legacyTab: BucketTab | undefined =
+    search.view === 'deleted' ? 'trash' : legacyRisk || search.details === 'storage' ? 'storage' : undefined
+  const tab = bucketTabs.find((candidate) => candidate === search.tab) ?? legacyTab
+  const risk = tab === 'storage' && (search.risk === true || search.risk === 'true' || legacyRisk) ? true : undefined
+
   return {
+    tab: tab === 'objects' ? undefined : tab,
     prefix: normalizePrefixSearch(search.prefix),
     marker: normalizeSearchString(search.marker),
-    version_marker: normalizeSearchString(search.version_marker),
+    risk,
     risk_prefix: normalizeSearchString(search.risk_prefix),
     risk_dataset: normalizePositiveIntegerSearch(search.risk_dataset),
     risk_key: normalizeSearchString(search.risk_key),
@@ -25,8 +36,6 @@ export function normalizeBucketRouteSearch(search: Record<string, unknown>): Buc
     risk_version_marker: normalizeSearchString(search.risk_version_marker),
     risk_created_at_marker: normalizeSearchString(search.risk_created_at_marker),
     risk_stale_before: normalizeSearchString(search.risk_stale_before),
-    view: search.view === 'deleted' || search.view === 'storage-risk' ? search.view : undefined,
-    details: search.details === 'storage' ? 'storage' : undefined,
   }
 }
 

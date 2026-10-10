@@ -1,13 +1,22 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, X } from 'lucide-react'
+import { Check, CheckCheck, ListTodo, Loader2 } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
 
 import { api, type TaskItem, type TaskScope } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { CursorPagination } from '@/components/app/CursorPagination'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
-import { PageErrorState } from '@/components/app/PageErrorState'
-import { PageHeader } from '@/components/app/PageHeader'
+import {
+  clickableRowProps,
+  DataTableFrame,
+  RowDetailsButton,
+  TableSkeleton,
+  tableHeaderRowClassName,
+} from '@/components/app/DataTable'
+import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
+import { EmptyState, PageError } from '@/components/app/PageState'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
@@ -15,11 +24,8 @@ import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog'
 import { TaskSubject } from '@/components/tasks/TaskSubject'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Label } from '@/components/ui/label'
-import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -136,7 +142,14 @@ function TasksPage() {
     queryClient.invalidateQueries({ queryKey: ['taskStats'] })
   }
   const retry = useRetryTask()
-  const acknowledge = useMutation({ mutationFn: api.acknowledgeTask, onSuccess: refreshTasks })
+  const [detailTaskID, setDetailTaskID] = useState<number | null>(null)
+  const acknowledge = useMutation({
+    mutationFn: api.acknowledgeTask,
+    onSuccess: (_, id) => {
+      toast.success(`Task ${id} acknowledged`)
+      refreshTasks()
+    },
+  })
   const previewAcknowledgeAll = useMutation({
     mutationFn: api.previewAcknowledgeTasks,
     onSuccess: (preview, variables) => setAcknowledgeAllScope({ ...preview, type: variables.type }),
@@ -144,6 +157,8 @@ function TasksPage() {
   const acknowledgeAll = useMutation({
     mutationFn: api.acknowledgeTasks,
     onSuccess: () => {
+      const count = acknowledgeAllScope?.count ?? 0
+      toast.success(count === 1 ? '1 failed task acknowledged' : `${count} failed tasks acknowledged`)
       setAcknowledgeAllScope(null)
       refreshTasks()
     },
@@ -178,16 +193,13 @@ function TasksPage() {
     setCursor(previous)
   }
 
-  if (tasks.error) {
-    return <PageErrorState title="Unable to load tasks" description={errorMessage(tasks.error)} />
-  }
-
   return (
     <div className="flex flex-col gap-6 p-6">
       <PageHeader
         title="Tasks"
         actions={
-          <div className="flex items-center gap-2">
+          <>
+            <RefreshButton onClick={() => tasks.refetch()} refreshing={tasks.isFetching} />
             {scope === 'work' && status === 'failed' && (
               <Button
                 variant="outline"
@@ -198,15 +210,11 @@ function TasksPage() {
                   previewAcknowledgeAll.mutate({ type: search.type })
                 }}
               >
-                <X data-icon="inline-start" />
+                <CheckCheck data-icon="inline-start" />
                 Acknowledge all
               </Button>
             )}
-            <Button variant="outline" size="sm" onClick={() => tasks.refetch()} disabled={tasks.isFetching}>
-              <RefreshCw data-icon="inline-start" className={tasks.isFetching ? 'animate-spin' : undefined} />
-              Refresh
-            </Button>
-          </div>
+          </>
         }
       />
 
@@ -217,8 +225,8 @@ function TasksPage() {
       >
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <TabsList aria-label="Tasks" className="max-w-full justify-start overflow-x-auto">
-            <TabsTrigger value="work">Work</TabsTrigger>
-            <TabsTrigger value="history">History</TabsTrigger>
+            <TabsTrigger value="work">Open</TabsTrigger>
+            <TabsTrigger value="history">Closed</TabsTrigger>
           </TabsList>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <div className="flex items-center gap-2">
@@ -283,56 +291,54 @@ function TasksPage() {
             </Alert>
           )}
 
-          {tasks.isLoading ? (
-            <TaskTableSkeleton />
+          {tasks.error ? (
+            <PageError
+              title="Failed to load tasks"
+              description={errorMessage(tasks.error)}
+              onRetry={() => tasks.refetch()}
+              retrying={tasks.isFetching}
+            />
+          ) : tasks.isLoading ? (
+            <TableSkeleton />
           ) : tasks.data?.tasks.length ? (
             <>
               <TaskTable
                 tasks={tasks.data.tasks}
                 retryingID={retry.isPending ? retry.variables : undefined}
                 acknowledgingID={acknowledge.isPending ? acknowledge.variables : undefined}
+                onOpen={setDetailTaskID}
                 onRetry={(id) => {
                   acknowledge.reset()
-                  retry.mutate(id)
+                  retry.mutate(id, { onSuccess: () => toast.success(`Retry started for task ${id}`) })
                 }}
                 onAcknowledge={(id) => {
                   retry.reset()
                   acknowledge.mutate(id)
                 }}
               />
-              {(cursorHistory.length > 0 || tasks.data.next_cursor) && (
-                <Pagination>
-                  <PaginationContent>
-                    <PaginationItem>
-                      <Button variant="outline" size="sm" onClick={previousPage} disabled={cursorHistory.length === 0}>
-                        <ChevronLeft data-icon="inline-start" />
-                        Previous
-                      </Button>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <Button variant="outline" size="sm" onClick={nextPage} disabled={!tasks.data.next_cursor}>
-                        Next
-                        <ChevronRight data-icon="inline-end" />
-                      </Button>
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
-              )}
+              <CursorPagination
+                hasPrevious={cursorHistory.length > 0}
+                hasNext={Boolean(tasks.data.next_cursor)}
+                onPrevious={previousPage}
+                onNext={nextPage}
+              />
             </>
           ) : (
-            <Empty>
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <ListTodo />
-                </EmptyMedia>
-                <EmptyTitle>No tasks found</EmptyTitle>
-                <EmptyDescription>Try another operation or status filter.</EmptyDescription>
-              </EmptyHeader>
-            </Empty>
+            <EmptyState
+              icon={<ListTodo />}
+              title="No tasks found"
+              description="Try another operation or status filter."
+            />
           )}
         </TabsContent>
       </Tabs>
 
+      <TaskDetailsDialog
+        taskID={detailTaskID}
+        onOpenChange={(open) => {
+          if (!open) setDetailTaskID(null)
+        }}
+      />
       <DangerActionAlertDialog
         open={acknowledgeAllScope !== null}
         onOpenChange={(open) => {
@@ -366,27 +372,29 @@ function acknowledgeAllDescription(count: number, operation?: string) {
   const scope = label ? ` for ${label}` : ''
   if (count === 0) return `No failed tasks${scope} are left to acknowledge.`
   const tasks = count === 1 ? '1 failed task' : `${count} failed tasks`
-  return `${tasks}${scope} will move to History. Their results and Retry availability remain unchanged.`
+  return `${tasks}${scope} will move to Closed. Their results and Retry availability remain unchanged.`
 }
 
 function TaskTable({
   tasks,
   retryingID,
   acknowledgingID,
+  onOpen,
   onRetry,
   onAcknowledge,
 }: {
   tasks: TaskItem[]
   retryingID?: number
   acknowledgingID?: number
+  onOpen: (id: number) => void
   onRetry: (id: number) => void
   onAcknowledge: (id: number) => void
 }) {
   return (
-    <div className="overflow-hidden rounded-lg border border-border">
-      <Table>
+    <DataTableFrame>
+      <Table className="min-w-[1080px]">
         <TableHeader>
-          <TableRow className="bg-muted/50">
+          <TableRow className={tableHeaderRowClassName}>
             <TableHead className="w-20 px-4">ID</TableHead>
             <TableHead className="px-4">Operation</TableHead>
             <TableHead className="px-4">Status</TableHead>
@@ -395,7 +403,9 @@ function TaskTable({
             <TableHead className="w-20 px-4">
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <button type="button">Took</button>
+                  <button type="button" className="cursor-help underline decoration-dotted underline-offset-4">
+                    Took
+                  </button>
                 </TooltipTrigger>
                 <TooltipContent className="max-w-72">
                   Time from start to finish, including later waits, retries, and recovery.
@@ -403,15 +413,15 @@ function TaskTable({
               </Tooltip>
             </TableHead>
             <TableHead className="min-w-64 px-4">Details</TableHead>
-            <TableHead className="px-4 text-right">Actions</TableHead>
+            <TableHead className="px-4 text-right">
+              <span className="sr-only">Actions</span>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {tasks.map((task) => (
-            <TableRow key={task.id}>
-              <TableCell className="px-4">
-                <CopyableValue value={String(task.id)} label="Task ID" monospace />
-              </TableCell>
+            <TableRow key={task.id} {...clickableRowProps(() => onOpen(task.id))}>
+              <TableCell className="px-4 font-mono text-xs tabular-nums">{task.id}</TableCell>
               <TableCell className="px-4 font-medium">{task.operation}</TableCell>
               <TableCell className="px-4">
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -437,8 +447,7 @@ function TaskTable({
                 <TaskDetails task={task} />
               </TableCell>
               <TableCell className="px-4">
-                <div className="flex justify-end gap-2">
-                  <TaskDetailsDialog taskID={task.id} />
+                <div className="flex items-center justify-end gap-2">
                   {task.retryable && (
                     <RetryButton
                       taskID={task.retry_task_id}
@@ -457,18 +466,19 @@ function TaskTable({
                       {acknowledgingID === task.id ? (
                         <Loader2 data-icon="inline-start" className="animate-spin" />
                       ) : (
-                        <X data-icon="inline-start" />
+                        <Check data-icon="inline-start" />
                       )}
                       Acknowledge
                     </Button>
                   )}
+                  <RowDetailsButton label={`task ${task.id}`} onClick={() => onOpen(task.id)} />
                 </div>
               </TableCell>
             </TableRow>
           ))}
         </TableBody>
       </Table>
-    </div>
+    </DataTableFrame>
   )
 }
 
@@ -497,7 +507,7 @@ function TaskDetails({ task }: { task: TaskItem }) {
             />
           )}
           <details className="text-sm">
-            <summary className="cursor-pointer text-muted-foreground">Confirmation details</summary>
+            <summary className="cursor-pointer text-muted-foreground">Batch details</summary>
             <div className="mt-2">
               <StorageConfirmationDetails confirmation={confirmation} />
             </div>
@@ -557,18 +567,6 @@ function TaskCreatedTime({ task }: { task: TaskItem }) {
 function taskRetriesLabel(task: TaskItem) {
   if (task.max_attempts != null) return `${task.retry_count}/${task.max_attempts - 1} retries`
   return task.retry_count === 1 ? '1 retry' : `${task.retry_count} retries`
-}
-
-function TaskTableSkeleton() {
-  return (
-    <div className="rounded-lg border p-4">
-      <div className="flex flex-col gap-3">
-        {['first', 'second', 'third', 'fourth', 'fifth', 'sixth'].map((row) => (
-          <Skeleton key={row} className="h-10 w-full" />
-        ))}
-      </div>
-    </div>
-  )
 }
 
 function errorMessage(error: unknown) {
