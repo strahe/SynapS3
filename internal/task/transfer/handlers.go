@@ -104,7 +104,7 @@ func NewStoreHandler(deps StoreDependencies) (*StoreHandler, error) {
 		deps.CommitMaxBacklog = config.DefaultCommitMaxBacklog
 	}
 	if deps.CommitMaxBacklog < 1 {
-		return nil, errors.New("storage registration backlog must be positive")
+		return nil, errors.New("batch backlog must be positive")
 	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -136,7 +136,7 @@ func NewPullHandler(deps PullDependencies) (*PullHandler, error) {
 		deps.CommitMaxBacklog = config.DefaultCommitMaxBacklog
 	}
 	if deps.CommitMaxBacklog < 1 {
-		return nil, errors.New("storage registration backlog must be positive")
+		return nil, errors.New("batch backlog must be positive")
 	}
 	h := &PullHandler{CopyCoordinator: deps.Coordinator, deps: deps}
 	h.FuncHandler = h.pullHandler()

@@ -321,14 +321,14 @@ func (heldAcknowledgeTaskRepo) AcknowledgeFailed(context.Context, int64) error {
 	return repository.ErrConflict
 }
 
-// A stopped Confirm storage task carries the confirmation it holds and offers
+// A stopped Submit batch task carries the confirmation it holds and offers
 // Retry instead of a dismissal, which is refused.
 func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	fixture := newAdminTaskFixture(t)
 	stopped := fixture.enqueue(t, model.TaskTypeStorageCommit, "stopped-commit", time.Now(), "", "")
 	fixture.transition(t, stopped.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: new("submission_mismatch"), LastError: new("storage registration requires attention"),
+		FailureReason: new("submission_mismatch"), LastError: new("batch requires attention"),
 	})
 	now := time.Date(2026, 9, 30, 19, 53, 39, 0, time.UTC)
 	fixture.repos.Contents = &commitAttentionTaskRepo{StorageContentRepository: fixture.repos.Contents, records: []storagecommit.AttentionRecord{{

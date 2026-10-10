@@ -84,7 +84,7 @@ function ProviderTopologyLink({
 
 function ProviderIdentityDetails({ providerID, identity }: { providerID?: string; identity: ProviderIdentity }) {
   const allFields: Array<[string, string | undefined]> = [
-    ['Registry Provider ID', identity.registry_provider_id || providerID],
+    ['Registry provider ID', identity.registry_provider_id || providerID],
     ['Actor ID', identity.filecoin_actor_id],
     ['Filecoin address', identity.filecoin_address],
     ['EVM service provider', identity.service_provider_address],

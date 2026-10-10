@@ -9,7 +9,7 @@ export function formatBytes(bytes: number): string {
   if (bytes < 0) return '—'
   if (bytes === 0) return '0 B'
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1)
   return `${parseFloat((bytes / k ** i).toFixed(1))} ${sizes[i]}`
 }
@@ -20,13 +20,11 @@ export function formatNumber(n: number): string {
   return n.toString()
 }
 
-export function titleCaseEnum(value?: string | null): string {
+/** Displays an enum value in sentence case: `create_failed` becomes "Create failed". */
+export function enumLabel(value?: string | null): string {
   if (!value) return ''
-  return value
-    .split('_')
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ')
+  const text = value.split('_').filter(Boolean).join(' ').toLowerCase()
+  return text.charAt(0).toUpperCase() + text.slice(1)
 }
 
 export function formatDuration(seconds: number): string {

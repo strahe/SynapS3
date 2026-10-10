@@ -51,7 +51,7 @@ Back up the database with `pg_dump` or the deployment's approved database snapsh
 
 SynapS3 leaves an incompatible database unchanged.
 
-Starting with an empty database does not import existing buckets, objects, users, storage data sets, wallet operations, provider replacements, or tasks. Existing paid remote storage services remain active. Keep the verified backup so those services and records can be reviewed and handled separately.
+Starting with an empty database does not import existing buckets, objects, users, storage data sets, wallet operations, provider replacements, or tasks. Existing paid remote data sets remain active. Keep the verified backup so those data sets and records can be reviewed and handled separately.
 
 Do not run the preserved installation and its replacement against the same database, cache, wallet workflow, or S3 traffic. After starting the replacement, create an S3 user and test bucket, then write and read a test object before restoring normal traffic.
 
@@ -60,12 +60,12 @@ Do not run the preserved installation and its replacement against the same datab
 After a restart, unfinished work becomes eligible to continue automatically.
 
 - Use **Retry** for a stopped task. The task list shows whether its result permits retry; opening details checks the current conditions. If another operation has taken over or recovery is unsafe, Retry explains why and refreshes the list.
-- Recover provider replacements from **Details** → **Storage** → **Data Sets**.
+- Recover provider replacements from the bucket's **Storage** tab.
 - A storage transfer task that stopped because of an internal error stays retryable. Retry checks what the earlier attempt already did before continuing. If the error came from a version that cannot run the task, install a compatible version first.
 - A wallet operation can be retried from Tasks when no broadcast started, or when it stopped because of an internal error. Retry checks the operation first: it sends the transaction only if none was ever broadcast, and otherwise checks the transaction already sent. If a broadcast may have gone out without a recorded transaction, the operation is marked unknown and cannot be retried.
 - **Retry** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
-- Acknowledgement moves a failure to History; use `scope=history&status=failed` to view it.
-- Storage registration recovery preserves the signed request and checks the chain before resubmitting. Missing pieces are transferred again when safe. Provider errors and failed transfers use a finite budget. If registration was conclusively refused and the chain confirms it did not land, the remaining pieces can continue when one cannot be recovered. When recovery stops, confirmation retains the saved evidence. Find it in **Tasks** (Confirm storage, Failed) or with `synaps3 admin storage-confirmation list`, restore its dependencies, and use **Retry**. An accepted request with conflicting chain evidence remains stopped for review.
+- Acknowledgement moves a failure to **Closed**; use `scope=history&status=failed` to view it.
+- Batch recovery preserves the signed request and checks the chain before resubmitting. Missing pieces are transferred again when safe. Provider errors and failed transfers use a finite budget. If a batch was conclusively refused and the chain confirms it did not land, the remaining pieces can continue when one cannot be recovered. When recovery stops, the batch keeps the saved evidence. Find it in **Tasks** (Submit batch, Failed) or with `synaps3 admin storage-confirmation list`, restore its dependencies, and use **Retry**. An accepted request with conflicting chain evidence remains stopped for review.
 - A provider with a full Pull queue is tried again after its requested delay without using the retry budget. Other failures use up to 12 opportunities in new or manually retried Pull rounds; existing rounds keep their original policy.
 
 Useful commands:
@@ -88,8 +88,8 @@ Restore failed dependencies before retrying work. Use the dashboard, Admin API, 
 | Storage provider or RPC is temporarily unavailable | Restore connectivity. Waiting work resumes automatically; retry only failed tasks marked retryable. |
 | Database full | Stop traffic, free space or scale the database, then verify health. |
 | Cache disk full | Increase disk or `cache.max_size_gb`, or restore remote storage and cache-cleanup progress. |
-| Provider must be evacuated | Open the bucket and use **Details** → **Storage** → **Data Sets**. Do not retry the replacement from Tasks. |
-| Process crash | Restart SynapS3, verify health and task statistics, then recover any stopped storage confirmation and review any wallet outcome. |
+| Provider must be evacuated | Open the bucket's **Storage** tab and replace the provider from **Data sets**. Do not retry the replacement from Tasks. |
+| Process crash | Restart SynapS3, verify health and task statistics, then retry any stopped batch and review any wallet outcome. |
 | Startup reports an incompatible database | Stop the process, verify that the configured database is the intended one, and preserve it unchanged before using an empty replacement database. |
 
 ## Restore or Roll Back

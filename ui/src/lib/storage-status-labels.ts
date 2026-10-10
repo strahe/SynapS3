@@ -1,6 +1,6 @@
 import type { ObjectState, ObjectStatus } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
-import { titleCaseEnum } from './utils.ts'
+import { enumLabel } from './utils.ts'
 
 export function taskReplicaLabel(task: { copy_index?: number; copyIndex?: number }) {
   const copyIndex = task.copy_index ?? task.copyIndex
@@ -29,7 +29,7 @@ export function storageCleanupCopyStatusLabel(status?: string) {
     case 'unsupported':
       return 'Unsupported'
     default:
-      return titleCaseEnum(status) || 'Unknown'
+      return enumLabel(status) || 'Unknown'
   }
 }
 
@@ -92,7 +92,7 @@ export function objectStateLabel(
     case 'uploading':
       return progressPercent === null ? 'Uploading' : `Uploading to Filecoin ${progressPercent}%`
     case 'committing':
-      return 'Registering storage record on-chain'
+      return 'Submitting to Filecoin'
     case 'replicating':
       return 'Syncing replicas'
     case 'stored':

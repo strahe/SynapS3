@@ -1,21 +1,20 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, Save } from 'lucide-react'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, Save, Undo2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import type {
   FilecoinReadinessData,
   SettingsData,
   SettingsEditableConfig,
   SettingsFieldError,
   SettingsFieldMetadata,
-  SettingsS3Credentials,
   SettingsUpdatePayload,
 } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
-import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
+import { PageError, PageLoading } from '@/components/app/PageState'
 import { StatusBadge } from '@/components/app/StatusBadge'
-import { S3SettingsPanel } from '@/components/settings/S3SettingsPanel'
 import {
   SettingsBanner as Banner,
   SettingsFieldShell as FieldShell,
@@ -24,21 +23,12 @@ import {
   SettingsReadOnlyField,
   SettingsSelect,
   SettingsStatusField,
-  SettingsValueField,
 } from '@/components/settings/settings-form'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useFilecoinPreflight, useSettings, useUpdateSettings, useValidateSettings } from '@/hooks/queries'
+import { settingsOptions } from '@/lib/display-labels'
 import {
   buildFilecoinPreflightPayload,
   filecoinPreflightPayloadKey,
@@ -65,19 +55,24 @@ import {
   settingsValidationPayloadKey,
 } from '@/lib/settings-validation'
 
+type SettingsTab = keyof typeof tabFields
+
 export const Route = createFileRoute('/settings')({
+  validateSearch: (search: Record<string, unknown>): { tab?: SettingsTab } => ({
+    tab: typeof search.tab === 'string' && search.tab in tabFields ? (search.tab as SettingsTab) : undefined,
+  }),
   component: SettingsPage,
 })
 
 const tabFields = {
-  s3: ['s3.region'],
-  server: [
+  's3-api': [
     'server.port',
     'server.max_connections',
     'server.max_requests',
     'server.tls.enabled',
     'server.tls.cert_file',
     'server.tls.key_file',
+    's3.region',
   ],
   filecoin: [
     'filecoin.network',
@@ -113,14 +108,16 @@ const tabFields = {
 } as const
 
 function SettingsPage() {
-  const { data, isLoading, error } = useSettings()
+  const search = Route.useSearch()
+  const navigate = useNavigate()
+  const tab = search.tab ?? 's3-api'
+  const { data, isLoading, error, refetch, isFetching } = useSettings()
   const updateSettings = useUpdateSettings()
   const validateSettings = useValidateSettings()
   const filecoinPreflight = useFilecoinPreflight()
   const [form, setForm] = useState<SettingsEditableConfig | null>(null)
   const [draftValidation, setDraftValidation] = useState<SettingsValidationDraft | null>(null)
   const [checkedPreflightKey, setCheckedPreflightKey] = useState<string | null>(null)
-  const [generatedCredentials, setGeneratedCredentials] = useState<SettingsS3Credentials | null>(null)
   const [preflightDetailData, setPreflightDetailData] = useState<FilecoinReadinessData | null>(null)
   const [pendingSettingsPayload, setPendingSettingsPayload] = useState<SettingsUpdatePayload | null>(null)
   const [pendingRiskChanges, setPendingRiskChanges] = useState<SettingsRiskChange[]>([])
@@ -192,19 +189,25 @@ function SettingsPage() {
     if (preflightDetailData && !preflightMatchesCurrentDraft) setPreflightDetailData(null)
   }, [preflightDetailData, preflightMatchesCurrentDraft])
 
-  if (error) {
-    return <PageErrorState title="Failed to load settings" />
-  }
-
-  if (isLoading || !data || !form) {
+  if (error || isLoading || !data || !form) {
     return (
-      <div className="flex h-full items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      <div className="flex flex-col gap-6 p-6">
+        <PageHeader title="Settings" />
+        {error ? (
+          <PageError
+            title="Failed to load settings"
+            description={error.message}
+            onRetry={() => refetch()}
+            retrying={isFetching}
+          />
+        ) : (
+          <PageLoading />
+        )}
       </div>
     )
   }
 
-  const submitDisabled = !data.writable || updateSettings.isPending
+  const submitDisabled = !data.writable || !formDirty || updateSettings.isPending
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -222,7 +225,10 @@ function SettingsPage() {
 
   function saveSettings(payload: SettingsUpdatePayload) {
     updateSettings.mutate(payload, {
-      onSuccess: (saved) => setForm(saved.config),
+      onSuccess: (saved) => {
+        setForm(saved.config)
+        toast.success('Settings saved')
+      },
     })
   }
 
@@ -233,8 +239,15 @@ function SettingsPage() {
         setForm(saved.config)
         setPendingSettingsPayload(null)
         setPendingRiskChanges([])
+        toast.success('Settings saved')
       },
     })
+  }
+
+  function discardChanges() {
+    if (!data) return
+    updateSettings.reset()
+    setForm(data.config)
   }
 
   function handleFilecoinNetworkChange(network: string) {
@@ -283,29 +296,43 @@ function SettingsPage() {
         title="Settings"
         description={<span className="break-all font-mono text-xs">{data.config_path}</span>}
         actions={
-          <Button type="submit" disabled={submitDisabled}>
-            {updateSettings.isPending ? (
-              <Loader2 data-icon="inline-start" className="animate-spin" />
-            ) : (
-              <Save data-icon="inline-start" />
+          <>
+            {formDirty && (
+              <>
+                <span className="text-sm text-muted-foreground">Unsaved changes</span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={discardChanges}
+                  disabled={updateSettings.isPending}
+                >
+                  <Undo2 data-icon="inline-start" />
+                  Discard
+                </Button>
+              </>
             )}
-            Save
-          </Button>
+            <Button type="submit" size="sm" disabled={submitDisabled}>
+              {updateSettings.isPending ? (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              ) : (
+                <Save data-icon="inline-start" />
+              )}
+              Save
+            </Button>
+          </>
         }
       />
 
       <StatusBanners data={data} mutationError={updateSettings.error ?? null} />
 
-      <Tabs defaultValue="s3" className="gap-4">
-        <TabsList className="w-full justify-start overflow-x-auto">
-          <SettingsTabTrigger
-            value="s3"
-            label="S3"
-            data={data}
-            errors={fieldErrors}
-            missing={s3Missing(activeValidationErrors)}
-          />
-          <SettingsTabTrigger value="server" label="Server" data={data} errors={fieldErrors} />
+      <Tabs
+        value={tab}
+        onValueChange={(next) => navigate({ to: '/settings', search: { tab: next as SettingsTab }, replace: true })}
+        className="gap-4"
+      >
+        <TabsList className="max-w-full justify-start overflow-x-auto">
+          <SettingsTabTrigger value="s3-api" label="S3 API" data={data} errors={fieldErrors} />
           <SettingsTabTrigger
             value="filecoin"
             label="Filecoin"
@@ -319,21 +346,19 @@ function SettingsPage() {
           <SettingsTabTrigger value="runtime" label="Runtime" data={data} errors={fieldErrors} />
         </TabsList>
 
-        <TabsContent value="s3">
-          <S3SettingsPanel
-            data={data}
-            value={form.s3}
-            errors={fieldErrors}
-            onChange={(s3) => setForm({ ...form, s3 })}
-            onCredentials={setGeneratedCredentials}
-          />
-        </TabsContent>
-
-        <TabsContent value="server">
-          <Section title="Server">
+        <TabsContent value="s3-api">
+          <Section title="S3 API">
             <div className="grid gap-4 md:grid-cols-2">
               <TextField
-                label="S3 Port"
+                label="Region"
+                field="s3.region"
+                value={form.s3.region}
+                data={data}
+                errors={fieldErrors}
+                onChange={(region) => setForm({ ...form, s3: { ...form.s3, region } })}
+              />
+              <TextField
+                label="S3 port"
                 field="server.port"
                 value={form.server.port}
                 data={data}
@@ -341,7 +366,7 @@ function SettingsPage() {
                 onChange={(value) => setForm({ ...form, server: { ...form.server, port: value } })}
               />
               <NumberField
-                label="Max Connections"
+                label="Max connections"
                 field="server.max_connections"
                 value={form.server.max_connections}
                 data={data}
@@ -349,7 +374,7 @@ function SettingsPage() {
                 onChange={(value) => setForm({ ...form, server: { ...form.server, max_connections: value } })}
               />
               <NumberField
-                label="Max Requests"
+                label="Max requests"
                 field="server.max_requests"
                 value={form.server.max_requests}
                 data={data}
@@ -357,7 +382,7 @@ function SettingsPage() {
                 onChange={(value) => setForm({ ...form, server: { ...form.server, max_requests: value } })}
               />
               <CheckboxField
-                label="TLS Enabled"
+                label="TLS enabled"
                 field="server.tls.enabled"
                 checked={form.server.tls.enabled}
                 data={data}
@@ -367,7 +392,7 @@ function SettingsPage() {
                 }
               />
               <TextField
-                label="TLS Cert File"
+                label="TLS certificate file"
                 field="server.tls.cert_file"
                 value={form.server.tls.cert_file}
                 data={data}
@@ -377,7 +402,7 @@ function SettingsPage() {
                 }
               />
               <TextField
-                label="TLS Key File"
+                label="TLS key file"
                 field="server.tls.key_file"
                 value={form.server.tls.key_file}
                 data={data}
@@ -405,7 +430,7 @@ function SettingsPage() {
                   data-icon="inline-start"
                   className={filecoinPreflight.isPending ? 'animate-spin' : undefined}
                 />
-                Check
+                Run preflight
               </Button>
             }
           >
@@ -416,12 +441,12 @@ function SettingsPage() {
               onDetails={setPreflightDetailData}
             />
             <div className="grid gap-4 md:grid-cols-2">
-              <CredentialStatusCard data={data} label="Filecoin Private Key" field={data.manual.filecoin_private_key} />
+              <CredentialStatusCard data={data} label="Filecoin private key" field={data.manual.filecoin_private_key} />
               <SelectField
                 label="Network"
                 field="filecoin.network"
                 value={form.filecoin.network}
-                options={['calibration', 'mainnet']}
+                options={settingsOptions('filecoin.network', ['calibration', 'mainnet'])}
                 data={data}
                 errors={fieldErrors}
                 onChange={handleFilecoinNetworkChange}
@@ -435,10 +460,10 @@ function SettingsPage() {
                 onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, rpc_url: value } })}
               />
               <SelectField
-                label="Provider Requirement"
+                label="Provider requirement"
                 field="filecoin.anchor_provider_tier"
                 value={form.filecoin.anchor_provider_tier}
-                options={['approved', 'endorsed', 'none']}
+                options={settingsOptions('filecoin.anchor_provider_tier', ['approved', 'endorsed', 'none'])}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => {
@@ -448,7 +473,7 @@ function SettingsPage() {
                 }}
               />
               <NumberField
-                label="Default Copies"
+                label="Default replicas"
                 field="filecoin.default_copies"
                 value={form.filecoin.default_copies}
                 data={data}
@@ -464,7 +489,7 @@ function SettingsPage() {
                 onChange={(checked) => setForm({ ...form, filecoin: { ...form.filecoin, with_cdn: checked } })}
               />
               <CheckboxField
-                label="Allow Private Networks"
+                label="Allow private networks"
                 field="filecoin.allow_private_networks"
                 checked={form.filecoin.allow_private_networks}
                 data={data}
@@ -474,7 +499,7 @@ function SettingsPage() {
                 }
               />
               <TextField
-                label="Observability Interval"
+                label="Observability interval"
                 field="filecoin.observability.interval"
                 value={form.filecoin.observability.interval}
                 data={data}
@@ -490,7 +515,7 @@ function SettingsPage() {
                 }
               />
               <TextField
-                label="Observability Timeout"
+                label="Observability timeout"
                 field="filecoin.observability.timeout"
                 value={form.filecoin.observability.timeout}
                 data={data}
@@ -506,7 +531,7 @@ function SettingsPage() {
                 }
               />
               <NumberField
-                label="Observability Concurrency"
+                label="Observability concurrency"
                 field="filecoin.observability.concurrency"
                 value={form.filecoin.observability.concurrency}
                 data={data}
@@ -537,7 +562,7 @@ function SettingsPage() {
                 onChange={(value) => setForm({ ...form, cache: { ...form.cache, dir: value } })}
               />
               <NumberField
-                label="Max Size GB"
+                label="Max cache size (GiB)"
                 field="cache.max_size_gb"
                 value={form.cache.max_size_gb}
                 data={data}
@@ -545,7 +570,7 @@ function SettingsPage() {
                 onChange={(value) => setForm({ ...form, cache: { ...form.cache, max_size_gb: value } })}
               />
               <SelectField
-                label="Eviction Policy"
+                label="Eviction policy"
                 field="cache.eviction_policy"
                 value={form.cache.eviction_policy}
                 options={[
@@ -560,7 +585,7 @@ function SettingsPage() {
               {form.cache.eviction_policy === 'lru' && (
                 <>
                   <NumberField
-                    label="LRU High Watermark %"
+                    label="LRU high watermark (%)"
                     field="cache.lru_high_watermark_percent"
                     value={form.cache.lru_high_watermark_percent}
                     data={data}
@@ -570,7 +595,7 @@ function SettingsPage() {
                     }
                   />
                   <NumberField
-                    label="LRU Low Watermark %"
+                    label="LRU low watermark (%)"
                     field="cache.lru_low_watermark_percent"
                     value={form.cache.lru_low_watermark_percent}
                     data={data}
@@ -601,7 +626,7 @@ function SettingsPage() {
                 label="Level"
                 field="logging.level"
                 value={form.logging.level}
-                options={['debug', 'info', 'warn', 'error']}
+                options={settingsOptions('logging.level', ['debug', 'info', 'warn', 'error'])}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, logging: { ...form.logging, level: value } })}
@@ -610,7 +635,7 @@ function SettingsPage() {
                 label="Format"
                 field="logging.format"
                 value={form.logging.format}
-                options={['json', 'text']}
+                options={settingsOptions('logging.format', ['json', 'text'])}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, logging: { ...form.logging, format: value } })}
@@ -618,7 +643,7 @@ function SettingsPage() {
               <CheckboxField
                 data={data}
                 field="logging.s3_access.enabled"
-                label="S3 Access Log"
+                label="S3 access log"
                 checked={form.logging.s3_access.enabled}
                 errors={fieldErrors}
                 onChange={(checked) =>
@@ -632,10 +657,10 @@ function SettingsPage() {
                 }
               />
               <SelectField
-                label="S3 Access Level"
+                label="S3 access log level"
                 field="logging.s3_access.level"
                 value={form.logging.s3_access.level}
-                options={['debug', 'info', 'warn', 'error']}
+                options={settingsOptions('logging.s3_access.level', ['debug', 'info', 'warn', 'error'])}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) =>
@@ -676,12 +701,8 @@ function SettingsPage() {
         </TabsContent>
       </Tabs>
 
-      <GeneratedCredentialsDialog
-        credentials={generatedCredentials}
-        onOpenChange={(open) => !open && setGeneratedCredentials(null)}
-      />
       <FilecoinReadinessDialog
-        title="Filecoin Preflight"
+        title="Filecoin preflight"
         data={preflightDetailData}
         open={Boolean(preflightDetailData)}
         onOpenChange={(open) => !open && setPreflightDetailData(null)}
@@ -910,7 +931,8 @@ function CheckboxField({
         checked={checked}
         disabled={disabled}
         invalid={Boolean(errors[field])}
-        label={data.metadata[field]?.label ?? label}
+        label="Enabled"
+        ariaLabel={data.metadata[field]?.label ?? label}
         onChange={onChange}
       />
     </FieldShell>
@@ -929,10 +951,10 @@ function TaskWorkerSection({
   onChange: (value: SettingsEditableConfig['worker']['tasks']) => void
 }) {
   return (
-    <Section title="Task Engine">
+    <Section title="Task engine">
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <NumberField
-          label="Concurrency"
+          label="Task concurrency"
           field="worker.tasks.concurrency"
           value={value.concurrency}
           data={data}
@@ -940,7 +962,7 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, concurrency: next })}
         />
         <TextField
-          label="Poll Interval"
+          label="Task poll interval"
           field="worker.tasks.poll_interval"
           value={value.poll_interval}
           data={data}
@@ -948,7 +970,7 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, poll_interval: next })}
         />
         <TextField
-          label="Lease Duration"
+          label="Task lease duration"
           field="worker.tasks.lease_duration"
           value={value.lease_duration}
           data={data}
@@ -956,7 +978,7 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, lease_duration: next })}
         />
         <NumberField
-          label="Upload Concurrency"
+          label="Upload concurrency"
           field="worker.tasks.upload_concurrency"
           value={value.upload_concurrency}
           data={data}
@@ -964,7 +986,7 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, upload_concurrency: next })}
         />
         <NumberField
-          label="Registration Size"
+          label="Batch size"
           field="worker.tasks.commit_max_pieces"
           value={value.commit_max_pieces}
           data={data}
@@ -972,7 +994,7 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, commit_max_pieces: next })}
         />
         <TextField
-          label="Registration Wait"
+          label="Batch wait"
           field="worker.tasks.commit_max_wait"
           value={value.commit_max_wait}
           data={data}
@@ -980,7 +1002,7 @@ function TaskWorkerSection({
           onChange={(next) => onChange({ ...value, commit_max_wait: next })}
         />
         <NumberField
-          label="Registration Backlog"
+          label="Batch backlog"
           field="worker.tasks.commit_max_backlog"
           value={value.commit_max_backlog}
           data={data}
@@ -1099,45 +1121,6 @@ function credentialSetupHint(
 
 function ReadOnlyRow({ data, field, value }: { data: SettingsData; field: string; value: string }) {
   return <SettingsReadOnlyField data={data} field={field} value={value} />
-}
-
-function GeneratedCredentialsDialog({
-  credentials,
-  onOpenChange,
-}: {
-  credentials: SettingsS3Credentials | null
-  onOpenChange: (open: boolean) => void
-}) {
-  return (
-    <Dialog open={Boolean(credentials)} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>S3 credentials generated</DialogTitle>
-          <DialogDescription>These credentials are shown once.</DialogDescription>
-        </DialogHeader>
-        {credentials && (
-          <div className="flex flex-col gap-3">
-            {credentials.role && <SettingsValueField label="Role" value={credentials.role} />}
-            <CopyableSecret label="Access Key" value={credentials.access_key} />
-            <CopyableSecret label="Secret Key" value={credentials.secret_key} />
-          </div>
-        )}
-        <DialogFooter>
-          <DialogClose asChild>
-            <Button type="button">Close</Button>
-          </DialogClose>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function CopyableSecret({ label, value }: { label: string; value: string }) {
-  return <SettingsValueField label={label} value={value} copy mono />
-}
-
-function s3Missing(errors: SettingsFieldError[]) {
-  return errors.some((error) => error.field.startsWith('s3.'))
 }
 
 function toFieldErrorMap(errors: SettingsFieldError[]) {

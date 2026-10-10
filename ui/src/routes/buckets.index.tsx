@@ -1,14 +1,17 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Database, Loader2, Plus, RefreshCw, UserRound } from 'lucide-react'
-import { type FormEvent, useEffect, useState } from 'react'
+import { Database, FolderOpen, HardDrive, Loader2, Plus, Settings } from 'lucide-react'
+import { type FormEvent, useState } from 'react'
+import { toast } from 'sonner'
 import type { ProviderSelectionStrategy } from '@/api/client'
 import { type BucketItem, internalRootOwnerAccessKey, type S3User } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { CopyableValue } from '@/components/app/CopyableValue'
-import { PageErrorState } from '@/components/app/PageErrorState'
-import { PageHeader } from '@/components/app/PageHeader'
-import { ReviewDetails } from '@/components/app/ReviewDetails'
+import { clickableRowProps, DataTableFrame, TableSkeleton, tableHeaderRowClassName } from '@/components/app/DataTable'
+import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
+import { EmptyState, PageError } from '@/components/app/PageState'
+import { RelativeTime } from '@/components/app/RelativeTime'
+import { RowActionItem, RowActionsMenu } from '@/components/app/RowActionsMenu'
 import { bucketStatusTone, StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -19,42 +22,42 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog'
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { useBuckets, useCreateBucket, useS3Users, useSettings, useUpdateBucketOwner } from '@/hooks/queries'
+import { useBuckets, useCreateBucket, useS3Users, useSettings } from '@/hooks/queries'
 import {
   bucketCopyPolicyLabel,
   clampMinimumDurableCopiesValue,
   copyPolicyOptions,
   minimumDurableCopiesChoiceNote,
   minimumDurableCopiesFixedCountNote,
-  minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
+  minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
+  replicaCountLabel,
   replicaTargetChoiceNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
 } from '@/lib/bucket-copy-policy'
+import type { BucketTab } from '@/lib/bucket-route-search'
 import {
   bucketStorageHealthLabel,
   bucketStorageHealthStatusTone,
   bucketStorageHealthTitle,
 } from '@/lib/bucket-storage-health'
+import { bucketStatusLabel, providerSelectionStrategyLabel } from '@/lib/display-labels'
 import { ownerLabel } from '@/lib/s3-owner'
-import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { formatBytes, formatNumber } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/')({
   component: BucketsPage,
 })
 
-function CreateBucketDialog() {
-  const [open, setOpen] = useState(false)
+function CreateBucketDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [providerSelectionStrategy, setProviderSelectionStrategy] = useState<ProviderSelectionStrategy>('distribution')
   const [bucketName, setBucketName] = useState('')
   const [ownerAccessKey, setOwnerAccessKey] = useState('')
@@ -85,7 +88,7 @@ function CreateBucketDialog() {
 
   const handleOpenChange = (next: boolean) => {
     if (!next) reset()
-    setOpen(next)
+    onOpenChange(next)
   }
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -107,8 +110,8 @@ function CreateBucketDialog() {
       { name, ownerAccessKey, defaultCopies, minimumDurableCopies: minimumCopies, providerSelectionStrategy },
       {
         onSuccess: (bucket) => {
-          setOpen(false)
-          reset()
+          handleOpenChange(false)
+          toast.success(`Created bucket ${bucket.name}`)
           navigate({ to: '/buckets/$name', params: { name: bucket.name } })
         },
         onError: (mutationError) => {
@@ -131,16 +134,12 @@ function CreateBucketDialog() {
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button size="sm">
-          <Plus data-icon="inline-start" />
-          Create Bucket
-        </Button>
-      </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Create Bucket</DialogTitle>
-          <DialogDescription>Choose the S3 user that will own and manage this bucket.</DialogDescription>
+          <DialogTitle>Create bucket</DialogTitle>
+          <DialogDescription>
+            Choose the bucket's owner and how many Filecoin replicas new uploads keep.
+          </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           <FieldGroup>
@@ -183,7 +182,7 @@ function CreateBucketDialog() {
                   <SelectGroup>
                     {copyPolicyOptions.map((copies) => (
                       <SelectItem key={copies} value={copies.toString()}>
-                        {copies} {copies === 1 ? 'copy' : 'copies'}
+                        {replicaCountLabel(copies)}
                       </SelectItem>
                     ))}
                   </SelectGroup>
@@ -196,26 +195,6 @@ function CreateBucketDialog() {
               ) : (
                 <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
               )}
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="bucket-provider-preference">Provider preference</FieldLabel>
-              <Select
-                value={providerSelectionStrategy}
-                onValueChange={(value) => {
-                  if (value === 'distribution' || value === 'speed') setProviderSelectionStrategy(value)
-                }}
-                disabled={createBucket.isPending}
-              >
-                <SelectTrigger id="bucket-provider-preference" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="distribution">Distribution first</SelectItem>
-                    <SelectItem value="speed">Speed first</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
             </Field>
             <Field>
               <FieldLabel htmlFor="bucket-minimum-durable-copies">Release cache after</FieldLabel>
@@ -242,6 +221,32 @@ function CreateBucketDialog() {
               ) : (
                 <FieldDescription>{minimumDurableCopiesFixedCountNote()}</FieldDescription>
               )}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="bucket-provider-preference">Provider preference</FieldLabel>
+              <Select
+                value={providerSelectionStrategy}
+                onValueChange={(value) => {
+                  if (value === 'distribution' || value === 'speed') setProviderSelectionStrategy(value)
+                }}
+                disabled={createBucket.isPending}
+              >
+                <SelectTrigger id="bucket-provider-preference" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="distribution">{providerSelectionStrategyLabel('distribution')}</SelectItem>
+                    <SelectItem value="speed">{providerSelectionStrategyLabel('speed')}</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FieldDescription>
+                {providerSelectionStrategy === 'speed'
+                  ? 'Prefers the fastest measured providers.'
+                  : 'Spreads new data sets across the least-used providers.'}{' '}
+                This can't be changed later.
+              </FieldDescription>
             </Field>
           </FieldGroup>
           {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
@@ -274,204 +279,75 @@ function CreateBucketDialog() {
   )
 }
 
-function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
-  const [open, setOpen] = useState(false)
-  const [ownerAccessKey, setOwnerAccessKey] = useState(bucket.owner_access_key ?? '')
-  const [reviewing, setReviewing] = useState(false)
-  const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
-  const updateOwner = useUpdateBucketOwner()
-
-  useEffect(() => {
-    if (!open) {
-      setOwnerAccessKey(bucket.owner_access_key ?? '')
-      setReviewing(false)
-    }
-  }, [bucket.owner_access_key, open])
-
-  const reset = () => {
-    setOwnerAccessKey(bucket.owner_access_key ?? '')
-    setReviewing(false)
-    updateOwner.reset()
-  }
-
-  const handleOpenChange = (next: boolean) => {
-    reset()
-    setOpen(next)
-  }
-
-  const handleUpdate = () => {
-    if (!ownerAccessKey || ownerAccessKey === bucket.owner_access_key) return
-    if (!reviewing) {
-      setReviewing(true)
-      return
-    }
-    updateOwner.mutate(
-      { name: bucket.name, ownerAccessKey },
-      {
-        onSuccess: () => {
-          setReviewing(false)
-          setOpen(false)
-          reset()
-        },
-      }
-    )
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="xs">
-          <UserRound data-icon="inline-start" />
-          {bucket.owner_access_key ? 'Change owner' : 'Assign owner'}
-        </Button>
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>
-            {reviewing
-              ? 'Review bucket owner'
-              : bucket.owner_access_key
-                ? 'Change bucket owner'
-                : 'Assign bucket owner'}
-          </DialogTitle>
-          <DialogDescription>
-            {reviewing
-              ? 'Confirm the owner that will receive full control of this bucket.'
-              : `Transfer full control of "${bucket.name}" to an existing S3 user.`}
-          </DialogDescription>
-        </DialogHeader>
-        {reviewing ? (
-          <ReviewDetails
-            rows={[
-              { id: 'bucket', label: 'Bucket', value: bucket.name, copyable: true },
-              {
-                id: 'current-owner',
-                label: 'Current owner',
-                value: bucket.owner_access_key ?? ownerLabel(bucket.owner_access_key),
-                displayValue: ownerLabel(bucket.owner_access_key, users),
-                maxLength: ownerLabel(bucket.owner_access_key, users).length,
-                copyable: Boolean(bucket.owner_access_key),
-              },
-              {
-                id: 'new-owner',
-                label: 'New owner',
-                value: ownerAccessKey || ownerLabel(null),
-                displayValue: ownerLabel(ownerAccessKey, users),
-                maxLength: ownerLabel(ownerAccessKey, users).length,
-                copyable: Boolean(ownerAccessKey),
-              },
-            ]}
-          />
-        ) : (
-          <FieldGroup>
-            <Field data-invalid={Boolean(usersError)}>
-              <FieldLabel htmlFor={`owner-${bucket.id}`}>Owner</FieldLabel>
-              <BucketOwnerSelect
-                id={`owner-${bucket.id}`}
-                value={ownerAccessKey}
-                onChange={setOwnerAccessKey}
-                disabled={updateOwner.isPending || usersLoading}
-                invalid={Boolean(usersError)}
-                users={users}
-              />
-              {users.length === 0 && !usersLoading && (
-                <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
-              )}
-              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
-            </Field>
-          </FieldGroup>
-        )}
-        {updateOwner.error && (
-          <Alert variant="destructive">
-            <AlertDescription>{updateOwner.error.message}</AlertDescription>
-          </Alert>
-        )}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => (reviewing ? setReviewing(false) : handleOpenChange(false))}
-            disabled={updateOwner.isPending}
-          >
-            {reviewing ? 'Back' : 'Cancel'}
-          </Button>
-          <Button
-            type="button"
-            onClick={handleUpdate}
-            disabled={!ownerAccessKey || ownerAccessKey === bucket.owner_access_key || updateOwner.isPending}
-          >
-            {updateOwner.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            {reviewing ? 'Confirm owner' : 'Review'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 function BucketsPage() {
-  const { data, isLoading, error } = useBuckets()
+  const { data, isLoading, error, refetch, isFetching } = useBuckets()
   const { data: users = [] } = useS3Users()
+  const navigate = useNavigate()
   const qc = useQueryClient()
+  const [createOpen, setCreateOpen] = useState(false)
   const buckets = data ?? []
+  const openBucket = (name: string, tab?: BucketTab) =>
+    navigate({ to: '/buckets/$name', params: { name }, search: { tab: tab === 'objects' ? undefined : tab } })
 
   return (
-    <div className="flex flex-col gap-4 p-6">
+    <div className="flex flex-col gap-6 p-6">
       <PageHeader
         title="Buckets"
         actions={
           <>
-            <CreateBucketDialog />
-            <Button variant="outline" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ['buckets'] })}>
-              <RefreshCw data-icon="inline-start" /> Refresh
+            <RefreshButton onClick={() => qc.invalidateQueries({ queryKey: ['buckets'] })} refreshing={isFetching} />
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
+              <Plus data-icon="inline-start" />
+              Create bucket
             </Button>
           </>
         }
       />
 
       {isLoading ? (
-        <div className="flex h-60 items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-        </div>
+        <TableSkeleton />
       ) : error ? (
-        <PageErrorState title="Failed to load buckets" className="h-60" />
+        <PageError
+          title="Failed to load buckets"
+          description={error.message}
+          onRetry={() => refetch()}
+          retrying={isFetching}
+        />
       ) : buckets.length === 0 ? (
-        <div className="rounded-lg border border-border">
-          <Empty className="h-60 border-0">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <Database />
-              </EmptyMedia>
-              <EmptyTitle>No buckets found</EmptyTitle>
-              <EmptyDescription>You don't have any buckets yet.</EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        </div>
+        <EmptyState
+          icon={<Database />}
+          title="No buckets yet"
+          description="Create a bucket here or with any S3 client."
+          action={
+            <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+              <Plus data-icon="inline-start" />
+              Create bucket
+            </Button>
+          }
+        />
       ) : (
-        <div className="overflow-hidden rounded-lg border border-border">
-          <Table>
+        <DataTableFrame>
+          <Table className="min-w-[960px]">
             <TableHeader>
-              <TableRow className="bg-muted/50">
+              <TableRow className={tableHeaderRowClassName}>
                 <TableHead className="px-4">Name</TableHead>
                 <TableHead className="px-4">Owner</TableHead>
                 <TableHead className="px-4">Replicas</TableHead>
-                <TableHead className="px-4">Storage Health</TableHead>
+                <TableHead className="px-4">Storage health</TableHead>
                 <TableHead className="px-4">Status</TableHead>
                 <TableHead className="px-4 text-right">Objects</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
                 <TableHead className="px-4">Created</TableHead>
-                <TableHead className="px-4">Actions</TableHead>
+                <TableHead className="w-12 px-4">
+                  <span className="sr-only">Actions</span>
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {buckets.map((bucket) => (
-                <TableRow key={bucket.id}>
+                <TableRow key={bucket.id} {...clickableRowProps(() => openBucket(bucket.name))}>
                   <TableCell className="px-4">
-                    <Link
-                      to="/buckets/$name"
-                      params={{ name: bucket.name }}
-                      className="font-medium text-primary hover:underline"
-                    >
+                    <Link to="/buckets/$name" params={{ name: bucket.name }} className="font-medium hover:underline">
                       {bucket.name}
                     </Link>
                   </TableCell>
@@ -480,28 +356,44 @@ function BucketsPage() {
                   </TableCell>
                   <TableCell className="px-4">
                     <div>{bucketCopyPolicyLabel(bucket)}</div>
-                    <div className="text-xs text-muted-foreground">{minimumDurableCopiesLabel(bucket)}</div>
+                    <div className="text-xs text-muted-foreground">
+                      Release cache after {minimumDurableCopiesValue(bucket)}
+                    </div>
                   </TableCell>
                   <TableCell className="px-4">
                     <BucketStorageHealthCell bucket={bucket} />
                   </TableCell>
                   <TableCell className="px-4">
-                    <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
+                    <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucketStatusLabel(bucket.status)}</StatusBadge>
                   </TableCell>
-                  <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
-                  <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
-                  <TableCell className="px-4 text-muted-foreground" title={bucket.created_at}>
-                    {timeAgo(bucket.created_at)}
+                  <TableCell className="px-4 text-right tabular-nums">{formatNumber(bucket.object_count)}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums">{formatBytes(bucket.total_size_bytes)}</TableCell>
+                  <TableCell className="px-4 text-muted-foreground">
+                    <RelativeTime value={bucket.created_at} />
                   </TableCell>
-                  <TableCell className="px-4">
-                    <ChangeBucketOwnerDialog bucket={bucket} />
+                  <TableCell className="px-4 text-right">
+                    <RowActionsMenu label={bucket.name}>
+                      <RowActionItem onSelect={() => openBucket(bucket.name)}>
+                        <FolderOpen data-icon="inline-start" />
+                        Open
+                      </RowActionItem>
+                      <RowActionItem onSelect={() => openBucket(bucket.name, 'storage')}>
+                        <HardDrive data-icon="inline-start" />
+                        Storage
+                      </RowActionItem>
+                      <RowActionItem onSelect={() => openBucket(bucket.name, 'settings')}>
+                        <Settings data-icon="inline-start" />
+                        Settings
+                      </RowActionItem>
+                    </RowActionsMenu>
                   </TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
-        </div>
+        </DataTableFrame>
       )}
+      <CreateBucketDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
   )
 }

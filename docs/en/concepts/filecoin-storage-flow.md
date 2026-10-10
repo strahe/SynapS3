@@ -5,7 +5,7 @@ description: Understand how background tasks store locally durable objects with 
 
 # Filecoin Storage Flow
 
-Filecoin storage starts after the S3 write is accepted. Background tasks read locally durable objects, store them with storage providers, and record the resulting remote copies.
+Filecoin storage starts after the S3 write is accepted. Background tasks read locally durable objects, store them with storage providers, and record the resulting replicas.
 
 ## Task Chain
 
@@ -28,9 +28,9 @@ flowchart TD
 | --- | --- |
 | `cached` | Object is durable locally and queued for upload. |
 | `uploading` | A background task is preparing remote storage or uploading bytes. |
-| `committing` | The provider has the piece, which is waiting for or undergoing on-chain registration; uploads to the same storage service are combined within the configured `commit_max_wait` window. |
-| `replicating` | At least one readable committed copy exists, but the bucket's minimum durable copies are not yet met. |
-| `stored` | The bucket's minimum durable copies are readable and committed; remaining target copies may still be syncing. |
+| `committing` | The provider has the piece, and its batch is waiting to be submitted or confirmed on chain; uploads to the same data set are batched within the configured `commit_max_wait` window. |
+| `replicating` | At least one readable committed replica exists, but the bucket's minimum durable replicas are not yet met. |
+| `stored` | The bucket's minimum durable replicas are readable and committed; remaining target replicas may still be syncing. |
 | `failed` | The active lifecycle step failed and may be retried. |
 
 Cache presence is tracked separately from storage state. A `stored` object may remain in the local cache or be available only from remote storage.
@@ -50,9 +50,9 @@ Retry after restoring RPC connectivity, storage provider reachability, wallet fu
 
 ## Provider Health
 
-Health checks record storage provider and local data set status. The dashboard uses those results to show copies that are `unavailable`, `degraded`, or `unknown`.
+Health checks record storage provider and local data set status. The dashboard uses those results to show replicas that are `unavailable`, `degraded`, or `unknown`.
 
-If an established provider becomes temporarily unavailable while the initial copies are still being stored, SynapS3 keeps using the other assigned writable copies. The unfinished copy waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider; see [Replace a Storage Provider](#replace-a-storage-provider) for the operator-approved path. Repairing copies that became unavailable after storage completed remains part of the planned replica repair feature below.
+If an established provider becomes temporarily unavailable while the initial replicas are still being stored, SynapS3 keeps using the other assigned writable replicas. The unfinished replica waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider; see [Replace a Storage Provider](#replace-a-storage-provider) for the operator-approved path. Repairing replicas that became unavailable after storage completed remains part of the planned replica repair feature below.
 
 ## Target and Minimum Replicas
 
@@ -62,13 +62,13 @@ Changing the target affects new uploads. Changing the minimum also re-evaluates 
 
 ## Replace a Storage Provider
 
-When a provider becomes permanently unavailable, or you plan to move away from one, open the bucket in the dashboard, choose **Details**, then **Storage** → **Data Sets**, and replace the provider. This is always an explicit decision: SynapS3 never swaps a provider on its own, because doing so creates a new paid service and changes where your data lives. A replica can be replaced only after its own storage service is ready; if that setup failed, retry it on the Tasks page first. While its provider stays unavailable, the setup keeps waiting and the replica cannot be replaced.
+When a provider becomes permanently unavailable, or you plan to move away from one, open the bucket in the dashboard, go to the **Storage** tab, and replace the provider from the replica's menu in **Data sets**. This is always an explicit decision: SynapS3 never swaps a provider on its own, because doing so creates a new paid data set and changes where your data lives. A replica can be replaced only after its own data set is ready; if that setup failed, retry it on the Tasks page first. While its provider stays unavailable, the setup keeps waiting and the replica cannot be replaced.
 
-One confirmation covers the whole move. SynapS3 creates the new storage service, switches new uploads to it once it is ready, copies existing data across, and only then shuts down the old provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down. Data that can still be read from the old provider stays readable until every retained version is readable on the new one.
+One confirmation covers the whole move. SynapS3 creates the new data set, switches new uploads to it once it is ready, copies existing data across, and only then shuts down the old provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down. Data that can still be read from the old provider stays readable until every retained version is readable on the new one.
 
-While replacements run, the Data Sets card shows every move that still needs progress or operator attention, including parallel moves on other replicas. Discovery uses an indeterminate progress bar because the final count is not known yet. Once discovery finishes, progress uses the processed share of the final total. Progress counts unique stored content, so content shared by several versions is copied once, and separates content transferred from content deleted before it needed to move.
+While replacements run, the **Storage** tab shows every move that still needs progress or operator attention, including parallel moves on other replicas. Discovery uses an indeterminate progress bar because the final count is not known yet. Once discovery finishes, progress uses the processed share of the final total. Progress counts unique stored content, so content shared by several versions is copied once, and separates content transferred from content deleted before it needed to move.
 
-Some steps wait rather than fail. The dashboard distinguishes creating the new service, waiting for it to become writable, an unreachable provider, wallet funds, and missing readable content. Most waits resume on their own. If an object has no other replica and no local cache, replacement waits until a source is available; this does not count toward the retry limit. Temporary copy failures resume after a restart and do not stop other content or another replacement. Recoverable copy failures are retried within the replacement's finite budget. If recovery exhausts that budget or needs attention, the replacement stops; review its error and use **Retry** from the Data Sets list. Before new uploads switch to the new provider, the replacement also waits for uploads already going to the old one; if one of them stopped, retry it on the Tasks page. If it cannot be retried, the replacement fails and shows why; resolve that upload, for example by reviewing unresolved storage confirmations, then use **Retry**. If the result of shutting down the old provider is unclear, SynapS3 checks the chain and tries again on its own. Use **Retry** from the Data Sets list when the dashboard shows that content needs attention, or when shutting down the old provider needs a payment settled first. A target already in use cannot be retried; choose another provider. A replica cannot be replaced again while an earlier replacement is still setting up its new storage service; wait for it to finish, or retry that setup on the Tasks page.
+Some steps wait rather than fail. The dashboard distinguishes creating the new data set, waiting for it to become writable, an unreachable provider, wallet funds, and missing readable content. Most waits resume on their own. If an object has no other replica and no local cache, replacement waits until a source is available; this does not count toward the retry limit. Temporary transfer failures resume after a restart and do not stop other content or another replacement. Recoverable transfer failures are retried within the replacement's finite budget. If recovery exhausts that budget or needs attention, the replacement stops; review its error and use **Retry** on the **Storage** tab. Before new uploads switch to the new provider, the replacement also waits for uploads already going to the old one; if one of them stopped, retry it on the Tasks page. If it cannot be retried, the replacement fails and shows why; resolve that upload, for example by reviewing stopped batches, then use **Retry**. If the result of shutting down the old provider is unclear, SynapS3 checks the chain and tries again on its own. Use **Retry** on the **Storage** tab when the dashboard shows that content needs attention, or when shutting down the old provider needs a payment settled first. A target already in use cannot be retried; choose another provider. A replica cannot be replaced again while an earlier replacement is still setting up its new data set; wait for it to finish, or retry that setup on the Tasks page.
 
 ## What Users See
 
@@ -81,8 +81,8 @@ Some steps wait rather than fail. The dashboard distinguishes creating the new s
 
 Replica repair is planned for a future release. After a storage provider becomes unavailable, it will:
 
-- identify stored copies affected by the provider outage,
-- create replacement copies until the configured target copy count is restored,
+- identify stored replicas affected by the provider outage,
+- create replacement replicas until the configured target replica count is restored,
 - show repair progress and failures that require operator action.
 
-This is distinct from completing the initial target copies and retrying failed storage tasks.
+This is distinct from completing the initial target replicas and retrying failed storage tasks.

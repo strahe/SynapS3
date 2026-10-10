@@ -37,7 +37,7 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 		return result
 	}
 	if copyRow.Status == model.StorageCopyStatusCommitted {
-		return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
+		return h.completeCopyTask(input, execution.ID(), "Replica is complete")
 	}
 	if copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
 		return h.handOffToCommit(input, execution.ID())

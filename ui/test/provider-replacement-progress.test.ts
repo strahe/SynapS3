@@ -39,7 +39,7 @@ test('prepare phase does not describe undiscovered migration work', () => {
   )
   assert.equal(view.indeterminate, true)
   assert.equal(view.value, null)
-  assert.equal(view.summary, 'Preparing the new storage service')
+  assert.equal(view.summary, 'Preparing the new data set')
   assert.equal(view.activity, 'Waiting for wallet funds')
 })
 

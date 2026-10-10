@@ -29,7 +29,7 @@ Coming soon: replica repair for provider outages.
 
 ![SynapS3 architecture](docs/public/architecture-overview.svg)
 
-Writes commit to local cache and metadata before returning success. Reads use local cache first, then committed Filecoin copies when available.
+Writes commit to local cache and metadata before returning success. Reads use local cache first, then committed Filecoin replicas when available.
 
 ## Core S3 Compatibility
 

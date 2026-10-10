@@ -15,16 +15,16 @@ export function taskStatusesForScope(scope: TaskScope): TaskItem['status'][] {
 export const taskOperationLabels: Record<string, string> = {
   bucket_provision: 'Prepare bucket',
   upload_plan: 'Prepare upload',
-  storage_dataset_ensure: 'Create dataset',
-  storage_transfer_plan: 'Prepare copy',
+  storage_dataset_ensure: 'Create data set',
+  storage_transfer_plan: 'Prepare replica',
   storage_store: 'Upload data',
   storage_pull: 'Copy data',
-  storage_commit: 'Confirm storage',
+  storage_commit: 'Submit batch',
   provider_replacement_coordinate: 'Replace provider',
   cache_evict: 'Clear cache',
   cache_reconcile_durability: 'Apply cache policy',
-  storage_cleanup: 'Delete remote copies',
-  storage_dataset_retire: 'Close dataset',
+  storage_cleanup: 'Delete remote replicas',
+  storage_dataset_retire: 'Close data set',
   wallet_operation: 'Wallet operation',
   provider_upload_speed_test: 'Test upload speed',
   cache_capacity_reconcile: 'Manage cache',
@@ -40,19 +40,19 @@ export function taskOperationLabel(type: string) {
 
 const subjectLabels: Record<string, string> = {
   storage_content: 'Content',
-  storage_copy: 'Copy',
-  storage_data_set: 'Dataset',
+  storage_copy: 'Replica',
+  storage_data_set: 'Data set',
   bucket: 'Bucket',
   provider: 'Provider',
   storage_replacement: 'Replacement',
   wallet_operation: 'Wallet operation',
-  storage_commit_request: 'Storage registration',
+  storage_commit_request: 'Batch',
 }
 
 export function taskSubjectLabel(task: Pick<TaskItem, 'subject_type' | 'subject_key'>) {
   if (task.subject_type === 'system') return 'System'
   if (!task.subject_type || !task.subject_key) return '—'
-  if (task.subject_type === 'storage_commit_request') return 'Storage registration'
+  if (task.subject_type === 'storage_commit_request') return 'Batch'
   return `${subjectLabels[task.subject_type] ?? 'Resource'} #${task.subject_key}`
 }
 
@@ -143,7 +143,7 @@ export function taskSubjectFields(info: TaskSubjectInfo): TaskSubjectField[] {
         bucket,
         { label: 'Replica', value: replica },
         provider,
-        { label: 'On-chain Dataset ID', value: info.data_set_id ?? 'Not available yet' },
+        { label: 'On-chain data set ID', value: info.data_set_id ?? 'Not available yet' },
       ]
     case 'bucket':
       return [{ label: 'Name', value: info.bucket || 'Unavailable' }]
@@ -174,7 +174,7 @@ export function taskSubjectFields(info: TaskSubjectInfo): TaskSubjectField[] {
       return [
         bucket,
         {
-          label: 'Dataset',
+          label: 'Data set',
           value: info.local_data_set_id === undefined ? 'Unavailable' : `Local #${info.local_data_set_id}`,
           note: info.data_set_id === undefined ? undefined : `On-chain #${info.data_set_id}`,
         },

@@ -1063,7 +1063,7 @@ func releaseCollectingCommitMembership(ctx context.Context, db bun.IDB, copyID i
 		Model((*storagecommit.Request)(nil)).
 		Set("status = ?", storagecommit.RequestStatusAbandoned).
 		Set("task_id = NULL").
-		Set("last_error = ?", "no storage copies are left to register").
+		Set("last_error = ?", "no replicas are left to submit").
 		Set("seal_requested_at = NULL").
 		Set("updated_at = ?", now).
 		Where("request_id = ? AND status = ?", requestID, storagecommit.RequestStatusCollecting).

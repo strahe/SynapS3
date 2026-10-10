@@ -5,15 +5,15 @@ test('provider replacement renders mocked setup eligibility and confirmations', 
   await page.goto(systemServer.adminURL)
   await page.getByLabel('Username').fill('admin')
   await page.getByLabel('Password').fill('system-test-admin-password')
-  await page.getByRole('button', { name: 'Sign In' }).click()
+  await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
   await page.getByRole('link', { name: 'Buckets', exact: true }).click()
-  await page.getByRole('button', { name: 'Create Bucket' }).click()
-  const create = page.getByRole('dialog', { name: 'Create Bucket' })
+  await page.getByRole('button', { name: 'Create bucket' }).first().click()
+  const create = page.getByRole('dialog', { name: 'Create bucket' })
   const name = 'creation-replacement-e2e'
   await create.getByLabel('Bucket name').fill(name)
   await create.getByLabel('Owner').click()
-  await page.getByRole('option', { name: 'SYSTEMTESTOWNER (userplus)' }).click()
+  await page.getByRole('option', { name: 'SYSTEMTESTOWNER (User+)' }).click()
   await create.getByRole('button', { name: 'Create', exact: true }).click()
   await expect(page.getByRole('heading', { name })).toBeVisible()
   const endpoint = new URL(`/api/v1/buckets/${name}`, page.url()).toString()
@@ -59,20 +59,20 @@ test('provider replacement renders mocked setup eligibility and confirmations', 
     }
     await page.route(endpoint, (route) => route.fulfill({ json: response }))
     await page.reload()
-    await page.getByRole('button', { name: 'Details', exact: true }).click()
-    const details = page.getByRole('dialog', { name: 'Bucket details' })
-    const replace = details.getByRole('button', { name: 'Replace provider for Replica 1', exact: true })
+    await page.getByRole('tab', { name: 'Storage', exact: true }).click()
+    const details = page.getByRole('tabpanel', { name: 'Storage', exact: true })
+    const actions = details.getByRole('button', { name: 'Actions for Replica 1', exact: true })
     if (state === 'unknown') {
-      await expect(replace).toHaveCount(0)
+      await expect(actions).toHaveCount(0)
       await expect(
         details.getByText(
           'Could not confirm whether storage setup succeeded. Check its task before replacing the provider.'
         )
       ).toBeVisible()
     } else {
-      await expect(replace).toBeVisible()
       if (setupError) await expect(details.getByText(setupError, { exact: true })).toBeVisible()
-      await replace.click()
+      await actions.click()
+      await page.getByRole('menuitem', { name: 'Replace provider', exact: true }).click()
       const confirmation = page.getByRole('alertdialog', { name: 'Replace provider' })
       if (ready) {
         await expect(confirmation.getByText('Data to copy', { exact: true })).toBeVisible()
@@ -83,13 +83,12 @@ test('provider replacement renders mocked setup eligibility and confirmations', 
         await expect(confirmation.getByText(/The old provider is ended/)).toHaveCount(0)
         await expect(confirmation.getByText(/New uploads that need this replica wait/)).toBeVisible()
       }
-      await expect(confirmation.getByText(/An earlier request may still create a paid storage service/)).toHaveCount(
+      await expect(confirmation.getByText(/An earlier request may still create a paid data set/)).toHaveCount(
         state === 'rejected' || abandonedTarget ? 1 : 0
       )
       await confirmation.getByRole('button', { name: 'Cancel' }).click()
+      await expect(confirmation).toBeHidden()
     }
-    await page.keyboard.press('Escape')
-    await expect(details).toBeHidden()
     await page.unroute(endpoint)
   }
 })

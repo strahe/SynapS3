@@ -32,7 +32,7 @@ ssh -L 9090:127.0.0.1:9090 user@server
 
 ## 创建 S3 用户
 
-登录仪表盘，在 S3 Users 页面创建用户；也可以在安装环境中使用原生 Admin CLI：
+登录仪表盘，在 **S3 users** 页面创建用户；也可以在安装环境中使用原生 Admin CLI：
 
 ```bash
 synaps3 admin s3-user create

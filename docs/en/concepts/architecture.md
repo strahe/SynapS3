@@ -29,7 +29,7 @@ The key boundary is between the S3 response and Filecoin upload. When a write is
 | S3 clients | Use familiar S3 operations and credentials. |
 | S3 gateway | Validates requests and returns S3-compatible responses. |
 | Local persistent storage | Keeps accepted object data and metadata available while background storage progresses. |
-| Background Filecoin storage | Completes the initial target copies, retries failed tasks, and evicts cache when policy allows. |
+| Background Filecoin storage | Completes the initial target replicas, retries failed tasks, and evicts cache when policy allows. |
 | Dashboard and Admin API | Show health, storage progress, configuration, and actions that need operator attention. |
 
 ## Design Principles
@@ -43,7 +43,7 @@ The key boundary is between the S3 response and Filecoin upload. When a write is
 
 | Behavior | Operator impact |
 | --- | --- |
-| S3 writes land locally first | While local runtime data is intact, accepted writes remain available from local storage until eligible cache eviction. After eviction, reads require an available remote copy. |
+| S3 writes land locally first | While local runtime data is intact, accepted writes remain available from local storage until eligible cache eviction. After eviction, reads require an available replica. |
 | Background tasks handle Filecoin storage | Watch pending, running, and failed tasks. |
 | Cache is part of durability | Treat cache disk as runtime data, not disposable scratch space. |
 | Admin API controls operations | Use Admin auth; keep it on loopback or behind HTTPS and access control. |

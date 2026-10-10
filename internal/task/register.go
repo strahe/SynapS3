@@ -99,7 +99,7 @@ func normalizeDependencies(deps Dependencies) (Dependencies, error) {
 		deps.CommitMaxBacklog = config.DefaultCommitMaxBacklog
 	}
 	if deps.CommitMaxPieces < 1 || deps.CommitMaxWait < 0 || deps.CommitMaxBacklog < deps.CommitMaxPieces {
-		return deps, errors.New("storage registration limits are invalid")
+		return deps, errors.New("batch limits are invalid")
 	}
 	if deps.AnchorProviderTier == "" {
 		deps.AnchorProviderTier = providerselect.TierApproved

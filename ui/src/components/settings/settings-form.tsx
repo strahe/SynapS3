@@ -150,12 +150,14 @@ export function SettingsCheckbox({
   disabled,
   invalid,
   label,
+  ariaLabel,
   onChange,
 }: {
   checked: boolean
   disabled?: boolean
   invalid?: boolean
   label: string
+  ariaLabel?: string
   onChange: (checked: boolean) => void
 }) {
   const generatedId = useId()
@@ -167,6 +169,7 @@ export function SettingsCheckbox({
         checked={checked}
         disabled={disabled}
         aria-invalid={invalid}
+        aria-label={ariaLabel}
         onCheckedChange={(next) => onChange(next === true)}
       />
       <FieldLabel htmlFor={generatedId}>{label}</FieldLabel>

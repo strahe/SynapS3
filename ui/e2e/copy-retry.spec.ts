@@ -6,7 +6,7 @@ async function signIn(page: Page, adminURL: string) {
   await page.goto(adminURL)
   await page.getByLabel('Username').fill('admin')
   await page.getByLabel('Password').fill('system-test-admin-password')
-  await page.getByRole('button', { name: 'Sign In' }).click()
+  await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
 }
 
@@ -79,7 +79,7 @@ test('failed tasks retry through their task ID before and after acknowledgement'
     const retry = page.getByRole('button', { name: 'Retry', exact: true })
     await expect(retry).toBeVisible()
     if (!viewed) {
-      await page.getByRole('button', { name: 'View', exact: true }).click()
+      await page.getByRole('button', { name: 'Details for task 201', exact: true }).click()
       const details = page.getByRole('dialog', { name: 'Task 201', exact: true })
       await expect(details.getByRole('tab', { name: 'Overview', exact: true })).toHaveAttribute('aria-selected', 'true')
       await expect(details.getByRole('heading', { name: 'Execution policy' })).toBeVisible()
@@ -90,9 +90,9 @@ test('failed tasks retry through their task ID before and after acknowledgement'
         details.getByRole('tabpanel', { name: 'History', exact: true }).getByText('Task 201', { exact: true })
       ).toBeVisible()
       await details.getByRole('tab', { name: 'Events', exact: true }).click()
-      await expect(details.getByText('No events recorded.', { exact: true })).toBeVisible()
+      await expect(details.getByText('No events recorded', { exact: true })).toBeVisible()
       await details.getByRole('button', { name: 'Close', exact: true }).click()
-      await page.getByRole('button', { name: 'View', exact: true }).click()
+      await page.getByRole('button', { name: 'Details for task 201', exact: true }).click()
       await expect(details.getByRole('tab', { name: 'Overview', exact: true })).toHaveAttribute('aria-selected', 'true')
       await details.getByRole('button', { name: 'Close', exact: true }).click()
     }
@@ -143,7 +143,7 @@ test('open task details refresh execution, history and events until closed', asy
   await signIn(page, systemServer.adminURL)
   await page.clock.install()
   await page.goto(new URL('/tasks', systemServer.adminURL).toString())
-  await page.getByRole('button', { name: 'View', exact: true }).click()
+  await page.getByRole('button', { name: 'Details for task 201', exact: true }).click()
   const details = page.getByRole('dialog', { name: 'Task 201', exact: true })
   await expect(details.getByText('Running', { exact: true })).toBeVisible()
   await expect.poll(() => Object.values(reads).every((count) => count > 0)).toBe(true)
@@ -169,11 +169,11 @@ test('open task details refresh execution, history and events until closed', asy
 test('provenance retries a failed replica and shows its updated recovery state', async ({ page, systemServer }) => {
   await signIn(page, systemServer.adminURL)
   await page.getByRole('link', { name: 'Buckets', exact: true }).click()
-  await page.getByRole('button', { name: 'Create Bucket' }).click()
-  const create = page.getByRole('dialog', { name: 'Create Bucket' })
+  await page.getByRole('button', { name: 'Create bucket' }).first().click()
+  const create = page.getByRole('dialog', { name: 'Create bucket' })
   await create.getByLabel('Bucket name').fill('copy-retry-e2e')
   await create.getByLabel('Owner').click()
-  await page.getByRole('option', { name: 'SYSTEMTESTOWNER (userplus)' }).click()
+  await page.getByRole('option', { name: 'SYSTEMTESTOWNER (User+)' }).click()
   await create.getByRole('button', { name: 'Create', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'copy-retry-e2e' })).toBeVisible()
   await page.getByRole('button', { name: 'Upload', exact: true }).click()

@@ -1850,7 +1850,7 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types
 	rows, _ := res.RowsAffected()
 	if rows > 0 {
 		_, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
-			Set("failure_reason = NULL").Set("last_error = ?", "Storage service was found. Retry the replacement to continue.").
+			Set("failure_reason = NULL").Set("last_error = ?", "Data set was found. Retry the replacement to continue.").
 			Set("updated_at = ?", time.Now()).Where("target_data_set_id = ?", id).
 			Where("status = ? AND failure_reason = ?", storagereplacement.StatusFailed, storagereplacement.FailureReasonTargetRejected).Exec(ctx)
 		return err

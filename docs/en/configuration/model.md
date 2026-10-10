@@ -69,7 +69,7 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | --- | --- |
 | `server` | S3 API listener, concurrency limits, and TLS fields. |
 | `s3` | Region reported to S3 clients. |
-| `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and copy policy. |
+| `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and replica policy. |
 | `filecoin.observability` | Provider and local data set health checks. |
 | `database` | PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
@@ -111,13 +111,13 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 
 `worker.tasks.concurrency` limits all running background tasks, including recovery. `upload_concurrency` additionally limits simultaneous uploads, including reading and hashing cached data. Both must be positive; an upload limit above the global limit is valid. Tasks without a free slot remain queued in due order while other task types can proceed. Wallet operations and upload measurements each run one at a time. Task settings require a SynapS3 restart. Each task type declares its finite retry policy; each execution retains the policy recorded when created. Task history is retained indefinitely.
 
-Uploads and replicas copied to the same storage service collect together until submission can proceed. `commit_max_pieces` (1–200) limits pieces per transaction, not the collection size; storage services with a data set ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. The next batch becomes eligible when collected pieces reach the applicable per-transaction limit, the service stops accepting new data, submission is requested manually, or the oldest piece has waited `commit_max_wait` (0–30m); `0s` removes the collection delay. Every batch waits for one of the service's four in-flight slots and for earlier signed batches ready to submit. It then signs the oldest pieces up to the limit and immediately attempts submission; remaining pieces keep collecting with their original wait times. Upload data awaiting submission stays in the local cache. Longer windows delay submission, replica copies that need a committed source, and local cache eviction.
+Uploads and replicas sent to the same data set collect into a batch until submission can proceed. `commit_max_pieces` (1–200) limits pieces per transaction, not the collection size; data sets with an ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. The next batch becomes eligible when collected pieces reach the applicable per-transaction limit, the data set stops accepting new data, submission is requested manually, or the oldest piece has waited `commit_max_wait` (0–30m); `0s` removes the collection delay. Every batch waits for one of the data set's four in-flight slots and for earlier signed batches ready to submit. It then signs the oldest pieces up to the limit and immediately attempts submission; remaining pieces keep collecting with their original wait times. Upload data awaiting submission stays in the local cache. Longer windows delay submission, replicas that need a committed source, and local cache eviction.
 
-Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one storage service for an unsent batch, new uploads and replica copies to it wait. A batch that does not fit one add-pieces message is split and signed again with fewer pieces.
+Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one data set for an unsent batch, new uploads and replicas to it wait. A batch that does not fit one add-pieces message is split and signed again with fewer pieces.
 
 Enable **Submit batches early to free cache space** in Settings (`worker.tasks.commit_seal_on_cache_pressure`) to submit batches early when safe automatic cleanup cannot free enough space. Early submission still waits for an in-flight slot and any earlier batches ready to submit. It is off by default and requires restart. With `lru`, it follows the effective cleanup target; with `after_upload`, a refused write supplies the required space. It has no automatic effect under `none`. Smaller batches can increase transaction costs. Confirmation and the bucket's durability requirements still apply before cache removal.
 
-Open **Batches** to see collected data. **Submit next batch** requests one submission up to the piece limit; remaining data stays waiting. Manual submission works independently of the automatic switch and cache policy, and waits for submission capacity. **Details** shows members, submission times, transaction ID, and errors; stopped tasks show **Retry** when recovery is allowed. Each member includes a linked object and the number of other versions sharing its data. Missing historical object information or size is marked unavailable.
+Open **Batches** to see collected data. **Submit next batch** requests one submission up to the piece limit; remaining data stays waiting. Manual submission works independently of the automatic switch and cache policy, and waits for submission capacity. Open a batch to see its pieces, submission times, transaction ID, and errors; a stopped batch shows **Retry** when recovery is allowed. Each piece lists a linked object and the number of other versions sharing its data. Missing historical object information or size is marked unavailable.
 
 ## Provider Selection
 
@@ -145,7 +145,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 Cache eviction policies have these user-visible results:
 
 - `lru`: when cache usage reaches the high watermark, or a write is refused because the cache is full, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark. The effective low watermark never leaves less than one largest object (`1,065,353,216` bytes) of free space, which matters only for small caches.
-- `after_upload`: after a version meets its bucket's minimum durable copies, SynapS3 queues it for asynchronous removal. A later remote read can restore the cache, and that restored entry is not immediately removed again.
+- `after_upload`: after a version meets its bucket's minimum durable replicas, SynapS3 queues it for asynchronous removal. A later remote read can restore the cache, and that restored entry is not immediately removed again.
 - `none`: SynapS3 does not automatically remove local cache data.
 
 The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain saved but have no effect under `after_upload` or `none`.

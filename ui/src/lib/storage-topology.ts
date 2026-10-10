@@ -14,7 +14,7 @@ import type {
 import { storageHealthReasonLabel } from './data-set-storage-health.ts'
 import { providerDisplayName, providerLocationLabel, providerRegistryLabel } from './provider-display.ts'
 import { replicaLabel } from './storage-status-labels.ts'
-import { formatNumber, timeAgo, titleCaseEnum } from './utils.ts'
+import { enumLabel, formatNumber, timeAgo } from './utils.ts'
 
 export const observabilityStatusOptions = ['all', 'available', 'degraded', 'unavailable', 'unknown'] as const
 export const storageTopologyAllFilterValue = '__all__'
@@ -210,7 +210,7 @@ export function observabilityStatusTone(status: ObservabilityStatus): StorageTop
 }
 
 export function observabilityStatusLabel(status: ObservabilityStatus) {
-  return titleCaseEnum(status)
+  return enumLabel(status)
 }
 
 /** Why a signal is not healthy, in reading order: its reasons, then the last recorded error. */
@@ -222,7 +222,7 @@ export function observabilitySignalDetails(signal?: ObservabilitySignal) {
 }
 
 export function localStatusLabel(status: string) {
-  return titleCaseEnum(status) || '—'
+  return enumLabel(status) || '—'
 }
 
 export function localStatusTone(status: string): StorageTopologyTone {
@@ -252,7 +252,7 @@ export function freshnessLabel(freshness: ObservabilityFreshness): string {
 
 export function dataSetDisplayLabel(dataSet: DataSetDisplaySource) {
   const chainDataSetID = dataSetChainID(dataSet)
-  return chainDataSetID ? `Data Set #${chainDataSetID}` : 'No chain data set'
+  return chainDataSetID ? `Data set #${chainDataSetID}` : 'No chain data set'
 }
 
 export function dataSetChainIDValue(dataSet: DataSetDisplaySource) {
