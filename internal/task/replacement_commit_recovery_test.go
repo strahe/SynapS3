@@ -1,7 +1,6 @@
 package task_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -30,7 +29,7 @@ func TestReplacementRecoversFailedCommitWithinCoordinatorBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkpoint := json.RawMessage(`{"request_id":"` + requestID + `","sends":1}`)
-			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", checkpoint).Where("id = ?", commitID).Exec(t.Context()); err != nil {
+			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Where("id = ?", commitID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			reason := "attempts_exhausted"
@@ -74,7 +73,7 @@ func TestReplacementRecoversFailedCommitWithinCoordinatorBudget(t *testing.T) {
 				}
 				return
 			}
-			if successor == nil || successor.Type != model.TaskTypeStorageCommit || successor.ResumeMode != model.TaskResumeModeRecover || successor.RetryCount != 0 || !bytes.Equal(successor.Checkpoint, checkpoint) ||
+			if successor == nil || successor.Type != model.TaskTypeStorageCommit || successor.ResumeMode != model.TaskResumeModeRecover || successor.RetryCount != 0 || !testutil.JSONEqual(successor.Checkpoint, checkpoint) ||
 				request.TaskID == nil || *request.TaskID != successor.ID || result.RetryCount != 1 || successor.AvailableAt.Before(result.AvailableAt) || successor.AvailableAt.Before(time.Now().Add(-time.Second)) {
 				t.Fatalf("Commit recovery lost its evidence or budget: task=%#v request=%#v successor=%#v", result, request, successor)
 			}

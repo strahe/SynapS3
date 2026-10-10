@@ -1,17 +1,11 @@
 package repository
 
 import (
-	"database/sql"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
-
-	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
-	"github.com/uptrace/bun/dialect/pgdialect"
-	_ "modernc.org/sqlite"
 )
 
 func TestCaseSensitivePrefixUpperBound(t *testing.T) {
@@ -38,8 +32,8 @@ func TestCaseSensitivePrefixUpperBound(t *testing.T) {
 
 func TestCaseSensitivePrefixSQLFallsBackWhenUpperBoundUnavailable(t *testing.T) {
 	prefix := string(utf8.MaxRune)
-	condition, args := caseSensitivePrefixSQLForDialect(dialect.SQLite, "object_version.key", prefix)
-	wantCondition := "object_version.key >= ? AND substr(object_version.key, 1, ?) = ?"
+	condition, args := caseSensitivePrefixSQL("object_version.key", prefix)
+	wantCondition := `object_version.key COLLATE "C" >= ? AND substr(object_version.key, 1, ?) = ?`
 	wantArgs := []interface{}{prefix, 1, prefix}
 	if condition != wantCondition || !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("caseSensitivePrefixSQL fallback = %q, %#v; want %q, %#v", condition, args, wantCondition, wantArgs)
@@ -47,7 +41,7 @@ func TestCaseSensitivePrefixSQLFallsBackWhenUpperBoundUnavailable(t *testing.T) 
 }
 
 func TestCaseSensitivePrefixUsesCollatedRangeOnPostgres(t *testing.T) {
-	condition, args := caseSensitivePrefixSQLForDialect(dialect.PG, "object_version.key", `logs\_%/`)
+	condition, args := caseSensitivePrefixSQL("object_version.key", `logs\_%/`)
 	wantCondition := `object_version.key COLLATE "C" >= ? AND object_version.key COLLATE "C" < ?`
 	wantArgs := []interface{}{`logs\_%/`, `logs\_%0`}
 	if condition != wantCondition || !reflect.DeepEqual(args, wantArgs) {
@@ -56,14 +50,7 @@ func TestCaseSensitivePrefixUsesCollatedRangeOnPostgres(t *testing.T) {
 }
 
 func TestBucketStorageHealthMarkerUsesCollatedComparisonsOnPostgres(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file::memory:")
-	if err != nil {
-		t.Fatalf("open sqlite handle: %v", err)
-	}
-	db := bun.NewDB(sqldb, pgdialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
-	filters, args := bucketStorageHealthAffectedVersionObjectFilters(db, BucketStorageHealthAffectedVersionsInput{
+	filters, args := bucketStorageHealthAffectedVersionObjectFilters(BucketStorageHealthAffectedVersionsInput{
 		KeyMarker:       "marker",
 		VersionIDMarker: "version",
 		CreatedAtMarker: time.Unix(1, 0),

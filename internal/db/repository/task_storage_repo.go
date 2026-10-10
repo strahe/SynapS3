@@ -12,7 +12,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 const (
@@ -55,13 +54,12 @@ func isHistoryTask(task *model.Task) bool {
 
 // Creation and supersession change current identity membership. Pure archival does not.
 func (r *BunTaskRepo) lockIdentity(ctx context.Context, taskType model.TaskType, key string) error {
-	if r.db.Dialect().Name() != dialect.PG {
-		return nil
-	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("synaps3.task.identity:%d:%s:%d:%s", len(taskType), taskType, len(key), key)))
 	lockKey := int64(binary.BigEndian.Uint64(sum[:8]))
 	var acquired bool
-	if err := r.db.NewRaw("SELECT pg_try_advisory_xact_lock(?)", lockKey).Scan(ctx, &acquired); err != nil {
+	// Advisory locks are database-wide; mixing in the schema keeps identities
+	// in other schemas of the same database from contending.
+	if err := r.db.NewRaw("SELECT pg_try_advisory_xact_lock(hashtextextended(current_schema(), ?))", lockKey).Scan(ctx, &acquired); err != nil {
 		return err
 	}
 	if !acquired {
@@ -91,9 +89,7 @@ func uniqueTaskRow(rows []model.Task) (*model.Task, error) {
 func (r *BunTaskRepo) GetForUpdate(ctx context.Context, id int64) (*model.Task, error) {
 	row := new(model.Task)
 	q := taskScopeQuery(r.db, row, TaskScopeWork, true).Where("task.id = ?", id)
-	if r.db.Dialect().Name() == dialect.PG {
-		q.For("UPDATE")
-	}
+	q.For("UPDATE")
 	if err := q.Scan(ctx); err == nil {
 		return row, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -101,9 +97,7 @@ func (r *BunTaskRepo) GetForUpdate(ctx context.Context, id int64) (*model.Task, 
 	}
 	// A hot row can have moved while FOR UPDATE was waiting. Read the new location.
 	q = taskScopeQuery(r.db, row, TaskScopeHistory, true).Where("task.id = ?", id)
-	if r.db.Dialect().Name() == dialect.PG {
-		q.For("UPDATE")
-	}
+	q.For("UPDATE")
 	if err := q.Scan(ctx); errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	} else if err != nil {
@@ -391,7 +385,7 @@ func (r *BunTaskRepo) ListCurrentFailedForSubject(ctx context.Context, subjectTy
 	// These leading order columns are fixed by the filters. Keeping them in
 	// the order lets PostgreSQL use the subject index even for NULL subjects.
 	q := taskRoundsQuery(r.db, &rows, false).Where("task.status = ? AND task.superseded_at IS NULL", model.TaskStatusFailed).
-		OrderExpr("task.subject_type DESC, task.subject_key DESC, task.superseded_at DESC, task.id DESC").Limit(limit + 1)
+		OrderExpr("task.subject_type DESC, task.subject_key DESC, task.superseded_at DESC, task.id DESC").Limit(int64(limit + 1))
 	if subjectType == "" && subjectKey == "" {
 		q.Where("task.subject_type IS NULL AND task.subject_key IS NULL")
 	} else {
@@ -462,7 +456,7 @@ func (r *BunTaskRepo) List(ctx context.Context, filter TaskListFilter) (TaskPage
 		limit = 50
 	}
 	var rows []model.Task
-	q := taskScopeQuery(r.db, &rows, filter.Scope, false).OrderExpr("task.id DESC").Limit(limit + 1)
+	q := taskScopeQuery(r.db, &rows, filter.Scope, false).OrderExpr("task.id DESC").Limit(int64(limit + 1))
 	if filter.Type != "" {
 		q = q.Where("task.type = ?", filter.Type)
 	}

@@ -84,7 +84,7 @@ type FilecoinObservabilityConfig struct {
 }
 
 type DatabaseConfig struct {
-	Driver       string `koanf:"driver"` // postgres | sqlite
+	Driver       string `koanf:"driver"` // postgres
 	DSN          string `koanf:"dsn"`
 	MaxOpenConns int    `koanf:"max_open_conns"`
 	MaxIdleConns int    `koanf:"max_idle_conns"`
@@ -448,9 +448,7 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	if strings.TrimSpace(c.Database.DSN) == "" {
 		add("database.dsn", "must be set to a PostgreSQL connection URL")
 	}
-	switch c.Database.Driver {
-	case "postgres", "sqlite":
-	default:
+	if c.Database.Driver != "postgres" {
 		add("database.driver", fmt.Sprintf("must be postgres, got %q", c.Database.Driver))
 	}
 	if c.Database.MaxOpenConns < 1 {

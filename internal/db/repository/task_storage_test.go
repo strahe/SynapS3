@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -14,16 +12,8 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 )
 
-func TestPostgresTaskDuplicateAcrossTablesIsReported(t *testing.T) {
-	assertTaskDuplicateAcrossTablesIsReported(t, migratedPostgresDB(t))
-}
-
-func TestPostgresTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T) {
-	assertTaskHistoryPaginationAcrossLongArchivedChain(t, migratedPostgresDB(t))
-}
-
 func TestPostgresTaskArchiveAndCreationKeepOneIdentity(t *testing.T) {
-	db := migratedPostgresDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
 	source := enqueueAndClaimTask(t, repos, "archive-create-race", time.Minute)
@@ -63,7 +53,7 @@ func TestPostgresTaskArchiveAndCreationKeepOneIdentity(t *testing.T) {
 }
 
 func TestPostgresTaskIdentityContentionHonorsDeadline(t *testing.T) {
-	db := migratedPostgresDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	held, release := make(chan struct{}), make(chan struct{})
 	result := make(chan error, 1)

@@ -56,55 +56,6 @@ func (s *Service) bootstrap(ctx context.Context) error {
 		if err := s.repos.TaskSchedules.Ensure(ctx, def.Key, time.Now().UTC()); err != nil {
 			return err
 		}
-		// Attach the old active head before any process can dispatch a new cycle.
-		legacy, err := s.repos.Tasks.GetByIdentity(ctx, def.Type, def.Key)
-		if err != nil {
-			return err
-		}
-		if legacy != nil && legacyPolicy(legacy) && (legacy.Status == model.TaskStatusPending || legacy.Status == model.TaskStatusRunning) {
-			if err := s.repos.WithTx(ctx, func(tx *repository.Repositories) error {
-				schedule, err := tx.TaskSchedules.GetForUpdate(ctx, def.Key)
-				if err != nil {
-					return err
-				}
-				if schedule.LatestTaskID != nil {
-					return nil
-				}
-				return tx.TaskSchedules.SetHead(ctx, def.Key, schedule.Generation, schedule.Generation, nil, &legacy.ID, legacy.AvailableAt)
-			}); err != nil {
-				return err
-			}
-		}
-	}
-	var before int64
-	for {
-		page, err := s.repos.Tasks.List(ctx, repository.TaskListFilter{Status: model.TaskStatusPending, BeforeID: before, Limit: 100})
-		if err != nil {
-			return err
-		}
-		for i := range page.Tasks {
-			task, err := s.repos.Tasks.GetByID(ctx, page.Tasks[i].ID)
-			if err != nil {
-				return err
-			}
-			if task == nil || task.Status != model.TaskStatusPending {
-				continue
-			}
-			if legacyPolicy(task) || task.Type == model.TaskTypeGC {
-				if err := s.handoff(ctx, task); err != nil {
-					if !errors.Is(err, errInvalidLegacyTask) {
-						return fmt.Errorf("handing off task %d: %w", task.ID, err)
-					}
-					if err := s.failInvalidLegacyPending(ctx, task, err); err != nil {
-						return fmt.Errorf("failing invalid legacy task %d: %w", task.ID, err)
-					}
-				}
-			}
-		}
-		if page.NextBeforeID == 0 {
-			break
-		}
-		before = page.NextBeforeID
 	}
 	return s.dispatchSchedules(ctx)
 }

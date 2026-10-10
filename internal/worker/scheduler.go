@@ -72,8 +72,8 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 	if !created {
 		return nil, repository.ErrConflict
 	}
-	if definition.LegacyHandoff != nil {
-		if err := definition.LegacyHandoff(ctx, tx, source, next); err != nil {
+	if definition.BindSuccessor != nil {
+		if err := definition.BindSuccessor(ctx, tx, source, next); err != nil {
 			return nil, err
 		}
 	}

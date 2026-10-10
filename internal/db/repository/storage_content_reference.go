@@ -10,7 +10,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // lockStorageContentsByID serializes object-version references with permanent
@@ -154,19 +153,16 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 }
 
 // bucketCopyPolicyForReference reads the policy a first reference freezes into
-// its content. PostgreSQL holds a share lock until the reference commits, so a
-// policy change cannot commit in between: content named before the change
-// keeps the old target and content named after it gets the new one. SQLite
-// serializes writers, so it needs no lock.
+// its content. A share lock held until the reference commits keeps a policy
+// change from committing in between: content named before the change keeps
+// the old target and content named after it gets the new one.
 func bucketCopyPolicyForReference(ctx context.Context, db bun.IDB, bucketID int64) (int, error) {
 	var defaultCopies int
 	query := db.NewSelect().
 		Model((*model.Bucket)(nil)).
 		Column("default_copies").
 		Where("id = ?", bucketID)
-	if db.Dialect().Name() == dialect.PG {
-		query = query.For("SHARE")
-	}
+	query = query.For("SHARE")
 	if err := query.Scan(ctx, &defaultCopies); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("bucket %d: %w", bucketID, ErrNotFound)

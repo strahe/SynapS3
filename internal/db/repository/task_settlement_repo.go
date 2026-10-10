@@ -7,7 +7,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transition TaskTransition) error {
@@ -116,9 +115,7 @@ func (r *BunTaskRepo) acknowledgeQuery(ctx context.Context, build func(*bun.Sele
 		count = 0
 		var rows []model.Task
 		q := build(taskScopeQuery(db, &rows, TaskScopeWork, true)).OrderExpr("task.id ASC")
-		if db.Dialect().Name() == dialect.PG {
-			q.For("UPDATE")
-		}
+		q.For("UPDATE")
 		if err := q.Scan(ctx); err != nil {
 			return err
 		}

@@ -4601,7 +4601,7 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	counter := &storageUploadSelectCounter{}
-	db.AddQueryHook(counter)
+	testutil.AddQueryHook(db, counter)
 	localCache, err := cache.NewFilesystem(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatalf("creating test cache: %v", err)
@@ -4640,7 +4640,7 @@ func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	counter := &storageUploadSelectCounter{}
-	db.AddQueryHook(counter)
+	testutil.AddQueryHook(db, counter)
 	localCache, err := cache.NewFilesystem(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatalf("creating test cache: %v", err)

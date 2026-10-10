@@ -703,9 +703,7 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 				t.Fatal(err)
 			}
 			if rollback {
-				if _, err := runtime.db.Exec(`CREATE TRIGGER reject_pull BEFORE INSERT ON storage_pull_attempts BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END`); err != nil {
-					t.Fatal(err)
-				}
+				testutil.FailWrites(t, runtime.db, "storage_pull_attempts", "INSERT", "", "injected reservation failure")
 			} else {
 				sources, err := runtime.repos.Contents.ListReadableCommittedCopies(t.Context(), pipeline.upload.ID)
 				if err != nil || len(sources) != 1 {

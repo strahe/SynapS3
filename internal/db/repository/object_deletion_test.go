@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -9,11 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/config"
-	appdb "github.com/strahe/synaps3/internal/db"
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
 )
 
@@ -50,23 +47,6 @@ func storageContentLockQuery(query string) bool {
 	return strings.Contains(query, "update") && strings.Contains(query, "storage_contents") && strings.Contains(query, "updated_at = updated_at")
 }
 
-func migratedPostgresDB(t *testing.T) *bun.DB {
-	t.Helper()
-	db, err := appdb.New(config.DatabaseConfig{Driver: "postgres", DSN: testpg.SchemaDSN(t), MaxOpenConns: 4, MaxIdleConns: 4})
-	if err != nil {
-		t.Fatalf("opening postgres test connections: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close PostgreSQL test database: %v", err)
-		}
-	})
-	if err := appdb.RunMigrations(context.Background(), db); err != nil {
-		t.Fatalf("running postgres test migrations: %v", err)
-	}
-	return db
-}
-
 func waitPostgresSignal(t *testing.T, signal <-chan struct{}, name string) {
 	t.Helper()
 	select {
@@ -101,7 +81,7 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 		{name: "reuse wins", blockedOperation: "reuse"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := migratedPostgresDB(t)
+			db := testDB(t)
 			repos := repository.NewRepositories(db)
 			ctx := context.Background()
 			bucket := seedBucket(t, db, "postgres-permanent-delete-"+strings.ReplaceAll(tc.name, " ", "-"))
@@ -128,7 +108,7 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 					close(barrier.release)
 				}
 			}()
-			db.AddQueryHook(barrier)
+			testutil.AddQueryHook(db, barrier)
 			deleteCtx := context.WithValue(ctx, storageContentLockContextKey{}, "delete")
 			reuseCtx := context.WithValue(ctx, storageContentLockContextKey{}, "reuse")
 			deleteResult := make(chan error, 1)

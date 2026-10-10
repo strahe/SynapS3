@@ -183,19 +183,6 @@ func (e *Engine) executeClaimSafely(parent context.Context, claimed *model.Task)
 
 func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	logger := e.logger.With("task_id", claimed.ID, "task_type", claimed.Type, "claim_generation", claimed.ClaimGeneration)
-	if claimed.Type == model.TaskTypeGC || legacyPolicy(claimed) {
-		service, _ := NewService(e.registry, e.repos)
-		if err := service.handoff(parent, claimed); err != nil {
-			logger.Error("handing off legacy task", "error", err)
-			if errors.Is(err, errInvalidLegacyTask) {
-				if e.commitResult(parent, claimed, Fail(err, "invalid_legacy_task", nil)) == nil {
-					return
-				}
-			}
-			e.abandonClaim(claimed)
-		}
-		return
-	}
 	policy, policyErr := DecodePolicy(claimed)
 	if policyErr != nil {
 		if err := e.commitResult(parent, claimed, Fail(policyErr, "invalid_policy", nil)); err != nil {

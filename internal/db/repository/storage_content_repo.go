@@ -16,7 +16,6 @@ import (
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 type BunStorageContentRepo struct {
@@ -551,7 +550,7 @@ func (r *BunStorageContentRepo) listBucketStorageHealthReasonCodes(ctx context.C
 		FROM abnormal_data_sets AS abnormal_data_set
 		WHERE %s
 		ORDER BY abnormal_data_set.bucket_id ASC`,
-		storageHealthEmptyJSONArraySQL(r.db),
+		storageHealthEmptyJSONArraySQL(),
 		dataSetBucketFilter,
 		storageHealthReadyDataSetStatusListSQL(),
 		storageHealthAbnormalObservationStatusListSQL(),
@@ -1536,7 +1535,7 @@ func countSubmittedCommitCopies(ctx context.Context, db bun.IDB, contentID int64
 	if err != nil {
 		return 0, fmt.Errorf("counting submitted storage commits: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 // selectObjectVersionRefsForContent lists the live data versions backed by one
@@ -1814,9 +1813,7 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types
 	// the target, so a recovered service cannot become rejected again.
 	var replacements []storagereplacement.Replacement
 	lock := db.NewSelect().Model(&replacements).Column("id").Where("target_data_set_id = ?", id).OrderExpr("id ASC")
-	if db.Dialect().Name() == dialect.PG {
-		lock = lock.For("UPDATE")
-	}
+	lock = lock.For("UPDATE")
 	if err := lock.Scan(ctx); err != nil {
 		return fmt.Errorf("locking replacement for ready binding: %w", err)
 	}

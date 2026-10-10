@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 type closedEnumCheck struct {
@@ -41,7 +40,7 @@ func TestClosedLifecycleEnumsMatchAppliedChecks(t *testing.T) {
 		{directory: "storagereplacement", typeName: "ItemStatus", table: "storage_replacement_items", constraint: "chk_storage_replacement_items_status"},
 	}
 
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		for _, check := range checks {
 			t.Run(check.table+"/"+check.typeName, func(t *testing.T) {
 				goValues := typedStringConstants(t, filepath.Join("..", "..", check.directory), check.typeName)
@@ -153,22 +152,14 @@ var singleQuotedSQLValue = regexp.MustCompile(`'(?:''|[^'])*'`)
 func appliedCheckStringValues(t *testing.T, db *bun.DB, table, constraint string) []string {
 	t.Helper()
 	var definition string
-	if db.Dialect().Name() == dialect.PG {
-		if err := db.NewRaw(`SELECT pg_get_constraintdef(constraint_info.oid)
-			FROM pg_constraint AS constraint_info
-			JOIN pg_class AS table_info ON table_info.oid = constraint_info.conrelid
-			JOIN pg_namespace AS namespace_info ON namespace_info.oid = table_info.relnamespace
-			WHERE namespace_info.nspname = current_schema()
-			  AND table_info.relname = ?
-			  AND constraint_info.conname = ?`, table, constraint).Scan(t.Context(), &definition); err != nil {
-			t.Fatalf("read PostgreSQL check %s.%s: %v", table, constraint, err)
-		}
-	} else {
-		var ddl string
-		if err := db.NewRaw(`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?`, table).Scan(t.Context(), &ddl); err != nil {
-			t.Fatalf("read SQLite DDL for %s: %v", table, err)
-		}
-		definition = namedCheckExpression(t, ddl, constraint)
+	if err := db.NewRaw(`SELECT pg_get_constraintdef(constraint_info.oid)
+		FROM pg_constraint AS constraint_info
+		JOIN pg_class AS table_info ON table_info.oid = constraint_info.conrelid
+		JOIN pg_namespace AS namespace_info ON namespace_info.oid = table_info.relnamespace
+		WHERE namespace_info.nspname = current_schema()
+		  AND table_info.relname = ?
+		  AND constraint_info.conname = ?`, table, constraint).Scan(t.Context(), &definition); err != nil {
+		t.Fatalf("read PostgreSQL check %s.%s: %v", table, constraint, err)
 	}
 	values := make([]string, 0)
 	for _, quoted := range singleQuotedSQLValue.FindAllString(definition, -1) {
@@ -176,47 +167,4 @@ func appliedCheckStringValues(t *testing.T, db *bun.DB, table, constraint string
 	}
 	slices.Sort(values)
 	return slices.Compact(values)
-}
-
-func namedCheckExpression(t *testing.T, ddl, constraint string) string {
-	t.Helper()
-	lower := strings.ToLower(ddl)
-	start := strings.Index(lower, "constraint "+strings.ToLower(constraint))
-	if start < 0 {
-		t.Fatalf("constraint %s not found in %s", constraint, ddl)
-	}
-	check := strings.Index(lower[start:], "check")
-	if check < 0 {
-		t.Fatalf("CHECK keyword for %s not found in %s", constraint, ddl)
-	}
-	open := strings.Index(ddl[start+check:], "(")
-	if open < 0 {
-		t.Fatalf("CHECK expression for %s not found in %s", constraint, ddl)
-	}
-	open += start + check
-	depth := 0
-	inString := false
-	for index := open; index < len(ddl); index++ {
-		switch ddl[index] {
-		case '\'':
-			if inString && index+1 < len(ddl) && ddl[index+1] == '\'' {
-				index++
-				continue
-			}
-			inString = !inString
-		case '(':
-			if !inString {
-				depth++
-			}
-		case ')':
-			if !inString {
-				depth--
-				if depth == 0 {
-					return ddl[open+1 : index]
-				}
-			}
-		}
-	}
-	t.Fatalf("unterminated CHECK expression for %s in %s", constraint, ddl)
-	return ""
 }

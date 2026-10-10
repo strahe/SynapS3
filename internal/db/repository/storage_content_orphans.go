@@ -45,7 +45,7 @@ func (r *BunStorageContentRepo) ListOrphanedContents(ctx context.Context, create
 		Where("storage_content.created_at < ?", createdBefore).
 		Where(orphanedContentSQL("storage_content")).
 		OrderExpr("storage_content.id ASC").
-		Limit(limit).
+		Limit(int64(limit)).
 		Scan(ctx, &rows)
 	if err != nil {
 		return nil, fmt.Errorf("listing orphaned content: %w", err)

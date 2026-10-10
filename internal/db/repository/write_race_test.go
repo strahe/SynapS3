@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -17,8 +15,8 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// These races only exist under PostgreSQL's READ COMMITTED: SQLite runs one
-// writing transaction at a time, so none of the interleavings below can occur.
+// These races exist under READ COMMITTED, where concurrent writing transactions
+// interleave.
 
 type postgresRaceOperation struct{}
 
@@ -83,16 +81,11 @@ func waitForPostgresLockWait(t *testing.T, db *bun.DB, table string) {
 	t.Fatalf("no transaction waited for a lock on %s", table)
 }
 
-func postgresRaceDB(t *testing.T) *bun.DB {
-	t.Helper()
-	return migratedPostgresDB(t)
-}
-
 // Replacement drains the source while an upload plan settles against it. The
 // settlement must not bind the drained source: a copy placed there after the
 // switch would never be migrated to the target.
 func TestPostgresUploadBindingDoesNotLandOnADrainedSource(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
 	bucket := seedBucket(t, db, "postgres-drained-source")
@@ -124,7 +117,7 @@ func TestPostgresUploadBindingDoesNotLandOnADrainedSource(t *testing.T) {
 	hold := newPostgresRaceHold("activate", func(query string) bool {
 		return strings.Contains(query, "storage_data_sets") && strings.Contains(query, "'draining'")
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 
 	coordinator := localCoordinatorTask(t, repos, replacement)
@@ -182,7 +175,7 @@ func TestPostgresUploadBindingDoesNotLandOnADrainedSource(t *testing.T) {
 // it, or the content would carry the old target although it was named after
 // the change.
 func TestPostgresCopyPolicyChangeWaitsForAFirstReference(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
 	bucket := &model.Bucket{Name: "postgres-first-reference", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
@@ -199,7 +192,7 @@ func TestPostgresCopyPolicyChangeWaitsForAFirstReference(t *testing.T) {
 	hold := newPostgresRaceHold("reference", func(query string) bool {
 		return strings.Contains(query, `from "buckets"`) && strings.Contains(query, "default_copies")
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 
 	version := newObjectVersion(bucket.ID, "first.txt", model.NewVersionID(), 10)
@@ -241,7 +234,7 @@ func TestPostgresCopyPolicyChangeWaitsForAFirstReference(t *testing.T) {
 // sends the same request ID twice at once. The loser must get the winner's
 // operation inside its own transaction.
 func TestPostgresWalletRequestRaceReturnsTheWinner(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
 	input := repository.CreateWalletOperationInput{
@@ -252,7 +245,7 @@ func TestPostgresWalletRequestRaceReturnsTheWinner(t *testing.T) {
 		Status: model.WalletOperationStatusPending, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	race := &walletInsertRace{db: db, winner: winner}
-	db.AddQueryHook(race)
+	testutil.AddQueryHook(db, race)
 
 	loserCtx := postgresRaceContext(ctx, "loser")
 	err := repos.WithTx(loserCtx, func(tx *repository.Repositories) error {

@@ -142,7 +142,7 @@ func TestPrepareEvictionReusesOnlyMatchingLiveOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal mismatched generation input: %v", err)
 	}
-	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("input_json = ?", badInput).Where("id = ?", generationConflictTask.ID).Exec(ctx); err != nil {
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("input_json = ?", json.RawMessage(badInput)).Where("id = ?", generationConflictTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("corrupt generation input: %v", err)
 	}
 	if err := repos.CacheEvictions.BindEvictionTask(

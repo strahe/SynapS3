@@ -10,11 +10,10 @@ import (
 	"testing"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucket(t, db, "constraint-bucket")
 		var strategy string
 		if err := db.NewRaw("SELECT provider_selection_strategy FROM buckets WHERE id = ?", bucketID).Scan(t.Context(), &strategy); err != nil || strategy != "distribution" {
@@ -143,7 +142,7 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 }
 
 func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketA := insertSchemaTestBucket(t, db, "identity-a")
 		bucketB := insertSchemaTestBucket(t, db, "identity-b")
 		contentA := insertSchemaTestContent(t, db, bucketA, "upload-a")
@@ -425,7 +424,7 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 }
 
 func TestCurrentSchemaFailedIngressAllowsOneReplacementIngress(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucket(t, db, "retired-ingress")
 		contentID := insertSchemaTestContent(t, db, bucketID, "retired-ingress-content")
 		retiredDataSetID := insertSchemaTestDataSet(t, db, bucketID, "101", 0, 1, true)
@@ -447,7 +446,7 @@ func TestCurrentSchemaFailedIngressAllowsOneReplacementIngress(t *testing.T) {
 }
 
 func TestCurrentSchemaIdentitySupportsGenerationAndBackfill(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		first := insertSchemaTestTask(t, db, "identity-first")
 		if _, err := db.Exec(`DELETE FROM tasks WHERE id = ?`, first); err != nil {
 			t.Fatalf("delete first identity row: %v", err)
@@ -474,9 +473,6 @@ func TestCurrentSchemaIdentitySupportsGenerationAndBackfill(t *testing.T) {
 		afterBackfill := insertSchemaTestTask(t, db, "identity-after-backfill")
 		if afterBackfill <= 0 || afterBackfill == backfilledID {
 			t.Fatalf("generated ID after backfill = %d", afterBackfill)
-		}
-		if db.Dialect().Name() == dialect.SQLite && afterBackfill <= backfilledID {
-			t.Fatalf("SQLite generated ID after backfill = %d, want > %d", afterBackfill, backfilledID)
 		}
 	})
 }
@@ -604,12 +600,9 @@ func requireConstraintRejection(t *testing.T, err error, query string) {
 // exactly how three stale cases survived a column being removed.
 func rejectedByMissingSchema(err error) bool {
 	for _, missing := range []string{
-		"no such table",       // SQLite
-		"no such column",      // SQLite
-		"has no column named", // SQLite, INSERT column list
-		"does not exist",      // PostgreSQL, relation/column
-		"undefined_table",     // PostgreSQL, SQLSTATE name
-		"undefined_column",    // PostgreSQL, SQLSTATE name
+		"does not exist",   // relation/column
+		"undefined_table",  // SQLSTATE name
+		"undefined_column", // SQLSTATE name
 	} {
 		if strings.Contains(err.Error(), missing) {
 			return true
@@ -619,19 +612,11 @@ func rejectedByMissingSchema(err error) bool {
 }
 
 func rejectedByNullConstraint(err error) bool {
-	for _, nullConstraint := range []string{
-		"NOT NULL constraint failed", // SQLite
-		"null value in column",       // PostgreSQL
-	} {
-		if strings.Contains(err.Error(), nullConstraint) {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(err.Error(), "null value in column")
 }
 
 func TestCurrentSchemaReplicaIndexRequiresAnOpenSlot(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucketWithSlots(t, db, "two-slot-bucket", 2)
 
 		// The bucket opened 0 and 1, so a data set on 5 has no slot to belong to.
@@ -656,7 +641,7 @@ func TestCurrentSchemaReplicaIndexRequiresAnOpenSlot(t *testing.T) {
 // A termination names one data set through the role it ended, and the composite
 // foreign keys keep that data set inside the replacement it belongs to.
 func TestCurrentSchemaTerminationBelongsToItsReplacementRole(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucket(t, db, "termination-bucket")
 		source := insertSchemaTestDataSet(t, db, bucketID, "101", 0, 1, true)
 		target := insertSchemaTestDataSet(t, db, bucketID, "202", 0, 2, false)
@@ -712,7 +697,7 @@ func TestCurrentSchemaTerminationBelongsToItsReplacementRole(t *testing.T) {
 // Accounts without a name share the empty default; set names are unique byte
 // for byte, so names differing only in case are distinct.
 func TestCurrentSchemaAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		const unnamed = `INSERT INTO s3_accounts (access_key, secret_key, role, is_root, created_at, updated_at)
 			VALUES (?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
@@ -737,7 +722,7 @@ func TestCurrentSchemaAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
 }
 
 func TestTaskTablesEnforceStateAndBudget(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		id := insertSchemaTestTask(t, db, "working")
 		for _, statement := range []string{
 			`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP WHERE id=?`,

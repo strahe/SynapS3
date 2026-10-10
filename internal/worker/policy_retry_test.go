@@ -47,7 +47,7 @@ func TestRetryUsesCurrentPolicyWithoutChangingSourceSnapshot(t *testing.T) {
 }
 
 func TestConcurrentManualRetriesReturnOneDirectSuccessor(t *testing.T) {
-	assertConcurrentManualRetries(t, testutil.NewTestFileDB(t))
+	assertConcurrentManualRetries(t, testutil.NewTestDB(t))
 }
 
 func assertConcurrentManualRetries(t *testing.T, db *bun.DB) {
@@ -202,7 +202,7 @@ func TestMalformedPolicyNeverDispatchesHandler(t *testing.T) {
 	}
 }
 
-func TestDecodePolicyRejectsUnavailableBudgetAndPreservesLegacyUnknownBudget(t *testing.T) {
+func TestDecodePolicyRejectsUnavailableBudget(t *testing.T) {
 	raw, err := encodePolicy(ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy()})
 	if err != nil {
 		t.Fatal(err)
@@ -224,24 +224,6 @@ func TestDecodePolicyRejectsUnavailableBudgetAndPreservesLegacyUnknownBudget(t *
 		if _, err := DecodePolicy(&model.Task{Policy: policy}); !errors.Is(err, ErrInvalidPolicy) {
 			t.Fatalf("budget %s accepted: %v", budget, err)
 		}
-	}
-	var legacy map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &legacy); err != nil {
-		t.Fatal(err)
-	}
-	legacy["version"] = json.RawMessage(`0`)
-	legacy["legacy"] = json.RawMessage(`true`)
-	legacy["max_attempts"] = json.RawMessage(`null`)
-	policy, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	task := &model.Task{Policy: policy}
-	if !legacyPolicy(task) {
-		t.Fatal("unknown legacy budget lost handoff eligibility")
-	}
-	if _, err := DecodePolicy(task); !errors.Is(err, ErrInvalidPolicy) {
-		t.Fatal("unknown legacy budget became an executable default")
 	}
 }
 

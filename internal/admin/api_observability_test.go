@@ -251,7 +251,7 @@ func TestAPIObservabilityProvidersKeepsHealthWhenSpeedResultsFail(t *testing.T) 
 }
 
 func TestAPIProviderUploadSpeedTestConcurrentAdmission(t *testing.T) {
-	db := testutil.NewTestFileDB(t)
+	db := testutil.NewTestDB(t)
 	db.SetMaxOpenConns(4)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Now().UTC()

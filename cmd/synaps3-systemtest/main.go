@@ -15,10 +15,15 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/systemtest"
+	"github.com/strahe/synaps3/internal/testpg"
 )
 
 func main() {
-	if err := run(); err != nil {
+	err := run()
+	if closeErr := testpg.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("closing PostgreSQL test container: %w", closeErr))
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "systemtest server: %v\n", err)
 		os.Exit(1)
 	}

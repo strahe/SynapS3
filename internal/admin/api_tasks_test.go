@@ -56,7 +56,6 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories, overr
 		model.TaskTypeWalletOperation,
 		model.TaskTypeObservabilityRefresh,
 		model.TaskTypeProviderUploadSpeedTest,
-		model.TaskTypeGC,
 	} {
 		definition := taskengine.Definition{
 			Type:         taskType,
@@ -906,23 +905,12 @@ func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 	}
 }
 
-func TestAPITaskLegacyPolicyIsReadableAndRetryRequiresEmptyBody(t *testing.T) {
+func TestAPITaskRetryRequiresEmptyBody(t *testing.T) {
 	f := newAdminTaskFixture(t)
-	row := f.enqueue(t, model.TaskTypeUploadPlan, "legacy-detail", time.Now(), "bucket", "1")
+	row := f.enqueue(t, model.TaskTypeUploadPlan, "retry-body", time.Now(), "bucket", "1")
 	f.transition(t, row.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
-	if _, err := f.db.NewRaw("UPDATE tasks SET policy_json = ? WHERE id = ?", `{"version":0,"legacy":true,"max_attempts":6,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2}}`, row.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
 	path := "/api/v1/tasks/" + strconv.FormatInt(row.ID, 10)
-	rr := f.request(http.MethodGet, path, nil)
-	var detail struct {
-		Policy *taskPolicyView `json:"policy"`
-	}
-	decodeJSON(t, rr, &detail)
-	if rr.Code != http.StatusOK || detail.Policy == nil || !detail.Policy.Legacy || detail.Policy.MaxAttempts == nil || *detail.Policy.MaxAttempts != 6 {
-		t.Fatalf("legacy policy unreadable: %d %s", rr.Code, rr.Body.String())
-	}
-	rr = f.request(http.MethodPost, path+"/retry", strings.NewReader(`{}`))
+	rr := f.request(http.MethodPost, path+"/retry", strings.NewReader(`{}`))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("retry accepted body: %d %s", rr.Code, rr.Body.String())
 	}

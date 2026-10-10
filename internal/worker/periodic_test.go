@@ -15,7 +15,7 @@ import (
 
 func periodicHarness(t *testing.T) taskHarness {
 	t.Helper()
-	return periodicHarnessWithDB(t, testutil.NewTestFileDB(t))
+	return periodicHarnessWithDB(t, testutil.NewTestDB(t))
 }
 
 func periodicHarnessWithDB(t *testing.T, db *bun.DB) taskHarness {

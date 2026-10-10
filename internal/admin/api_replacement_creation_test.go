@@ -395,10 +395,11 @@ func TestObservedReplacementServiceCompletionIsAtomic(t *testing.T) {
 				}}, nil
 			}})
 			messages := f.srv.replacementMessages
+			restoreEnqueue := func() {}
 			if failure == "dependency" {
 				f.srv.replacementMessages = nil
-			} else if _, err := f.srv.db.ExecContext(t.Context(), `CREATE TRIGGER reject_recovered_copy_task BEFORE INSERT ON tasks WHEN NEW.type = 'storage_transfer_plan' BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END`); err != nil {
-				t.Fatal(err)
+			} else {
+				restoreEnqueue = testutil.FailWrites(t, f.srv.db, "tasks", "INSERT", "NEW.type = 'storage_transfer_plan'", "injected enqueue failure")
 			}
 			failed := f.start(t, `{"mode":"manual","provider_id":"202"}`)
 			if failed.Code != http.StatusInternalServerError {
@@ -412,11 +413,7 @@ func TestObservedReplacementServiceCompletionIsAtomic(t *testing.T) {
 			if err != nil || copyRow.ActiveTaskID != nil || copyRow.WorkGeneration != 0 {
 				t.Fatalf("partial copy work committed: %#v %v", copyRow, err)
 			}
-			if failure == "enqueue" {
-				if _, err := f.srv.db.ExecContext(t.Context(), "DROP TRIGGER reject_recovered_copy_task"); err != nil {
-					t.Fatal(err)
-				}
-			}
+			restoreEnqueue()
 			f.srv.replacementMessages = messages
 			recovered := f.start(t, `{"mode":"manual","provider_id":"202"}`)
 			if recovered.Code != http.StatusConflict {
@@ -627,10 +624,8 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 				if wantReplaceable {
 					// A cleanup enqueue failure must also roll back the new target and
 					// the predecessor's supersession, generation, and coordinator fence.
-					trigger := fmt.Sprintf("CREATE TRIGGER reject_cleanup_coordinator BEFORE INSERT ON tasks WHEN NEW.type = 'provider_replacement_coordinate' AND NEW.subject_key = '%d' BEGIN SELECT RAISE(ABORT, 'injected cleanup enqueue failure'); END", row.ID)
-					if _, err := f.srv.db.ExecContext(t.Context(), trigger); err != nil {
-						t.Fatal(err)
-					}
+					restoreRejectCleanupCoordinator := testutil.FailWrites(t, f.srv.db, "tasks", "INSERT",
+						fmt.Sprintf("NEW.type = 'provider_replacement_coordinate' AND NEW.subject_key = '%d'", row.ID), "injected cleanup enqueue failure")
 					failed := f.start(t, confirmation)
 					before, err := f.srv.repos.Replacements.GetByID(t.Context(), row.ID)
 					if failed.Code != http.StatusInternalServerError || err != nil || before.Status != phase || before.TaskGeneration != row.TaskGeneration || before.TaskID == nil || *before.TaskID != f.replacementTaskID(t, row.ID) {
@@ -640,9 +635,7 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 					if err != nil || count != 2 {
 						t.Fatalf("replacement rollback left another target: count=%d err=%v", count, err)
 					}
-					if _, err := f.srv.db.ExecContext(t.Context(), "DROP TRIGGER reject_cleanup_coordinator"); err != nil {
-						t.Fatal(err)
-					}
+					restoreRejectCleanupCoordinator()
 				}
 				confirmed := f.start(t, confirmation)
 				if wantReplaceable {

@@ -349,7 +349,7 @@ func (r *BunBucketRepo) CountByOwner(ctx context.Context, ownerAccessKey string)
 	if err != nil {
 		return 0, fmt.Errorf("counting buckets by owner: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 func (r *BunBucketRepo) AggregateCountsByOwner(ctx context.Context) (map[string]int, error) {
@@ -419,5 +419,5 @@ func (r *BunBucketRepo) CountStorageDataSets(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("counting storage data sets: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }

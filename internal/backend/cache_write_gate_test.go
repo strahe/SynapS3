@@ -63,7 +63,7 @@ func assertWriteHoldsContentGateThroughVersionInsert(
 ) {
 	t.Helper()
 	hook := &blockingObjectVersionInsertHook{entered: make(chan struct{}), release: make(chan struct{})}
-	tb.db.AddQueryHook(hook)
+	testutil.AddQueryHook(tb.db, hook)
 	writeDone := make(chan error, 1)
 	go func() { writeDone <- write() }()
 

@@ -37,7 +37,7 @@ func bucketStorageHealthDataSetCTE(db bun.IDB) string {
 		   OR observation_missing
 		   OR observation_stale
 		   OR observation_status IN (%s)
-	)`, storageHealthEmptyJSONArraySQL(db), storageHealthReadyDataSetStatusListSQL(), storageHealthAbnormalObservationStatusListSQL())
+	)`, storageHealthEmptyJSONArraySQL(), storageHealthReadyDataSetStatusListSQL(), storageHealthAbnormalObservationStatusListSQL())
 }
 
 type affectedVersionRow struct {
@@ -124,12 +124,12 @@ func (r *BunStorageContentRepo) ListBucketStorageHealthAffectedVersions(ctx cont
 }
 
 func (r *BunStorageContentRepo) listBucketStorageHealthAffectedVersionRows(ctx context.Context, input BucketStorageHealthAffectedVersionsInput, limit int) ([]affectedVersionRow, error) {
-	filters, args := bucketStorageHealthAffectedVersionObjectFilters(r.db, input)
+	filters, args := bucketStorageHealthAffectedVersionObjectFilters(input)
 	args = append([]any{input.StaleBefore, input.BucketID, input.BucketID}, args...)
 	dataSetFilter, dataSetArgs := bucketStorageHealthAffectedVersionDataSetFilter(input)
 	args = append(args, dataSetArgs...)
 	args = append(args, limit)
-	keyOrder := keyOrderExpr(r.db, "object_version.key")
+	keyOrder := keyOrderExpr("object_version.key")
 	query := fmt.Sprintf(`WITH %s
 		SELECT
 			object_version.version_id,
@@ -249,7 +249,7 @@ func (r *BunStorageContentRepo) listBucketStorageHealthReadableAlternativeCounts
 	return out, nil
 }
 
-func bucketStorageHealthAffectedVersionObjectFilters(db bun.IDB, input BucketStorageHealthAffectedVersionsInput) (string, []any) {
+func bucketStorageHealthAffectedVersionObjectFilters(input BucketStorageHealthAffectedVersionsInput) (string, []any) {
 	var filters strings.Builder
 	args := make([]any, 0, 8)
 	if input.Key != "" {
@@ -257,7 +257,7 @@ func bucketStorageHealthAffectedVersionObjectFilters(db bun.IDB, input BucketSto
 		  AND object_version.key = ?`)
 		args = append(args, input.Key)
 	} else if input.Prefix != "" {
-		condition, prefixArgs := caseSensitivePrefixSQL(db, "object_version.key", input.Prefix)
+		condition, prefixArgs := caseSensitivePrefixSQL("object_version.key", input.Prefix)
 		filters.WriteString(`
 		  AND `)
 		filters.WriteString(condition)
@@ -267,11 +267,11 @@ func bucketStorageHealthAffectedVersionObjectFilters(db bun.IDB, input BucketSto
 		filters.WriteString(`
 		  AND (
 				`)
-		filters.WriteString(keyComparisonSQL(db, "object_version.key", ">"))
+		filters.WriteString(keyComparisonSQL("object_version.key", ">"))
 		filters.WriteString(`
 				OR (
 					`)
-		filters.WriteString(keyComparisonSQL(db, "object_version.key", "="))
+		filters.WriteString(keyComparisonSQL("object_version.key", "="))
 		filters.WriteString(`
 					AND (
 						object_version.created_at < ?

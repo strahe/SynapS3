@@ -83,7 +83,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input walletoperation.Input
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

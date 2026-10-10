@@ -12,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 var _ StorageReplacementRepository = (*BunStorageReplacementRepo)(nil)
@@ -57,9 +56,7 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		}
 		source := new(model.StorageDataSet)
 		query := db.NewSelect().Model(source).Where("id = ?", input.SourceDataSetID)
-		if db.Dialect().Name() == dialect.PG {
-			query = query.For("UPDATE")
-		}
+		query = query.For("UPDATE")
 		if err := query.Scan(ctx); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
@@ -803,7 +800,7 @@ func (r *BunStorageReplacementRepo) ListForBucket(ctx context.Context, bucketID 
 		Where("storage_replacement.bucket_id = ?", bucketID).
 		OrderExpr("storage_replacement.id DESC")
 	if limit > 0 {
-		q = q.Limit(limit)
+		q = q.Limit(int64(limit))
 	}
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing bucket provider replacements: %w", err)
@@ -873,7 +870,7 @@ func (r *BunStorageReplacementRepo) ListActive(ctx context.Context, afterID int6
 			storagereplacement.StatusWaiting,
 			storagereplacement.StatusRetiring).
 		OrderExpr("storage_replacement.id ASC").
-		Limit(limit).
+		Limit(int64(limit)).
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing active provider replacements: %w", err)
 	}

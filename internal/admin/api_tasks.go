@@ -176,8 +176,7 @@ func validTaskType(taskType model.TaskType) bool {
 		model.TaskTypeObservabilityRefresh,
 		model.TaskTypeApprovedProviderRefresh,
 		model.TaskTypeEndorsedProviderRefresh,
-		model.TaskTypeProviderUploadSpeedTest,
-		model.TaskTypeGC:
+		model.TaskTypeProviderUploadSpeedTest:
 		return true
 	default:
 		return false
@@ -216,16 +215,12 @@ func (s *Server) taskListItem(_ context.Context, row *model.Task) taskListItem {
 func taskMaxAttempts(row *model.Task) *int {
 	var snapshot struct {
 		Version     int  `json:"version"`
-		Legacy      bool `json:"legacy"`
 		MaxAttempts *int `json:"max_attempts"`
 	}
-	if json.Unmarshal(row.Policy, &snapshot) != nil || snapshot.MaxAttempts == nil || *snapshot.MaxAttempts < 1 {
+	if json.Unmarshal(row.Policy, &snapshot) != nil || snapshot.Version != 2 || snapshot.MaxAttempts == nil || *snapshot.MaxAttempts < 1 {
 		return nil
 	}
-	if snapshot.Version == 2 || (snapshot.Version == 0 && snapshot.Legacy) {
-		return snapshot.MaxAttempts
-	}
-	return nil
+	return snapshot.MaxAttempts
 }
 
 // Unresolved storage attention blocks acknowledgement on every task view.
@@ -326,8 +321,6 @@ func taskOperationLabel(taskType model.TaskType) string {
 		return "Refresh endorsed providers"
 	case model.TaskTypeProviderUploadSpeedTest:
 		return "Test upload speed"
-	case model.TaskTypeGC:
-		return "Legacy task cleanup"
 	default:
 		return "Background operation"
 	}
@@ -506,19 +499,6 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 	}{Task: items[0]}
 	if policy, err := taskengine.DecodePolicy(row); err == nil {
 		response.Policy = &taskPolicyView{MaxAttempts: new(policy.MaxAttempts), InitialDelay: policy.Backoff.InitialDelay.String(), MaximumDelay: policy.Backoff.MaximumDelay.String(), Multiplier: policy.Backoff.Multiplier, Jitter: policy.Backoff.Jitter, InvocationTimeout: policy.InvocationTimeout.String(), ObservationWindow: policy.ObservationWindow.String()}
-	} else {
-		var snapshot struct {
-			Version           int                      `json:"version"`
-			Legacy            bool                     `json:"legacy"`
-			Backoff           taskengine.BackoffPolicy `json:"backoff"`
-			InvocationTimeout time.Duration            `json:"invocation_timeout"`
-			ObservationWindow time.Duration            `json:"observation_window"`
-			MaxAttempts       *int                     `json:"max_attempts"`
-		}
-		if json.Unmarshal(row.Policy, &snapshot) == nil && snapshot.Version == 0 && snapshot.Legacy {
-			response.Policy = &taskPolicyView{Legacy: true, InitialDelay: snapshot.Backoff.InitialDelay.String(), MaximumDelay: snapshot.Backoff.MaximumDelay.String(), Multiplier: snapshot.Backoff.Multiplier, Jitter: snapshot.Backoff.Jitter, InvocationTimeout: snapshot.InvocationTimeout.String(), ObservationWindow: snapshot.ObservationWindow.String()}
-			response.Policy.MaxAttempts = snapshot.MaxAttempts
-		}
 	}
 	writeJSON(w, 200, response)
 }
@@ -531,7 +511,6 @@ type taskPolicyView struct {
 	Jitter            float64 `json:"jitter"`
 	InvocationTimeout string  `json:"invocation_timeout"`
 	ObservationWindow string  `json:"observation_window"`
-	Legacy            bool    `json:"legacy"`
 }
 
 func taskPageParameters(w http.ResponseWriter, r *http.Request) (int64, int, bool) {

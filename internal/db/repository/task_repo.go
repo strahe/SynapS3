@@ -11,49 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
-
-const claimExpiredTaskSQLiteSQL = `UPDATE tasks
-SET status = 'running',
-    resume_mode = 'recover',
-    claim_generation = claim_generation + 1,
-    claimed_at = ?,
-    lease_until = ?,
-    started_at = COALESCE(started_at, ?),
-    finished_at = NULL,
-    wait_reason = NULL,
-    status_message = NULL,
-    updated_at = ?
-WHERE id = (
-    SELECT id
-    FROM tasks
-    WHERE status = 'running' AND lease_until <= ?%s
-    ORDER BY lease_until, id
-    LIMIT 1
-)
-AND status = 'running' AND lease_until <= ?
-RETURNING *`
-
-const claimPendingTaskSQLiteSQL = `UPDATE tasks
-SET status = 'running',
-    claim_generation = claim_generation + 1,
-    claimed_at = ?,
-    lease_until = ?,
-    started_at = COALESCE(started_at, ?),
-    finished_at = NULL,
-    wait_reason = NULL,
-    status_message = NULL,
-    updated_at = ?
-WHERE id = (
-    SELECT id
-    FROM tasks
-    WHERE status = 'pending' AND available_at <= ?%s
-    ORDER BY available_at, id
-    LIMIT 1
-)
-AND status = 'pending' AND available_at <= ?
-RETURNING *`
 
 const claimExpiredTaskPostgresSQL = `UPDATE tasks
 SET status = 'running',
@@ -129,16 +87,6 @@ func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration
 	if leaseDuration <= 0 {
 		return nil, fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
 	}
-	if r.db.Dialect().Name() != dialect.PG {
-		// The claim and its payload read commit together, as on PostgreSQL.
-		var claimed *model.Task
-		err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-			var err error
-			claimed, err = r.claimNextSQLite(ctx, db, leaseDuration, filter)
-			return err
-		})
-		return claimed, err
-	}
 	db, ok := r.db.(*bun.DB)
 	if !ok {
 		return r.claimNextPostgres(ctx, r.db, leaseDuration, filter)
@@ -154,10 +102,6 @@ func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration
 
 func (r *BunTaskRepo) claimNextPostgres(ctx context.Context, db bun.IDB, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error) {
 	return claimNextTask(ctx, db, leaseDuration, filter, claimExpiredTaskPostgresSQL, claimPendingTaskPostgresSQL)
-}
-
-func (r *BunTaskRepo) claimNextSQLite(ctx context.Context, db bun.IDB, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error) {
-	return claimNextTask(ctx, db, leaseDuration, filter, claimExpiredTaskSQLiteSQL, claimPendingTaskSQLiteSQL)
 }
 
 func claimNextTask(
@@ -406,7 +350,7 @@ func (r *BunTaskRepo) CountFailedMatching(ctx context.Context, filter TaskAcknow
 	if err != nil {
 		return 0, fmt.Errorf("counting failed tasks: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 func (r *BunTaskRepo) CountUnacknowledgedFailed(ctx context.Context) (int64, error) {

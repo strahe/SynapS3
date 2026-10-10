@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -136,7 +137,7 @@ func TestWalletTaskBindingRejectsInvalidLogicalReferences(t *testing.T) {
 				case "wrong_subject":
 					query = query.Set("subject_key = ?", strconv.FormatInt(op.ID+1, 10))
 				case "wrong_operation":
-					query = query.Set("input_json = ?", []byte(fmt.Sprintf(`{"operation_id":%d}`, op.ID+1)))
+					query = query.Set("input_json = ?", json.RawMessage(fmt.Sprintf(`{"operation_id":%d}`, op.ID+1)))
 				case "archived":
 					query = query.Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "test_failure").Set("finished_at = ?", time.Now())
 				}

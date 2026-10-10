@@ -654,7 +654,7 @@ func TestCanceledMultipartCompletionReleasesTheUpload(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tb.db.AddQueryHook(cancelAfterQuery{match: "'completing'", cancel: cancel})
+	synaps3testutil.AddQueryHook(tb.db, cancelAfterQuery{match: "'completing'", cancel: cancel})
 
 	if err := completeMultipartTestParts(ctx, tb, "canceled-complete-bucket", "canceled.bin", uploadID, parts); err == nil {
 		t.Fatal("CompleteMultipartUpload succeeded after its request was canceled")

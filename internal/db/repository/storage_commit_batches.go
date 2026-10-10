@@ -69,7 +69,7 @@ func (r *BunStorageContentRepo) ListCommitBatches(ctx context.Context, filter Co
 		return nil, ErrInvalidInput
 	}
 	rows := make([]CommitBatch, 0)
-	query := commitBatchQuery(r.db, &rows).OrderExpr("commit_request.created_at DESC, commit_request.request_id DESC").Limit(filter.Limit)
+	query := commitBatchQuery(r.db, &rows).OrderExpr("commit_request.created_at DESC, commit_request.request_id DESC").Limit(int64(filter.Limit))
 	if filter.Status != "" {
 		query.Where("commit_request.status = ?", filter.Status)
 	}

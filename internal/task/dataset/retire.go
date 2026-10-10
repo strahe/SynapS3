@@ -70,7 +70,7 @@ func (h *RetireHandler) dataSetRetireHandler() *taskengine.FuncHandler {
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		Subject:       taskengine.SubjectFromInput("storage_data_set", func(input storagereplacement.RetireInput) int64 { return input.DataSetID }),
 		InspectRetry:  inspectRetirementRetry,
-		LegacyHandoff: transferRetirementOwner,
+		BindSuccessor: transferRetirementOwner,
 		PrepareRetry: func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
 			return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: json.RawMessage(source.Input)}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: transferRetirementOwner}, nil
 		},

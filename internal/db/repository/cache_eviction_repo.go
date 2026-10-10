@@ -212,7 +212,7 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int,
 		query = query.Where("(COALESCE(object_cache.cache_accessed_at, object_cache.created_at) > ? OR (COALESCE(object_cache.cache_accessed_at, object_cache.created_at) = ? AND object_cache.content_id > ?))", cursor.AccessedAt, cursor.AccessedAt, cursor.ContentID)
 	}
 	if limit > 0 {
-		query = query.Limit(limit)
+		query = query.Limit(int64(limit))
 	}
 	if err := query.Scan(ctx, &candidates); err != nil {
 		return nil, fmt.Errorf("listing LRU cache candidates: %w", err)

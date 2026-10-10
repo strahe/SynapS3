@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // appliedColumn is one column as the database reports it.
@@ -23,43 +22,7 @@ type appliedColumn struct {
 }
 
 func tableColumns(ctx context.Context, db bun.IDB, table string) ([]appliedColumn, error) {
-	if db.Dialect().Name() == dialect.PG {
-		return postgresColumns(ctx, db, table)
-	}
-	return sqliteColumns(ctx, db, table)
-}
-
-func sqliteColumns(ctx context.Context, db bun.IDB, table string) ([]appliedColumn, error) {
-	ddl, err := sqliteTableDDL(ctx, db, table)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := db.QueryContext(ctx, `SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?) ORDER BY cid`, table)
-	if err != nil {
-		return nil, fmt.Errorf("reading columns of %s: %w", table, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var columns []appliedColumn
-	for rows.Next() {
-		var name, sqlType string
-		var notNull, primaryKey int
-		var defaultValue sql.NullString
-		if err := rows.Scan(&name, &sqlType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return nil, fmt.Errorf("reading columns of %s: %w", table, err)
-		}
-		columns = append(columns, appliedColumn{
-			Name:       name,
-			Type:       normalizedSQLType(sqlType),
-			NotNull:    notNull != 0,
-			Default:    normalizedSQLDefault(defaultValue.String),
-			PrimaryKey: primaryKey != 0,
-			Generated:  primaryKey != 0 && name == "id" && strings.Contains(strings.ToUpper(ddl), "AUTOINCREMENT"),
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("reading columns of %s: %w", table, err)
-	}
-	return columns, nil
+	return postgresColumns(ctx, db, table)
 }
 
 func postgresColumns(ctx context.Context, db bun.IDB, table string) ([]appliedColumn, error) {
@@ -109,20 +72,12 @@ func postgresColumns(ctx context.Context, db bun.IDB, table string) ([]appliedCo
 	return columns, nil
 }
 
-func sqliteTableDDL(ctx context.Context, db bun.IDB, table string) (string, error) {
-	var ddl string
-	if err := db.NewRaw(`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?`, table).Scan(ctx, &ddl); err != nil {
-		return "", fmt.Errorf("reading DDL of %s: %w", table, err)
-	}
-	return ddl, nil
-}
-
 func normalizedSQLType(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch value {
 	case "timestamptz", "timestamp with time zone", "timestamp":
 		return "timestamp"
-	case "bytea", "blob":
+	case "bytea":
 		return "binary"
 	default:
 		return value
@@ -158,9 +113,11 @@ func appliedTableColumns(t *testing.T, db *bun.DB, table string) []appliedColumn
 	return columns
 }
 
-func testSchemaDialects(t *testing.T, test func(*testing.T, *bun.DB)) {
+// withMigratedDB runs test against a private PostgreSQL schema holding the
+// complete migration chain.
+func withMigratedDB(t *testing.T, test func(*testing.T, *bun.DB)) {
 	t.Helper()
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigrationDB(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		if err := ValidateTarget(ctx, db); err != nil {
 			t.Fatalf("validate empty target: %v", err)
@@ -179,11 +136,7 @@ func testSchemaDialects(t *testing.T, test func(*testing.T, *bun.DB)) {
 // Compare native definitions within one database; no cross-dialect rendering is needed.
 func appliedSchemaState(t *testing.T, db *bun.DB) []string {
 	t.Helper()
-	query := `SELECT type || '|' || name || '|' || sql FROM sqlite_schema
-		WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
-		AND tbl_name NOT IN ('bun_migrations', 'bun_migration_locks') ORDER BY 1`
-	if db.Dialect().Name() == dialect.PG {
-		query = `WITH app_tables AS (
+	query := `WITH app_tables AS (
 			SELECT c.oid, c.relname, c.relkind FROM pg_class c
 			JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = current_schema() AND c.relkind IN ('r','p','v','m')
@@ -216,7 +169,6 @@ func appliedSchemaState(t *testing.T, db *bun.DB) []string {
 		SELECT 'trigger|' || pg_get_triggerdef(g.oid) FROM app_tables t
 		JOIN pg_trigger g ON g.tgrelid = t.oid WHERE NOT g.tgisinternal
 		ORDER BY 1`
-	}
 	var state []string
 	if err := db.NewRaw(query).Scan(t.Context(), &state); err != nil {
 		t.Fatalf("read application schema state: %v", err)

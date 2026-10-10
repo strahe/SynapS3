@@ -8,7 +8,6 @@ import (
 	"slices"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 	"github.com/uptrace/bun/migrate"
 )
 
@@ -118,18 +117,11 @@ func applicationTableCount(ctx context.Context, db bun.IDB) (int, error) {
 }
 
 func applicationTableNames(ctx context.Context, db bun.IDB) ([]string, error) {
-	query := `SELECT name FROM sqlite_schema
-		WHERE type = 'table'
-		  AND name NOT LIKE 'sqlite_%'
-		  AND name NOT IN ('bun_migrations', 'bun_migration_locks')
-		ORDER BY name`
-	if db.Dialect().Name() == dialect.PG {
-		query = `SELECT table_name FROM information_schema.tables
-			WHERE table_schema = current_schema()
-			  AND table_type = 'BASE TABLE'
-			  AND table_name NOT IN ('bun_migrations', 'bun_migration_locks')
-			ORDER BY table_name`
-	}
+	query := `SELECT table_name FROM information_schema.tables
+		WHERE table_schema = current_schema()
+		  AND table_type = 'BASE TABLE'
+		  AND table_name NOT IN ('bun_migrations', 'bun_migration_locks')
+		ORDER BY table_name`
 	var names []string
 	if err := db.NewRaw(query).Scan(ctx, &names); err != nil {
 		return nil, err
@@ -169,11 +161,8 @@ func transactionalMigration(body migrationBody) migrate.MigrationFunc {
 }
 
 func tableExists(ctx context.Context, db bun.IDB, table string) (bool, error) {
-	query := `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`
-	if db.Dialect().Name() == dialect.PG {
-		query = `SELECT COUNT(*) FROM information_schema.tables
-			WHERE table_schema = current_schema() AND table_name = ?`
-	}
+	query := `SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name = ?`
 	return queryExists(ctx, db, query, table)
 }
 

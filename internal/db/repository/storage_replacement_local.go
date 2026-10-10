@@ -47,7 +47,7 @@ func (r *BunStorageReplacementRepo) AbandonUncreatedCopiesBatch(ctx context.Cont
 		}
 		var copies []model.StorageCopy
 		if err := uncreatedSlotCopies(db, locked, target).ColumnExpr("storage_copy.*").
-			OrderExpr("storage_copy.content_id ASC, storage_copy.id ASC").Limit(limit).Scan(ctx, &copies); err != nil {
+			OrderExpr("storage_copy.content_id ASC, storage_copy.id ASC").Limit(int64(limit)).Scan(ctx, &copies); err != nil {
 			return err
 		}
 		contents := &BunStorageContentRepo{db: db}

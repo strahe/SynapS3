@@ -3,6 +3,7 @@ package task_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -328,24 +329,30 @@ func (f registrationFixture) collect(t *testing.T) (string, int64) {
 
 func (f registrationFixture) collectAt(t *testing.T, requestID string, now time.Time, copies ...*model.StorageCopy) (string, int64) {
 	t.Helper()
-	taskRow, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
-		Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
-		SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: requestID,
-	})
-	if err != nil {
-		t.Fatalf("enqueue commit task: %v", err)
-	}
 	ids := make([]int64, len(copies))
 	for i, copyRow := range copies {
 		ids[i] = copyRow.ID
 	}
-	if err := f.runtime.repos.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
-		RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: f.dataSet.ID, CopyIDs: ids, Now: now,
+	// The task and its request commit together, as the Commit handler creates
+	// them; a running engine must never claim the task before the request exists.
+	var taskID int64
+	if err := f.runtime.repos.WithTx(t.Context(), func(tx *repository.Repositories) error {
+		taskRow, _, err := f.runtime.service.EnqueueInTransaction(t.Context(), tx, taskengine.EnqueueRequest{
+			Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
+			Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
+			SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: requestID,
+		})
+		if err != nil {
+			return fmt.Errorf("enqueue commit task: %w", err)
+		}
+		taskID = taskRow.ID
+		return tx.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
+			RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: f.dataSet.ID, CopyIDs: ids, Now: now,
+		})
 	}); err != nil {
-		t.Fatalf("CreateCollectingCommitRequest: %v", err)
+		t.Fatalf("collect commit request: %v", err)
 	}
-	return requestID, taskRow.ID
+	return requestID, taskID
 }
 
 func (f registrationFixture) request(t *testing.T, requestID string) *storagecommit.Request {
@@ -1115,7 +1122,7 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 			}
 			owner := *bad.ActiveTaskID
 			checkpoint := []byte(`{"unresolved_effect":"preserved"}`)
-			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "invalid_checkpoint").Set("checkpoint_json = ?", checkpoint).Set("finished_at = ?", time.Now()).Where("id = ?", owner).Exec(t.Context()); err != nil {
+			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "invalid_checkpoint").Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Set("finished_at = ?", time.Now()).Where("id = ?", owner).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			sends, extras := f.provider.sent()
@@ -1142,7 +1149,7 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 				t.Fatalf("blocked member lost its protected owner: %#v %v", bad, err)
 			}
 			source, err := f.runtime.repos.Tasks.GetByID(t.Context(), owner)
-			if err != nil || !bytes.Equal(source.Checkpoint, checkpoint) || source.SupersededAt != nil {
+			if err != nil || !testutil.JSONEqual(source.Checkpoint, checkpoint) || source.SupersededAt != nil {
 				t.Fatalf("blocked member lost its evidence: %#v %v", source, err)
 			}
 			after := f.request(t, requestID)

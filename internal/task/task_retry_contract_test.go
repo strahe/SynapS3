@@ -14,6 +14,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/systemtask"
+	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
@@ -262,12 +263,12 @@ func TestCommitFailedOwnedMemberUsesCoordinatorBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			if maxAttempts == 2 {
-				if parent.RetryCount != 1 || *member.ActiveTaskID != failedID || source.SupersededAt != nil || !bytes.Equal(source.Checkpoint, checkpoint) {
+				if parent.RetryCount != 1 || *member.ActiveTaskID != failedID || source.SupersededAt != nil || !testutil.JSONEqual(source.Checkpoint, checkpoint) {
 					t.Fatalf("exhausted coordinator reopened failed member: parent=%#v member=%#v source=%#v", parent, member, source)
 				}
 			} else {
 				child, err := f.runtime.repos.Tasks.GetDirectSuccessor(t.Context(), failedID)
-				if err != nil || child == nil || *member.ActiveTaskID != child.ID || parent.RetryCount != 2 || child.ResumeMode != model.TaskResumeModeRecover || child.RetryCount != 0 || !bytes.Equal(child.Checkpoint, checkpoint) || child.AvailableAt.Before(parent.AvailableAt) || source.SupersededAt == nil {
+				if err != nil || child == nil || *member.ActiveTaskID != child.ID || parent.RetryCount != 2 || child.ResumeMode != model.TaskResumeModeRecover || child.RetryCount != 0 || !testutil.JSONEqual(child.Checkpoint, checkpoint) || child.AvailableAt.Before(parent.AvailableAt) || source.SupersededAt == nil {
 					t.Fatalf("member recovery bypassed budget or evidence: parent=%#v member=%#v child=%#v err=%v", parent, member, child, err)
 				}
 			}

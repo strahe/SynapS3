@@ -107,8 +107,9 @@ type Definition struct {
 	Subject      SubjectFunc
 	InspectRetry func(context.Context, *repository.Repositories, *model.Task) error
 	PrepareRetry func(context.Context, *repository.Repositories, *model.Task) (RetryPreparation, error)
-	// LegacyHandoff also binds same-type retries unless PrepareRetry overrides it.
-	LegacyHandoff       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	// BindSuccessor moves domain ownership from a superseded round to its
+	// successor in the same transaction, unless PrepareRetry overrides it.
+	BindSuccessor       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
 	NextCycleCheckpoint func(context.Context, *repository.Repositories, *model.Task) (json.RawMessage, error)
 }
 

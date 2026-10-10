@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -15,7 +13,7 @@ import (
 
 func TestPostgresProviderCatalogRepeatedUpsertKeepsLatestTierSnapshot(t *testing.T) {
 	ctx := context.Background()
-	repos := repository.NewRepositories(newPostgresTaskDB(t))
+	repos := repository.NewRepositories(testDB(t))
 	id := onChainID(t, "101")
 	start := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
 	state := func(name string) observability.ProviderState {

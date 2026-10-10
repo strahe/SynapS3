@@ -783,8 +783,6 @@ type TaskRepository interface {
 	GetForUpdate(ctx context.Context, id int64) (*model.Task, error)
 	GetDirectSuccessor(ctx context.Context, id int64) (*model.Task, error)
 	SupersedeTerminal(ctx context.Context, id int64) error
-	CloseLegacy(ctx context.Context, id, generation int64) error
-	FailLegacyPending(ctx context.Context, id, generation int64, cause string) error
 	LatestForSubject(ctx context.Context, subjectType, subjectKey string, types ...model.TaskType) (*model.Task, error)
 	ListCurrentFailedForSubject(ctx context.Context, subjectType, subjectKey string, beforeID int64, limit int, types ...model.TaskType) (TaskPage, error)
 	ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error)

@@ -9,17 +9,7 @@ import (
 )
 
 func TestNewTestDBCreatesIsolatedDatabases(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		newDB func(*testing.T) *bun.DB
-	}{
-		{name: "Memory", newDB: NewTestDB},
-		{name: "File", newDB: NewTestFileDB},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			assertTestDBsAreIsolated(t, tt.newDB)
-		})
-	}
+	assertTestDBsAreIsolated(t, NewTestDB)
 }
 
 func assertTestDBsAreIsolated(t *testing.T, newDB func(*testing.T) *bun.DB) {

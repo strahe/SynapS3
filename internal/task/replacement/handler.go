@@ -98,7 +98,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 		}
 		return repos.Replacements.ResumeCoordinatorTask(ctx, input.ReplacementID, input.Generation, old.ID, next.ID)
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input storagereplacement.CoordinateInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

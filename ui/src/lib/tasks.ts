@@ -31,7 +31,6 @@ export const taskOperationLabels: Record<string, string> = {
   observability_refresh: 'Refresh health',
   approved_provider_refresh: 'Refresh approved providers',
   endorsed_provider_refresh: 'Refresh endorsed providers',
-  task_gc: 'Legacy task cleanup',
 }
 
 export function taskOperationLabel(type: string) {
@@ -66,7 +65,6 @@ export function taskSystemDescription(type: string) {
     observability_refresh: 'Updates storage health information.',
     approved_provider_refresh: 'Updates approved providers.',
     endorsed_provider_refresh: 'Updates endorsed providers.',
-    task_gc: 'Legacy cleanup task; no longer scheduled.',
   }
   return descriptions[type] ?? 'Runs maintenance for this node.'
 }

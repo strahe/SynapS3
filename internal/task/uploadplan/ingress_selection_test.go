@@ -13,7 +13,7 @@ import (
 )
 
 func TestFastestIngressRequiresValidSpeedForEveryProvider(t *testing.T) {
-	db := testutil.NewTestFileDB(t)
+	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	now := time.Now().UTC()
 	states := make([]observability.ProviderState, 2)

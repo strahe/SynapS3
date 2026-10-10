@@ -5,15 +5,16 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
-	_ "modernc.org/sqlite"
 )
 
 func TestStorageOnChainIDColumnsUseTextInPostgresDDL(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file::memory:")
+	// Rendering DDL never connects, so the handle needs no server.
+	sqldb, err := sql.Open("pgx", "")
 	if err != nil {
-		t.Fatalf("open sqlite handle: %v", err)
+		t.Fatalf("open PostgreSQL handle: %v", err)
 	}
 	t.Cleanup(func() { _ = sqldb.Close() })
 

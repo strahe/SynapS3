@@ -126,8 +126,7 @@ func (r *BunS3AccountRepo) Delete(ctx context.Context, accessKey string) error {
 }
 
 func (r *BunS3AccountRepo) LockByAccessKey(ctx context.Context, accessKey string) (*model.S3Account, error) {
-	// Use a no-op UPDATE as a portable pessimistic lock for the surrounding transaction.
-	// SQLite takes a write lock, and PostgreSQL holds the row update lock until commit.
+	// A no-op UPDATE locks the row until the surrounding transaction ends.
 	res, err := r.db.NewUpdate().
 		Model((*model.S3Account)(nil)).
 		Set("access_key = access_key").

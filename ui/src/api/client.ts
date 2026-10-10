@@ -773,7 +773,6 @@ export interface TaskPolicy {
   jitter: number
   invocation_timeout: string
   observation_window: string
-  legacy: boolean
 }
 
 export interface TaskDetail {

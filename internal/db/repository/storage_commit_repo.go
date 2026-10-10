@@ -15,7 +15,6 @@ import (
 	idtypes "github.com/strahe/synaps3/internal/types"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // A commit request moves through its lifecycle only under its own task: every
@@ -831,7 +830,7 @@ func (r *BunStorageContentRepo) CountCommitBacklog(ctx context.Context, storageD
 	if err != nil {
 		return 0, fmt.Errorf("counting storage commit backlog: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 func countOpenCommitRequests(ctx context.Context, db bun.IDB, storageDataSetID int64) (int, error) {
@@ -843,7 +842,7 @@ func countOpenCommitRequests(ctx context.Context, db bun.IDB, storageDataSetID i
 	if err != nil {
 		return 0, fmt.Errorf("counting open storage commit requests: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 func countSubmittedCommitRequests(ctx context.Context, db bun.IDB, storageDataSetID int64) (int, error) {
@@ -854,7 +853,7 @@ func countSubmittedCommitRequests(ctx context.Context, db bun.IDB, storageDataSe
 	if err != nil {
 		return 0, fmt.Errorf("counting submitted storage commit requests: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 // eligibleReadyCommitRequest returns the oldest ready request of the data set
@@ -1015,9 +1014,7 @@ func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64, excludedW
 	if len(excludedWaitReasons) > 0 {
 		ids = ids.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(excludedWaitReasons))
 	}
-	if db.Dialect().Name() == dialect.PG {
-		ids = ids.For("UPDATE SKIP LOCKED")
-	}
+	ids = ids.For("UPDATE SKIP LOCKED")
 	if _, err := db.NewUpdate().
 		Model((*model.Task)(nil)).
 		Set("available_at = ?", now).
@@ -1174,7 +1171,7 @@ func countCommitMembers(ctx context.Context, db bun.IDB, requestID string) (int,
 	if err != nil {
 		return 0, fmt.Errorf("counting storage commit request members: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 func commitPieceID(first idtypes.OnChainID, position int) (idtypes.OnChainID, error) {
@@ -1207,7 +1204,7 @@ func (r *BunStorageContentRepo) ListCommitAttention(ctx context.Context, limit i
 	}
 	return r.scanCommitAttention(ctx, commitAttentionQuery(r.db).
 		OrderExpr("commit_request.attention_at ASC, commit_request.request_id ASC").
-		Limit(limit))
+		Limit(int64(limit)))
 }
 
 // ListCommitAttentionForTasks lists the flagged requests driven by the tasks.

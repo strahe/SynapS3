@@ -29,7 +29,7 @@ func (h *CopyCoordinator) copyDefinition(taskType model.TaskType) taskengine.Def
 		},
 		InspectRetry:  h.inspectCopyRetry,
 		PrepareRetry:  h.prepareCopyRetry,
-		LegacyHandoff: transferCopyOwner,
+		BindSuccessor: transferCopyOwner,
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
 			return input.CopyID
 		}),

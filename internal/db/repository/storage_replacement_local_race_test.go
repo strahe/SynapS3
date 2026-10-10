@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -9,53 +7,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
 func TestPostgresUncreatedReplacementAdmissionAndFencing(t *testing.T) {
-	uncreatedReplacementAdmissionAndFencing(t, migratedPostgresDB(t))
+	uncreatedReplacementAdmissionAndFencing(t, testDB(t))
 }
 
 func TestPostgresLocalReplacementBatchesPreserveFrozenCopyObligations(t *testing.T) {
-	localReplacementBatchesPreserveFrozenCopyObligations(t, migratedPostgresDB(t))
+	localReplacementBatchesPreserveFrozenCopyObligations(t, testDB(t))
 }
 
 func TestPostgresLocalReplacementRetryAndCompletion(t *testing.T) {
-	localReplacementRetryAndCompletion(t, migratedPostgresDB(t))
+	localReplacementRetryAndCompletion(t, testDB(t))
 }
 
 func TestPostgresRejectedLocalTargetCanBeReplacedAgain(t *testing.T) {
-	rejectedLocalTargetCanBeReplacedAgain(t, migratedPostgresDB(t))
+	rejectedLocalTargetCanBeReplacedAgain(t, testDB(t))
 }
 
 func TestPostgresReplacementUploadWakeScope(t *testing.T) {
-	replacementUploadWakeScope(t, migratedPostgresDB(t))
+	replacementUploadWakeScope(t, testDB(t))
 }
 
 func TestPostgresReplacementObservationAuthorization(t *testing.T) {
-	replacementObservationAuthorization(t, migratedPostgresDB(t))
+	replacementObservationAuthorization(t, testDB(t))
 }
 
 func TestPostgresReadyTargetRejectsStaleRefusalSettlement(t *testing.T) {
-	readyTargetRejectsStaleRefusalSettlement(t, migratedPostgresDB(t))
+	readyTargetRejectsStaleRefusalSettlement(t, testDB(t))
 }
 
 func TestPostgresRemoteSourceCannotCompleteLocally(t *testing.T) {
-	remoteSourceCannotCompleteLocally(t, migratedPostgresDB(t))
+	remoteSourceCannotCompleteLocally(t, testDB(t))
 }
 
 func TestPostgresUncreatedReplacementSerializesWithCreatePermission(t *testing.T) {
 	for _, first := range []string{"replacement", "creation"} {
 		t.Run(first, func(t *testing.T) {
-			db := migratedPostgresDB(t)
+			db := testDB(t)
 			repos, source, ensure := localReplacementSource(t, db, "create-permission-race")
 			hold := newPostgresRaceHold(first, func(query string) bool {
 				return strings.Contains(query, "storage_data_sets") &&
 					(strings.Contains(query, "for update") || strings.HasPrefix(query, "update"))
 			})
-			db.AddQueryHook(hold)
+			testutil.AddQueryHook(db, hold)
 			defer hold.Release()
 			operations := map[string]func(context.Context) error{
 				"replacement": func(ctx context.Context) error {
@@ -109,7 +109,7 @@ func TestPostgresUncreatedReplacementSerializesWithCreatePermission(t *testing.T
 func TestPostgresReadyBindingSerializesWithRefusalSettlement(t *testing.T) {
 	for _, first := range []string{"ready", "refusal"} {
 		t.Run(first, func(t *testing.T) {
-			db := migratedPostgresDB(t)
+			db := testDB(t)
 			repos, source, _ := localReplacementSource(t, db, "ready-refusal-race")
 			row, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "202"), ClientRequestID: "first"})
 			if err != nil {
@@ -124,7 +124,7 @@ func TestPostgresReadyBindingSerializesWithRefusalSettlement(t *testing.T) {
 				return strings.Contains(query, "storage_replacements") &&
 					(strings.Contains(query, "for update") || strings.HasPrefix(query, "update"))
 			})
-			db.AddQueryHook(hold)
+			testutil.AddQueryHook(db, hold)
 			defer hold.Release()
 			reason := storagereplacement.FailureReasonTargetRejected
 			operations := map[string]func(context.Context) error{

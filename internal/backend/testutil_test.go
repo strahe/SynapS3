@@ -38,8 +38,8 @@ type testBackend struct {
 	tasks   *taskengine.Service
 }
 
-// newTestBackend constructs a SynapseBackend backed by in-memory SQLite
-// and a real filesystem cache rooted at t.TempDir().
+// newTestBackend constructs a SynapseBackend backed by a test database and a
+// real filesystem cache rooted at t.TempDir().
 func newTestBackend(t *testing.T) *testBackend {
 	return newTestBackendWithOptions(t)
 }

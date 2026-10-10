@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -8,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/strahe/synaps3/internal/testutil"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -24,7 +24,7 @@ func TestPostgresConcurrentTaskAcknowledgementArchivesOnce(t *testing.T) {
 
 func assertPostgresTaskArchiveLockRace(t *testing.T, acknowledge bool) {
 	t.Helper()
-	db := migratedPostgresDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -150,7 +150,7 @@ func waitForTaskArchiveLock(ctx context.Context, db *bun.DB, comment string) err
 }
 
 func TestPostgresTaskScopesLoadJSONForFinalPageOnly(t *testing.T) {
-	db := migratedPostgresDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	for i := range 3 {
 		row := enqueueAndClaimTask(t, repos, fmt.Sprintf("history-projection-%d", i), time.Minute)
@@ -167,7 +167,7 @@ func TestPostgresTaskScopesLoadJSONForFinalPageOnly(t *testing.T) {
 		}
 	}
 	capture := new(postgresQueryCapture)
-	db.AddQueryHook(capture)
+	testutil.AddQueryHook(db, capture)
 	for _, scope := range []repository.TaskScope{repository.TaskScopeWork, repository.TaskScopeHistory} {
 		t.Run(string(scope), func(t *testing.T) {
 			capture.reset()

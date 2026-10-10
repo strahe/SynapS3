@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -8,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
@@ -15,7 +15,7 @@ import (
 
 func TestPostgresCommitRequestLedger(t *testing.T) {
 	for _, c := range commitLedgerCases {
-		t.Run(c.name, func(t *testing.T) { c.run(t, newCommitFixture(t, migratedPostgresDB(t))) })
+		t.Run(c.name, func(t *testing.T) { c.run(t, newCommitFixture(t, testDB(t))) })
 	}
 }
 
@@ -47,7 +47,7 @@ func joinOrStartCommitRequest(ctx context.Context, tx *repository.Repositories, 
 // request when it starts looking, but they must not start one each: copies
 // transferred together are registered together.
 func TestPostgresCopiesTransferredTogetherShareOneRequest(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	f := newCommitFixture(t, db)
 	ctx := t.Context()
 	first, second := f.transferredCopy(t, "first"), f.transferredCopy(t, "second")
@@ -55,7 +55,7 @@ func TestPostgresCopiesTransferredTogetherShareOneRequest(t *testing.T) {
 	hold := newPostgresRaceHold("first", func(query string) bool {
 		return strings.Contains(query, "update storage_data_sets") && strings.Contains(query, "updated_at = updated_at")
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 
 	firstDone := make(chan error, 1)
@@ -89,7 +89,7 @@ func TestPostgresCopiesTransferredTogetherShareOneRequest(t *testing.T) {
 // signed set, so it starts the next request instead of being lost or signed
 // for.
 func TestPostgresCopyArrivingDuringASealStartsTheNextRequest(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	f := newCommitFixture(t, db)
 	ctx := t.Context()
 	signed, late := f.transferredCopy(t, "signed"), f.transferredCopy(t, "late")
@@ -98,7 +98,7 @@ func TestPostgresCopyArrivingDuringASealStartsTheNextRequest(t *testing.T) {
 	hold := newPostgresRaceHold("seal", func(query string) bool {
 		return strings.Contains(query, "update storage_commit_requests") && strings.Contains(query, "updated_at = updated_at")
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 
 	sealed := make(chan error, 1)
@@ -134,7 +134,7 @@ func TestPostgresCopyArrivingDuringASealStartsTheNextRequest(t *testing.T) {
 // take the data set before the request, so neither waits on the other in a
 // cycle and both settle.
 func TestPostgresSealThatQueuesLateCopiesDoesNotDeadlockAJoin(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	f := newCommitFixture(t, db)
 	ctx := t.Context()
 	signed, late, arriving := f.transferredCopy(t, "signed"), f.transferredCopy(t, "late"), f.transferredCopy(t, "arriving")
@@ -143,7 +143,7 @@ func TestPostgresSealThatQueuesLateCopiesDoesNotDeadlockAJoin(t *testing.T) {
 	hold := newPostgresRaceHold("seal", func(query string) bool {
 		return strings.Contains(query, "update storage_commit_requests") && strings.Contains(query, "updated_at = updated_at")
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 
 	sealed := make(chan error, 1)
@@ -188,9 +188,9 @@ func TestPostgresSealThatQueuesLateCopiesDoesNotDeadlockAJoin(t *testing.T) {
 }
 
 func TestPostgresPullAuthorizationLedger(t *testing.T) {
-	testPullAuthorizationLedger(t, newCommitFixture(t, migratedPostgresDB(t)))
+	testPullAuthorizationLedger(t, newCommitFixture(t, testDB(t)))
 }
 
 func TestPostgresPullTaskRecoveryProtection(t *testing.T) {
-	testPullTaskRecoveryProtection(t, newCommitFixture(t, migratedPostgresDB(t)))
+	testPullTaskRecoveryProtection(t, newCommitFixture(t, testDB(t)))
 }

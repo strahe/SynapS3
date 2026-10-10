@@ -2,19 +2,15 @@ package repository_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/sqlitedialect"
 )
 
 // seedContent creates the byte identity a data version needs before it exists.
@@ -537,22 +533,8 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent(t *testing.T) {
 }
 
 func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinner(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "restore-objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := testDB(t)
 	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "concurrent-restore-bucket")
@@ -609,22 +591,8 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinn
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := testDB(t)
 	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "concurrent-version-bucket")
@@ -678,22 +646,8 @@ func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWriteReusesCurrent(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := testDB(t)
 	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "concurrent-dedupe-bucket")

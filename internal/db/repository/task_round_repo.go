@@ -17,52 +17,6 @@ var (
 	ErrTaskOperationUnresolved   = errors.New("previous task operation is unresolved")
 )
 
-func (r *BunTaskRepo) CloseLegacy(ctx context.Context, id, generation int64) error {
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		tx := &BunTaskRepo{db: db}
-		row, err := tx.GetForUpdate(ctx, id)
-		if err != nil {
-			return err
-		}
-		if row == nil || isHistoryTask(row) {
-			return ErrTaskLeaseLost
-		}
-		now := time.Now()
-		if generation == 0 {
-			if row.Status != model.TaskStatusPending {
-				return ErrTaskLeaseLost
-			}
-		} else if row.Status != model.TaskStatusRunning || row.ClaimGeneration != generation || row.LeaseUntil == nil || !row.LeaseUntil.After(now) {
-			return ErrTaskLeaseLost
-		}
-		row.Status, row.FinishedAt, row.UpdatedAt = model.TaskStatusCancelled, &now, now
-		row.ClaimedAt, row.LeaseUntil = nil, nil
-		return tx.archive(ctx, row, nil)
-	})
-}
-
-// FailLegacyPending isolates unverifiable input without changing recovery evidence.
-func (r *BunTaskRepo) FailLegacyPending(ctx context.Context, id, generation int64, cause string) error {
-	now := time.Now()
-	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusFailed).
-		Set("failure_reason = ?", "invalid_legacy_task").
-		Set("last_error = ?", cause).
-		Set("wait_reason = NULL").Set("status_message = NULL").
-		Set("finished_at = ?", now).
-		Set("claimed_at = NULL").Set("lease_until = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ? AND status = ? AND claim_generation = ?", id, model.TaskStatusPending, generation).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failing legacy pending task %d: %w", id, err)
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return ErrConflict
-	}
-	return nil
-}
-
 func (r *BunTaskRepo) ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50

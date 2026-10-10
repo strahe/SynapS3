@@ -3,14 +3,12 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 type BunTaskScheduleRepo struct{ db bun.IDB }
@@ -28,9 +26,7 @@ func (r *BunTaskScheduleRepo) Ensure(ctx context.Context, key string, nextRunAt 
 func (r *BunTaskScheduleRepo) GetForUpdate(ctx context.Context, key string) (*model.TaskSchedule, error) {
 	row := new(model.TaskSchedule)
 	q := r.db.NewSelect().Model(row).Where("key = ?", key)
-	if r.db.Dialect().Name() == dialect.PG {
-		q.For("UPDATE")
-	}
+	q.For("UPDATE")
 	if err := q.Scan(ctx); errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	} else if err != nil {
@@ -69,18 +65,11 @@ func (r *BunTaskScheduleRepo) SetHead(ctx context.Context, key string, expectedG
 				return ErrConflict
 			}
 			identity := fmt.Sprintf("%s:%d", key, generation)
-			if task.IdempotencyKey != identity && (generation != 0 || task.IdempotencyKey != key) {
+			if task.IdempotencyKey != identity {
 				return ErrConflict
 			}
 			if task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning {
-				var policy struct {
-					Version int  `json:"version"`
-					Legacy  bool `json:"legacy"`
-				}
-				// A legacy scheduled row remains the durable head until its first new cycle.
-				if task.Status != model.TaskStatusCancelled || generation != expectedGeneration || json.Unmarshal(task.Policy, &policy) != nil || policy.Version != 0 || !policy.Legacy {
-					return ErrConflict
-				}
+				return ErrConflict
 			}
 			if expectedTaskID != nil && *expectedTaskID != task.ID {
 				previous, err := (&BunTaskRepo{db: db}).GetByID(ctx, *expectedTaskID)

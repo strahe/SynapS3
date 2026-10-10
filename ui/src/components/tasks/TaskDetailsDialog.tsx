@@ -108,9 +108,7 @@ export function TaskDetailsDialog({ taskID }: { taskID: number }) {
   const task = detail.data?.task
   const policy = detail.data?.policy
   const message = task ? taskDetailsView(task) : undefined
-  const visibleEvents = events.data?.events.filter(
-    (event) => event.type !== 'legacy_handoff' && event.type !== 'policy_replaced'
-  )
+  const visibleEvents = events.data?.events
   return (
     <Dialog
       open={open}

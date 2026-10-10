@@ -3,7 +3,6 @@ package repository
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -57,21 +56,14 @@ var ErrAlreadyCurrent = errors.New("already current")
 
 var errConcurrentObjectCreate = errors.New("concurrent object create")
 
-// isUniqueViolation detects unique constraint violations for both PostgreSQL and SQLite.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return true
-	}
-	return strings.Contains(err.Error(), "UNIQUE constraint")
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func isS3AccountNameUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code == "23505" && pgErr.ConstraintName == "uq_s3_accounts_name"
-	}
-	return strings.Contains(err.Error(), "UNIQUE constraint failed: s3_accounts.name")
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_s3_accounts_name"
 }
 
 func shouldRetryObjectWrite(err error, canRestartTx bool) bool {
@@ -82,12 +74,6 @@ func shouldRetryRepositoryTx(err error) bool {
 	if errors.Is(err, errConcurrentObjectCreate) || errors.Is(err, ErrTaskIdentityContended) {
 		return true
 	}
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
-		return true
-	}
-	sqliteErr, ok := errors.AsType[interface {
-		error
-		Code() int
-	}](err)
-	return ok && (sqliteErr.Code()&255 == 5 || sqliteErr.Code()&255 == 6)
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && (pgErr.Code == "40001" || pgErr.Code == "40P01")
 }

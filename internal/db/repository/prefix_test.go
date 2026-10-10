@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -9,18 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/config"
-	appdb "github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
-	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
 )
 
 func TestPostgresPrefixPlan(t *testing.T) {
 	ctx := context.Background()
-	db := newPostgresPrefixTestDB(t, ctx)
+	db := testDB(t)
 	capture := new(postgresQueryCapture)
 	repos := repository.NewRepositories(db.WithQueryHook(capture))
 	bucket := seedBucket(t, db, "pg-prefix-plan-bucket")
@@ -95,28 +90,6 @@ func TestPostgresPrefixPlan(t *testing.T) {
 		t.Fatalf("storage risk versions = %#v, want %s", riskPage.Versions, riskVersionID)
 	}
 	assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.match(t, `ORDER BY object_version.key COLLATE "C" ASC`))
-}
-
-func newPostgresPrefixTestDB(t *testing.T, ctx context.Context) *bun.DB {
-	t.Helper()
-	db, err := appdb.New(config.DatabaseConfig{
-		Driver:       "postgres",
-		DSN:          testpg.SchemaDSN(t),
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
-	})
-	if err != nil {
-		t.Fatalf("opening postgres test db: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close PostgreSQL test database: %v", err)
-		}
-	})
-	if err := appdb.RunMigrations(ctx, db); err != nil {
-		t.Fatalf("running postgres migrations: %v", err)
-	}
-	return db
 }
 
 func seedPostgresPrefixObjects(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64) {

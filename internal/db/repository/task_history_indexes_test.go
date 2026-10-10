@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -10,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 )
 
 func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
-	db := migratedPostgresDB(t)
+	db := testDB(t)
 	ctx := t.Context()
 	now := time.Now().UTC()
 	st, sk := "periodic", "cache"
@@ -80,7 +80,7 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 		t.Fatal(err)
 	}
 	capture := new(taskHistoryQueries)
-	db.AddQueryHook(capture)
+	testutil.AddQueryHook(db, capture)
 	repos := repository.NewRepositories(db)
 	for _, scenario := range []struct {
 		name, subjectType, subjectKey string

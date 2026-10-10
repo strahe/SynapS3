@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -12,14 +10,8 @@ import (
 )
 
 func TestPostgresCompleteSnapshotOrdering(t *testing.T) {
-	t.Run("newer snapshot wins", func(t *testing.T) {
-		assertNewerCompleteSnapshotsWin(t, newPostgresTaskDB(t))
-	})
-	t.Run("observations stored ahead of the clock are replaced", func(t *testing.T) {
-		assertObservationsAheadOfTheClockAreReplaced(t, newPostgresTaskDB(t))
-	})
 	t.Run("equal time keeps the first commit", func(t *testing.T) {
-		db := newPostgresTaskDB(t)
+		db := testDB(t)
 		ctx := t.Context()
 		repos := repository.NewRepositories(db)
 		bucket := seedBucket(t, db, "snapshot-race")

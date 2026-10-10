@@ -1,27 +1,19 @@
 package db
 
 import (
-	"bytes"
 	"context"
-	"database/sql"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/testpg"
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/migrations"
-	"github.com/strahe/synaps3/internal/db/repository"
-	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type migrationLockBarrier struct {
@@ -48,30 +40,18 @@ func (h *migrationLockBarrier) AfterQuery(ctx context.Context, event *bun.QueryE
 }
 
 func TestNewRejectsBlankDSNBeforeConnecting(t *testing.T) {
-	for _, driver := range []string{"postgres", "sqlite"} {
-		database, err := New(config.DatabaseConfig{Driver: driver, DSN: " ", MaxOpenConns: 1})
-		if database != nil {
-			_ = database.Close()
-			t.Fatalf("New(%s) returned a connection for a blank DSN", driver)
-		}
-		if err == nil || !strings.Contains(err.Error(), "database.dsn") {
-			t.Fatalf("New(%s) error = %v, want a database.dsn error", driver, err)
-		}
+	database, err := New(config.DatabaseConfig{Driver: "postgres", DSN: " ", MaxOpenConns: 1})
+	if database != nil {
+		_ = database.Close()
+		t.Fatal("New returned a connection for a blank DSN")
+	}
+	if err == nil || !strings.Contains(err.Error(), "database.dsn") {
+		t.Fatalf("New error = %v, want a database.dsn error", err)
 	}
 }
 
 func TestForceUnlockMigrationsClearsALockLeftByAKilledRun(t *testing.T) {
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), "force-unlock.db"),
-		MaxOpenConns: 2,
-		MaxIdleConns: 2,
-	}
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := newPostgresDB(t, 2)
 	ctx := context.Background()
 
 	if err := RunMigrations(ctx, db); err != nil {
@@ -81,7 +61,7 @@ func TestForceUnlockMigrationsClearsALockLeftByAKilledRun(t *testing.T) {
 	if err := migrations.NewMigrator(db).Lock(ctx); err != nil {
 		t.Fatalf("acquiring the leaked lock: %v", err)
 	}
-	err = RunMigrations(ctx, db)
+	err := RunMigrations(ctx, db)
 	if err == nil || !strings.Contains(err.Error(), "--force-unlock") {
 		t.Fatalf("RunMigrations() error = %v, want the stale-lock remediation", err)
 	}
@@ -95,15 +75,7 @@ func TestForceUnlockMigrationsClearsALockLeftByAKilledRun(t *testing.T) {
 }
 
 func TestForceUnlockMigrationsRejectsLegacyDatabaseWithoutModification(t *testing.T) {
-	cfg := config.DatabaseConfig{
-		Driver: "sqlite", DSN: "file:" + filepath.Join(t.TempDir(), "legacy-force-unlock.db"),
-		MaxOpenConns: 1, MaxIdleConns: 1,
-	}
-	database, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
+	database := newPostgresDB(t, 1)
 	if _, err := database.ExecContext(t.Context(), `CREATE TABLE legacy_tasks (id INTEGER PRIMARY KEY, status TEXT NOT NULL)`); err != nil {
 		t.Fatalf("create legacy table: %v", err)
 	}
@@ -111,7 +83,7 @@ func TestForceUnlockMigrationsRejectsLegacyDatabaseWithoutModification(t *testin
 		t.Fatalf("seed legacy table: %v", err)
 	}
 
-	err = ForceUnlockMigrations(t.Context(), database)
+	err := ForceUnlockMigrations(t.Context(), database)
 	if !errors.Is(err, migrations.ErrIncompatibleDatabase) {
 		t.Fatalf("ForceUnlockMigrations() error = %v, want incompatible database", err)
 	}
@@ -123,7 +95,7 @@ func TestForceUnlockMigrationsRejectsLegacyDatabaseWithoutModification(t *testin
 		t.Fatalf("legacy row status = %q, want unchanged", status)
 	}
 	var migrationTables int
-	if err := database.NewRaw(`SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name LIKE 'bun_migration%'`).Scan(t.Context(), &migrationTables); err != nil {
+	if err := database.NewRaw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name LIKE 'bun_migration%'`).Scan(t.Context(), &migrationTables); err != nil {
 		t.Fatalf("count migration tables: %v", err)
 	}
 	if migrationTables != 0 {
@@ -131,70 +103,11 @@ func TestForceUnlockMigrationsRejectsLegacyDatabaseWithoutModification(t *testin
 	}
 }
 
-func TestNewRejectsLegacySQLiteBeforeApplyingPersistentPragmas(t *testing.T) {
-	databasePath := filepath.Join(t.TempDir(), "preserved-legacy.db")
-	legacy, err := sql.Open("sqlite", databasePath)
-	if err != nil {
-		t.Fatalf("open legacy sqlite database: %v", err)
-	}
-	if _, err := legacy.Exec(`CREATE TABLE legacy_tasks (id INTEGER PRIMARY KEY, status TEXT NOT NULL)`); err != nil {
-		_ = legacy.Close()
-		t.Fatalf("create legacy task table: %v", err)
-	}
-	if _, err := legacy.Exec(`INSERT INTO legacy_tasks (id, status) VALUES (1, 'running')`); err != nil {
-		_ = legacy.Close()
-		t.Fatalf("seed legacy task: %v", err)
-	}
-	if err := legacy.Close(); err != nil {
-		t.Fatalf("close legacy sqlite database: %v", err)
-	}
-	before, err := os.ReadFile(databasePath)
-	if err != nil {
-		t.Fatalf("read legacy sqlite database before preflight: %v", err)
-	}
-
-	database, err := New(config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.ToSlash(databasePath) + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 2,
-		MaxIdleConns: 2,
-	})
-	if database != nil {
-		_ = database.Close()
-		t.Fatal("New returned a connection for an incompatible database")
-	}
-	if !errors.Is(err, migrations.ErrIncompatibleDatabase) {
-		t.Fatalf("New error = %v, want incompatible database", err)
-	}
-	after, err := os.ReadFile(databasePath)
-	if err != nil {
-		t.Fatalf("read legacy sqlite database after preflight: %v", err)
-	}
-	if !bytes.Equal(after, before) {
-		t.Fatal("legacy sqlite database changed during compatibility preflight")
-	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		if _, statErr := os.Stat(databasePath + suffix); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("legacy sqlite sidecar %s exists after rejection: %v", suffix, statErr)
-		}
-	}
-}
-
 func TestRunMigrationsSerializesConcurrentRunnersAndUnlocksAfterCancellation(t *testing.T) {
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), "migration-lock.db") + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 2,
-		MaxIdleConns: 2,
-	}
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := newPostgresDB(t, 2)
 
 	barrier := &migrationLockBarrier{locked: make(chan struct{}), release: make(chan struct{})}
-	db.AddQueryHook(barrier)
+	testutil.AddQueryHook(db, barrier)
 	ctx, cancel := context.WithCancel(context.Background())
 	firstResult := make(chan error, 1)
 	go func() {
@@ -224,181 +137,10 @@ func TestRunMigrationsSerializesConcurrentRunnersAndUnlocksAfterCancellation(t *
 	}
 }
 
-func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
-	t.Parallel()
-
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), "busy.db") + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 25,
-		MaxIdleConns: 5,
-	}
-
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx := context.Background()
-	if err := RunMigrations(ctx, db); err != nil {
-		t.Fatalf("RunMigrations() error = %v", err)
-	}
-
-	repos := repository.NewRepositories(db)
-	for i := range 100 {
-		versionID := fmt.Sprintf("01J00000000000000000%06d", i+1)
-		task := &model.Task{
-			Type: model.TaskTypeUploadPlan, IdempotencyKey: fmt.Sprintf("upload-plan:%s", versionID),
-			Runtime: []byte(`{}`), Events: []byte(`[]`), Policy: []byte(`{"version":2,"max_attempts":6,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2},"invocation_timeout":0,"observation_window":0}`),
-			InputVersion: 1, Input: []byte(fmt.Sprintf(`{"version_id":%q}`, versionID)), InputHash: versionID,
-			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		}
-		if _, created, err := repos.Tasks.Enqueue(ctx, task); err != nil || !created {
-			t.Fatalf("Enqueue() created=%t error=%v", created, err)
-		}
-	}
-
-	var busyCount atomic.Int64
-	var claimedCount atomic.Int64
-	seenIDs := make(map[int64]bool)
-	var claimsMu sync.Mutex
-	var wg sync.WaitGroup
-	for range 8 {
-		wg.Go(func() {
-			for {
-				task, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
-				if err != nil {
-					if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
-						busyCount.Add(1)
-						return
-					}
-					t.Errorf("ClaimNext() unexpected error = %v", err)
-					return
-				}
-				if task == nil {
-					return
-				}
-				claimsMu.Lock()
-				duplicate := seenIDs[task.ID]
-				seenIDs[task.ID] = true
-				claimsMu.Unlock()
-				if duplicate {
-					t.Errorf("task %d was claimed more than once", task.ID)
-					return
-				}
-				claimedCount.Add(1)
-			}
-		})
-	}
-	wg.Wait()
-
-	if busyCount.Load() != 0 {
-		t.Fatalf("expected no SQLITE_BUSY errors during concurrent claim, got %d (claimed=%d)", busyCount.Load(), claimedCount.Load())
-	}
-	if claimedCount.Load() != 100 {
-		t.Fatalf("expected all tasks claimed, got %d", claimedCount.Load())
-	}
-	if len(seenIDs) != 100 {
-		t.Fatalf("unique claims = %d, want 100", len(seenIDs))
-	}
-}
-
-func TestNew_SQLiteReadWriteTransactionsAcquireWriteLockAtBegin(t *testing.T) {
-	t.Parallel()
-
-	db, err := New(config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), "read-then-write.db"),
-		MaxOpenConns: 2,
-		MaxIdleConns: 2,
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	if err := RunMigrations(ctx, db); err != nil {
-		t.Fatalf("RunMigrations() error = %v", err)
-	}
-
-	probe, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("reserving probe connection: %v", err)
-	}
-	t.Cleanup(func() { _ = probe.Close() })
-	if _, err := probe.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
-		t.Fatalf("disabling probe lock wait: %v", err)
-	}
-
-	readThenEnqueue := func(txRepos *repository.Repositories, wantCount int64) error {
-		counts, err := txRepos.Tasks.CountByScope(ctx, repository.TaskScopeWork)
-		if err != nil {
-			return err
-		}
-		var count int64
-		for _, statusCount := range counts {
-			count += statusCount.Count
-		}
-		if count != wantCount {
-			return fmt.Errorf("visible tasks = %d, want %d", count, wantCount)
-		}
-		versionID := fmt.Sprintf("01J00000000000000000%06d", wantCount+1)
-		_, created, err := txRepos.Tasks.Enqueue(ctx, &model.Task{
-			Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload-plan:" + versionID,
-			Runtime: []byte(`{}`), Events: []byte(`[]`), Policy: []byte(`{"version":2,"max_attempts":6,"backoff":{"initial_delay":10000000000,"multiplier":2,"maximum_delay":300000000000,"jitter":0.2},"invocation_timeout":0,"observation_window":0}`),
-			InputVersion: 1, Input: []byte(fmt.Sprintf(`{"version_id":%q}`, versionID)), InputHash: versionID,
-			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-		})
-		if err != nil {
-			return err
-		}
-		if !created {
-			return errors.New("read-then-write transaction did not create its task")
-		}
-		return nil
-	}
-
-	repos := repository.NewRepositories(db)
-	if err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		// Probe before any read or write to distinguish IMMEDIATE from DEFERRED.
-		_, err := probe.ExecContext(ctx, "BEGIN IMMEDIATE")
-		if err == nil {
-			if _, err := probe.ExecContext(ctx, "ROLLBACK"); err != nil {
-				return fmt.Errorf("rolling back unexpected probe transaction: %w", err)
-			}
-			return errors.New("competing write transaction began before the first transaction committed")
-		}
-		var sqliteErr *sqlite.Error
-		if !errors.As(err, &sqliteErr) || sqliteErr.Code() != sqlite3.SQLITE_BUSY {
-			return fmt.Errorf("competing write transaction error = %v, want SQLITE_BUSY", err)
-		}
-		return readThenEnqueue(txRepos, 0)
-	}); err != nil {
-		t.Fatalf("first read-then-write transaction: %v", err)
-	}
-
-	if err := probe.RunInTx(ctx, nil, func(_ context.Context, tx bun.Tx) error {
-		return readThenEnqueue(repository.NewRepositories(tx), 1)
-	}); err != nil {
-		t.Fatalf("read-then-write transaction after lock release: %v", err)
-	}
-
-	count, err := db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeUploadPlan).Count(ctx)
-	if err != nil {
-		t.Fatalf("counting tasks: %v", err)
-	}
-	if count != 2 {
-		t.Fatalf("committed tasks = %d, want 2", count)
-	}
-}
-
 func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
-	db := newMigratedSQLiteDB(t, "schema.db")
+	db := newMigratedPostgresDB(t)
 
-	objectColumns := sqliteColumns(t, db, "objects")
+	objectColumns := schemaColumns(t, db, "objects")
 	for _, column := range []string{"size", "e_tag", "checksum", "cache_key", "in_cache", "in_filecoin", "state"} {
 		if objectColumns[column] {
 			t.Fatalf("objects.%s should not exist", column)
@@ -411,7 +153,7 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 		}
 	}
 
-	versionColumns := sqliteColumns(t, db, "object_versions")
+	versionColumns := schemaColumns(t, db, "object_versions")
 	for _, column := range []string{"content_id", "multipart_upload_id"} {
 		if !versionColumns[column] {
 			t.Fatalf("object_versions.%s should exist", column)
@@ -428,38 +170,38 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 			t.Fatalf("object_versions.%s should not exist", column)
 		}
 	}
-	cacheColumns := sqliteColumns(t, db, "object_cache")
+	cacheColumns := schemaColumns(t, db, "object_cache")
 	for _, column := range []string{"content_id", "in_cache", "cache_accessed_at", "cache_active_task_id"} {
 		if !cacheColumns[column] {
 			t.Fatalf("object_cache.%s should exist", column)
 		}
 	}
 
-	bucketColumns := sqliteColumns(t, db, "buckets")
+	bucketColumns := schemaColumns(t, db, "buckets")
 	if bucketColumns["proof_set_id"] {
 		t.Fatal("buckets.proof_set_id should not exist")
 	}
 
 	for _, table := range []string{"storage_contents", "storage_data_sets", "storage_copies"} {
-		if columns := sqliteColumns(t, db, table); len(columns) == 0 {
+		if columns := schemaColumns(t, db, table); len(columns) == 0 {
 			t.Fatalf("%s table should exist", table)
 		}
 	}
-	copyColumns := sqliteColumns(t, db, "storage_copies")
+	copyColumns := schemaColumns(t, db, "storage_copies")
 	if copyColumns["is_new_data_set"] {
 		t.Fatal("storage_copies.is_new_data_set should not exist")
 	}
-	partColumns := sqliteColumns(t, db, "multipart_parts")
+	partColumns := schemaColumns(t, db, "multipart_parts")
 	if !partColumns["checksum"] {
 		t.Fatal("multipart_parts.checksum should exist")
 	}
 
-	indexes := sqliteIndexes(t, db, "objects")
+	indexes := schemaIndexes(t, db, "objects")
 	if !indexes["idx_objects_bucket_key"] {
 		t.Fatal("idx_objects_bucket_key should exist")
 	}
-	versionIndexes := sqliteIndexes(t, db, "object_versions")
-	objectIndexes := sqliteIndexes(t, db, "objects")
+	versionIndexes := schemaIndexes(t, db, "object_versions")
+	objectIndexes := schemaIndexes(t, db, "objects")
 	if !objectIndexes["idx_objects_current_version"] {
 		t.Fatal("idx_objects_current_version should exist")
 	}
@@ -472,11 +214,11 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	if !versionIndexes["idx_object_versions_object_created"] {
 		t.Fatal("idx_object_versions_object_created should exist")
 	}
-	cacheIndexes := sqliteIndexes(t, db, "object_cache")
+	cacheIndexes := schemaIndexes(t, db, "object_cache")
 	if !cacheIndexes["idx_object_cache_lru"] {
 		t.Fatal("idx_object_cache_lru should exist")
 	}
-	taskIndexes := sqliteIndexes(t, db, "tasks")
+	taskIndexes := schemaIndexes(t, db, "tasks")
 	for _, name := range []string{
 		"idx_tasks_pending",
 		"idx_tasks_recovery",
@@ -491,14 +233,14 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 			t.Fatalf("%s should exist", name)
 		}
 	}
-	uploadCopyIndexes := sqliteIndexes(t, db, "storage_copies")
+	uploadCopyIndexes := schemaIndexes(t, db, "storage_copies")
 	if !uploadCopyIndexes["idx_storage_copies_status_data_set_content"] {
 		t.Fatal("idx_storage_copies_status_data_set_content should exist")
 	}
 }
 
 func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T) {
-	db := newMigratedSQLiteDB(t, "object-version-constraints.db")
+	db := newMigratedPostgresDB(t)
 
 	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
@@ -507,10 +249,10 @@ func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T
 	mustExec(t, db, `INSERT INTO objects (id, bucket_id, key, created_at, updated_at) VALUES (1, 1, 'file.txt', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	// A data version points at the content holding its bytes, and the composite
 	// foreign key welds the size it repeats to that content's size.
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (1, 1, 1, printf('%064x', 1), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (2, 1, 2, printf('%064x', 2), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (3, 1, 3, printf('%064x', 3), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (4, 2, 1, printf('%064x', 4), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (1, 1, 1, lpad(to_hex(1), 64, '0'), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (2, 1, 2, lpad(to_hex(2), 64, '0'), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (3, 1, 3, lpad(to_hex(3), 64, '0'), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (4, 2, 1, lpad(to_hex(4), 64, '0'), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('v1', 1, 1, 'file.txt', 1, 1, 'etag-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('v3', 1, 1, 'file.txt', 3, 3, 'etag-3', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	// One column holds one value, so "at most one current version" needs no
@@ -533,7 +275,7 @@ func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T
 	mustReject(t, db, "expected malformed delete marker insert to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type, is_delete_marker, created_at, updated_at) VALUES ('bad-marker', 1, 1, 'file.txt', 1, 1, 'etag-marker', '', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustReject(t, db, "expected malformed delete marker update to fail", `UPDATE object_versions SET is_delete_marker = TRUE WHERE version_id = 'v3'`)
 	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, status, created_at, updated_at) VALUES (1, 'file.txt', 'upload-valid', 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (5, 1, 1, printf('%064x', 5), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (5, 1, 1, lpad(to_hex(5), 64, '0'), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, multipart_upload_id, created_at, updated_at) VALUES ('multipart-valid', 1, 1, 'file.txt', 5, 1, 'etag-mp', 'upload-valid', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustReject(t, db, "expected object_versions multipart_upload_id without upload to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, multipart_upload_id, created_at, updated_at) VALUES ('multipart-missing', 1, 1, 'file.txt', 5, 1, 'etag-missing', 'upload-missing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, content_type, is_delete_marker, created_at, updated_at) VALUES ('marker-ok', 1, 1, 'file.txt', 0, '', '', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
@@ -546,14 +288,14 @@ func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T
 }
 
 func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
-	db := newMigratedSQLiteDB(t, "storage-provenance-constraints.db")
+	db := newMigratedPostgresDB(t)
 
 	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
 	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (2, 'bucket-b', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 2, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, piece_cid, requested_copies, created_at, updated_at) VALUES (1, 1, 10, printf('%064x', 1), 'bafk2bzacefake', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (2, 2, 10, printf('%064x', 2), 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, piece_cid, requested_copies, created_at, updated_at) VALUES (1, 1, 10, lpad(to_hex(1), 64, '0'), 'bafk2bzacefake', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (2, 2, 10, lpad(to_hex(2), 64, '0'), 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_content_id, created_at, updated_at) VALUES (1, 1, '101', 0, 1, TRUE, '1001', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustReject(t, db, "expected provider/data_set reuse across buckets to fail", `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_content_id, created_at, updated_at) VALUES (2, '101', 0, 1, TRUE, '1001', 'ready', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustReject(t, db, "expected duplicate bucket/copy_index binding to fail", `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, status, created_by_content_id, created_at, updated_at) VALUES (1, '202', 0, 1, TRUE, 'pending', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
@@ -583,18 +325,18 @@ func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
 	mustExec(t, db, `INSERT INTO storage_commit_requests (request_id, storage_data_set_id, status, piece_count, extra_data_hex, sealed_at, first_sent_at, sends, submitted_at, last_sent_at, transaction_id, status_url, refusals, first_piece_id, confirmed_transaction_id, confirmed_at, created_at, updated_at) VALUES ('request-2', 2, 'confirmed', 1, 'abcd', current_timestamp, current_timestamp, 1, current_timestamp, current_timestamp, 'tx-2', 'https://provider.example/status/request-2', 0, '0', 'tx-2', current_timestamp, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO storage_commit_request_pieces (request_id, position, content_id, storage_data_set_id, piece_cid, created_at) VALUES ('request-2', 0, 1, 2, 'bafk2bzacefake', CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `UPDATE storage_copies SET status = 'committed', piece_id = '0', retrieval_url = 'https://provider.example/zero-piece', commit_request_id = 'request-2', commit_position = 0, commit_request_status = 'confirmed' WHERE content_id = 1 AND copy_index = 1`)
-	mustExec(t, db, `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2001', 'bafk2bzacefake', printf('%064x', 1), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustReject(t, db, "expected duplicate physical cleanup identity to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2001', 'bafk2bzaceduplicate', printf('%064x', 1), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2001', 'bafk2bzacefake', lpad(to_hex(1), 64, '0'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected duplicate physical cleanup identity to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2001', 'bafk2bzaceduplicate', lpad(to_hex(1), 64, '0'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	// Cleanup evidence requires the data set, the piece it removed, and the
 	// bytes it names; each NOT NULL is the invariant under test, so supply
 	// every other column.
-	mustRejectRequiredColumn(t, db, "expected cleanup evidence without storage_data_set_id to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, piece_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', '2002', 'bafk2bzacemissingdataset', printf('%064x', 1), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	mustRejectRequiredColumn(t, db, "expected cleanup evidence without piece_id to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', 1, 'bafk2bzacemissingpiece', printf('%064x', 1), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustRejectRequiredColumn(t, db, "expected cleanup evidence without storage_data_set_id to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, piece_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', '2002', 'bafk2bzacemissingdataset', lpad(to_hex(1), 64, '0'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustRejectRequiredColumn(t, db, "expected cleanup evidence without piece_id to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_cid, checksum, created_at, updated_at) VALUES (1, 1, 0, '101', 1, 'bafk2bzacemissingpiece', lpad(to_hex(1), 64, '0'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustRejectRequiredColumn(t, db, "expected cleanup evidence without checksum to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2003', 'bafk2bzacemissingchecksum', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 }
 
 func TestRunMigrations_TaskAndMultipartConstraints(t *testing.T) {
-	db := newMigratedSQLiteDB(t, "task-multipart-constraints.db")
+	db := newMigratedPostgresDB(t)
 	ctx := context.Background()
 
 	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
@@ -617,286 +359,26 @@ func TestRunMigrations_TaskAndMultipartConstraints(t *testing.T) {
 	}
 }
 
-func TestNew_SQLiteCreatesParentDirectory(t *testing.T) {
-	t.Parallel()
-
-	dbDir := filepath.Join(t.TempDir(), "nested", "db")
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.ToSlash(filepath.Join(dbDir, "synaps3.db")) + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
-	}
-
-	db, err := New(cfg)
+// newPostgresDB opens a private PostgreSQL schema through New, as production does.
+func newPostgresDB(t *testing.T, maxOpenConns int) *bun.DB {
+	t.Helper()
+	db, err := New(config.DatabaseConfig{
+		Driver: "postgres", DSN: testpg.SchemaDSN(t), MaxOpenConns: maxOpenConns, MaxIdleConns: maxOpenConns,
+	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	info, err := os.Stat(dbDir)
-	if err != nil {
-		t.Fatalf("expected sqlite directory to exist: %v", err)
-	}
-	if !info.IsDir() {
-		t.Fatalf("sqlite path %s is not a directory", dbDir)
-	}
-	if runtime.GOOS != "windows" {
-		if got := info.Mode().Perm(); got != 0o700 {
-			t.Fatalf("sqlite directory mode = %o, want 700", got)
-		}
-	}
-}
-
-func TestNew_SQLiteFileDSNAppliesManagedPragmas(t *testing.T) {
-	t.Parallel()
-
-	dbDir := filepath.Join(t.TempDir(), "db")
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.ToSlash(filepath.Join(dbDir, "synaps3.db")),
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
-	}
-
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx := context.Background()
-	var journalMode string
-	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
-		t.Fatalf("PRAGMA journal_mode: %v", err)
-	}
-	if strings.ToLower(journalMode) != "wal" {
-		t.Fatalf("journal_mode = %q, want wal", journalMode)
-	}
-
-	var busyTimeout int
-	if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
-		t.Fatalf("PRAGMA busy_timeout: %v", err)
-	}
-	if busyTimeout != 5000 {
-		t.Fatalf("busy_timeout = %d, want 5000", busyTimeout)
-	}
-
-	var foreignKeys int
-	if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
-		t.Fatalf("PRAGMA foreign_keys: %v", err)
-	}
-	if foreignKeys != 1 {
-		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
-	}
-}
-
-func TestNew_SQLiteMemoryDSNDoesNotCreateDirectories(t *testing.T) {
-	cwd := t.TempDir()
-	oldCWD, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	if err := os.Chdir(cwd); err != nil {
-		t.Fatalf("Chdir: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := os.Chdir(oldCWD); err != nil {
-			t.Errorf("restore cwd: %v", err)
+		if err := db.Close(); err != nil {
+			t.Errorf("close PostgreSQL test database: %v", err)
 		}
 	})
-
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:memory-dir/named?mode=memory&cache=shared",
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
-	}
-
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	if _, err := os.Stat(filepath.Join(cwd, "memory-dir")); !os.IsNotExist(err) {
-		t.Fatalf("memory DSN created directory unexpectedly, stat error = %v", err)
-	}
+	return db
 }
 
-func TestNew_SQLiteMemoryDSNAppliesManagedConnectionPragmas(t *testing.T) {
-	t.Parallel()
-
-	for name, dsn := range map[string]string{
-		"colon": ":memory:",
-		"uri":   "file:managed-memory?mode=memory&cache=shared",
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := config.DatabaseConfig{
-				Driver:       "sqlite",
-				DSN:          dsn,
-				MaxOpenConns: 1,
-				MaxIdleConns: 1,
-			}
-
-			db, err := New(cfg)
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			t.Cleanup(func() { _ = db.Close() })
-
-			ctx := context.Background()
-			var journalMode string
-			if err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
-				t.Fatalf("PRAGMA journal_mode: %v", err)
-			}
-			if strings.EqualFold(journalMode, "wal") {
-				t.Fatalf("journal_mode = %q, want non-WAL memory journal", journalMode)
-			}
-
-			var busyTimeout int
-			if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
-				t.Fatalf("PRAGMA busy_timeout: %v", err)
-			}
-			if busyTimeout != 5000 {
-				t.Fatalf("busy_timeout = %d, want 5000", busyTimeout)
-			}
-
-			var foreignKeys int
-			if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
-				t.Fatalf("PRAGMA foreign_keys: %v", err)
-			}
-			if foreignKeys != 1 {
-				t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
-			}
-		})
-	}
-}
-
-func TestNew_SQLiteRefusesDSNsWithoutForeignKeyEnforcement(t *testing.T) {
-	t.Parallel()
-
-	for name, setting := range map[string]string{
-		"pragma off":      "_pragma=foreign_keys(0)",
-		"pragma word off": "_pragma=foreign_keys(off)",
-		"assignment off":  "foreign_keys=off",
-		// The driver ignores this form, so enforcement stays off.
-		"assignment on": "foreign_keys=1",
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			db, err := New(config.DatabaseConfig{
-				Driver:       "sqlite",
-				DSN:          "file:foreign-keys-" + strings.ReplaceAll(name, " ", "-") + "?mode=memory&cache=shared&" + setting,
-				MaxOpenConns: 1,
-				MaxIdleConns: 1,
-			})
-			if db != nil {
-				_ = db.Close()
-			}
-			if !errors.Is(err, errSQLiteForeignKeysOff) {
-				t.Fatalf("New() error = %v, want foreign key enforcement refused", err)
-			}
-		})
-	}
-}
-
-func TestEnsureSQLitePragmasDoesNotDuplicateExistingSettings(t *testing.T) {
-	for name, query := range map[string]string{
-		"pragma":     "_pragma=journal_mode(WAL)&_pragma=busy_timeout(7000)&_pragma=foreign_keys(1)&_txlock=exclusive",
-		"assignment": "journal_mode=WAL&busy_timeout=7000&foreign_keys=1&_txlock=exclusive",
-	} {
-		t.Run(name, func(t *testing.T) {
-			dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3.db")) + "?" + query
-
-			got := ensureSQLitePragmas(dsn)
-
-			for _, want := range []string{"journal_mode", "busy_timeout", "foreign_keys", "_txlock"} {
-				if count := strings.Count(strings.ToLower(got), want); count != 1 {
-					t.Fatalf("%s count = %d in %q, want 1", want, count, got)
-				}
-			}
-			if !strings.Contains(got, "busy_timeout=7000") && !strings.Contains(got, "busy_timeout(7000)") {
-				t.Fatalf("managed pragmas overwrote existing busy_timeout: %q", got)
-			}
-			if !strings.Contains(got, "_txlock=exclusive") {
-				t.Fatalf("managed settings overwrote existing _txlock: %q", got)
-			}
-		})
-	}
-}
-
-func TestEnsureSQLitePragmasIgnoresSimilarQueryParameters(t *testing.T) {
-	dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3.db")) +
-		"?journal_mode_override=WAL&note=foreign_keys(1)&busy_timeout_ms=7000&txlock=deferred"
-
-	got := ensureSQLitePragmas(dsn)
-
-	for _, want := range []string{"journal_mode(WAL)", "foreign_keys(1)", "busy_timeout(5000)", "_txlock=immediate"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("ensureSQLitePragmas() = %q, want %s", got, want)
-		}
-	}
-}
-
-func TestEnsureSQLitePragmasDoesNotAddWALForMemoryDSN(t *testing.T) {
-	for _, dsn := range []string{":memory:", "file:memory-dir/named?mode=memory&cache=shared"} {
-		got := ensureSQLitePragmas(dsn)
-		if strings.Contains(strings.ToLower(got), "journal_mode") {
-			t.Fatalf("ensureSQLitePragmas(%q) = %q, want no journal_mode", dsn, got)
-		}
-		for _, want := range []string{"foreign_keys(1)", "busy_timeout(5000)", "_txlock=immediate"} {
-			if !strings.Contains(got, want) {
-				t.Fatalf("ensureSQLitePragmas(%q) = %q, want %s", dsn, got, want)
-			}
-		}
-	}
-}
-
-func TestSQLiteFilePathTreatsWindowsDrivePathAsFilePath(t *testing.T) {
-	path, ok, err := sqliteFilePath(`C:\synaps3\db\synaps3.db?_pragma=journal_mode(WAL)`)
-	if err != nil {
-		t.Fatalf("sqliteFilePath() error = %v", err)
-	}
-	if !ok {
-		t.Fatal("sqliteFilePath() ok = false, want true")
-	}
-	if path == "" {
-		t.Fatal("sqliteFilePath() path is empty")
-	}
-}
-
-func TestSQLiteFilePathTreatsWindowsFileURIAsFilePath(t *testing.T) {
-	path, ok, err := sqliteFilePath("file:C:/synaps3/db/synaps3.db?_pragma=journal_mode(WAL)")
-	if err != nil {
-		t.Fatalf("sqliteFilePath() error = %v", err)
-	}
-	if !ok {
-		t.Fatal("sqliteFilePath() ok = false, want true")
-	}
-	if filepath.ToSlash(path) != "C:/synaps3/db/synaps3.db" {
-		t.Fatalf("sqliteFilePath() path = %q, want C:/synaps3/db/synaps3.db", filepath.ToSlash(path))
-	}
-}
-
-func newMigratedSQLiteDB(t *testing.T, filename string) *bun.DB {
+func newMigratedPostgresDB(t *testing.T) *bun.DB {
 	t.Helper()
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), filename) + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
-	}
-
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := newPostgresDB(t, 1)
 	if err := RunMigrations(context.Background(), db); err != nil {
 		t.Fatalf("RunMigrations() error = %v", err)
 	}
@@ -934,12 +416,9 @@ func mustReject(t *testing.T, db *bun.DB, message, query string, args ...any) {
 // exactly how three stale cases survived a column being removed.
 func rejectedByMissingSchema(err error) bool {
 	for _, missing := range []string{
-		"no such table",       // SQLite
-		"no such column",      // SQLite
-		"has no column named", // SQLite, INSERT column list
-		"does not exist",      // PostgreSQL, relation/column
-		"undefined_table",     // PostgreSQL, SQLSTATE name
-		"undefined_column",    // PostgreSQL, SQLSTATE name
+		"does not exist",   // relation/column
+		"undefined_table",  // SQLSTATE name
+		"undefined_column", // SQLSTATE name
 	} {
 		if strings.Contains(err.Error(), missing) {
 			return true
@@ -963,69 +442,33 @@ func mustRejectRequiredColumn(t *testing.T, db *bun.DB, message, query string, a
 }
 
 func rejectedByNullConstraint(err error) bool {
-	for _, nullConstraint := range []string{
-		"NOT NULL constraint failed", // SQLite
-		"null value in column",       // PostgreSQL
-	} {
-		if strings.Contains(err.Error(), nullConstraint) {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(err.Error(), "null value in column")
 }
 
-type sqliteQueryer interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}
-
-func sqliteColumns(t *testing.T, db sqliteQueryer, table string) map[string]bool {
+func schemaColumns(t *testing.T, db *bun.DB, table string) map[string]bool {
 	t.Helper()
-	rows, err := db.QueryContext(context.Background(), "PRAGMA table_info("+table+")")
-	if err != nil {
-		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+	var names []string
+	if err := db.NewRaw(`SELECT column_name FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = ?`, table).Scan(t.Context(), &names); err != nil {
+		t.Fatalf("read columns of %s: %v", table, err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	columns := make(map[string]bool)
-	for rows.Next() {
-		var cid int
-		var name, columnType string
-		var notNull int
-		var defaultValue sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			t.Fatalf("scan column info for %s: %v", table, err)
-		}
-		columns[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate columns for %s: %v", table, err)
-	}
-	return columns
+	return setOf(names)
 }
 
-func sqliteIndexes(t *testing.T, db sqliteQueryer, table string) map[string]bool {
+func schemaIndexes(t *testing.T, db *bun.DB, table string) map[string]bool {
 	t.Helper()
-	rows, err := db.QueryContext(context.Background(), "PRAGMA index_list("+table+")")
-	if err != nil {
-		t.Fatalf("PRAGMA index_list(%s): %v", table, err)
+	var names []string
+	if err := db.NewRaw(`SELECT indexname FROM pg_indexes
+		WHERE schemaname = current_schema() AND tablename = ?`, table).Scan(t.Context(), &names); err != nil {
+		t.Fatalf("read indexes of %s: %v", table, err)
 	}
-	defer func() { _ = rows.Close() }()
+	return setOf(names)
+}
 
-	indexes := make(map[string]bool)
-	for rows.Next() {
-		var seq int
-		var name string
-		var unique int
-		var origin string
-		var partial int
-		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-			t.Fatalf("scan index info for %s: %v", table, err)
-		}
-		indexes[name] = true
+func setOf(names []string) map[string]bool {
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate indexes for %s: %v", table, err)
-	}
-	return indexes
+	return set
 }

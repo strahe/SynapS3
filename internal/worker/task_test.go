@@ -75,7 +75,7 @@ type taskHarness struct {
 
 func newTaskHarness(t *testing.T, handler Handler, config *EngineConfig, others ...Handler) taskHarness {
 	t.Helper()
-	return newTaskHarnessWithDB(t, testutil.NewTestFileDB(t), handler, config, others...)
+	return newTaskHarnessWithDB(t, testutil.NewTestDB(t), handler, config, others...)
 }
 
 func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *EngineConfig, others ...Handler) taskHarness {
@@ -155,7 +155,7 @@ func TestServiceCanonicalEnqueueAndConflict(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("first enqueue = task:%#v created:%v err:%v", first, created, err)
 	}
-	if string(first.Input) != `{"value":"alpha"}` {
+	if !testutil.JSONEqual(first.Input, []byte(`{"value":"alpha"}`)) {
 		t.Fatalf("canonical input = %s", first.Input)
 	}
 
@@ -846,10 +846,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 }
 
 func TestCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) {
-		assertCheckpointedEffectCommitsCheckpointBeforeEffect(t, testutil.NewTestFileDB(t))
-	})
-	testPostgresCheckpointedEffect(t)
+	assertCheckpointedEffectCommitsCheckpointBeforeEffect(t, testutil.NewTestDB(t))
 }
 
 func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun.DB) {
@@ -1066,11 +1063,7 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 		delay:          2 * config.LeaseDuration / 3,
 	}
 	harness.repos.Tasks = ordered
-	if _, err := harness.db.ExecContext(t.Context(), `CREATE TRIGGER fail_task_settlement
-		BEFORE INSERT ON task_history
-		BEGIN SELECT RAISE(FAIL, 'injected settlement failure'); END`); err != nil {
-		t.Fatalf("create settlement fault: %v", err)
-	}
+	restoreFailTaskSettlement := testutil.FailWrites(t, harness.db, "task_history", "INSERT", "", "injected settlement failure")
 	harness.engine.settlementRetryDelays = []time.Duration{0, 0, 0, 0}
 	harness.engine.executeClaim(t.Context(), claimed)
 	if got := ordered.renewalsAfterShort.Load(); got != 0 {
@@ -1083,9 +1076,7 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	if stored.LeaseUntil.After(time.Now().Add(2 * harness.engine.config.PollInterval)) {
 		t.Fatalf("settlement failure lease was not shortened: %s", stored.LeaseUntil)
 	}
-	if _, err := harness.db.ExecContext(t.Context(), `DROP TRIGGER fail_task_settlement`); err != nil {
-		t.Fatalf("drop settlement fault: %v", err)
-	}
+	restoreFailTaskSettlement()
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Millisecond), row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("expire shortened lease: %v", err)
 	}

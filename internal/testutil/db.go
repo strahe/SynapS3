@@ -5,26 +5,28 @@ package testutil
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
-	"errors"
+	"encoding/json"
 	"fmt"
-	"path/filepath"
-	"sync"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/sqlitedialect"
-
-	"modernc.org/sqlite"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
-var testDBCounter atomic.Uint64
+// testDBMaxOpenConns bounds each test database so packages running in
+// parallel stay well below the server's connection limit.
+const testDBMaxOpenConns = 8
 
 // StorageChecksum turns a readable fixture identity into the canonical
 // lowercase SHA-256 representation required by storage_contents.
@@ -38,116 +40,94 @@ func StorageChecksum(identity string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// NewTestDB creates a fresh in-memory SQLite DB with all migrations applied.
-// The database is closed automatically when the test completes.
+// NewTestDB creates a private PostgreSQL schema with all migrations applied.
+// The connections close and the schema is dropped when the test completes.
 func NewTestDB(t *testing.T) *bun.DB {
 	t.Helper()
-
-	dsn := fmt.Sprintf("file:synaps3-test-%d?mode=memory&cache=shared&_pragma=foreign_keys(1)", testDBCounter.Add(1))
-	return newTestSQLiteDB(t, dsn)
-}
-
-// NewTestFileDB creates a fresh file-backed SQLite DB with all migrations applied.
-// Use it for tests that cancel database contexts while worker goroutines are active.
-func NewTestFileDB(t *testing.T) *bun.DB {
-	t.Helper()
-
-	path := filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3-test.db"))
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
-	return newTestSQLiteDB(t, dsn)
-}
-
-func newTestSQLiteDB(t *testing.T, dsn string) *bun.DB {
-	t.Helper()
-
-	sqldb, err := sql.Open("sqlite", dsn)
+	config, err := pgx.ParseConfig(testpg.SchemaDSN(t))
 	if err != nil {
-		t.Fatalf("opening test db: %v", err)
+		t.Fatalf("parse PostgreSQL DSN: %v", err)
 	}
-	sqldb.SetMaxOpenConns(1)
-	sqldb.SetMaxIdleConns(1)
-
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
-	if err := restoreMigratedTemplate(context.Background(), sqldb); err != nil {
-		t.Fatalf("copying migrated test schema: %v", err)
+	sqldb := stdlib.OpenDB(*config)
+	sqldb.SetMaxOpenConns(testDBMaxOpenConns)
+	db := bun.NewDB(sqldb, pgdialect.New())
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close PostgreSQL test database: %v", err)
+		}
+	})
+	ctx := context.Background()
+	migrator := migrations.NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
 	}
-
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
 	return db
 }
 
-// migratedTemplateURI names a shared in-memory database that holds every
-// migration, so each test database is a copy instead of a fresh migration run.
-const migratedTemplateURI = "file:synaps3-migrated-template?mode=memory&cache=shared"
-
-var migratedTemplate struct {
-	once sync.Once
-	// holder keeps the shared in-memory template alive for the test process.
-	holder *sql.Conn
-	err    error
-	mu     sync.Mutex
-}
-
-func buildMigratedTemplate() (*sql.Conn, error) {
-	ctx := context.Background()
-	sqldb, err := sql.Open("sqlite", migratedTemplateURI+"&_pragma=foreign_keys(1)")
-	if err != nil {
-		return nil, err
-	}
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		return nil, fmt.Errorf("init migrator: %w", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		return nil, fmt.Errorf("running migrations: %w", err)
-	}
-	return sqldb.Conn(ctx)
-}
-
-// restoreMigratedTemplate copies the migrated template into the database of
-// sqldb's single connection with SQLite's backup API.
-func restoreMigratedTemplate(ctx context.Context, sqldb *sql.DB) error {
-	migratedTemplate.once.Do(func() {
-		migratedTemplate.holder, migratedTemplate.err = buildMigratedTemplate()
-	})
-	if migratedTemplate.err != nil {
-		return migratedTemplate.err
-	}
-	migratedTemplate.mu.Lock()
-	defer migratedTemplate.mu.Unlock()
-
-	conn, err := sqldb.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-	return conn.Raw(func(driverConn any) error {
-		restorer, ok := driverConn.(interface {
-			NewRestore(string) (*sqlite.Backup, error)
-		})
-		if !ok {
-			return errors.New("sqlite driver connection cannot restore a backup")
-		}
-		backup, err := restorer.NewRestore(migratedTemplateURI)
-		if err != nil {
-			return err
-		}
-		for more := true; more; {
-			if more, err = backup.Step(-1); err != nil {
-				_ = backup.Finish()
-				return err
-			}
-		}
-		return backup.Finish()
-	})
-}
-
-// NewTestRepos creates a Repositories instance backed by an in-memory SQLite DB.
+// NewTestRepos creates a Repositories instance backed by NewTestDB.
 func NewTestRepos(t *testing.T) *repository.Repositories {
 	t.Helper()
 	return repository.NewRepositories(NewTestDB(t))
+}
+
+// AddQueryHook attaches hook to db in place. Tests use it to observe or pause
+// the queries of components that already hold db; bun's WithQueryHook returns
+// a copy those components never see.
+func AddQueryHook(db *bun.DB, hook bun.QueryHook) {
+	db.AddQueryHook(hook) //nolint:staticcheck // WithQueryHook cannot reach existing holders of db.
+}
+
+// JSONEqual reports whether a and b hold the same JSON value; two absent values
+// are equal. PostgreSQL stores jsonb normalized, so a value read back need not
+// repeat the bytes written.
+func JSONEqual(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b)
+	}
+	var left, right any
+	if json.Unmarshal(a, &left) != nil || json.Unmarshal(b, &right) != nil {
+		return false
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+var failWritesCounter atomic.Uint64
+
+// FailWrites makes matching row writes to table fail with message, to inject a
+// database failure at one statement. event is a trigger event such as "INSERT"
+// or "UPDATE OF status"; when, if not empty, is a condition over NEW and OLD.
+// The returned function removes the fault.
+func FailWrites(tb testing.TB, db bun.IDB, table, event, when, message string) func() {
+	tb.Helper()
+	name := fmt.Sprintf("test_fail_writes_%d", failWritesCounter.Add(1))
+	condition := ""
+	if when != "" {
+		condition = "WHEN (" + when + ") "
+	}
+	statements := []string{
+		fmt.Sprintf("CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION USING MESSAGE = '%s'; END$$",
+			name, strings.ReplaceAll(message, "'", "''")),
+		fmt.Sprintf("CREATE TRIGGER %s BEFORE %s ON %s FOR EACH ROW %sEXECUTE FUNCTION %s()", name, event, table, condition, name),
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(context.Background(), statement); err != nil {
+			tb.Fatalf("install write fault on %s: %v", table, err)
+		}
+	}
+	return func() {
+		tb.Helper()
+		for _, statement := range []string{
+			fmt.Sprintf("DROP TRIGGER %s ON %s", name, table),
+			fmt.Sprintf("DROP FUNCTION %s()", name),
+		} {
+			if _, err := db.ExecContext(context.Background(), statement); err != nil {
+				tb.Fatalf("remove write fault on %s: %v", table, err)
+			}
+		}
+	}
 }
 
 // SeedBucket inserts an active bucket and returns it.

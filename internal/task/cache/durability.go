@@ -52,7 +52,7 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input cacheeviction.DurabilityInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

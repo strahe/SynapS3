@@ -93,7 +93,7 @@ func evaluateRetirementGate(ctx context.Context, db bun.IDB, replacementID int64
 	if err != nil {
 		return gate, fmt.Errorf("counting outstanding replacement items: %w", err)
 	}
-	gate.WaitingItems = waiting
+	gate.WaitingItems = int(waiting)
 	if waiting > 0 {
 		gate.Blockers = append(gate.Blockers, retirementBlockerWaitingItems)
 	}
@@ -170,7 +170,7 @@ func countRetirementSourceWrites(ctx context.Context, db bun.IDB, _ int64, sourc
 		return 0, fmt.Errorf("counting in-flight source copies: %w", err)
 	}
 
-	return inFlight, nil
+	return int(inFlight), nil
 }
 
 // CountAbandonedTargetSoleCopies reports how many uploads would lose their only
@@ -322,7 +322,7 @@ func countReplacementActiveCommitAttempts(ctx context.Context, db bun.IDB, repla
 	if err != nil {
 		return 0, fmt.Errorf("counting replacement confirmation attempts: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 func lockReplacementDataSets(ctx context.Context, db bun.IDB, ids ...int64) error {

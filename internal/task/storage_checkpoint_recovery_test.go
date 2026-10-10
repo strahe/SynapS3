@@ -72,7 +72,7 @@ func seedStoreCheckpoint(t *testing.T, runtime handlerTestRuntime, taskID, copyI
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, checkpoint, taskID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, json.RawMessage(checkpoint), taskID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = 'recover' WHERE id = ?`, taskID).Exec(t.Context()); err != nil {
@@ -236,7 +236,7 @@ func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) 
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ? WHERE id = ?`, runtimeJSON, taskRow.ID).Exec(t.Context()); err != nil {
+				if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ? WHERE id = ?`, json.RawMessage(runtimeJSON), taskRow.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}

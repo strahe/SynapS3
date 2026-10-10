@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -14,18 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/strahe/synaps3/internal/db/migrations"
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
-	db := newPostgresTaskDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	const taskCount = 24
 	input := json.RawMessage(`{}`)
@@ -77,14 +72,6 @@ func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
 	}
 }
 
-func TestPostgresTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T) {
-	assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t, newPostgresTaskDB(t))
-}
-
-func TestPostgresTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T) {
-	assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, newPostgresTaskDB(t))
-}
-
 type claimQueryRecorder struct {
 	queries []string
 }
@@ -105,7 +92,7 @@ func TestPostgresTaskClaimFilteredBacklogDiagnostics(t *testing.T) {
 	if !*taskClaimDiagnostics {
 		t.Skip("run with -args -task-claim-diagnostics")
 	}
-	db := newPostgresTaskDB(t)
+	db := testDB(t)
 	ctx := t.Context()
 	const backlogPerMode = 5000
 	old := time.Now().UTC().Add(-time.Hour)
@@ -137,7 +124,7 @@ func TestPostgresTaskClaimFilteredBacklogDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := new(claimQueryRecorder)
-	db.AddQueryHook(recorder)
+	testutil.AddQueryHook(db, recorder)
 	repos := repository.NewRepositories(db)
 	for index, mode := range []string{"recovery", "pending"} {
 		before := len(recorder.queries)
@@ -173,16 +160,8 @@ func TestPostgresTaskClaimFilteredBacklogDiagnostics(t *testing.T) {
 	}
 }
 
-func TestPostgresTaskOperationAdmissionAndRollback(t *testing.T) {
-	assertTaskOperationAdmissionAndRollback(t, newPostgresTaskDB(t))
-}
-
-func TestPostgresTaskEventsAreBoundedAndTransactional(t *testing.T) {
-	assertTaskEventsAreBoundedAndTransactional(t, newPostgresTaskDB(t))
-}
-
 func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T) {
-	db := newPostgresTaskDB(t)
+	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	availableAt := time.Now().Add(-time.Minute)
 	for index := range 2 {
@@ -235,29 +214,4 @@ func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T)
 	case <-ctx.Done():
 		t.Fatal("claim blocked behind the queue head or legacy advisory lock")
 	}
-}
-
-func newPostgresTaskDB(t *testing.T) *bun.DB {
-	t.Helper()
-	config, err := pgx.ParseConfig(testpg.SchemaDSN(t))
-	if err != nil {
-		t.Fatalf("parse PostgreSQL DSN: %v", err)
-	}
-	db := bun.NewDB(stdlib.OpenDB(*config), pgdialect.New())
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close PostgreSQL test database: %v", err)
-		}
-	})
-	if err := migrations.ValidateTarget(t.Context(), db); err != nil {
-		t.Fatalf("validate empty PostgreSQL schema: %v", err)
-	}
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(t.Context()); err != nil {
-		t.Fatalf("initialize PostgreSQL migrations: %v", err)
-	}
-	if _, err := migrator.Migrate(t.Context()); err != nil {
-		t.Fatalf("migrate PostgreSQL schema: %v", err)
-	}
-	return db
 }

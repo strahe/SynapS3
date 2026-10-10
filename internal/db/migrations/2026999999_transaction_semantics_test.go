@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/uptrace/bun"
@@ -12,7 +11,7 @@ import (
 )
 
 func TestMigrationUpFailureRollsBackAndDoesNotMark(t *testing.T) {
-	testMigrationDialects(t, testMigrationUpFailureRollsBackAndDoesNotMark)
+	withMigrationDB(t, testMigrationUpFailureRollsBackAndDoesNotMark)
 }
 
 func testMigrationUpFailureRollsBackAndDoesNotMark(t *testing.T, db *bun.DB) {
@@ -43,7 +42,7 @@ func testMigrationUpFailureRollsBackAndDoesNotMark(t *testing.T, db *bun.DB) {
 }
 
 func TestMigrationsPreserveDataOnRepeatAndMarkerRecovery(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		id := insertSchemaTestTask(t, db, "marker-survivor")
 		before := appliedSchemaState(t, db)
@@ -87,7 +86,7 @@ func TestMigrationsPreserveDataOnRepeatAndMarkerRecovery(t *testing.T) {
 // A partial baseline with an empty marker is refused unchanged, both before
 // startup migrates and by the baseline itself, so migration execution cannot alter it.
 func TestPartialBaselineWithEmptyMarkerIsRefusedUnchanged(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigrationDB(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		migrator := NewMigrator(db)
 		if err := migrator.Init(ctx); err != nil {
@@ -112,12 +111,10 @@ func TestPartialBaselineWithEmptyMarkerIsRefusedUnchanged(t *testing.T) {
 	})
 }
 
-func testMigrationDialects(t *testing.T, test func(*testing.T, *bun.DB)) {
+// withMigrationDB runs test against an empty private PostgreSQL schema.
+func withMigrationDB(t *testing.T, test func(*testing.T, *bun.DB)) {
 	t.Helper()
-	t.Run("SQLite", func(t *testing.T) {
-		test(t, newSQLiteMigrationDB(t, strings.ReplaceAll(t.Name(), "/", "_")))
-	})
-	testPostgresMigrationDialect(t, test)
+	test(t, newPostgresMigrationDB(t))
 }
 
 func assertAppliedMigrationCount(t *testing.T, ctx context.Context, migrator *migrate.Migrator, want int) {

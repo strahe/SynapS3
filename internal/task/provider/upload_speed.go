@@ -101,7 +101,7 @@ func (h *UploadSpeedTestHandler) newHandler() *taskengine.FuncHandler {
 			return repos.ProviderUploadSpeed.Begin(ctx, input.ProviderID, input.ServiceURLHash, next.ID)
 		}}, nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		return repos.ProviderUploadSpeed.TransferTaskOwner(ctx, old.ID, next.ID)
 	}
 	return taskengine.NewFuncHandler(definition, h.executeProviderUploadSpeed, h.recoverProviderUploadSpeed)

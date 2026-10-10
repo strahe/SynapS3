@@ -14,10 +14,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  postgres:
+  system:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 15
-    services:
+    services: &postgres-service
       postgres:
         image: postgres:18
         env:
@@ -31,7 +31,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
+    env: &postgres-env
       GOTOOLCHAIN: auto
       SYNAPS3_POSTGRES_TEST_DSN: postgres://postgres:postgres@localhost:5432/synaps3_test?sslmode=disable
     steps:
@@ -41,17 +41,14 @@ jobs:
       - name: Set up Go
         uses: ./.github/actions/setup-go
 
-      - name: Test PostgreSQL persistence contracts
-        run: make test-postgres
-
-      - name: Test system runtime on PostgreSQL
-        run: make test-system-postgres
+      - name: Test system runtime
+        run: make test-system
 
   verify:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 30
-    env:
-      GOTOOLCHAIN: auto
+    services: *postgres-service
+    env: *postgres-env
 
     steps:
       - name: Checkout
@@ -90,8 +87,8 @@ jobs:
   race:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 5
-    env:
-      GOTOOLCHAIN: auto
+    services: *postgres-service
+    env: *postgres-env
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -105,8 +102,8 @@ jobs:
   dashboard:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 15
-    env:
-      GOTOOLCHAIN: auto
+    services: *postgres-service
+    env: *postgres-env
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -148,7 +145,7 @@ jobs:
           retention-days: 7
 
   check:
-    needs: [verify, race, postgres, dashboard]
+    needs: [verify, race, system, dashboard]
     if: ${{ always() }}
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 5
@@ -157,10 +154,10 @@ jobs:
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
           RACE_RESULT: ${{ needs.race.result }}
-          POSTGRES_RESULT: ${{ needs.postgres.result }}
+          SYSTEM_RESULT: ${{ needs.system.result }}
           DASHBOARD_RESULT: ${{ needs.dashboard.result }}
         run: |
           test "$VERIFY_RESULT" = success
           test "$RACE_RESULT" = success
-          test "$POSTGRES_RESULT" = success
+          test "$SYSTEM_RESULT" = success
           test "$DASHBOARD_RESULT" = success

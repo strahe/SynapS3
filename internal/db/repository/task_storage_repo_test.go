@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
 
@@ -27,9 +28,7 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `CREATE TRIGGER refuse_task_archive BEFORE DELETE ON tasks BEGIN SELECT RAISE(ABORT, 'archive refused'); END`); err != nil {
-		t.Fatal(err)
-	}
+	restoreRefuseTaskArchive := testutil.FailWrites(t, db, "tasks", "DELETE", "", "archive refused")
 	transition := repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover}
 	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, transition); err == nil {
 		t.Fatal("archive unexpectedly committed")
@@ -41,9 +40,7 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 	if err != nil || failed == nil || failed.Status != model.TaskStatusRunning || !bytes.Equal(failed.Events, before.Events) || !bytes.Equal(failed.Checkpoint, before.Checkpoint) {
 		t.Fatalf("rollback changed source: %#v, %v", failed, err)
 	}
-	if _, err := db.ExecContext(ctx, "DROP TRIGGER refuse_task_archive"); err != nil {
-		t.Fatal(err)
-	}
+	restoreRefuseTaskArchive()
 	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, transition); err != nil {
 		t.Fatal(err)
 	}

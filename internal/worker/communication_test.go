@@ -114,7 +114,7 @@ func TestRegistryRequiresClosedCommunicationDeclarations(t *testing.T) {
 
 func TestSchedulerRequiresRegisteredTypesAtFreeze(t *testing.T) {
 	registry := NewRegistry()
-	service, err := NewService(registry, repository.NewRepositories(testutil.NewTestFileDB(t)))
+	service, err := NewService(registry, repository.NewRepositories(testutil.NewTestDB(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestSchedulerRequiresRegisteredTypesAtFreeze(t *testing.T) {
 func TestMessengerRequiresTransactionPermissionsAndStableSubscriberOrder(t *testing.T) {
 	var messenger *Messenger
 	var received []string
-	harness := communicationHarness(t, testutil.NewTestFileDB(t), nil, func(r *Registry, _ *Service) {
+	harness := communicationHarness(t, testutil.NewTestDB(t), nil, func(r *Registry, _ *Service) {
 		declarations := []string{"ready"}
 		var err error
 		messenger, err = r.Messenger("source", nil, declarations)
@@ -183,7 +183,7 @@ func TestMessengerRequiresTransactionPermissionsAndStableSubscriberOrder(t *test
 }
 
 func TestMessengerRejectsUnfrozenAndRecursiveDispatch(t *testing.T) {
-	repos := repository.NewRepositories(testutil.NewTestFileDB(t))
+	repos := repository.NewRepositories(testutil.NewTestDB(t))
 	registry := NewRegistry()
 	messenger, err := registry.Messenger("source", []string{"recursive"}, nil)
 	if err != nil {
@@ -214,10 +214,9 @@ func TestMessengerRejectsUnfrozenAndRecursiveDispatch(t *testing.T) {
 func TestMessagesShareEngineSettlementTransaction(t *testing.T) {
 	for _, failure := range []string{"error", "panic"} {
 		t.Run(failure, func(t *testing.T) {
-			assertMessageSettlementRollback(t, testutil.NewTestFileDB(t), failure)
+			assertMessageSettlementRollback(t, testutil.NewTestDB(t), failure)
 		})
 	}
-	testPostgresMessageSettlement(t)
 }
 
 func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
@@ -310,8 +309,7 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 }
 
 func TestSchedulerWakePreservesTypeAndWaitReasonBoundaries(t *testing.T) {
-	assertSchedulerWakeBoundaries(t, testutil.NewTestFileDB(t))
-	testPostgresSchedulerWake(t)
+	assertSchedulerWakeBoundaries(t, testutil.NewTestDB(t))
 }
 
 func assertSchedulerWakeBoundaries(t *testing.T, db *bun.DB) {

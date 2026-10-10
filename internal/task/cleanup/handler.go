@@ -94,7 +94,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		_, err := repos.StorageCleanup.AuthorizeTask(ctx, input.ContentID, input.Generation, source.ID)
 		return err
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input storagecleanup.Input
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

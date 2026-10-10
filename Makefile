@@ -23,7 +23,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-race-ci test-postgres test-system test-system-support test-system-postgres test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-ci verify-norace clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-race-ci test-system test-system-support test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-ci verify-norace clean run ui-install ui-build ui-dev ui-e2e-install
 .PHONY: docker-init docker-up docker-verify docker-down docker-status docker-logs docker-password
 
 all: build
@@ -68,17 +68,11 @@ test-race-ci:
 	$(CGO) go test -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task
 	$(CGO) go test -race -tags dev -count=1 -run '^TestEngine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork|TypeConcurrencyPreservesQueueAndFairness|GlobalConcurrencyIncludesUnrestrictedTypes|ActiveClaimCannotBeReclaimedBeforeInvocationReturns|ConcurrencyHeldThroughSettlement|ShutdownWaitsForInvocations)$$' ./internal/worker
 
-test-postgres:
-	$(CGO) go test -tags=postgres -count=1 ./internal/testpg ./internal/db/migrations ./internal/db/repository ./internal/worker
-
 test-system:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./tests/testutil/... ./internal/systemtest ./tests/system
 
 test-system-support:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./tests/testutil/... ./internal/systemtest
-
-test-system-postgres:
-	$(CGO) go test $(GOFLAGS) -tags='dev systemtest postgres' -count=1 ./tests/system
 
 test-s3-compatibility:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest s3compat' -count=1 -run '^(TestS3CompatibilityMatrix|TestS3Clients)$$' ./tests/system
@@ -93,6 +87,7 @@ ui-e2e-install:
 	cd ui && pnpm exec playwright install $(PLAYWRIGHT_INSTALL_FLAGS) chromium
 
 test-ui-e2e:
+	@test -n "$$SYNAPS3_POSTGRES_TEST_DSN" || { echo "SYNAPS3_POSTGRES_TEST_DSN is not set; point it at a PostgreSQL database for the systemtest servers"; exit 1; }
 	@test -f ui/dist/index.html || { echo "ui/dist/index.html not found; run make ui-build first"; exit 1; }
 	@test -x bin/$(SYSTEMTEST_BINARY) || { echo "bin/$(SYSTEMTEST_BINARY) not found; run make build-systemtest-server first"; exit 1; }
 	cd ui && pnpm exec playwright test

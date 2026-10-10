@@ -71,14 +71,12 @@ func TestCacheCapacityCompletionPreservesDemandUntilArchiveCommits(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", checkpoint).Where("id = ?", planner.ID).Exec(t.Context()); err != nil {
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Where("id = ?", planner.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			observer := &capacityArchiveObserver{failed: make(chan struct{})}
-			runtime.db.AddQueryHook(observer)
-			if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER reject_capacity_archive BEFORE INSERT ON task_history BEGIN SELECT RAISE(ABORT, 'injected capacity archive failure'); END`); err != nil {
-				t.Fatal(err)
-			}
+			testutil.AddQueryHook(runtime.db, observer)
+			restoreRejectCapacityArchive := testutil.FailWrites(t, runtime.db, "task_history", "INSERT", "", "injected capacity archive failure")
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			select {
@@ -87,12 +85,10 @@ func TestCacheCapacityCompletionPreservesDemandUntilArchiveCommits(t *testing.T)
 				t.Fatal("capacity completion did not reach the archive fault")
 			}
 			current, err := runtime.repos.Tasks.GetByID(t.Context(), planner.ID)
-			if err != nil || current.Status != model.TaskStatusRunning || string(current.Checkpoint) != string(checkpoint) {
+			if err != nil || current.Status != model.TaskStatusRunning || !testutil.JSONEqual(current.Checkpoint, checkpoint) {
 				t.Fatalf("uncommitted completion lost demand: %#v, err=%v", current, err)
 			}
-			if _, err := runtime.db.ExecContext(t.Context(), `DROP TRIGGER reject_capacity_archive`); err != nil {
-				t.Fatal(err)
-			}
+			restoreRejectCapacityArchive()
 			completed := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
 			var cp struct {
 				CycleActive       bool  `json:"cycle_active"`
@@ -109,12 +105,9 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		policy cache.EvictionPolicy
-		legacy bool
 	}{
-		{"lru/direct", cache.EvictionPolicyLRU, false},
-		{"disabled/direct", cache.EvictionPolicyNone, false},
-		{"lru/legacy", cache.EvictionPolicyLRU, true},
-		{"disabled/legacy", cache.EvictionPolicyNone, true},
+		{"lru", cache.EvictionPolicyLRU},
+		{"disabled", cache.EvictionPolicyNone},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runtime := newScheduledCapacityRuntime(t, handlerRuntimeOptions{policy: tc.policy, maxBytes: 100, highPercent: 90, lowPercent: 60})
@@ -133,33 +126,9 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 				t.Fatal(err)
 			}
 			healthyKey, nextKey, historyCount := key+":2", key+":3", 2
-			if tc.legacy {
-				legacy, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: key + ":2", Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
-				if err != nil {
-					t.Fatal(err)
-				}
-				policy := map[string]any{}
-				if err := json.Unmarshal(legacy.Policy, &policy); err != nil {
-					t.Fatal(err)
-				}
-				policy["version"], policy["legacy"] = 0, true
-				encoded, err := json.Marshal(policy)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("policy_json = ?", encoded).Set("wait_reason = ?", "scheduled").Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", legacy.ID).Exec(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				if err := runtime.repos.TaskSchedules.SetHead(t.Context(), key, 1, 2, &source.ID, &legacy.ID, time.Now().Add(-time.Second)); err != nil {
-					t.Fatal(err)
-				}
-				healthyKey, nextKey, historyCount = key+":3", key+":4", 3
-			}
 			observer := &capacityArchiveObserver{failed: make(chan struct{})}
-			runtime.db.AddQueryHook(observer)
-			if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER reject_healthy_capacity_archive BEFORE INSERT ON task_history WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'injected healthy capacity archive failure'); END`); err != nil {
-				t.Fatal(err)
-			}
+			testutil.AddQueryHook(runtime.db, observer)
+			restoreRejectHealthyCapacityArchive := testutil.FailWrites(t, runtime.db, "task_history", "INSERT", "NEW.status = 'completed'", "injected healthy capacity archive failure")
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			select {
@@ -168,16 +137,14 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 				t.Fatal("healthy capacity completion did not reach the archive fault")
 			}
 			unsettled, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, healthyKey)
-			if err != nil || unsettled == nil || unsettled.Status != model.TaskStatusRunning || !strings.Contains(string(unsettled.Checkpoint), `"previous_cycle_failed":true`) {
+			if err != nil || unsettled == nil || unsettled.Status != model.TaskStatusRunning || !strings.Contains(string(unsettled.Checkpoint), `"previous_cycle_failed": true`) {
 				t.Fatalf("uncommitted healthy completion lost failure evidence: %#v, err=%v", unsettled, err)
 			}
 			previous, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
 			if err != nil || previous == nil || previous.Status != model.TaskStatusFailed || previous.SupersededAt != nil {
 				t.Fatalf("uncommitted healthy completion hid the previous failure: %#v, err=%v", previous, err)
 			}
-			if _, err := runtime.db.ExecContext(t.Context(), `DROP TRIGGER reject_healthy_capacity_archive`); err != nil {
-				t.Fatal(err)
-			}
+			restoreRejectHealthyCapacityArchive()
 			waitForTask(t, runtime.repos, source.ID, func(row *model.Task) bool { return row.SupersededAt != nil })
 			completed, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, healthyKey)
 			if err != nil || completed == nil || completed.Status != model.TaskStatusCompleted || strings.Contains(string(completed.Checkpoint), "previous_cycle_failed") {
@@ -237,18 +204,15 @@ func TestCacheCapacityMergesRefusalBeforeCompletingAfterUpload(t *testing.T) {
 			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(`{"cycle_active":false,"refused_write_bytes":20}`)).Where("id = ?", planner.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			restoreRejectCapacityDemand := func() {}
 			if failCheckpoint {
-				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER reject_capacity_demand BEFORE UPDATE OF checkpoint_json ON tasks BEGIN SELECT RAISE(ABORT, 'injected capacity demand failure'); END`); err != nil {
-					t.Fatal(err)
-				}
+				restoreRejectCapacityDemand = testutil.FailWrites(t, runtime.db, "tasks", "UPDATE OF checkpoint_json", "", "injected capacity demand failure")
 			}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			if failCheckpoint {
 				waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusPending && row.RetryCount > 0 })
-				if _, err := runtime.db.ExecContext(t.Context(), `DROP TRIGGER reject_capacity_demand`); err != nil {
-					t.Fatal(err)
-				}
+				restoreRejectCapacityDemand()
 				wakeTask(t, runtime, planner.ID)
 			}
 			current := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool {
@@ -279,13 +243,13 @@ func TestCacheCapacityNextCyclePreservesUnparseableDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", inherited).Where("id = ?", planner.ID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(inherited)).Where("id = ?", planner.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	failed := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusFailed })
-	if failed.FailureReason == nil || *failed.FailureReason != "invalid_checkpoint" || string(failed.Checkpoint) != string(checkpoint) {
+	if failed.FailureReason == nil || *failed.FailureReason != "invalid_checkpoint" || !testutil.JSONEqual(failed.Checkpoint, checkpoint) {
 		t.Fatalf("unparseable demand was discarded or reported as healthy: %#v", failed)
 	}
 }

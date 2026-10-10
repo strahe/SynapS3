@@ -1,5 +1,3 @@
-//go:build postgres
-
 package repository_test
 
 import (
@@ -17,21 +15,21 @@ import (
 )
 
 func TestPostgresCopyRetryAdmissionAndHistory(t *testing.T) {
-	copyRetryAdmissionAndHistory(t, migratedPostgresDB(t))
+	copyRetryAdmissionAndHistory(t, testDB(t))
 }
 
 func TestPostgresCopyRetryFailedIngressWithSuccessor(t *testing.T) {
-	copyRetryFailedIngressWithSuccessor(t, migratedPostgresDB(t))
+	copyRetryFailedIngressWithSuccessor(t, testDB(t))
 }
 
 func TestPostgresOrdinaryCacheRestoreProtectsCache(t *testing.T) {
-	ordinaryCacheRestoreProtectsCache(t, migratedPostgresDB(t))
+	ordinaryCacheRestoreProtectsCache(t, testDB(t))
 }
 
 func TestPostgresCopyRetrySerializesReplacement(t *testing.T) {
 	for _, first := range []string{"retry", "replacement"} {
 		t.Run(first, func(t *testing.T) {
-			db := postgresRaceDB(t)
+			db := testDB(t)
 			copyRow := copyRetryAdmissionAndHistory(t, db)
 			repos := repository.NewRepositories(db)
 			if err := repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: "failed again"}); err != nil {
@@ -43,7 +41,7 @@ func TestPostgresCopyRetrySerializesReplacement(t *testing.T) {
 				}
 				return strings.HasPrefix(query, "update") && strings.Contains(query, `"buckets"`)
 			})
-			db.AddQueryHook(hold)
+			testutil.AddQueryHook(db, hold)
 			defer hold.Release()
 			gate := cacheaccess.NewGate()
 			runRetry := func() error {
@@ -100,7 +98,7 @@ func TestPostgresCopyRetrySerializesReplacement(t *testing.T) {
 }
 
 func TestPostgresCopyRetryConcurrentRequests(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	copyRow := copyRetryAdmissionAndHistory(t, db)
 	repos := repository.NewRepositories(db)
 	if err := repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: "failed again"}); err != nil {
@@ -109,7 +107,7 @@ func TestPostgresCopyRetryConcurrentRequests(t *testing.T) {
 	hold := newPostgresRaceHold("first", func(query string) bool {
 		return strings.HasPrefix(query, "update") && strings.Contains(query, `"storage_contents"`)
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 	done := make(chan error, 2)
 	go func() {
@@ -135,7 +133,7 @@ func TestPostgresCopyRetryConcurrentRequests(t *testing.T) {
 }
 
 func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
-	db := postgresRaceDB(t)
+	db := testDB(t)
 	copyRow := copyRetryAdmissionAndHistory(t, db)
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
@@ -167,7 +165,7 @@ func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
 	hold := newPostgresRaceHold("eviction", func(query string) bool {
 		return strings.HasPrefix(query, "update") && strings.Contains(query, `"storage_contents"`)
 	})
-	db.AddQueryHook(hold)
+	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
 	gate := cacheaccess.NewGate()
 	key := model.ContentCacheKey(copyRow.ContentID)

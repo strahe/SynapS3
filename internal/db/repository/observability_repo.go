@@ -12,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // OverviewStorageStates scopes health to local dependencies without changing global observations.
@@ -118,7 +117,7 @@ func upsertProviderProfile(ctx context.Context, db bun.IDB, profile *observabili
 		return nil
 	}
 	profile.LastSuccessAt = checkedAt
-	guard, latest := upsertTimestampGuard(db, "provider_profile", "last_success_at")
+	guard, latest := upsertTimestampGuard("provider_profile", "last_success_at")
 	_, err := db.NewInsert().Model(profile).On("CONFLICT (provider_id) DO UPDATE").
 		Set("name = EXCLUDED.name").Set("description = EXCLUDED.description").
 		Set("service_provider_address = EXCLUDED.service_provider_address").
@@ -130,7 +129,7 @@ func upsertProviderProfile(ctx context.Context, db bun.IDB, profile *observabili
 }
 
 func upsertProviderState(ctx context.Context, db bun.IDB, state *observability.ProviderState) error {
-	guard, latest := upsertTimestampGuard(db, "provider_state", "last_attempt_at")
+	guard, latest := upsertTimestampGuard("provider_state", "last_attempt_at")
 	if state.Status == observability.StatusUnknown && state.LastError != nil {
 		_, err := db.NewInsert().Model(state).On("CONFLICT (provider_id) DO UPDATE").
 			Set("last_attempt_at = EXCLUDED.last_attempt_at").Set("last_error = EXCLUDED.last_error").
@@ -161,23 +160,20 @@ func latestPlausibleObservationTime() time.Time {
 
 // upsertTimestampGuard lets an observation replace one taken at the same or an
 // earlier time. The returned time is the guard's only argument.
-func upsertTimestampGuard(db bun.IDB, modelAlias, column string) (string, time.Time) {
-	return observationTimeGuard(db, modelAlias, column, "<=")
+func upsertTimestampGuard(modelAlias, column string) (string, time.Time) {
+	return observationTimeGuard(modelAlias, column, "<=")
 }
 
 // snapshotTimestampGuard orders complete snapshots strictly. A snapshot taken
 // at the stored time is the same observation replayed, so the first commit
 // stands and a late equal or older read changes nothing. The returned time is
 // the guard's only argument.
-func snapshotTimestampGuard(db bun.IDB, modelAlias, column string) (string, time.Time) {
-	return observationTimeGuard(db, modelAlias, column, "<")
+func snapshotTimestampGuard(modelAlias, column string) (string, time.Time) {
+	return observationTimeGuard(modelAlias, column, "<")
 }
 
-func observationTimeGuard(db bun.IDB, modelAlias, column, op string) (string, time.Time) {
-	stored := column
-	if db.Dialect().Name() == dialect.PG {
-		stored = modelAlias + "." + column
-	}
+func observationTimeGuard(modelAlias, column, op string) (string, time.Time) {
+	stored := modelAlias + "." + column
 	return "(" + stored + " " + op + " EXCLUDED." + column + " OR " + stored + " > ?)", latestPlausibleObservationTime()
 }
 
@@ -252,7 +248,7 @@ func (r *BunObservabilityRepo) recordProviderTier(ctx context.Context, startedAt
 	snapshot := &observability.ProviderTierSnapshot{Tier: tier, ProviderIDs: encoded, CheckedAt: normalizeCheckedAt(startedAt, startedAt)}
 	result, err := r.db.NewInsert().Model(snapshot).On("CONFLICT (tier) DO UPDATE").
 		Set("provider_ids_json = EXCLUDED.provider_ids_json").Set("checked_at = EXCLUDED.checked_at").
-		Where(snapshotTimestampGuard(r.db, "provider_tier_snapshot", "checked_at")).Exec(ctx)
+		Where(snapshotTimestampGuard("provider_tier_snapshot", "checked_at")).Exec(ctx)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -273,8 +269,8 @@ func (r *BunObservabilityRepo) ListProviderStates(ctx context.Context, opts obse
 	var rows []observability.ProviderState
 	if err := applyProviderObservabilityFilters(r.db.NewSelect().Model(&rows), opts).
 		OrderExpr("length(provider_id) ASC, provider_id ASC").
-		Limit(limit).
-		Offset(offset).
+		Limit(int64(limit)).
+		Offset(int64(offset)).
 		Scan(ctx); err != nil {
 		return observability.ProviderStatePage{}, err
 	}
@@ -324,8 +320,8 @@ func (r *BunObservabilityRepo) ListDataSetStates(ctx context.Context, opts obser
 	var rows []observability.DataSetState
 	if err := applyDataSetObservabilityFilters(withDataSetStateJoins(r.db.NewSelect().Model(&rows)), opts).
 		OrderExpr("observed_bucket.name ASC, observability_data_set_state.local_data_set_id ASC").
-		Limit(limit).
-		Offset(offset).
+		Limit(int64(limit)).
+		Offset(int64(offset)).
 		Scan(ctx); err != nil {
 		return observability.DataSetStatePage{}, err
 	}
@@ -438,7 +434,7 @@ func claimObservabilityCollection(ctx context.Context, db bun.IDB, collectionTyp
 		Model(&row).
 		On("CONFLICT (collection_type) DO UPDATE").
 		Set("last_checked_at = EXCLUDED.last_checked_at").
-		Where(snapshotTimestampGuard(db, "collection_state", "last_checked_at")).
+		Where(snapshotTimestampGuard("collection_state", "last_checked_at")).
 		Exec(ctx)
 	if err != nil {
 		return false, fmt.Errorf("recording %s collection time: %w", collectionType, err)

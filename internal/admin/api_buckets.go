@@ -1483,8 +1483,8 @@ func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.R
 		Model(&deletions).
 		Where("bucket_id = ?", bucket.ID).
 		OrderExpr("deleted_at DESC, id DESC").
-		Limit(limit).
-		Offset(offset)
+		Limit(int64(limit)).
+		Offset(int64(offset))
 	if key := r.URL.Query().Get("key"); key != "" {
 		q = q.Where("key = ?", key)
 	}

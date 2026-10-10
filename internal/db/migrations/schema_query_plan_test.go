@@ -7,11 +7,10 @@ import (
 	"time"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 func TestCurrentSchemaRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		seedObjectPlanBacklog(t, db)
 		seedStorageCommitPlanBacklog(t, db)
 		seedTaskPlanBacklog(t, db)
@@ -109,29 +108,15 @@ func seedObjectPlanBacklog(t *testing.T, db *bun.DB) {
 	if _, err := db.ExecContext(t.Context(), `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) VALUES (1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatalf("seed query-plan replica slot: %v", err)
 	}
-	var insertObjects string
-	if db.Dialect().Name() == dialect.PG {
-		insertObjects = `INSERT INTO objects (id, bucket_id, key, created_at, updated_at)
-			SELECT value, 1,
-			       CASE WHEN value = 1 THEN 'key' ELSE 'key-' || lpad(value::text, 6, '0') END, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM generate_series(1, 512) AS series(value)`
-	} else {
-		insertObjects = `WITH RECURSIVE sequence(value) AS (
-				SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 512
-			)
-			INSERT INTO objects (id, bucket_id, key, created_at, updated_at)
-			SELECT value, 1,
-			       CASE WHEN value = 1 THEN 'key' ELSE 'key-' || printf('%06d', value) END, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM sequence`
-	}
+	insertObjects := `INSERT INTO objects (id, bucket_id, key, created_at, updated_at)
+		SELECT value, 1,
+		       CASE WHEN value = 1 THEN 'key' ELSE 'key-' || lpad(value::text, 6, '0') END, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM generate_series(1, 512) AS series(value)`
 	if _, err := db.ExecContext(t.Context(), insertObjects); err != nil {
 		t.Fatalf("seed query-plan objects: %v", err)
 	}
 	// Cache residency belongs to the content.
-	checksumExpression := "printf('%064x', id)"
-	if db.Dialect().Name() == dialect.PG {
-		checksumExpression = "lpad(to_hex(id), 64, '0')"
-	}
+	checksumExpression := "lpad(to_hex(id), 64, '0')"
 	if _, err := db.ExecContext(t.Context(), `INSERT INTO storage_contents (
 			id, bucket_id, checksum, content_size, requested_copies
 		, created_at, updated_at)
@@ -169,43 +154,20 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 	// A representative settled history makes the open-request lookups
 	// materially cheaper through the status index than by scanning.
 	var insertCopies, insertHistory string
-	if db.Dialect().Name() == dialect.PG {
-		insertCopies = `INSERT INTO storage_copies (
-			content_id, bucket_id, content_size, storage_data_set_id, copy_index,
-			provider_id, piece_id, transfer_method, status, commit_ready_at,
-			created_at, updated_at)
-			SELECT value, 1, 1, 1, 0,
-			       'query-plan-provider', 'piece-' || value, 'ingress', 'piece_ready',
-			       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM generate_series(1, 512) AS series(value)`
-		insertHistory = `INSERT INTO storage_commit_requests (
-			request_id, storage_data_set_id, status, piece_count, sends, refusals,
-			last_error, created_at, updated_at)
-			SELECT 'history-' || value, 1, 'abandoned', 0, 0, 0,
-			       'query plan history', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM generate_series(1, 4096) AS series(value)`
-	} else {
-		insertCopies = `WITH RECURSIVE contents(content_id) AS (
-			SELECT 1 UNION ALL SELECT content_id + 1 FROM contents WHERE content_id < 512
-		)
-		INSERT INTO storage_copies (
-			content_id, bucket_id, content_size, storage_data_set_id, copy_index,
-			provider_id, piece_id, transfer_method, status, commit_ready_at,
-			created_at, updated_at)
-			SELECT content_id, 1, 1, 1, 0,
-			       'query-plan-provider', 'piece-' || content_id, 'ingress', 'piece_ready',
-			       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM contents`
-		insertHistory = `WITH RECURSIVE requests(value) AS (
-			SELECT 1 UNION ALL SELECT value + 1 FROM requests WHERE value < 4096
-		)
-		INSERT INTO storage_commit_requests (
-			request_id, storage_data_set_id, status, piece_count, sends, refusals,
-			last_error, created_at, updated_at)
-			SELECT 'history-' || value, 1, 'abandoned', 0, 0, 0,
-			       'query plan history', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM requests`
-	}
+	insertCopies = `INSERT INTO storage_copies (
+		content_id, bucket_id, content_size, storage_data_set_id, copy_index,
+		provider_id, piece_id, transfer_method, status, commit_ready_at,
+		created_at, updated_at)
+		SELECT value, 1, 1, 1, 0,
+		       'query-plan-provider', 'piece-' || value, 'ingress', 'piece_ready',
+		       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM generate_series(1, 512) AS series(value)`
+	insertHistory = `INSERT INTO storage_commit_requests (
+		request_id, storage_data_set_id, status, piece_count, sends, refusals,
+		last_error, created_at, updated_at)
+		SELECT 'history-' || value, 1, 'abandoned', 0, 0, 0,
+		       'query plan history', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM generate_series(1, 4096) AS series(value)`
 
 	statements := []struct {
 		name      string
@@ -234,35 +196,15 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 
 func seedTaskPlanBacklog(t *testing.T, db *bun.DB) {
 	t.Helper()
-	var statements []string
-	if db.Dialect().Name() == dialect.PG {
-		statements = []string{
-			`INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-			 SELECT 'plan', 'pending-' || value, 1, 'hash', 'pending', '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
-			 FROM generate_series(1, 512) AS series(value)`,
-			`INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status,
-			 available_at, resume_mode, claim_generation, claimed_at, lease_until, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-			 SELECT 'plan', 'running-' || value, 1, 'hash', 'running', '2026-01-01 00:00:00',
-			 'recover', 1, '2026-01-01 00:00:00', '2026-01-01 00:01:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
-			 FROM generate_series(1, 512) AS series(value)`,
-		}
-	} else {
-		statements = []string{
-			`WITH RECURSIVE sequence(value) AS (
-				SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 512
-			 )
-			 INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-			 SELECT 'plan', 'pending-' || value, 1, 'hash', 'pending', '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
-			 FROM sequence`,
-			`WITH RECURSIVE sequence(value) AS (
-				SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 512
-			 )
-			 INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status,
-			 available_at, resume_mode, claim_generation, claimed_at, lease_until, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-			 SELECT 'plan', 'running-' || value, 1, 'hash', 'running', '2026-01-01 00:00:00',
-			 'recover', 1, '2026-01-01 00:00:00', '2026-01-01 00:01:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
-			 FROM sequence`,
-		}
+	statements := []string{
+		`INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
+		 SELECT 'plan', 'pending-' || value, 1, 'hash', 'pending', '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
+		 FROM generate_series(1, 512) AS series(value)`,
+		`INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status,
+		 available_at, resume_mode, claim_generation, claimed_at, lease_until, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
+		 SELECT 'plan', 'running-' || value, 1, 'hash', 'running', '2026-01-01 00:00:00',
+		 'recover', 1, '2026-01-01 00:00:00', '2026-01-01 00:01:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
+		 FROM generate_series(1, 512) AS series(value)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(t.Context(), statement); err != nil {
@@ -276,21 +218,10 @@ func seedTaskPlanBacklog(t *testing.T, db *bun.DB) {
 
 func seedWalletPlanBacklog(t *testing.T, db *bun.DB) {
 	t.Helper()
-	var statement string
-	if db.Dialect().Name() == dialect.PG {
-		statement = `INSERT INTO wallet_operations
-			(type, client_request_id, amount, created_at, updated_at)
-			SELECT 'fund', 'wallet-' || value, '1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM generate_series(1, 512) AS series(value)`
-	} else {
-		statement = `WITH RECURSIVE sequence(value) AS (
-				SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 512
-			)
-			INSERT INTO wallet_operations
-				(type, client_request_id, amount, created_at, updated_at)
-			SELECT 'fund', 'wallet-' || value, '1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-			FROM sequence`
-	}
+	statement := `INSERT INTO wallet_operations
+		(type, client_request_id, amount, created_at, updated_at)
+		SELECT 'fund', 'wallet-' || value, '1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM generate_series(1, 512) AS series(value)`
 	if _, err := db.ExecContext(t.Context(), statement); err != nil {
 		t.Fatalf("seed wallet query-plan backlog: %v", err)
 	}
@@ -301,38 +232,21 @@ func seedWalletPlanBacklog(t *testing.T, db *bun.DB) {
 
 func explainQueryPlan(t *testing.T, db *bun.DB, query string) string {
 	t.Helper()
-	if db.Dialect().Name() == dialect.PG {
-		var plan []string
-		err := db.RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
-			if _, err := tx.ExecContext(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
-				return err
-			}
-			return tx.NewRaw("EXPLAIN (COSTS OFF) "+query).Scan(ctx, &plan)
-		})
-		if err != nil {
-			t.Fatalf("explain PostgreSQL query: %v", err)
+	var plan []string
+	err := db.RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := tx.ExecContext(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
+			return err
 		}
-		return strings.Join(plan, "\n")
+		return tx.NewRaw("EXPLAIN (COSTS OFF) "+query).Scan(ctx, &plan)
+	})
+	if err != nil {
+		t.Fatalf("explain PostgreSQL query: %v", err)
 	}
-
-	var rows []struct {
-		ID      int    `bun:"id"`
-		Parent  int    `bun:"parent"`
-		NotUsed int    `bun:"notused"`
-		Detail  string `bun:"detail"`
-	}
-	if err := db.NewRaw("EXPLAIN QUERY PLAN "+query).Scan(t.Context(), &rows); err != nil {
-		t.Fatalf("explain SQLite query: %v", err)
-	}
-	details := make([]string, 0, len(rows))
-	for _, row := range rows {
-		details = append(details, row.Detail)
-	}
-	return strings.Join(details, "\n")
+	return strings.Join(plan, "\n")
 }
 
 func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		if _, err := db.ExecContext(t.Context(), `WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM sequence WHERE value<30000)
    INSERT INTO task_history (task_id,type,idempotency_key,input_version,input_hash,status,subject_type,subject_key,available_at,finished_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
    SELECT value,CASE WHEN value%500=0 THEN 'bucket_provision' ELSE 'observability_refresh' END,'history-'||value,1,'hash','completed','bucket',CAST(value%500 AS TEXT),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]' FROM sequence`); err != nil {
@@ -371,16 +285,11 @@ func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
 			{`SELECT task_id FROM task_history WHERE type='bucket_provision' ORDER BY task_id DESC LIMIT 20`, "idx_task_history_type_id"},
 			{`SELECT task_id FROM task_history WHERE subject_type='bucket' AND subject_key='17' ORDER BY task_id DESC LIMIT 20`, "idx_task_history_subject"},
 		} {
-			var plan string
-			if db.Dialect().Name() == dialect.PG {
-				var lines []string
-				if err := db.NewRaw("EXPLAIN (COSTS OFF) "+tc.query).Scan(t.Context(), &lines); err != nil {
-					t.Fatal(err)
-				}
-				plan = strings.Join(lines, "\n")
-			} else {
-				plan = explainQueryPlan(t, db, tc.query)
+			var lines []string
+			if err := db.NewRaw("EXPLAIN (COSTS OFF) "+tc.query).Scan(t.Context(), &lines); err != nil {
+				t.Fatal(err)
 			}
+			plan := strings.Join(lines, "\n")
 			if !strings.Contains(plan, tc.index) {
 				t.Fatalf("query did not use %s: %s\n%s", tc.index, tc.query, plan)
 			}

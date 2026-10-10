@@ -7,6 +7,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
 
@@ -175,23 +176,18 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	}
 }
 
-func TestWriteCheckpointStoresJSONText(t *testing.T) {
+func TestWriteCheckpointSwitchesToRecovery(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	claimed := enqueueAndClaimTask(t, repos, "checkpoint-text", time.Minute)
 	if err := repos.Tasks.WriteCheckpoint(t.Context(), claimed.ID, claimed.ClaimGeneration, []byte(`{"attempted":true}`)); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
-	// A BLOB would still pass json_valid(); the schema promises TEXT JSON.
-	var storageClass string
-	if err := db.NewRaw(`SELECT typeof(checkpoint_json) FROM tasks WHERE id = ?`, claimed.ID).Scan(t.Context(), &storageClass); err != nil || storageClass != "text" {
-		t.Fatalf("checkpoint storage class = %q, err=%v", storageClass, err)
-	}
 	stored, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
 	if err != nil {
 		t.Fatalf("load task: %v", err)
 	}
-	if string(stored.Checkpoint) != `{"attempted":true}` || stored.ResumeMode != model.TaskResumeModeRecover {
+	if !testutil.JSONEqual(stored.Checkpoint, []byte(`{"attempted":true}`)) || stored.ResumeMode != model.TaskResumeModeRecover {
 		t.Fatalf("stored checkpoint = %s, resume mode = %s", stored.Checkpoint, stored.ResumeMode)
 	}
 }
@@ -209,7 +205,7 @@ func TestListKeepsCheckpointForRetryChecks(t *testing.T) {
 	if err != nil || len(page.Tasks) != 1 {
 		t.Fatalf("List = %#v, err=%v", page, err)
 	}
-	if listed := page.Tasks[0]; string(listed.Checkpoint) != `{"attempted":true}` || string(listed.Input) != `{}` {
+	if listed := page.Tasks[0]; !testutil.JSONEqual(listed.Checkpoint, []byte(`{"attempted":true}`)) || string(listed.Input) != `{}` {
 		t.Fatalf("listed checkpoint = %s, input = %s", listed.Checkpoint, listed.Input)
 	}
 }

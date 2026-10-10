@@ -271,9 +271,6 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 	} {
 		assertConfigContains(t, text, want)
 	}
-	if strings.Contains(text, "_pragma") {
-		t.Fatalf("generated config contains SQLite pragmas:\n%s", text)
-	}
 	assertGeneratedTOMLOnlyEnablesInitFields(t, text)
 
 	for _, disabled := range []string{

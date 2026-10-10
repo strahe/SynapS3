@@ -204,7 +204,7 @@ func (r *BunWalletOperationRepo) ListRecent(ctx context.Context, limit int) ([]m
 	err := r.db.NewSelect().
 		Model(&ops).
 		OrderExpr("created_at DESC, id DESC").
-		Limit(limit).
+		Limit(int64(limit)).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing recent wallet operations: %w", err)

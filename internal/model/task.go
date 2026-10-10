@@ -31,7 +31,6 @@ const (
 	TaskTypeApprovedProviderRefresh       TaskType = "approved_provider_refresh"
 	TaskTypeEndorsedProviderRefresh       TaskType = "endorsed_provider_refresh"
 	TaskTypeProviderUploadSpeedTest       TaskType = "provider_upload_speed_test"
-	TaskTypeGC                            TaskType = "task_gc"
 )
 
 // Task subjects that repository logic finds tasks by. Definitions of tasks

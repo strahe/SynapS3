@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/testutil"
+
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
@@ -40,38 +42,31 @@ func TestTaskIdentityLookupUsesBothIdentityIndexes(t *testing.T) {
 	if _, err := db.NewInsert().Model(&history).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	var live []*model.Task
+	for id := int64(513); id <= 1024; id++ {
+		live = append(live, repositoryTestTask(&model.Task{
+			ID: id, Type: model.TaskTypeUploadPlan, IdempotencyKey: fmt.Sprintf("identity-%d", id),
+			InputVersion: 1, InputHash: "identity", Input: json.RawMessage(`{}`), Events: json.RawMessage(`[]`),
+			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
+			AvailableAt: now, CreatedAt: now, UpdatedAt: now,
+		}))
+	}
+	if _, err := db.NewInsert().Model(&live).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.ExecContext(t.Context(), "ANALYZE"); err != nil {
 		t.Fatal(err)
 	}
 	capture := new(taskHistoryQueries)
-	db.AddQueryHook(capture)
+	testutil.AddQueryHook(db, capture)
 	repos := repository.NewRepositories(db)
 	row, err := repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeUploadPlan, "identity-256")
 	if err != nil || row == nil || row.ID != 256 || len(capture.queries) != 1 {
 		t.Fatalf("identity lookup = %#v, queries=%d, err=%v", row, len(capture.queries), err)
 	}
 	query := capture.queries[0]
-	plan, err := db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = plan.Close() }()
-	var details []string
-	for plan.Next() {
-		var id, parent, unused int
-		var detail string
-		if err := plan.Scan(&id, &parent, &unused, &detail); err != nil {
-			t.Fatal(err)
-		}
-		details = append(details, detail)
-	}
-	if err := plan.Err(); err != nil {
-		t.Fatal(err)
-	}
-	joined := strings.Join(details, "\n")
-	if !strings.Contains(joined, "SEARCH tasks USING INDEX uq_tasks_type_key") || !strings.Contains(joined, "SEARCH task_history USING INDEX uq_task_history_type_key") {
-		t.Fatalf("identity lookup scans unrelated rounds:\n%s", joined)
-	}
+	assertPostgresPlanUsesIndex(t, db, "uq_tasks_type_key", query)
+	assertPostgresPlanUsesIndex(t, db, "uq_task_history_type_key", query)
 }
 
 func TestTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T) {
@@ -163,7 +158,7 @@ func assertTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T, db *bun.DB
 	}
 	repos := repository.NewRepositories(db)
 	capture := new(taskHistoryQueries)
-	db.AddQueryHook(capture)
+	testutil.AddQueryHook(db, capture)
 	checkPage := func(anchor, cursor, first int64, size int, next int64) {
 		t.Helper()
 		capture.queries = nil
