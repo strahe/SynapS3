@@ -9,7 +9,7 @@ export function bucketCopyPolicyValue(bucket: Pick<BucketItem, 'default_copies'>
 }
 
 export function bucketCopyPolicyLabel(bucket: Pick<BucketItem, 'default_copies'>) {
-  return copyCountLabel(bucket.default_copies)
+  return replicaCountLabel(bucket.default_copies)
 }
 
 export function replicaTargetChoiceNote() {
@@ -50,7 +50,7 @@ export function minimumDurableCopiesLabel(bucket: BucketCopyPolicy) {
 }
 
 export function minimumDurableCopiesOptionLabel(copies: number, targetCopies?: number | null) {
-  const count = `${copies} ${copies === 1 ? 'replica' : 'replicas'}`
+  const count = replicaCountLabel(copies)
   if (targetCopies != null && copies === targetCopies) {
     return `${count} (all replicas)`
   }
@@ -98,6 +98,6 @@ export function showsMinimumDurableCopiesWarning(value: string, targetCopies: nu
   return Number.isInteger(copies) && targetCopies != null && copies < targetCopies
 }
 
-function copyCountLabel(copies: number) {
-  return `${copies} ${copies === 1 ? 'copy' : 'copies'}`
+export function replicaCountLabel(copies: number) {
+  return `${copies} ${copies === 1 ? 'replica' : 'replicas'}`
 }

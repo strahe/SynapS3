@@ -540,11 +540,11 @@ test('storage topology uses raw ids for value fields and prefixed ids for labels
   assert.equal(formatOptionalTopologyID(null), '—')
   assert.equal(formatOptionalTopologyID(''), '—')
   assert.equal(formatOptionalTopologyID(' 51002 '), '51002')
-  assert.equal(dataSetDisplayLabel(mediaReplicaDataSet), 'Data Set #51002')
+  assert.equal(dataSetDisplayLabel(mediaReplicaDataSet), 'Data set #51002')
   assert.equal(dataSetChainIDValue(mediaReplicaDataSet), '51002')
   assert.equal(dataSetChainIDValue(missingChainDataSet), '—')
   assert.equal(dataSetDisplayLabel(missingChainDataSet), 'No chain data set')
-  assert.equal(dataSetTopologyPath(mediaReplicaDataSet), 'media-prod -> Replica 2 -> Data Set #51002 -> Registry 202')
+  assert.equal(dataSetTopologyPath(mediaReplicaDataSet), 'media-prod -> Replica 2 -> Data set #51002 -> Registry 202')
   assert.equal(
     dataSetTopologyPath(missingChainDataSet),
     'research-data -> Replica 1 -> No chain data set -> Registry 101'
@@ -612,8 +612,8 @@ test('storage topology graph connects bucket to replicas and replicas to provide
       ['data-set-provider:12:202', 'data-set:12', 'provider:202'],
     ]
   )
-  assert.equal(graph.edges[0]?.data.path, 'media-prod -> Replica 1 -> Data Set #51001')
-  assert.equal(graph.edges[1]?.data.path, 'media-prod -> Replica 1 -> Data Set #51001 -> Registry 101')
+  assert.equal(graph.edges[0]?.data.path, 'media-prod -> Replica 1 -> Data set #51001')
+  assert.equal(graph.edges[1]?.data.path, 'media-prod -> Replica 1 -> Data set #51001 -> Registry 101')
   assert.equal(graph.edges[1]?.data.chainDataSetID, '51001')
   assert.equal(graph.edges[1]?.data.clientDataSetID, '90001')
 })

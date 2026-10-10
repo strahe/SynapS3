@@ -91,7 +91,7 @@ func (r *BunStorageReplacementRepo) AbandonUncreatedCopiesBatch(ctx context.Cont
 			}
 			if err := contents.MarkUploadCopyFailed(ctx, MarkUploadCopyFailedInput{
 				StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex,
-				LastError: "Replaced before storage service setup completed",
+				LastError: "Replaced before data set setup completed",
 			}); err != nil {
 				return err
 			}

@@ -10,7 +10,7 @@ import {
   type StorageTopologyProviderOption,
   storageTopologyAllFilterValue,
 } from '@/lib/storage-topology'
-import { titleCaseEnum } from '@/lib/utils'
+import { enumLabel } from '@/lib/utils'
 
 export type StorageTopologyTab = 'topology' | 'providers' | 'data-sets'
 
@@ -48,12 +48,12 @@ export function StorageTopologyToolbar({
         <TabsList className="max-w-full justify-start overflow-x-auto">
           <TabsTrigger value="topology">Topology</TabsTrigger>
           <TabsTrigger value="providers">Providers</TabsTrigger>
-          <TabsTrigger value="data-sets">Data Sets</TabsTrigger>
+          <TabsTrigger value="data-sets">Data sets</TabsTrigger>
         </TabsList>
       </Tabs>
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <ToolbarFilter id="topology-status-filter" label="Status:">
+        <ToolbarFilter id="topology-status-filter" label="Status">
           <Select
             value={filters.status}
             onValueChange={(value) => onChange({ status: value as ObservabilityStatusFilter })}
@@ -65,7 +65,7 @@ export function StorageTopologyToolbar({
               <SelectGroup>
                 {observabilityStatusOptions.map((status) => (
                   <SelectItem key={status} value={status}>
-                    {status === 'all' ? 'All statuses' : titleCaseEnum(status)}
+                    {status === 'all' ? 'All statuses' : enumLabel(status)}
                   </SelectItem>
                 ))}
               </SelectGroup>
@@ -73,7 +73,7 @@ export function StorageTopologyToolbar({
           </Select>
         </ToolbarFilter>
 
-        <ToolbarFilter id="topology-provider-filter" label="Provider:">
+        <ToolbarFilter id="topology-provider-filter" label="Provider">
           <Select value={filters.provider} onValueChange={(value) => onChange({ provider: value })}>
             <SelectTrigger id="topology-provider-filter" className="w-52">
               <SelectValue />
@@ -91,7 +91,7 @@ export function StorageTopologyToolbar({
           </Select>
         </ToolbarFilter>
 
-        <ToolbarFilter id="topology-bucket-filter" label="Bucket:">
+        <ToolbarFilter id="topology-bucket-filter" label="Bucket">
           <Select value={filters.bucket} onValueChange={(value) => onChange({ bucket: value })}>
             <SelectTrigger id="topology-bucket-filter" className="w-44">
               <SelectValue />

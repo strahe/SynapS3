@@ -38,7 +38,7 @@ func (d *StorageDataSet) CreationRejectionEvidence() (*DataSetCreationRejection,
 		return nil, err
 	}
 	if !evidence.Valid() || d.ClientDataSetID == nil || !evidence.ClientDataSetID.Equal(*d.ClientDataSetID) {
-		return nil, errors.New("invalid storage service creation rejection evidence")
+		return nil, errors.New("invalid data set creation rejection evidence")
 	}
 	return &evidence, nil
 }

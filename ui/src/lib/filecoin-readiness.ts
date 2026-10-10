@@ -77,7 +77,7 @@ const checkTitles: Record<string, string> = {
   config_private_key: 'Private key',
   config_rpc_url: 'RPC URL',
   config_network: 'Network selection',
-  config_default_copies: 'Default copy count',
+  config_default_copies: 'Default replica count',
   config_provider_requirement: 'Provider requirement',
   private_networks: 'Private network access',
   sdk_client: 'Filecoin SDK client',

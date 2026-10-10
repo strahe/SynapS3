@@ -101,11 +101,11 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 | `--json` | 以 JSON 返回成功响应。 |
 | `--timeout <duration>` | 设置 Admin API 请求超时。 |
 
-task list 和 stats 默认使用 `--scope work`；用 `--scope history` 查看完成、取消、已确认和已被替代的执行轮次。列出任务支持 `--type`、`--status`、`--limit` 和基于 ID 的 `--cursor`。Work 的状态筛选支持 `pending`、`running`、`failed`；History 支持 `completed`、`cancelled`、`failed`。
+task list 和 stats 默认使用 `--scope work`；用 `--scope history` 查看完成、取消、已确认和已被替代的执行轮次。列出任务支持 `--type`、`--status`、`--limit` 和基于 ID 的 `--cursor`。`work` 的状态筛选支持 `pending`、`running`、`failed`；`history` 支持 `completed`、`cancelled`、`failed`。
 
-`synaps3 admin task retry` 为可重试的失败任务创建新轮次，并显示新 ID；重复请求返回同一后继。`synaps3 admin task acknowledge <id>` 将已查看的失败移入 History，保留原结果和 Retry 资格。批量确认使用 `--type`、`--before` 和 `--yes` 限定操作及截止时刻。
+`synaps3 admin task retry` 为可重试的失败任务创建新轮次，并显示新 ID；重复请求返回同一后继。`synaps3 admin task acknowledge <id>` 将已查看的失败移入 `history`，保留原结果和 Retry 资格。批量确认使用 `--type`、`--before` 和 `--yes` 限定操作及截止时刻。
 
-`synaps3 admin storage-confirmation list` 会显示需要处理的存储登记：每次登记一行，包括所属任务 ID、存储提供方、data set、piece 数量和存储提供方的回复。对已停止的登记，使用 `synaps3 admin task retry <task-id>` 重试：新一轮执行基于已保存的登记证据继续恢复。
+`synaps3 admin storage-confirmation list` 会显示需要处理的批次：每个批次一行，包括所属任务 ID、存储提供方、数据集、piece 数量和存储提供方的回复。对已停止的批次，使用 `synaps3 admin task retry <task-id>` 重试：新一轮执行基于已保存的批次证据继续恢复。
 
 缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 

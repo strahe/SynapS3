@@ -20,7 +20,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 			return result
 		}
 		if copyRow.Status == model.StorageCopyStatusCommitted {
-			return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
+			return h.completeCopyTask(input, execution.ID(), "Replica is complete")
 		}
 		if copyRow.Status == model.StorageCopyStatusPieceReady || copyRow.Status == model.StorageCopyStatusCommitting {
 			return h.handOffToCommit(input, execution.ID())
@@ -33,7 +33,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 			return h.failCopyTask(execution, input, copyRow, repository.ErrNotFound, "dataset_missing")
 		}
 		if binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.IsZero() {
-			return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "dataset", "Waiting for storage service", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "dataset", "Waiting for data set", nil)
 		}
 		unreferenced, err := h.CopyCoordinator.deps.Repositories.Objects.ContentIsUnreferenced(ctx, copyRow.ContentID)
 		if err != nil {
@@ -42,7 +42,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 		// A signed member is transferred again whatever names its bytes: its
 		// request can only be sent whole.
 		if unreferenced && !copyRow.CommitSealed() {
-			return h.completeCopyTask(input, execution.ID(), "Storage copy is no longer required")
+			return h.completeCopyTask(input, execution.ID(), "Replica is no longer required")
 		}
 		//exhaustive:enforce
 		switch copyRow.TransferMethod {
@@ -54,7 +54,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 				return h.retryCopyTask(execution, input, copyRow, err, "copy_source_load_failed")
 			}
 			if len(sources) > 0 {
-				return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStoragePull, "Storage copy is ready to transfer")
+				return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStoragePull, "Replica is ready to transfer")
 			}
 			migration, err := h.CopyCoordinator.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
 			if err != nil {
@@ -77,7 +77,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 				}
 				return taskengine.Fail(errors.New("stored content migration has no readable source or local cache"), "migration_cache_missing", nil)
 			}
-			return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
+			return h.advanceToCacheRestore(input, execution.ID(), "Replica is recovering from cache", "")
 		default:
 			// A method this version does not know may not be a store, so the
 			// copy waits instead of being uploaded.
@@ -89,7 +89,7 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 			return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed")
 		}
 		if available {
-			return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready to transfer")
+			return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Replica is ready to transfer")
 		}
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 			migration, err := h.CopyCoordinator.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)

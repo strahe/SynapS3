@@ -1,6 +1,6 @@
 import { internalRootOwnerAccessKey } from '@/api/client'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { s3UserLabel } from '@/lib/s3-owner'
+import { s3UserLabel, s3UserRoleLabel } from '@/lib/s3-owner'
 
 export function BucketOwnerSelect({
   id,
@@ -24,15 +24,15 @@ export function BucketOwnerSelect({
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
-          <SelectItem value={internalRootOwnerAccessKey}>Internal root</SelectItem>
+          {users.map((user) => (
+            <SelectItem key={user.access_key} value={user.access_key}>
+              {s3UserLabel(user)} ({s3UserRoleLabel(user.role)})
+            </SelectItem>
+          ))}
           {value && value !== internalRootOwnerAccessKey && !users.some((user) => user.access_key === value) && (
             <SelectItem value={value}>{value}</SelectItem>
           )}
-          {users.map((user) => (
-            <SelectItem key={user.access_key} value={user.access_key}>
-              {s3UserLabel(user)} ({user.role})
-            </SelectItem>
-          ))}
+          <SelectItem value={internalRootOwnerAccessKey}>Internal root</SelectItem>
         </SelectGroup>
       </SelectContent>
     </Select>

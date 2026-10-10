@@ -266,7 +266,7 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"# max_size_gb = 100",
 		"Host and port where the S3-compatible API listens.",
 		"Env: SYNAPS3_SERVER_PORT",
-		"Default target Filecoin copies for buckets without an explicit copy policy, from 1 to 8.",
+		"Default Filecoin replica target for buckets without their own replica policy, from 1 to 8.",
 		"\n\n# Maximum concurrent TCP connections accepted by the S3 server.",
 	} {
 		assertConfigContains(t, text, want)

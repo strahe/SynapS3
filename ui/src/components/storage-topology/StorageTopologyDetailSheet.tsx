@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { ChevronRight, Database, Gauge, Info, Loader2, RefreshCw, TriangleAlert } from 'lucide-react'
-import { type ReactNode, type RefObject, useEffect, useMemo, useRef } from 'react'
+import { type RefObject, useEffect, useMemo, useRef } from 'react'
 import type {
   ObservabilityDataSetObservation,
   ObservabilityFreshness,
@@ -11,13 +11,20 @@ import type {
   ProviderTierRefreshResult,
 } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import {
+  DetailBody,
+  DetailField,
+  DetailGrid,
+  DetailHeader,
+  DetailNote,
+  DetailSection,
+  DisclosureSection,
+} from '@/components/app/DetailPanel'
 import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useRefreshProvider, useRefreshProviderTiers, useTestProviderUploadSpeed } from '@/hooks/queries'
@@ -487,101 +494,6 @@ function BucketDetails({
       </DetailBody>
     </>
   )
-}
-
-function DetailHeader({
-  titleRef,
-  kind,
-  title,
-  badge,
-  subtitle,
-  actions,
-}: {
-  titleRef: TitleRef
-  kind: string
-  title: string
-  badge: ReactNode
-  subtitle: string
-  actions?: ReactNode
-}) {
-  return (
-    <SheetHeader className="gap-1 border-b pr-12">
-      <p className="text-xs font-medium text-muted-foreground">{kind}</p>
-      <div className="flex min-w-0 items-center gap-2">
-        <SheetTitle ref={titleRef} tabIndex={-1} className="min-w-0 truncate outline-none">
-          {title}
-        </SheetTitle>
-        {badge}
-      </div>
-      <SheetDescription className="break-words">{subtitle}</SheetDescription>
-      {actions && <div className="mt-3">{actions}</div>}
-    </SheetHeader>
-  )
-}
-
-function DetailBody({ children }: { children: ReactNode }) {
-  return (
-    <ScrollArea className="min-h-0 flex-1">
-      <div className="@container flex flex-col gap-6 p-4">{children}</div>
-    </ScrollArea>
-  )
-}
-
-function DetailSection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="flex min-w-0 flex-col gap-3">
-      <h3 className="text-sm font-medium">{title}</h3>
-      {children}
-    </section>
-  )
-}
-
-function DisclosureSection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <Collapsible className="flex min-w-0 flex-col gap-3">
-      <CollapsibleTrigger asChild>
-        <Button variant="ghost" size="sm" className="-ml-2 w-fit [&[data-state=open]>svg]:rotate-90">
-          <ChevronRight data-icon="inline-start" className="transition-transform" />
-          {title}
-        </Button>
-      </CollapsibleTrigger>
-      <CollapsibleContent>{children}</CollapsibleContent>
-    </Collapsible>
-  )
-}
-
-function DetailGrid({ className, children }: { className?: string; children: ReactNode }) {
-  return (
-    <dl className={cn('grid grid-cols-1 gap-x-6 gap-y-4 text-sm @sm:grid-cols-2 @xl:grid-cols-3', className)}>
-      {children}
-    </dl>
-  )
-}
-
-function DetailField({
-  label,
-  action,
-  wide,
-  children,
-}: {
-  label: string
-  action?: ReactNode
-  wide?: boolean
-  children: ReactNode
-}) {
-  return (
-    <div className={cn('min-w-0', wide && 'col-span-full')}>
-      <dt className="flex h-5 items-center gap-1 text-xs text-muted-foreground">
-        {label}
-        {action}
-      </dt>
-      <dd className="mt-1 min-w-0 break-words">{children}</dd>
-    </div>
-  )
-}
-
-function DetailNote({ className, children }: { className?: string; children: ReactNode }) {
-  return <span className={cn('mt-0.5 block text-xs text-muted-foreground', className)}>{children}</span>
 }
 
 function IdentifierGrid({ items }: { items: Array<[label: string, value: string | undefined]> }) {

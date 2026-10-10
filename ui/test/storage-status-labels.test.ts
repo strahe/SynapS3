@@ -15,7 +15,7 @@ test('object state labels describe the derived storage position in user-facing t
   assert.equal(objectStateLabel('cached', 'uploading'), 'Stored in cache')
   assert.equal(objectStateLabel('uploading', 'uploading'), 'Uploading')
   assert.equal(objectStateLabel('uploading', 'uploading', 56), 'Uploading to Filecoin 56%')
-  assert.equal(objectStateLabel('committing', 'syncing'), 'Registering storage record on-chain')
+  assert.equal(objectStateLabel('committing', 'syncing'), 'Submitting to Filecoin')
   assert.equal(objectStateLabel('replicating', 'syncing'), 'Syncing replicas')
   assert.equal(objectStateLabel('stored', 'success'), 'Stored on Filecoin')
   assert.equal(objectStateLabel('failed', 'warning'), 'Needs attention')

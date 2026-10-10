@@ -81,7 +81,7 @@ function replacement(overrides: Partial<ProviderReplacement> = {}): ProviderRepl
 }
 
 test('confirmation uses referenced versions and bytes', () => {
-  assert.equal(replacementConfirmationSummary(dataSet()), '12 versions · 1 MB')
+  assert.equal(replacementConfirmationSummary(dataSet()), '12 versions · 1 MiB')
 })
 
 test('a superseded replacement retains its identity while unused storage retirement needs attention', () => {
@@ -89,10 +89,7 @@ test('a superseded replacement retains its identity while unused storage retirem
   assert.deepEqual(activeReplacements([stopped]), [stopped])
   assert.equal(stopped.status, 'superseded')
   assert.equal(replacementRetryable(stopped), true)
-  assert.equal(
-    replacementNextStep(stopped),
-    'The unused storage service could not be shut down. Check its retirement task.'
-  )
+  assert.equal(replacementNextStep(stopped), 'The unused data set could not be shut down. Check its retirement task.')
   assert.deepEqual(activeReplacements([replacement({ status: 'superseded' })]), [])
 })
 
@@ -106,7 +103,7 @@ test('confirmation discloses late paid services only after a creation request', 
   for (const source of [unsent, dataSet({ data_set_id: '1001' })]) {
     assert.match(
       replacementConfirmationDescription({ ...source, replacement_has_late_service_risk: true }),
-      /earlier request.*paid storage service.*will not close it/
+      /earlier request.*paid data set.*will not close it/
     )
   }
   assert.match(replacementConfirmationDescription(unsent), /New uploads that need this replica wait/)

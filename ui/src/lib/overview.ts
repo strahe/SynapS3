@@ -1,7 +1,7 @@
 import type { ObservabilityFreshness, OverviewData } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
 import { taskOperationLabels } from './tasks.ts'
-import { timeAgo, titleCaseEnum } from './utils.ts'
+import { enumLabel, timeAgo } from './utils.ts'
 
 export type AttentionTone = 'warning' | 'danger'
 export type FilecoinStorageHealthLevel = OverviewData['filecoin_storage_health']['level']
@@ -73,14 +73,14 @@ const filecoinStorageHealthLevelStyles: Record<FilecoinStorageHealthLevel, Filec
 
 const workerOrder = ['tasks']
 const workerLabels: Record<string, string> = {
-  tasks: 'Task Engine',
+  tasks: 'Task engine',
 }
 
 export function workerHealthRows(workers: Record<string, boolean>) {
   return Object.entries(workers)
     .map(([key, healthy]) => ({
       key,
-      label: workerLabels[key] ?? titleCaseEnum(key),
+      label: workerLabels[key] ?? enumLabel(key),
       healthy,
       order: workerOrder.includes(key) ? workerOrder.indexOf(key) : workerOrder.length,
     }))
@@ -109,7 +109,7 @@ export function attentionDisplayRows(attention: {
     },
     {
       key: 'storage_confirmations',
-      label: 'Stopped storage confirmations',
+      label: 'Stopped batches',
       value: attention.tasks.storage_confirmations,
       tone: 'danger' as const,
       target: 'tasks' as const,
@@ -265,7 +265,7 @@ export function filecoinStorageHealthPartialErrorRows(partialErrors: Record<stri
   }
   return Object.entries(partialErrors).map(([key, message]) => ({
     key,
-    label: labels[key] ?? titleCaseEnum(key),
+    label: labels[key] ?? enumLabel(key),
     message,
   }))
 }

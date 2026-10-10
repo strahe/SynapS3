@@ -1,9 +1,10 @@
 import { useQueryClient } from '@tanstack/react-query'
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, type HistoryState, Link, useLocation, useNavigate } from '@tanstack/react-router'
 import {
   CheckCircle2,
   CircleSlash,
   Clock3,
+  Database,
   Download,
   FileIcon,
   Fingerprint,
@@ -11,7 +12,6 @@ import {
   History,
   Info,
   Loader2,
-  MoreHorizontal,
   RefreshCw,
   Repeat2,
   RotateCcw,
@@ -20,10 +20,12 @@ import {
   Upload,
   UserRound,
 } from 'lucide-react'
-import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ChangeEvent, Fragment, useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import {
   APIError,
   api,
+  type BucketDetail,
   type BucketStorageHealthSummary,
   type BucketStorageRiskVersion,
   type CopyHealthInfo,
@@ -46,21 +48,27 @@ import {
   validateFOCUploadSize,
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
-import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
-import { CopyableValue } from '@/components/app/CopyableValue'
+import { CopyableValue, OptionalCopyableValue } from '@/components/app/CopyableValue'
+import { CursorPagination } from '@/components/app/CursorPagination'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
+import { clickableRowProps, DataTableFrame, TableSkeleton, tableHeaderRowClassName } from '@/components/app/DataTable'
+import { DetailField, DetailGrid } from '@/components/app/DetailPanel'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
-import { PageErrorState } from '@/components/app/PageErrorState'
-import { PageHeader } from '@/components/app/PageHeader'
+import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
+import { EmptyState, PageError } from '@/components/app/PageState'
 import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
 import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { ProviderReplacementProgress as ReplacementProgressView } from '@/components/app/ProviderReplacementProgress'
 import { ProviderSelect } from '@/components/app/ProviderSelect'
+import { RelativeTime } from '@/components/app/RelativeTime'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
+import { RowActionItem, RowActionsMenu } from '@/components/app/RowActionsMenu'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
 import { WarmStoragePriceDetails } from '@/components/app/WarmStoragePriceDetails'
-import { StorageRiskHeader, StorageRiskView } from '@/components/buckets/StorageRiskView'
+import { BucketOwnerDialog } from '@/components/buckets/BucketOwnerDialog'
+import { type RiskMarkers, StorageRiskHeader, StorageRiskView } from '@/components/buckets/StorageRiskView'
+import { SettingsSection } from '@/components/settings/settings-form'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -79,25 +87,15 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
-import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
+import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
-import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   useBucket,
@@ -120,7 +118,6 @@ import {
   useStartProviderReplacement,
   useTestProviderUploadSpeed,
   useUpdateBucketCopyPolicy,
-  useUpdateBucketOwner,
   useWarmStoragePriceList,
 } from '@/hooks/queries'
 import {
@@ -131,19 +128,19 @@ import {
   copyPolicyOptions,
   minimumDurableCopiesChoiceNote,
   minimumDurableCopiesFixedCountNote,
-  minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
   persistMinimumDurableCopies,
+  replicaCountLabel,
   replicaTargetChoiceNote,
   replicaTargetLocked,
   replicaTargetLockNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
 } from '@/lib/bucket-copy-policy'
-import { type BucketRouteSearch, normalizeBucketRouteSearch } from '@/lib/bucket-route-search'
+import { type BucketRouteSearch, type BucketTab, normalizeBucketRouteSearch } from '@/lib/bucket-route-search'
 import {
   bucketStorageHealthAffectedVersionsLabel,
   bucketStorageHealthLabel,
@@ -164,6 +161,7 @@ import {
   copyHealthSummaryTitle,
 } from '@/lib/copy-health'
 import { dataSetStorageHealthDetailParts, dataSetStorageHealthRefreshErrorMessage } from '@/lib/data-set-storage-health'
+import { bucketStatusLabel, providerSelectionStrategyLabel, versioningStatusLabel } from '@/lib/display-labels'
 import {
   activeReplacements,
   dataSetGenerationLabel,
@@ -186,161 +184,19 @@ import {
   storageConfirmationTasksSearch,
 } from '@/lib/storage-confirmation-attention'
 import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
-import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
-import { cn, formatBytes, formatNumber, formatTokenAmount, timeAgo } from '@/lib/utils'
-
-const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
+import { bucketStorageDataSetTopologyLinkModel, observabilityStatusLabel } from '@/lib/storage-topology'
+import { formatBytes, formatNumber, formatTokenAmount, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/$name')({
   validateSearch: (search: Record<string, unknown>): BucketRouteSearch => normalizeBucketRouteSearch(search),
   component: ObjectBrowserPage,
 })
 
-function ChangeBucketOwnerDetailDialog({
-  bucketName,
-  ownerAccessKey,
-  open: controlledOpen,
-  onOpenChange,
-  showTrigger = true,
-}: {
-  bucketName: string
-  ownerAccessKey: string | null
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
-  showTrigger?: boolean
-}) {
-  const [internalOpen, setInternalOpen] = useState(false)
-  const [selectedOwner, setSelectedOwner] = useState(ownerAccessKey ?? '')
-  const [reviewing, setReviewing] = useState(false)
-  const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
-  const updateOwner = useUpdateBucketOwner()
-  const dialogOpen = controlledOpen ?? internalOpen
-  const setDialogOpen = onOpenChange ?? setInternalOpen
-
-  useEffect(() => {
-    if (!dialogOpen) {
-      setSelectedOwner(ownerAccessKey ?? '')
-      setReviewing(false)
-    }
-  }, [ownerAccessKey, dialogOpen])
-
-  const reset = () => {
-    setSelectedOwner(ownerAccessKey ?? '')
-    setReviewing(false)
-    updateOwner.reset()
+declare module '@tanstack/react-router' {
+  interface HistoryState {
+    bucketObjectMarkers?: string[]
+    bucketRiskMarkers?: RiskMarkers[]
   }
-
-  const handleOpenChange = (next: boolean) => {
-    if (!next) reset()
-    setDialogOpen(next)
-  }
-
-  const handleUpdate = () => {
-    if (!selectedOwner || selectedOwner === ownerAccessKey) return
-    if (!reviewing) {
-      setReviewing(true)
-      return
-    }
-    updateOwner.mutate(
-      { name: bucketName, ownerAccessKey: selectedOwner },
-      {
-        onSuccess: () => {
-          setReviewing(false)
-          setDialogOpen(false)
-          reset()
-        },
-      }
-    )
-  }
-
-  return (
-    <Dialog open={dialogOpen} onOpenChange={handleOpenChange}>
-      {showTrigger && (
-        <DialogTrigger asChild>
-          <Button variant="outline" size="sm">
-            <UserRound data-icon="inline-start" />
-            {ownerAccessKey ? 'Change owner' : 'Assign owner'}
-          </Button>
-        </DialogTrigger>
-      )}
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>
-            {reviewing ? 'Review bucket owner' : ownerAccessKey ? 'Change bucket owner' : 'Assign bucket owner'}
-          </DialogTitle>
-          <DialogDescription>
-            {reviewing
-              ? 'Confirm the owner that will receive full control of this bucket.'
-              : `Transfer full control of "${bucketName}" to an existing S3 user.`}
-          </DialogDescription>
-        </DialogHeader>
-        {reviewing ? (
-          <ReviewDetails
-            rows={[
-              { id: 'bucket', label: 'Bucket', value: bucketName, copyable: true },
-              {
-                id: 'current-owner',
-                label: 'Current owner',
-                value: ownerAccessKey ?? ownerLabel(ownerAccessKey),
-                displayValue: ownerLabel(ownerAccessKey, users),
-                maxLength: ownerLabel(ownerAccessKey, users).length,
-                copyable: Boolean(ownerAccessKey),
-              },
-              {
-                id: 'new-owner',
-                label: 'New owner',
-                value: selectedOwner || ownerLabel(null),
-                displayValue: ownerLabel(selectedOwner, users),
-                maxLength: ownerLabel(selectedOwner, users).length,
-                copyable: Boolean(selectedOwner),
-              },
-            ]}
-          />
-        ) : (
-          <FieldGroup>
-            <Field data-invalid={Boolean(usersError)}>
-              <FieldLabel htmlFor="bucket-detail-owner">Owner</FieldLabel>
-              <BucketOwnerSelect
-                id="bucket-detail-owner"
-                value={selectedOwner}
-                onChange={setSelectedOwner}
-                disabled={updateOwner.isPending || usersLoading}
-                invalid={Boolean(usersError)}
-                users={users}
-              />
-              {users.length === 0 && !usersLoading && (
-                <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
-              )}
-              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
-            </Field>
-          </FieldGroup>
-        )}
-        {updateOwner.error && (
-          <Alert variant="destructive">
-            <AlertDescription>{updateOwner.error.message}</AlertDescription>
-          </Alert>
-        )}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => (reviewing ? setReviewing(false) : handleOpenChange(false))}
-            disabled={updateOwner.isPending}
-          >
-            {reviewing ? 'Back' : 'Cancel'}
-          </Button>
-          <Button
-            type="button"
-            onClick={handleUpdate}
-            disabled={!selectedOwner || selectedOwner === ownerAccessKey || updateOwner.isPending}
-          >
-            {updateOwner.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            {reviewing ? 'Confirm owner' : 'Review'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
 }
 
 function ObjectVersionsDialog({
@@ -397,9 +253,9 @@ function ObjectVersionsDialog({
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : versions.error ? (
-          <div className="text-sm text-destructive">Failed to load object versions</div>
+          <PageError title="Failed to load object versions" onRetry={() => versions.refetch()} />
         ) : (
-          <div className="overflow-hidden rounded-md border border-border">
+          <DataTableFrame>
             <Table className="table-fixed">
               <colgroup>
                 <col className="w-[22%]" />
@@ -411,14 +267,16 @@ function ObjectVersionsDialog({
                 <col className="w-[7%]" />
               </colgroup>
               <TableHeader>
-                <TableRow className="bg-muted/50">
+                <TableRow className={tableHeaderRowClassName}>
                   <TableHead className="px-2">Version</TableHead>
                   <TableHead className="px-2 text-right">Size</TableHead>
                   <TableHead className="px-2">Location</TableHead>
                   <TableHead className="px-2">ETag</TableHead>
                   <TableHead className="px-2">Piece CID</TableHead>
                   <TableHead className="px-2">Created</TableHead>
-                  <TableHead className="px-2 text-right">Actions</TableHead>
+                  <TableHead className="px-2 text-right">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -429,7 +287,7 @@ function ObjectVersionsDialog({
                         <CopyableValue label="Version" value={version.version_id} monospace maxLength={22} />
                         {version.is_delete_marker ? (
                           <StatusBadge tone="neutral" className="shrink-0">
-                            Deleted
+                            Delete marker
                           </StatusBadge>
                         ) : (
                           <ObjectStatusIcon
@@ -462,11 +320,8 @@ function ObjectVersionsDialog({
                         '—'
                       )}
                     </TableCell>
-                    <TableCell
-                      className="overflow-hidden truncate px-2 text-muted-foreground"
-                      title={version.created_at}
-                    >
-                      {timeAgo(version.created_at)}
+                    <TableCell className="overflow-hidden truncate px-2 text-muted-foreground">
+                      <RelativeTime value={version.created_at} />
                     </TableCell>
                     <TableCell className="px-2 text-right">
                       <VersionActions
@@ -488,26 +343,14 @@ function ObjectVersionsDialog({
                 )}
               </TableBody>
             </Table>
-          </div>
+          </DataTableFrame>
         )}
-        {(hasPreviousPage || nextVersionMarker) && (
-          <DialogFooter>
-            {hasPreviousPage && (
-              <Button variant="outline" size="sm" onClick={() => setVersionMarkers((markers) => markers.slice(0, -1))}>
-                Previous page
-              </Button>
-            )}
-            {nextVersionMarker && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setVersionMarkers((markers) => [...markers, nextVersionMarker])}
-              >
-                Next page
-              </Button>
-            )}
-          </DialogFooter>
-        )}
+        <CursorPagination
+          hasPrevious={hasPreviousPage}
+          hasNext={Boolean(nextVersionMarker)}
+          onPrevious={() => setVersionMarkers((markers) => markers.slice(0, -1))}
+          onNext={() => nextVersionMarker && setVersionMarkers((markers) => [...markers, nextVersionMarker])}
+        />
       </DialogContent>
     </Dialog>
   )
@@ -533,15 +376,14 @@ function VersionActions({
   const restore = useRestoreBucketObjectVersion()
   const permanentDelete = usePermanentDeleteBucketObjectVersion()
 
-  if (version.is_delete_marker) {
-    return <span className="text-xs text-muted-foreground">-</span>
-  }
+  if (version.is_delete_marker) return null
 
   const handlePermanentDelete = () => {
     permanentDelete.mutate(
       { name: bucketName, key: objectKey, versionID: version.version_id },
       {
         onSuccess: () => {
+          toast.success('Version permanently deleted')
           setPermanentDeleteOpen(false)
           permanentDelete.reset()
         },
@@ -565,6 +407,7 @@ function VersionActions({
       },
       {
         onSuccess: () => {
+          toast.success('Restored as a new current version')
           setRestoreOpen(false)
           restore.reset()
           onVersionsChanged()
@@ -584,42 +427,32 @@ function VersionActions({
 
   return (
     <>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${version.version_id}`} title="Actions">
-            <MoreHorizontal />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-40">
-          <DropdownMenuGroup>
-            <DropdownMenuItem asChild>
-              <a
-                href={api.getObjectDownloadUrl(bucketName, objectKey, version.version_id)}
-                aria-label={`Download ${objectKey} version ${version.version_id}`}
-              >
-                <Download data-icon="inline-start" />
-                Download
-              </a>
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => setProvenanceOpen(true)}>
-              <Fingerprint data-icon="inline-start" />
-              Provenance
-            </DropdownMenuItem>
-            {!version.is_current && (
-              <DropdownMenuItem onSelect={() => setRestoreOpen(true)}>
-                <RotateCcw data-icon="inline-start" />
-                Restore as new version
-              </DropdownMenuItem>
-            )}
-            {!version.is_delete_marker && (
-              <DropdownMenuItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
-                <Trash2 data-icon="inline-start" />
-                Permanently delete
-              </DropdownMenuItem>
-            )}
-          </DropdownMenuGroup>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <RowActionsMenu label={version.version_id}>
+        <RowActionItem asChild>
+          <a
+            href={api.getObjectDownloadUrl(bucketName, objectKey, version.version_id)}
+            aria-label={`Download ${objectKey} version ${version.version_id}`}
+          >
+            <Download data-icon="inline-start" />
+            Download
+          </a>
+        </RowActionItem>
+        <RowActionItem onSelect={() => setProvenanceOpen(true)}>
+          <Fingerprint data-icon="inline-start" />
+          Provenance
+        </RowActionItem>
+        {!version.is_current && (
+          <RowActionItem onSelect={() => setRestoreOpen(true)}>
+            <RotateCcw data-icon="inline-start" />
+            Restore as new version
+          </RowActionItem>
+        )}
+        <DropdownMenuSeparator />
+        <RowActionItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
+          <Trash2 data-icon="inline-start" />
+          Permanently delete
+        </RowActionItem>
+      </RowActionsMenu>
       <ObjectProvenanceDialog
         bucketName={bucketName}
         objectKey={objectKey}
@@ -751,7 +584,7 @@ function ObjectProvenanceDialog({
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : provenance.error ? (
-          <div className="text-sm text-destructive">Failed to load provenance</div>
+          <PageError title="Failed to load provenance" onRetry={() => provenance.refetch()} />
         ) : data ? (
           <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
             <ProvenanceSummary data={data} />
@@ -767,66 +600,20 @@ function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
   const progressPercent = uploadProgressPercent(data.progress)
 
   return (
-    <dl className="grid gap-x-8 gap-y-4 rounded-md border border-border p-3 text-sm sm:grid-cols-2 lg:grid-cols-6">
-      <ProvenanceSummaryItem
-        label="Object status"
-        value={objectStateLabel(data.state, data.status, progressPercent)}
-        className="lg:col-span-4"
-      />
-      <ProvenanceSummaryItem label="Replicas" value={`${data.success_copies} / ${data.requested_copies}`} />
-      <ProvenanceSummaryItem
-        label="Object copy health"
-        value={copyHealthSummaryLabel(data.copy_health)}
-        title={copyHealthSummaryTitle(data.copy_health)}
-      />
-      <ProvenanceSummaryItem
-        label="Updated"
-        value={timeAgo(data.updated_at)}
-        title={data.updated_at}
-        className="sm:col-span-2 lg:col-span-1"
-      />
-      <ProvenanceSummaryItem
-        label="Piece CID"
-        value={data.piece_cid ?? '—'}
-        title={data.piece_cid}
-        className="sm:col-span-2 lg:col-span-5"
-        mono
-        copyable={Boolean(data.piece_cid)}
-      />
-    </dl>
-  )
-}
-
-function ProvenanceSummaryItem({
-  label,
-  value,
-  title,
-  className,
-  mono = false,
-  copyable = false,
-}: {
-  label: string
-  value: string
-  title?: string
-  className?: string
-  mono?: boolean
-  copyable?: boolean
-}) {
-  const copyableValue = copyable && value !== '—'
-
-  return (
-    <div className={cn('min-w-0', className)}>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd
-        className={cn('mt-1 min-w-0', mono ? 'font-mono text-xs' : 'font-medium')}
-        title={copyableValue ? undefined : (title ?? value)}
-      >
-        {copyableValue ? (
-          <CopyableValue label={label} value={value} monospace={mono} maxLength={value.length} />
-        ) : (
-          <span className="block break-words">{value}</span>
-        )}
-      </dd>
+    <div className="rounded-lg border border-border p-3">
+      <DetailGrid className="@xl:grid-cols-4">
+        <DetailField label="Object status">{objectStateLabel(data.state, data.status, progressPercent)}</DetailField>
+        <DetailField label="Replicas">{`${data.success_copies} / ${data.requested_copies}`}</DetailField>
+        <DetailField label="Replica health">
+          <span title={copyHealthSummaryTitle(data.copy_health)}>{copyHealthSummaryLabel(data.copy_health)}</span>
+        </DetailField>
+        <DetailField label="Updated">
+          <RelativeTime value={data.updated_at} />
+        </DetailField>
+        <DetailField label="Piece CID" wide>
+          <OptionalCopyableValue label="Piece CID" value={data.piece_cid} maxLength={72} />
+        </DetailField>
+      </DetailGrid>
     </div>
   )
 }
@@ -834,8 +621,8 @@ function ProvenanceSummaryItem({
 function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
   const retry = useRetryTask()
   return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Replicas</div>
+    <DataTableFrame>
+      <h3 className="border-b border-border px-3 py-2 text-sm font-semibold">Replicas</h3>
       {retry.error && (
         <Alert>
           <AlertDescription>Could not retry. Refresh and try again.</AlertDescription>
@@ -844,15 +631,15 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
       <ScrollArea className="w-full">
         <Table className="min-w-[1080px]">
           <TableHeader>
-            <TableRow>
+            <TableRow className={tableHeaderRowClassName}>
               <TableHead className="px-3">Replica</TableHead>
               <TableHead className="px-3">Transfer</TableHead>
               <TableHead className="px-3">Status</TableHead>
               <TableHead className="px-3">Health</TableHead>
               <TableHead className="px-3">Provider</TableHead>
-              <TableHead className="px-3">Data Set ID</TableHead>
+              <TableHead className="px-3">Data set ID</TableHead>
               <TableHead className="px-3">Piece ID</TableHead>
-              <TableHead className="px-3">New</TableHead>
+              <TableHead className="px-3">New data set</TableHead>
               <TableHead className="px-3">Retrieval URL</TableHead>
               <TableHead className="px-3">Recovery</TableHead>
             </TableRow>
@@ -892,16 +679,12 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                   <ProviderIdentityCell providerID={copy.provider_id} identity={copy.provider_identity} />
                 </TableCell>
                 <TableCell className="px-3 text-muted-foreground">
-                  <OptionalCopyableValue label="Data Set ID" value={copy.data_set_id} />
+                  <OptionalCopyableValue label="Data set ID" value={copy.data_set_id} />
                 </TableCell>
                 <TableCell className="px-3 text-muted-foreground">
                   <OptionalCopyableValue label="Piece ID" value={copy.piece_id} maxLength={24} />
                 </TableCell>
-                <TableCell className="px-3">
-                  <StatusBadge tone={copy.is_new_data_set ? 'info' : 'neutral'}>
-                    {copy.is_new_data_set ? 'Yes' : 'No'}
-                  </StatusBadge>
-                </TableCell>
+                <TableCell className="px-3 text-muted-foreground">{copy.is_new_data_set ? 'Yes' : 'No'}</TableCell>
                 <TableCell className="max-w-72 overflow-hidden px-3 text-muted-foreground">
                   {copy.retrieval_url ? (
                     <CopyableValue
@@ -941,21 +724,8 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
         </Table>
         <ScrollBar orientation="horizontal" />
       </ScrollArea>
-    </div>
+    </DataTableFrame>
   )
-}
-
-function OptionalCopyableValue({
-  label,
-  value,
-  maxLength = 24,
-}: {
-  label: string
-  value?: string | null
-  maxLength?: number
-}) {
-  if (!value) return <span className="font-mono text-xs">—</span>
-  return <CopyableValue label={label} value={value} monospace maxLength={maxLength} />
 }
 
 function LocationBadges({ location }: { location: { cache: boolean; filecoin: boolean } }) {
@@ -1083,7 +853,7 @@ function copyStatusLabel(copy: ObjectProvenanceCopy) {
     case 'piece_ready':
       return 'Ready'
     case 'committing':
-      return 'Registering'
+      return 'Submitting'
     case 'committed':
       return 'Stored'
     case 'failed':
@@ -1116,7 +886,7 @@ function CopyAttentionDetails({
           </div>
         )}
         <p>
-          Use Recover in{' '}
+          Use Retry in{' '}
           <Link to="/tasks" search={storageConfirmationTasksSearch} className="text-foreground underline">
             Tasks
           </Link>
@@ -1137,8 +907,12 @@ function ObjectBrowserPage() {
   const { name } = Route.useParams()
   const search = Route.useSearch()
   const navigate = useNavigate()
+  const qc = useQueryClient()
+  const tab: BucketTab = search.tab ?? 'objects'
+  const browsing = tab === 'objects' || tab === 'trash'
   const prefix = search.prefix ?? ''
   const marker = search.marker ?? ''
+  const riskView = tab === 'storage' && Boolean(search.risk)
   const riskPrefix = search.risk_prefix ?? ''
   const riskKey = search.risk_key ?? ''
   const riskDatasetID = search.risk_dataset ? Number(search.risk_dataset) : undefined
@@ -1146,15 +920,14 @@ function ObjectBrowserPage() {
   const riskVersionMarker = search.risk_version_marker ?? ''
   const riskCreatedAtMarker = search.risk_created_at_marker ?? ''
   const riskStaleBefore = search.risk_stale_before ?? ''
-  const view = search.view ?? 'objects'
-  const [detailsOpen, setDetailsOpen] = useState(false)
-  const [changeOwnerOpen, setChangeOwnerOpen] = useState(false)
+  // Each history entry keeps its own previous pages across browser navigation and panel reloads.
+  const markerHistory = useLocation({ select: (location) => location.state.bucketObjectMarkers }) ?? []
   const [uploadOpen, setUploadOpen] = useState(false)
   const [riskProvenanceVersion, setRiskProvenanceVersion] = useState<BucketStorageRiskVersion | null>(null)
 
   const bucket = useBucket(name)
-  const objects = useBucketObjects(name, prefix, marker, 50, '/', view === 'objects')
-  const deletedObjects = useDeletedBucketObjects(name, prefix, marker, 50, view === 'deleted')
+  const objects = useBucketObjects(name, prefix, marker, 50, '/', tab === 'objects')
+  const deletedObjects = useDeletedBucketObjects(name, prefix, marker, 50, tab === 'trash')
   const storageRisk = useBucketStorageRiskVersions(
     name,
     {
@@ -1167,73 +940,47 @@ function ObjectBrowserPage() {
       stale_before: riskStaleBefore || undefined,
       limit: 50,
     },
-    view === 'storage-risk'
+    riskView
   )
-  const qc = useQueryClient()
 
-  useEffect(() => {
-    if (search.details === 'storage') setDetailsOpen(true)
-  }, [search.details])
+  const go = (next: BucketRouteSearch, state: HistoryState = {}) =>
+    navigate({ to: '/buckets/$name', params: { name }, search: next, state })
+  const listTab = tab === 'trash' ? ('trash' as const) : undefined
 
-  const handleDetailsOpenChange = (open: boolean) => {
-    setDetailsOpen(open)
-    if (!open && search.details === 'storage') {
-      navigate({
-        to: '/buckets/$name',
-        params: { name },
-        search: { ...search, details: undefined },
-        replace: true,
-      })
-    }
+  const selectTab = (next: BucketTab) => {
+    go({
+      tab: next === 'objects' ? undefined : next,
+      prefix: next === 'objects' || next === 'trash' ? prefix || undefined : undefined,
+    })
   }
-
-  const pathCrumbs = bucketPrefixCrumbs(prefix)
 
   const navigateToPrefix = (newPrefix: string) => {
-    navigate({
-      to: '/buckets/$name',
-      params: { name },
-      search: {
-        prefix: newPrefix || undefined,
-        marker: undefined,
-        version_marker: undefined,
-        risk_prefix: undefined,
-        risk_key: undefined,
-        risk_key_marker: undefined,
-        risk_version_marker: undefined,
-        risk_created_at_marker: undefined,
-        risk_stale_before: undefined,
-        risk_dataset: view === 'storage-risk' ? search.risk_dataset : undefined,
-        view: view === 'deleted' || view === 'storage-risk' ? view : undefined,
-      },
-    })
+    go({ tab: listTab, prefix: newPrefix || undefined })
   }
 
-  const navigateToMarker = (newMarker: string) => {
-    navigate({
-      to: '/buckets/$name',
-      params: { name },
-      search: {
-        prefix: prefix || undefined,
-        marker: newMarker || undefined,
-        view: view === 'deleted' ? view : undefined,
-      },
-    })
+  const goToMarker = (nextMarker: string, history: string[]) =>
+    go({ tab: listTab, prefix: prefix || undefined, marker: nextMarker || undefined }, { bucketObjectMarkers: history })
+
+  const nextPage = (nextMarker: string) => {
+    goToMarker(nextMarker, [...markerHistory, marker])
+  }
+
+  const previousPage = () => {
+    // Without a remembered page (a shared link), Previous returns to the first page.
+    goToMarker(markerHistory[markerHistory.length - 1] ?? '', markerHistory.slice(0, -1))
   }
 
   const navigateToStorageRiskMarker = (
     keyMarker: string,
     nextVersionMarker: string,
     nextCreatedAtMarker: string,
-    nextStaleBefore: string
-  ) => {
-    navigate({
-      to: '/buckets/$name',
-      params: { name },
-      search: {
-        prefix: undefined,
-        marker: undefined,
-        version_marker: undefined,
+    nextStaleBefore: string,
+    history: RiskMarkers[]
+  ) =>
+    go(
+      {
+        tab: 'storage',
+        risk: true,
         risk_prefix: riskKey ? undefined : riskPrefix || undefined,
         risk_dataset: search.risk_dataset,
         risk_key: riskKey || undefined,
@@ -1241,60 +988,18 @@ function ObjectBrowserPage() {
         risk_version_marker: nextVersionMarker || undefined,
         risk_created_at_marker: nextCreatedAtMarker || undefined,
         risk_stale_before: nextStaleBefore || undefined,
-        view: 'storage-risk',
       },
+      { bucketRiskMarkers: history }
+    )
+
+  const navigateToStorageRiskFilters = (next: { prefix?: string; key?: string; dataSetID?: number }) =>
+    go({
+      tab: 'storage',
+      risk: true,
+      risk_prefix: next.key ? undefined : next.prefix || undefined,
+      risk_dataset: next.dataSetID ? next.dataSetID.toString() : undefined,
+      risk_key: next.key || undefined,
     })
-  }
-
-  const navigateToStorageRiskFilters = (next: { prefix?: string; key?: string; dataSetID?: number }) => {
-    navigate({
-      to: '/buckets/$name',
-      params: { name },
-      search: {
-        prefix: undefined,
-        marker: undefined,
-        version_marker: undefined,
-        risk_prefix: next.key ? undefined : next.prefix || undefined,
-        risk_dataset: next.dataSetID ? next.dataSetID.toString() : undefined,
-        risk_key: next.key || undefined,
-        risk_key_marker: undefined,
-        risk_version_marker: undefined,
-        risk_created_at_marker: undefined,
-        risk_stale_before: undefined,
-        view: 'storage-risk',
-      },
-    })
-  }
-
-  const navigateToStorageRisk = () => {
-    navigateToStorageRiskFilters({})
-    setDetailsOpen(false)
-  }
-
-  const navigateToStorageRiskDataSet = (dataSetID: number) => {
-    navigateToStorageRiskFilters({ dataSetID })
-    setDetailsOpen(false)
-  }
-
-  const navigateToView = (nextView: 'objects' | 'deleted') => {
-    navigate({
-      to: '/buckets/$name',
-      params: { name },
-      search: {
-        prefix: prefix || undefined,
-        marker: undefined,
-        version_marker: undefined,
-        risk_prefix: undefined,
-        risk_dataset: undefined,
-        risk_key: undefined,
-        risk_key_marker: undefined,
-        risk_version_marker: undefined,
-        risk_created_at_marker: undefined,
-        risk_stale_before: undefined,
-        view: nextView === 'objects' ? undefined : nextView,
-      },
-    })
-  }
 
   const handleRefresh = () => {
     qc.invalidateQueries({ queryKey: ['bucket', name] })
@@ -1310,126 +1015,152 @@ function ObjectBrowserPage() {
     qc.invalidateQueries({ queryKey: ['tasks'] })
     qc.invalidateQueries({ queryKey: ['taskStats'] })
     if (marker) {
-      navigate({
-        to: '/buckets/$name',
-        params: { name },
-        search: {
-          prefix: prefix || undefined,
-          marker: undefined,
-          view: undefined,
-        },
-      })
+      go({ prefix: prefix || undefined })
     }
   }
 
-  const openChangeOwner = () => {
-    setChangeOwnerOpen(true)
-  }
+  const data = bucket.data
+  const canUpload = data?.status === 'ready'
 
   return (
-    <div className="flex flex-col gap-4 p-6">
-      <BucketBreadcrumb name={name} pathCrumbs={pathCrumbs} navigateToPrefix={navigateToPrefix} />
+    <div className="flex flex-col gap-6 p-6">
+      <div className="flex flex-col gap-2">
+        <BucketBreadcrumb
+          name={name}
+          pathCrumbs={browsing ? bucketPrefixCrumbs(prefix) : []}
+          navigateToPrefix={navigateToPrefix}
+        />
+        <PageHeader
+          title={name}
+          meta={
+            data && <StatusBadge tone={bucketStatusTone(data.status)}>{bucketStatusLabel(data.status)}</StatusBadge>
+          }
+          description={data && <BucketSummary bucket={data} />}
+          actions={
+            <>
+              <RefreshButton onClick={handleRefresh} refreshing={bucket.isFetching} />
+              {tab === 'objects' && (
+                <Button size="sm" onClick={() => setUploadOpen(true)} disabled={!canUpload}>
+                  <Upload data-icon="inline-start" />
+                  Upload
+                </Button>
+              )}
+            </>
+          }
+        />
+      </div>
 
-      <PageHeader
-        title={name}
-        meta={
-          bucket.data && <StatusBadge tone={bucketStatusTone(bucket.data.status)}>{bucket.data.status}</StatusBadge>
-        }
-        actions={
-          <>
-            {view === 'objects' && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setUploadOpen(true)}
-                disabled={bucket.data?.status !== 'ready'}
-              >
-                <Upload data-icon="inline-start" /> Upload
-              </Button>
-            )}
-            <Button variant="outline" size="sm" onClick={handleRefresh}>
-              <RefreshCw data-icon="inline-start" /> Refresh
-            </Button>
-            {bucket.data && (
-              <Button variant="outline" size="sm" onClick={() => setDetailsOpen(true)}>
-                <Info data-icon="inline-start" /> Details
-              </Button>
-            )}
-          </>
-        }
-      />
-
-      {bucket.error && <PageErrorState title="Failed to load bucket details" className="min-h-24 p-0" />}
-
-      {view === 'storage-risk' ? (
-        <StorageRiskHeader onBack={() => navigateToView('objects')} />
-      ) : (
-        <Tabs value={view} onValueChange={(value) => navigateToView(value === 'deleted' ? 'deleted' : 'objects')}>
-          <TabsList className="max-w-full justify-start overflow-x-auto">
-            <TabsTrigger value="objects">Objects</TabsTrigger>
-            <TabsTrigger value="deleted">Trash</TabsTrigger>
-          </TabsList>
-        </Tabs>
+      {bucket.error && (
+        <PageError
+          title="Failed to load bucket details"
+          description={bucket.error.message}
+          onRetry={() => bucket.refetch()}
+          retrying={bucket.isFetching}
+        />
       )}
 
-      {view === 'objects' && objects.isLoading ? (
-        <ObjectBrowserSkeleton />
-      ) : view === 'objects' && objects.error ? (
-        <PageErrorState title="Failed to load objects" className="h-64" />
-      ) : view === 'objects' ? (
-        <ObjectBrowserTable
-          bucketName={name}
-          prefix={prefix}
-          folders={objects.data?.folders ?? []}
-          files={objects.data?.objects ?? []}
-          hasMore={objects.data?.has_more ?? false}
-          nextMarker={objects.data?.next_marker}
-          marker={marker}
-          navigateToPrefix={navigateToPrefix}
-          navigateToMarker={navigateToMarker}
-        />
-      ) : view === 'deleted' && deletedObjects.isLoading ? (
-        <ObjectBrowserSkeleton />
-      ) : view === 'deleted' && deletedObjects.error ? (
-        <PageErrorState title="Failed to load trash" className="h-64" />
-      ) : view === 'deleted' ? (
-        <DeletedObjectsTable
-          bucketName={name}
-          prefix={prefix}
-          objects={deletedObjects.data?.objects ?? []}
-          hasMore={deletedObjects.data?.has_more ?? false}
-          nextMarker={deletedObjects.data?.next_marker}
-          marker={marker}
-          navigateToPrefix={navigateToPrefix}
-          navigateToMarker={navigateToMarker}
-        />
-      ) : view === 'storage-risk' && storageRisk.isLoading ? (
-        <ObjectBrowserSkeleton />
-      ) : view === 'storage-risk' && storageRisk.error ? (
-        <PageErrorState title="Failed to load storage risk" className="h-64" />
-      ) : view === 'storage-risk' ? (
-        <StorageRiskView
-          prefix={riskKey ? '' : riskPrefix}
-          exactKey={riskKey}
-          dataSetID={riskDatasetID}
-          dataSets={bucket.data?.data_sets ?? []}
-          versions={storageRisk.data?.versions ?? []}
-          hasMore={storageRisk.data?.has_more ?? false}
-          nextKeyMarker={storageRisk.data?.next_key_marker}
-          nextVersionMarker={storageRisk.data?.next_version_marker}
-          nextCreatedAtMarker={storageRisk.data?.next_created_at_marker}
-          staleBefore={storageRisk.data?.stale_before}
-          keyMarker={riskKeyMarker}
-          versionMarker={riskVersionMarker}
-          createdAtMarker={riskCreatedAtMarker}
-          staleBeforeMarker={riskStaleBefore}
-          navigateToMarker={navigateToStorageRiskMarker}
-          navigateToFilters={navigateToStorageRiskFilters}
-          onOpenProvenance={setRiskProvenanceVersion}
-        />
-      ) : (
-        <ObjectBrowserSkeleton />
-      )}
+      <Tabs value={tab} onValueChange={(value) => selectTab(value as BucketTab)} className="min-w-0 gap-6">
+        <TabsList className="max-w-full justify-start overflow-x-auto">
+          <TabsTrigger value="objects">Objects</TabsTrigger>
+          <TabsTrigger value="trash">Trash</TabsTrigger>
+          <TabsTrigger value="storage">Storage</TabsTrigger>
+          <TabsTrigger value="settings">Settings</TabsTrigger>
+        </TabsList>
+        {/* Only the selected tab mounts, so one panel carries whichever view is open. */}
+        <TabsContent value={tab} className="min-w-0 text-base">
+          {tab === 'objects' ? (
+            objects.isLoading ? (
+              <TableSkeleton />
+            ) : objects.error ? (
+              <PageError
+                title="Failed to load objects"
+                description={objects.error.message}
+                onRetry={() => objects.refetch()}
+                retrying={objects.isFetching}
+              />
+            ) : (
+              <ObjectBrowserTable
+                bucketName={name}
+                prefix={prefix}
+                folders={objects.data?.folders ?? []}
+                files={objects.data?.objects ?? []}
+                hasPrevious={Boolean(marker)}
+                nextMarker={objects.data?.has_more ? objects.data.next_marker : undefined}
+                onPrevious={previousPage}
+                onNext={nextPage}
+                navigateToPrefix={navigateToPrefix}
+                onUpload={canUpload ? () => setUploadOpen(true) : undefined}
+              />
+            )
+          ) : tab === 'trash' ? (
+            deletedObjects.isLoading ? (
+              <TableSkeleton />
+            ) : deletedObjects.error ? (
+              <PageError
+                title="Failed to load trash"
+                description={deletedObjects.error.message}
+                onRetry={() => deletedObjects.refetch()}
+                retrying={deletedObjects.isFetching}
+              />
+            ) : (
+              <DeletedObjectsTable
+                bucketName={name}
+                prefix={prefix}
+                objects={deletedObjects.data?.objects ?? []}
+                hasPrevious={Boolean(marker)}
+                nextMarker={deletedObjects.data?.has_more ? deletedObjects.data.next_marker : undefined}
+                onPrevious={previousPage}
+                onNext={nextPage}
+              />
+            )
+          ) : !data ? (
+            bucket.isLoading && <TableSkeleton />
+          ) : tab === 'settings' ? (
+            <BucketSettingsTab bucket={data} />
+          ) : riskView ? (
+            <div className="flex min-w-0 flex-col gap-4">
+              <StorageRiskHeader onBack={() => go({ tab: 'storage' })} />
+              {storageRisk.isLoading ? (
+                <TableSkeleton />
+              ) : storageRisk.error ? (
+                <PageError
+                  title="Failed to load affected versions"
+                  description={storageRisk.error.message}
+                  onRetry={() => storageRisk.refetch()}
+                  retrying={storageRisk.isFetching}
+                />
+              ) : (
+                <StorageRiskView
+                  prefix={riskKey ? '' : riskPrefix}
+                  exactKey={riskKey}
+                  dataSetID={riskDatasetID}
+                  dataSets={data.data_sets ?? []}
+                  versions={storageRisk.data?.versions ?? []}
+                  hasMore={storageRisk.data?.has_more ?? false}
+                  nextKeyMarker={storageRisk.data?.next_key_marker}
+                  nextVersionMarker={storageRisk.data?.next_version_marker}
+                  nextCreatedAtMarker={storageRisk.data?.next_created_at_marker}
+                  staleBefore={storageRisk.data?.stale_before}
+                  keyMarker={riskKeyMarker}
+                  versionMarker={riskVersionMarker}
+                  createdAtMarker={riskCreatedAtMarker}
+                  staleBeforeMarker={riskStaleBefore}
+                  navigateToMarker={navigateToStorageRiskMarker}
+                  navigateToFilters={navigateToStorageRiskFilters}
+                  onOpenProvenance={setRiskProvenanceVersion}
+                />
+              )}
+            </div>
+          ) : (
+            <BucketStorageTab
+              bucket={data}
+              onReviewStorageRisk={() => navigateToStorageRiskFilters({})}
+              onReviewStorageDataSetRisk={(dataSetID) => navigateToStorageRiskFilters({ dataSetID })}
+            />
+          )}
+        </TabsContent>
+      </Tabs>
+
       <ObjectProvenanceDialog
         bucketName={name}
         objectKey={riskProvenanceVersion?.key ?? ''}
@@ -1446,26 +1177,73 @@ function ObjectBrowserPage() {
         onOpenChange={setUploadOpen}
         onUploaded={handleUploadCompleted}
       />
-      {bucket.data && (
-        <>
-          <BucketDetailsSheet
-            bucket={bucket.data}
-            open={detailsOpen}
-            onOpenChange={handleDetailsOpenChange}
-            focusStorage={search.details === 'storage'}
-            onChangeOwner={openChangeOwner}
-            onReviewStorageRisk={() => navigateToStorageRisk()}
-            onReviewStorageDataSetRisk={navigateToStorageRiskDataSet}
-          />
-          <ChangeBucketOwnerDetailDialog
-            bucketName={name}
-            ownerAccessKey={bucket.data.owner_access_key}
-            open={changeOwnerOpen}
-            onOpenChange={setChangeOwnerOpen}
-            showTrigger={false}
-          />
-        </>
-      )}
+    </div>
+  )
+}
+
+function BucketSummary({ bucket }: { bucket: BucketDetail }) {
+  const { data: users = [] } = useS3Users()
+  const health = bucket.storage_health
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+      <span>{formatObjectCount(bucket.object_count)}</span>
+      <span aria-hidden="true">·</span>
+      <span>{formatBytes(bucket.total_size_bytes)}</span>
+      <span aria-hidden="true">·</span>
+      <span>{bucketCopyPolicyLabel(bucket)}</span>
+      <span aria-hidden="true">·</span>
+      <span>Owner {ownerLabel(bucket.owner_access_key, users)}</span>
+      <span className="inline-flex" title={bucketStorageHealthTitle(health)}>
+        <StatusBadge tone={bucketStorageHealthStatusTone(health)}>{bucketStorageHealthLabel(health)}</StatusBadge>
+      </span>
+    </div>
+  )
+}
+
+function BucketStorageTab({
+  bucket,
+  onReviewStorageRisk,
+  onReviewStorageDataSetRisk,
+}: {
+  bucket: BucketDetail
+  onReviewStorageRisk: () => void
+  onReviewStorageDataSetRisk: (dataSetID: number) => void
+}) {
+  const [storageHealthError, setStorageHealthError] = useState<string | null>(null)
+  // Replacement diagnostics are not replica-health diagnostics; sharing one
+  // dialog labelled them as the wrong kind of fault.
+  const [replacementError, setReplacementError] = useState<string | null>(null)
+  const [replacementTarget, setReplacementTarget] = useState<StorageDataSetSummary | null>(null)
+
+  return (
+    <div className="flex min-w-0 flex-col gap-6">
+      <BucketStorageHealthPanel
+        health={bucket.storage_health}
+        onOpenLastError={setStorageHealthError}
+        onReviewVersions={onReviewStorageRisk}
+      />
+      <ProviderReplacementProgress replacements={bucket.replacements ?? []} onOpenLastError={setReplacementError} />
+      <BucketStorageDataSets
+        bucketName={bucket.name}
+        dataSets={bucket.data_sets ?? []}
+        onReviewStorageRisk={onReviewStorageDataSetRisk}
+        onReplaceProvider={setReplacementTarget}
+      />
+      <DetailTextDialog
+        title="Storage health error"
+        text={storageHealthError}
+        onClose={() => setStorageHealthError(null)}
+      />
+      <DetailTextDialog
+        title="Provider replacement diagnostics"
+        text={replacementError}
+        onClose={() => setReplacementError(null)}
+      />
+      <ReplaceProviderDialog
+        bucketName={bucket.name}
+        dataSet={replacementTarget}
+        onClose={() => setReplacementTarget(null)}
+      />
     </div>
   )
 }
@@ -1502,6 +1280,7 @@ function UploadObjectsDialog({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const queuedCount = items.filter((item) => item.status === 'queued').length
   const retryableFailedCount = items.filter((item) => item.status === 'failed' && item.retryable).length
+  const finished = !uploading && items.length > 0 && items.every((item) => item.status === 'success')
 
   useEffect(() => {
     if (!open && !uploading) {
@@ -1554,10 +1333,12 @@ function UploadObjectsDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-3xl">
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-3xl [&>*]:min-w-0">
         <DialogHeader>
           <DialogTitle>Upload objects</DialogTitle>
-          <DialogDescription>Target: {prefix || '/'}</DialogDescription>
+          <DialogDescription>
+            Files upload to <span className="font-mono">{`${bucketName}/${prefix}`}</span>
+          </DialogDescription>
         </DialogHeader>
 
         <FieldGroup>
@@ -1590,22 +1371,13 @@ function UploadObjectsDialog({
         </FieldGroup>
 
         {items.length === 0 ? (
-          <div className="rounded-md border border-border">
-            <Empty className="h-44 border-0">
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <Upload />
-                </EmptyMedia>
-                <EmptyTitle>No files selected</EmptyTitle>
-              </EmptyHeader>
-            </Empty>
-          </div>
+          <EmptyState icon={<Upload />} title="No files selected" className="min-h-44" />
         ) : (
-          <div className="rounded-md border border-border">
+          <DataTableFrame>
             <ScrollArea className="max-h-80 w-full">
-              <Table className="min-w-[680px]">
+              <Table className="min-w-[680px] table-fixed">
                 <TableHeader>
-                  <TableRow className="bg-muted/50">
+                  <TableRow className={tableHeaderRowClassName}>
                     <TableHead className="w-[36%] px-4">Name</TableHead>
                     <TableHead className="w-[16%] px-4 text-right">Size</TableHead>
                     <TableHead className="w-[14%] px-4">Status</TableHead>
@@ -1617,7 +1389,7 @@ function UploadObjectsDialog({
                   {items.map((item) => (
                     <TableRow key={item.id}>
                       <TableCell className="px-4">
-                        <span className="block max-w-72 truncate" title={item.key}>
+                        <span className="block truncate" title={item.key}>
                           {item.file.name}
                         </span>
                       </TableCell>
@@ -1632,7 +1404,7 @@ function UploadObjectsDialog({
                       </TableCell>
                       <TableCell className="px-4">
                         <span className="block max-w-44 truncate text-muted-foreground" title={item.error}>
-                          {item.error ?? '-'}
+                          {item.error ?? '—'}
                         </span>
                       </TableCell>
                     </TableRow>
@@ -1641,26 +1413,32 @@ function UploadObjectsDialog({
               </Table>
               <ScrollBar orientation="horizontal" />
             </ScrollArea>
-          </div>
+          </DataTableFrame>
         )}
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={uploading}>
-            Close
-          </Button>
-          {retryableFailedCount > 0 && (
-            <Button variant="outline" onClick={() => uploadItems('failed')} disabled={uploading}>
-              <RotateCcw data-icon="inline-start" /> Retry failed
-            </Button>
+          {finished ? (
+            <Button onClick={() => handleOpenChange(false)}>Done</Button>
+          ) : (
+            <>
+              <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={uploading}>
+                Close
+              </Button>
+              {retryableFailedCount > 0 && (
+                <Button variant="outline" onClick={() => uploadItems('failed')} disabled={uploading}>
+                  <RotateCcw data-icon="inline-start" /> Retry failed
+                </Button>
+              )}
+              <Button onClick={() => uploadItems('queued')} disabled={uploading || queuedCount === 0}>
+                {uploading ? (
+                  <Loader2 data-icon="inline-start" className="animate-spin" />
+                ) : (
+                  <Upload data-icon="inline-start" />
+                )}
+                Upload
+              </Button>
+            </>
           )}
-          <Button onClick={() => uploadItems('queued')} disabled={uploading || queuedCount === 0}>
-            {uploading ? (
-              <Loader2 data-icon="inline-start" className="animate-spin" />
-            ) : (
-              <Upload data-icon="inline-start" />
-            )}
-            Upload
-          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1773,106 +1551,6 @@ function uploadDialogStatusTone(status: UploadDialogStatus): StatusTone {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Upload failed'
-}
-
-function BucketDetailsSheet({
-  bucket,
-  open,
-  onOpenChange,
-  onChangeOwner,
-  onReviewStorageRisk,
-  onReviewStorageDataSetRisk,
-  focusStorage,
-}: {
-  bucket: NonNullable<ReturnType<typeof useBucket>['data']>
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onChangeOwner: () => void
-  onReviewStorageRisk: () => void
-  onReviewStorageDataSetRisk: (dataSetID: number) => void
-  focusStorage: boolean
-}) {
-  const [storageHealthError, setStorageHealthError] = useState<string | null>(null)
-  // Replacement diagnostics are not replica-health diagnostics; sharing one
-  // dialog labelled them as the wrong kind of fault.
-  const [replacementError, setReplacementError] = useState<string | null>(null)
-  const [replacementTarget, setReplacementTarget] = useState<StorageDataSetSummary | null>(null)
-  const titleRef = useRef<HTMLHeadingElement>(null)
-  const storageRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (open && focusStorage) storageRef.current?.scrollIntoView({ block: 'start' })
-  }, [focusStorage, open])
-
-  return (
-    <>
-      <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent
-          className="min-w-0 overflow-hidden !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]"
-          onOpenAutoFocus={(event) => {
-            event.preventDefault()
-            titleRef.current?.focus({ preventScroll: true })
-          }}
-        >
-          <SheetHeader>
-            <SheetTitle ref={titleRef} tabIndex={-1} className="outline-none">
-              Bucket details
-            </SheetTitle>
-            <SheetDescription>
-              <span className="sr-only">Details for selected bucket.</span>
-            </SheetDescription>
-            <div className="pr-8 text-muted-foreground">
-              <CopyableValue label="Bucket" value={bucket.name} monospace className="max-w-full" />
-            </div>
-          </SheetHeader>
-          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
-            <div className="flex min-w-0 max-w-full flex-col gap-6 px-4 pb-4">
-              <BucketDetailsSection title="Overview">
-                <BucketDetailsOverview bucket={bucket} />
-              </BucketDetailsSection>
-              <BucketStorageHealthPanel
-                health={bucket.storage_health}
-                onOpenLastError={setStorageHealthError}
-                onReviewVersions={onReviewStorageRisk}
-              />
-              <div ref={storageRef}>
-                <BucketDetailsSection title="Storage">
-                  <ProviderReplacementProgress
-                    replacements={bucket.replacements ?? []}
-                    onOpenLastError={setReplacementError}
-                  />
-                  <BucketStorageDataSets
-                    bucketName={bucket.name}
-                    dataSets={bucket.data_sets ?? []}
-                    onReviewStorageRisk={onReviewStorageDataSetRisk}
-                    onReplaceProvider={setReplacementTarget}
-                  />
-                </BucketDetailsSection>
-              </div>
-              <BucketDetailsSection title="Settings">
-                <BucketDetailsSettings bucket={bucket} onChangeOwner={onChangeOwner} />
-              </BucketDetailsSection>
-            </div>
-          </div>
-        </SheetContent>
-      </Sheet>
-      <DetailTextDialog
-        title="Storage Health Error"
-        text={storageHealthError}
-        onClose={() => setStorageHealthError(null)}
-      />
-      <DetailTextDialog
-        title="Provider Replacement Diagnostics"
-        text={replacementError}
-        onClose={() => setReplacementError(null)}
-      />
-      <ReplaceProviderDialog
-        bucketName={bucket.name}
-        dataSet={replacementTarget}
-        onClose={() => setReplacementTarget(null)}
-      />
-    </>
-  )
 }
 
 function ReplaceProviderDialog({
@@ -2260,11 +1938,17 @@ function ProviderReplacementProgressCard({
       <ReplacementProgressView progress={replacement.progress} />
       {nextStep && <div className="text-sm text-muted-foreground">{nextStep}</div>}
       {replacement.last_error && (
-        <BucketDetailAction
-          label="Error details"
-          value="View"
-          onClick={() => onOpenLastError(replacement.last_error ?? '')}
-        />
+        <div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onOpenLastError(replacement.last_error ?? '')}
+          >
+            <Info data-icon="inline-start" />
+            Error details
+          </Button>
+        </div>
       )}
       {replacement.retryable ? (
         <div>
@@ -2274,45 +1958,6 @@ function ProviderReplacementProgressCard({
         <p className="text-sm text-muted-foreground">{replacement.retry_unavailable_reason}</p>
       ) : null}
     </div>
-  )
-}
-
-function BucketDetailsSection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="flex min-w-0 max-w-full flex-col gap-3">
-      <h3 className="text-sm font-medium">{title}</h3>
-      {children}
-    </section>
-  )
-}
-
-function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<typeof useBucket>['data']> }) {
-  const { data: users = [] } = useS3Users()
-  const ownerDisplay = ownerLabel(bucket.owner_access_key, users)
-  return (
-    <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      <BucketDetailField label="Objects" value={formatObjectCount(bucket.object_count)} />
-      <BucketDetailField label="Total size" value={formatBytes(bucket.total_size_bytes)} />
-      <BucketDetailField label="Replicas" value={bucketCopyPolicyLabel(bucket)} />
-      <BucketDetailField label="Release cache after" value={minimumDurableCopiesLabel(bucket)} />
-      <BucketDetailField label="Versioning" value={bucket.versioning_status} />
-      <BucketDetailField
-        label="Owner"
-        value={bucket.owner_access_key ?? ownerLabel(bucket.owner_access_key)}
-        displayValue={ownerDisplay}
-        maxLength={ownerDisplay.length}
-        copyValue={bucket.owner_access_key ?? undefined}
-        copyable={Boolean(bucket.owner_access_key)}
-      />
-      <BucketDetailField label="Created" value={timeAgo(bucket.created_at)} title={bucket.created_at} />
-      <BucketDetailField label="Updated" value={timeAgo(bucket.updated_at)} title={bucket.updated_at} />
-      <div>
-        <dt className="text-xs text-muted-foreground">Status</dt>
-        <dd className="mt-1">
-          <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
-        </dd>
-      </div>
-    </dl>
   )
 }
 
@@ -2331,87 +1976,42 @@ function BucketStorageHealthPanel({
   return (
     <Card size="sm">
       <CardHeader>
-        <CardTitle>Storage Health</CardTitle>
+        <CardTitle>Storage health</CardTitle>
         <CardAction title={bucketStorageHealthTitle(health)}>
           <StatusBadge tone={bucketStorageHealthStatusTone(health)}>{bucketStorageHealthLabel(health)}</StatusBadge>
         </CardAction>
       </CardHeader>
-      <CardContent>
-        <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
-          <BucketDetailField
-            label="Retained versions at risk"
-            value={bucketStorageHealthAffectedVersionsLabel(health)}
-            title="Capped list triage count, not a diagnostic total"
-          />
-          <BucketDetailField label="Abnormal data sets" value={formatNumber(health.abnormal_data_sets)} />
-          <BucketDetailField
-            label="Observation"
-            value={bucketStorageHealthObservationLabel(health)}
-            title={health.last_checked_at}
-          />
-          <BucketDetailField
-            label="Checked"
-            value={health.last_checked_at ? timeAgo(health.last_checked_at) : 'Not checked'}
-            title={health.last_checked_at}
-          />
-          {lastError && (
-            <BucketDetailAction label="Last error" value="Error details" onClick={() => onOpenLastError(lastError)} />
-          )}
-          {hasAffectedVersions && (
-            <BucketDetailAction label="Affected versions" value="Review versions" onClick={onReviewVersions} />
-          )}
-        </dl>
+      <CardContent className="flex flex-col gap-4">
+        <DetailGrid className="@xl:grid-cols-4">
+          <DetailField label="Retained versions at risk">
+            <span title="Capped list triage count, not a diagnostic total">
+              {bucketStorageHealthAffectedVersionsLabel(health)}
+            </span>
+          </DetailField>
+          <DetailField label="Data sets with issues">{formatNumber(health.abnormal_data_sets)}</DetailField>
+          <DetailField label="Observation">{bucketStorageHealthObservationLabel(health)}</DetailField>
+          <DetailField label="Checked">
+            {health.last_checked_at ? <RelativeTime value={health.last_checked_at} /> : 'Not checked'}
+          </DetailField>
+        </DetailGrid>
+        {(lastError || hasAffectedVersions) && (
+          <div className="flex flex-wrap gap-2">
+            {lastError && (
+              <Button type="button" variant="outline" size="sm" onClick={() => onOpenLastError(lastError)}>
+                <Info data-icon="inline-start" />
+                Error details
+              </Button>
+            )}
+            {hasAffectedVersions && (
+              <Button type="button" variant="outline" size="sm" onClick={onReviewVersions}>
+                <TriangleAlert data-icon="inline-start" />
+                Review affected versions
+              </Button>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
-  )
-}
-
-function BucketDetailField({
-  label,
-  value,
-  displayValue,
-  maxLength,
-  copyValue,
-  title,
-  copyable,
-}: {
-  label: string
-  value: string
-  displayValue?: string
-  maxLength?: number
-  copyValue?: string
-  title?: string
-  copyable?: boolean
-}) {
-  const displayText = displayValue ?? value
-  const copiedValue = copyValue ?? value
-  const copyableValue = copyable && copiedValue !== '—'
-
-  return (
-    <div>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 truncate font-medium" title={copyableValue ? undefined : (title ?? displayText)}>
-        {copyableValue ? (
-          <CopyableValue label={label} value={copiedValue} displayValue={displayText} maxLength={maxLength ?? 28} />
-        ) : (
-          displayText
-        )}
-      </dd>
-    </div>
-  )
-}
-
-function BucketDetailAction({ label, value, onClick }: { label: string; value: string; onClick: () => void }) {
-  return (
-    <div>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1">
-        <Button type="button" variant="outline" size="xs" onClick={onClick} className="justify-start">
-          <Info data-icon="inline-start" />
-          {value}
-        </Button>
-      </dd>
-    </div>
   )
 }
 
@@ -2431,17 +2031,18 @@ function BucketStorageDataSets({
 
   if (dataSets.length === 0) {
     return (
-      <div className="rounded-md border border-border p-4">
-        <p className="text-sm font-medium">No data sets</p>
-        <p className="mt-1 text-sm text-muted-foreground">This bucket has no provider data sets yet.</p>
-      </div>
+      <EmptyState
+        icon={<Database />}
+        title="No data sets yet"
+        description="Data sets appear once this bucket stores its first replica with a provider."
+      />
     )
   }
 
   return (
-    <div className="min-w-0 max-w-full overflow-hidden rounded-md border border-border">
-      <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border bg-muted/50 px-4 py-2">
-        <div className="text-sm font-medium">Data Sets</div>
+    <DataTableFrame>
+      <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-4 py-2">
+        <h2 className="text-sm font-semibold">Data sets</h2>
         <Button
           type="button"
           variant="outline"
@@ -2469,14 +2070,14 @@ function BucketStorageDataSets({
         </div>
       )}
       <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
-        <Table className="min-w-[820px] table-fixed">
+        <Table className="min-w-[860px] table-fixed">
           <TableHeader>
-            <TableRow>
-              <TableHead className="w-[9%] px-3">Replica</TableHead>
-              <TableHead className="w-[14%] px-3">Provider</TableHead>
-              <TableHead className="w-[12%] px-3">Data Set</TableHead>
-              <TableHead className="w-[19%] px-3">Storage Health</TableHead>
-              <TableHead className="w-[20%] px-3">Impact</TableHead>
+            <TableRow className={tableHeaderRowClassName}>
+              <TableHead className="w-[10%] px-3">Replica</TableHead>
+              <TableHead className="w-[18%] px-3">Provider</TableHead>
+              <TableHead className="w-[12%] px-3">Data set</TableHead>
+              <TableHead className="w-[19%] px-3">Storage health</TableHead>
+              <TableHead className="w-[17%] px-3">Impact</TableHead>
               <TableHead
                 className="w-[8%] px-2 text-right"
                 aria-label="Current object versions referencing this data set"
@@ -2489,7 +2090,9 @@ function BucketStorageDataSets({
               >
                 Total
               </TableHead>
-              <TableHead className="w-[9%] px-2 text-right">Actions</TableHead>
+              <TableHead className="w-[6%] px-2 text-right">
+                <span className="sr-only">Actions</span>
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -2508,9 +2111,7 @@ function BucketStorageDataSets({
               return (
                 <TableRow key={dataSet.id}>
                   <TableCell className="overflow-hidden px-3">
-                    <span className="block max-w-full truncate font-mono text-xs">
-                      {replicaLabel(dataSet.copy_index)}
-                    </span>
+                    <span className="block max-w-full truncate font-medium">{replicaLabel(dataSet.copy_index)}</span>
                     <StatusBadge
                       tone={dataSetGenerationTone(dataSet)}
                       className="mt-1 max-w-full truncate"
@@ -2524,7 +2125,7 @@ function BucketStorageDataSets({
                   </TableCell>
                   <TableCell className="overflow-hidden px-3 text-muted-foreground">
                     {topologyLink.copyValue ? (
-                      <CopyableValue label="Data Set ID" value={topologyLink.copyValue} monospace maxLength={24}>
+                      <CopyableValue label="Data set ID" value={topologyLink.copyValue} monospace maxLength={24}>
                         {link}
                       </CopyableValue>
                     ) : (
@@ -2560,40 +2161,22 @@ function BucketStorageDataSets({
                     {formatNumber(dataSet.referenced_version_count)}
                   </TableCell>
                   <TableCell className="px-2 text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      {dataSetNeedsStorageRiskReview(dataSet) && (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={`Review affected versions for ${replicaLabel(dataSet.copy_index)}`}
-                              onClick={() => onReviewStorageRisk(dataSet.id)}
-                            >
-                              <TriangleAlert />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>Affected versions</TooltipContent>
-                        </Tooltip>
-                      )}
-                      {dataSet.replaceable && (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={`Replace provider for ${replicaLabel(dataSet.copy_index)}`}
-                              onClick={() => onReplaceProvider(dataSet)}
-                            >
-                              <Repeat2 />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>Replace provider</TooltipContent>
-                        </Tooltip>
-                      )}
-                    </div>
+                    {(dataSetNeedsStorageRiskReview(dataSet) || dataSet.replaceable) && (
+                      <RowActionsMenu label={replicaLabel(dataSet.copy_index)}>
+                        {dataSetNeedsStorageRiskReview(dataSet) && (
+                          <RowActionItem onSelect={() => onReviewStorageRisk(dataSet.id)}>
+                            <TriangleAlert data-icon="inline-start" />
+                            Review affected versions
+                          </RowActionItem>
+                        )}
+                        {dataSet.replaceable && (
+                          <RowActionItem onSelect={() => onReplaceProvider(dataSet)}>
+                            <Repeat2 data-icon="inline-start" />
+                            Replace provider
+                          </RowActionItem>
+                        )}
+                      </RowActionsMenu>
+                    )}
                   </TableCell>
                 </TableRow>
               )
@@ -2601,7 +2184,7 @@ function BucketStorageDataSets({
           </TableBody>
         </Table>
       </div>
-    </div>
+    </DataTableFrame>
   )
 }
 
@@ -2617,26 +2200,16 @@ function DataSetImpactCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
 
 function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
   const storageHealth = dataSet.storage_health
-  const detailParts = dataSetStorageHealthDetailParts(dataSet)
-  const details = detailParts.join(' · ')
-  if (!storageHealth) {
-    return (
-      <div className="flex min-w-0 flex-col gap-1">
-        <StatusBadge tone="neutral">unknown</StatusBadge>
-        <span className="block min-w-0 max-w-full truncate text-xs text-muted-foreground" title={details}>
-          {details}
-        </span>
-      </div>
-    )
-  }
+  const details = dataSetStorageHealthDetailParts(dataSet).join(' · ')
+  const status = storageHealth?.status ?? 'unknown'
 
   return (
     <div className="flex min-w-0 max-w-full flex-col gap-1 overflow-hidden">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <StatusBadge tone={storageHealthStatusTone(storageHealth.status)}>{storageHealth.status}</StatusBadge>
-        {storageHealth.stale && (
+        <StatusBadge tone={storageHealthStatusTone(status)}>{observabilityStatusLabel(status)}</StatusBadge>
+        {storageHealth?.stale && (
           <StatusBadge tone="warning" className="shrink-0">
-            stale
+            Stale
           </StatusBadge>
         )}
       </div>
@@ -2670,21 +2243,70 @@ function storageHealthStatusTone(status: StorageHealthStatus): StatusTone {
   }
 }
 
-function BucketDetailsSettings({
-  bucket,
-  onChangeOwner,
-}: {
-  bucket: NonNullable<ReturnType<typeof useBucket>['data']>
-  onChangeOwner: () => void
-}) {
+function BucketSettingsTab({ bucket }: { bucket: BucketDetail }) {
   const { data: users = [] } = useS3Users()
+  const [ownerOpen, setOwnerOpen] = useState(false)
+  const owner = bucket.owner_access_key
+
+  return (
+    <div className="flex min-w-0 max-w-3xl flex-col gap-6">
+      <SettingsSection title="General">
+        <DetailGrid>
+          <DetailField label="Name">
+            <CopyableValue label="Bucket" value={bucket.name} />
+          </DetailField>
+          <DetailField label="Status">
+            <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucketStatusLabel(bucket.status)}</StatusBadge>
+          </DetailField>
+          <DetailField label="Versioning">{versioningStatusLabel(bucket.versioning_status)}</DetailField>
+          <DetailField label="Provider preference">
+            {providerSelectionStrategyLabel(bucket.provider_selection_strategy)}
+          </DetailField>
+          <DetailField label="Created">
+            <RelativeTime value={bucket.created_at} />
+          </DetailField>
+          <DetailField label="Updated">
+            <RelativeTime value={bucket.updated_at} />
+          </DetailField>
+        </DetailGrid>
+      </SettingsSection>
+      <SettingsSection
+        title="Owner"
+        action={
+          <Button variant="outline" size="sm" onClick={() => setOwnerOpen(true)}>
+            <UserRound data-icon="inline-start" />
+            {owner ? 'Change owner' : 'Assign owner'}
+          </Button>
+        }
+      >
+        <div className="flex flex-col gap-1 text-sm">
+          {owner ? (
+            <CopyableValue
+              label="Owner"
+              value={owner}
+              displayValue={ownerLabel(owner, users)}
+              maxLength={ownerLabel(owner, users).length}
+            />
+          ) : (
+            <span className="text-muted-foreground">{ownerLabel(owner)}</span>
+          )}
+          <span className="text-muted-foreground">The owner has full control of this bucket through the S3 API.</span>
+        </div>
+      </SettingsSection>
+      <ReplicaPolicySection bucket={bucket} />
+      <BucketOwnerDialog bucketName={bucket.name} ownerAccessKey={owner} open={ownerOpen} onOpenChange={setOwnerOpen} />
+    </div>
+  )
+}
+
+function ReplicaPolicySection({ bucket }: { bucket: BucketDetail }) {
   const updateCopyPolicy = useUpdateBucketCopyPolicy()
   const currentCopyPolicy = bucketCopyPolicyValue(bucket)
   const currentMinimumDurableCopies = minimumDurableCopiesValue(bucket)
   const [copyPolicy, setCopyPolicy] = useState(currentCopyPolicy)
   const [minimumDurableCopies, setMinimumDurableCopies] = useState(currentMinimumDurableCopies)
   const [copyPolicyError, setCopyPolicyError] = useState<string | null>(null)
-  const [copyPolicyNotice, setCopyPolicyNotice] = useState<string | null>(null)
+  const [justSaved, setJustSaved] = useState(false)
   const targetCopies = selectedTargetCopies(copyPolicy)
   const minimumOptions = minimumDurableCopiesOptions(targetCopies)
 
@@ -2693,10 +2315,6 @@ function BucketDetailsSettings({
     setMinimumDurableCopies(currentMinimumDurableCopies)
     setCopyPolicyError(null)
   }, [currentCopyPolicy, currentMinimumDurableCopies])
-
-  useEffect(() => {
-    if (bucket.name) setCopyPolicyNotice(null)
-  }, [bucket.name])
 
   const nextMinimumDurableCopies = persistMinimumDurableCopies(
     minimumDurableCopies,
@@ -2707,7 +2325,7 @@ function BucketDetailsSettings({
     (copyPolicy !== currentCopyPolicy ||
       minimumDurableCopies !== currentMinimumDurableCopies ||
       nextMinimumDurableCopies !== undefined) &&
-    copyPolicyNotice == null
+    !justSaved
   const handleCopyPolicyChange = (next: string) => {
     const nextTarget = selectedTargetCopies(next)
     setCopyPolicy(next)
@@ -2719,16 +2337,15 @@ function BucketDetailsSettings({
         : clampMinimumDurableCopiesValue(current, nextTarget)
     )
     setCopyPolicyError(null)
-    setCopyPolicyNotice(null)
+    setJustSaved(false)
   }
   const handleMinimumDurableCopiesChange = (next: string) => {
     setMinimumDurableCopies(next)
     setCopyPolicyError(null)
-    setCopyPolicyNotice(null)
+    setJustSaved(false)
   }
   const saveCopyPolicy = () => {
     setCopyPolicyError(null)
-    setCopyPolicyNotice(null)
     updateCopyPolicy.mutate(
       {
         name: bucket.name,
@@ -2739,39 +2356,28 @@ function BucketDetailsSettings({
         onSuccess: (savedBucket) => {
           setCopyPolicy(bucketCopyPolicyValue(savedBucket))
           setMinimumDurableCopies(minimumDurableCopiesValue(savedBucket))
-          setCopyPolicyNotice(bucketCopyPolicySavedMessage())
+          setJustSaved(true)
+          toast.success(bucketCopyPolicySavedMessage())
         },
         onError: (mutationError) => {
-          setCopyPolicyError(mutationError instanceof Error ? mutationError.message : 'Failed to update copy policy')
+          setCopyPolicyError(mutationError instanceof Error ? mutationError.message : 'Failed to update replica policy')
         },
       }
     )
   }
 
   return (
-    <div className="flex min-w-0 flex-col gap-4">
-      <section className="rounded-md border border-border p-4">
-        <h3 className="text-sm font-medium">Owner</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {bucket.owner_access_key ? (
-            <CopyableValue
-              label="Owner"
-              value={bucket.owner_access_key}
-              displayValue={ownerLabel(bucket.owner_access_key, users)}
-              maxLength={ownerLabel(bucket.owner_access_key, users).length}
-            />
-          ) : (
-            ownerLabel(bucket.owner_access_key)
-          )}
-        </p>
-        <Button variant="outline" size="sm" className="mt-3" onClick={onChangeOwner}>
-          <UserRound data-icon="inline-start" />
-          {bucket.owner_access_key ? 'Change owner' : 'Assign owner'}
+    <SettingsSection
+      title="Replica policy"
+      action={
+        <Button size="sm" onClick={saveCopyPolicy} disabled={!copyPolicyChanged || updateCopyPolicy.isPending}>
+          {updateCopyPolicy.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
+          Save
         </Button>
-      </section>
-      <section className="rounded-md border border-border p-4">
-        <h3 className="text-sm font-medium">Replica policy</h3>
-        <FieldGroup className="mt-3">
+      }
+    >
+      <div className="flex max-w-xl flex-col gap-4">
+        <FieldGroup>
           <Field>
             <FieldLabel htmlFor={`bucket-copies-${bucket.id}`}>Replicas</FieldLabel>
             <Select value={copyPolicy} onValueChange={handleCopyPolicyChange} disabled={updateCopyPolicy.isPending}>
@@ -2786,7 +2392,7 @@ function BucketDetailsSettings({
                       value={copies.toString()}
                       disabled={replicaTargetLocked(copies, bucket.default_copies)}
                     >
-                      {copies} {copies === 1 ? 'copy' : 'copies'}
+                      {replicaCountLabel(copies)}
                     </SelectItem>
                   ))}
                 </SelectGroup>
@@ -2823,34 +2429,17 @@ function BucketDetailsSettings({
           </Field>
         </FieldGroup>
         {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
-          <Alert className="mt-3">
+          <Alert>
             <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
           </Alert>
         )}
-        <div className="mt-3 flex justify-end">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={saveCopyPolicy}
-            disabled={!copyPolicyChanged || updateCopyPolicy.isPending}
-          >
-            {updateCopyPolicy.isPending ? (
-              <Loader2 data-icon="inline-start" className="animate-spin" />
-            ) : (
-              <CheckCircle2 data-icon="inline-start" />
-            )}
-            Save
-          </Button>
-        </div>
-        {copyPolicyNotice && (
-          <p className="mt-2 inline-flex items-center gap-1.5 text-sm text-status-success" role="status">
-            <CheckCircle2 className="size-4" />
-            {copyPolicyNotice}
-          </p>
+        {copyPolicyError && (
+          <Alert variant="destructive">
+            <AlertDescription>{copyPolicyError}</AlertDescription>
+          </Alert>
         )}
-        {copyPolicyError && <p className="mt-2 text-sm text-destructive">{copyPolicyError}</p>}
-      </section>
-    </div>
+      </div>
+    </SettingsSection>
   )
 }
 
@@ -2863,142 +2452,126 @@ function ObjectBrowserTable({
   prefix,
   folders,
   files,
-  hasMore,
+  hasPrevious,
   nextMarker,
-  marker,
+  onPrevious,
+  onNext,
   navigateToPrefix,
-  navigateToMarker,
+  onUpload,
 }: {
   bucketName: string
   prefix: string
   folders: ObjectFolderItem[]
   files: ObjectItem[]
-  hasMore: boolean
+  hasPrevious: boolean
   nextMarker?: string
-  marker: string
+  onPrevious: () => void
+  onNext: (marker: string) => void
   navigateToPrefix: (prefix: string) => void
-  navigateToMarker: (marker: string) => void
+  onUpload?: () => void
 }) {
-  const empty = folders.length === 0 && files.length === 0
+  if (folders.length === 0 && files.length === 0 && !hasPrevious) {
+    return (
+      <EmptyState
+        icon={<Folder />}
+        title={prefix ? 'This folder is empty' : 'No objects yet'}
+        description="Upload files here or write them with any S3 client."
+        action={
+          onUpload && (
+            <Button size="sm" variant="outline" onClick={onUpload}>
+              <Upload data-icon="inline-start" />
+              Upload files
+            </Button>
+          )
+        }
+      />
+    )
+  }
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <ObjectPathBreadcrumb prefix={prefix} navigateToPrefix={navigateToPrefix} />
-        <p className="text-sm text-muted-foreground">{formatBrowserCount(folders.length, files.length)}</p>
-      </div>
-
-      {empty ? (
-        <div className="rounded-md border border-border">
-          <Empty className="h-64 border-0">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <Folder />
-              </EmptyMedia>
-              <EmptyTitle>No objects found</EmptyTitle>
-              <EmptyDescription>This path has no visible objects.</EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        </div>
-      ) : (
-        <div className="rounded-md border border-border">
-          <ScrollArea className="w-full">
-            <Table className="min-w-[780px]">
-              <TableHeader>
-                <TableRow className="bg-muted/50">
-                  <TableHead className="w-[35%] px-4">Name</TableHead>
-                  <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
-                  <TableHead className="w-[18%] px-4">Location</TableHead>
-                  <TableHead className="w-[18%] px-4">Type</TableHead>
-                  <TableHead className="w-[12%] px-4">Updated</TableHead>
-                  <TableHead className="w-[7%] px-4 text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {folders.map((folder) => (
-                  <TableRow key={folder.prefix}>
-                    <TableCell className="px-4">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-auto max-w-full justify-start gap-1.5 p-0 font-normal text-foreground hover:bg-transparent hover:text-foreground has-data-[icon=inline-start]:pl-0"
-                        onClick={() => navigateToPrefix(folder.prefix)}
-                      >
-                        <Folder data-icon="inline-start" className="text-status-info" />
-                        <span className="truncate font-medium">{folder.name}</span>
-                      </Button>
-                    </TableCell>
-                    <TableCell className="px-4 text-right text-muted-foreground">-</TableCell>
-                    <TableCell className="px-4 text-muted-foreground">-</TableCell>
-                    <TableCell className="px-4">
-                      <StatusBadge tone="info">Folder</StatusBadge>
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground">-</TableCell>
-                    <TableCell className="px-4 text-right">
-                      <FolderActions folder={folder} onOpen={() => navigateToPrefix(folder.prefix)} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {files.map((object) => (
-                  <TableRow key={object.id}>
-                    <TableCell className="px-4">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <FileIcon className="size-4 shrink-0 text-muted-foreground" />
-                        <CopyableValue
-                          label="Object key"
-                          value={object.key}
-                          displayValue={objectDisplayName(object.key, prefix)}
-                          maxLength={36}
-                        />
-                        <ObjectStatusIcon
-                          bucketName={bucketName}
-                          versionID={object.current_version_id}
-                          state={object.state}
-                          status={object.status}
-                          progress={object.progress}
-                          compact
-                        />
-                      </div>
-                    </TableCell>
-                    <TableCell className="px-4 text-right">{formatBytes(object.size)}</TableCell>
-                    <TableCell className="px-4">
-                      <LocationBadges location={object.location} />
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground">
-                      <span className="block max-w-48 truncate" title={object.content_type}>
-                        {object.content_type}
-                      </span>
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground" title={object.updated_at}>
-                      {timeAgo(object.updated_at)}
-                    </TableCell>
-                    <TableCell className="px-4 text-right">
-                      <ObjectActions bucketName={bucketName} object={object} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            <ScrollBar orientation="horizontal" />
-          </ScrollArea>
-        </div>
-      )}
-
-      <div className="flex justify-between">
-        {marker ? (
-          <Button variant="outline" size="sm" onClick={() => navigateToMarker('')}>
-            First page
-          </Button>
-        ) : (
-          <span />
-        )}
-        {hasMore && nextMarker && (
-          <Button variant="outline" size="sm" onClick={() => navigateToMarker(nextMarker)}>
-            Next page
-          </Button>
-        )}
-      </div>
+      <DataTableFrame>
+        <Table className="min-w-[780px]">
+          <TableHeader>
+            <TableRow className={tableHeaderRowClassName}>
+              <TableHead className="w-[38%] px-4">Name</TableHead>
+              <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
+              <TableHead className="w-[16%] px-4">Location</TableHead>
+              <TableHead className="w-[18%] px-4">Type</TableHead>
+              <TableHead className="w-[12%] px-4">Updated</TableHead>
+              <TableHead className="w-[6%] px-4 text-right">
+                <span className="sr-only">Actions</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {folders.map((folder) => (
+              <TableRow key={folder.prefix} {...clickableRowProps(() => navigateToPrefix(folder.prefix))}>
+                <TableCell className="px-4">
+                  <button
+                    type="button"
+                    className="inline-flex max-w-full items-center gap-1.5 font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => navigateToPrefix(folder.prefix)}
+                  >
+                    <Folder className="size-4 shrink-0 text-status-info" />
+                    <span className="truncate">{folder.name}</span>
+                  </button>
+                </TableCell>
+                <TableCell className="px-4 text-right text-muted-foreground">—</TableCell>
+                <TableCell className="px-4 text-muted-foreground">—</TableCell>
+                <TableCell className="px-4 text-muted-foreground">Folder</TableCell>
+                <TableCell className="px-4 text-muted-foreground">—</TableCell>
+                <TableCell className="px-4" />
+              </TableRow>
+            ))}
+            {files.map((object) => (
+              <TableRow key={object.id}>
+                <TableCell className="px-4">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                    <CopyableValue
+                      label="Object key"
+                      value={object.key}
+                      displayValue={objectDisplayName(object.key, prefix)}
+                      maxLength={36}
+                    />
+                    <ObjectStatusIcon
+                      bucketName={bucketName}
+                      versionID={object.current_version_id}
+                      state={object.state}
+                      status={object.status}
+                      progress={object.progress}
+                      compact
+                    />
+                  </div>
+                </TableCell>
+                <TableCell className="px-4 text-right tabular-nums">{formatBytes(object.size)}</TableCell>
+                <TableCell className="px-4">
+                  <LocationBadges location={object.location} />
+                </TableCell>
+                <TableCell className="px-4 text-muted-foreground">
+                  <span className="block max-w-48 truncate" title={object.content_type}>
+                    {object.content_type || '—'}
+                  </span>
+                </TableCell>
+                <TableCell className="px-4 text-muted-foreground">
+                  <RelativeTime value={object.updated_at} />
+                </TableCell>
+                <TableCell className="px-4 text-right">
+                  <ObjectActions bucketName={bucketName} object={object} />
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </DataTableFrame>
+      <CursorPagination
+        summary={formatBrowserCount(folders.length, files.length)}
+        hasPrevious={hasPrevious}
+        hasNext={Boolean(nextMarker)}
+        onPrevious={onPrevious}
+        onNext={() => nextMarker && onNext(nextMarker)}
+      />
     </div>
   )
 }
@@ -3007,113 +2580,86 @@ function DeletedObjectsTable({
   bucketName,
   prefix,
   objects,
-  hasMore,
+  hasPrevious,
   nextMarker,
-  marker,
-  navigateToPrefix,
-  navigateToMarker,
+  onPrevious,
+  onNext,
 }: {
   bucketName: string
   prefix: string
   objects: DeletedObjectItem[]
-  hasMore: boolean
+  hasPrevious: boolean
   nextMarker?: string
-  marker: string
-  navigateToPrefix: (prefix: string) => void
-  navigateToMarker: (marker: string) => void
+  onPrevious: () => void
+  onNext: (marker: string) => void
 }) {
-  const empty = objects.length === 0
+  if (objects.length === 0 && !hasPrevious) {
+    return (
+      <EmptyState
+        icon={<Trash2 />}
+        title="Trash is empty"
+        description="Deleted objects stay here, ready to restore, until they are permanently deleted."
+      />
+    )
+  }
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <ObjectPathBreadcrumb prefix={prefix} navigateToPrefix={navigateToPrefix} />
-        <p className="text-sm text-muted-foreground">{formatCountLabel(objects.length, 'trash item')}</p>
-      </div>
-
-      {empty ? (
-        <div className="rounded-md border border-border">
-          <Empty className="h-64 border-0">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <Trash2 />
-              </EmptyMedia>
-              <EmptyTitle>Trash is empty</EmptyTitle>
-              <EmptyDescription>This path has no objects that can be restored.</EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        </div>
-      ) : (
-        <div className="rounded-md border border-border">
-          <ScrollArea className="w-full">
-            <Table className="min-w-[860px]">
-              <TableHeader>
-                <TableRow className="bg-muted/50">
-                  <TableHead className="w-[35%] px-4">Name</TableHead>
-                  <TableHead className="w-[22%] px-4">Restore target</TableHead>
-                  <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
-                  <TableHead className="w-[18%] px-4">Type</TableHead>
-                  <TableHead className="w-[10%] px-4">Moved to Trash</TableHead>
-                  <TableHead className="w-[5%] px-4 text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {objects.map((object) => (
-                  <TableRow key={object.delete_marker_version_id}>
-                    <TableCell className="px-4">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <FileIcon className="size-4 shrink-0 text-muted-foreground" />
-                        <CopyableValue
-                          label="Object key"
-                          value={object.key}
-                          displayValue={objectDisplayName(object.key, prefix)}
-                          maxLength={36}
-                        />
-                      </div>
-                    </TableCell>
-                    <TableCell className="overflow-hidden px-4">
-                      <CopyableValue
-                        label="Restore target"
-                        value={object.restore_version_id}
-                        monospace
-                        maxLength={24}
-                      />
-                    </TableCell>
-                    <TableCell className="px-4 text-right">{formatBytes(object.restore_size)}</TableCell>
-                    <TableCell className="px-4 text-muted-foreground">
-                      <span className="block max-w-48 truncate" title={object.restore_content_type}>
-                        {object.restore_content_type}
-                      </span>
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground" title={object.deleted_at}>
-                      {timeAgo(object.deleted_at)}
-                    </TableCell>
-                    <TableCell className="px-4 text-right">
-                      <DeletedObjectActions bucketName={bucketName} object={object} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            <ScrollBar orientation="horizontal" />
-          </ScrollArea>
-        </div>
-      )}
-
-      <div className="flex justify-between">
-        {marker ? (
-          <Button variant="outline" size="sm" onClick={() => navigateToMarker('')}>
-            First page
-          </Button>
-        ) : (
-          <span />
-        )}
-        {hasMore && nextMarker && (
-          <Button variant="outline" size="sm" onClick={() => navigateToMarker(nextMarker)}>
-            Next page
-          </Button>
-        )}
-      </div>
+      <DataTableFrame>
+        <Table className="min-w-[860px]">
+          <TableHeader>
+            <TableRow className={tableHeaderRowClassName}>
+              <TableHead className="w-[34%] px-4">Name</TableHead>
+              <TableHead className="w-[22%] px-4">Restore version</TableHead>
+              <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
+              <TableHead className="w-[16%] px-4">Type</TableHead>
+              <TableHead className="w-[12%] px-4">Deleted</TableHead>
+              <TableHead className="w-[6%] px-4 text-right">
+                <span className="sr-only">Actions</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {objects.map((object) => (
+              <TableRow key={object.delete_marker_version_id}>
+                <TableCell className="px-4">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                    <CopyableValue
+                      label="Object key"
+                      value={object.key}
+                      displayValue={objectDisplayName(object.key, prefix)}
+                      maxLength={36}
+                    />
+                  </div>
+                </TableCell>
+                <TableCell className="overflow-hidden px-4">
+                  <CopyableValue label="Restore version" value={object.restore_version_id} monospace maxLength={24} />
+                </TableCell>
+                <TableCell className="px-4 text-right tabular-nums">{formatBytes(object.restore_size)}</TableCell>
+                <TableCell className="px-4 text-muted-foreground">
+                  <span className="block max-w-48 truncate" title={object.restore_content_type}>
+                    {object.restore_content_type || '—'}
+                  </span>
+                </TableCell>
+                <TableCell className="px-4 text-muted-foreground">
+                  <RelativeTime value={object.deleted_at} />
+                </TableCell>
+                <TableCell className="px-4 text-right">
+                  <DeletedObjectActions bucketName={bucketName} object={object} />
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </DataTableFrame>
+      <CursorPagination
+        summary={formatCountLabel(objects.length, 'item')}
+        hasPrevious={hasPrevious}
+        hasNext={Boolean(nextMarker)}
+        onPrevious={onPrevious}
+        onNext={() => nextMarker && onNext(nextMarker)}
+      />
     </div>
   )
 }
@@ -3125,29 +2671,21 @@ function DeletedObjectActions({ bucketName, object }: { bucketName: string; obje
 
   return (
     <>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${object.key}`} title="Actions">
-            <MoreHorizontal />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-52">
-          <DropdownMenuGroup>
-            <DropdownMenuItem onSelect={() => setRestoreOpen(true)}>
-              <RotateCcw data-icon="inline-start" />
-              Restore
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => setVersionsOpen(true)}>
-              <History data-icon="inline-start" />
-              Versions
-            </DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
-              <Trash2 data-icon="inline-start" />
-              Permanently delete object
-            </DropdownMenuItem>
-          </DropdownMenuGroup>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <RowActionsMenu label={object.key}>
+        <RowActionItem onSelect={() => setRestoreOpen(true)}>
+          <RotateCcw data-icon="inline-start" />
+          Restore
+        </RowActionItem>
+        <RowActionItem onSelect={() => setVersionsOpen(true)}>
+          <History data-icon="inline-start" />
+          Versions
+        </RowActionItem>
+        <DropdownMenuSeparator />
+        <RowActionItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
+          <Trash2 data-icon="inline-start" />
+          Permanently delete
+        </RowActionItem>
+      </RowActionsMenu>
       <RestoreDeletedObjectDialog
         bucketName={bucketName}
         object={object}
@@ -3193,6 +2731,7 @@ function PermanentDeleteDeletedObjectDialog({
       { name: bucketName, key: object.key, deleteMarkerVersionID: object.delete_marker_version_id },
       {
         onSuccess: () => {
+          toast.success(`Permanently deleted ${object.key}`)
           handleOpenChange(false)
         },
       }
@@ -3243,6 +2782,7 @@ function RestoreDeletedObjectDialog({
       { name: bucketName, key: object.key, deleteMarkerVersionID: object.delete_marker_version_id },
       {
         onSuccess: () => {
+          toast.success(`Restored ${object.key}`)
           handleOpenChange(false)
         },
       }
@@ -3288,26 +2828,6 @@ function RestoreDeletedObjectDialog({
   )
 }
 
-function FolderActions({ folder, onOpen }: { folder: ObjectFolderItem; onOpen: () => void }) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${folder.name}`} title="Actions">
-          <MoreHorizontal />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-36">
-        <DropdownMenuGroup>
-          <DropdownMenuItem onSelect={onOpen}>
-            <Folder data-icon="inline-start" />
-            Open
-          </DropdownMenuItem>
-        </DropdownMenuGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
 function ObjectActions({ bucketName, object }: { bucketName: string; object: ObjectItem }) {
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [provenanceOpen, setProvenanceOpen] = useState(false)
@@ -3319,6 +2839,7 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
       { name: bucketName, key: object.key },
       {
         onSuccess: () => {
+          toast.success(`Moved ${object.key} to Trash`)
           setDeleteOpen(false)
           deleteObject.reset()
         },
@@ -3328,35 +2849,27 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
 
   return (
     <>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${object.key}`} title="Actions">
-            <MoreHorizontal />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-40">
-          <DropdownMenuGroup>
-            <DropdownMenuItem asChild>
-              <a href={api.getObjectDownloadUrl(bucketName, object.key)} aria-label={`Download ${object.key}`}>
-                <Download data-icon="inline-start" />
-                Download
-              </a>
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => setVersionsOpen(true)}>
-              <History data-icon="inline-start" />
-              Versions
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => setProvenanceOpen(true)}>
-              <Fingerprint data-icon="inline-start" />
-              Provenance
-            </DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
-              <Trash2 data-icon="inline-start" />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuGroup>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <RowActionsMenu label={object.key}>
+        <RowActionItem asChild>
+          <a href={api.getObjectDownloadUrl(bucketName, object.key)} aria-label={`Download ${object.key}`}>
+            <Download data-icon="inline-start" />
+            Download
+          </a>
+        </RowActionItem>
+        <RowActionItem onSelect={() => setVersionsOpen(true)}>
+          <History data-icon="inline-start" />
+          Versions
+        </RowActionItem>
+        <RowActionItem onSelect={() => setProvenanceOpen(true)}>
+          <Fingerprint data-icon="inline-start" />
+          Provenance
+        </RowActionItem>
+        <DropdownMenuSeparator />
+        <RowActionItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
+          <Trash2 data-icon="inline-start" />
+          Delete
+        </RowActionItem>
+      </RowActionsMenu>
       <ObjectVersionsDialog
         bucketName={bucketName}
         objectKey={object.key}
@@ -3382,85 +2895,15 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
         pending={deleteObject.isPending}
         error={deleteObject.error?.message}
         onConfirm={handleDelete}
-      />
+      >
+        <ReviewDetails
+          rows={[
+            { id: 'key', label: 'Object', value: object.key, copyable: true, maxLength: 36 },
+            { id: 'size', label: 'Size', value: formatBytes(object.size) },
+          ]}
+        />
+      </DangerActionAlertDialog>
     </>
-  )
-}
-
-function ObjectBrowserSkeleton() {
-  return (
-    <div className="rounded-md border border-border p-4">
-      <div className="flex flex-col gap-3">
-        {objectBrowserSkeletonRows.map((row) => (
-          <div key={row} className="grid grid-cols-[1fr_6rem_9rem_10rem_8rem_3rem] items-center gap-4">
-            <Skeleton className="h-6 w-full" />
-            <Skeleton className="h-6 w-full" />
-            <Skeleton className="h-6 w-full" />
-            <Skeleton className="h-6 w-full" />
-            <Skeleton className="h-6 w-full" />
-            <Skeleton className="h-6 w-full" />
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function ObjectPathBreadcrumb({
-  prefix,
-  navigateToPrefix,
-}: {
-  prefix: string
-  navigateToPrefix: (prefix: string) => void
-}) {
-  const pathCrumbs = bucketPrefixCrumbs(prefix)
-
-  return (
-    <Breadcrumb className="min-w-0">
-      <BreadcrumbList className="text-xs">
-        <BreadcrumbItem>
-          {pathCrumbs.length > 0 ? (
-            <BreadcrumbLink asChild>
-              <Button
-                type="button"
-                variant="link"
-                className="h-auto p-0 text-xs font-normal"
-                onClick={() => navigateToPrefix('')}
-              >
-                /
-              </Button>
-            </BreadcrumbLink>
-          ) : (
-            <BreadcrumbCurrentPage className="text-muted-foreground">/</BreadcrumbCurrentPage>
-          )}
-        </BreadcrumbItem>
-        {pathCrumbs.map((crumb, index) => {
-          const isLast = index === pathCrumbs.length - 1
-
-          return (
-            <Fragment key={crumb.prefix}>
-              <BreadcrumbSeparator />
-              <BreadcrumbItem>
-                {isLast ? (
-                  <BreadcrumbCurrentPage>{crumb.label}</BreadcrumbCurrentPage>
-                ) : (
-                  <BreadcrumbLink asChild>
-                    <Button
-                      type="button"
-                      variant="link"
-                      className="h-auto p-0 text-xs font-normal"
-                      onClick={() => navigateToPrefix(crumb.prefix)}
-                    >
-                      {crumb.label}
-                    </Button>
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </Fragment>
-          )
-        })}
-      </BreadcrumbList>
-    </Breadcrumb>
   )
 }
 

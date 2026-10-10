@@ -19,8 +19,8 @@ import {
 
 test('worker health rows use stable product labels and ordering', () => {
   assert.deepEqual(workerHealthRows({ tasks: true, unknown_worker: false }), [
-    { key: 'tasks', label: 'Task Engine', healthy: true },
-    { key: 'unknown_worker', label: 'Unknown Worker', healthy: false },
+    { key: 'tasks', label: 'Task engine', healthy: true },
+    { key: 'unknown_worker', label: 'Unknown worker', healthy: false },
   ])
 })
 
@@ -44,7 +44,7 @@ test('attention rows show only nonzero attention items', () => {
     { key: 'unavailable', label: 'Unavailable objects', value: 1, tone: 'danger', target: 'buckets' },
     {
       key: 'storage_confirmations',
-      label: 'Stopped storage confirmations',
+      label: 'Stopped batches',
       value: 4,
       tone: 'danger',
       target: 'tasks',
@@ -160,9 +160,9 @@ test('filecoin storage health summary row exposes compact observability counts w
     level: 'warning',
     tone: 'warning',
   })
-  assert.deepEqual(filecoinStorageHealthSummaryRow('data_sets', 'Data Sets', null), {
+  assert.deepEqual(filecoinStorageHealthSummaryRow('data_sets', 'Data sets', null), {
     key: 'data_sets',
-    label: 'Data Sets',
+    label: 'Data sets',
     total: null,
     available: null,
     degraded: null,
@@ -178,13 +178,13 @@ test('filecoin storage health summary row exposes compact observability counts w
 
 test('filecoin storage health summary row does not render missing observations as zero counts', () => {
   assert.deepEqual(
-    filecoinStorageHealthSummaryRow('data_sets', 'Data Sets', {
+    filecoinStorageHealthSummaryRow('data_sets', 'Data sets', {
       summary: { total: 0, available: 0, degraded: 0, unavailable: 0, unknown: 0 },
       summary_signal: { level: 'warning', freshness: { stale: false, warnings: ['no_state_recorded'] } },
     }),
     {
       key: 'data_sets',
-      label: 'Data Sets',
+      label: 'Data sets',
       total: null,
       available: null,
       degraded: null,

@@ -5,10 +5,10 @@ import { normalizeBucketRouteSearch } from '../src/lib/bucket-route-search.ts'
 
 test('storage risk prefix keeps raw S3 prefix semantics', () => {
   const search = normalizeBucketRouteSearch({
-    view: 'storage-risk',
+    tab: 'storage',
+    risk: true,
     prefix: 'objects',
     marker: 'objects/page',
-    version_marker: 'object-version-marker',
     risk_prefix: ' invoice ',
     risk_key: ' exact key ',
     risk_key_marker: ' risk key marker ',
@@ -19,7 +19,7 @@ test('storage risk prefix keeps raw S3 prefix semantics', () => {
 
   assert.equal(search.prefix, 'objects/')
   assert.equal(search.marker, 'objects/page')
-  assert.equal(search.version_marker, 'object-version-marker')
+  assert.equal(search.risk, true)
   assert.equal(search.risk_prefix, ' invoice ')
   assert.equal(normalizeBucketRouteSearch({ risk_prefix: 'foo' }).risk_prefix, 'foo')
   assert.equal(search.risk_key, ' exact key ')
@@ -36,4 +36,22 @@ test('storage risk dataset only accepts positive integer strings', () => {
   assert.equal(normalizeBucketRouteSearch({ risk_dataset: '42.5' }).risk_dataset, undefined)
   assert.equal(normalizeBucketRouteSearch({ risk_dataset: 'abc' }).risk_dataset, undefined)
   assert.equal(normalizeBucketRouteSearch({ risk_dataset: ' ' }).risk_dataset, undefined)
+})
+
+test('bucket tabs accept links written before the page had tabs', () => {
+  assert.deepEqual(
+    [
+      normalizeBucketRouteSearch({ view: 'deleted' }),
+      normalizeBucketRouteSearch({ view: 'storage-risk' }),
+      normalizeBucketRouteSearch({ details: 'storage' }),
+    ].map(({ tab, risk }) => ({ tab, risk })),
+    [
+      { tab: 'trash', risk: undefined },
+      { tab: 'storage', risk: true },
+      { tab: 'storage', risk: undefined },
+    ]
+  )
+  assert.equal(normalizeBucketRouteSearch({ tab: 'objects' }).tab, undefined)
+  assert.equal(normalizeBucketRouteSearch({ tab: 'unknown' }).tab, undefined)
+  assert.equal(normalizeBucketRouteSearch({ tab: 'settings', risk: true }).risk, undefined)
 })

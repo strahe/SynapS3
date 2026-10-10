@@ -117,7 +117,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 	}
 	dataSet, err := h.deps.Repositories.Contents.AuthorizeDataSetRetirementTask(ctx, input.DataSetID, input.Generation, execution.ID())
 	if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
-		return taskengine.Cancel("Storage service retirement was superseded", nil)
+		return taskengine.Cancel("Data set retirement was superseded", nil)
 	}
 	if err != nil {
 		return h.retryRetirement(execution, input.ReplacementID, err, "retirement_authorization_failed")
@@ -134,12 +134,12 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		return taskengine.Fail(errors.New("retirement data set does not belong to replacement"), "retirement_identity_mismatch", nil)
 	}
 	if dataSet.Status == model.StorageDataSetStatusRetired {
-		return taskengine.Complete("Storage service retired", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Complete("Data set retired", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.Contents.CompleteDataSetRetirementTask(ctx, input.DataSetID, input.Generation, execution.ID())
 		})
 	}
 	if dataSet.DataSetID == nil || dataSet.DataSetID.IsZero() {
-		return taskengine.Fail(errors.New("storage service has no remote identity"), "retirement_identity_missing", nil)
+		return taskengine.Fail(errors.New("data set has no remote identity"), "retirement_identity_missing", nil)
 	}
 
 	var terminationEpoch *int64
@@ -150,7 +150,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			return h.retryRetirement(execution, row.ID, err, "retirement_gate_failed")
 		}
 		if sole > 0 {
-			return taskengine.Fail(fmt.Errorf("unused storage service holds %d sole copies", sole), "retirement_coverage", nil)
+			return taskengine.Fail(fmt.Errorf("unused data set holds %d sole replicas", sole), "retirement_coverage", nil)
 		}
 	} else {
 		terminationEpoch = row.TerminationEpoch
@@ -165,7 +165,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 					return repos.Replacements.MarkCleanupAttention(ctx, row.ID, err.Error())
 				})
 			}
-			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "retirement_gate", "Waiting for safe storage service retirement", nil)
+			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "retirement_gate", "Waiting for safe data set retirement", nil)
 		}
 	}
 
@@ -180,13 +180,13 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		// epoch read there would say nothing about ours, so this reads nothing
 		// and sends nothing until the original configuration is back.
 		return stopRetirement(abandoned, row.ID,
-			errors.New("the wallet or network changed after storage service retirement began"), "termination_identity_changed")
+			errors.New("the wallet or network changed after data set retirement began"), "termination_identity_changed")
 	}
 	if terminationEpoch == nil && checkpoint.TerminationEpoch != nil {
 		if *checkpoint.TerminationEpoch < 0 {
-			return taskengine.Fail(errors.New("storage service retirement checkpoint has an invalid epoch"), "invalid_checkpoint", nil)
+			return taskengine.Fail(errors.New("data set retirement checkpoint has an invalid epoch"), "invalid_checkpoint", nil)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, 0, "termination_epoch", "Recording storage service retirement", retirementEvidenceSettlement(
+		return taskengine.Wait(model.TaskResumeModeRecover, 0, "termination_epoch", "Recording data set retirement", retirementEvidenceSettlement(
 			abandoned, row.ID, *checkpoint.TerminationEpoch, checkpoint.TransactionHash,
 		))
 	}
@@ -208,10 +208,10 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 					"error", synapse.ErrorSummary(err))
 			}
 			if observed != nil {
-				return taskengine.Wait(model.TaskResumeModeRecover, 0, "termination_epoch", "Recording storage service retirement", retirementEvidenceSettlement(abandoned, row.ID, observed.EndEpoch, observed.TxHash))
+				return taskengine.Wait(model.TaskResumeModeRecover, 0, "termination_epoch", "Recording data set retirement", retirementEvidenceSettlement(abandoned, row.ID, observed.EndEpoch, observed.TxHash))
 			}
 			if pending {
-				return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage service retirement", nil)
+				return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for data set retirement", nil)
 			}
 		}
 		if hasCheckpoint && !mayTerminate {
@@ -219,13 +219,13 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			// sending another one, so resuming there cannot end the service twice;
 			// the delay gives the earlier request time to land.
 			wait := max(time.Until(checkpoint.AttemptedAt.Add(unobservedOutcomeDelay(checkpoint.Sends))), 0)
-			return taskengine.Wait(model.TaskResumeModeExecute, wait, "provider_confirmation", "Checking storage service retirement", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, wait, "provider_confirmation", "Checking data set retirement", nil)
 		}
 		if !mayTerminate {
-			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage service is ready to retire", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Data set is ready to retire", nil)
 		}
 		if h.deps.Terminator == nil {
-			return taskengine.Fail(errors.New("storage service terminator is unavailable"), "dependency_unavailable", nil)
+			return taskengine.Fail(errors.New("data set terminator is unavailable"), "dependency_unavailable", nil)
 		}
 		identity := h.deps.Terminator.ContextIdentity()
 		if !contextIdentityComplete(identity) {
@@ -278,15 +278,15 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		}
 		if terminationEpochValue < 0 {
 			return stopRetirement(abandoned, row.ID,
-				errors.New("storage service termination returned an invalid epoch"), "termination_outcome_unknown")
+				errors.New("data set termination returned an invalid epoch"), "termination_outcome_unknown")
 		}
 		checkpoint.TerminationEpoch = &terminationEpochValue
 		checkpoint.TransactionHash = txHash
 		settlement := retirementEvidenceSettlement(abandoned, row.ID, terminationEpochValue, txHash)
 		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "termination_epoch", "Recording storage service retirement", settlement)
+			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "termination_epoch", "Recording data set retirement", settlement)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "termination_epoch", "Waiting for storage service retirement", settlement)
+		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "termination_epoch", "Waiting for data set retirement", settlement)
 	}
 	if h.deps.Epochs == nil {
 		return taskengine.Fail(errors.New("chain epoch reader is unavailable"), "dependency_unavailable", nil)
@@ -296,9 +296,9 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		return retryTask(err, "termination_epoch_observation_failed")
 	}
 	if observedEpoch < *terminationEpoch {
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "termination_epoch", "Waiting for storage service retirement", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "termination_epoch", "Waiting for data set retirement", nil)
 	}
-	return taskengine.Complete("Storage service retired", func(ctx context.Context, repos *repository.Repositories) error {
+	return taskengine.Complete("Data set retired", func(ctx context.Context, repos *repository.Repositories) error {
 		if abandoned {
 			if err := repos.Replacements.CompleteAbandonedTargetTermination(ctx, row.ID); err != nil {
 				return err

@@ -1,15 +1,14 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { Database, RefreshCw, TriangleAlert } from 'lucide-react'
+import { TriangleAlert } from 'lucide-react'
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
-import { PageHeader } from '@/components/app/PageHeader'
+import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
+import { PageError } from '@/components/app/PageState'
 import { TopologyDetailSheet } from '@/components/storage-topology/StorageTopologyDetailSheet'
 import { DataSetsTableCard, ProvidersTableCard } from '@/components/storage-topology/StorageTopologyTables'
 import { type StorageTopologyTab, StorageTopologyToolbar } from '@/components/storage-topology/StorageTopologyToolbar'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useObservabilityDataSets, useObservabilityProviders, useTestProviderUploadSpeed } from '@/hooks/queries'
 import { providerDisplayName } from '@/lib/provider-display'
@@ -475,14 +474,9 @@ function StorageTopologyPage() {
     <div className={pageClassName}>
       <PageHeader
         className="shrink-0"
-        title="Storage Topology"
-        meta={<span className="text-sm text-muted-foreground">{topologySummaryLabel(graph)}</span>}
-        actions={
-          <Button variant="outline" size="sm" onClick={refreshObservability} disabled={refreshing}>
-            <RefreshCw data-icon="inline-start" className={refreshing ? 'animate-spin' : undefined} />
-            Refresh
-          </Button>
-        }
+        title="Storage topology"
+        description={topologySummaryLabel(graph)}
+        actions={<RefreshButton onClick={refreshObservability} refreshing={refreshing} />}
       />
 
       <div className="shrink-0">
@@ -682,23 +676,7 @@ function TopologyLoading() {
 }
 
 function TopologyError({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <div className="flex min-h-0 flex-1 items-center justify-center rounded-md border bg-card p-6">
-      <Empty className="border-0">
-        <EmptyHeader>
-          <EmptyMedia variant="icon">
-            <Database />
-          </EmptyMedia>
-          <EmptyTitle>Failed to load topology</EmptyTitle>
-          <EmptyDescription>{message}</EmptyDescription>
-        </EmptyHeader>
-        <Button variant="outline" size="sm" onClick={onRetry}>
-          <RefreshCw data-icon="inline-start" />
-          Retry
-        </Button>
-      </Empty>
-    </div>
-  )
+  return <PageError title="Failed to load storage topology" description={message} onRetry={onRetry} />
 }
 
 function sameStorageTopologySelectionState(left: TopologySelectionState | null, right: TopologySelectionState | null) {

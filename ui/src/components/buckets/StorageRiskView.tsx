@@ -1,3 +1,4 @@
+import { useLocation } from '@tanstack/react-router'
 import { ArrowLeft, FileIcon, Fingerprint, TriangleAlert } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 
@@ -8,10 +9,13 @@ import type {
   StorageHealthStatus,
 } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { CursorPagination } from '@/components/app/CursorPagination'
+import { DataTableFrame, tableHeaderRowClassName } from '@/components/app/DataTable'
+import { EmptyState } from '@/components/app/PageState'
 import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
+import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
-import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
@@ -20,19 +24,25 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { dataSetStorageHealthDetailParts } from '@/lib/data-set-storage-health'
 import { replicaLabel } from '@/lib/storage-status-labels'
-import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { localStatusLabel, observabilityStatusLabel } from '@/lib/storage-topology'
+import { formatBytes, formatNumber } from '@/lib/utils'
 
 const allRiskDataSetsValue = '__all__'
+
+export type RiskMarkers = [keyMarker: string, versionMarker: string, createdAtMarker: string, staleBefore: string]
 
 export function StorageRiskHeader({ onBack }: { onBack: () => void }) {
   return (
     <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0">
-        <h2 className="truncate text-sm font-medium">Storage Risk</h2>
+        <h2 className="truncate text-sm font-semibold">Affected versions</h2>
+        <p className="text-sm text-muted-foreground">
+          Retained versions with a replica on a data set that needs attention.
+        </p>
       </div>
       <Button type="button" variant="outline" size="sm" onClick={onBack} className="w-fit">
         <ArrowLeft data-icon="inline-start" />
-        Objects
+        Data sets
       </Button>
     </div>
   )
@@ -71,13 +81,22 @@ export function StorageRiskView({
   versionMarker: string
   createdAtMarker: string
   staleBeforeMarker: string
-  navigateToMarker: (keyMarker: string, versionMarker: string, createdAtMarker: string, staleBefore: string) => void
+  navigateToMarker: (
+    keyMarker: string,
+    versionMarker: string,
+    createdAtMarker: string,
+    staleBefore: string,
+    history: RiskMarkers[]
+  ) => void
   navigateToFilters: (next: { prefix?: string; key?: string; dataSetID?: number }) => void
   onOpenProvenance: (version: BucketStorageRiskVersion) => void
 }) {
   const [prefixInput, setPrefixInput] = useState(prefix)
   const [keyInput, setKeyInput] = useState(exactKey)
   const [dataSetInput, setDataSetInput] = useState(dataSetID ? dataSetID.toString() : allRiskDataSetsValue)
+  const markerHistory = useLocation({ select: (location) => location.state.bucketRiskMarkers }) ?? []
+  const currentMarkers: RiskMarkers = [keyMarker, versionMarker, createdAtMarker, staleBeforeMarker]
+  const onFirstPage = currentMarkers.every((marker) => !marker)
   const empty = versions.length === 0
   const filtered = Boolean(prefix || exactKey || dataSetID)
 
@@ -166,29 +185,25 @@ export function StorageRiskView({
       </form>
 
       {empty ? (
-        <div className="rounded-md border border-border">
-          <Empty className="h-64 border-0">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <TriangleAlert />
-              </EmptyMedia>
-              <EmptyTitle>{filtered ? 'No affected versions match filters' : 'No affected versions found'}</EmptyTitle>
-            </EmptyHeader>
-          </Empty>
-        </div>
+        <EmptyState
+          icon={<TriangleAlert />}
+          title={filtered ? 'No affected versions match these filters' : 'No affected versions'}
+        />
       ) : (
-        <div className="rounded-md border border-border">
+        <DataTableFrame>
           <ScrollArea className="w-full">
             <Table className="min-w-[960px]">
               <TableHeader>
-                <TableRow className="bg-muted/50">
+                <TableRow className={tableHeaderRowClassName}>
                   <TableHead className="w-[26%] px-4">Object</TableHead>
                   <TableHead className="w-[16%] px-4">Version</TableHead>
                   <TableHead className="w-[8%] px-4 text-right">Size</TableHead>
                   <TableHead className="w-[29%] px-4">Risk data sets</TableHead>
                   <TableHead className="w-[12%] px-4">Readability</TableHead>
                   <TableHead className="w-[9%] px-4">Updated</TableHead>
-                  <TableHead className="px-4 text-right">Actions</TableHead>
+                  <TableHead className="px-4 text-right">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -224,8 +239,8 @@ export function StorageRiskView({
                         Recorded readable alternatives: {formatNumber(version.readable_alternative_count)}
                       </span>
                     </TableCell>
-                    <TableCell className="px-4 text-muted-foreground" title={version.updated_at}>
-                      {timeAgo(version.updated_at)}
+                    <TableCell className="px-4 text-muted-foreground">
+                      <RelativeTime value={version.updated_at} />
                     </TableCell>
                     <TableCell className="px-4 text-right">
                       <Tooltip>
@@ -248,27 +263,25 @@ export function StorageRiskView({
             </Table>
             <ScrollBar orientation="horizontal" />
           </ScrollArea>
-        </div>
+        </DataTableFrame>
       )}
 
-      <div className="flex justify-between">
-        {keyMarker || versionMarker || createdAtMarker || staleBeforeMarker ? (
-          <Button variant="outline" size="sm" onClick={() => navigateToMarker('', '', '', '')}>
-            First page
-          </Button>
-        ) : (
-          <span />
-        )}
-        {hasMore && nextKeyMarker && nextVersionMarker && nextCreatedAtMarker && staleBefore && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => navigateToMarker(nextKeyMarker, nextVersionMarker, nextCreatedAtMarker, staleBefore)}
-          >
-            Next page
-          </Button>
-        )}
-      </div>
+      <CursorPagination
+        hasPrevious={!onFirstPage}
+        hasNext={Boolean(hasMore && nextKeyMarker && nextVersionMarker && nextCreatedAtMarker && staleBefore)}
+        onPrevious={() => {
+          // Without a remembered page (a shared link), Previous returns to the first page.
+          const previous = markerHistory[markerHistory.length - 1] ?? ['', '', '', '']
+          navigateToMarker(...previous, markerHistory.slice(0, -1))
+        }}
+        onNext={() => {
+          if (!nextKeyMarker || !nextVersionMarker || !nextCreatedAtMarker || !staleBefore) return
+          navigateToMarker(nextKeyMarker, nextVersionMarker, nextCreatedAtMarker, staleBefore, [
+            ...markerHistory,
+            currentMarkers,
+          ])
+        }}
+      />
     </div>
   )
 }
@@ -291,22 +304,22 @@ function RiskDataSetsCell({ dataSets }: { dataSets: BucketStorageRiskDataSet[] }
               <StatusBadge tone="neutral">{replicaLabel(dataSet.copy_index)}</StatusBadge>
               <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
               <StatusBadge tone={storageHealthStatusTone(dataSet.storage_health.status)}>
-                {dataSet.storage_health.status}
+                {observabilityStatusLabel(dataSet.storage_health.status)}
               </StatusBadge>
               {dataSet.storage_health.stale && (
                 <StatusBadge tone="warning" className="shrink-0">
-                  stale
+                  Stale
                 </StatusBadge>
               )}
             </div>
             <div className="min-w-0 truncate text-xs text-muted-foreground" title={details}>
               <span className="font-mono">#{dataSet.local_data_set_id}</span>
               {' · '}
-              <span>local: {dataSet.local_status}</span>
+              <span>Local status: {localStatusLabel(dataSet.local_status)}</span>
               {dataSet.data_set_id && (
                 <>
                   {' · '}
-                  <CopyableValue label="Data Set ID" value={dataSet.data_set_id} monospace maxLength={18} />
+                  <CopyableValue label="Data set ID" value={dataSet.data_set_id} monospace maxLength={18} />
                 </>
               )}
             </div>

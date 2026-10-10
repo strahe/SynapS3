@@ -61,7 +61,7 @@ func NewHandler(deps Dependencies) (*Handler, error) {
 		deps.CommitMaxPieces = config.DefaultCommitMaxPieces
 	}
 	if deps.CommitMaxPieces < 1 || deps.CommitMaxWait < 0 {
-		return nil, errors.New("storage registration limits are invalid")
+		return nil, errors.New("batch limits are invalid")
 	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()

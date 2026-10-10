@@ -50,7 +50,7 @@ async function openTasks(page: Page, adminURL: string, rows = [task(201), task(2
   await page.goto(adminURL)
   await page.getByLabel('Username').fill('admin')
   await page.getByLabel('Password').fill('system-test-admin-password')
-  await page.getByRole('button', { name: 'Sign In' }).click()
+  await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
   await page.getByRole('link', { name: 'Tasks', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Content #128', exact: true }).first()).toBeVisible()
@@ -60,7 +60,7 @@ async function pauseClock(page: Page) {
   await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000))
 }
 
-test('Work and History reset filters and pagination while preserving Retry and round navigation', async ({
+test('Open and Closed reset filters and pagination while preserving Retry and round navigation', async ({
   page,
   systemServer,
 }) => {
@@ -76,6 +76,9 @@ test('Work and History reset filters and pagination while preserving Retry and r
   acknowledged.retry_task_id = 199
   let retried = false
   const requests: URL[] = []
+  await page.route('**/api/v1/tasks/acknowledge/preview*', (route) =>
+    route.fulfill({ json: { count: 1, as_of: '2026-10-03T00:03:00Z' } })
+  )
   await openTasks(page, systemServer.adminURL, [work])
   await page.route('**/api/v1/tasks?*', (route) => {
     const url = new URL(route.request().url())
@@ -95,7 +98,12 @@ test('Work and History reset filters and pagination while preserving Retry and r
   await page.getByRole('combobox', { name: 'Status', exact: true }).click()
   await page.getByRole('option', { name: 'Failed', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Acknowledge all', exact: true })).toBeVisible()
-  await page.getByRole('tab', { name: 'History', exact: true }).click()
+  await page.getByRole('button', { name: 'Acknowledge all', exact: true }).click()
+  const acknowledge = page.getByRole('alertdialog', { name: 'Acknowledge failed tasks' })
+  await expect(acknowledge).toContainText('1 failed task will move to Closed.')
+  await expect(acknowledge).toContainText('Their results and Retry availability remain unchanged.')
+  await acknowledge.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.getByRole('tab', { name: 'Closed', exact: true }).click()
   await expect.poll(() => requests.at(-1)?.searchParams.get('scope')).toBe('history')
   expect(requests.at(-1)?.searchParams.has('status')).toBe(false)
   expect(requests.at(-1)?.searchParams.has('cursor')).toBe(false)
@@ -125,7 +133,7 @@ test('Work and History reset filters and pagination while preserving Retry and r
     )
     await page.route(`**/api/v1/tasks/${id}/events*`, (route) => route.fulfill({ json: { events: [] } }))
   }
-  await page.getByRole('button', { name: 'View', exact: true }).click()
+  await page.getByRole('button', { name: 'Details for task 199', exact: true }).click()
   const details = page.getByRole('dialog')
   await details.getByRole('tab', { name: 'History', exact: true }).click()
   await details.getByRole('button', { name: 'Task 200', exact: true }).click()
@@ -434,7 +442,7 @@ test('touch opens the same subject information and acknowledgement preserves fai
     })
     await page.getByRole('button', { name: 'Acknowledge', exact: true }).tap()
     await expect(page.getByText('1h 4m', { exact: true })).toHaveCount(0)
-    await page.getByRole('tab', { name: 'History', exact: true }).click()
+    await page.getByRole('tab', { name: 'Closed', exact: true }).click()
     await expect(page.getByText('Acknowledged', { exact: true })).toBeVisible()
     await expect(page.getByText('Failed', { exact: true })).toBeVisible()
     await expect(page.getByText('1h 4m', { exact: true })).toBeVisible()

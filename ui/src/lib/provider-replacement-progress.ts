@@ -18,7 +18,7 @@ export function providerReplacementProgressView(
   const processed = progress.items_processed ?? 0
   const percent = progress.percent ?? 0
   const summary = preparing
-    ? 'Preparing the new storage service'
+    ? 'Preparing the new data set'
     : discovering
       ? `Discovering stored content · ${total} found · ${processed} processed`
       : `${processed} of ${total} processed${progress.percent === undefined ? '' : ` · ${percent}%`}`

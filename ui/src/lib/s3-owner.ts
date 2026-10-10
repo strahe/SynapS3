@@ -12,3 +12,26 @@ export function ownerLabel(ownerAccessKey: string | null, users: readonly NamedS
   const user = users.find((candidate) => candidate.access_key === ownerAccessKey)
   return user ? s3UserLabel(user) : ownerAccessKey
 }
+
+const s3UserRoleLabels: Record<string, string> = {
+  admin: 'Admin',
+  user: 'User',
+  userplus: 'User+',
+}
+
+export function s3UserRoleLabel(role: string) {
+  return s3UserRoleLabels[role] ?? (role || 'Unknown')
+}
+
+export function s3UserRoleDescription(role: string) {
+  switch (role) {
+    case 'admin':
+      return 'Can administer S3 API operations and access all buckets.'
+    case 'user':
+      return 'Can access buckets it owns, but cannot create new buckets.'
+    case 'userplus':
+      return 'Can create buckets and access buckets it owns.'
+    default:
+      return 'Unknown S3 role.'
+  }
+}

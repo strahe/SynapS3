@@ -1,37 +1,57 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { createFileRoute } from '@tanstack/react-router'
-import { ChevronLeft, ChevronRight, Eye, Layers, Loader2, RefreshCw } from 'lucide-react'
-import { type ReactNode, useRef, useState } from 'react'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { Layers, Loader2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
 
 import { api, type CommitBatch, type CommitBatchDetails, type CommitBatchStatus } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
-import { PageErrorState } from '@/components/app/PageErrorState'
-import { PageHeader } from '@/components/app/PageHeader'
+import { CursorPagination } from '@/components/app/CursorPagination'
+import {
+  clickableRowProps,
+  DataTableFrame,
+  RowDetailsButton,
+  TableSkeleton,
+  tableHeaderRowClassName,
+} from '@/components/app/DataTable'
+import { DetailBody, DetailField, DetailGrid, DetailHeader, DetailSection } from '@/components/app/DetailPanel'
+import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
+import { EmptyState, PageError } from '@/components/app/PageState'
+import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Label } from '@/components/ui/label'
-import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useCommitBatch, useCommitBatches } from '@/hooks/queries'
-import { cn, formatBytes, timeAgo } from '@/lib/utils'
+import { formatBytes } from '@/lib/utils'
 
-export const Route = createFileRoute('/commit-batches')({ component: CommitBatchesPage })
+type StatusFilter = CommitBatchStatus | 'all'
 
-const statuses: { value: CommitBatchStatus | 'all'; label: string; tone: StatusTone }[] = [
+const statuses: { value: StatusFilter; label: string; tone: StatusTone }[] = [
+  { value: 'all', label: 'All statuses', tone: 'neutral' },
   { value: 'collecting', label: 'Collecting data', tone: 'neutral' },
   { value: 'ready', label: 'Ready to submit', tone: 'info' },
   { value: 'submitted', label: 'Awaiting confirmation', tone: 'info' },
   { value: 'confirmed', label: 'Completed', tone: 'success' },
   { value: 'abandoned', label: 'Stopped', tone: 'warning' },
-  { value: 'all', label: 'All statuses', tone: 'neutral' },
 ]
+const statusValues = new Set<string>(statuses.map((entry) => entry.value))
+
+export const Route = createFileRoute('/commit-batches')({
+  validateSearch: (search: Record<string, unknown>): { status?: StatusFilter } => ({
+    status:
+      typeof search.status === 'string' && statusValues.has(search.status) && search.status !== 'collecting'
+        ? (search.status as StatusFilter)
+        : undefined,
+  }),
+  component: CommitBatchesPage,
+})
 
 function BatchStatus({ batch }: { batch: CommitBatch }) {
   if (batch.task_status === 'failed') return <StatusBadge tone="danger">Needs attention</StatusBadge>
@@ -41,14 +61,20 @@ function BatchStatus({ batch }: { batch: CommitBatch }) {
 }
 
 function CommitBatchesPage() {
+  const search = Route.useSearch()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const detailTitle = useRef<HTMLHeadingElement>(null)
-  const [status, setStatus] = useState<CommitBatchStatus | 'all'>('collecting')
-  const [cursor, setCursor] = useState<string>()
-  const [history, setHistory] = useState<Array<string | undefined>>([])
+  const status: StatusFilter = search.status ?? 'collecting'
+  const [pagination, setPagination] = useState<{ status: StatusFilter; cursors: string[] }>({ status, cursors: [] })
+  const cursors = pagination.status === status ? pagination.cursors : []
+  const cursor = cursors[cursors.length - 1]
   const [selected, setSelected] = useState<string | null>(null)
   const batches = useCommitBatches(status === 'all' ? undefined : status, cursor)
   const detail = useCommitBatch(selected)
+  useEffect(() => {
+    setPagination((current) => (current.status === status ? current : { status, cursors: [] }))
+  }, [status])
   const refresh = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ['commitBatches'] }),
@@ -58,17 +84,18 @@ function CommitBatchesPage() {
   }
   const seal = useMutation({
     mutationFn: api.sealCommitBatch,
-    onSuccess: refresh,
-    onError: () => {
+    onSuccess: (result) => {
+      toast.success('Submission requested', { description: `Batch ${result.request_id}` })
+      void refresh()
+    },
+    onError: (error) => {
+      toast.error("Couldn't submit the batch", { description: error.message })
       void refresh()
     },
   })
-  const requestSeal = (batch: CommitBatch) => {
-    seal.mutate(batch.request_id)
-  }
   const sealButton = (batch: CommitBatch) =>
     batch.can_seal && (
-      <Button variant="outline" size="sm" disabled={seal.isPending} onClick={() => requestSeal(batch)}>
+      <Button variant="outline" size="sm" disabled={seal.isPending} onClick={() => seal.mutate(batch.request_id)}>
         {seal.isPending && seal.variables === batch.request_id && (
           <Loader2 className="animate-spin" data-icon="inline-start" />
         )}
@@ -76,30 +103,23 @@ function CommitBatchesPage() {
       </Button>
     )
 
+  const changeStatus = (next: StatusFilter) => {
+    navigate({ to: '/commit-batches', search: { status: next === 'collecting' ? undefined : next }, replace: true })
+  }
+
   return (
     <div className="flex flex-col gap-6 p-6">
       <PageHeader
         title="Batches"
-        actions={
-          <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={batches.isFetching}>
-            <RefreshCw data-icon="inline-start" className={cn(batches.isFetching && 'animate-spin')} />
-            Refresh
-          </Button>
-        }
+        description="Uploaded pieces collect into batches that are submitted to each provider in one transaction."
+        actions={<RefreshButton onClick={() => void refresh()} refreshing={batches.isFetching} />}
       />
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <div className="flex items-center gap-2">
           <Label htmlFor="batch-status" className="text-sm text-muted-foreground">
             Status
           </Label>
-          <Select
-            value={status}
-            onValueChange={(next) => {
-              setStatus(next as typeof status)
-              setCursor(undefined)
-              setHistory([])
-            }}
-          >
+          <Select value={status} onValueChange={(next) => changeStatus(next as StatusFilter)}>
             <SelectTrigger id="batch-status" className="w-56">
               <SelectValue />
             </SelectTrigger>
@@ -117,298 +137,259 @@ function CommitBatchesPage() {
       </div>
       {batches.data?.batches.some((batch) => batch.can_seal) && (
         <Alert>
-          <AlertDescription>Submit the next batch; remaining data stays waiting.</AlertDescription>
-        </Alert>
-      )}
-      {selected === null && seal.isSuccess && (
-        <Alert>
-          <AlertTitle>Submission requested</AlertTitle>
           <AlertDescription>
-            <CopyableValue label="Batch ID" value={seal.data.request_id} monospace />
+            Batches submit on their own when full or after the configured wait. Submit next batch sends one now; the
+            remaining pieces keep collecting.
           </AlertDescription>
         </Alert>
       )}
-      {selected === null && seal.isError && (
-        <Alert variant="destructive">
-          <AlertTitle>Couldn't submit the batch</AlertTitle>
-          <AlertDescription>{seal.error.message}</AlertDescription>
-        </Alert>
-      )}
       {batches.isError ? (
-        <PageErrorState title="Couldn't load batches" description="Refresh to try again." />
+        <PageError
+          title="Failed to load batches"
+          description={batches.error.message}
+          onRetry={() => batches.refetch()}
+          retrying={batches.isFetching}
+        />
       ) : batches.isPending ? (
-        <BatchTableSkeleton />
+        <TableSkeleton />
       ) : batches.data.batches.length === 0 ? (
-        <Empty>
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <Layers />
-            </EmptyMedia>
-            <EmptyTitle>No batches in this view</EmptyTitle>
-            <EmptyDescription>Choose another status to see other batches.</EmptyDescription>
-          </EmptyHeader>
-        </Empty>
+        <EmptyState
+          icon={<Layers />}
+          title="No batches in this view"
+          description="Choose another status to see other batches."
+        />
       ) : (
-        <div className="overflow-hidden rounded-lg border border-border">
-          <Table>
+        <DataTableFrame>
+          <Table className="min-w-[960px]">
             <TableHeader>
-              <TableRow className="bg-muted/50">
+              <TableRow className={tableHeaderRowClassName}>
                 <TableHead className="px-4">Batch</TableHead>
                 <TableHead className="px-4">Bucket</TableHead>
-                <TableHead className="px-4">Storage service</TableHead>
-                <TableHead className="px-4 text-right">Members</TableHead>
+                <TableHead className="px-4">Provider</TableHead>
+                <TableHead className="px-4 text-right">Pieces</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
                 <TableHead className="px-4">Waiting since</TableHead>
                 <TableHead className="px-4">Submitted</TableHead>
                 <TableHead className="px-4">Status</TableHead>
-                <TableHead className="px-4 text-right">Actions</TableHead>
+                <TableHead className="px-4 text-right">
+                  <span className="sr-only">Actions</span>
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {batches.data.batches.map((batch) => (
-                <TableRow key={batch.request_id}>
+                <TableRow key={batch.request_id} {...clickableRowProps(() => setSelected(batch.request_id))}>
                   <TableCell className="px-4">
                     <CopyableValue value={batch.request_id} label="Batch ID" monospace maxLength={16} />
                   </TableCell>
-                  <TableCell className="px-4 font-medium">{batch.bucket_name}</TableCell>
+                  <TableCell className="px-4">
+                    <Link
+                      to="/buckets/$name"
+                      params={{ name: batch.bucket_name }}
+                      className="font-medium hover:underline"
+                    >
+                      {batch.bucket_name}
+                    </Link>
+                  </TableCell>
                   <TableCell className="px-4">{batch.provider_name ?? batch.provider_id}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{batch.member_count}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">
                     {batch.total_bytes === null ? '—' : formatBytes(batch.total_bytes)}
                   </TableCell>
                   <TableCell className="px-4 text-muted-foreground">
-                    {batch.status === 'collecting' && batch.oldest_ready_at ? timeAgo(batch.oldest_ready_at) : '—'}
+                    {batch.status === 'collecting' ? <RelativeTime value={batch.oldest_ready_at} /> : '—'}
                   </TableCell>
                   <TableCell className="px-4 text-muted-foreground">
-                    {batch.submitted_at ? (
-                      <time dateTime={batch.submitted_at} title={new Date(batch.submitted_at).toLocaleString()}>
-                        {timeAgo(batch.submitted_at)}
-                      </time>
-                    ) : (
-                      '—'
-                    )}
+                    <RelativeTime value={batch.submitted_at} />
                   </TableCell>
                   <TableCell className="px-4">
                     <BatchStatus batch={batch} />
                   </TableCell>
                   <TableCell className="px-4">
-                    <div className="flex justify-end gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        aria-label={`Details for batch ${batch.request_id}`}
-                        onClick={() => {
-                          setSelected(batch.request_id)
-                        }}
-                      >
-                        <Eye data-icon="inline-start" />
-                        Details
-                      </Button>
+                    <div className="flex items-center justify-end gap-2">
                       {sealButton(batch)}
+                      <RowDetailsButton
+                        label={`batch ${batch.request_id}`}
+                        onClick={() => setSelected(batch.request_id)}
+                      />
                     </div>
                   </TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
-        </div>
+        </DataTableFrame>
       )}
-      {(history.length > 0 || batches.data?.next_cursor) && (
-        <Pagination>
-          <PaginationContent>
-            <PaginationItem>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={history.length === 0}
-                onClick={() => {
-                  setCursor(history[history.length - 1])
-                  setHistory(history.slice(0, -1))
-                }}
-              >
-                <ChevronLeft data-icon="inline-start" />
-                Previous
-              </Button>
-            </PaginationItem>
-            <PaginationItem>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={!batches.data?.next_cursor}
-                onClick={() => {
-                  setHistory([...history, cursor])
-                  setCursor(batches.data?.next_cursor)
-                }}
-              >
-                Next
-                <ChevronRight data-icon="inline-end" />
-              </Button>
-            </PaginationItem>
-          </PaginationContent>
-        </Pagination>
-      )}
+      <CursorPagination
+        hasPrevious={cursors.length > 0}
+        hasNext={Boolean(batches.data?.next_cursor)}
+        onPrevious={() => {
+          setPagination({ status, cursors: cursors.slice(0, -1) })
+        }}
+        onNext={() => {
+          const next = batches.data?.next_cursor
+          if (next) setPagination({ status, cursors: [...cursors, next] })
+        }}
+      />
       <Sheet
         open={selected !== null}
         onOpenChange={(open) => {
-          if (!open) {
-            setSelected(null)
-          }
+          if (!open) setSelected(null)
         }}
       >
         <SheetContent
-          className="min-w-0 overflow-hidden !w-[min(32rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]"
+          side="right"
+          className="gap-0 data-[side=right]:w-[min(720px,calc(100vw-2rem))] data-[side=right]:sm:max-w-[720px]"
           onOpenAutoFocus={(event) => {
             event.preventDefault()
             detailTitle.current?.focus({ preventScroll: true })
           }}
         >
-          <SheetHeader>
-            <SheetTitle ref={detailTitle} tabIndex={-1} className="outline-none">
-              Batch details
-            </SheetTitle>
-            <SheetDescription>Batch contents and submission history.</SheetDescription>
-            {detail.data && (
-              <div className="pr-8 text-muted-foreground">
-                <CopyableValue label="Batch ID" value={detail.data.request_id} monospace />
-              </div>
+          <DetailHeader
+            titleRef={detailTitle}
+            kind="Batch"
+            title={
+              detail.data
+                ? `${detail.data.bucket_name} → ${detail.data.provider_name ?? detail.data.provider_id}`
+                : 'Batch'
+            }
+            badge={detail.data && <BatchStatus batch={detail.data} />}
+            subtitle={
+              detail.data && `${detail.data.member_count} ${detail.data.member_count === 1 ? 'piece' : 'pieces'}`
+            }
+            actions={
+              detail.data &&
+              (detail.data.can_seal || detail.data.task?.retryable) && (
+                <>
+                  {sealButton(detail.data)}
+                  {detail.data.task?.retryable && <RetryButton taskID={detail.data.task.retry_task_id} />}
+                </>
+              )
+            }
+          />
+          <DetailBody>
+            {detail.isError ? (
+              <PageError
+                title="Failed to load this batch"
+                description={detail.error.message}
+                onRetry={() => detail.refetch()}
+                retrying={detail.isFetching}
+              />
+            ) : detail.isPending ? (
+              <Skeleton className="h-48 w-full" />
+            ) : (
+              <BatchDetails batch={detail.data} />
             )}
-          </SheetHeader>
-          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
-            <div className="flex min-w-0 max-w-full flex-col gap-6 px-4 pb-4">
-              {detail.isError ? (
-                <PageErrorState title="Couldn't load this batch" description="Refresh to try again." />
-              ) : detail.isPending ? (
-                <Skeleton className="h-48 w-full" />
-              ) : (
-                detail.data && (
-                  <>
-                    <dl className="grid min-w-0 gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
-                      <BatchDetailField label="Bucket">
-                        <CopyableValue label="Bucket" value={detail.data.bucket_name} maxLength={28} />
-                      </BatchDetailField>
-                      <BatchDetailField label="Storage service">
-                        <CopyableValue
-                          label="Storage service"
-                          value={detail.data.provider_id}
-                          displayValue={detail.data.provider_name ?? detail.data.provider_id}
-                          maxLength={28}
-                        />
-                      </BatchDetailField>
-                    </dl>
-                    <BatchMembers members={detail.data.members} />
-                    <section className="flex min-w-0 max-w-full flex-col gap-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <h3 className="text-sm font-medium">Submission</h3>
-                        <BatchStatus batch={detail.data} />
-                      </div>
-                      <dl className="grid min-w-0 gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
-                        {detail.data.seal_requested_at && (
-                          <BatchDetailField label="Requested at">
-                            <BatchTimestamp value={detail.data.seal_requested_at} />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.submitted_at && (
-                          <BatchDetailField label="Submitted at">
-                            <BatchTimestamp value={detail.data.submitted_at} />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.confirmed_at && (
-                          <BatchDetailField label="Confirmed at">
-                            <BatchTimestamp value={detail.data.confirmed_at} />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.data_set_id !== null && (
-                          <BatchDetailField label="Data set">
-                            <CopyableValue label="Data set ID" value={detail.data.data_set_id} monospace />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.task_id !== null && (
-                          <BatchDetailField label="Task">
-                            <CopyableValue label="Task ID" value={String(detail.data.task_id)} monospace />
-                          </BatchDetailField>
-                        )}
-                        {detail.data.transaction_id && (
-                          <BatchDetailField label="Transaction">
-                            <CopyableValue
-                              label="Transaction"
-                              value={detail.data.transaction_id}
-                              monospace
-                              maxLength={32}
-                            />
-                          </BatchDetailField>
-                        )}
-                      </dl>
-                      {detail.data.status_message && (
-                        <p className="text-sm text-muted-foreground">{detail.data.status_message}</p>
-                      )}
-                      {detail.data.last_error && (
-                        <Alert variant="destructive">
-                          <AlertTitle>Batch needs attention</AlertTitle>
-                          <AlertDescription>
-                            <CopyableValue
-                              label="Batch error"
-                              value={detail.data.last_error}
-                              displayValue={detail.data.last_error}
-                              maxLength={120}
-                            />
-                          </AlertDescription>
-                        </Alert>
-                      )}
-                      {detail.data.task?.storage_confirmation && (
-                        <StorageConfirmationDetails confirmation={detail.data.task.storage_confirmation} />
-                      )}
-                    </section>
-                    {(detail.data.can_seal || detail.data.task?.retryable) && (
-                      <div className="flex flex-col gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          {sealButton(detail.data)}
-                          {detail.data.task?.retryable && <RetryButton taskID={detail.data.task.retry_task_id} />}
-                        </div>
-                        {detail.data.can_seal && (
-                          <p className="text-xs text-muted-foreground">
-                            Smaller batches may increase transaction costs. Confirmation is required before cached data
-                            can be removed.
-                          </p>
-                        )}
-                      </div>
-                    )}
-                  </>
-                )
-              )}
-              {seal.isError && seal.variables === selected && (
-                <Alert variant="destructive">
-                  <AlertTitle>Couldn't complete the action</AlertTitle>
-                  <AlertDescription>{seal.error?.message ?? 'Refresh and try again.'}</AlertDescription>
-                </Alert>
-              )}
-            </div>
-          </div>
+          </DetailBody>
         </SheetContent>
       </Sheet>
     </div>
   )
 }
 
+function BatchDetails({ batch }: { batch: CommitBatchDetails }) {
+  return (
+    <>
+      <DetailSection title="Overview">
+        <DetailGrid>
+          <DetailField label="Batch ID">
+            <CopyableValue label="Batch ID" value={batch.request_id} monospace maxLength={24} />
+          </DetailField>
+          <DetailField label="Bucket">
+            <Link to="/buckets/$name" params={{ name: batch.bucket_name }} className="font-medium hover:underline">
+              {batch.bucket_name}
+            </Link>
+          </DetailField>
+          <DetailField label="Provider">
+            <CopyableValue
+              label="Provider"
+              value={batch.provider_id}
+              displayValue={batch.provider_name ?? batch.provider_id}
+              maxLength={28}
+            />
+          </DetailField>
+          {batch.data_set_id !== null && (
+            <DetailField label="Data set">
+              <CopyableValue label="Data set ID" value={batch.data_set_id} monospace />
+            </DetailField>
+          )}
+          {batch.task_id !== null && (
+            <DetailField label="Task">
+              <CopyableValue label="Task ID" value={String(batch.task_id)} monospace />
+            </DetailField>
+          )}
+          {batch.transaction_id && (
+            <DetailField label="Transaction">
+              <CopyableValue label="Transaction" value={batch.transaction_id} monospace maxLength={32} />
+            </DetailField>
+          )}
+        </DetailGrid>
+      </DetailSection>
+      <BatchMembers members={batch.members} />
+      <DetailSection title="Submission">
+        <DetailGrid>
+          {batch.seal_requested_at && (
+            <DetailField label="Requested">
+              <BatchTimestamp value={batch.seal_requested_at} />
+            </DetailField>
+          )}
+          {batch.submitted_at && (
+            <DetailField label="Submitted">
+              <BatchTimestamp value={batch.submitted_at} />
+            </DetailField>
+          )}
+          {batch.confirmed_at && (
+            <DetailField label="Confirmed">
+              <BatchTimestamp value={batch.confirmed_at} />
+            </DetailField>
+          )}
+        </DetailGrid>
+        {batch.status_message && <p className="text-sm text-muted-foreground">{batch.status_message}</p>}
+        {batch.last_error && (
+          <Alert variant="destructive">
+            <AlertTitle>Batch needs attention</AlertTitle>
+            <AlertDescription>
+              <CopyableValue
+                label="Batch error"
+                value={batch.last_error}
+                displayValue={batch.last_error}
+                maxLength={120}
+              />
+            </AlertDescription>
+          </Alert>
+        )}
+        {batch.task?.storage_confirmation && (
+          <StorageConfirmationDetails confirmation={batch.task.storage_confirmation} />
+        )}
+        {batch.can_seal && (
+          <p className="text-xs text-muted-foreground">
+            Smaller batches may increase transaction costs. Confirmation is required before cached data can be removed.
+          </p>
+        )}
+      </DetailSection>
+    </>
+  )
+}
+
 function BatchMembers({ members }: { members: CommitBatchDetails['members'] }) {
   return (
-    <section className="flex min-w-0 flex-col gap-3">
-      <h3 className="text-sm font-medium">Members</h3>
+    <DetailSection title="Pieces">
       {members.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No members in this batch.</p>
+        <p className="text-sm text-muted-foreground">No pieces in this batch.</p>
       ) : (
-        <div className="overflow-hidden rounded-lg border border-border">
+        <DataTableFrame>
           <Table>
             <TableHeader>
-              <TableRow className="bg-muted/50">
-                <TableHead>Related object</TableHead>
-                <TableHead className="text-right">Size</TableHead>
-                <TableHead>Piece CID</TableHead>
+              <TableRow className={tableHeaderRowClassName}>
+                <TableHead className="px-3">Object</TableHead>
+                <TableHead className="px-3 text-right">Size</TableHead>
+                <TableHead className="px-3">Piece CID</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {members.map((member) => (
                 <TableRow key={member.content_id}>
-                  <TableCell>
+                  <TableCell className="px-3">
                     {member.file ? (
                       <div className="flex flex-col gap-1">
                         <CopyableValue label="Object key" value={member.file.key} maxLength={24} />
@@ -433,43 +414,22 @@ function BatchMembers({ members }: { members: CommitBatchDetails['members'] }) {
                       <span className="text-muted-foreground">Object unavailable</span>
                     )}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">
+                  <TableCell className="px-3 text-right tabular-nums">
                     {member.size === null ? '—' : formatBytes(member.size)}
                   </TableCell>
-                  <TableCell>
+                  <TableCell className="px-3">
                     <CopyableValue label="Piece CID" value={member.piece_cid} monospace maxLength={20} />
                   </TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
-        </div>
+        </DataTableFrame>
       )}
-    </section>
+    </DetailSection>
   )
 }
 
 function BatchTimestamp({ value }: { value: string }) {
   return <time dateTime={value}>{new Date(value).toLocaleString()}</time>
-}
-
-function BatchDetailField({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="min-w-0">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 min-w-0 font-medium">{children}</dd>
-    </div>
-  )
-}
-
-function BatchTableSkeleton() {
-  return (
-    <div className="rounded-lg border p-4">
-      <div className="flex flex-col gap-3">
-        {['first', 'second', 'third', 'fourth', 'fifth', 'sixth'].map((row) => (
-          <Skeleton key={row} className="h-10 w-full" />
-        ))}
-      </div>
-    </div>
-  )
 }

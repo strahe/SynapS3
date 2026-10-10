@@ -45,7 +45,7 @@ func (h *PullHandler) pullWithoutSource(ctx context.Context, execution taskengin
 		}
 		return taskengine.Fail(err, "migration_cache_missing", nil)
 	}
-	return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
+	return h.advanceToCacheRestore(input, execution.ID(), "Replica is recovering from cache", "")
 }
 
 func (h *PullHandler) recoverPullFromCache(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, pullAttemptID, lastError string) (taskengine.Result, bool) {
@@ -81,7 +81,7 @@ func (h *PullHandler) recoverPullFromCache(ctx context.Context, execution tasken
 			return repos.Contents.AbandonMigrationPull(ctx, copyRow.ID, input.Generation, execution.ID(), pullAttemptID)
 		}), true
 	}
-	return h.advanceToCacheRestoreWithError(input, execution.ID(), "Storage copy is recovering from cache", pullAttemptID, lastError), true
+	return h.advanceToCacheRestoreWithError(input, execution.ID(), "Replica is recovering from cache", pullAttemptID, lastError), true
 }
 
 func (h *PullHandler) pullHandler() *taskengine.FuncHandler {
@@ -145,7 +145,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 			return h.finishPieceTransfer(execution, input, copyRow, retrievalURL, pieceCID, attempt.AttemptID)
 		}
 		if copyRow.Status == model.StorageCopyStatusCommitted {
-			return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
+			return h.completeCopyTask(input, execution.ID(), "Replica is complete")
 		}
 		return h.handOffToCommit(input, execution.ID())
 	}
@@ -162,7 +162,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		})
 	}
 	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress && attempt == nil {
-		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready for ingress")
+		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Replica is ready for ingress")
 	}
 	if attempt == nil && !mayPull {
 		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)

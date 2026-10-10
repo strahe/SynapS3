@@ -1,11 +1,25 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Clock, ShieldCheck, Wallet } from 'lucide-react'
+import { useQueryClient } from '@tanstack/react-query'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import {
+  AlertTriangle,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Clock,
+  Coins,
+  Fuel,
+  Loader2,
+  type LucideIcon,
+  ShieldCheck,
+  Wallet,
+} from 'lucide-react'
 import { type ReactNode, useMemo, useState } from 'react'
 import type { PaymentAccountData, WalletOperation, WalletOperationStatus } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { DataTableFrame, tableHeaderRowClassName } from '@/components/app/DataTable'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
-import { PageErrorState } from '@/components/app/PageErrorState'
-import { PageHeader } from '@/components/app/PageHeader'
+import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
+import { EmptyState, PageError } from '@/components/app/PageState'
+import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -18,11 +32,9 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
-import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import {
@@ -33,8 +45,9 @@ import {
   useWalletOperations,
   useWalletWithdraw,
 } from '@/hooks/queries'
+import { walletOperationStatusLabel, walletOperationTypeLabel } from '@/lib/display-labels'
 import { filecoinReadinessStatusLabel, filecoinReadinessStatusTone } from '@/lib/filecoin-readiness'
-import { cn, formatAttoFIL, formatDuration, formatTokenAmount, timeAgo } from '@/lib/utils'
+import { cn, formatAttoFIL, formatDuration, formatTokenAmount } from '@/lib/utils'
 import {
   baseUnitsToDecimal,
   createWalletOperationDraft,
@@ -70,10 +83,12 @@ interface PendingWalletOperation extends WalletOperationDraft {
 }
 
 function WalletPage() {
-  const { data, isLoading, error } = useWallet()
+  const queryClient = useQueryClient()
+  const { data, isLoading, error, refetch, isFetching } = useWallet()
   const readiness = useFilecoinReadiness(Boolean(data?.configured))
   const [operationsLimit, setOperationsLimit] = useState(walletOperationsDefaultLimit)
   const { data: operationsData } = useWalletOperations(operationsLimit)
+  const nextOperationsLimit = walletOperationsLimitOptions.find((limit) => limit > operationsLimit)
   const fundMutation = useWalletFund()
   const withdrawMutation = useWalletWithdraw()
   const approveMutation = useWalletApprove()
@@ -107,25 +122,43 @@ function WalletPage() {
     }))
   }, [paymentAccount])
 
-  if (isLoading) return <WalletSkeleton />
-
-  if (error || !data) {
-    return <PageErrorState title="Failed to load wallet data" />
+  const refreshWallet = () => {
+    queryClient.invalidateQueries({ queryKey: ['wallet'] })
+    queryClient.invalidateQueries({ queryKey: ['walletOperations'] })
+    queryClient.invalidateQueries({ queryKey: ['filecoinReadiness'] })
   }
+  const header = (
+    <PageHeader title="Wallet" actions={<RefreshButton onClick={refreshWallet} refreshing={isFetching} />} />
+  )
 
-  if (!data.configured) {
+  if (isLoading) return <WalletSkeleton header={header} />
+
+  if (error || !data || !data.configured) {
     return (
-      <Empty className="h-full border-0">
-        <EmptyHeader>
-          <EmptyMedia variant="icon">
-            <Wallet />
-          </EmptyMedia>
-          <EmptyTitle>Wallet not configured</EmptyTitle>
-          <EmptyDescription>
-            Set your Filecoin private key in the configuration to enable wallet features.
-          </EmptyDescription>
-        </EmptyHeader>
-      </Empty>
+      <div className="flex flex-col gap-6 p-6">
+        {header}
+        {error || !data ? (
+          <PageError
+            title="Failed to load wallet"
+            description={error?.message}
+            onRetry={() => refetch()}
+            retrying={isFetching}
+          />
+        ) : (
+          <EmptyState
+            icon={<Wallet />}
+            title="Wallet not configured"
+            description="Set the Filecoin private key in the configuration to enable wallet features."
+            action={
+              <Button asChild size="sm" variant="outline">
+                <Link to="/settings" search={{ tab: 'filecoin' }}>
+                  Open settings
+                </Link>
+              </Button>
+            }
+          />
+        )}
+      </div>
     )
   }
 
@@ -222,7 +255,7 @@ function WalletPage() {
 
   return (
     <div className="flex flex-col gap-6 p-6">
-      <PageHeader title="Wallet" />
+      {header}
 
       {data.partial_errors && Object.keys(data.partial_errors).length > 0 && (
         <Alert>
@@ -242,29 +275,31 @@ function WalletPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Wallet</CardTitle>
+          <CardTitle>Account</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
-          <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+          <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <IdentityField
               label="Address"
               value={data.identity?.address ?? '—'}
               copyable
-              className="sm:col-span-2 lg:col-span-3"
+              className="sm:col-span-2 lg:col-span-2"
             />
             <IdentityField label="Network" value={data.chain?.network ?? '—'} badge />
             <IdentityField label="Chain ID" value={data.chain?.chain_id?.toString() ?? '—'} />
             <IdentityField label="Nonce" value={data.identity?.nonce?.toString() ?? '—'} />
-            <IdentityField label="Current Epoch" value={data.chain?.current_epoch ?? '—'} />
+            <IdentityField label="Current epoch" value={data.chain?.current_epoch ?? '—'} />
           </dl>
           <div className="grid gap-4 sm:grid-cols-2">
             <BalanceCard
-              title="FIL Balance"
+              icon={Fuel}
+              title="FIL balance"
               amount={formatAttoFIL(data.wallet_balances?.fil_gas)}
               raw={data.wallet_balances?.fil_gas}
             />
             <BalanceCard
-              title="USDFC Balance"
+              icon={Coins}
+              title="USDFC balance"
               amount={formatTokenAmount(data.wallet_balances?.usdfc, decimals, 'USDFC')}
               raw={data.wallet_balances?.usdfc}
             />
@@ -274,7 +309,7 @@ function WalletPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>USDFC Payment Account</CardTitle>
+          <CardTitle>USDFC payment account</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
           {paymentAccount ? (
@@ -300,11 +335,10 @@ function WalletPage() {
                     <Button
                       type="button"
                       variant="outline"
-                      size="sm"
                       onClick={withdrawMax}
                       disabled={!paymentAccount.available_funds || isMutating}
                     >
-                      Max withdraw
+                      Max
                     </Button>
                   }
                 />
@@ -339,17 +373,19 @@ function WalletPage() {
                       variant="outline"
                       size="sm"
                       className="h-auto min-h-12 justify-start whitespace-normal px-3 py-2 text-left"
-                      disabled={isMutating}
+                      disabled={isMutating || paymentAccount.no_active_spend}
                       onClick={() => topUpRunway(target.amount, target.label)}
                       title={`Additional needed: ${formatTokenAmount(target.amount.toString(), decimals, 'USDFC')}`}
                     >
                       <Clock data-icon="inline-start" />
                       <span className="flex min-w-0 flex-col items-start gap-0.5">
                         <span className="leading-none">To {target.label}</span>
-                        <span className="max-w-full truncate text-[11px] font-normal text-muted-foreground group-hover/button:text-foreground">
-                          {target.amount > 0n
-                            ? formatTokenAmount(target.amount.toString(), decimals, 'USDFC')
-                            : 'Already funded'}
+                        <span className="max-w-full truncate text-xs font-normal text-muted-foreground group-hover/button:text-foreground">
+                          {paymentAccount.no_active_spend
+                            ? 'Not needed'
+                            : target.amount > 0n
+                              ? formatTokenAmount(target.amount.toString(), decimals, 'USDFC')
+                              : 'Already funded'}
                         </span>
                       </span>
                     </Button>
@@ -371,29 +407,20 @@ function WalletPage() {
       <Card>
         <CardHeader>
           <CardTitle>Operations</CardTitle>
-          <CardAction className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground">Latest</span>
-            <Label htmlFor="wallet-operations-limit" className="sr-only">
-              Operation count
-            </Label>
-            <Select value={operationsLimit.toString()} onValueChange={(value) => setOperationsLimit(Number(value))}>
-              <SelectTrigger id="wallet-operations-limit" className="h-7 w-20 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {walletOperationsLimitOptions.map((limit) => (
-                    <SelectItem key={limit} value={limit.toString()}>
-                      {limit}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </CardAction>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-3">
           <OperationsTable operations={operations} decimals={decimals} onOpenDetails={setOperationDetailText} />
+          {nextOperationsLimit && operations.length >= operationsLimit && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="self-center"
+              onClick={() => setOperationsLimit(nextOperationsLimit)}
+            >
+              Show more
+            </Button>
+          )}
         </CardContent>
       </Card>
 
@@ -404,8 +431,8 @@ function WalletPage() {
           </CardHeader>
           <CardContent>
             <dl className="grid gap-4 sm:grid-cols-2">
-              <IdentityField label="Payments Contract" value={data.contracts.payments_address} copyable />
-              <IdentityField label="USDFC Token" value={data.contracts.usdfc_address} copyable />
+              <IdentityField label="Payments contract" value={data.contracts.payments_address} copyable />
+              <IdentityField label="USDFC token" value={data.contracts.usdfc_address} copyable />
             </dl>
           </CardContent>
         </Card>
@@ -428,13 +455,14 @@ function WalletPage() {
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isMutating}>Cancel</AlertDialogCancel>
             <Button type="button" disabled={isMutating} onClick={confirmPendingOperation}>
+              {isMutating && <Loader2 data-icon="inline-start" className="animate-spin" />}
               {pendingOperation?.confirmation.actionLabel ?? 'Confirm'}
             </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
       <DetailTextDialog
-        title="Operation Details"
+        title="Operation details"
         text={operationDetailText}
         onClose={() => setOperationDetailText(null)}
       />
@@ -442,17 +470,17 @@ function WalletPage() {
   )
 }
 
-function WalletSkeleton() {
+function WalletSkeleton({ header }: { header: ReactNode }) {
   return (
     <div className="flex flex-col gap-6 p-6">
-      <PageHeader title="Wallet" />
+      {header}
       <Card>
         <CardHeader>
-          <CardTitle>Wallet</CardTitle>
+          <CardTitle>Account</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
-            <SkeletonField className="sm:col-span-2 lg:col-span-3" />
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <SkeletonField className="sm:col-span-2 lg:col-span-2" />
             <SkeletonField />
             <SkeletonField />
             <SkeletonField />
@@ -466,7 +494,7 @@ function WalletSkeleton() {
       </Card>
       <Card>
         <CardHeader>
-          <CardTitle>USDFC Payment Account</CardTitle>
+          <CardTitle>USDFC payment account</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -523,16 +551,24 @@ function IdentityField({
   )
 }
 
-function BalanceCard({ title, amount, raw }: { title: string; amount: string; raw: string | null | undefined }) {
+function BalanceCard({
+  icon: Icon,
+  title,
+  amount,
+  raw,
+}: {
+  icon: LucideIcon
+  title: string
+  amount: string
+  raw: string | null | undefined
+}) {
   return (
     <div className="rounded-md border border-border p-4">
       <div className="flex items-center gap-2 text-muted-foreground">
-        <Wallet className="size-4" />
+        <Icon className="size-4" />
         <span className="text-sm">{title}</span>
       </div>
-      <div className={raw == null ? 'mt-2 text-2xl font-bold text-muted-foreground' : 'mt-2 text-2xl font-bold'}>
-        {amount}
-      </div>
+      <div className={cn('mt-2 text-2xl font-bold tabular-nums', raw == null && 'text-muted-foreground')}>{amount}</div>
     </div>
   )
 }
@@ -555,7 +591,7 @@ function PaymentAccountStats({ account, decimals }: { account: PaymentAccountDat
 
   return (
     <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-      <AccountMetric label="Total Deposited" value={formatTokenAmount(account.funds, decimals, 'USDFC')} />
+      <AccountMetric label="Total deposited" value={formatTokenAmount(account.funds, decimals, 'USDFC')} />
       <AccountMetric
         label="Available"
         value={formatTokenAmount(account.available_funds, decimals, 'USDFC')}
@@ -563,16 +599,16 @@ function PaymentAccountStats({ account, decimals }: { account: PaymentAccountDat
       />
       <AccountMetric label="Locked" value={formatTokenAmount(account.lockup_current, decimals, 'USDFC')} />
       <AccountMetric label="Runway" value={runwayDisplay} tone={riskTone} caption={riskCaption} />
-      <AccountMetric label="Lock Rate" value={formatTokenAmount(account.lockup_rate, decimals, 'USDFC/epoch')} />
+      <AccountMetric label="Lock rate" value={formatTokenAmount(account.lockup_rate, decimals, 'USDFC/epoch')} />
       <AccountMetric
-        label="Daily Spend"
+        label="Daily spend"
         value={formatTokenAmount(account.lockup_rate_per_day, decimals, 'USDFC/day')}
       />
       <AccountMetric
-        label="Monthly Spend"
+        label="Monthly spend"
         value={formatTokenAmount(account.lockup_rate_per_month, decimals, 'USDFC/month')}
       />
-      <AccountMetric label="Funded Until Epoch" value={fundedDisplay} tone={riskTone} caption={riskCaption} />
+      <AccountMetric label="Funded until epoch" value={fundedDisplay} tone={riskTone} caption={riskCaption} />
     </dl>
   )
 }
@@ -601,7 +637,7 @@ function AccountMetric({
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd
         className={cn(
-          'mt-1 truncate font-mono text-sm',
+          'mt-1 truncate text-sm tabular-nums',
           highlight && 'font-semibold text-primary',
           accountMetricTextClasses[tone]
         )}
@@ -643,12 +679,12 @@ function OperationBox({
           placeholder="0.0"
           disabled={disabled}
         />
+        {secondaryAction}
         <Button type="button" onClick={onSubmit} disabled={disabled}>
           {icon}
           {label}
         </Button>
       </div>
-      {secondaryAction && <div className="mt-2 flex justify-end">{secondaryAction}</div>}
     </div>
   )
 }
@@ -663,66 +699,70 @@ function OperationsTable({
   onOpenDetails: (detail: string) => void
 }) {
   if (operations.length === 0) {
-    return <p className="text-sm text-muted-foreground">No wallet operations yet</p>
+    return <p className="text-sm text-muted-foreground">No wallet operations yet.</p>
   }
 
   return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>Type</TableHead>
-          <TableHead>Status</TableHead>
-          <TableHead>Amount</TableHead>
-          <TableHead>Tx Hash</TableHead>
-          <TableHead>Details</TableHead>
-          <TableHead>Updated</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {operations.map((operation) => {
-          const detail = walletOperationDetail(operation)
-          return (
-            <TableRow key={operation.id}>
-              <TableCell className="capitalize">{operation.type}</TableCell>
-              <TableCell>
-                <StatusBadge tone={walletOperationStatusTone(operation.status)} className="capitalize">
-                  {operation.status}
-                </StatusBadge>
-              </TableCell>
-              <TableCell className="font-mono">
-                {operation.type === 'approve' ? (
-                  <span className="text-muted-foreground">—</span>
-                ) : (
-                  formatTokenAmount(operation.amount, decimals, 'USDFC')
-                )}
-              </TableCell>
-              <TableCell>
-                {operation.tx_hash ? (
-                  <CopyableValue label="Transaction hash" value={operation.tx_hash} monospace maxLength={24} />
-                ) : (
-                  <span className="text-muted-foreground">—</span>
-                )}
-              </TableCell>
-              <TableCell>
-                {detail ? (
-                  <Button
-                    type="button"
-                    variant="link"
-                    onClick={() => onOpenDetails(detail)}
-                    className="h-auto max-w-80 justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
-                  >
-                    <span className="truncate">{detail}</span>
-                  </Button>
-                ) : (
-                  <span className="text-muted-foreground">—</span>
-                )}
-              </TableCell>
-              <TableCell className="text-muted-foreground">{timeAgo(operation.updated_at)}</TableCell>
-            </TableRow>
-          )
-        })}
-      </TableBody>
-    </Table>
+    <DataTableFrame>
+      <Table className="min-w-[760px]">
+        <TableHeader>
+          <TableRow className={tableHeaderRowClassName}>
+            <TableHead className="px-4">Type</TableHead>
+            <TableHead className="px-4">Status</TableHead>
+            <TableHead className="px-4">Amount</TableHead>
+            <TableHead className="px-4">Transaction</TableHead>
+            <TableHead className="px-4">Details</TableHead>
+            <TableHead className="px-4">Updated</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {operations.map((operation) => {
+            const detail = walletOperationDetail(operation)
+            return (
+              <TableRow key={operation.id}>
+                <TableCell className="px-4">{walletOperationTypeLabel(operation.type)}</TableCell>
+                <TableCell className="px-4">
+                  <StatusBadge tone={walletOperationStatusTone(operation.status)}>
+                    {walletOperationStatusLabel(operation.status)}
+                  </StatusBadge>
+                </TableCell>
+                <TableCell className="px-4 tabular-nums">
+                  {operation.type === 'approve' ? (
+                    <span className="text-muted-foreground">—</span>
+                  ) : (
+                    formatTokenAmount(operation.amount, decimals, 'USDFC')
+                  )}
+                </TableCell>
+                <TableCell className="px-4">
+                  {operation.tx_hash ? (
+                    <CopyableValue label="Transaction hash" value={operation.tx_hash} monospace maxLength={24} />
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="px-4">
+                  {detail ? (
+                    <Button
+                      type="button"
+                      variant="link"
+                      onClick={() => onOpenDetails(detail)}
+                      className="h-auto max-w-80 justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
+                    >
+                      <span className="truncate">{detail}</span>
+                    </Button>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="px-4 text-muted-foreground">
+                  <RelativeTime value={operation.updated_at} />
+                </TableCell>
+              </TableRow>
+            )
+          })}
+        </TableBody>
+      </Table>
+    </DataTableFrame>
   )
 }
 

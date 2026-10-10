@@ -54,9 +54,9 @@ func (r WaitReason) Message() string {
 	case WaitReasonTarget:
 		return "Waiting for the replacement provider to become reachable"
 	case WaitReasonTargetCreating:
-		return "Waiting for the replacement storage service to be created"
+		return "Waiting for the replacement data set to be created"
 	case WaitReasonTargetWritable:
-		return "Waiting for the replacement storage service to become writable"
+		return "Waiting for the replacement data set to become writable"
 	case WaitReasonFunding:
 		return "Waiting for wallet funds to cover the replacement service"
 	case WaitReasonProvider:

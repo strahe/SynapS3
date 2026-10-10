@@ -110,7 +110,7 @@ export function dataSetGenerationLabel(dataSet: StorageDataSetSummary) {
 const replacementErrorMessages: Record<string, string> = {
   replacement_active: 'This replica is already being replaced. Wait for it to finish or retry it below.',
   replacement_target_creating:
-    'The earlier replacement of this replica is still setting up its new storage service. Wait for it to finish, or retry that setup from Tasks if it stopped.',
+    'The earlier replacement of this replica is still setting up its new data set. Wait for it to finish, or retry that setup from Tasks if it stopped.',
   replacement_target_in_use: 'That provider already stores a replica of this bucket. Choose a different one.',
   replacement_target_invalid: 'Choose a provider other than the one being replaced.',
   replacement_no_eligible_provider:
@@ -133,7 +133,7 @@ const replacementErrorMessages: Record<string, string> = {
  */
 export function replacementNextStep(replacement: ProviderReplacement) {
   if (replacement.status === 'superseded' && replacement.retirement_attention) {
-    return 'The unused storage service could not be shut down. Check its retirement task.'
+    return 'The unused data set could not be shut down. Check its retirement task.'
   }
   switch (replacement.status) {
     case 'failed':
@@ -257,6 +257,6 @@ export function replacementConfirmationDescription(dataSet: StorageDataSetSummar
     ? 'This starts paying a new provider. Once it is ready, new uploads go there. The old provider is ended after existing objects are readable on the new one.'
     : 'This creates a replica on the new provider. Storage charges start when its setup succeeds. New uploads that need this replica wait until the new provider is ready.'
   return dataSet.replacement_has_late_service_risk || (!dataSet.data_set_id && dataSet.client_data_set_id)
-    ? `${description} An earlier request may still create a paid storage service; this replacement will not close it.`
+    ? `${description} An earlier request may still create a paid data set; this replacement will not close it.`
     : description
 }

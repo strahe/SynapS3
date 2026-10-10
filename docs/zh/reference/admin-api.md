@@ -92,7 +92,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 后台任务和存储健康 | 任务重试与确认、存储提供方和数据集刷新 | 创建新的执行轮次、确认已查看的失败，或刷新运维状态。 |
-| 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement` | 创建新的付费存储服务，把副本迁移过去，并终止已存在的旧服务。 |
+| 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement` | 创建新的付费数据集，把副本迁移过去，并终止已存在的旧数据集。 |
 
 ## 健康检查和指标
 
@@ -132,7 +132,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | 列出受存储健康问题影响的版本。 |
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的存储提供方，以及其他存储提供方不能接管的原因。 |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
-| `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的存储确认。 |
+| `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的批次。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
 
@@ -196,7 +196,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 替换存储提供方
 
-`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费存储服务、把新上传切换过去、复制已有数据，并在每个保留版本都能从新存储提供方读取之后关闭已存在的旧服务。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧存储提供方也不会被关闭。
+`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费数据集、把新上传切换过去、复制已有数据，并在每个保留版本都能从新存储提供方读取之后关闭已存在的旧数据集。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧存储提供方也不会被关闭。
 
 自动选择新的存储提供方：
 
@@ -256,17 +256,17 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
+这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；Filecoin 存储不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing` 和 `profile_url_changed`。手动选择不受 FWSS 批准名单限制，但仍须满足健康、最新资料处于启用状态和存储桶约束。自动选择还会排除该存储桶用过的所有存储提供方，并按 ID 顺序链上核对新鲜获批的候选。
 
-手动确认不核对 FWSS 批准名单，也不检查存储提供方是否仍在链上为该存储桶运行存储服务。后者会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移。此前已正常退休的存储提供方可以再次选择。
+手动确认不核对 FWSS 批准名单，也不检查存储提供方是否仍在链上为该存储桶保留数据集。后者会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移。此前已正常退休的存储提供方可以再次选择。
 
-### 存储确认处理
+### 需要处理的批次
 
-一次存储登记用一个签名请求把写入同一 data set 的一个或多个 piece 登记上链。存储提供方拒绝该登记、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对这些 piece 是否已登记。未登记时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方报告该请求仍在处理时，SynapS3 会继续等待。存储提供方拒绝该请求时会稍后再试；登记前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他 data set 时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。自动恢复受当前执行轮次的有限预算限制；预算耗尽后保留登记证据，供人工 Retry。
+一个批次用一个签名请求把写入同一数据集的一个或多个 piece 提交上链。存储提供方拒绝该批次、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对这些 piece 是否已添加。未添加时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方报告该请求仍在处理时，SynapS3 会继续等待。存储提供方拒绝该请求时会稍后再试；批次确认前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他数据集时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。自动恢复受当前执行轮次的有限预算限制；预算耗尽后保留批次证据，供人工 Retry。
 
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的存储登记，也包括超过 15 分钟仍未登记、SynapS3 仍在继续尝试的登记：登记（`request_id`）、所属任务（`task_id`）、存储提供方和 data set、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Confirm storage 任务上显示同样的登记。对已停止的登记，使用 `POST /api/v1/tasks/{id}/retry` 重试；新一轮执行基于已保存的登记证据继续恢复。
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的批次，也包括超过 15 分钟仍未确认、SynapS3 仍在继续尝试的批次：批次（`request_id`）、所属任务（`task_id`）、存储提供方和数据集、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Submit batch 任务上显示同样的批次。对已停止的批次，使用 `POST /api/v1/tasks/{id}/retry` 重试；新一轮执行基于已保存的批次证据继续恢复。
 
 ### 失败副本恢复
 
@@ -283,17 +283,17 @@ Provenance 副本和替换详情提供 `retryable`、`retry_task_id`，使用该
 | `GET` | `/api/v1/tasks/{id}/events` | 用 `limit`、`cursor` 分页读取保留的关键事件。 |
 | `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | 读取一个任务主体及已知关联信息。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时创建新的执行轮次。 |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时将已核对的失败移入 History，保留结果和 Retry 资格。 |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时将已核对的失败移入 `history` 范围，保留结果和 Retry 资格。 |
 | `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
 | `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
 
 `POST /api/v1/tasks/{id}/retry` 无需请求体，返回 `202 {"task_id":456}`。自动重试留在原轮次；手动 Retry 创建后继，获得新的策略和独立预算。重复请求返回同一后继。任务不存在返回 404，来源已过时或恢复不安全返回 409，并说明原因。临时事务竞争返回 503，可重试请求。
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表按已保存的结果计算重试资格；详情检查当前恢复条件，并可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。登记需要处理的 Confirm storage 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表按已保存的结果计算重试资格；详情检查当前恢复条件，并可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。批次需要处理的 Submit batch 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
-列表和统计默认使用 `scope=work`：Pending、Running 和未确认失败。`scope=history` 包含完成、取消、已确认和已被替代的执行轮次，也包含周期任务。Work 的状态筛选支持 `pending`、`running`、`failed`；History 支持 `completed`、`cancelled`、`failed`。无效范围或不属于该范围的状态返回 400。确认将失败移入 History，保留 Failed 结果和 Retry 资格；历史永久保存。
+列表和统计默认使用 `scope=work`：Pending、Running 和未确认失败。`scope=history` 包含完成、取消、已确认和已被替代的执行轮次，也包含周期任务。`work` 的状态筛选支持 `pending`、`running`、`failed`；`history` 支持 `completed`、`cancelled`、`failed`。无效范围或不属于该范围的状态返回 400。确认将失败移入 `history`，保留 Failed 结果和 Retry 资格；历史永久保存。Tasks 页面把 `work` 显示为 Open，把 `history` 显示为 Closed。
 
-主体查询支持 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 和 `storage_commit_request`。本地资源 key 为正整数 ID，Provider key 为十进制 uint256 ID，存储确认 key 为请求 ID；分别编码两个路径参数。响应包含 `subject_type`、`subject_key` 和可用资源信息。`copy_index` 从 0 开始；`local_data_set_id` 与字符串 `data_set_id` 分别表示本地和链上 Dataset ID。文件样例包含 `key`、`source`（`current`、`historical` 或 `deleted`）及 `other_versions`。钱包金额保留为 USDFC 最小单位字符串。参数无效返回 `400`，主体信息不可用返回 `404`，查询失败返回 `500`；接口读取本地记录，可能返回部分信息。
+主体查询支持 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 和 `storage_commit_request`。本地资源 key 为正整数 ID，Provider key 为十进制 uint256 ID，批次 key 为请求 ID；分别编码两个路径参数。响应包含 `subject_type`、`subject_key` 和可用资源信息。`copy_index` 从 0 开始；`local_data_set_id` 与字符串 `data_set_id` 分别表示本地和链上数据集 ID。文件样例包含 `key`、`source`（`current`、`historical` 或 `deleted`）及 `other_versions`。钱包金额保留为 USDFC 最小单位字符串。参数无效返回 `400`，主体信息不可用返回 `404`，查询失败返回 `500`；接口读取本地记录，可能返回部分信息。
 
 `started_at` 表示任务首次实际开始工作的时间。上传在存储资源等待和数据哈希完成后、即将传输时开始计时。尚未开始工作或无法可靠确定开始时间时省略该字段，包括无需实际工作就结束的任务。新一轮执行记录自己的实际执行或恢复开始时间。`started_at` 和 `finished_at` 保留小数秒。
 
@@ -340,7 +340,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | 刷新单个节点的 Registry 资料和健康状态；同 ID 并发刷新会冲突。 |
 | `POST` | `/api/v1/observability/provider-tiers/refresh` | 并行刷新 approved 和 endorsed 名单；分别返回成功状态、尝试时间及成功采集时间或错误。单路失败时保留该路之前的资料状态和采集时间。 |
 | `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 对可用的存储提供方发起一次 32 MiB 上传测速。返回 `202 Accepted` 和 `task_id`；存储提供方不存在时返回 `404 Not Found`；已有测速进行中或存储提供方不满足测速条件时返回 `409 Conflict`。 |
-| `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的存储确认数量。 |
+| `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的批次数量。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
 存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。最新失败测速可通过统一任务 Retry 接口创建新的测速轮次。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。

@@ -56,10 +56,10 @@ function uploadSpeedDetails(test?: ProviderUploadSpeedTest) {
   return details
 }
 
-/** Stopped storage confirmations holding a data set, linked to where they are retried. */
+/** Stopped batches holding a data set, linked to where they are retried. */
 export function StorageConfirmationsBadge({ count }: { count: number }) {
   if (count <= 0) return null
-  const label = count === 1 ? '1 stopped confirmation' : `${count} stopped confirmations`
+  const label = count === 1 ? '1 stopped batch' : `${count} stopped batches`
   return (
     <Link to="/tasks" search={storageConfirmationTasksSearch} aria-label={`Open ${label} in Tasks`}>
       <StatusBadge tone="danger">{label}</StatusBadge>

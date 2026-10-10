@@ -110,10 +110,10 @@ Recovery options:
 - Restore storage provider connectivity and background task progress so queued uploads can complete and cache eviction can run.
 - If batches are waiting to fill, open **Batches** and choose **Submit next batch**, or enable [automatic early submission](../configuration/model.md) in Settings and restart.
 - Use the default `lru` policy for capacity-based cleanup. Lower the high watermark to leave more write headroom, and keep `0 <= low < high <= 100`.
-- Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable copies commit.
+- Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable replicas commit.
 - Use `none` when automatic removal must be disabled.
 
-LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. With `lru`, a refused write requests background cleanup when usage exceeds the effective low watermark. Writes do not wait for cleanup, so `503 SlowDown` can continue until cleanup catches up or safe candidates become available. Default S3 client retries may give up sooner; retry the upload later.
+LRU cannot remove multipart staging data, versions below their bucket's minimum durable replicas, or versions without a readable committed replica. With `lru`, a refused write requests background cleanup when usage exceeds the effective low watermark. Writes do not wait for cleanup, so `503 SlowDown` can continue until cleanup catches up or safe candidates become available. Default S3 client retries may give up sooner; retry the upload later.
 
 Failed LRU deletion tasks remain visible as failed work. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` when the task is marked retryable.
 
@@ -133,7 +133,7 @@ Retry only after RPC connectivity, storage provider availability, wallet funds, 
 synaps3 admin task retry 42
 ```
 
-The API indicates whether Retry is available for each failed task. Provider replacement work is recovered from **Details** → **Storage** → **Data Sets**. A wallet operation can be recovered from Tasks when no broadcast started, or when it stopped because of an internal error; recovery sends the transaction only if it was never broadcast, and an uncertain broadcast remains non-retryable. A failed Store offers **Retry**; it checks the provider first and resends the piece only if missing. For remote-copy removal that remains unconfirmed after 24 hours, **Retry** checks the chain first and may submit another paid request if the copy is still present and not queued; the earlier request may still succeed. If the data set is no longer active, the chain cannot confirm this individual removal, so the task keeps checking instead of claiming the copy is gone. Use **Acknowledge** or `synaps3 admin task acknowledge <id>` to mark a reviewed failure as viewed; history is retained indefinitely. When failures have piled up, select **Work** and **Failed** on the Tasks page to show **Acknowledge all**. The Operation filter narrows which failures it clears, and `synaps3 admin task acknowledge --type <operation> --yes` does the same from the CLI; failures recorded after you confirm stay in the list.
+The API indicates whether Retry is available for each failed task. Provider replacement work is recovered from the bucket's **Storage** tab. A wallet operation can be recovered from Tasks when no broadcast started, or when it stopped because of an internal error; recovery sends the transaction only if it was never broadcast, and an uncertain broadcast remains non-retryable. A failed **Upload data** task offers **Retry**; it checks the provider first and resends the piece only if missing. For remote replica removal that remains unconfirmed after 24 hours, **Retry** checks the chain first and may submit another paid request if the replica is still present and not queued; the earlier request may still succeed. If the data set is no longer active, the chain cannot confirm this individual removal, so the task keeps checking instead of claiming the replica is gone. Use **Acknowledge** or `synaps3 admin task acknowledge <id>` to mark a reviewed failure as viewed; history is retained indefinitely. When failures have piled up, select **Open** and **Failed** on the Tasks page to show **Acknowledge all**. The Operation filter narrows which failures it clears, and `synaps3 admin task acknowledge --type <operation> --yes` does the same from the CLI; failures recorded after you confirm stay in the list.
 
 For a failed replica, use **Retry** in **Tasks** or the object's **Provenance → Replicas** table. It creates a new execution and preserves earlier failed executions for that replica. Check Provenance for **Stored** to confirm completion. Confirmed peer sync failures use retained local cache automatically when available; otherwise replica recovery needs a readable remote source or local cache. If recovery is unavailable, follow the reason shown beside the replica.
 
@@ -151,7 +151,7 @@ Enter the Admin password at curl's no-echo prompt.
 Recovery:
 
 - Restore the configured `filecoin.rpc_url`.
-- Confirm provider URLs are reachable from the SynapS3 host. The provider details in **Storage Topology** show why the last health check failed.
+- Confirm provider URLs are reachable from the SynapS3 host. The provider details in **Storage topology** show why the last health check failed.
 - Keep `filecoin.allow_private_networks = false` unless private provider URLs are expected and trusted.
 
 ## S3 Client Cannot Upload

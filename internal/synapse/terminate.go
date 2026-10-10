@@ -63,7 +63,7 @@ func IsTerminationBlocked(err error) bool {
 // wallet other than the one signing. Under this configuration its number names
 // someone else's service, so it is never terminated; an operator has to put the
 // original wallet or network back.
-var ErrServicePaidByAnother = errors.New("storage service is paid for by another wallet")
+var ErrServicePaidByAnother = errors.New("data set is paid for by another wallet")
 
 // ErrTerminationObservationUnavailable identifies a provider status read that
 // permits the existing payer-checked termination fallback.
@@ -81,7 +81,7 @@ var ErrTerminationObservationUnavailable = errors.New("provider termination stat
 // the chain still shows the service running.
 func (s *StorageServiceAdapter) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, error) {
 	if s == nil || s.terminator == nil || s.dataSets == nil {
-		return nil, errors.New("storage service terminator is not configured")
+		return nil, errors.New("data set terminator is not configured")
 	}
 	if ended, err := s.recordedTermination(ctx, dataSetID); err != nil || ended != nil {
 		return ended, err
@@ -111,7 +111,7 @@ func (s *StorageServiceAdapter) TerminateService(ctx context.Context, dataSetID 
 		}
 	}
 	if res == nil {
-		return nil, errors.New("storage service returned no termination result")
+		return nil, errors.New("data set termination returned no result")
 	}
 	out := &TerminationResult{EndEpoch: int64(res.EndEpoch)}
 	if res.TxHash != nil {
@@ -124,7 +124,7 @@ func (s *StorageServiceAdapter) TerminateService(ctx context.Context, dataSetID 
 // reads the chain, so retirement runs it before committing to a request.
 func (s *StorageServiceAdapter) VerifyServicePayer(ctx context.Context, dataSetID sdktypes.BigInt) error {
 	if s == nil || s.dataSets == nil {
-		return errors.New("storage service terminator is not configured")
+		return errors.New("data set terminator is not configured")
 	}
 	_, err := s.recordedTermination(ctx, dataSetID)
 	return err
@@ -135,10 +135,10 @@ func (s *StorageServiceAdapter) VerifyServicePayer(ctx context.Context, dataSetI
 func (s *StorageServiceAdapter) recordedTermination(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, error) {
 	info, err := s.dataSets.GetDataSet(ctx, dataSetID)
 	if err != nil {
-		return nil, fmt.Errorf("reading storage service state: %w", err)
+		return nil, fmt.Errorf("reading data set state: %w", err)
 	}
 	if info == nil {
-		return nil, errors.New("reading storage service state: no data set record")
+		return nil, errors.New("reading data set state: no data set record")
 	}
 	// The direct path carries no payer check of its own, so a record that
 	// belongs to someone else is refused here rather than terminated.
@@ -179,7 +179,7 @@ func (s *StorageServiceAdapter) ObserveTermination(ctx context.Context, dataSetI
 		return ended, false, err
 	}
 	if s.service == nil {
-		return nil, false, errors.New("storage service status unavailable")
+		return nil, false, errors.New("data set status unavailable")
 	}
 	target, err := s.service.NewDataSetContext(ctx, dataSetID, storage.NewDataSetContextOptions{})
 	if err != nil {

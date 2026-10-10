@@ -32,7 +32,7 @@ Do not bind port 9090 directly to a public interface.
 
 ## Create an S3 User
 
-Sign in to the dashboard and create a user from S3 Users. You can also use the native Admin CLI in the installation environment:
+Sign in to the dashboard and create a user on the **S3 users** page. You can also use the native Admin CLI in the installation environment:
 
 ```bash
 synaps3 admin s3-user create

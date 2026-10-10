@@ -10,9 +10,9 @@ func (e *SourceOutcomeError) Unwrap() error { return ErrSourceOutcomeUnknown }
 
 var (
 	// ErrSourceRunning blocks replacement while creation work holds a live claim.
-	ErrSourceRunning = errors.New("storage service setup is still running")
+	ErrSourceRunning = errors.New("data set setup is still running")
 	// ErrSourceOutcomeUnknown requires an observed result before replacement.
-	ErrSourceOutcomeUnknown = errors.New("storage service creation outcome is not confirmed")
+	ErrSourceOutcomeUnknown = errors.New("data set creation outcome is not confirmed")
 	// ErrActiveReplacement means this data set is reserved by an unfinished
 	// replacement; only stopped outgoing work permits another provider choice.
 	ErrActiveReplacement = errors.New("data set already has an active replacement")

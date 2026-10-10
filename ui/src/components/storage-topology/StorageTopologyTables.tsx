@@ -1,13 +1,18 @@
 import { Link } from '@tanstack/react-router'
-import { ChevronRight, Database, Gauge, Loader2 } from 'lucide-react'
-import type { MouseEvent, ReactNode } from 'react'
+import { Database, Gauge, Loader2 } from 'lucide-react'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation, ProviderProfile } from '@/api/client'
-import { CopyableValue } from '@/components/app/CopyableValue'
+import { CopyableValue, OptionalCopyableValue } from '@/components/app/CopyableValue'
+import { CursorPagination } from '@/components/app/CursorPagination'
+import {
+  clickableRowProps,
+  DataTableFrame,
+  RowDetailsButton,
+  tableHeaderRowClassName,
+} from '@/components/app/DataTable'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
-import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -53,10 +58,10 @@ export function ProvidersTableCard({
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <InventoryTableFrame>
+      <DataTableFrame>
         <Table className="min-w-[820px]">
           <TableHeader>
-            <TableRow className="bg-muted/50">
+            <TableRow className={tableHeaderRowClassName}>
               <TableHead className="whitespace-nowrap px-3 py-2">Provider</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">Health</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">FWSS</TableHead>
@@ -76,11 +81,7 @@ export function ProvidersTableCard({
               rows.map((row) => {
                 const name = providerDisplayName(row.providerID, row.provider?.provider_profile?.name)
                 return (
-                  <TableRow
-                    key={row.providerID}
-                    className="cursor-pointer"
-                    onClick={(event) => openRowDetails(event, () => onSelect(row))}
-                  >
+                  <TableRow key={row.providerID} {...clickableRowProps(() => onSelect(row))}>
                     <TableCell className="px-3 py-2">
                       <ProviderNameCell providerID={row.providerID} profile={row.provider?.provider_profile} />
                     </TableCell>
@@ -107,7 +108,7 @@ export function ProvidersTableCard({
                       {row.freshness ? freshnessLabel(row.freshness) : '—'}
                     </TableCell>
                     <TableCell className="px-3 py-2 text-right">
-                      <DetailsButton label={name} onClick={() => onSelect(row)} />
+                      <RowDetailsButton label={name} onClick={() => onSelect(row)} />
                     </TableCell>
                   </TableRow>
                 )
@@ -121,9 +122,15 @@ export function ProvidersTableCard({
             )}
           </TableBody>
         </Table>
-      </InventoryTableFrame>
+      </DataTableFrame>
       {contextNote && <div className="text-sm text-muted-foreground">{contextNote}</div>}
-      <TopologyPagination total={total} page={page} totalPages={totalPages} onPageChange={onPageChange} />
+      <CursorPagination
+        summary={totalPages > 1 ? `Page ${page} of ${totalPages} · ${total} total` : undefined}
+        hasPrevious={page > 1}
+        hasNext={page < totalPages}
+        onPrevious={() => onPageChange(page - 1)}
+        onNext={() => onPageChange(page + 1)}
+      />
     </div>
   )
 }
@@ -259,10 +266,10 @@ export function DataSetsTableCard({
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <InventoryTableFrame>
+      <DataTableFrame>
         <Table className="min-w-[860px]">
           <TableHeader>
-            <TableRow className="bg-muted/50">
+            <TableRow className={tableHeaderRowClassName}>
               <TableHead className="whitespace-nowrap px-3 py-2">Bucket</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">Replica</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">Provider</TableHead>
@@ -283,11 +290,7 @@ export function DataSetsTableCard({
               <InventoryErrorRow colSpan={9} message={error} />
             ) : dataSets.length > 0 ? (
               dataSets.map((dataSet) => (
-                <TableRow
-                  key={dataSet.facts.local_data_set_id}
-                  className="cursor-pointer"
-                  onClick={(event) => openRowDetails(event, () => onSelect(dataSet))}
-                >
+                <TableRow key={dataSet.facts.local_data_set_id} {...clickableRowProps(() => onSelect(dataSet))}>
                   <TableCell className="whitespace-nowrap px-3 py-2">
                     <Link
                       to="/buckets/$name"
@@ -330,7 +333,7 @@ export function DataSetsTableCard({
                     {freshnessLabel(dataSet.signal.freshness)}
                   </TableCell>
                   <TableCell className="px-3 py-2 text-right">
-                    <DetailsButton
+                    <RowDetailsButton
                       label={`${dataSet.facts.bucket_name} ${replicaLabel(dataSet.facts.copy_index)}`}
                       onClick={() => onSelect(dataSet)}
                     />
@@ -346,35 +349,16 @@ export function DataSetsTableCard({
             )}
           </TableBody>
         </Table>
-      </InventoryTableFrame>
-      <TopologyPagination total={total} page={page} totalPages={totalPages} onPageChange={onPageChange} />
+      </DataTableFrame>
+      <CursorPagination
+        summary={totalPages > 1 ? `Page ${page} of ${totalPages} · ${total} total` : undefined}
+        hasPrevious={page > 1}
+        hasNext={page < totalPages}
+        onPrevious={() => onPageChange(page - 1)}
+        onNext={() => onPageChange(page + 1)}
+      />
     </div>
   )
-}
-
-// A row opens its details unless the click belongs to a control inside it or
-// ends a text selection.
-function openRowDetails(event: MouseEvent<HTMLTableRowElement>, open: () => void) {
-  if (event.target instanceof Element && event.target.closest('a, button, input, [role="button"]')) return
-  if (window.getSelection()?.toString()) return
-  open()
-}
-
-function DetailsButton({ label, onClick }: { label: string; onClick: () => void }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button variant="ghost" size="icon-xs" aria-label={`Details for ${label}`} onClick={onClick}>
-          <ChevronRight />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>Details</TooltipContent>
-    </Tooltip>
-  )
-}
-
-function InventoryTableFrame({ children }: { children: ReactNode }) {
-  return <div className="overflow-hidden rounded-lg border border-border">{children}</div>
 }
 
 function InventoryEmptyRow({ colSpan, title, description }: { colSpan: number; title: string; description: string }) {
@@ -425,83 +409,5 @@ function InventoryErrorRow({ colSpan, message }: { colSpan: number; message: str
         </Empty>
       </TableCell>
     </TableRow>
-  )
-}
-
-function OptionalCopyableValue({
-  label,
-  value,
-  linkHref,
-  maxLength,
-}: {
-  label: string
-  value: string
-  linkHref?: string
-  maxLength?: number
-}) {
-  if (value === '—') return <span className="font-mono text-xs">—</span>
-  return (
-    <CopyableValue
-      label={label}
-      value={value}
-      monospace
-      maxLength={maxLength}
-      linkHref={linkHref}
-      external={Boolean(linkHref)}
-    />
-  )
-}
-
-function TopologyPagination({
-  total,
-  page,
-  totalPages,
-  onPageChange,
-}: {
-  total: number
-  page: number
-  totalPages: number
-  onPageChange: (page: number) => void
-}) {
-  if (totalPages <= 1) {
-    return null
-  }
-
-  return (
-    <div className="flex items-center justify-between">
-      <span className="text-sm text-muted-foreground">
-        Page {page} of {totalPages} ({total} total)
-      </span>
-      <Pagination className="mx-0 w-auto justify-end">
-        <PaginationContent>
-          <PaginationItem>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={page === 1}
-              onClick={() => {
-                if (page > 1) onPageChange(page - 1)
-              }}
-            >
-              Prev
-            </Button>
-          </PaginationItem>
-          <PaginationItem>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={page >= totalPages}
-              onClick={() => {
-                if (page < totalPages) onPageChange(page + 1)
-              }}
-            >
-              Next
-            </Button>
-          </PaginationItem>
-        </PaginationContent>
-      </Pagination>
-    </div>
   )
 }

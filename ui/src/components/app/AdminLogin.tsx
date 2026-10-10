@@ -1,5 +1,5 @@
 import { useMutation } from '@tanstack/react-query'
-import { LockKeyhole } from 'lucide-react'
+import { HardDrive, Loader2 } from 'lucide-react'
 import { type FormEvent, useState } from 'react'
 import { type AuthSession, api } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -27,8 +27,8 @@ export function AdminLogin({ onAuthenticated }: { onAuthenticated: (session: Aut
       <form className="flex w-full max-w-sm flex-col gap-5" onSubmit={submit}>
         <div className="flex flex-col gap-2">
           <div className="flex items-center gap-2">
-            <div className="flex size-9 items-center justify-center rounded-md border border-border bg-muted">
-              <LockKeyhole />
+            <div className="flex size-9 items-center justify-center rounded-md bg-primary text-primary-foreground">
+              <HardDrive className="size-5" />
             </div>
             <div className="flex min-w-0 flex-col">
               <h1 className="text-lg font-semibold leading-tight">SynapS3 Admin</h1>
@@ -78,7 +78,8 @@ export function AdminLogin({ onAuthenticated }: { onAuthenticated: (session: Aut
         </FieldGroup>
 
         <Button type="submit" disabled={login.isPending || username.trim() === '' || password === ''}>
-          Sign In
+          {login.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
+          Sign in
         </Button>
       </form>
     </main>

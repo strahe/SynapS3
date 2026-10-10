@@ -5,6 +5,7 @@ import {
   BellOff,
   Database,
   HardDrive,
+  KeyRound,
   Layers,
   LayoutDashboard,
   ListTodo,
@@ -47,6 +48,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from '@/components/ui/sidebar'
+import { Toaster } from '@/components/ui/sonner'
 import { useFilecoinReadiness, useSettings } from '@/hooks/queries'
 import { useAuthSessionRenewal } from '@/hooks/use-auth-session-renewal'
 import {
@@ -88,10 +90,11 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 const navItems = [
   { to: '/' as const, label: 'Overview', icon: LayoutDashboard },
   { to: '/buckets' as const, label: 'Buckets', icon: Database },
-  { to: '/storage-topology' as const, label: 'Topology', icon: Network },
+  { to: '/storage-topology' as const, label: 'Storage topology', icon: Network },
   { to: '/commit-batches' as const, label: 'Batches', icon: Layers },
   { to: '/tasks' as const, label: 'Tasks', icon: ListTodo },
   { to: '/wallet' as const, label: 'Wallet', icon: Wallet },
+  { to: '/s3-users' as const, label: 'S3 users', icon: KeyRound },
   { to: '/settings' as const, label: 'Settings', icon: Settings },
 ]
 type NavItem = (typeof navItems)[number]
@@ -159,6 +162,8 @@ function RootLayout() {
     writeThemePreference(preference)
   }
 
+  const toaster = <Toaster theme={dark ? 'dark' : 'light'} position="bottom-right" />
+
   if (authSession.isLoading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-background">
@@ -169,20 +174,26 @@ function RootLayout() {
 
   if (authSession.isError || !authSession.data) {
     return (
-      <AdminLogin
-        onAuthenticated={(session) => {
-          queryClient.setQueryData(['authSession'], session)
-        }}
-      />
+      <>
+        <AdminLogin
+          onAuthenticated={(session) => {
+            queryClient.setQueryData(['authSession'], session)
+          }}
+        />
+        {toaster}
+      </>
     )
   }
 
   return (
-    <AuthenticatedRootLayout
-      session={authSession.data}
-      themePreference={themePreference}
-      onThemePreferenceChange={handleThemePreferenceChange}
-    />
+    <>
+      <AuthenticatedRootLayout
+        session={authSession.data}
+        themePreference={themePreference}
+        onThemePreferenceChange={handleThemePreferenceChange}
+      />
+      {toaster}
+    </>
   )
 }
 
@@ -332,7 +343,7 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
         </Alert>
       </div>
       <FilecoinReadinessDialog
-        title="Filecoin Readiness"
+        title="Filecoin readiness"
         data={alert.details}
         open={detailsOpen}
         onOpenChange={setDetailsOpen}
@@ -472,9 +483,12 @@ function AppSidebar({
       <SidebarFooter>
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton tooltip={`Signed in as ${username}`} onClick={onLogout}>
+            <SidebarMenuButton tooltip={`Sign out ${username}`} onClick={onLogout}>
               <LogOut />
-              <span className="group-data-[collapsible=icon]:hidden">Sign Out</span>
+              <span className="group-data-[collapsible=icon]:hidden">Sign out</span>
+              <span className="ml-auto min-w-0 truncate text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+                {username}
+              </span>
             </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem>
@@ -541,7 +555,7 @@ function SetupRequired({ configPath }: { configPath: string }) {
           <span>SynapS3 is running in setup mode. Complete configuration in Settings, then restart the service.</span>
           <span className="break-all font-mono text-xs">{configPath}</span>
           <Button asChild>
-            <Link to="/settings">Open Settings</Link>
+            <Link to="/settings">Open settings</Link>
           </Button>
         </AlertDescription>
       </Alert>

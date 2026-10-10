@@ -65,8 +65,8 @@ test('replica targets below the stored one are offered but locked', () => {
 
 test('a bucket reports the replica target it stores rather than one to resolve later', () => {
   assert.equal(bucketCopyPolicyValue({ default_copies: 3 }), '3')
-  assert.equal(bucketCopyPolicyLabel({ default_copies: 1 }), '1 copy')
-  assert.equal(bucketCopyPolicyLabel({ default_copies: 3 }), '3 copies')
+  assert.equal(bucketCopyPolicyLabel({ default_copies: 1 }), '1 replica')
+  assert.equal(bucketCopyPolicyLabel({ default_copies: 3 }), '3 replicas')
 })
 
 test('minimum durable copy labels read against the stored target', () => {

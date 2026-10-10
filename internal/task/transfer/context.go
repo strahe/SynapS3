@@ -29,7 +29,7 @@ func copyContext(
 	copyRow *model.StorageCopy,
 ) (*model.StorageDataSet, synapse.DataSetTarget, *model.StorageContent, *model.Bucket, error) {
 	if copyRow == nil {
-		return nil, nil, nil, nil, errors.New("storage copy has no data set")
+		return nil, nil, nil, nil, errors.New("replica has no data set")
 	}
 	binding, err := repos.Contents.GetDataSetBindingByID(ctx, copyRow.StorageDataSetID)
 	if err != nil || binding == nil {

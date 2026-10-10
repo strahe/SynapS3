@@ -31,7 +31,7 @@ func main() {
 
 func run() error {
 	flags := flag.NewFlagSet("synaps3-systemtest", flag.ContinueOnError)
-	commitMaxWait := flags.Duration("commit-max-wait", time.Second, "Registration collection window")
+	commitMaxWait := flags.Duration("commit-max-wait", time.Second, "Batch collection window")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
