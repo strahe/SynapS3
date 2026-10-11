@@ -4,15 +4,16 @@ import { AlertTriangle, KeyRound, Loader2, Pencil, Plus, RotateCw, Trash2 } from
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import type { S3User, S3UserCredentials, S3UserRole, SettingsS3Credentials } from '@/api/client'
+import { Banner } from '@/components/app/Banner'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
-import { DataTableFrame, TableSkeleton, tableHeaderRowClassName } from '@/components/app/DataTable'
+import { clickableRowProps, DataTableFrame, TableSkeleton, tableHeaderRowClassName } from '@/components/app/DataTable'
 import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
 import { EmptyState, PageError } from '@/components/app/PageState'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { RowActionItem, RowActionsMenu } from '@/components/app/RowActionsMenu'
 import { StatusBadge } from '@/components/app/StatusBadge'
-import { SettingsBanner, SettingsSelect, SettingsValueField } from '@/components/settings/settings-form'
+import { SettingsSelect, SettingsValueField } from '@/components/settings/settings-form'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -73,7 +74,7 @@ function S3UsersPage() {
     const label = s3UserLabel(deleteTarget)
     deleteUser.mutate(deleteTarget.access_key, {
       onSuccess: () => {
-        toast.success(`Deleted S3 user ${label}`)
+        toast.success(`S3 user ${label} deleted`)
         setDeleteTarget(null)
       },
     })
@@ -85,7 +86,6 @@ function S3UsersPage() {
     <div className="flex flex-col gap-6 p-6">
       <PageHeader
         title="S3 users"
-        description="Access keys used by S3 clients. Secrets are shown only when a user is created or its secret is rotated."
         actions={
           <>
             <RefreshButton
@@ -101,14 +101,14 @@ function S3UsersPage() {
       />
 
       {!available ? (
-        <SettingsBanner tone="warning" icon={AlertTriangle}>
+        <Banner tone="warning" icon={AlertTriangle}>
           {unavailableReason}
-        </SettingsBanner>
+        </Banner>
       ) : users.isLoading ? (
         <TableSkeleton rows={3} />
       ) : users.error ? (
         <PageError
-          title="Failed to load S3 users"
+          title="Could not load S3 users"
           description={users.error.message}
           onRetry={() => users.refetch()}
           retrying={users.isFetching}
@@ -119,7 +119,7 @@ function S3UsersPage() {
           title="No S3 users yet"
           description="Create a user to give an S3 client its own access key."
           action={
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
               <Plus data-icon="inline-start" />
               Create S3 user
             </Button>
@@ -140,7 +140,7 @@ function S3UsersPage() {
             </TableHeader>
             <TableBody>
               {list.map((user) => (
-                <TableRow key={user.access_key}>
+                <TableRow key={user.access_key} {...clickableRowProps(() => setEditTarget(user))}>
                   <TableCell className="max-w-0 px-4">
                     <CopyableValue
                       label="Access key"
@@ -198,7 +198,7 @@ function S3UsersPage() {
         onOpenChange={(open) => {
           if (!open) setRotateTarget(null)
         }}
-        title="Rotate S3 secret?"
+        title="Rotate S3 secret"
         description={
           rotateTarget
             ? `Rotate the secret for ${s3UserLabel(rotateTarget)}. Existing clients using the old secret will fail immediately. The new secret is shown once.`
@@ -214,7 +214,7 @@ function S3UsersPage() {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null)
         }}
-        title="Delete S3 user?"
+        title="Delete S3 user"
         description={
           deleteTarget ? `Delete ${s3UserLabel(deleteTarget)}. Existing requests signed with this key will fail.` : ''
         }
@@ -371,7 +371,7 @@ function EditS3UserDialog({ user, onClose }: { user: S3User | null; onClose: () 
       { accessKey: user.access_key, ...(nameChanged ? { name: trimmedName } : {}), ...(roleChanged ? { role } : {}) },
       {
         onSuccess: () => {
-          toast.success(`Updated S3 user ${s3UserLabel({ access_key: user.access_key, name: trimmedName })}`)
+          toast.success(`S3 user ${s3UserLabel({ access_key: user.access_key, name: trimmedName })} updated`)
           handleOpenChange(false)
         },
       }

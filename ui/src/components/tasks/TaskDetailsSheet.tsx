@@ -1,0 +1,427 @@
+import { useQuery } from '@tanstack/react-query'
+import { Circle, CircleCheck, CircleX, Clock3, History } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { api, type TaskItem, type TaskProviderSelection } from '@/api/client'
+import { CopyableValue } from '@/components/app/CopyableValue'
+import { CursorPagination } from '@/components/app/CursorPagination'
+import { DetailHeader } from '@/components/app/DetailPanel'
+import { RelativeTime } from '@/components/app/RelativeTime'
+import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { RetryButton } from '@/components/tasks/RetryButton'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import { Separator } from '@/components/ui/separator'
+import { Sheet, SheetContent } from '@/components/ui/sheet'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { providerSelectionBlockedReason } from '@/lib/provider-replacement'
+import { taskDetailsView, taskOperationLabel, taskRetryPolicyView, taskSubjectLabel, taskTook } from '@/lib/tasks'
+import { enumLabel } from '@/lib/utils'
+
+const eventLabels: Record<string, string> = {
+  created: 'Created',
+  retry: 'Retry scheduled',
+  retry_scheduled: 'Retry scheduled',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  superseded: 'New execution created',
+  acknowledged: 'Acknowledged',
+  effect_admitted: 'Operation started',
+  pending: 'Retry scheduled',
+  retired: 'Retired',
+  waiting: 'Waiting',
+  wait: 'Waiting',
+  provider_selection: 'Provider selection',
+}
+
+function TaskStatus({ task }: { task: TaskItem }) {
+  const status = task.presentation_status ?? task.status
+  return <StatusBadge tone={taskStatusTone(status)}>{enumLabel(status)}</StatusBadge>
+}
+
+function TaskTime({ value }: { value?: string }) {
+  return <RelativeTime value={value} />
+}
+
+function LoadingDetails() {
+  return (
+    <div role="status" aria-label="Loading details" className="flex flex-col gap-4">
+      {[1, 2, 3, 4].map((row) => (
+        <div key={row} className="flex items-center justify-between gap-4">
+          <Skeleton className="h-4 w-2/5" />
+          <Skeleton className="h-4 w-1/4" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function LoadError({ label, onRetry }: { label: string; onRetry: () => void }) {
+  return (
+    <Alert variant="destructive">
+      <CircleX />
+      <AlertTitle>Could not load {label}</AlertTitle>
+      <AlertDescription>
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          Try again
+        </Button>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+function ProviderSelectionDetails({ selection }: { selection: TaskProviderSelection }) {
+  const tierLabels: Record<string, string> = { approved: 'Approved', endorsed: 'Endorsed', none: 'None' }
+  const tier = tierLabels[selection.tier] ?? 'Unknown'
+  return (
+    <div className="flex min-w-0 flex-col gap-2 text-xs text-muted-foreground">
+      <span>
+        Eligible providers: {selection.eligible_count} · Needed: {selection.requested_count}
+      </span>
+      <span>Required tier: {tier}</span>
+      {selection.tier !== 'none' && (
+        <span>Required provider already included: {selection.has_trusted ? 'Yes' : 'No'}</span>
+      )}
+      {selection.tier_checked_at && (
+        <span>
+          Tier checked: <TaskTime value={selection.tier_checked_at} />
+        </span>
+      )}
+      {selection.rejected_total > 0 && (
+        <details>
+          <summary className="cursor-pointer">Excluded providers ({selection.rejected_total})</summary>
+          <Table aria-label="Provider exclusions" className="mt-2">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Provider</TableHead>
+                <TableHead>Reason</TableHead>
+                <TableHead>Health checked</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {selection.rejections.map((provider) => (
+                <TableRow key={provider.provider_id}>
+                  <TableCell>#{provider.provider_id}</TableCell>
+                  <TableCell className="whitespace-normal">{providerSelectionBlockedReason(provider.reason)}</TableCell>
+                  <TableCell>
+                    {provider.observation_checked_at ? (
+                      <TaskTime value={provider.observation_checked_at} />
+                    ) : (
+                      'Not checked'
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          {selection.rejected_omitted > 0 && <p>{selection.rejected_omitted} more providers omitted.</p>}
+        </details>
+      )}
+    </div>
+  )
+}
+
+/** Details for one task; switching to another execution of it stays inside the sheet. */
+export function TaskDetailsSheet({
+  taskID,
+  onOpenChange,
+}: {
+  taskID: number | null
+  onOpenChange: (open: boolean) => void
+}) {
+  const open = taskID !== null
+  const titleRef = useRef<HTMLHeadingElement>(null)
+  const [selectedTaskID, setSelectedTaskID] = useState(taskID ?? 0)
+  const [historyCursors, setHistoryCursors] = useState<number[]>([])
+  const [eventCursors, setEventCursors] = useState<number[]>([])
+  const historyCursor = historyCursors[historyCursors.length - 1]
+  const eventCursor = eventCursors[eventCursors.length - 1]
+
+  useEffect(() => {
+    if (taskID === null) return
+    setSelectedTaskID(taskID)
+    setHistoryCursors([])
+    setEventCursors([])
+  }, [taskID])
+
+  const detail = useQuery({
+    queryKey: ['task', selectedTaskID],
+    queryFn: () => api.getTask(selectedTaskID),
+    enabled: open,
+    refetchInterval: open ? 10_000 : false,
+  })
+  const history = useQuery({
+    queryKey: ['taskHistory', selectedTaskID, historyCursor],
+    queryFn: () => api.getTaskHistory(selectedTaskID, historyCursor),
+    enabled: open,
+    refetchInterval: open ? 10_000 : false,
+  })
+  const events = useQuery({
+    queryKey: ['taskEvents', selectedTaskID, eventCursor],
+    queryFn: () => api.getTaskEvents(selectedTaskID, eventCursor),
+    enabled: open,
+    refetchInterval: open ? 10_000 : false,
+  })
+  const task = detail.data?.task
+  const policy = detail.data?.policy
+  const message = task ? taskDetailsView(task) : undefined
+  const retryPolicy = task && policy ? taskRetryPolicyView(task, policy) : undefined
+  const visibleEvents = events.data?.events
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent
+        side="right"
+        className="gap-0 data-[side=right]:w-[min(720px,calc(100vw-2rem))] data-[side=right]:sm:max-w-[720px]"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault()
+          titleRef.current?.focus({ preventScroll: true })
+        }}
+      >
+        <DetailHeader
+          titleRef={titleRef}
+          kind="Task"
+          title={task ? taskOperationLabel(task.type) : `Task ${selectedTaskID}`}
+          subtitle={task ? `Task ${selectedTaskID}` : undefined}
+        />
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4">
+          {detail.isPending && <LoadingDetails />}
+          {detail.isError && <LoadError label="task details" onRetry={() => void detail.refetch()} />}
+          {task && (
+            <>
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <TaskStatus task={task} />
+                  {task.acknowledged_at && <StatusBadge tone="neutral">Acknowledged</StatusBadge>}
+                  <span className="text-xs text-muted-foreground">{taskSubjectLabel(task)}</span>
+                </div>
+                {task.retryable && (
+                  <div className="flex max-w-full flex-col items-end gap-1 text-right">
+                    <RetryButton taskID={task.retry_task_id} />
+                    <span className="text-xs text-muted-foreground">
+                      Retry starts a new task with a fresh retry allowance.
+                    </span>
+                  </div>
+                )}
+              </div>
+              {task.retry_unavailable_reason && (
+                <p className="shrink-0 text-sm text-muted-foreground">{task.retry_unavailable_reason}</p>
+              )}
+              {message?.value && (
+                <Alert variant={task.status === 'failed' ? 'destructive' : 'default'} className="shrink-0">
+                  {task.status === 'failed' ? <CircleX /> : <Clock3 />}
+                  <AlertTitle>{task.status === 'failed' ? 'Failure reason' : 'Status'}</AlertTitle>
+                  <AlertDescription className="min-w-0">
+                    <CopyableValue value={message.value} label={message.label} maxLength={150} className="w-full" />
+                  </AlertDescription>
+                </Alert>
+              )}
+              <Tabs defaultValue="overview" className="min-h-0 flex-1 gap-4">
+                <TabsList className="w-full shrink-0" aria-label="Task details">
+                  <TabsTrigger value="overview">Overview</TabsTrigger>
+                  <TabsTrigger value="history">History</TabsTrigger>
+                  <TabsTrigger value="events">Events</TabsTrigger>
+                </TabsList>
+                <TabsContent value="overview" className="min-h-0 overflow-hidden">
+                  <ScrollArea className="h-full">
+                    <div className="flex flex-col gap-5 pr-3">
+                      <dl className="grid grid-cols-2 gap-x-6 gap-y-4">
+                        {[
+                          ['Created', <TaskTime key="created" value={task.created_at} />],
+                          ['Started', <TaskTime key="started" value={task.started_at} />],
+                          ['Finished', <TaskTime key="finished" value={task.finished_at} />],
+                          ['Duration', taskTook(task)],
+                        ].map(([label, value]) => (
+                          <div key={String(label)} className="flex min-w-0 flex-col gap-1">
+                            <dt className="text-xs text-muted-foreground">{label}</dt>
+                            <dd>{value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                      <Separator />
+                      <section className="flex flex-col gap-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <h3 className="font-medium">Execution policy</h3>
+                        </div>
+                        {policy ? (
+                          <dl className="grid gap-3 sm:grid-cols-2">
+                            {[
+                              ['Attempt limit', retryPolicy?.attemptLimit ?? 'Unknown'],
+                              ['Retries scheduled', retryPolicy?.retriesScheduled ?? 'Unknown'],
+                              ['Automatic retries', retryPolicy?.status ?? 'Unknown'],
+                              ...(policy.max_attempts == null || policy.max_attempts === 1
+                                ? []
+                                : [
+                                    [
+                                      'Retry delay',
+                                      `${policy.initial_delay} × ${policy.multiplier}, up to ${policy.maximum_delay}`,
+                                    ],
+                                    ['Delay variation', `±${Math.round(policy.jitter * 100)}%`],
+                                  ]),
+                              [
+                                'Execution timeout',
+                                policy.invocation_timeout === '0s' ? 'Not set' : policy.invocation_timeout,
+                              ],
+                              [
+                                'Result wait limit',
+                                policy.observation_window === '0s' ? 'Not set' : policy.observation_window,
+                              ],
+                            ].map(([label, value]) => (
+                              <div
+                                key={label}
+                                className="flex min-w-0 flex-col gap-1 rounded-lg bg-muted/40 px-3 py-2.5"
+                              >
+                                <dt className="text-xs text-muted-foreground">{label}</dt>
+                                <dd className="break-words tabular-nums">{value}</dd>
+                              </div>
+                            ))}
+                          </dl>
+                        ) : (
+                          <p className="text-muted-foreground">Policy is unavailable for this record.</p>
+                        )}
+                        {retryPolicy?.nextRetryAt && (
+                          <p className="text-xs text-muted-foreground">
+                            Next retry: <TaskTime value={retryPolicy.nextRetryAt} />
+                          </p>
+                        )}
+                      </section>
+                      {message?.lastError && (
+                        <details>
+                          <summary className="cursor-pointer text-muted-foreground">Last error</summary>
+                          <CopyableValue
+                            value={message.lastError}
+                            label="Last error"
+                            maxLength={150}
+                            className="mt-2"
+                          />
+                        </details>
+                      )}
+                    </div>
+                  </ScrollArea>
+                </TabsContent>
+                <TabsContent value="history" className="min-h-0 overflow-hidden">
+                  <ScrollArea className="h-full">
+                    <div className="flex flex-col gap-4 pr-3">
+                      {history.isPending && <LoadingDetails />}
+                      {history.isError && <LoadError label="history" onRetry={() => void history.refetch()} />}
+                      <ol>
+                        {history.data?.tasks.map((round, index) => (
+                          <li key={round.id}>
+                            {index > 0 && <Separator />}
+                            <div className="flex items-start justify-between gap-4 py-3">
+                              <div className="flex min-w-0 flex-col gap-1.5">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <Button
+                                    variant="link"
+                                    size="sm"
+                                    onClick={() => {
+                                      setSelectedTaskID(round.id)
+                                      setHistoryCursors([])
+                                      setEventCursors([])
+                                    }}
+                                  >
+                                    Task {round.id}
+                                  </Button>
+                                  {round.id === selectedTaskID && <StatusBadge tone="neutral">Current</StatusBadge>}
+                                </div>
+                                <span className="text-muted-foreground">{taskOperationLabel(round.type)}</span>
+                                <span className="text-xs text-muted-foreground">
+                                  <TaskTime value={round.created_at} />
+                                </span>
+                              </div>
+                              <TaskStatus task={round} />
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                      <CursorPagination
+                        hasPrevious={historyCursors.length > 0}
+                        hasNext={Boolean(history.data?.next_cursor)}
+                        onPrevious={() => setHistoryCursors((cursors) => cursors.slice(0, -1))}
+                        onNext={() => {
+                          const next = history.data?.next_cursor
+                          if (next) setHistoryCursors((cursors) => [...cursors, next])
+                        }}
+                      />
+                    </div>
+                  </ScrollArea>
+                </TabsContent>
+                <TabsContent value="events" className="min-h-0 overflow-hidden">
+                  <ScrollArea className="h-full">
+                    <div className="flex flex-col gap-4 pr-3">
+                      {events.isPending && <LoadingDetails />}
+                      {events.isError && <LoadError label="events" onRetry={() => void events.refetch()} />}
+                      {visibleEvents?.length === 0 && (
+                        <Empty>
+                          <EmptyHeader>
+                            <EmptyMedia variant="icon">
+                              <History />
+                            </EmptyMedia>
+                            <EmptyTitle>No events recorded</EmptyTitle>
+                          </EmptyHeader>
+                        </Empty>
+                      )}
+                      <ol>
+                        {visibleEvents?.map((event, index) => {
+                          const EventIcon =
+                            event.type === 'failed' ? CircleX : event.type === 'completed' ? CircleCheck : Circle
+                          return (
+                            <li key={event.sequence} className="flex gap-3">
+                              <div className="flex w-5 shrink-0 flex-col items-center gap-1 py-1">
+                                <EventIcon aria-hidden="true" className="size-4 text-muted-foreground" />
+                                {index < (visibleEvents?.length ?? 0) - 1 && (
+                                  <Separator orientation="vertical" className="min-h-5 flex-1" />
+                                )}
+                              </div>
+                              <div className="flex min-w-0 flex-1 flex-wrap items-start justify-between gap-x-4 gap-y-1 pb-5">
+                                <div className="flex min-w-0 flex-col gap-1">
+                                  <span>{eventLabels[event.type] ?? 'Task updated'}</span>
+                                  {(event.next_attempt || event.attempt || event.retry_task_id) && (
+                                    <span className="text-xs text-muted-foreground">
+                                      {[
+                                        event.next_attempt || event.attempt
+                                          ? `Attempt ${event.next_attempt || event.attempt}`
+                                          : '',
+                                        event.retry_task_id ? `Task ${event.retry_task_id}` : '',
+                                      ]
+                                        .filter(Boolean)
+                                        .join(' · ')}
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-xs text-muted-foreground">
+                                  <TaskTime value={event.created_at} />
+                                </span>
+                                {event.provider_selection && (
+                                  <div className="w-full">
+                                    <ProviderSelectionDetails selection={event.provider_selection} />
+                                  </div>
+                                )}
+                              </div>
+                            </li>
+                          )
+                        })}
+                      </ol>
+                      <CursorPagination
+                        hasPrevious={eventCursors.length > 0}
+                        hasNext={Boolean(events.data?.next_cursor)}
+                        onPrevious={() => setEventCursors((cursors) => cursors.slice(0, -1))}
+                        onNext={() => {
+                          const next = events.data?.next_cursor
+                          if (next) setEventCursors((cursors) => [...cursors, next])
+                        }}
+                      />
+                    </div>
+                  </ScrollArea>
+                </TabsContent>
+              </Tabs>
+            </>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  )
+}

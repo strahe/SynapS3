@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import { type ReactNode, useMemo, useState } from 'react'
 import type { PaymentAccountData, WalletOperation, WalletOperationStatus } from '@/api/client'
+import { Banner } from '@/components/app/Banner'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { DataTableFrame, tableHeaderRowClassName } from '@/components/app/DataTable'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
@@ -21,7 +22,7 @@ import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
 import { EmptyState, PageError } from '@/components/app/PageState'
 import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -47,7 +48,7 @@ import {
 } from '@/hooks/queries'
 import { walletOperationStatusLabel, walletOperationTypeLabel } from '@/lib/display-labels'
 import { filecoinReadinessStatusLabel, filecoinReadinessStatusTone } from '@/lib/filecoin-readiness'
-import { cn, formatAttoFIL, formatDuration, formatTokenAmount } from '@/lib/utils'
+import { cn, enumLabel, formatAttoFIL, formatDuration, formatTokenAmount } from '@/lib/utils'
 import {
   baseUnitsToDecimal,
   createWalletOperationDraft,
@@ -139,7 +140,7 @@ function WalletPage() {
         {header}
         {error || !data ? (
           <PageError
-            title="Failed to load wallet"
+            title="Could not load wallet"
             description={error?.message}
             onRetry={() => refetch()}
             retrying={isFetching}
@@ -258,19 +259,15 @@ function WalletPage() {
       {header}
 
       {data.partial_errors && Object.keys(data.partial_errors).length > 0 && (
-        <Alert>
-          <AlertTriangle />
-          <AlertTitle>Some data could not be retrieved</AlertTitle>
-          <AlertDescription>
-            <div className="flex flex-col gap-1">
-              {Object.entries(data.partial_errors).map(([key, msg]) => (
-                <p key={key} className="text-xs text-muted-foreground">
-                  <span className="font-mono">{key}</span>: {msg}
-                </p>
-              ))}
-            </div>
-          </AlertDescription>
-        </Alert>
+        <Banner tone="warning" icon={AlertTriangle} title="Some wallet data could not be loaded">
+          <div className="flex flex-col gap-1">
+            {Object.entries(data.partial_errors).map(([key, msg]) => (
+              <p key={key} className="text-xs">
+                {walletPartialErrorLabels[key] ?? enumLabel(key)}: {msg}
+              </p>
+            ))}
+          </div>
+        </Banner>
       )}
 
       <Card>
@@ -353,6 +350,9 @@ function WalletPage() {
                       </StatusBadge>
                     </div>
                     <p className="mt-1 text-sm text-muted-foreground">{fwssApproval.message}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Filecoin Warm Storage Service (FWSS) spends USDFC from this account for storage payments.
+                    </p>
                     {fwssApproval.action && <p className="mt-1 text-xs text-muted-foreground">{fwssApproval.action}</p>}
                   </div>
                   {fwssApproval.canApprove && (
@@ -427,7 +427,7 @@ function WalletPage() {
       {data.contracts && (
         <Card>
           <CardHeader>
-            <CardTitle>Advanced</CardTitle>
+            <CardTitle>Contracts</CardTitle>
           </CardHeader>
           <CardContent>
             <dl className="grid gap-4 sm:grid-cols-2">
@@ -516,6 +516,12 @@ function SkeletonField({ className }: { className?: string }) {
       <Skeleton className="mt-2 h-5 w-full max-w-72" />
     </div>
   )
+}
+
+const walletPartialErrorLabels: Record<string, string> = {
+  usdfc_wallet_balance: 'USDFC balance',
+  fil_gas_balance: 'FIL balance',
+  usdfc_account: 'USDFC payment account',
 }
 
 function IdentityField({

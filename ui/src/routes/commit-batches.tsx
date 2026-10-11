@@ -85,11 +85,11 @@ function CommitBatchesPage() {
   const seal = useMutation({
     mutationFn: api.sealCommitBatch,
     onSuccess: (result) => {
-      toast.success('Submission requested', { description: `Batch ${result.request_id}` })
+      toast.success('Batch submission requested', { description: `Batch ${result.request_id}` })
       void refresh()
     },
     onError: (error) => {
-      toast.error("Couldn't submit the batch", { description: error.message })
+      toast.error('Could not submit the batch', { description: error.message })
       void refresh()
     },
   })
@@ -111,7 +111,6 @@ function CommitBatchesPage() {
     <div className="flex flex-col gap-6 p-6">
       <PageHeader
         title="Batches"
-        description="Uploaded pieces collect into batches that are submitted to each provider in one transaction."
         actions={<RefreshButton onClick={() => void refresh()} refreshing={batches.isFetching} />}
       />
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -145,7 +144,7 @@ function CommitBatchesPage() {
       )}
       {batches.isError ? (
         <PageError
-          title="Failed to load batches"
+          title="Could not load batches"
           description={batches.error.message}
           onRetry={() => batches.refetch()}
           retrying={batches.isFetching}
@@ -270,7 +269,7 @@ function CommitBatchesPage() {
           <DetailBody>
             {detail.isError ? (
               <PageError
-                title="Failed to load this batch"
+                title="Could not load this batch"
                 description={detail.error.message}
                 onRetry={() => detail.refetch()}
                 retrying={detail.isFetching}

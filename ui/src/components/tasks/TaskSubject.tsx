@@ -133,7 +133,7 @@ function SubjectSession({
     const message = query.error
       ? query.error instanceof APIError && query.error.status === 404
         ? 'Subject information is no longer available.'
-        : 'Unable to load information. Close and reopen to try again.'
+        : 'Could not load information. Close and reopen to try again.'
       : 'Loading…'
     content = <p role="status">{message}</p>
   } else {
@@ -155,7 +155,7 @@ function SubjectSession({
         </dl>
         {query.error && (
           <p role="status" className="text-xs text-muted-foreground">
-            Unable to update information. Close and reopen to try again.
+            Could not update information. Close and reopen to try again.
           </p>
         )}
       </div>

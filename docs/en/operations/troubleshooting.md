@@ -151,7 +151,7 @@ Enter the Admin password at curl's no-echo prompt.
 Recovery:
 
 - Restore the configured `filecoin.rpc_url`.
-- Confirm provider URLs are reachable from the SynapS3 host. The provider details in **Storage topology** show why the last health check failed.
+- Confirm provider URLs are reachable from the SynapS3 host. The provider details in **Storage** show why the last health check failed.
 - Keep `filecoin.allow_private_networks = false` unless private provider URLs are expected and trusted.
 
 ## S3 Client Cannot Upload

@@ -34,9 +34,9 @@ import {
   copyPolicyOptions,
   minimumDurableCopiesChoiceNote,
   minimumDurableCopiesFixedCountNote,
+  minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
-  minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
   replicaCountLabel,
   replicaTargetChoiceNote,
@@ -111,11 +111,11 @@ function CreateBucketDialog({ open, onOpenChange }: { open: boolean; onOpenChang
       {
         onSuccess: (bucket) => {
           handleOpenChange(false)
-          toast.success(`Created bucket ${bucket.name}`)
+          toast.success(`Bucket ${bucket.name} created`)
           navigate({ to: '/buckets/$name', params: { name: bucket.name } })
         },
         onError: (mutationError) => {
-          setError(mutationError instanceof Error ? mutationError.message : 'Failed to create bucket')
+          setError(mutationError instanceof Error ? mutationError.message : 'Could not create bucket')
         },
       }
     )
@@ -170,7 +170,7 @@ function CreateBucketDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                 <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
               )}
               {ownerError && <FieldError>{ownerError}</FieldError>}
-              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
+              {usersError && <FieldError>Could not load S3 users.</FieldError>}
             </Field>
             <Field>
               <FieldLabel htmlFor="bucket-copies">Replicas</FieldLabel>
@@ -308,7 +308,7 @@ function BucketsPage() {
         <TableSkeleton />
       ) : error ? (
         <PageError
-          title="Failed to load buckets"
+          title="Could not load buckets"
           description={error.message}
           onRetry={() => refetch()}
           retrying={isFetching}
@@ -357,7 +357,7 @@ function BucketsPage() {
                   <TableCell className="px-4">
                     <div>{bucketCopyPolicyLabel(bucket)}</div>
                     <div className="text-xs text-muted-foreground">
-                      Release cache after {minimumDurableCopiesValue(bucket)}
+                      Release cache after {minimumDurableCopiesLabel(bucket)}
                     </div>
                   </TableCell>
                   <TableCell className="px-4">

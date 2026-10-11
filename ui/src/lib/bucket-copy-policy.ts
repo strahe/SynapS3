@@ -29,7 +29,7 @@ export function replicaTargetLockNote() {
 }
 
 export function bucketCopyPolicySavedMessage() {
-  return 'Saved. New uploads use this replica target. Cache can be released after the selected count.'
+  return 'Replica policy saved. New uploads use this replica target. Cache can be released after the selected count.'
 }
 
 export function minimumDurableCopiesChoiceNote() {

@@ -23,6 +23,7 @@ import {
 import { type MouseEvent, useCallback, useEffect, useState } from 'react'
 import { type AuthSession, addAuthInvalidationListener, api } from '@/api/client'
 import { AdminLogin } from '@/components/app/AdminLogin'
+import { Banner } from '@/components/app/Banner'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -90,7 +91,7 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 const navItems = [
   { to: '/' as const, label: 'Overview', icon: LayoutDashboard },
   { to: '/buckets' as const, label: 'Buckets', icon: Database },
-  { to: '/storage-topology' as const, label: 'Storage topology', icon: Network },
+  { to: '/storage-topology' as const, label: 'Storage', icon: Network },
   { to: '/commit-batches' as const, label: 'Batches', icon: Layers },
   { to: '/tasks' as const, label: 'Tasks', icon: ListTodo },
   { to: '/wallet' as const, label: 'Wallet', icon: Wallet },
@@ -235,8 +236,9 @@ function AuthenticatedRootLayout({
         onLogout={handleLogout}
       />
 
-      <SidebarInset className="overflow-auto">
-        <div className="flex h-14 items-center gap-2 border-b border-border px-4 md:hidden">
+      {/* A page that marks itself data-fill-viewport gets the height left after the alert, instead of the full screen. */}
+      <SidebarInset className="overflow-auto has-data-[fill-viewport]:h-svh">
+        <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-4 md:hidden">
           <SidebarTrigger />
           <span className="font-semibold">SynapS3</span>
         </div>
@@ -268,7 +270,6 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
   if (!alert.show) return null
 
   const danger = alert.failed || alert.status === 'blocked'
-  const attention = !danger
   const canDismissPrimaryCheck = Boolean(
     alert.primaryCheck && isDismissibleFilecoinReadinessCheck(alert.primaryCheck.id)
   )
@@ -285,62 +286,58 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
 
   return (
     <>
-      <div className="w-full min-w-0 px-6 pt-6">
-        <Alert
-          variant={danger ? 'destructive' : 'default'}
-          className={
-            attention
-              ? 'max-w-full border-[color:var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[color:var(--status-warning)]'
-              : 'max-w-full'
+      <div className="w-full min-w-0 shrink-0 px-6 pt-6">
+        <Banner
+          tone={danger ? 'danger' : 'warning'}
+          icon={AlertTriangle}
+          className="max-w-full"
+          title={
+            <span className="flex flex-wrap items-center gap-2">
+              {alert.title}
+              {!alert.failed && (
+                <StatusBadge tone={filecoinReadinessStatusTone(alert.status)}>
+                  {filecoinReadinessStatusLabel(alert.status)}
+                </StatusBadge>
+              )}
+            </span>
           }
         >
-          <AlertTriangle />
-          <AlertTitle className="flex flex-wrap items-center gap-2">
-            {alert.title}
-            {!alert.failed && (
-              <StatusBadge tone={filecoinReadinessStatusTone(alert.status)}>
-                {filecoinReadinessStatusLabel(alert.status)}
-              </StatusBadge>
-            )}
-          </AlertTitle>
-          <AlertDescription className={attention ? 'text-[color:var(--status-warning)]' : undefined}>
-            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-              <span className="min-w-0 flex-1 break-words">{alert.summary}</span>
-              <div className="flex shrink-0 flex-wrap items-center gap-2">
-                {dismissiblePrimaryCheck && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => dismissCheck(dismissiblePrimaryCheck.id)}
-                  >
-                    <BellOff data-icon="inline-start" />
-                    Dismiss
-                  </Button>
-                )}
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+            <span className="min-w-0 flex-1 break-words">{alert.summary}</span>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              {dismissiblePrimaryCheck && (
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() => readiness.refetch()}
-                  disabled={readiness.isFetching}
+                  onClick={() => dismissCheck(dismissiblePrimaryCheck.id)}
                 >
-                  <RefreshCw data-icon="inline-start" className={readiness.isFetching ? 'animate-spin' : undefined} />
-                  Refresh
+                  <BellOff data-icon="inline-start" />
+                  Dismiss
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={!alert.details}
-                  onClick={() => alert.details && setDetailsOpen(true)}
-                >
-                  Details
-                </Button>
-              </div>
+              )}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => readiness.refetch()}
+                disabled={readiness.isFetching}
+              >
+                <RefreshCw data-icon="inline-start" className={readiness.isFetching ? 'animate-spin' : undefined} />
+                Refresh
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!alert.details}
+                onClick={() => alert.details && setDetailsOpen(true)}
+              >
+                Details
+              </Button>
             </div>
-          </AlertDescription>
-        </Alert>
+          </div>
+        </Banner>
       </div>
       <FilecoinReadinessDialog
         title="Filecoin readiness"

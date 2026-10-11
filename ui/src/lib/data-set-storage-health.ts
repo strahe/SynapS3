@@ -72,5 +72,5 @@ export function storageHealthReasonLabel(reason: string) {
 }
 
 export function dataSetStorageHealthRefreshErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : 'Failed to refresh data set storage health'
+  return error instanceof Error ? error.message : 'Could not check data set health'
 }

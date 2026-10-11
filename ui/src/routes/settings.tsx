@@ -10,19 +10,20 @@ import type {
   SettingsFieldMetadata,
   SettingsUpdatePayload,
 } from '@/api/client'
+import { Banner } from '@/components/app/Banner'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { PageError, PageLoading } from '@/components/app/PageState'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import {
-  SettingsBanner as Banner,
   SettingsFieldShell as FieldShell,
   SettingsSection as Section,
   SettingsCheckbox,
   SettingsReadOnlyField,
   SettingsSelect,
   SettingsStatusField,
+  SettingsValueField,
 } from '@/components/settings/settings-form'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -195,7 +196,7 @@ function SettingsPage() {
         <PageHeader title="Settings" />
         {error ? (
           <PageError
-            title="Failed to load settings"
+            title="Could not load settings"
             description={error.message}
             onRetry={() => refetch()}
             retrying={isFetching}
@@ -294,7 +295,6 @@ function SettingsPage() {
     <form className="flex flex-col gap-6 p-6" onSubmit={handleSubmit}>
       <PageHeader
         title="Settings"
-        description={<span className="break-all font-mono text-xs">{data.config_path}</span>}
         actions={
           <>
             {formDirty && (
@@ -347,7 +347,7 @@ function SettingsPage() {
         </TabsList>
 
         <TabsContent value="s3-api">
-          <Section title="S3 API">
+          <Section>
             <div className="grid gap-4 md:grid-cols-2">
               <TextField
                 label="Region"
@@ -417,7 +417,6 @@ function SettingsPage() {
 
         <TabsContent value="filecoin">
           <Section
-            title="Filecoin"
             action={
               <Button
                 type="button"
@@ -430,7 +429,7 @@ function SettingsPage() {
                   data-icon="inline-start"
                   className={filecoinPreflight.isPending ? 'animate-spin' : undefined}
                 />
-                Run preflight
+                Check settings
               </Button>
             }
           >
@@ -551,7 +550,7 @@ function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="cache">
-          <Section title="Cache">
+          <Section>
             <div className="grid gap-4 md:grid-cols-2">
               <TextField
                 label="Directory"
@@ -620,7 +619,7 @@ function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="logging">
-          <Section title="Logging">
+          <Section>
             <div className="grid gap-4 md:grid-cols-2">
               <SelectField
                 label="Level"
@@ -678,8 +677,11 @@ function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="runtime">
-          <Section title="Runtime">
+          <Section>
             <div className="grid gap-4 md:grid-cols-2">
+              <div className="md:col-span-2">
+                <SettingsValueField label="Config file" value={data.config_path} copy mono />
+              </div>
               <ReadOnlyRow data={data} field="database.driver" value={data.manual.database.driver} />
               <ReadOnlyRow
                 data={data}
@@ -702,7 +704,7 @@ function SettingsPage() {
       </Tabs>
 
       <FilecoinReadinessDialog
-        title="Filecoin preflight"
+        title="Filecoin settings check"
         data={preflightDetailData}
         open={Boolean(preflightDetailData)}
         onOpenChange={(open) => !open && setPreflightDetailData(null)}
@@ -716,7 +718,7 @@ function SettingsPage() {
             setPendingRiskChanges([])
           }
         }}
-        title={strongRiskConfirmation ? 'Save high-risk settings?' : 'Save reviewed settings?'}
+        title={strongRiskConfirmation ? 'Save high-risk settings' : 'Save reviewed settings'}
         description={
           strongRiskConfirmation
             ? 'Review these high-risk settings before saving. Type SAVE to confirm. Changes are written to the config file and may require a restart.'
@@ -751,7 +753,7 @@ function FilecoinPreflightSummary({
 
   const status = data?.status ?? 'unknown'
   const label = pending ? 'Checking' : filecoinReadinessStatusLabel(status)
-  const summary = pending ? 'Checking draft Filecoin settings...' : error?.message || filecoinReadinessSummary(data)
+  const summary = pending ? 'Checking unsaved Filecoin settings…' : error?.message || filecoinReadinessSummary(data)
 
   return (
     <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2">
@@ -951,7 +953,7 @@ function TaskWorkerSection({
   onChange: (value: SettingsEditableConfig['worker']['tasks']) => void
 }) {
   return (
-    <Section title="Task engine">
+    <Section>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <NumberField
           label="Task concurrency"

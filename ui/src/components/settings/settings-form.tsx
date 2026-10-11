@@ -3,7 +3,6 @@ import { type ReactNode, useId } from 'react'
 import type { SettingsData } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { StatusBadge } from '@/components/app/StatusBadge'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -11,61 +10,27 @@ import { Field, FieldDescription, FieldError, FieldLabel, FieldTitle } from '@/c
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { cn } from '@/lib/utils'
 
+/** A settings card. Omit the title when the surrounding tab already names it. */
 export function SettingsSection({
   title,
   action,
   children,
 }: {
-  title: string
+  title?: string
   action?: ReactNode
   children: ReactNode
 }) {
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        {action && <CardAction>{action}</CardAction>}
-      </CardHeader>
+      {(title || action) && (
+        <CardHeader>
+          {title && <CardTitle>{title}</CardTitle>}
+          {action && <CardAction>{action}</CardAction>}
+        </CardHeader>
+      )}
       <CardContent>{children}</CardContent>
     </Card>
-  )
-}
-
-const bannerToneClasses: Record<'warning' | 'danger' | 'success', { alert?: string; description?: string }> = {
-  warning: {
-    alert:
-      'border-[color:var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[color:var(--status-warning)]',
-    description: 'text-[color:var(--status-warning)]',
-  },
-  danger: {},
-  success: {
-    alert:
-      'border-[color:var(--status-success-border)] bg-[var(--status-success-bg)] text-[color:var(--status-success)]',
-    description: 'text-[color:var(--status-success)]',
-  },
-}
-
-export function SettingsBanner({
-  tone,
-  icon: Icon,
-  title,
-  children,
-}: {
-  tone: 'warning' | 'danger' | 'success'
-  icon: typeof AlertTriangle
-  title?: ReactNode
-  children: ReactNode
-}) {
-  const toneClass = bannerToneClasses[tone]
-
-  return (
-    <Alert variant={tone === 'danger' ? 'destructive' : 'default'} className={toneClass.alert}>
-      <Icon />
-      {title && <AlertTitle>{title}</AlertTitle>}
-      <AlertDescription className={cn(toneClass.description)}>{children}</AlertDescription>
-    </Alert>
   )
 }
 

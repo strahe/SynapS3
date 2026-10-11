@@ -124,5 +124,5 @@ test('data set storage health details include last error only for attention stat
 
 test('data set storage health refresh error message is visible', () => {
   assert.equal(dataSetStorageHealthRefreshErrorMessage(new Error('refresh failed')), 'refresh failed')
-  assert.equal(dataSetStorageHealthRefreshErrorMessage('bad'), 'Failed to refresh data set storage health')
+  assert.equal(dataSetStorageHealthRefreshErrorMessage('bad'), 'Could not check data set health')
 })

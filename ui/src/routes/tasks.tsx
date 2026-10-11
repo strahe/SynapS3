@@ -20,9 +20,8 @@ import { EmptyState, PageError } from '@/components/app/PageState'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
-import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog'
+import { TaskDetailsSheet } from '@/components/tasks/TaskDetailsSheet'
 import { TaskSubject } from '@/components/tasks/TaskSubject'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -149,10 +148,12 @@ function TasksPage() {
       toast.success(`Task ${id} acknowledged`)
       refreshTasks()
     },
+    onError: (error, id) => toast.error(`Could not acknowledge task ${id}`, { description: errorMessage(error) }),
   })
   const previewAcknowledgeAll = useMutation({
     mutationFn: api.previewAcknowledgeTasks,
     onSuccess: (preview, variables) => setAcknowledgeAllScope({ ...preview, type: variables.type }),
+    onError: (error) => toast.error('Could not count failed tasks', { description: errorMessage(error) }),
   })
   const acknowledgeAll = useMutation({
     mutationFn: api.acknowledgeTasks,
@@ -163,7 +164,6 @@ function TasksPage() {
       refreshTasks()
     },
   })
-  const actionError = retry.error ?? acknowledge.error ?? previewAcknowledgeAll.error
 
   const setFilters = (nextType: TaskOperationFilter, nextStatus: TaskStatusFilter, nextScope: TaskScope = scope) => {
     retry.reset()
@@ -282,18 +282,9 @@ function TasksPage() {
           </div>
         </div>
         <TabsContent value={scope} className="flex flex-col gap-6">
-          {actionError && (
-            <Alert variant="destructive">
-              <AlertTitle>Task action failed</AlertTitle>
-              <AlertDescription>
-                {retry.error ? taskRetryErrorMessage(retry.error) : errorMessage(actionError)}
-              </AlertDescription>
-            </Alert>
-          )}
-
           {tasks.error ? (
             <PageError
-              title="Failed to load tasks"
+              title="Could not load tasks"
               description={errorMessage(tasks.error)}
               onRetry={() => tasks.refetch()}
               retrying={tasks.isFetching}
@@ -309,7 +300,11 @@ function TasksPage() {
                 onOpen={setDetailTaskID}
                 onRetry={(id) => {
                   acknowledge.reset()
-                  retry.mutate(id, { onSuccess: () => toast.success(`Retry started for task ${id}`) })
+                  retry.mutate(id, {
+                    onSuccess: () => toast.success(`Retry started for task ${id}`),
+                    onError: (error) =>
+                      toast.error(`Could not retry task ${id}`, { description: taskRetryErrorMessage(error) }),
+                  })
                 }}
                 onAcknowledge={(id) => {
                   retry.reset()
@@ -333,7 +328,7 @@ function TasksPage() {
         </TabsContent>
       </Tabs>
 
-      <TaskDetailsDialog
+      <TaskDetailsSheet
         taskID={detailTaskID}
         onOpenChange={(open) => {
           if (!open) setDetailTaskID(null)
@@ -404,7 +399,7 @@ function TaskTable({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button type="button" className="cursor-help underline decoration-dotted underline-offset-4">
-                    Took
+                    Duration
                   </button>
                 </TooltipTrigger>
                 <TooltipContent className="max-w-72">
