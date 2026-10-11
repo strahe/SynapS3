@@ -185,7 +185,7 @@ function ProviderDetails({
           <Alert>
             <Info />
             <AlertTitle>No health check recorded yet</AlertTitle>
-            <AlertDescription>Refresh this provider to check it now.</AlertDescription>
+            <AlertDescription>Use Check now to run a health check.</AlertDescription>
           </Alert>
         )}
         {provider && (
@@ -281,7 +281,7 @@ function ProviderActions({
           onClick={() => refreshProvider.mutate(providerID)}
         >
           <RefreshCw data-icon="inline-start" className={refreshProvider.isPending ? 'animate-spin' : undefined} />
-          Refresh provider
+          Check now
         </Button>
       </div>
       {provider?.upload_speed_test?.retry_unavailable_reason && (
@@ -301,7 +301,7 @@ function ProviderActions({
           Health check failed {timeAgo(refreshResult.health_result.attempted_at)}. The previous result remains visible.
         </p>
       )}
-      {refreshProvider.isError && <p className="text-xs text-destructive">Could not refresh this provider.</p>}
+      {refreshProvider.isError && <p className="text-xs text-destructive">Could not check this provider.</p>}
     </div>
   )
 }

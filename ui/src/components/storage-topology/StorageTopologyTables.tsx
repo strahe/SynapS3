@@ -9,6 +9,7 @@ import {
   RowDetailsButton,
   tableHeaderRowClassName,
 } from '@/components/app/DataTable'
+import { PageError } from '@/components/app/PageState'
 import { ProviderUploadSpeedButton } from '@/components/app/ProviderUploadSpeedButton'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
@@ -39,6 +40,7 @@ export function ProvidersTableCard({
   error,
   contextNote,
   onPageChange,
+  onRetry,
   onSelect,
   onTestUploadSpeed,
   testingProviderID,
@@ -51,22 +53,25 @@ export function ProvidersTableCard({
   error?: string
   contextNote?: string
   onPageChange: (page: number) => void
+  onRetry: () => void
   onSelect: (item: StorageTopologyProviderRow) => void
   onTestUploadSpeed: (providerID: string) => void
   testingProviderID?: string
 }) {
+  if (error) return <PageError title="Could not load providers" description={error} onRetry={onRetry} />
+
   return (
     <div className="flex flex-col gap-3">
       <DataTableFrame>
         <Table className="min-w-[820px]">
           <TableHeader>
             <TableRow className={tableHeaderRowClassName}>
-              <TableHead className="whitespace-nowrap px-3 py-2">Provider</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Health</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">FWSS</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Service URL</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Checked</TableHead>
-              <TableHead className="w-10 px-3 py-2">
+              <TableHead className="whitespace-nowrap px-4">Provider</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Health</TableHead>
+              <TableHead className="whitespace-nowrap px-4">FWSS</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Service URL</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Last checked</TableHead>
+              <TableHead className="w-10 px-4">
                 <span className="sr-only">Details</span>
               </TableHead>
             </TableRow>
@@ -74,17 +79,15 @@ export function ProvidersTableCard({
           <TableBody>
             {loading ? (
               <InventoryLoadingRow colSpan={6} />
-            ) : error ? (
-              <InventoryErrorRow colSpan={6} message={error} />
             ) : rows.length > 0 ? (
               rows.map((row) => {
                 const name = providerDisplayName(row.providerID, row.provider?.provider_profile?.name)
                 return (
                   <TableRow key={row.providerID} {...clickableRowProps(() => onSelect(row))}>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-4">
                       <ProviderNameCell providerID={row.providerID} profile={row.provider?.provider_profile} />
                     </TableCell>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-4">
                       <ProviderHealthCell
                         row={row}
                         name={name}
@@ -92,10 +95,10 @@ export function ProvidersTableCard({
                         onTest={() => onTestUploadSpeed(row.providerID)}
                       />
                     </TableCell>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-4">
                       <ProviderTierBadges profile={row.provider?.provider_profile} />
                     </TableCell>
-                    <TableCell className="max-w-72 px-3 py-2 text-muted-foreground">
+                    <TableCell className="max-w-72 px-4 text-muted-foreground">
                       <OptionalCopyableValue
                         label="Service URL"
                         value={formatOptionalTopologyText(row.provider?.facts.service_url)}
@@ -103,10 +106,10 @@ export function ProvidersTableCard({
                         maxLength={36}
                       />
                     </TableCell>
-                    <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                    <TableCell className="whitespace-nowrap px-4 text-muted-foreground">
                       {row.freshness ? freshnessLabel(row.freshness) : '—'}
                     </TableCell>
-                    <TableCell className="px-3 py-2 text-right">
+                    <TableCell className="px-4 text-right">
                       <RowDetailsButton label={name} onClick={() => onSelect(row)} />
                     </TableCell>
                   </TableRow>
@@ -116,7 +119,7 @@ export function ProvidersTableCard({
               <InventoryEmptyRow
                 colSpan={6}
                 title="No providers found"
-                description="No provider observations match the current filters."
+                description="No providers match the current filters."
               />
             )}
           </TableBody>
@@ -232,6 +235,7 @@ export function DataSetsTableCard({
   loading,
   error,
   onPageChange,
+  onRetry,
   onSelect,
 }: {
   dataSets: ObservabilityDataSetObservation[]
@@ -243,23 +247,26 @@ export function DataSetsTableCard({
   loading?: boolean
   error?: string
   onPageChange: (page: number) => void
+  onRetry: () => void
   onSelect: (item: ObservabilityDataSetObservation) => void
 }) {
+  if (error) return <PageError title="Could not load data sets" description={error} onRetry={onRetry} />
+
   return (
     <div className="flex flex-col gap-3">
       <DataTableFrame>
         <Table className="min-w-[860px]">
           <TableHeader>
             <TableRow className={tableHeaderRowClassName}>
-              <TableHead className="whitespace-nowrap px-3 py-2">Bucket</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Replica</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Provider</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Data set</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Local status</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Health</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2 text-right">Pieces</TableHead>
-              <TableHead className="whitespace-nowrap px-3 py-2">Checked</TableHead>
-              <TableHead className="w-10 px-3 py-2">
+              <TableHead className="whitespace-nowrap px-4">Bucket</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Replica</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Provider</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Data set</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Local status</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Health</TableHead>
+              <TableHead className="whitespace-nowrap px-4 text-right">Pieces</TableHead>
+              <TableHead className="whitespace-nowrap px-4">Last checked</TableHead>
+              <TableHead className="w-10 px-4">
                 <span className="sr-only">Details</span>
               </TableHead>
             </TableRow>
@@ -267,12 +274,10 @@ export function DataSetsTableCard({
           <TableBody>
             {loading ? (
               <InventoryLoadingRow colSpan={9} />
-            ) : error ? (
-              <InventoryErrorRow colSpan={9} message={error} />
             ) : dataSets.length > 0 ? (
               dataSets.map((dataSet) => (
                 <TableRow key={dataSet.facts.local_data_set_id} {...clickableRowProps(() => onSelect(dataSet))}>
-                  <TableCell className="whitespace-nowrap px-3 py-2">
+                  <TableCell className="whitespace-nowrap px-4">
                     <Link
                       to="/buckets/$name"
                       params={{ name: dataSet.facts.bucket_name }}
@@ -281,20 +286,18 @@ export function DataSetsTableCard({
                       {dataSet.facts.bucket_name}
                     </Link>
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2">
-                    {replicaLabel(dataSet.facts.copy_index)}
-                  </TableCell>
-                  <TableCell className="px-3 py-2">
+                  <TableCell className="whitespace-nowrap px-4">{replicaLabel(dataSet.facts.copy_index)}</TableCell>
+                  <TableCell className="px-4">
                     <ProviderNameCell
                       providerID={dataSet.facts.provider_id}
                       profile={providersByID.get(dataSet.facts.provider_id)?.provider_profile}
                       showLocation={false}
                     />
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2">
+                  <TableCell className="whitespace-nowrap px-4">
                     <OptionalCopyableValue label="Chain data set" value={dataSetChainIDValue(dataSet)} />
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2">
+                  <TableCell className="whitespace-nowrap px-4">
                     <div className="flex items-center gap-2">
                       <StatusBadge tone={localStatusTone(dataSet.facts.local_status)}>
                         {localStatusLabel(dataSet.facts.local_status)}
@@ -304,16 +307,16 @@ export function DataSetsTableCard({
                       />
                     </div>
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2">
+                  <TableCell className="whitespace-nowrap px-4">
                     <TopologySignalBadge status={dataSet.signal.status} signal={dataSet.signal} />
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2 text-right">
+                  <TableCell className="whitespace-nowrap px-4 text-right">
                     {activePiecesValue(dataSet.facts)}
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                  <TableCell className="whitespace-nowrap px-4 text-muted-foreground">
                     {freshnessLabel(dataSet.signal.freshness)}
                   </TableCell>
-                  <TableCell className="px-3 py-2 text-right">
+                  <TableCell className="px-4 text-right">
                     <RowDetailsButton
                       label={`${dataSet.facts.bucket_name} ${replicaLabel(dataSet.facts.copy_index)}`}
                       onClick={() => onSelect(dataSet)}
@@ -325,7 +328,7 @@ export function DataSetsTableCard({
               <InventoryEmptyRow
                 colSpan={9}
                 title="No data sets found"
-                description="No data set observations match the current filters."
+                description="No data sets match the current filters."
               />
             )}
           </TableBody>
@@ -370,24 +373,6 @@ function InventoryLoadingRow({ colSpan }: { colSpan: number }) {
           <Skeleton className="h-5 w-5/6" />
           <Skeleton className="h-5 w-2/3" />
         </div>
-      </TableCell>
-    </TableRow>
-  )
-}
-
-function InventoryErrorRow({ colSpan, message }: { colSpan: number; message: string }) {
-  return (
-    <TableRow>
-      <TableCell colSpan={colSpan} className="h-60">
-        <Empty className="min-h-56 border">
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <Database />
-            </EmptyMedia>
-            <EmptyTitle>Failed to load observations</EmptyTitle>
-            <EmptyDescription>{message}</EmptyDescription>
-          </EmptyHeader>
-        </Empty>
       </TableCell>
     </TableRow>
   )

@@ -297,7 +297,7 @@ Subject lookup accepts `storage_content`, `storage_copy`, `storage_data_set`, `b
 
 `started_at` is when actual task work first began. Uploads start after waiting for storage resources and hashing the data, immediately before transfer. The field is omitted when work has not started or its start cannot be reliably determined, including tasks that finish without starting work. A new execution records its own actual start or recovery time. `started_at` and `finished_at` retain fractional seconds.
 
-Took measures actual start to finish, including later waits, retries, and recovery gaps. Pending and running tasks and tasks without a known start show no duration; acknowledgement does not change it. The Tasks page reads subjects only when their tooltip or popover opens.
+Duration measures actual start to finish, including later waits, retries, and recovery gaps. Pending and running tasks and tasks without a known start show no duration; acknowledgement does not change it. The Tasks page reads subjects only when their tooltip or popover opens.
 
 Bulk acknowledgement takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
 

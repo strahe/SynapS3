@@ -28,7 +28,7 @@ test('bucket copy policy text explains save result and future upload scope', () 
   )
   assert.equal(
     bucketCopyPolicySavedMessage(),
-    'Saved. New uploads use this replica target. Cache can be released after the selected count.'
+    'Replica policy saved. New uploads use this replica target. Cache can be released after the selected count.'
   )
   assert.equal(minimumDurableCopiesChoiceNote(), 'Keeps cache until every replica of that upload is stored.')
   assert.equal(minimumDurableCopiesFixedCountNote(), 'Keeps this count if Replicas later increases.')

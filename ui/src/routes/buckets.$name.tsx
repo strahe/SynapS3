@@ -20,7 +20,7 @@ import {
   Upload,
   UserRound,
 } from 'lucide-react'
-import { type ChangeEvent, Fragment, useEffect, useRef, useState } from 'react'
+import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   APIError,
@@ -179,7 +179,7 @@ import {
 } from '@/lib/provider-replacement'
 import { providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
 import { ownerLabel } from '@/lib/s3-owner'
-import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
+import { bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import {
   storageConfirmationAttentionView,
   storageConfirmationRetryNote,
@@ -255,7 +255,7 @@ function ObjectVersionsDialog({
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : versions.error ? (
-          <PageError title="Failed to load object versions" onRetry={() => versions.refetch()} />
+          <PageError title="Could not load object versions" onRetry={() => versions.refetch()} />
         ) : (
           <DataTableFrame>
             <Table className="table-fixed">
@@ -270,13 +270,13 @@ function ObjectVersionsDialog({
               </colgroup>
               <TableHeader>
                 <TableRow className={tableHeaderRowClassName}>
-                  <TableHead className="px-2">Version</TableHead>
-                  <TableHead className="px-2 text-right">Size</TableHead>
-                  <TableHead className="px-2">Location</TableHead>
-                  <TableHead className="px-2">ETag</TableHead>
-                  <TableHead className="px-2">Piece CID</TableHead>
-                  <TableHead className="px-2">Created</TableHead>
-                  <TableHead className="px-2 text-right">
+                  <TableHead className="px-3">Version</TableHead>
+                  <TableHead className="px-3 text-right">Size</TableHead>
+                  <TableHead className="px-3">Location</TableHead>
+                  <TableHead className="px-3">ETag</TableHead>
+                  <TableHead className="px-3">Piece CID</TableHead>
+                  <TableHead className="px-3">Created</TableHead>
+                  <TableHead className="px-3 text-right">
                     <span className="sr-only">Actions</span>
                   </TableHead>
                 </TableRow>
@@ -284,7 +284,7 @@ function ObjectVersionsDialog({
               <TableBody>
                 {versions.data?.versions.map((version) => (
                   <TableRow key={version.version_id}>
-                    <TableCell className="overflow-hidden px-2">
+                    <TableCell className="overflow-hidden px-3">
                       <div className="flex min-w-0 items-center gap-2">
                         <CopyableValue label="Version" value={version.version_id} monospace maxLength={22} />
                         {version.is_delete_marker ? (
@@ -308,24 +308,24 @@ function ObjectVersionsDialog({
                         )}
                       </div>
                     </TableCell>
-                    <TableCell className="overflow-hidden px-2 text-right">{formatBytes(version.size)}</TableCell>
-                    <TableCell className="overflow-hidden px-2">
+                    <TableCell className="overflow-hidden px-3 text-right">{formatBytes(version.size)}</TableCell>
+                    <TableCell className="overflow-hidden px-3">
                       <LocationBadges location={version.location} />
                     </TableCell>
-                    <TableCell className="overflow-hidden px-2 text-muted-foreground">
+                    <TableCell className="overflow-hidden px-3 text-muted-foreground">
                       <CopyableValue label="ETag" value={version.etag} monospace maxLength={22} />
                     </TableCell>
-                    <TableCell className="overflow-hidden px-2 text-muted-foreground">
+                    <TableCell className="overflow-hidden px-3 text-muted-foreground">
                       {version.piece_cid ? (
                         <CopyableValue label="Piece CID" value={version.piece_cid} monospace maxLength={24} />
                       ) : (
                         '—'
                       )}
                     </TableCell>
-                    <TableCell className="overflow-hidden truncate px-2 text-muted-foreground">
+                    <TableCell className="overflow-hidden truncate px-3 text-muted-foreground">
                       <RelativeTime value={version.created_at} />
                     </TableCell>
-                    <TableCell className="px-2 text-right">
+                    <TableCell className="px-3 text-right">
                       <VersionActions
                         bucketName={bucketName}
                         objectKey={objectKey}
@@ -409,7 +409,7 @@ function VersionActions({
       },
       {
         onSuccess: () => {
-          toast.success('Restored as a new current version')
+          toast.success('Version restored as the current version')
           setRestoreOpen(false)
           restore.reset()
           onVersionsChanged()
@@ -586,7 +586,7 @@ function ObjectProvenanceDialog({
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : provenance.error ? (
-          <PageError title="Failed to load provenance" onRetry={() => provenance.refetch()} />
+          <PageError title="Could not load provenance" onRetry={() => provenance.refetch()} />
         ) : data ? (
           <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
             <ProvenanceSummary data={data} />
@@ -798,7 +798,7 @@ function ObjectStatusIcon({
               {detail.isLoading
                 ? 'Loading issue details'
                 : detail.error
-                  ? 'Failed to load issue details'
+                  ? 'Could not load issue details'
                   : detail.data?.message
                     ? detail.data.message
                     : 'No issue details recorded'}
@@ -1027,34 +1027,28 @@ function ObjectBrowserPage() {
   return (
     <div className="flex flex-col gap-6 p-6">
       <div className="flex flex-col gap-2">
-        <BucketBreadcrumb
-          name={name}
-          pathCrumbs={browsing ? bucketPrefixCrumbs(prefix) : []}
-          navigateToPrefix={navigateToPrefix}
-        />
+        <BucketBreadcrumb name={name} />
         <PageHeader
           title={name}
           meta={
-            data && <StatusBadge tone={bucketStatusTone(data.status)}>{bucketStatusLabel(data.status)}</StatusBadge>
+            data && (
+              <>
+                <StatusBadge tone={bucketStatusTone(data.status)}>{bucketStatusLabel(data.status)}</StatusBadge>
+                <span className="inline-flex" title={bucketStorageHealthTitle(data.storage_health)}>
+                  <StatusBadge tone={bucketStorageHealthStatusTone(data.storage_health)}>
+                    {bucketStorageHealthLabel(data.storage_health)}
+                  </StatusBadge>
+                </span>
+              </>
+            )
           }
-          description={data && <BucketSummary bucket={data} />}
-          actions={
-            <>
-              <RefreshButton onClick={handleRefresh} refreshing={bucket.isFetching} />
-              {tab === 'objects' && (
-                <Button size="sm" onClick={() => setUploadOpen(true)} disabled={!canUpload}>
-                  <Upload data-icon="inline-start" />
-                  Upload
-                </Button>
-              )}
-            </>
-          }
+          actions={<RefreshButton onClick={handleRefresh} refreshing={bucket.isFetching} />}
         />
       </div>
 
       {bucket.error && (
         <PageError
-          title="Failed to load bucket details"
+          title="Could not load bucket details"
           description={bucket.error.message}
           onRetry={() => bucket.refetch()}
           retrying={bucket.isFetching}
@@ -1062,20 +1056,38 @@ function ObjectBrowserPage() {
       )}
 
       <Tabs value={tab} onValueChange={(value) => selectTab(value as BucketTab)} className="min-w-0 gap-6">
-        <TabsList className="max-w-full justify-start overflow-x-auto">
-          <TabsTrigger value="objects">Objects</TabsTrigger>
-          <TabsTrigger value="trash">Trash</TabsTrigger>
-          <TabsTrigger value="storage">Storage</TabsTrigger>
-          <TabsTrigger value="settings">Settings</TabsTrigger>
-        </TabsList>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <TabsList className="max-w-full justify-start overflow-x-auto">
+            <TabsTrigger value="objects">Objects</TabsTrigger>
+            <TabsTrigger value="trash">Trash</TabsTrigger>
+            <TabsTrigger value="storage">Storage</TabsTrigger>
+            <TabsTrigger value="settings">Settings</TabsTrigger>
+          </TabsList>
+          {data && <BucketSummary bucket={data} />}
+        </div>
         {/* Only the selected tab mounts, so one panel carries whichever view is open. */}
-        <TabsContent value={tab} className="min-w-0 text-base">
+        <TabsContent value={tab} className="flex min-w-0 flex-col gap-4 text-base">
+          {browsing && (tab === 'objects' || prefix !== '') && (
+            <ObjectPathToolbar
+              bucketName={name}
+              prefix={prefix}
+              navigateToPrefix={navigateToPrefix}
+              upload={
+                tab === 'objects' && (
+                  <Button size="sm" onClick={() => setUploadOpen(true)} disabled={!canUpload}>
+                    <Upload data-icon="inline-start" />
+                    Upload files
+                  </Button>
+                )
+              }
+            />
+          )}
           {tab === 'objects' ? (
             objects.isLoading ? (
               <TableSkeleton />
             ) : objects.error ? (
               <PageError
-                title="Failed to load objects"
+                title="Could not load objects"
                 description={objects.error.message}
                 onRetry={() => objects.refetch()}
                 retrying={objects.isFetching}
@@ -1099,7 +1111,7 @@ function ObjectBrowserPage() {
               <TableSkeleton />
             ) : deletedObjects.error ? (
               <PageError
-                title="Failed to load trash"
+                title="Could not load trash"
                 description={deletedObjects.error.message}
                 onRetry={() => deletedObjects.refetch()}
                 retrying={deletedObjects.isFetching}
@@ -1126,7 +1138,7 @@ function ObjectBrowserPage() {
                 <TableSkeleton />
               ) : storageRisk.error ? (
                 <PageError
-                  title="Failed to load affected versions"
+                  title="Could not load affected versions"
                   description={storageRisk.error.message}
                   onRetry={() => storageRisk.refetch()}
                   retrying={storageRisk.isFetching}
@@ -1185,9 +1197,8 @@ function ObjectBrowserPage() {
 
 function BucketSummary({ bucket }: { bucket: BucketDetail }) {
   const { data: users = [] } = useS3Users()
-  const health = bucket.storage_health
   return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
       <span>{formatObjectCount(bucket.object_count)}</span>
       <span aria-hidden="true">·</span>
       <span>{formatBytes(bucket.total_size_bytes)}</span>
@@ -1195,9 +1206,6 @@ function BucketSummary({ bucket }: { bucket: BucketDetail }) {
       <span>{bucketCopyPolicyLabel(bucket)}</span>
       <span aria-hidden="true">·</span>
       <span>Owner {ownerLabel(bucket.owner_access_key, users)}</span>
-      <span className="inline-flex" title={bucketStorageHealthTitle(health)}>
-        <StatusBadge tone={bucketStorageHealthStatusTone(health)}>{bucketStorageHealthLabel(health)}</StatusBadge>
-      </span>
     </div>
   )
 }
@@ -1337,7 +1345,7 @@ function UploadObjectsDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-3xl [&>*]:min-w-0">
         <DialogHeader>
-          <DialogTitle>Upload objects</DialogTitle>
+          <DialogTitle>Upload files</DialogTitle>
           <DialogDescription>
             Files upload to <span className="font-mono">{`${bucketName}/${prefix}`}</span>
           </DialogDescription>
@@ -1803,7 +1811,7 @@ function ReplaceProviderDialog({
                     disabled={refreshProvider.isPending}
                     onClick={() => refreshProvider.mutate(inspectedProvider.provider_id)}
                   >
-                    Refresh provider
+                    Check now
                   </Button>
 
                   {inspectedProvider.upload_speed_test?.retryable ? (
@@ -1825,7 +1833,7 @@ function ReplaceProviderDialog({
                   </p>
                 )}
                 {refreshProvider.isError && refreshProvider.variables === inspectedProvider.provider_id && (
-                  <p className="text-xs text-destructive">Could not refresh this provider. Try again.</p>
+                  <p className="text-xs text-destructive">Could not check this provider. Try again.</p>
                 )}
                 {refreshProvider.data?.provider_id === inspectedProvider.provider_id &&
                   !refreshProvider.data.profile_result.success && (
@@ -1893,15 +1901,20 @@ function ProviderReplacementProgress({
   const active = activeReplacements(replacements)
   if (active.length === 0) return null
   return (
-    <div className="flex flex-col gap-3">
-      {active.map((replacement) => (
-        <ProviderReplacementProgressCard
-          key={replacement.id}
-          replacement={replacement}
-          onOpenLastError={onOpenLastError}
-        />
-      ))}
-    </div>
+    <Card size="sm">
+      <CardHeader>
+        <CardTitle>Provider replacements</CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {active.map((replacement) => (
+          <ProviderReplacementProgressCard
+            key={replacement.id}
+            replacement={replacement}
+            onOpenLastError={onOpenLastError}
+          />
+        ))}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -1971,6 +1984,7 @@ function BucketStorageHealthPanel({
 }) {
   const lastError = health.last_error
   const hasAffectedVersions = !lastError && health.affected_versions_capped > 0
+  const observation = bucketStorageHealthObservationLabel(health)
 
   return (
     <Card size="sm">
@@ -1981,16 +1995,18 @@ function BucketStorageHealthPanel({
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
-        <DetailGrid className="@xl:grid-cols-4">
-          <DetailField label="Retained versions at risk">
-            <span title="Capped list triage count, not a diagnostic total">
-              {bucketStorageHealthAffectedVersionsLabel(health)}
-            </span>
-          </DetailField>
+        <DetailGrid>
+          <DetailField label="Versions at risk">{bucketStorageHealthAffectedVersionsLabel(health)}</DetailField>
           <DetailField label="Data sets with issues">{formatNumber(health.abnormal_data_sets)}</DetailField>
-          <DetailField label="Observation">{bucketStorageHealthObservationLabel(health)}</DetailField>
-          <DetailField label="Checked">
-            {health.last_checked_at ? <RelativeTime value={health.last_checked_at} /> : 'Not checked'}
+          <DetailField label="Last checked">
+            {health.last_checked_at ? (
+              <>
+                <RelativeTime value={health.last_checked_at} />
+                {observation !== 'Fresh' && ` · ${observation}`}
+              </>
+            ) : (
+              observation
+            )}
           </DetailField>
         </DetailGrid>
         {(lastError || hasAffectedVersions) && (
@@ -2039,151 +2055,162 @@ function BucketStorageDataSets({
   }
 
   return (
-    <DataTableFrame>
-      <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-4 py-2">
-        <h2 className="text-sm font-semibold">Data sets</h2>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={refreshStorageHealth.isPending}
-          onClick={() => {
-            setRefreshError(null)
-            refreshStorageHealth.mutate(
-              { bucket: bucketName },
-              {
-                onSuccess: () => setRefreshError(null),
-                onError: (error) => setRefreshError(dataSetStorageHealthRefreshErrorMessage(error)),
-              }
-            )
-          }}
-        >
-          <RefreshCw data-icon="inline-start" className={refreshStorageHealth.isPending ? 'animate-spin' : undefined} />
-          Refresh
-        </Button>
-      </div>
-      {refreshError && (
-        <div className="flex items-start gap-2 border-b border-border px-4 py-2 text-sm text-destructive">
-          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
-          <span>{refreshError}</span>
-        </div>
-      )}
-      <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
-        <Table className="min-w-[860px] table-fixed">
-          <TableHeader>
-            <TableRow className={tableHeaderRowClassName}>
-              <TableHead className="w-[10%] px-3">Replica</TableHead>
-              <TableHead className="w-[18%] px-3">Provider</TableHead>
-              <TableHead className="w-[12%] px-3">Data set</TableHead>
-              <TableHead className="w-[19%] px-3">Storage health</TableHead>
-              <TableHead className="w-[17%] px-3">Impact</TableHead>
-              <TableHead
-                className="w-[8%] px-2 text-right"
-                aria-label="Current object versions referencing this data set"
-              >
-                Current
-              </TableHead>
-              <TableHead
-                className="w-[9%] px-2 text-right"
-                aria-label="Total non-delete-marker versions referencing this data set"
-              >
-                Total
-              </TableHead>
-              <TableHead className="w-[6%] px-2 text-right">
-                <span className="sr-only">Actions</span>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {dataSets.map((dataSet) => {
-              const topologyLink = bucketStorageDataSetTopologyLinkModel(bucketName, dataSet)
-              const link = (
-                <Link
-                  to="/storage-topology"
-                  search={topologyLink.search}
-                  className="block min-w-0 max-w-full truncate font-mono text-xs hover:text-foreground hover:underline"
-                >
-                  {topologyLink.label}
-                </Link>
+    <Card size="sm">
+      <CardHeader>
+        <CardTitle>Data sets</CardTitle>
+        <CardAction>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={refreshStorageHealth.isPending}
+            onClick={() => {
+              setRefreshError(null)
+              refreshStorageHealth.mutate(
+                { bucket: bucketName },
+                {
+                  onSuccess: () => setRefreshError(null),
+                  onError: (error) => setRefreshError(dataSetStorageHealthRefreshErrorMessage(error)),
+                }
               )
-
-              return (
-                <TableRow key={dataSet.id}>
-                  <TableCell className="overflow-hidden px-3">
-                    <span className="block max-w-full truncate font-medium">{replicaLabel(dataSet.copy_index)}</span>
-                    <StatusBadge
-                      tone={dataSetGenerationTone(dataSet)}
-                      className="mt-1 max-w-full truncate"
-                      title={dataSetGenerationLabel(dataSet)}
-                    >
-                      {dataSetGenerationLabel(dataSet)}
-                    </StatusBadge>
-                  </TableCell>
-                  <TableCell className="overflow-hidden px-3">
-                    <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
-                  </TableCell>
-                  <TableCell className="overflow-hidden px-3 text-muted-foreground">
-                    {topologyLink.copyValue ? (
-                      <CopyableValue label="Data set ID" value={topologyLink.copyValue} monospace maxLength={24}>
-                        {link}
-                      </CopyableValue>
-                    ) : (
-                      link
-                    )}
-                  </TableCell>
-                  <TableCell className="overflow-hidden px-3">
-                    <DataSetStorageHealthCell dataSet={dataSet} />
-                    {dataSetSetupMessage(dataSet) && (
-                      <p
-                        className="mt-1 truncate text-xs text-muted-foreground"
-                        title={dataSetSetupMessage(dataSet) ?? undefined}
-                      >
-                        {dataSetSetupMessage(dataSet)}
-                      </p>
-                    )}
-                  </TableCell>
-                  <TableCell className="overflow-hidden px-3">
-                    <DataSetImpactCell dataSet={dataSet} />
-                  </TableCell>
-                  <TableCell
-                    className="px-2 text-right text-muted-foreground"
-                    aria-label={`Current object versions referencing this data set: ${formatNumber(dataSet.current_version_count)}`}
-                    title="Current object versions referencing this data set"
+            }}
+          >
+            <RefreshCw
+              data-icon="inline-start"
+              className={refreshStorageHealth.isPending ? 'animate-spin' : undefined}
+            />
+            Check now
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {refreshError && (
+          <div className="flex items-start gap-2 text-sm text-destructive">
+            <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+            <span>{refreshError}</span>
+          </div>
+        )}
+        <DataTableFrame>
+          <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
+            <Table className="min-w-[860px] table-fixed">
+              <TableHeader>
+                <TableRow className={tableHeaderRowClassName}>
+                  <TableHead className="w-[10%] px-4">Replica</TableHead>
+                  <TableHead className="w-[18%] px-4">Provider</TableHead>
+                  <TableHead className="w-[12%] px-4">Data set</TableHead>
+                  <TableHead className="w-[19%] px-4">Storage health</TableHead>
+                  <TableHead className="w-[17%] px-4">Impact</TableHead>
+                  <TableHead
+                    className="w-[8%] px-2 text-right"
+                    aria-label="Current object versions referencing this data set"
                   >
-                    {formatNumber(dataSet.current_version_count)}
-                  </TableCell>
-                  <TableCell
-                    className="px-2 text-right text-muted-foreground"
-                    aria-label={`Total non-delete-marker versions referencing this data set: ${formatNumber(dataSet.referenced_version_count)}`}
-                    title="Total non-delete-marker versions referencing this data set"
+                    Current
+                  </TableHead>
+                  <TableHead
+                    className="w-[9%] px-2 text-right"
+                    aria-label="Total non-delete-marker versions referencing this data set"
                   >
-                    {formatNumber(dataSet.referenced_version_count)}
-                  </TableCell>
-                  <TableCell className="px-2 text-right">
-                    {(dataSetNeedsStorageRiskReview(dataSet) || dataSet.replaceable) && (
-                      <RowActionsMenu label={replicaLabel(dataSet.copy_index)}>
-                        {dataSetNeedsStorageRiskReview(dataSet) && (
-                          <RowActionItem onSelect={() => onReviewStorageRisk(dataSet.id)}>
-                            <TriangleAlert data-icon="inline-start" />
-                            Review affected versions
-                          </RowActionItem>
-                        )}
-                        {dataSet.replaceable && (
-                          <RowActionItem onSelect={() => onReplaceProvider(dataSet)}>
-                            <Repeat2 data-icon="inline-start" />
-                            Replace provider
-                          </RowActionItem>
-                        )}
-                      </RowActionsMenu>
-                    )}
-                  </TableCell>
+                    Total
+                  </TableHead>
+                  <TableHead className="w-[6%] px-4 text-right">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
                 </TableRow>
-              )
-            })}
-          </TableBody>
-        </Table>
-      </div>
-    </DataTableFrame>
+              </TableHeader>
+              <TableBody>
+                {dataSets.map((dataSet) => {
+                  const topologyLink = bucketStorageDataSetTopologyLinkModel(bucketName, dataSet)
+                  const link = (
+                    <Link
+                      to="/storage-topology"
+                      search={topologyLink.search}
+                      className="block min-w-0 max-w-full truncate font-mono text-xs hover:text-foreground hover:underline"
+                    >
+                      {topologyLink.label}
+                    </Link>
+                  )
+
+                  return (
+                    <TableRow key={dataSet.id}>
+                      <TableCell className="overflow-hidden px-4">
+                        <span className="block max-w-full truncate font-medium">
+                          {replicaLabel(dataSet.copy_index)}
+                        </span>
+                        <StatusBadge
+                          tone={dataSetGenerationTone(dataSet)}
+                          className="mt-1 max-w-full truncate"
+                          title={dataSetGenerationLabel(dataSet)}
+                        >
+                          {dataSetGenerationLabel(dataSet)}
+                        </StatusBadge>
+                      </TableCell>
+                      <TableCell className="overflow-hidden px-4">
+                        <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
+                      </TableCell>
+                      <TableCell className="overflow-hidden px-4 text-muted-foreground">
+                        {topologyLink.copyValue ? (
+                          <CopyableValue label="Data set ID" value={topologyLink.copyValue} monospace maxLength={24}>
+                            {link}
+                          </CopyableValue>
+                        ) : (
+                          link
+                        )}
+                      </TableCell>
+                      <TableCell className="overflow-hidden px-4">
+                        <DataSetStorageHealthCell dataSet={dataSet} />
+                        {dataSetSetupMessage(dataSet) && (
+                          <p
+                            className="mt-1 truncate text-xs text-muted-foreground"
+                            title={dataSetSetupMessage(dataSet) ?? undefined}
+                          >
+                            {dataSetSetupMessage(dataSet)}
+                          </p>
+                        )}
+                      </TableCell>
+                      <TableCell className="overflow-hidden px-4">
+                        <DataSetImpactCell dataSet={dataSet} />
+                      </TableCell>
+                      <TableCell
+                        className="px-2 text-right text-muted-foreground"
+                        aria-label={`Current object versions referencing this data set: ${formatNumber(dataSet.current_version_count)}`}
+                        title="Current object versions referencing this data set"
+                      >
+                        {formatNumber(dataSet.current_version_count)}
+                      </TableCell>
+                      <TableCell
+                        className="px-2 text-right text-muted-foreground"
+                        aria-label={`Total non-delete-marker versions referencing this data set: ${formatNumber(dataSet.referenced_version_count)}`}
+                        title="Total non-delete-marker versions referencing this data set"
+                      >
+                        {formatNumber(dataSet.referenced_version_count)}
+                      </TableCell>
+                      <TableCell className="px-4 text-right">
+                        {(dataSetNeedsStorageRiskReview(dataSet) || dataSet.replaceable) && (
+                          <RowActionsMenu label={replicaLabel(dataSet.copy_index)}>
+                            {dataSetNeedsStorageRiskReview(dataSet) && (
+                              <RowActionItem onSelect={() => onReviewStorageRisk(dataSet.id)}>
+                                <TriangleAlert data-icon="inline-start" />
+                                Review affected versions
+                              </RowActionItem>
+                            )}
+                            {dataSet.replaceable && (
+                              <RowActionItem onSelect={() => onReplaceProvider(dataSet)}>
+                                <Repeat2 data-icon="inline-start" />
+                                Replace provider
+                              </RowActionItem>
+                            )}
+                          </RowActionsMenu>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        </DataTableFrame>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -2253,9 +2280,6 @@ function BucketSettingsTab({ bucket }: { bucket: BucketDetail }) {
         <DetailGrid>
           <DetailField label="Name">
             <CopyableValue label="Bucket" value={bucket.name} />
-          </DetailField>
-          <DetailField label="Status">
-            <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucketStatusLabel(bucket.status)}</StatusBadge>
           </DetailField>
           <DetailField label="Versioning">{versioningStatusLabel(bucket.versioning_status)}</DetailField>
           <DetailField label="Provider preference">
@@ -2359,7 +2383,7 @@ function ReplicaPolicySection({ bucket }: { bucket: BucketDetail }) {
           toast.success(bucketCopyPolicySavedMessage())
         },
         onError: (mutationError) => {
-          setCopyPolicyError(mutationError instanceof Error ? mutationError.message : 'Failed to update replica policy')
+          setCopyPolicyError(mutationError instanceof Error ? mutationError.message : 'Could not update replica policy')
         },
       }
     )
@@ -2469,6 +2493,10 @@ function ObjectBrowserTable({
   navigateToPrefix: (prefix: string) => void
   onUpload?: () => void
 }) {
+  // The key outlives the open state so the dialog keeps its content while it closes.
+  const [versionsKey, setVersionsKey] = useState('')
+  const [versionsOpen, setVersionsOpen] = useState(false)
+
   if (folders.length === 0 && files.length === 0 && !hasPrevious) {
     return (
       <EmptyState
@@ -2524,7 +2552,13 @@ function ObjectBrowserTable({
               </TableRow>
             ))}
             {files.map((object) => (
-              <TableRow key={object.id}>
+              <TableRow
+                key={object.id}
+                {...clickableRowProps(() => {
+                  setVersionsKey(object.key)
+                  setVersionsOpen(true)
+                })}
+              >
                 <TableCell className="px-4">
                   <div className="flex min-w-0 items-center gap-1.5">
                     <FileIcon className="size-4 shrink-0 text-muted-foreground" />
@@ -2570,6 +2604,12 @@ function ObjectBrowserTable({
         hasNext={Boolean(nextMarker)}
         onPrevious={onPrevious}
         onNext={() => nextMarker && onNext(nextMarker)}
+      />
+      <ObjectVersionsDialog
+        bucketName={bucketName}
+        objectKey={versionsKey}
+        open={versionsOpen}
+        onOpenChange={setVersionsOpen}
       />
     </div>
   )
@@ -2730,7 +2770,7 @@ function PermanentDeleteDeletedObjectDialog({
       { name: bucketName, key: object.key, deleteMarkerVersionID: object.delete_marker_version_id },
       {
         onSuccess: () => {
-          toast.success(`Permanently deleted ${object.key}`)
+          toast.success(`${object.key} permanently deleted`)
           handleOpenChange(false)
         },
       }
@@ -2781,7 +2821,7 @@ function RestoreDeletedObjectDialog({
       { name: bucketName, key: object.key, deleteMarkerVersionID: object.delete_marker_version_id },
       {
         onSuccess: () => {
-          toast.success(`Restored ${object.key}`)
+          toast.success(`${object.key} restored`)
           handleOpenChange(false)
         },
       }
@@ -2838,7 +2878,7 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
       { name: bucketName, key: object.key },
       {
         onSuccess: () => {
-          toast.success(`Moved ${object.key} to Trash`)
+          toast.success(`${object.key} moved to Trash`)
           setDeleteOpen(false)
           deleteObject.reset()
         },
@@ -2919,15 +2959,7 @@ function objectDisplayName(key: string, prefix: string) {
   return name || key
 }
 
-function BucketBreadcrumb({
-  name,
-  pathCrumbs,
-  navigateToPrefix,
-}: {
-  name: string
-  pathCrumbs: BucketPrefixCrumb[]
-  navigateToPrefix: (prefix: string) => void
-}) {
+function BucketBreadcrumb({ name }: { name: string }) {
   return (
     <Breadcrumb>
       <BreadcrumbList>
@@ -2938,47 +2970,75 @@ function BucketBreadcrumb({
         </BreadcrumbItem>
         <BreadcrumbSeparator />
         <BreadcrumbItem>
-          {pathCrumbs.length > 0 ? (
-            <BreadcrumbLink asChild>
-              <Button
-                type="button"
-                variant="link"
-                className="h-auto p-0 text-sm font-normal"
-                onClick={() => navigateToPrefix('')}
-              >
-                {name}
-              </Button>
-            </BreadcrumbLink>
-          ) : (
-            <BreadcrumbCurrentPage>{name}</BreadcrumbCurrentPage>
-          )}
+          <BreadcrumbCurrentPage>{name}</BreadcrumbCurrentPage>
         </BreadcrumbItem>
-        {pathCrumbs.map((crumb, index) => {
-          const isLast = index === pathCrumbs.length - 1
-
-          return (
-            <Fragment key={crumb.prefix}>
-              <BreadcrumbSeparator />
-              <BreadcrumbItem>
-                {isLast ? (
-                  <BreadcrumbCurrentPage>{crumb.label}</BreadcrumbCurrentPage>
-                ) : (
-                  <BreadcrumbLink asChild>
-                    <Button
-                      type="button"
-                      variant="link"
-                      className="h-auto p-0 text-sm font-normal"
-                      onClick={() => navigateToPrefix(crumb.prefix)}
-                    >
-                      {crumb.label}
-                    </Button>
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </Fragment>
-          )
-        })}
       </BreadcrumbList>
     </Breadcrumb>
+  )
+}
+
+/** The folder path being browsed, with the tab's own action beside it. */
+function ObjectPathToolbar({
+  bucketName,
+  prefix,
+  navigateToPrefix,
+  upload,
+}: {
+  bucketName: string
+  prefix: string
+  navigateToPrefix: (prefix: string) => void
+  upload?: ReactNode
+}) {
+  const pathCrumbs = bucketPrefixCrumbs(prefix)
+
+  return (
+    <div className="flex min-h-8 flex-wrap items-center justify-between gap-3">
+      <Breadcrumb className="min-w-0">
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            {pathCrumbs.length > 0 ? (
+              <BreadcrumbLink asChild>
+                <Button
+                  type="button"
+                  variant="link"
+                  className="h-auto p-0 text-sm font-normal"
+                  onClick={() => navigateToPrefix('')}
+                >
+                  {bucketName}
+                </Button>
+              </BreadcrumbLink>
+            ) : (
+              <BreadcrumbCurrentPage>{bucketName}</BreadcrumbCurrentPage>
+            )}
+          </BreadcrumbItem>
+          {pathCrumbs.map((crumb, index) => {
+            const isLast = index === pathCrumbs.length - 1
+
+            return (
+              <Fragment key={crumb.prefix}>
+                <BreadcrumbSeparator />
+                <BreadcrumbItem>
+                  {isLast ? (
+                    <BreadcrumbCurrentPage>{crumb.label}</BreadcrumbCurrentPage>
+                  ) : (
+                    <BreadcrumbLink asChild>
+                      <Button
+                        type="button"
+                        variant="link"
+                        className="h-auto p-0 text-sm font-normal"
+                        onClick={() => navigateToPrefix(crumb.prefix)}
+                      >
+                        {crumb.label}
+                      </Button>
+                    </BreadcrumbLink>
+                  )}
+                </BreadcrumbItem>
+              </Fragment>
+            )
+          })}
+        </BreadcrumbList>
+      </Breadcrumb>
+      {upload}
+    </div>
   )
 }

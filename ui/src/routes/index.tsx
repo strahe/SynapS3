@@ -47,7 +47,7 @@ function OverviewPage() {
           <PageLoading />
         ) : (
           <PageError
-            title="Failed to load overview"
+            title="Could not load overview"
             description={error?.message}
             onRetry={() => refetch()}
             retrying={isFetching}
@@ -73,7 +73,7 @@ function OverviewPage() {
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard icon={Database} label="Buckets" value={formatNumber(data.buckets.total)} to="/buckets" />
         <StatCard icon={FileBox} label="Objects" value={formatNumber(data.objects.total)} />
-        <StatCard icon={HardDrive} label="Storage" value={formatBytes(data.objects.total_size_bytes)} />
+        <StatCard icon={HardDrive} label="Stored data" value={formatBytes(data.objects.total_size_bytes)} />
         <StatCard
           icon={MemoryStick}
           label="Cache"
@@ -225,7 +225,7 @@ function StorageHealthCard({ health }: { health: OverviewData['filecoin_storage_
                 <InlineMetric label="Unknown" value={dataSets.unknown} />
               </div>
               <div className="ml-auto">
-                <CompactMetric label="Checked" value={filecoinStorageHealthCheckedLabel(health)} align="end" />
+                <CompactMetric label="Last checked" value={filecoinStorageHealthCheckedLabel(health)} align="end" />
               </div>
             </div>
           </div>

@@ -117,7 +117,7 @@ export function BucketOwnerDialog({
               {users.length === 0 && !usersLoading && (
                 <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
               )}
-              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
+              {usersError && <FieldError>Could not load S3 users.</FieldError>}
             </Field>
           </FieldGroup>
         )}

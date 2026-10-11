@@ -2,13 +2,14 @@ import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { TriangleAlert } from 'lucide-react'
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
+import { toast } from 'sonner'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
+import { Banner } from '@/components/app/Banner'
 import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
 import { PageError } from '@/components/app/PageState'
 import { TopologyDetailSheet } from '@/components/storage-topology/StorageTopologyDetailSheet'
 import { DataSetsTableCard, ProvidersTableCard } from '@/components/storage-topology/StorageTopologyTables'
 import { type StorageTopologyTab, StorageTopologyToolbar } from '@/components/storage-topology/StorageTopologyToolbar'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useObservabilityDataSets, useObservabilityProviders, useTestProviderUploadSpeed } from '@/hooks/queries'
 import { providerDisplayName } from '@/lib/provider-display'
@@ -119,7 +120,6 @@ function StorageTopologyPage() {
   const [dataSetPage, setDataSetPage] = useState(1)
   const [selection, setSelection] = useState<TopologySelectionState | null>(null)
   const [pinnedContext, setPinnedContext] = useState<PinnedTopologyContext | null>(null)
-  const [uploadSpeedTestError, setUploadSpeedTestError] = useState<string | null>(null)
   const testProviderUploadSpeed = useTestProviderUploadSpeed()
   const selectionProviderID = search.selection_provider ?? observabilityProviderParam(filters.provider)
   const selectionBucketName = search.selection_bucket ?? observabilityBucketParam(filters.bucket)
@@ -458,23 +458,25 @@ function StorageTopologyPage() {
   }
 
   function startProviderUploadSpeedTest(providerID: string) {
-    setUploadSpeedTestError(null)
     const providerName = providerDisplayName(providerID, detailProvidersByID.get(providerID)?.provider_profile?.name)
     testProviderUploadSpeed.mutate(providerID, {
-      onError: (error) => setUploadSpeedTestError(providerUploadSpeedTestErrorMessage(error, providerName)),
+      onError: (error) =>
+        toast.error('Upload speed test not started', {
+          description: providerUploadSpeedTestErrorMessage(error, providerName),
+        }),
     })
   }
 
   const pageClassName =
     tab === 'topology'
-      ? 'flex h-[calc(100svh-3.5rem)] min-h-0 min-w-0 flex-col gap-6 overflow-hidden px-6 pt-6 pb-0 md:h-svh'
+      ? 'flex min-h-0 min-w-0 flex-1 flex-col gap-6 overflow-hidden px-6 pt-6 pb-0'
       : 'flex min-h-[calc(100vh-3rem)] min-w-0 flex-col gap-6 p-6'
 
   return (
-    <div className={pageClassName}>
+    <div className={pageClassName} data-fill-viewport={tab === 'topology' ? '' : undefined}>
       <PageHeader
         className="shrink-0"
-        title="Storage topology"
+        title="Storage"
         description={topologySummaryLabel(graph)}
         actions={<RefreshButton onClick={refreshObservability} refreshing={refreshing} />}
       />
@@ -494,13 +496,6 @@ function StorageTopologyPage() {
         <div className="shrink-0">
           <TopologyPartialAlert />
         </div>
-      )}
-
-      {tab === 'providers' && uploadSpeedTestError && (
-        <Alert variant="destructive">
-          <AlertTitle>Upload speed test not started</AlertTitle>
-          <AlertDescription>{uploadSpeedTestError}</AlertDescription>
-        </Alert>
       )}
 
       {snapshotLoading ? (
@@ -523,6 +518,7 @@ function StorageTopologyPage() {
           totalPages={providerTableTotalPages}
           loading={!providerInventoryUsesSnapshot && providerInventory.isLoading}
           error={!providerInventoryUsesSnapshot ? providerInventory.error?.message : undefined}
+          onRetry={() => void providerInventory.refetch()}
           contextNote={
             providerInventoryUsesSnapshot
               ? 'Bucket filter shows providers connected to the loaded topology snapshot.'
@@ -543,6 +539,7 @@ function StorageTopologyPage() {
           totalPages={dataSetTableTotalPages}
           loading={dataSetInventory.isLoading}
           error={dataSetInventory.error?.message}
+          onRetry={() => void dataSetInventory.refetch()}
           onPageChange={setDataSetPage}
           onSelect={selectDataSet}
         />
@@ -570,13 +567,9 @@ function StorageTopologyPage() {
 
 function TopologyPartialAlert() {
   return (
-    <Alert className="py-2">
-      <TriangleAlert className="size-4" />
-      <AlertTitle>Partial topology snapshot</AlertTitle>
-      <AlertDescription>
-        Topology is based on the first 500 observations. Some relationships and filter options may be missing.
-      </AlertDescription>
-    </Alert>
+    <Banner tone="warning" icon={TriangleAlert} title="Topology is incomplete">
+      It shows up to 500 providers and 500 data sets. Some links and filter options may be missing.
+    </Banner>
   )
 }
 
@@ -676,7 +669,7 @@ function TopologyLoading() {
 }
 
 function TopologyError({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return <PageError title="Failed to load storage topology" description={message} onRetry={onRetry} />
+  return <PageError title="Could not load storage topology" description={message} onRetry={onRetry} />
 }
 
 function sameStorageTopologySelectionState(left: TopologySelectionState | null, right: TopologySelectionState | null) {
