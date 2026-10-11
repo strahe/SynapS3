@@ -56,7 +56,7 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 				recover: func(context.Context, Execution) Result { return Complete("recovered", nil) },
 			}
 			harness = newTaskHarness(t, handler, nil)
-			row := enqueueTestTask(t, harness, "work-boundary", "work-boundary")
+			row := enqueueTestTask(t, harness, "work-boundary")
 			harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 			harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 			stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
@@ -70,6 +70,7 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	definition := testDefinition(nil, true)
 	definition.Type = model.TaskTypeObservabilityRefresh
+	definition.Codec, definition.Identity = CycleCodec, CycleIdentity("test-cycle")
 	definition.WorkStart = WorkStartOnHandler
 	calls := 0
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: func(context.Context, Execution) Result {
@@ -82,7 +83,7 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	if err := h.service.bootstrap(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	row, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "test-cycle:1")
+	row, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "system", "test-cycle", 1)
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	waiting, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	if waiting.WorkStartedAt == nil {
@@ -100,7 +101,7 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	if err := h.service.dispatchSchedules(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	next, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "test-cycle:2")
+	next, _ := h.repos.Tasks.GetByIdentity(t.Context(), definition.Type, "system", "test-cycle", 2)
 	if next == nil || next.WorkStartedAt != nil || next.RetryCount != 0 || next.ID <= row.ID {
 		t.Fatalf("new cycle: %#v", next)
 	}

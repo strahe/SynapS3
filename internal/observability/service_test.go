@@ -454,10 +454,6 @@ func TestServiceDataSetObservationSummaryUsesScopedInventoryForFilteredLists(t *
 }
 
 func TestServiceDataSetObservationsByLocalIDsBatchesLookups(t *testing.T) {
-	const sqliteBindParameterLimit = 999
-	if dataSetStateLookupBatchSize > sqliteBindParameterLimit {
-		t.Fatalf("data set state lookup batch size = %d, want <= %d", dataSetStateLookupBatchSize, sqliteBindParameterLimit)
-	}
 	const ids = dataSetStateLookupBatchSize + 3
 	store := &fakeStateStore{}
 	store.dataSets = make([]DataSetState, 0, ids)

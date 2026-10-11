@@ -238,8 +238,10 @@ func TestAPIObservabilityProvidersKeepsHealthWhenSpeedResultsFail(t *testing.T) 
 	}
 	var page struct {
 		Items []struct {
-			Facts           observability.ProviderFacts `json:"facts"`
-			UploadSpeedTest json.RawMessage             `json:"upload_speed_test"`
+			Facts                        observability.ProviderFacts `json:"facts"`
+			UploadSpeedTest              json.RawMessage             `json:"upload_speed_test"`
+			UploadSpeedTestable          bool                        `json:"upload_speed_testable"`
+			UploadSpeedUnavailableReason string                      `json:"upload_speed_unavailable_reason"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &page); err != nil {
@@ -248,10 +250,50 @@ func TestAPIObservabilityProvidersKeepsHealthWhenSpeedResultsFail(t *testing.T) 
 	if len(page.Items) != 1 || page.Items[0].Facts.ProviderID.String() != "101" || page.Items[0].UploadSpeedTest != nil {
 		t.Fatalf("provider page = %+v", page.Items)
 	}
+	if page.Items[0].UploadSpeedTestable || page.Items[0].UploadSpeedUnavailableReason == "" {
+		t.Fatalf("unavailable speed results allowed testing: %+v", page.Items[0])
+	}
+}
+
+func TestUploadSpeedAvailabilityUsesProviderEvidence(t *testing.T) {
+	serviceURL := "https://provider.example"
+	for _, scenario := range []string{"available", "profile missing", "stale", "inactive", "no pdp", "no url", "unhealthy", "url mismatch", "testing", "no observation"} {
+		t.Run(scenario, func(t *testing.T) {
+			observation := &observability.ProviderObservation{Facts: observability.ProviderFacts{Active: new(true), HasPDP: new(true), ServiceURL: &serviceURL}, Signal: observability.Signal{Status: observability.StatusAvailable}}
+			profile := &observability.ProviderProfile{ServiceURL: serviceURL}
+			var test *providerbenchmark.Result
+			switch scenario {
+			case "available":
+			case "profile missing":
+				profile = nil
+			case "stale":
+				observation.Signal.Freshness.Stale = true
+			case "inactive":
+				observation.Facts.Active = new(false)
+			case "no pdp":
+				observation.Facts.HasPDP = new(false)
+			case "no url":
+				observation.Facts.ServiceURL = nil
+			case "unhealthy":
+				observation.Signal.Status = observability.StatusDegraded
+			case "url mismatch":
+				profile.ServiceURL = "https://changed.example"
+			case "testing":
+				test = &providerbenchmark.Result{State: providerbenchmark.StateTesting}
+			case "no observation":
+				observation = nil
+			}
+			allowed, reason := uploadSpeedAvailability(observation, profile, test)
+			wantAllowed := scenario == "available" || scenario == "profile missing"
+			if allowed != wantAllowed || (reason == "") != wantAllowed {
+				t.Fatalf("availability=%v reason=%q", allowed, reason)
+			}
+		})
+	}
 }
 
 func TestAPIProviderUploadSpeedTestConcurrentAdmission(t *testing.T) {
-	db := testutil.NewTestFileDB(t)
+	db := testutil.NewTestDB(t)
 	db.SetMaxOpenConns(4)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Now().UTC()

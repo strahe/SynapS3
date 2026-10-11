@@ -53,7 +53,7 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 			return nil, err
 		}
 	}
-	prepared, err := s.service.prepare(EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input, SubjectType: dereference(source.SubjectType), SubjectKey: dereference(source.SubjectKey), AvailableAt: availableAt})
+	prepared, err := s.service.prepare(EnqueueRequest{Type: source.Type, Input: source.Input, AvailableAt: availableAt})
 	if err != nil {
 		return nil, err
 	}
@@ -72,8 +72,8 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 	if !created {
 		return nil, repository.ErrConflict
 	}
-	if definition.LegacyHandoff != nil {
-		if err := definition.LegacyHandoff(ctx, tx, source, next); err != nil {
+	if definition.BindSuccessor != nil {
+		if err := definition.BindSuccessor(ctx, tx, source, next); err != nil {
 			return nil, err
 		}
 	}

@@ -16,7 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 type BunStorageContentRepo struct {
@@ -551,7 +551,7 @@ func (r *BunStorageContentRepo) listBucketStorageHealthReasonCodes(ctx context.C
 		FROM abnormal_data_sets AS abnormal_data_set
 		WHERE %s
 		ORDER BY abnormal_data_set.bucket_id ASC`,
-		storageHealthEmptyJSONArraySQL(r.db),
+		storageHealthEmptyJSONArraySQL(),
 		dataSetBucketFilter,
 		storageHealthReadyDataSetStatusListSQL(),
 		storageHealthAbnormalObservationStatusListSQL(),
@@ -974,40 +974,52 @@ func (r *BunStorageContentRepo) RetireRejectedDataSet(ctx context.Context, stora
 }
 
 func (r *BunStorageContentRepo) CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error {
+	if len(copies) == 0 {
+		return nil
+	}
+	dataSetIDs := make([]int64, len(copies))
+	for i, input := range copies {
+		if input.ProviderID.IsZero() {
+			return fmt.Errorf("providerID is required: %w", ErrInvalidInput)
+		}
+		if !input.TransferMethod.Valid() {
+			return fmt.Errorf("transfer method %q: %w", input.TransferMethod, ErrInvalidInput)
+		}
+		dataSetIDs[i] = input.StorageDataSetID
+	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		for _, input := range copies {
-			if input.ProviderID.IsZero() {
-				return fmt.Errorf("providerID is required: %w", ErrInvalidInput)
-			}
-			if !input.TransferMethod.Valid() {
-				return fmt.Errorf("transfer method %q: %w", input.TransferMethod, ErrInvalidInput)
-			}
-			binding := new(model.StorageDataSet)
-			if err := db.NewSelect().
-				Model(binding).
-				Where("id = ?", input.StorageDataSetID).
-				Scan(ctx); err != nil {
-				return fmt.Errorf("loading storage data set for bound copy: %w", err)
+		var content struct {
+			BucketID    int64 `bun:"bucket_id"`
+			ContentSize int64 `bun:"content_size"`
+		}
+		if err := db.NewSelect().
+			Model((*model.StorageContent)(nil)).
+			Column("bucket_id", "content_size").
+			Where("id = ?", contentID).
+			Scan(ctx, &content); err != nil {
+			return fmt.Errorf("loading storage content for bound copy: %w", err)
+		}
+		var bindings []model.StorageDataSet
+		if err := db.NewSelect().Model(&bindings).Where("id IN (?)", bun.List(dataSetIDs)).Scan(ctx); err != nil {
+			return fmt.Errorf("loading storage data sets for bound copies: %w", err)
+		}
+		byID := make(map[int64]*model.StorageDataSet, len(bindings))
+		for i := range bindings {
+			byID[bindings[i].ID] = &bindings[i]
+		}
+		rows := make([]model.StorageCopy, len(copies))
+		for i, input := range copies {
+			binding := byID[input.StorageDataSetID]
+			if binding == nil {
+				return fmt.Errorf("loading storage data set %d for bound copy: %w", input.StorageDataSetID, sql.ErrNoRows)
 			}
 			if binding.CopyIndex != input.CopyIndex || binding.ProviderID.String() != input.ProviderID.String() {
 				return fmt.Errorf("storage copy binding identity does not match data set: %w", ErrConflict)
 			}
-			var content struct {
-				BucketID    int64 `bun:"bucket_id"`
-				ContentSize int64 `bun:"content_size"`
-			}
-			if err := db.NewSelect().
-				Model((*model.StorageContent)(nil)).
-				Column("bucket_id", "content_size").
-				Where("id = ?", contentID).
-				Scan(ctx, &content); err != nil {
-				return fmt.Errorf("loading storage content for bound copy: %w", err)
-			}
-			uploadBucketID := content.BucketID
-			if binding.BucketID != uploadBucketID {
+			if binding.BucketID != content.BucketID {
 				return fmt.Errorf("storage copy upload and data set belong to different buckets: %w", ErrConflict)
 			}
-			copyRow := &model.StorageCopy{
+			rows[i] = model.StorageCopy{
 				ContentID:        contentID,
 				BucketID:         binding.BucketID,
 				ContentSize:      content.ContentSize,
@@ -1017,14 +1029,15 @@ func (r *BunStorageContentRepo) CreateUploadCopiesForBindings(ctx context.Contex
 				Status:           model.StorageCopyStatusPending,
 				StorageDataSetID: input.StorageDataSetID,
 			}
-			// Copies are unique per concrete data set so one upload can hold both
-			// generations of a slot while a replacement migrates.
-			if _, err := db.NewInsert().
-				Model(copyRow).
-				On("CONFLICT (content_id, storage_data_set_id) DO NOTHING").
-				Exec(ctx); err != nil {
-				return fmt.Errorf("creating storage upload copy row: %w", err)
-			}
+		}
+		// Copies are unique per concrete data set so one upload can hold both
+		// generations of a slot while a replacement migrates.
+		if _, err := db.NewInsert().
+			Model(&rows).
+			On("CONFLICT (content_id, storage_data_set_id) DO NOTHING").
+			Returning("NULL").
+			Exec(ctx); err != nil {
+			return fmt.Errorf("creating storage upload copy rows: %w", err)
 		}
 		return nil
 	})
@@ -1536,7 +1549,7 @@ func countSubmittedCommitCopies(ctx context.Context, db bun.IDB, contentID int64
 	if err != nil {
 		return 0, fmt.Errorf("counting submitted storage commits: %w", err)
 	}
-	return count, nil
+	return int(count), nil
 }
 
 // selectObjectVersionRefsForContent lists the live data versions backed by one
@@ -1582,7 +1595,7 @@ func (r *BunStorageContentRepo) bindReadableContent(ctx context.Context, content
 		if content.BucketID != bucketID {
 			return fmt.Errorf("storage content %d belongs to bucket %d, not %d: %w", content.ID, content.BucketID, bucketID, ErrConflict)
 		}
-		if err := updateUploadReadable(ctx, db, contentID, derefString(content.PieceCID), time.Now()); err != nil {
+		if err := updateUploadsReadable(ctx, db, []int64{contentID}, []string{derefString(content.PieceCID)}, time.Now()); err != nil {
 			return err
 		}
 		refs, err = selectObjectVersionRefsForContent(ctx, db, contentID, versionID)
@@ -1772,20 +1785,12 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 // source under the same row lock, so work bound here cannot land on a
 // generation that stopped accepting writes after it was read.
 func lockCurrentDataSetBinding(ctx context.Context, db bun.IDB, id int64) (*model.StorageDataSet, error) {
-	res, err := db.NewUpdate().
-		Model((*model.StorageDataSet)(nil)).
-		Set("updated_at = updated_at").
-		Where("id = ? AND is_current", id).
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("locking storage data set binding %d: %w", id, err)
-	}
-	if rows, _ := res.RowsAffected(); rows != 1 {
-		return nil, fmt.Errorf("storage data set binding %d is no longer current: %w", id, ErrConflict)
-	}
 	binding := new(model.StorageDataSet)
-	if err := db.NewSelect().Model(binding).Where("id = ?", id).Scan(ctx); err != nil {
-		return nil, fmt.Errorf("loading locked storage data set binding %d: %w", id, err)
+	if err := db.NewSelect().Model(binding).Where("id = ? AND is_current", id).For("NO KEY UPDATE").Scan(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("storage data set binding %d is no longer current: %w", id, ErrConflict)
+		}
+		return nil, fmt.Errorf("locking storage data set binding %d: %w", id, err)
 	}
 	return binding, nil
 }
@@ -1814,9 +1819,7 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types
 	// the target, so a recovered service cannot become rejected again.
 	var replacements []storagereplacement.Replacement
 	lock := db.NewSelect().Model(&replacements).Column("id").Where("target_data_set_id = ?", id).OrderExpr("id ASC")
-	if db.Dialect().Name() == dialect.PG {
-		lock = lock.For("UPDATE")
-	}
+	lock = lock.For("UPDATE")
 	if err := lock.Scan(ctx); err != nil {
 		return fmt.Errorf("locking replacement for ready binding: %w", err)
 	}
@@ -1972,14 +1975,13 @@ func updateUploadIngressReady(ctx context.Context, db bun.IDB, contentID int64, 
 	return nil
 }
 
-func updateUploadReadable(ctx context.Context, db bun.IDB, contentID int64, pieceCID string, now time.Time) error {
-	_, err := db.NewUpdate().
-		Model((*model.StorageContent)(nil)).
-		Set("piece_cid = COALESCE(?, piece_cid)", nullableString(pieceCID)).
-		Set("error_message = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ?", contentID).
-		Exec(ctx)
+// updateUploadsReadable records each content's piece CID, keeping the stored
+// one where the given CID is empty.
+func updateUploadsReadable(ctx context.Context, db bun.IDB, contentIDs []int64, pieceCIDs []string, now time.Time) error {
+	_, err := db.NewRaw(`UPDATE storage_contents
+		SET piece_cid = COALESCE(NULLIF(upload.piece_cid, ''), storage_contents.piece_cid), error_message = NULL, updated_at = ?
+		FROM unnest(?::bigint[], ?::text[]) AS upload(id, piece_cid)
+		WHERE storage_contents.id = upload.id`, now, pgdialect.Array(contentIDs), pgdialect.Array(pieceCIDs)).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage upload readable: %w", err)
 	}

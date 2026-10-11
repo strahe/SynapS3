@@ -1,13 +1,16 @@
-import { APIError, type ObservabilityProviderObservation, type ProviderUploadSpeedTest } from '../api/client.ts'
+import { APIError, type ProviderUploadSpeedEligibility, type ProviderUploadSpeedTest } from '../api/client.ts'
 
-export function canTestProviderUploadSpeed(provider?: ObservabilityProviderObservation) {
-  return Boolean(
-    provider?.signal.status === 'available' &&
-      !provider.signal.freshness.stale &&
-      provider.facts.active &&
-      provider.facts.has_pdp &&
-      provider.facts.service_url &&
-      provider.upload_speed_test?.state !== 'testing'
+type UploadSpeedProvider = ProviderUploadSpeedEligibility & { upload_speed_test?: ProviderUploadSpeedTest }
+
+export function canTestProviderUploadSpeed(provider?: UploadSpeedProvider) {
+  return provider?.upload_speed_testable === true && provider.upload_speed_test?.state !== 'testing'
+}
+
+export function providerUploadSpeedUnavailableReason(provider?: UploadSpeedProvider): string | undefined {
+  if (provider?.upload_speed_test?.state === 'testing') return 'A test is already running.'
+  if (canTestProviderUploadSpeed(provider)) return undefined
+  return (
+    provider?.upload_speed_unavailable_reason || 'Provider availability could not be checked. Refresh this provider.'
   )
 }
 

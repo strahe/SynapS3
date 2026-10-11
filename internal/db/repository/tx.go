@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // runMaybeTx runs fn in a transaction when db is a connection pool, and inline
@@ -24,10 +23,7 @@ func runMaybeTx(ctx context.Context, db bun.IDB, fn func(bun.IDB) error) error {
 }
 
 func runRepositoryTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) error) error {
-	var options *sql.TxOptions
-	if db.Dialect().Name() == dialect.PG {
-		options = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
-	}
+	options := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 	for attempt := 0; ; attempt++ {
 		err := db.RunInTx(ctx, options, fn)
 		if err == nil || !shouldRetryRepositoryTx(err) {

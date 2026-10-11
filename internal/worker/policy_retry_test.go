@@ -17,7 +17,7 @@ import (
 func TestRetryUsesCurrentPolicyWithoutChangingSourceSnapshot(t *testing.T) {
 	limit := 5
 	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result { return Fail(errors.New("stopped"), "stopped", nil) }}, nil)
-	row := enqueueTestTask(t, h, "policy", "policy")
+	row := enqueueTestTask(t, h, "policy")
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	registry := NewRegistry()
 	newLimit := 1
@@ -47,13 +47,13 @@ func TestRetryUsesCurrentPolicyWithoutChangingSourceSnapshot(t *testing.T) {
 }
 
 func TestConcurrentManualRetriesReturnOneDirectSuccessor(t *testing.T) {
-	assertConcurrentManualRetries(t, testutil.NewTestFileDB(t))
+	assertConcurrentManualRetries(t, testutil.NewTestDB(t))
 }
 
 func assertConcurrentManualRetries(t *testing.T, db *bun.DB) {
 	t.Helper()
 	h := newTaskHarnessWithDB(t, db, scriptedHandler{definition: testDefinition(nil, true), execute: func(context.Context, Execution) Result { return Fail(errors.New("stopped"), "stopped", nil) }}, nil)
-	row := enqueueTestTask(t, h, "concurrent-retry", "concurrent-retry")
+	row := enqueueTestTask(t, h, "concurrent-retry")
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	if err := h.service.Acknowledge(t.Context(), row.ID); err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestFinalOpportunityMayAdmitAndCompleteEffect(t *testing.T) {
 		}
 		return Complete("Done", nil)
 	}}, nil)
-	row := enqueueTestTask(t, h, "last", "last")
+	row := enqueueTestTask(t, h, "last")
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	if !called || stored.Status != model.TaskStatusCompleted || stored.RetryCount != 0 {
@@ -128,7 +128,7 @@ func TestExhaustionSelectsOnlyExhaustedSettlement(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result {
 		return RetryBackoff(errors.New("unknown result"), "temporary", nil).WithRetrySettlements(func(context.Context, *repository.Repositories, time.Time) error { retried = true; return nil }, func(context.Context, *repository.Repositories) error { exhausted = true; return nil })
 	}}, nil)
-	row := enqueueTestTask(t, h, "exhaust", "exhaust")
+	row := enqueueTestTask(t, h, "exhaust")
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	if retried || !exhausted || stored.RetryCount != 0 || dereference(stored.FailureReason) != "attempts_exhausted" {
@@ -147,7 +147,7 @@ func TestTaskContentionPreservesFinalOpportunityAndRecovery(t *testing.T) {
 					return nil
 				})
 			}}, nil)
-			row := enqueueTestTask(t, h, "contention", "contention")
+			row := enqueueTestTask(t, h, "contention")
 			before := time.Now()
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, err := h.repos.Tasks.GetByID(t.Context(), row.ID)
@@ -165,27 +165,17 @@ func TestTaskContentionPreservesFinalOpportunityAndRecovery(t *testing.T) {
 }
 
 func TestMalformedPolicyNeverDispatchesHandler(t *testing.T) {
-	for _, field := range []string{"unsupported_version", "sealed_snapshot", "invocation_timeout", "observation_window", "backoff"} {
+	// The schema already refuses policies other than version 2.
+	for _, field := range []string{"invocation_timeout", "observation_window", "backoff"} {
 		t.Run(field, func(t *testing.T) {
 			called := false
 			h := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true), execute: func(context.Context, Execution) Result { called = true; return Complete("Done", nil) }}, nil)
-			row := enqueueTestTask(t, h, "corrupt-policy", "corrupt-policy")
+			row := enqueueTestTask(t, h, "corrupt-policy")
 			var snapshot map[string]json.RawMessage
 			if err := json.Unmarshal(row.Policy, &snapshot); err != nil {
 				t.Fatal(err)
 			}
-			switch field {
-			case "unsupported_version":
-				snapshot["version"] = json.RawMessage(`999`)
-			case "sealed_snapshot":
-				snapshot = map[string]json.RawMessage{
-					"version":              json.RawMessage(`-1`),
-					"original_policy":      row.Policy,
-					"original_retry_limit": json.RawMessage(`null`),
-				}
-			default:
-				delete(snapshot, field)
-			}
+			delete(snapshot, field)
 			raw, err := json.Marshal(snapshot)
 			if err != nil {
 				t.Fatal(err)
@@ -202,7 +192,7 @@ func TestMalformedPolicyNeverDispatchesHandler(t *testing.T) {
 	}
 }
 
-func TestDecodePolicyRejectsUnavailableBudgetAndPreservesLegacyUnknownBudget(t *testing.T) {
+func TestDecodePolicyRejectsUnavailableBudget(t *testing.T) {
 	raw, err := encodePolicy(ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy()})
 	if err != nil {
 		t.Fatal(err)
@@ -225,24 +215,6 @@ func TestDecodePolicyRejectsUnavailableBudgetAndPreservesLegacyUnknownBudget(t *
 			t.Fatalf("budget %s accepted: %v", budget, err)
 		}
 	}
-	var legacy map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &legacy); err != nil {
-		t.Fatal(err)
-	}
-	legacy["version"] = json.RawMessage(`0`)
-	legacy["legacy"] = json.RawMessage(`true`)
-	legacy["max_attempts"] = json.RawMessage(`null`)
-	policy, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	task := &model.Task{Policy: policy}
-	if !legacyPolicy(task) {
-		t.Fatal("unknown legacy budget lost handoff eligibility")
-	}
-	if _, err := DecodePolicy(task); !errors.Is(err, ErrInvalidPolicy) {
-		t.Fatal("unknown legacy budget became an executable default")
-	}
 }
 
 func TestInvocationTimeoutAllocatesRecoveryButPreservesObservedCompletion(t *testing.T) {
@@ -257,7 +229,7 @@ func TestInvocationTimeoutAllocatesRecoveryButPreservesObservedCompletion(t *tes
 				}
 				return Wait(model.TaskResumeModeRecover, time.Minute, "observing", "Waiting", nil)
 			}}, nil)
-			row := enqueueTestTask(t, h, "timeout", "timeout")
+			row := enqueueTestTask(t, h, "timeout")
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 			if completed {

@@ -87,8 +87,8 @@ func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.DataSetInput) error {
 			return storagepipeline.ValidateDataSetInput(*input)
 		}),
-		Subject: taskengine.SubjectFromInput("storage_data_set", func(input storagepipeline.DataSetInput) int64 { return input.DataSetID }),
-		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagepipeline.DataSetInput) (int64, int64) { return input.DataSetID, 0 }),
+		Policy:   taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		// A refusal checkpoint resumes queries; only settled terminal failures
 		// have no remaining creation work to retry.
 		CanManualRetry: func(task *model.Task) bool {
@@ -117,7 +117,7 @@ func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input storagepipeline.DataSetInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

@@ -41,7 +41,7 @@ func countContents(t *testing.T, tb *testBackend) int {
 	if err != nil {
 		t.Fatalf("counting content: %v", err)
 	}
-	return count
+	return int(count)
 }
 
 func TestPutObjectFailureDiscardsTheContentItCreated(t *testing.T) {

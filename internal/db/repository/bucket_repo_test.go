@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -211,9 +210,6 @@ func TestBucketRepo_UpdateCopyPolicyRefusesLoweringTheTarget(t *testing.T) {
 	}
 }
 
-// The schema only requires a positive replica target and says nothing about
-// status values, so the replica ceiling and the known statuses are enforced
-// here.
 func TestBucketRepo_RejectsCopiesAboveTheLimitAndUnknownStatus(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -664,8 +660,6 @@ func TestBucketRepo_PromoteReadyRequiresEveryConfiguredSlot(t *testing.T) {
 	}
 }
 
-// A row inserted without explicit timestamps must still carry them, and carry
-// them in bun's encoding rather than the database's own clock format.
 func TestModelInsertsStampAuditTimestamps(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -682,14 +676,5 @@ func TestModelInsertsStampAuditTimestamps(t *testing.T) {
 	}
 	if stored.CreatedAt.Before(before) || stored.UpdatedAt.Before(before) {
 		t.Fatalf("stamped timestamps = created:%s updated:%s, want at or after %s", stored.CreatedAt, stored.UpdatedAt, before)
-	}
-	// Second granularity is what a database default would produce; the hook
-	// writes the same instant bun renders everywhere else.
-	var raw string
-	if err := db.NewRaw(`SELECT created_at FROM buckets WHERE id = ?`, bucket.ID).Scan(ctx, &raw); err != nil {
-		t.Fatalf("read raw created_at: %v", err)
-	}
-	if !strings.Contains(raw, ".") || strings.Contains(raw, " ") {
-		t.Fatalf("stored created_at = %q, want bun's fractional encoding rather than the database clock's", raw)
 	}
 }

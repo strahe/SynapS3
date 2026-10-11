@@ -3,18 +3,11 @@ package storagecleanup
 
 import (
 	"errors"
-	"fmt"
 )
-
-const TaskKeyPrefix = "storage-cleanup:"
 
 type Input struct {
 	ContentID  int64 `json:"content_id"`
 	Generation int64 `json:"generation"`
-}
-
-func TaskKey(contentID, generation int64) string {
-	return fmt.Sprintf("%s%d:%d", TaskKeyPrefix, contentID, generation)
 }
 
 func ValidateInput(input Input) error {

@@ -2,19 +2,15 @@ package repository_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/sqlitedialect"
 )
 
 // seedContent creates the byte identity a data version needs before it exists.
@@ -174,8 +170,10 @@ func TestObjectRepo_CreateDeleteMarkerHidesCurrentObjectButKeepsVersionHistory(t
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 	bucket := seedBucket(t, db, "delete-marker-bucket")
+	createdAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 	data := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001001", 10)
+	data.CreatedAt = createdAt
 	if _, err := createVersion(t, repos, data); err != nil {
 		t.Fatalf("create data version: %v", err)
 	}
@@ -206,23 +204,59 @@ func TestObjectRepo_CreateDeleteMarkerHidesCurrentObjectButKeepsVersionHistory(t
 	if len(currentList) != 0 {
 		t.Fatalf("current list len = %d, want object hidden", len(currentList))
 	}
+	head, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J00000000000000000001003")
+	if err != nil {
+		t.Fatalf("create second delete marker: %v", err)
+	}
+	if _, err := db.NewUpdate().Model((*model.ObjectVersion)(nil)).Set("created_at = ?", createdAt).
+		Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").Exec(ctx); err != nil {
+		t.Fatalf("set tied version times: %v", err)
+	}
 
 	versions, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "", "", 10)
 	if err != nil {
 		t.Fatalf("ListVersionsByBucket: %v", err)
 	}
-	if len(versions) != 2 {
-		t.Fatalf("versions len = %d, want marker plus data version", len(versions))
+	if len(versions) != 3 {
+		t.Fatalf("versions len = %d, want two markers plus data version", len(versions))
 	}
-	if !versions[0].IsDeleteMarker || !versions[0].IsCurrent {
+	if versions[0].VersionID != head.VersionID || !versions[0].IsDeleteMarker || !versions[0].IsCurrent {
 		t.Fatalf("first version = %#v, want current delete marker", versions[0].ObjectVersion)
 	}
-	if versions[1].VersionID != data.VersionID || versions[1].IsDeleteMarker {
-		t.Fatalf("second version = %#v, want data version %s", versions[1].ObjectVersion, data.VersionID)
+	if versions[1].VersionID != marker.VersionID || !versions[1].IsDeleteMarker || versions[1].IsCurrent {
+		t.Fatalf("second version = %#v, want historical delete marker", versions[1].ObjectVersion)
+	}
+	if versions[2].VersionID != data.VersionID || versions[2].IsDeleteMarker || versions[2].IsCurrent {
+		t.Fatalf("third version = %#v, want data version %s", versions[2].ObjectVersion, data.VersionID)
 	}
 	// The hidden data version keeps its bytes and its derived position.
-	if versions[1].State != model.ObjectStateCached {
-		t.Fatalf("hidden data version state = %s, want cached", versions[1].State)
+	if versions[2].State != model.ObjectStateCached {
+		t.Fatalf("hidden data version state = %s, want cached", versions[2].State)
+	}
+	for _, listing := range []struct {
+		name string
+		page func(string) ([]repository.ObjectVersionListItem, error)
+	}{
+		{"bucket", func(after string) ([]repository.ObjectVersionListItem, error) {
+			return repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "file.txt", after, 1)
+		}},
+		{"key", func(after string) ([]repository.ObjectVersionListItem, error) {
+			return repos.Objects.ListVersionsByKey(ctx, bucket.ID, "file.txt", after, 1)
+		}},
+	} {
+		t.Run(listing.name, func(t *testing.T) {
+			after := head.VersionID
+			for _, want := range versions[1:] {
+				page, err := listing.page(after)
+				if err != nil || len(page) != 1 || page[0].VersionID != want.VersionID || page[0].IsDeleteMarker != want.IsDeleteMarker || page[0].IsCurrent {
+					t.Fatalf("page after %s = %#v, err=%v, want historical version %s", after, page, err, want.VersionID)
+				}
+				after = page[0].VersionID
+			}
+			if tail, err := listing.page(after); err != nil || len(tail) != 0 {
+				t.Fatalf("page after data = %#v, err=%v, want empty tail", tail, err)
+			}
+		})
 	}
 }
 
@@ -537,22 +571,8 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent(t *testing.T) {
 }
 
 func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinner(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "restore-objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := testDB(t)
 	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "concurrent-restore-bucket")
@@ -609,22 +629,8 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinn
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := testDB(t)
 	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "concurrent-version-bucket")
@@ -678,22 +684,8 @@ func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWriteReusesCurrent(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
+	db := testDB(t)
 	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "concurrent-dedupe-bucket")
@@ -918,17 +910,25 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 	bucket := seedBucket(t, db, "version-list-bucket")
+	createdAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 	oldVersion := newObjectVersion(bucket.ID, "a.txt", "01J00000000000000000000074", 10)
+	oldVersion.CreatedAt = createdAt
 	if _, err := createVersion(t, repos, oldVersion); err != nil {
 		t.Fatalf("create old version: %v", err)
 	}
 	currentVersion := newObjectVersion(bucket.ID, "a.txt", "01J00000000000000000000075", 20)
+	currentVersion.CreatedAt = createdAt
 	if _, err := createVersion(t, repos, currentVersion); err != nil {
 		t.Fatalf("create current version: %v", err)
 	}
 	if _, err := createVersion(t, repos, newObjectVersion(bucket.ID, "b.txt", "01J00000000000000000000076", 30)); err != nil {
 		t.Fatalf("create b version: %v", err)
+	}
+	otherBucket := seedBucket(t, db, "version-list-other-bucket")
+	otherVersion := newObjectVersion(otherBucket.ID, "a.txt", "01J00000000000000000000079", 10)
+	if _, err := createVersion(t, repos, otherVersion); err != nil {
+		t.Fatalf("create other bucket version: %v", err)
 	}
 
 	rows, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "", "", 10)
@@ -949,8 +949,27 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListVersionsByBucket marker: %v", err)
 	}
-	if len(page) == 0 || page[0].VersionID != oldVersion.VersionID {
-		t.Fatalf("marker page first = %#v, want old version", page)
+	if len(page) != 2 || page[0].VersionID != oldVersion.VersionID || page[1].Key != "b.txt" {
+		t.Fatalf("marker page = %#v, want old a.txt then b.txt", page)
+	}
+	if page[0].IsCurrent || !page[1].IsCurrent || page[0].Checksum != rows[1].Checksum || page[0].State != rows[1].State {
+		t.Fatalf("marker page lost projected storage/current fields: %#v", page)
+	}
+	for _, limit := range []int{1, 0} {
+		limited, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "a.txt", currentVersion.VersionID, limit)
+		wantLength := 2
+		if limit > 0 {
+			wantLength = limit
+		}
+		if err != nil || len(limited) != wantLength || limited[0].VersionID != oldVersion.VersionID {
+			t.Fatalf("marker page limit %d = %#v, err=%v", limit, limited, err)
+		}
+	}
+	for _, versionMarker := range []string{"", "missing-version", "01J00000000000000000000076", otherVersion.VersionID} {
+		fallback, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "a.txt", versionMarker, 10)
+		if err != nil || len(fallback) != 1 || fallback[0].Key != "b.txt" {
+			t.Fatalf("key marker with version %q = %#v, err=%v, want b.txt", versionMarker, fallback, err)
+		}
 	}
 
 	if _, err := createVersion(t, repos, newObjectVersion(bucket.ID, "case/a.txt", "01J00000000000000000000077", 40)); err != nil {
@@ -966,6 +985,17 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	if len(prefixed) != 1 || prefixed[0].Key != "case/a.txt" {
 		t.Fatalf("case-sensitive prefix rows = %#v", prefixed)
 	}
+	for _, scenario := range []struct {
+		prefix, versionID string
+	}{
+		{"case/", "01J00000000000000000000077"},
+		{"a.txt", oldVersion.VersionID},
+	} {
+		page, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, scenario.prefix, "a.txt", currentVersion.VersionID, 10)
+		if err != nil || len(page) != 1 || page[0].VersionID != scenario.versionID {
+			t.Fatalf("prefixed marker page %q = %#v, err=%v, want version %s", scenario.prefix, page, err, scenario.versionID)
+		}
+	}
 }
 
 func TestObjectRepo_ListVersionsByKey(t *testing.T) {
@@ -974,16 +1004,20 @@ func TestObjectRepo_ListVersionsByKey(t *testing.T) {
 	ctx := context.Background()
 	bucket := seedBucket(t, db, "version-list-key-bucket")
 	otherBucket := seedBucket(t, db, "version-list-key-other-bucket")
+	createdAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 	oldVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000002001", 10)
+	oldVersion.CreatedAt = createdAt.Add(-time.Minute)
 	if _, err := createVersion(t, repos, oldVersion); err != nil {
 		t.Fatalf("create old version: %v", err)
 	}
 	middleVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000002002", 20)
+	middleVersion.CreatedAt = createdAt
 	if _, err := createVersion(t, repos, middleVersion); err != nil {
 		t.Fatalf("create middle version: %v", err)
 	}
 	currentVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000002003", 30)
+	currentVersion.CreatedAt = createdAt
 	if _, err := createVersion(t, repos, currentVersion); err != nil {
 		t.Fatalf("create current version: %v", err)
 	}
@@ -1019,6 +1053,12 @@ func TestObjectRepo_ListVersionsByKey(t *testing.T) {
 	}
 	if len(page) != 2 || page[0].VersionID != middleVersion.VersionID || page[1].VersionID != oldVersion.VersionID {
 		t.Fatalf("marker page = %#v, want middle then old", page)
+	}
+	for _, versionMarker := range []string{"missing-version", "01J00000000000000000002004", "01J00000000000000000002005"} {
+		fallback, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "file.txt", versionMarker, 10)
+		if err != nil || len(fallback) != 3 || fallback[0].VersionID != currentVersion.VersionID || fallback[1].VersionID != middleVersion.VersionID || fallback[2].VersionID != oldVersion.VersionID {
+			t.Fatalf("invalid marker %s page = %#v, err=%v, want all versions", versionMarker, fallback, err)
+		}
 	}
 
 	limited, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "file.txt", "", 2)

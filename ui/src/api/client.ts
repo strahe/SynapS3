@@ -157,7 +157,12 @@ export interface ObservabilityProviderFacts {
   health_status?: string
 }
 
-export interface ObservabilityProviderObservation {
+export interface ProviderUploadSpeedEligibility {
+  upload_speed_testable?: boolean
+  upload_speed_unavailable_reason?: string
+}
+
+export interface ObservabilityProviderObservation extends ProviderUploadSpeedEligibility {
   facts: ObservabilityProviderFacts
   signal: ObservabilitySignal
   upload_speed_test?: ProviderUploadSpeedTest
@@ -584,7 +589,7 @@ export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 
 export type StorageCommitAttentionCode = 'submission_mismatch' | 'data_set_unavailable' | 'confirmation_timeout'
 
 /** One provider offered for a replacement, with why it cannot be chosen. */
-export interface ReplacementProviderCandidate {
+export interface ReplacementProviderCandidate extends ProviderUploadSpeedEligibility {
   provider_id: string
   manual_selectable: boolean
   manual_block_reason?: string
@@ -773,7 +778,6 @@ export interface TaskPolicy {
   jitter: number
   invocation_timeout: string
   observation_window: string
-  legacy: boolean
 }
 
 export interface TaskDetail {
@@ -781,6 +785,7 @@ export interface TaskDetail {
   policy: TaskPolicy | null
 }
 export interface TaskEvent {
+  provider_selection?: TaskProviderSelection
   failure_reason?: string
   attempt?: number
   next_attempt?: number
@@ -788,6 +793,20 @@ export interface TaskEvent {
   sequence: number
   type: string
   created_at: string
+}
+export interface TaskProviderSelection {
+  tier: string
+  tier_checked_at?: string
+  has_trusted: boolean
+  requested_count: number
+  eligible_count: number
+  rejected_total: number
+  rejected_omitted: number
+  rejections: {
+    provider_id: string
+    reason: string
+    observation_checked_at?: string
+  }[]
 }
 export interface TaskEvents {
   events: TaskEvent[]

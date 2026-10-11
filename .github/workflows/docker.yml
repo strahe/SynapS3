@@ -29,8 +29,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 2
+    outputs:
+      docker_image: ${{ steps.plan.outputs.docker_image }}
+      docker_deployment: ${{ steps.plan.outputs.docker_deployment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - name: Select Docker checks
+        id: plan
+        uses: ./.github/actions/ci-plan
+
   deployment:
     name: deployment
+    needs: changes
+    if: needs.changes.outputs.docker_deployment == 'true'
     runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 10
 
@@ -42,20 +60,77 @@ jobs:
       - name: Validate Docker deployment
         env:
           SYNAPS3_REQUIRE_DOCKER_DAEMON: '1'
-        run: make test-docker-deployment
+        run: make test-docker-entrypoint test-docker-deployment
 
   image_pr:
     name: image-pr
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: needs.changes.outputs.docker_image == 'true' && github.event_name == 'pull_request'
     runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 10
+    timeout-minutes: 20
+    env:
+      IMAGE_ARCH: amd64
 
     steps:
       - *checkout
 
       - &setup-buildx
         name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v4
+
+      - &resolve-go-cache
+        name: Resolve Docker Go cache environment
+        id: go-cache
+        shell: bash
+        timeout-minutes: 1
+        continue-on-error: true
+        run: |
+          builder_image=$(sed -n 's/^ARG GO_BUILD_IMAGE=//p' Dockerfile)
+          printf 'go-build-image=%s\n' "$builder_image" >> "$GITHUB_OUTPUT"
+          digest=$(timeout 30s docker buildx imagetools inspect "$builder_image" --format '{{ .Manifest.Digest }}') || digest=''
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::warning::Could not resolve the Go builder digest; continuing without the archived Go build cache.'
+            exit 0
+          fi
+          printf 'go-build-image=%s@%s\n' "$builder_image" "$digest" >> "$GITHUB_OUTPUT"
+          export GO_BUILD_DIGEST="$digest"
+          python3 .github/scripts/docker-build-cache.py >> "$GITHUB_OUTPUT"
+
+      - &restore-go-cache
+        name: Restore Docker Go build cache
+        id: go-cache-restore
+        if: runner.environment == 'github-hosted' && steps.go-cache.outputs.cache-key != ''
+        uses: actions/cache@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+        with:
+          path: ${{ runner.temp }}/docker-go-cache/${{ env.IMAGE_ARCH }}
+          key: ${{ steps.go-cache.outputs.cache-key }}
+          restore-keys: ${{ steps.go-cache.outputs.restore-key }}
+
+      # Post steps extract before cache save, while the Buildx builder still exists.
+      - &inject-go-cache
+        name: Inject Docker Go build cache
+        if: runner.environment == 'github-hosted' && steps.go-cache-restore.outcome == 'success'
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          scratch-dir: ${{ runner.temp }}/docker-go-cache-scratch/${{ env.IMAGE_ARCH }}
+          skip-extraction: ${{ steps.go-cache-restore.outputs.cache-hit == 'true' }}
+          utility-image: ghcr.io/containerd/busybox@sha256:52f73a0a43a16cf37cd0720c90887ce972fe60ee06a687ee71fb93a7ca601df7
+          cache-map: |
+            {
+              "${{ runner.temp }}/docker-go-cache/${{ env.IMAGE_ARCH }}": {
+                "target": "/root/.cache/go-build",
+                "id": "synaps3-go-${{ env.IMAGE_ARCH }}-musl",
+                "sharing": "locked"
+              }
+            }
 
       - &resolve-build-date
         name: Resolve build date
@@ -82,23 +157,29 @@ jobs:
 
       - name: Build image
         uses: docker/build-push-action@v7
+        timeout-minutes: 10
         with:
           context: .
           platforms: linux/amd64
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=synaps3-image-amd64
+          cache-from: type=gha,scope=synaps3-image-amd64,timeout=2m
+          cache-to: type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true,timeout=2m
           build-args: |
+            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.26-alpine' }}
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
 
   image_amd64:
     name: image-amd64
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: changes
+    if: needs.changes.outputs.docker_image == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 10
+    timeout-minutes: 20
+    env:
+      IMAGE_ARCH: amd64
     permissions:
       contents: read
       packages: write
@@ -109,6 +190,12 @@ jobs:
       - *checkout
 
       - *setup-buildx
+
+      - *resolve-go-cache
+
+      - *restore-go-cache
+
+      - *inject-go-cache
 
       - &login-ghcr
         name: Log in to GHCR
@@ -128,23 +215,28 @@ jobs:
       - name: Build image
         id: build
         uses: docker/build-push-action@v7
+        timeout-minutes: 10
         with:
           context: .
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
-          cache-from: type=gha,scope=synaps3-image-amd64
-          cache-to: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && 'type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true' || '' }}
+          cache-from: type=gha,scope=synaps3-image-amd64,timeout=2m
+          cache-to: type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true,timeout=2m
           build-args: |
+            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.26-alpine' }}
             VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
 
   image_arm64:
     name: image-arm64
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: changes
+    if: needs.changes.outputs.docker_image == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ${{ vars.RUNS_ON_ARM64 || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 10
+    timeout-minutes: 20
+    env:
+      IMAGE_ARCH: arm64
     permissions:
       contents: read
       packages: write
@@ -155,6 +247,12 @@ jobs:
       - *checkout
 
       - *setup-buildx
+
+      - *resolve-go-cache
+
+      - *restore-go-cache
+
+      - *inject-go-cache
 
       - *login-ghcr
 
@@ -167,21 +265,26 @@ jobs:
       - name: Build image
         id: build
         uses: docker/build-push-action@v7
+        timeout-minutes: 10
         with:
           context: .
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
-          cache-from: type=gha,scope=synaps3-image-arm64
-          cache-to: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && 'type=gha,scope=synaps3-image-arm64,mode=max,ignore-error=true' || '' }}
+          cache-from: type=gha,scope=synaps3-image-arm64,timeout=2m
+          cache-to: type=gha,scope=synaps3-image-arm64,mode=max,ignore-error=true,timeout=2m
           build-args: |
+            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.26-alpine' }}
             VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
 
   image_manifest:
     name: image-manifest
-    if: github.event_name == 'push' || github.event.inputs.mode == 'publish-test'
+    if: >-
+      !cancelled() &&
+      (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') &&
+      needs.image_amd64.result == 'success' && needs.image_arm64.result == 'success'
     needs:
       - image_amd64
       - image_arm64

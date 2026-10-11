@@ -5,15 +5,10 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
-	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
-func storageHealthEmptyJSONArraySQL(db bun.IDB) string {
-	if db.Dialect().Name() == dialect.PG {
-		return "'[]'::jsonb"
-	}
-	return "'[]'"
+func storageHealthEmptyJSONArraySQL() string {
+	return "'[]'::jsonb"
 }
 
 func storageHealthReadyDataSetStatusListSQL() string {

@@ -40,7 +40,7 @@ func (c *partialCatalogChecker) CheckDataSets(context.Context, time.Time, []obse
 }
 
 func TestObservabilityRefreshPublishesCommittedProvidersBeforeDataSetFailure(t *testing.T) {
-	repos := repository.NewRepositories(testutil.NewTestFileDB(t))
+	repos := repository.NewRepositories(testutil.NewTestDB(t))
 	events := &catalogEventRecorder{}
 	checker := &partialCatalogChecker{events: events}
 	service := observability.NewService(observability.ServiceOptions{

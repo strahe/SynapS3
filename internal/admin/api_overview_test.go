@@ -430,7 +430,7 @@ func overviewSeedTask(
 		availableAt = availableAt.Add(time.Hour)
 	}
 	taskRow, _, err := service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: taskType, IdempotencyKey: key, Input: map[string]any{"key": key}, AvailableAt: availableAt,
+		Type: taskType, Input: map[string]any{"key": key}, AvailableAt: availableAt,
 	})
 	if err != nil {
 		t.Fatalf("Enqueue(%s): %v", key, err)

@@ -45,15 +45,15 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 		CanManualRetry: func(source *model.Task) bool {
 			return source != nil && source.FailureReason != nil && *source.FailureReason != "invalid_checkpoint"
 		},
-		Subject: func(canonical json.RawMessage) (taskengine.Subject, error) {
+		Identity: func(canonical json.RawMessage) (taskengine.Identity, error) {
 			var input storagepipeline.CommitRequestInput
 			if err := json.Unmarshal(canonical, &input); err != nil {
-				return taskengine.Subject{}, fmt.Errorf("decoding task subject: %w", err)
+				return taskengine.Identity{}, fmt.Errorf("decoding task identity: %w", err)
 			}
 			if input.RequestID == "" {
-				return taskengine.Subject{}, errors.New("task subject request ID is required")
+				return taskengine.Identity{}, errors.New("task identity request ID is required")
 			}
-			return taskengine.Subject{Type: model.TaskSubjectStorageCommitRequest, Key: input.RequestID}, nil
+			return taskengine.Identity{SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: input.RequestID, Generation: new(int64(0))}, nil
 		},
 	}
 
@@ -74,7 +74,7 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input storagepipeline.CommitRequestInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err
@@ -1014,9 +1014,8 @@ func (h *Handler) enqueueCommitTask(ctx context.Context, repos *repository.Repos
 		return 0, errors.New("task service is unavailable")
 	}
 	taskRow, _, err := h.deps.Scheduler.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
+		Type:        model.TaskTypeStorageCommit,
 		Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
-		SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: requestID,
 		AvailableAt: availableAt,
 	})
 	if err != nil {

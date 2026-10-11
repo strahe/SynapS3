@@ -82,12 +82,11 @@ func TestDataSetProviderRefusalStopsSendingAndPreservesReplacementEvidence(t *te
 			})
 			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("provider-refusal-%d", sequence))
 			var failedWrite *refusalSettlementObserver
+			restoreRejectRefusalSettlement := func() {}
 			if tc.settlementFails {
 				failedWrite = &refusalSettlementObserver{failed: make(chan struct{})}
-				runtime.db.AddQueryHook(failedWrite)
-				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER reject_refusal_settlement BEFORE UPDATE OF creation_rejection ON storage_data_sets BEGIN SELECT RAISE(ABORT, 'injected rejection settlement failure'); END`); err != nil {
-					t.Fatal(err)
-				}
+				testutil.AddQueryHook(runtime.db, failedWrite)
+				restoreRejectRefusalSettlement = testutil.FailWrites(t, runtime.db, "storage_data_sets", "UPDATE OF creation_rejection", "", "injected rejection settlement failure")
 			}
 			if tc.priorSend {
 				clientID := testOnChainID(t, 61000+sequence)
@@ -139,9 +138,7 @@ func TestDataSetProviderRefusalStopsSendingAndPreservesReplacementEvidence(t *te
 				if err != nil || !strings.Contains(string(stored.Checkpoint), "provider_rejection") {
 					t.Fatalf("refusal checkpoint was lost: task=%#v err=%v", stored, err)
 				}
-				if _, err := runtime.db.ExecContext(t.Context(), "DROP TRIGGER reject_refusal_settlement"); err != nil {
-					t.Fatal(err)
-				}
+				restoreRejectRefusalSettlement()
 			}
 			if tc.lookupFails {
 				waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool { return lookups.Load() > 0 && task.Status == model.TaskStatusPending })
@@ -248,7 +245,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			}
 			enqueueEnsure := func(id int64) *model.Task {
 				task, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-					Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(id), Input: storagepipeline.DataSetInput{DataSetID: id}, SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(id),
+					Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: id},
 				}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 					return repos.Contents.BindDataSetEnsureTask(ctx, id, task.ID)
 				})
@@ -315,8 +312,8 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			}
 			enqueueCoordinator := func() *model.Task {
 				coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-					Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
-					Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}, SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(row.ID),
+					Type:  model.TaskTypeProviderReplacementCoordinate,
+					Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
 				}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 					return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
 				})
@@ -436,8 +433,10 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 
 func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	var opened atomic.Int64
+	noRetries := 0
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		cache: &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return false }},
+		maxAttempts: taskTestMaxAttempts(&noRetries),
+		cache:       &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return false }},
 		storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 			opened.Add(1)
 			return nil, errors.New("unexpected creation")
@@ -456,7 +455,7 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: testOnChainID(t, 2002)}); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration), Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 		return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
 	})
 	if err != nil {

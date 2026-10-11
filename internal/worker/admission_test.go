@@ -45,7 +45,7 @@ func startAdmissionEngine(t *testing.T, harness taskHarness) context.CancelFunc 
 func enqueueAdmissionTask(t *testing.T, harness taskHarness, taskType model.TaskType, key string) *model.Task {
 	t.Helper()
 	row, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: taskType, IdempotencyKey: key, Input: testInput{Value: key},
+		Type: taskType, Input: testInput{Value: key},
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue %s: created=%v err=%v", key, created, err)
@@ -104,8 +104,8 @@ func TestEngineTypeConcurrencyPreservesQueueAndFairness(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: run, recover: run},
 		&EngineConfig{Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second},
 		scriptedHandler{definition: other})
-	holder := enqueueTestTask(t, h, "holder", "holder")
-	old := enqueueTestTask(t, h, "old", "old")
+	holder := enqueueTestTask(t, h, "holder")
+	old := enqueueTestTask(t, h, "old")
 	if _, err := h.db.ExecContext(t.Context(), `UPDATE tasks SET resume_mode = 'recover' WHERE id = ?`, holder.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestEngineTypeConcurrencyPreservesQueueAndFairness(t *testing.T) {
 		t.Fatalf("first invocation = id:%d mode:%s", first.ID(), first.Mode())
 	}
 	for i := range 4 {
-		enqueueTestTask(t, h, fmt.Sprintf("new-%d", i), fmt.Sprintf("new-%d", i))
+		enqueueTestTask(t, h, fmt.Sprintf("new-%d", i))
 		plain := enqueueAdmissionTask(t, h, other.Type, fmt.Sprintf("plain-%d", i))
 		waitAdmissionTask(t, h, plain.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
 		waiting, err := h.repos.Tasks.GetByID(t.Context(), old.ID)
@@ -163,7 +163,7 @@ func TestEngineGlobalConcurrencyIncludesUnrestrictedTypes(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: run},
 		&EngineConfig{Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second},
 		scriptedHandler{definition: other, execute: run})
-	enqueueTestTask(t, h, "first", "first")
+	enqueueTestTask(t, h, "first")
 	enqueueAdmissionTask(t, h, other.Type, "second")
 	third := enqueueAdmissionTask(t, h, other.Type, "third")
 	filters := make(chan repository.TaskClaimFilter, 100)
@@ -217,7 +217,7 @@ func TestEngineActiveClaimCannotBeReclaimedBeforeInvocationReturns(t *testing.T)
 		},
 	}, &EngineConfig{Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second},
 		scriptedHandler{definition: other})
-	row := enqueueTestTask(t, h, "stale", "stale")
+	row := enqueueTestTask(t, h, "stale")
 	startAdmissionEngine(t, h)
 	t.Cleanup(func() { closeOnce.Do(func() { close(release) }) })
 	first := receiveAdmission(t, entered)
@@ -253,14 +253,14 @@ func TestEngineConcurrencyHeldThroughSettlement(t *testing.T) {
 	}}, &EngineConfig{
 		Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
 		OnTaskSettled: func(row *model.Task, _ repository.TaskTransition) {
-			if row.IdempotencyKey == "first" {
+			if row.SubjectKey == "first" {
 				close(settling)
 				<-release
 			}
 		},
 	}, scriptedHandler{definition: other})
-	enqueueTestTask(t, h, "first", "first")
-	second := enqueueTestTask(t, h, "second", "second")
+	enqueueTestTask(t, h, "first")
+	second := enqueueTestTask(t, h, "second")
 	startAdmissionEngine(t, h)
 	t.Cleanup(func() { closeOnce.Do(func() { close(release) }) })
 	receiveAdmission(t, entered)
@@ -309,8 +309,8 @@ func TestEngineConcurrencyReleasedAfterHandlerResults(t *testing.T) {
 				}
 			}}, &EngineConfig{Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second})
 			h.engine.settlementRetryDelays = []time.Duration{0}
-			enqueueTestTask(t, h, "first", "first")
-			second := enqueueTestTask(t, h, "second", "second")
+			enqueueTestTask(t, h, "first")
+			second := enqueueTestTask(t, h, "second")
 			startAdmissionEngine(t, h)
 			receiveAdmission(t, entered)
 			if next := receiveAdmission(t, entered); next.ID() != second.ID {
@@ -324,11 +324,11 @@ func TestEngineConcurrencyReleasedAfterHandlerResults(t *testing.T) {
 func TestEngineUnknownTypeFailsWithoutBlockingOtherTypes(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true)},
 		&EngineConfig{Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second})
-	unknown := enqueueTestTask(t, h, "unknown", "unknown")
+	unknown := enqueueTestTask(t, h, "unknown")
 	if _, err := h.db.ExecContext(t.Context(), `UPDATE tasks SET type = 'unregistered' WHERE id = ?`, unknown.ID); err != nil {
 		t.Fatal(err)
 	}
-	next := enqueueTestTask(t, h, "next", "next")
+	next := enqueueTestTask(t, h, "next")
 	startAdmissionEngine(t, h)
 	failed := waitAdmissionTask(t, h, unknown.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusFailed })
 	if dereference(failed.FailureReason) != failureHandlerUnavailable {
@@ -362,8 +362,8 @@ func TestEngineShutdownWaitsForInvocations(t *testing.T) {
 	shortening := &controlledShortenRepository{TaskRepository: h.repos.Tasks}
 	shortening.fail.Store(true)
 	h.repos.Tasks = shortening
-	row := enqueueTestTask(t, h, "first", "first")
-	queued := enqueueTestTask(t, h, "second", "second")
+	row := enqueueTestTask(t, h, "first")
+	queued := enqueueTestTask(t, h, "second")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	stopped := make(chan error, 1)
@@ -433,7 +433,7 @@ func TestEngineClaimFailureDoesNotConsumeConcurrency(t *testing.T) {
 	definition.MaxConcurrency = 1
 	h := newTaskHarness(t, scriptedHandler{definition: definition},
 		&EngineConfig{Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second})
-	row := enqueueTestTask(t, h, "first", "first")
+	row := enqueueTestTask(t, h, "first")
 	h.repos.Tasks = &failingClaimRepository{TaskRepository: h.repos.Tasks}
 	startAdmissionEngine(t, h)
 	waitAdmissionTask(t, h, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })

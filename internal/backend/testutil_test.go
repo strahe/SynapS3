@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/backend"
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
 	cachetask "github.com/strahe/synaps3/internal/task/cache"
@@ -38,8 +40,8 @@ type testBackend struct {
 	tasks   *taskengine.Service
 }
 
-// newTestBackend constructs a SynapseBackend backed by in-memory SQLite
-// and a real filesystem cache rooted at t.TempDir().
+// newTestBackend constructs a SynapseBackend backed by a test database and a
+// real filesystem cache rooted at t.TempDir().
 func newTestBackend(t *testing.T) *testBackend {
 	return newTestBackendWithOptions(t)
 }
@@ -156,14 +158,21 @@ func (backendTestTaskHandler) Recover(context.Context, taskengine.Execution) tas
 func newBackendTaskRuntime(t *testing.T, repos *repository.Repositories) (*taskengine.Service, *taskengine.Messenger) {
 	t.Helper()
 	registry := taskengine.NewRegistry()
-	for _, taskType := range []model.TaskType{
-		model.TaskTypeBucketProvision,
-		model.TaskTypeUploadPlan,
-		model.TaskTypeStorageCleanup,
+	// The stubs keep the production identities that the backend's lookups use.
+	for taskType, identity := range map[model.TaskType]taskengine.IdentityFunc{
+		model.TaskTypeBucketProvision: taskengine.IdentityFromInput("bucket", func(input bucketlifecycle.ProvisionInput) (int64, int64) {
+			return input.BucketID, int64(input.Copies)
+		}),
+		model.TaskTypeUploadPlan: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) (int64, int64) {
+			return input.ContentID, 0
+		}),
+		model.TaskTypeStorageCleanup: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) (int64, int64) {
+			return input.ContentID, input.Generation
+		}),
 	} {
 		err := registry.Register(backendTestTaskHandler{definition: taskengine.Definition{
 			Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
-			Codec:  taskengine.StrictJSONCodec[map[string]any](nil),
+			Codec: taskengine.StrictJSONCodec[map[string]any](nil), Identity: identity,
 			Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		}})
 		if err != nil {

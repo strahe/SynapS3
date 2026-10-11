@@ -58,8 +58,10 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagereplacement.CoordinateInput) error {
 			return storagereplacement.ValidateCoordinateInput(*input)
 		}),
-		Subject: taskengine.SubjectFromInput("storage_replacement", func(input storagereplacement.CoordinateInput) int64 { return input.ReplacementID }),
-		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Identity: taskengine.IdentityFromInput("storage_replacement", func(input storagereplacement.CoordinateInput) (int64, int64) {
+			return input.ReplacementID, input.Generation
+		}),
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		OnEngineFailure: func(task *model.Task, _ string) taskengine.Settlement {
 			return func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.FailForEngineTask(ctx, task.ID,
@@ -98,7 +100,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 		}
 		return repos.Replacements.ResumeCoordinatorTask(ctx, input.ReplacementID, input.Generation, old.ID, next.ID)
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input storagereplacement.CoordinateInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err
@@ -107,7 +109,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 	}
 
 	definition.PrepareRetry = func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
-		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: bind}, nil
+		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, Input: source.Input}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: bind}, nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)

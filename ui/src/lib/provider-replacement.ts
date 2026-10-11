@@ -198,7 +198,14 @@ export function replacementErrorMessage(error: unknown) {
 const providerIneligibleReasons: Record<string, string> = {
   current_source: 'This is the provider being replaced',
   already_serves_bucket: 'Already stores a replica of this bucket',
+  bucket_in_use: 'Already stores a replica of this bucket',
+  context_open_failed: 'Could not prepare storage with this provider.',
+  observation_missing: 'Health information is unavailable. Refresh this provider.',
   provider_unavailable: 'Provider is not currently available',
+  provider_inactive: 'Provider is not active.',
+  provider_missing_pdp: 'Provider does not offer PDP storage.',
+  provider_unhealthy: 'Provider health check failed.',
+  service_url_missing: 'Provider has no service URL.',
   observation_stale: 'Health information is out of date. Refresh this provider.',
   profile_missing: 'Provider details are unavailable. Refresh this provider.',
   profile_url_changed: 'The provider service URL changed. Refresh this provider to check its health.',
@@ -212,7 +219,11 @@ const providerIneligibleReasons: Record<string, string> = {
  */
 export function providerCandidateDisabledReason(candidate: ReplacementProviderCandidate) {
   if (candidate.manual_selectable) return null
-  return providerIneligibleReasons[candidate.manual_block_reason ?? ''] ?? 'Cannot take this replica'
+  return providerSelectionBlockedReason(candidate.manual_block_reason, 'Cannot take this replica')
+}
+
+export function providerSelectionBlockedReason(reason?: string, fallback = 'Provider unavailable') {
+  return providerIneligibleReasons[reason ?? ''] ?? fallback
 }
 
 /** A provider reads as its name; the registry ID identifies it. */

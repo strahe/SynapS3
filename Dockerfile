@@ -1,3 +1,5 @@
+ARG GO_BUILD_IMAGE=golang:1.26-alpine
+
 # Build stage - frontend
 FROM node:26-alpine AS frontend
 
@@ -6,7 +8,7 @@ ENV PATH="$PNPM_HOME:$PATH"
 
 WORKDIR /ui
 
-RUN npm install -g pnpm@11
+RUN npm install -g pnpm@11.1.2
 
 COPY ui/pnpm-lock.yaml ui/pnpm-workspace.yaml ./
 RUN pnpm fetch --frozen-lockfile --config.store-dir=/pnpm/store --config.confirmModulesPurge=false
@@ -18,7 +20,7 @@ COPY ui/ .
 RUN pnpm run build
 
 # Build stage - Go binary
-FROM golang:1.26-alpine AS builder
+FROM ${GO_BUILD_IMAGE} AS builder
 
 RUN apk add --no-cache gcc musl-dev git
 
@@ -35,8 +37,13 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 ARG CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"
+ARG TARGETARCH
 
-RUN CGO_ENABLED=1 CGO_CFLAGS="${CGO_CFLAGS}" go build -trimpath \
+# Go's cache does not detect changes to system C libraries.
+RUN --mount=type=cache,id=synaps3-go-${TARGETARCH}-musl,target=/root/.cache/go-build,sharing=locked \
+    toolchain="$(apk info -v)" \
+    && toolchain="$(printf '%s\n' "${toolchain}" | LC_ALL=C sort | sha256sum | cut -d ' ' -f1)" \
+    && CGO_ENABLED=1 CGO_CFLAGS="${CGO_CFLAGS}" GOCACHE="/root/.cache/go-build/${toolchain}" go build -trimpath \
     -ldflags "-X github.com/strahe/synaps3/internal/buildinfo.Version=${VERSION} \
               -X github.com/strahe/synaps3/internal/buildinfo.Commit=${COMMIT} \
               -X github.com/strahe/synaps3/internal/buildinfo.Date=${BUILD_DATE}" \

@@ -59,7 +59,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		Type: model.TaskTypeWalletOperation, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		MaxConcurrency: 1,
 		Codec:          taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
-		Subject:        taskengine.SubjectFromInput("wallet_operation", func(input walletoperation.Input) int64 { return input.OperationID }),
+		Identity:       taskengine.IdentityFromInput("wallet_operation", func(input walletoperation.Input) (int64, int64) { return input.OperationID, 0 }),
 		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		CanManualRetry: func(source *model.Task) bool {
 			return source != nil && (source.FailureReason == nil || (*source.FailureReason != "invalid_checkpoint" && *source.FailureReason != "wallet_broadcast_unknown" && *source.FailureReason != "wallet_transaction_reverted"))
@@ -83,7 +83,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input walletoperation.Input
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

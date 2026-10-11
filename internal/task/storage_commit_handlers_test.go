@@ -3,6 +3,7 @@ package task_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,7 +20,6 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
-	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
@@ -328,24 +328,29 @@ func (f registrationFixture) collect(t *testing.T) (string, int64) {
 
 func (f registrationFixture) collectAt(t *testing.T, requestID string, now time.Time, copies ...*model.StorageCopy) (string, int64) {
 	t.Helper()
-	taskRow, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
-		Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
-		SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: requestID,
-	})
-	if err != nil {
-		t.Fatalf("enqueue commit task: %v", err)
-	}
 	ids := make([]int64, len(copies))
 	for i, copyRow := range copies {
 		ids[i] = copyRow.ID
 	}
-	if err := f.runtime.repos.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
-		RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: f.dataSet.ID, CopyIDs: ids, Now: now,
+	// The task and its request commit together, as the Commit handler creates
+	// them; a running engine must never claim the task before the request exists.
+	var taskID int64
+	if err := f.runtime.repos.WithTx(t.Context(), func(tx *repository.Repositories) error {
+		taskRow, _, err := f.runtime.service.EnqueueInTransaction(t.Context(), tx, taskengine.EnqueueRequest{
+			Type:  model.TaskTypeStorageCommit,
+			Input: storagepipeline.CommitRequestInput{RequestID: requestID},
+		})
+		if err != nil {
+			return fmt.Errorf("enqueue commit task: %w", err)
+		}
+		taskID = taskRow.ID
+		return tx.Contents.CreateCollectingCommitRequest(t.Context(), repository.CreateCommitRequestInput{
+			RequestID: requestID, TaskID: taskRow.ID, StorageDataSetID: f.dataSet.ID, CopyIDs: ids, Now: now,
+		})
 	}); err != nil {
-		t.Fatalf("CreateCollectingCommitRequest: %v", err)
+		t.Fatalf("collect commit request: %v", err)
 	}
-	return requestID, taskRow.ID
+	return requestID, taskID
 }
 
 func (f registrationFixture) request(t *testing.T, requestID string) *storagecommit.Request {
@@ -476,7 +481,7 @@ func TestCachePressureSealsAndRecoversWriteCapacity(t *testing.T) {
 			if _, err := fs.Put(t.Context(), bucket.Name, "next", bytes.NewReader(make([]byte, 256)), 256); !errors.Is(err, cache.ErrCacheFull) {
 				t.Fatalf("admission = %v", err)
 			}
-			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -535,7 +540,7 @@ func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T
 				t.Fatal(err)
 			}
 			requestID, taskID := f.collect(t)
-			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -731,8 +736,8 @@ func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
 			}
 			requestID, taskID := f.collectAt(t, "pressure-collecting", time.Now(), f.copies[5])
 			if _, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-				Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-				Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+				Type:  model.TaskTypeCacheCapacityReconcile,
+				Input: taskengine.CycleInput{Cycle: 1},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -810,9 +815,8 @@ func (f registrationFixture) queueTransferredCopy(t *testing.T, copyRow *model.S
 			return err
 		}
 		task, _, err := f.runtime.service.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(copyRow.ID, generation),
-			Input:       storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation},
-			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID),
+			Type:  model.TaskTypeStorageTransferPlan,
+			Input: storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation},
 		})
 		if err != nil {
 			return err
@@ -1115,7 +1119,7 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 			}
 			owner := *bad.ActiveTaskID
 			checkpoint := []byte(`{"unresolved_effect":"preserved"}`)
-			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "invalid_checkpoint").Set("checkpoint_json = ?", checkpoint).Set("finished_at = ?", time.Now()).Where("id = ?", owner).Exec(t.Context()); err != nil {
+			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "invalid_checkpoint").Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Set("finished_at = ?", time.Now()).Where("id = ?", owner).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			sends, extras := f.provider.sent()
@@ -1142,7 +1146,7 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 				t.Fatalf("blocked member lost its protected owner: %#v %v", bad, err)
 			}
 			source, err := f.runtime.repos.Tasks.GetByID(t.Context(), owner)
-			if err != nil || !bytes.Equal(source.Checkpoint, checkpoint) || source.SupersededAt != nil {
+			if err != nil || !testutil.JSONEqual(source.Checkpoint, checkpoint) || source.SupersededAt != nil {
 				t.Fatalf("blocked member lost its evidence: %#v %v", source, err)
 			}
 			after := f.request(t, requestID)
@@ -1263,9 +1267,14 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	f.provider.statusDown = true
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
-	defer stopHandlerEngine(t, cancel, done)
+	defer func() { stopHandlerEngine(t, cancel, done) }()
 
-	waitForCommitTask(t, f.runtime, taskID, func(*model.Task) bool { return f.request(t, requestID).TransactionID != nil })
+	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
+			f.request(t, requestID).TransactionID != nil
+	})
+	// Rewriting fixture history must not race with settlement of the same rows.
+	stopHandlerEngine(t, cancel, done)
 	// The provider accepted the request but its transaction never landed, and
 	// its status endpoint stays down past the attention threshold.
 	legacyStart := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
@@ -1279,6 +1288,7 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("age submission: %v", err)
 	}
+	cancel, done = runHandlerEngine(t, f.runtime)
 	completed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
 	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(legacyStart) {
 		t.Fatalf("registration recovery start = %v, must be after the original submission %v", completed.WorkStartedAt, legacyStart)

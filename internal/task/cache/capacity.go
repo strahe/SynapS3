@@ -13,7 +13,6 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/systemtask"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
@@ -74,7 +73,7 @@ type cacheCapacityCheckpoint struct {
 func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeCacheCapacityReconcile, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:  taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
+		Codec: taskengine.CycleCodec, Identity: taskengine.CycleIdentity("cache-capacity"),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		NextCycleCheckpoint: func(ctx context.Context, repos *repository.Repositories, previous *model.Task) (json.RawMessage, error) {
 			var cp cacheCapacityCheckpoint
@@ -85,8 +84,8 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 				return append(json.RawMessage(nil), previous.Checkpoint...), nil
 			}
 			cp.PreviousCycleFailed = cp.PreviousCycleFailed || previous.Status == model.TaskStatusFailed
-			if !cp.PreviousCycleFailed && previous.SubjectType != nil && previous.SubjectKey != nil {
-				failed, err := repos.Tasks.ListCurrentFailedForSubject(ctx, *previous.SubjectType, *previous.SubjectKey, previous.ID, 1, previous.Type)
+			if !cp.PreviousCycleFailed {
+				failed, err := repos.Tasks.ListCurrentFailedForSubject(ctx, previous.SubjectType, previous.SubjectKey, previous.ID, 1, previous.Type)
 				if err != nil {
 					return nil, err
 				}

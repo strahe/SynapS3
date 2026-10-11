@@ -1,27 +1,47 @@
 package repository_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
 
 func TestTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T) {
-	assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, testDB(t))
+	for _, transaction := range []bool{false, true} {
+		name := "pool"
+		if transaction {
+			name = "transaction"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := testDB(t)
+			if transaction {
+				if err := db.RunInTx(t.Context(), nil, func(_ context.Context, tx bun.Tx) error {
+					assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, tx)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, db)
+			}
+		})
+	}
 }
 
-func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db *bun.DB) {
+func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db bun.IDB) {
 	t.Helper()
 	repos := repository.NewRepositories(db)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	seed := func(key, taskType string, availableAt time.Time, expired bool) *model.Task {
 		t.Helper()
 		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-			Type: model.TaskType(taskType), IdempotencyKey: key, InputVersion: 1,
+			Type: model.TaskType(taskType), SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, AvailableAt: availableAt,
 		}))
 		if err != nil || !created {
@@ -88,7 +108,7 @@ func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db *bu
 func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key string, lease time.Duration) *model.Task {
 	t.Helper()
 	if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: "repository_test", IdempotencyKey: key, InputVersion: 1,
+		Type: "repository_test", SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	})); err != nil || !created {
@@ -110,7 +130,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	ctx := t.Context()
 	repos := repository.NewRepositories(db)
 	row, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: "claim-timing", InputVersion: 1,
+		Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "claim-timing", Generation: new(int64(0)), InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", AvailableAt: time.Now(),
 		WaitReason: new("dependency"), StatusMessage: new("Old wait"), LastError: new("Old error"),
 	}))
@@ -175,23 +195,18 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	}
 }
 
-func TestWriteCheckpointStoresJSONText(t *testing.T) {
+func TestWriteCheckpointSwitchesToRecovery(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	claimed := enqueueAndClaimTask(t, repos, "checkpoint-text", time.Minute)
 	if err := repos.Tasks.WriteCheckpoint(t.Context(), claimed.ID, claimed.ClaimGeneration, []byte(`{"attempted":true}`)); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
-	// A BLOB would still pass json_valid(); the schema promises TEXT JSON.
-	var storageClass string
-	if err := db.NewRaw(`SELECT typeof(checkpoint_json) FROM tasks WHERE id = ?`, claimed.ID).Scan(t.Context(), &storageClass); err != nil || storageClass != "text" {
-		t.Fatalf("checkpoint storage class = %q, err=%v", storageClass, err)
-	}
 	stored, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
 	if err != nil {
 		t.Fatalf("load task: %v", err)
 	}
-	if string(stored.Checkpoint) != `{"attempted":true}` || stored.ResumeMode != model.TaskResumeModeRecover {
+	if !testutil.JSONEqual(stored.Checkpoint, []byte(`{"attempted":true}`)) || stored.ResumeMode != model.TaskResumeModeRecover {
 		t.Fatalf("stored checkpoint = %s, resume mode = %s", stored.Checkpoint, stored.ResumeMode)
 	}
 }
@@ -209,7 +224,7 @@ func TestListKeepsCheckpointForRetryChecks(t *testing.T) {
 	if err != nil || len(page.Tasks) != 1 {
 		t.Fatalf("List = %#v, err=%v", page, err)
 	}
-	if listed := page.Tasks[0]; string(listed.Checkpoint) != `{"attempted":true}` || string(listed.Input) != `{}` {
+	if listed := page.Tasks[0]; !testutil.JSONEqual(listed.Checkpoint, []byte(`{"attempted":true}`)) || string(listed.Input) != `{}` {
 		t.Fatalf("listed checkpoint = %s, input = %s", listed.Checkpoint, listed.Input)
 	}
 }
@@ -224,7 +239,7 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 	seedFailed := func(key string, taskType model.TaskType, failedAt time.Time) int64 {
 		t.Helper()
 		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-			Type: taskType, IdempotencyKey: key, InputVersion: 1,
+			Type: taskType, SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		}))

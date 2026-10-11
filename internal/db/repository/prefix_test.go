@@ -1,0 +1,362 @@
+package repository_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
+	"github.com/uptrace/bun"
+)
+
+func TestPostgresPrefixPlan(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	capture := new(postgresQueryCapture)
+	repos := repository.NewRepositories(db.WithQueryHook(capture))
+	bucket := seedBucket(t, db, "pg-prefix-plan-bucket")
+
+	seedPostgresPrefixObjects(t, ctx, repos, bucket.ID)
+	seedPostgresPrefixMultiparts(t, ctx, repos, bucket.ID)
+	seedPostgresPrefixPlanRows(t, ctx, db, bucket.ID)
+	riskVersionID, staleBefore := seedPostgresStorageRisk(t, ctx, db, repos, bucket)
+	if _, err := db.ExecContext(ctx, "ANALYZE object_versions, multipart_uploads"); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	capture.reset()
+	current, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "prefix/00010000", "", 10)
+	if err != nil {
+		t.Fatalf("ListCurrentVersionsByBucket: %v", err)
+	}
+	requireObjectVersionKeys(t, current, []string{"prefix/00010000.txt"})
+	assertPostgresPlanUsesIndex(t, db, "idx_objects_bucket_key", capture.last(t))
+
+	capture.reset()
+	version, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "prefix/00010000.txt")
+	if err != nil || version == nil || version.Key != "prefix/00010000.txt" {
+		t.Fatalf("GET/HEAD current version=%+v, err=%v", version, err)
+	}
+	getPlan := assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.last(t))
+	if !strings.Contains(getPlan, "AND (key = 'prefix/00010000.txt'::text)") {
+		t.Fatalf("GET/HEAD key is not an index condition:\n%s", getPlan)
+	}
+
+	capture.reset()
+	keyVersions, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "prefix/00010000.txt", "", 10)
+	if err != nil || len(keyVersions) != 1 || keyVersions[0].Key != "prefix/00010000.txt" {
+		t.Fatalf("key version page=%+v, err=%v", keyVersions, err)
+	}
+	keyPlan := assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.last(t))
+	if !strings.Contains(keyPlan, "AND (key = 'prefix/00010000.txt'::text)") {
+		t.Fatalf("version-list key is not an index condition:\n%s", keyPlan)
+	}
+
+	capture.reset()
+	versions, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "under", "underX/literal.txt", "01J000000000000000PG000003", 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByBucket: %v", err)
+	}
+	if len(versions) == 0 || versions[0].Key != "under_/literal.txt" {
+		t.Fatalf("version marker page = %#v, want under_/literal.txt first", versions)
+	}
+	assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.last(t))
+
+	capture.reset()
+	uploads, err := repos.Multiparts.ListByBucket(ctx, bucket.ID, `back\slash/`, `back\slash/literal.txt`, "pg-prefix-upload-000002", 10)
+	if err != nil {
+		t.Fatalf("ListByBucket multipart: %v", err)
+	}
+	if len(uploads) != 1 || uploads[0].UploadID != "pg-prefix-upload-000002-next" {
+		t.Fatalf("multipart page = %#v, want next upload for the marker key", uploads)
+	}
+	assertPostgresPlanUsesIndex(t, db, "idx_multipart_uploads_bucket_status_key_upload", capture.last(t))
+
+	capture.reset()
+	riskPage, err := repos.Contents.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:    bucket.ID,
+		Prefix:      "prefix/00010000",
+		StaleBefore: staleBefore,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions: %v", err)
+	}
+	if len(riskPage.Versions) != 1 || riskPage.Versions[0].Version.VersionID != riskVersionID {
+		t.Fatalf("storage risk versions = %#v, want %s", riskPage.Versions, riskVersionID)
+	}
+	assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.match(t, `ORDER BY object_version.key COLLATE "C" ASC`))
+
+	t.Run("deep version cursors", func(t *testing.T) {
+		current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "prefix/00015000.txt")
+		if err != nil || current == nil || current.ContentID == nil {
+			t.Fatalf("deep-page current version = %#v, err=%v", current, err)
+		}
+		base := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+		if _, err := db.ExecContext(ctx, `INSERT INTO object_versions
+			(version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type, is_delete_marker, created_at, updated_at)
+			SELECT 'pg-version-deep-' || lpad(value::text, 6, '0'), ?, ?, ?, ?, 10, 'etag', 'text/plain', FALSE,
+			?::timestamptz + (value / 2) * interval '1 second', ?
+			FROM generate_series(1, 4096) AS series(value)`, current.ObjectID, bucket.ID, current.Key, *current.ContentID, base, base); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "ANALYZE object_versions"); err != nil {
+			t.Fatal(err)
+		}
+		for _, marker := range []int{512, 16} {
+			t.Run(fmt.Sprintf("after-%d", marker), func(t *testing.T) {
+				markerID := fmt.Sprintf("pg-version-deep-%06d", marker)
+				capture.reset()
+				byKey, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, current.Key, markerID, 16)
+				wantLength := min(marker-1, 16)
+				if err != nil || len(byKey) != wantLength {
+					t.Fatalf("deep key page = %#v, err=%v, want %d versions", byKey, err, wantLength)
+				}
+				for i, version := range byKey {
+					if wantID := fmt.Sprintf("pg-version-deep-%06d", marker-i-1); version.VersionID != wantID {
+						t.Fatalf("key page version %d = %s, want %s", i, version.VersionID, wantID)
+					}
+				}
+				keyConditions := planIndexConditions(explainPostgresPlan(t, db, capture.last(t)), "idx_object_versions_bucket_key_created")
+				assertVersionTupleIndexCondition(t, keyConditions)
+
+				capture.reset()
+				byBucket, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", current.Key, markerID, 16)
+				if err != nil || len(byBucket) != 16 {
+					t.Fatalf("deep bucket page = %#v, err=%v", byBucket, err)
+				}
+				for i := range wantLength {
+					version := byBucket[i]
+					if version.VersionID != byKey[i].VersionID || version.IsCurrent || version.Checksum != current.Checksum || version.State != current.State || version.InCache != current.InCache {
+						t.Fatalf("bucket version %d = %#v, want projected key-page version %s", i, version, byKey[i].VersionID)
+					}
+				}
+				if wantLength < 16 && (byBucket[15].Key != "prefix/00015001.txt" || !byBucket[15].IsCurrent) {
+					t.Fatalf("bucket page did not continue to the next key: %#v", byBucket[15])
+				}
+				bucketConditions := planIndexConditions(explainPostgresPlan(t, db, capture.last(t)), "idx_object_versions_bucket_key_created")
+				assertVersionTupleIndexCondition(t, bucketConditions)
+				hasLaterKeyRange := false
+				for _, condition := range bucketConditions {
+					if strings.Contains(condition, "key") && strings.Contains(condition, current.Key) && strings.Contains(condition, " > ") {
+						hasLaterKeyRange = true
+					}
+				}
+				if !hasLaterKeyRange {
+					t.Fatalf("later keys do not have an index lower bound: %v", bucketConditions)
+				}
+			})
+		}
+	})
+}
+
+func assertVersionTupleIndexCondition(t *testing.T, conditions []string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if strings.Contains(condition, "ROW(") && strings.Contains(condition, "created_at") && strings.Contains(condition, "version_id") && strings.Contains(condition, " < ") {
+			return
+		}
+	}
+	t.Fatalf("version cursor is not an index condition: %v", conditions)
+}
+
+func seedPostgresPrefixObjects(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64) {
+	t.Helper()
+	keys := []string{
+		"wild%/literal.txt",
+		"wildX/literal.txt",
+		"under_/literal.txt",
+		"underX/literal.txt",
+	}
+	for i, key := range keys {
+		versionID := fmt.Sprintf("01J000000000000000PG%06d", i)
+		if _, err := createVersion(t, repos, newObjectVersion(bucketID, key, versionID, 10)); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent(%s): %v", key, err)
+		}
+	}
+}
+
+func seedPostgresPrefixMultiparts(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64) {
+	t.Helper()
+	for _, uploadID := range []string{"pg-prefix-upload-000002", "pg-prefix-upload-000002-next"} {
+		if err := repos.Multiparts.Create(ctx, &model.MultipartUpload{
+			BucketID:    bucketID,
+			Key:         `back\slash/literal.txt`,
+			UploadID:    uploadID,
+			ContentType: "application/octet-stream",
+			Status:      model.MultipartStatusInitiated,
+		}); err != nil {
+			t.Fatalf("Create multipart(%s): %v", uploadID, err)
+		}
+	}
+}
+
+func seedPostgresPrefixPlanRows(t *testing.T, ctx context.Context, db *bun.DB, bucketID int64) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO objects (bucket_id, key, created_at, updated_at)
+		SELECT ?, 'prefix/' || lpad(value::text, 8, '0') || '.txt', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM generate_series(0, 19999) AS series(value)`, bucketID); err != nil {
+		t.Fatalf("seeding plan objects: %v", err)
+	}
+	// Bytes own their identity, so each seeded version needs a content row and
+	// residency belongs to that content rather than to the version.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO storage_contents (bucket_id, checksum, content_size, requested_copies, created_at, updated_at)
+		SELECT object_row.bucket_id, lpad(to_hex(object_row.id), 64, '0'), 10, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM objects AS object_row
+		WHERE object_row.bucket_id = ? AND object_row.key LIKE 'prefix/%'`, bucketID); err != nil {
+		t.Fatalf("seeding plan contents: %v", err)
+	}
+	// Only the plan contents need entries here; the objects seeded through the
+	// repository already have theirs, and their checksums do not collide.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO object_cache (content_id, in_cache, cache_accessed_at, created_at, updated_at)
+		SELECT content_row.id, TRUE, now(), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM objects AS object_row
+		JOIN storage_contents AS content_row
+		  ON content_row.checksum = lpad(to_hex(object_row.id), 64, '0')
+		 AND content_row.bucket_id = object_row.bucket_id
+		WHERE object_row.bucket_id = ? AND object_row.key LIKE 'prefix/%'`, bucketID); err != nil {
+		t.Fatalf("seeding plan cache entries: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO object_versions (
+			version_id, object_id, bucket_id, key, content_id, size, e_tag,
+			content_type, is_delete_marker
+		, created_at, updated_at)
+		SELECT
+			'pg-prefix-version-' || object_row.id,
+			object_row.id,
+			object_row.bucket_id,
+			object_row.key,
+			content_row.id,
+			10,
+			'etag',
+			'text/plain',
+			FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM objects AS object_row
+		JOIN storage_contents AS content_row
+		  ON content_row.checksum = lpad(to_hex(object_row.id), 64, '0')
+		 AND content_row.bucket_id = object_row.bucket_id
+		WHERE object_row.bucket_id = ? AND object_row.key LIKE 'prefix/%'`, bucketID); err != nil {
+		t.Fatalf("seeding plan object versions: %v", err)
+	}
+	// "Current" is the object's pointer now.
+	if _, err := db.ExecContext(ctx, `
+		UPDATE objects SET current_version_id = 'pg-prefix-version-' || id
+		WHERE bucket_id = ? AND key LIKE 'prefix/%'`, bucketID); err != nil {
+		t.Fatalf("pointing plan objects at their versions: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO multipart_uploads (bucket_id, key, upload_id, content_type, status, created_at, updated_at)
+		SELECT
+			?,
+			'prefix/' || lpad(value::text, 8, '0') || '.txt',
+			'pg-prefix-plan-upload-' || value,
+			'application/octet-stream',
+			'initiated', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM generate_series(0, 19999) AS series(value)`, bucketID); err != nil {
+		t.Fatalf("seeding plan multipart uploads: %v", err)
+	}
+}
+
+func seedPostgresStorageRisk(t *testing.T, ctx context.Context, db *bun.DB, repos *repository.Repositories, bucket *model.Bucket) (string, time.Time) {
+	t.Helper()
+	version, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "prefix/00010000.txt")
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if version == nil {
+		t.Fatal("storage risk version is missing")
+	}
+	if version.ContentID == nil {
+		t.Fatal("storage risk version has no content")
+	}
+	contentID := *version.ContentID
+	risk := commitStorageHealthCopy(t, db, repos, bucket.ID, contentID, 0, "501", "5501", "6501", "https://provider.example/prefix-risk")
+	bindStorageHealthVersion(t, repos, bucket.ID, contentID, version)
+	checkedAt := time.Now().UTC()
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{{
+		LocalDataSetID: risk.ID,
+		BucketID:       bucket.ID,
+		BucketName:     bucket.Name,
+		CopyIndex:      risk.CopyIndex,
+		ProviderID:     risk.ProviderID,
+		ChainDataSetID: risk.DataSetID,
+		LocalStatus:    risk.Status,
+		Status:         observability.StatusUnavailable,
+		LastCheckedAt:  checkedAt,
+		Evidence:       map[string]any{},
+	}}); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+	return version.VersionID, checkedAt.Add(-time.Hour)
+}
+
+type postgresQueryCapture struct {
+	queries []string
+}
+
+func (h *postgresQueryCapture) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *postgresQueryCapture) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	h.queries = append(h.queries, event.Query)
+}
+
+func (h *postgresQueryCapture) reset() {
+	h.queries = h.queries[:0]
+}
+
+func (h *postgresQueryCapture) last(t *testing.T) string {
+	t.Helper()
+	if len(h.queries) == 0 {
+		t.Fatal("repository did not execute a query")
+	}
+	return h.queries[len(h.queries)-1]
+}
+
+func (h *postgresQueryCapture) match(t *testing.T, fragment string) string {
+	t.Helper()
+	for _, query := range h.queries {
+		if strings.Contains(query, fragment) {
+			return query
+		}
+	}
+	t.Fatalf("repository did not execute a query containing %q", fragment)
+	return ""
+}
+
+func assertPostgresPlanUsesIndex(t *testing.T, db *bun.DB, indexName string, query string) string {
+	t.Helper()
+	var plan []string
+	if err := db.NewRaw("EXPLAIN (ANALYZE, BUFFERS) "+query).Scan(context.Background(), &plan); err != nil {
+		t.Fatalf("EXPLAIN %s: %v", indexName, err)
+	}
+	joined := strings.Join(plan, "\n")
+	if !strings.Contains(joined, indexName) {
+		t.Fatalf("plan does not use %s:\n%s", indexName, joined)
+	}
+	t.Logf("plan for %s:\n%s", indexName, joined)
+	return joined
+}
+
+func bindStorageHealthVersion(
+	t *testing.T,
+	repos *repository.Repositories,
+	bucketID, contentID int64,
+	version *model.ObjectVersion,
+) {
+	t.Helper()
+	if _, err := repos.Contents.BindReadableUploadForVersion(context.Background(), repository.BindReadableUploadForVersionInput{
+		ContentID: contentID, BucketID: bucketID, VersionID: version.VersionID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForVersion: %v", err)
+	}
+}

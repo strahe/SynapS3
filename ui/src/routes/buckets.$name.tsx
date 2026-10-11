@@ -60,6 +60,7 @@ import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
 import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { ProviderReplacementProgress as ReplacementProgressView } from '@/components/app/ProviderReplacementProgress'
 import { ProviderSelect } from '@/components/app/ProviderSelect'
+import { ProviderUploadSpeedButton } from '@/components/app/ProviderUploadSpeedButton'
 import { RelativeTime } from '@/components/app/RelativeTime'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { RowActionItem, RowActionsMenu } from '@/components/app/RowActionsMenu'
@@ -168,6 +169,7 @@ import {
   dataSetGenerationTone,
   dataSetSetupMessage,
   providerCandidateDisabledReason,
+  providerCandidateLabel,
   replacementConfirmationDescription,
   replacementConfirmationSummary,
   replacementErrorMessage,
@@ -1807,17 +1809,14 @@ function ReplaceProviderDialog({
                   {inspectedProvider.upload_speed_test?.retryable ? (
                     <RetryButton taskID={inspectedProvider.upload_speed_test.retry_task_id} />
                   ) : (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={testUploadSpeed.isPending || !inspectedProvider.manual_selectable}
-                      onClick={() => testUploadSpeed.mutate(inspectedProvider.provider_id)}
-                    >
-                      {testUploadSpeed.isPending && testUploadSpeed.variables === inspectedProvider.provider_id
-                        ? 'Starting speed test…'
-                        : 'Test upload speed (32 MiB)'}
-                    </Button>
+                    <ProviderUploadSpeedButton
+                      provider={inspectedProvider}
+                      name={providerCandidateLabel(inspectedProvider)}
+                      starting={
+                        testUploadSpeed.isPending && testUploadSpeed.variables === inspectedProvider.provider_id
+                      }
+                      onTest={() => testUploadSpeed.mutate(inspectedProvider.provider_id)}
+                    />
                   )}
                 </div>
                 {inspectedProvider.upload_speed_test?.retry_unavailable_reason && (

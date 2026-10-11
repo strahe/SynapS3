@@ -112,7 +112,7 @@ func (f commitFixture) request(t *testing.T, id string) *storagecommit.Request {
 // commitTask is the task row a request with the given ID is driven by.
 func commitTask(requestID string) *model.Task {
 	return repositoryTestTask(&model.Task{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: requestID, InputVersion: 1,
+		Type: model.TaskTypeStorageCommit, SubjectType: "test", SubjectKey: requestID, Generation: new(int64(0)), InputVersion: 1,
 		Input: fmt.Appendf(nil, `{"request_id":%q}`, requestID), InputHash: requestID,
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	})

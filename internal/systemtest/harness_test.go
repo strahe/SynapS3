@@ -14,7 +14,8 @@ import (
 
 func TestHarnessStopsAllComponentsWhenS3ServerFails(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	// Database setup has a separate budget from the runtime's five-second shutdown guard.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	invalidSocket := filepath.Join(t.TempDir(), "missing", "s3.sock")
@@ -25,7 +26,11 @@ func TestHarnessStopsAllComponentsWhenS3ServerFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "S3 server") {
 		t.Fatalf("newHarness error = %v, want S3 server context", err)
 	}
+	if strings.Contains(err.Error(), "runtime shutdown exceeded") ||
+		strings.Contains(err.Error(), "systemtest runtime did not stop after startup failure") {
+		t.Fatalf("runtime did not stop after S3 server failure: %v", err)
+	}
 	if ctx.Err() != nil {
-		t.Fatalf("runtime shutdown exceeded test deadline: %v", ctx.Err())
+		t.Fatalf("harness initialization and cleanup exceeded test deadline: %v", ctx.Err())
 	}
 }

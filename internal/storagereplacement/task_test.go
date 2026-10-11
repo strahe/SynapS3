@@ -34,18 +34,6 @@ func TestReplacementInputsRejectIncompleteIdentity(t *testing.T) {
 	}
 }
 
-func TestReplacementTaskKeysAreGenerationScoped(t *testing.T) {
-	if CoordinateTaskKey(1, 1) == CoordinateTaskKey(1, 2) {
-		t.Fatal("replacement generations share a coordinator key")
-	}
-	if RetireTaskKey(4, 1) == RetireTaskKey(4, 2) {
-		t.Fatal("retirement generations share a key")
-	}
-	if CoordinateTaskKey(1, 1) == RetireTaskKey(1, 1) {
-		t.Fatal("coordinator and retirement keys collide")
-	}
-}
-
 func TestCodeMapsReplacementErrors(t *testing.T) {
 	cases := map[error]string{
 		ErrActiveReplacement:  CodeActive,

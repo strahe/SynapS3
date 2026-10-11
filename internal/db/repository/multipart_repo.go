@@ -53,7 +53,7 @@ func (r *BunMultipartRepo) ListByBucket(
 	maxUploads int,
 ) ([]model.MultipartUpload, error) {
 	var uploads []model.MultipartUpload
-	keyExpr := keyOrderExpr(r.db, "key")
+	keyExpr := keyOrderExpr("key")
 	q := r.db.NewSelect().
 		Model(&uploads).
 		Where("bucket_id = ?", bucketID).
@@ -61,17 +61,17 @@ func (r *BunMultipartRepo) ListByBucket(
 		OrderExpr(keyExpr + " ASC, upload_id ASC")
 
 	if prefix != "" {
-		q = applyCaseSensitivePrefixFilter(r.db, q, "key", prefix)
+		q = applyCaseSensitivePrefixFilter(q, "key", prefix)
 	}
 	if keyMarker != "" {
 		if uploadIDMarker != "" {
-			q = q.Where("("+keyComparisonSQL(r.db, "key", ">")+" OR ("+keyComparisonSQL(r.db, "key", "=")+" AND upload_id > ?))", keyMarker, keyMarker, uploadIDMarker)
+			q = q.Where("("+keyComparisonSQL("key", ">")+" OR ("+keyComparisonSQL("key", "=")+" AND upload_id > ?))", keyMarker, keyMarker, uploadIDMarker)
 		} else {
-			q = q.Where(keyComparisonSQL(r.db, "key", ">"), keyMarker)
+			q = q.Where(keyComparisonSQL("key", ">"), keyMarker)
 		}
 	}
 	if maxUploads > 0 {
-		q = q.Limit(maxUploads)
+		q = q.Limit(int64(maxUploads))
 	}
 
 	if err := q.Scan(ctx); err != nil {
@@ -153,7 +153,7 @@ func (r *BunMultipartRepo) GetParts(ctx context.Context, uploadID string, partNu
 		q = q.Where("part_number > ?", partNumberMarker)
 	}
 	if maxParts > 0 {
-		q = q.Limit(maxParts)
+		q = q.Limit(int64(maxParts))
 	}
 
 	if err := q.Scan(ctx); err != nil {

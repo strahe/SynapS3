@@ -3,7 +3,6 @@ package transfer
 import (
 	"context"
 	"errors"
-	"strconv"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -109,8 +108,7 @@ func (h *CopyCoordinator) enqueueCopyTaskAt(ctx context.Context, repos *reposito
 	}
 	input := storagepipeline.CopyGenerationInput{CopyID: copyID, Generation: generation}
 	taskRow, _, err := h.deps.Scheduler.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type: taskType, IdempotencyKey: copyTaskKey(taskType, copyID, generation), Input: input,
-		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyID, 10),
+		Type: taskType, Input: input,
 		AvailableAt: availableAt,
 	})
 	if err != nil {
@@ -155,8 +153,7 @@ func (h *CopyCoordinator) enqueueSuccessorCopyTask(
 	}
 	next := storagepipeline.CopyGenerationInput{CopyID: current.CopyID, Generation: current.Generation + 1}
 	taskRow, _, err := h.deps.Scheduler.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type: nextType, IdempotencyKey: copyTaskKey(nextType, next.CopyID, next.Generation), Input: next,
-		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(next.CopyID, 10),
+		Type: nextType, Input: next,
 	})
 	if err != nil {
 		return err

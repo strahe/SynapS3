@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test'
-import type { TaskItem, TaskSubjectInfo } from '../src/api/client'
+import type { TaskEvents, TaskItem, TaskPolicy, TaskSubjectInfo } from '../src/api/client'
 import { expect, test } from './fixtures'
 
 const fileKey = 'projects/archive/2026/october/reports/a-complete-and-long-object-key.txt'
@@ -59,6 +59,82 @@ async function openTasks(page: Page, adminURL: string, rows = [task(201), task(2
 async function pauseClock(page: Page) {
   await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000))
 }
+
+test('task details explain stopped retries, independent limits and recorded provider exclusions', async ({
+  page,
+  systemServer,
+}) => {
+  const row = task(201)
+  row.status = 'failed'
+  row.presentation_status = 'failed'
+  row.failure_reason = 'provider_unavailable'
+  row.retryable = true
+  row.retry_task_id = row.id
+  const policy: TaskPolicy = {
+    max_attempts: 6,
+    initial_delay: '1s',
+    maximum_delay: '1m',
+    multiplier: 2,
+    jitter: 0,
+    invocation_timeout: '1m',
+    observation_window: '0s',
+  }
+  const events: TaskEvents = {
+    events: [
+      {
+        sequence: 9,
+        type: 'provider_selection',
+        created_at: '2026-10-11T01:00:00Z',
+        provider_selection: {
+          tier: 'approved',
+          has_trusted: false,
+          requested_count: 3,
+          eligible_count: 0,
+          rejected_total: 3,
+          rejected_omitted: 1,
+          rejections: [
+            { provider_id: '101', reason: 'observation_stale', observation_checked_at: '2026-10-10T01:00:00Z' },
+            { provider_id: '102', reason: 'unknown_future_reason' },
+          ],
+        },
+      },
+    ],
+  }
+  await page.route('**/api/v1/tasks/201', (route) => route.fulfill({ json: { task: row, policy } }))
+  await page.route('**/api/v1/tasks/201/history*', (route) => route.fulfill({ json: { tasks: [row] } }))
+  await page.route('**/api/v1/tasks/201/events*', (route) => route.fulfill({ json: events }))
+  await openTasks(page, systemServer.adminURL, [row])
+  await page.getByRole('button', { name: 'Details for task 201', exact: true }).click()
+  const details = page.getByRole('dialog')
+  await expect(details.getByText('Attempt limit', { exact: true }).locator('..')).toContainText('6')
+  await expect(details.getByText('Retries scheduled', { exact: true }).locator('..')).toContainText('0 / 5')
+  await expect(details.getByText('Automatic retries', { exact: true }).locator('..')).toContainText('Stopped')
+  await expect(details.getByText('Current attempt', { exact: true })).toHaveCount(0)
+  await expect(details.getByText('Enabled', { exact: true })).toHaveCount(0)
+  await expect(details.getByText('Retry starts a new task with a fresh retry allowance.')).toBeVisible()
+  await details.getByRole('tab', { name: 'Events', exact: true }).click()
+  await expect(details.getByText('Required tier: Approved', { exact: true })).toBeVisible()
+  await expect(details.getByText('Eligible providers: 0 · Needed: 3', { exact: true })).toBeVisible()
+  await details.getByText('Excluded providers (3)', { exact: true }).click()
+  const exclusions = details.getByRole('table', { name: 'Provider exclusions' })
+  await expect(exclusions).toContainText('Health information is out of date. Refresh this provider.')
+  await expect(exclusions).toContainText('Provider unavailable')
+  await expect(exclusions).not.toContainText('unknown_future_reason')
+  await expect(details.getByText('1 more providers omitted.', { exact: true })).toBeVisible()
+  await page.keyboard.press('Escape')
+  row.status = 'pending'
+  row.presentation_status = 'scheduled'
+  row.retry_count = 1
+  row.retryable = false
+  row.retry_task_id = null
+  row.finished_at = undefined
+  row.available_at = new Date(Date.now() + 60_000).toISOString()
+  await page.reload()
+  await page.getByRole('button', { name: 'Details for task 201', exact: true }).click()
+  await expect(details.getByText('Automatic retries', { exact: true }).locator('..')).toContainText('4 remaining')
+  await expect(details.getByText('Retries scheduled', { exact: true }).locator('..')).toContainText('1 / 5')
+  await expect(details.getByText(/^Next retry:/)).toBeVisible()
+})
 
 test('Open and Closed reset filters and pagination while preserving Retry and round navigation', async ({
   page,
@@ -381,7 +457,9 @@ test('an unfinished subject read survives overlay switching and cancels after it
   await expect(page.getByRole('tooltip')).toHaveCount(1)
   await expect(page.getByRole('tooltip').getByText('Loading…', { exact: true })).toBeVisible()
   expect(await state()).toEqual({ requests: 1, aborted: 0 })
-  await page.mouse.move(1000, 100, { steps: 5 })
+  await page.mouse.move(0, 0)
+  // A subsequent move leaves the hoverable tooltip's pointer grace area.
+  await page.getByRole('heading', { name: 'Tasks', exact: true }).hover()
   await expect(page.getByRole('tooltip')).toHaveCount(0)
   expect(await state()).toEqual({ requests: 1, aborted: 0 })
   await page.keyboard.press('Escape')

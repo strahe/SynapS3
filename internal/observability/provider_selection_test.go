@@ -96,6 +96,13 @@ func TestSelectionAdmissionFreshnessAndIndependentTiers(t *testing.T) {
 			if scenario == "none" && store.reads != 0 {
 				t.Fatalf("none read tier snapshots %d times", store.reads)
 			}
+			if scenario == "none" {
+				if admission.CheckedAt != nil {
+					t.Fatal("unconstrained admission retained tier evidence")
+				}
+			} else if admission.CheckedAt == nil || !admission.CheckedAt.Equal(store.snapshots["endorsed"].CheckedAt) {
+				t.Fatalf("tier evidence timestamp = %v", admission.CheckedAt)
+			}
 			if (scenario == "missing" || scenario == "stale") && store.endorsedCalls != 1 {
 				t.Fatalf("refresh writes = %d, want 1", store.endorsedCalls)
 			}
@@ -103,35 +110,53 @@ func TestSelectionAdmissionFreshnessAndIndependentTiers(t *testing.T) {
 	}
 }
 
-func TestSelectionInventoryRefreshesEmptyFirstPageWithNonzeroTotal(t *testing.T) {
-	now := time.Now().UTC()
-	id := types.NewOnChainID(101)
-	active, hasPDP := true, true
-	url := "https://provider.test"
-	states := []ProviderState{{
-		ProviderID: id, Status: StatusAvailable, Active: &active, HasPDP: &hasPDP,
-		ServiceURL: &url, LastCheckedAt: now,
-		Profile: &ProviderProfile{ProviderID: id, Active: true, ServiceURL: url},
-	}}
-	store := &selectionTierStore{
-		tierTestStore: &tierTestStore{fakeStateStore: &fakeStateStore{providers: states}},
-		snapshots: map[string]*ProviderTierSnapshot{
-			"approved": {CheckedAt: now, ProviderIDs: json.RawMessage(`["101"]`)},
-		},
-		// The initial rows were read before the first refresh committed, and
-		// the total was read afterwards.
-		firstProviderPage: &ProviderStatePage{Total: 1},
-	}
-	checker := &fakeRefreshChecker{checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
-		return states, nil
-	}}
-	service := NewService(ServiceOptions{Store: store, Checker: checker, RefreshInterval: time.Minute, Now: func() time.Time { return now }})
-	in, err := service.SelectionInventory(t.Context(), providerselect.TierApproved)
-	if err != nil {
-		t.Fatal(err)
-	}
-	selected, err := providerselect.Select(in, providerselect.StrategyDistribution, 1, nil, false)
-	if err != nil || len(selected) != 1 || !selected[0].ID.Equal(id) {
-		t.Fatalf("selected providers = %#v, err=%v, want trusted provider %s", selected, err, id.String())
+func TestSelectionInventoryRetainsEvidenceWithoutRefreshingHealth(t *testing.T) {
+	for _, scenario := range []string{"empty first page", "stale observation", "fresh observation"} {
+		t.Run(scenario, func(t *testing.T) {
+			now := time.Now().UTC()
+			checkedAt := now
+			if scenario == "stale observation" {
+				checkedAt = now.Add(-3 * time.Minute)
+			}
+			id := types.NewOnChainID(101)
+			active, hasPDP := true, true
+			url := "https://provider.test"
+			states := []ProviderState{{
+				ProviderID: id, Status: StatusAvailable, Active: &active, HasPDP: &hasPDP,
+				ServiceURL: &url, LastCheckedAt: checkedAt,
+				Profile: &ProviderProfile{ProviderID: id, Active: true, ServiceURL: url},
+			}}
+			store := &selectionTierStore{
+				tierTestStore: &tierTestStore{fakeStateStore: &fakeStateStore{providers: states}},
+				snapshots:     map[string]*ProviderTierSnapshot{"approved": {CheckedAt: now, ProviderIDs: json.RawMessage(`["101"]`)}},
+			}
+			if scenario == "empty first page" {
+				store.firstProviderPage = &ProviderStatePage{Total: 1}
+			}
+			refreshes := 0
+			checker := &fakeRefreshChecker{checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
+				refreshes++
+				return states, nil
+			}}
+			service := NewService(ServiceOptions{Store: store, Checker: checker, RefreshInterval: time.Minute, Now: func() time.Time { return now }})
+			in, err := service.SelectionInventory(t.Context(), providerselect.TierApproved)
+			if err != nil || refreshes != 0 {
+				t.Fatalf("inventory err=%v automatic health refreshes=%d", err, refreshes)
+			}
+			if scenario != "empty first page" && (len(in.Candidates) != 1 || in.Candidates[0].ObservationCheckedAt == nil || !in.Candidates[0].ObservationCheckedAt.Equal(checkedAt)) {
+				t.Fatalf("observation evidence = %#v", in.Candidates)
+			}
+			selected, err := providerselect.Select(in, providerselect.StrategyDistribution, 1, nil, false)
+			if scenario == "fresh observation" {
+				if err != nil || len(selected) != 1 || !selected[0].ID.Equal(id) {
+					t.Fatalf("selected providers = %#v, err=%v", selected, err)
+				}
+			} else {
+				var failure *providerselect.SelectionError
+				if !errors.As(err, &failure) || !failure.Diagnostics.NeedsRefresh() || len(selected) != 0 {
+					t.Fatalf("missing health evidence error=%v selected=%#v", err, selected)
+				}
+			}
+		})
 	}
 }

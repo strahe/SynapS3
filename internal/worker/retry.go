@@ -26,10 +26,8 @@ func (s *Service) InspectRetry(ctx context.Context, task *model.Task) error {
 		return ErrRetryUnsupported
 	}
 	definition, _ := s.registry.Definition(task.Type)
-	if !legacyPolicy(task) {
-		if _, err := DecodePolicy(task); err != nil {
-			return repository.ErrConflict
-		}
+	if _, err := DecodePolicy(task); err != nil {
+		return repository.ErrConflict
 	}
 	if task.InputVersion != definition.InputVersion {
 		return repository.ErrConflict
@@ -75,8 +73,8 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 	}
 	definition, _ := s.registry.Definition(source.Type)
 	preparation := RetryPreparation{
-		Request:    EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input, SubjectType: dereference(source.SubjectType), SubjectKey: dereference(source.SubjectKey)},
-		Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: definition.LegacyHandoff,
+		Request:    EnqueueRequest{Type: source.Type, Input: source.Input},
+		Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: definition.BindSuccessor,
 	}
 	if definition.PrepareRetry != nil {
 		preparation, err = definition.PrepareRetry(ctx, s.repos, source)

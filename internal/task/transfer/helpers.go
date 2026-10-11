@@ -29,23 +29,10 @@ func (h *CopyCoordinator) copyDefinition(taskType model.TaskType) taskengine.Def
 		},
 		InspectRetry:  h.inspectCopyRetry,
 		PrepareRetry:  h.prepareCopyRetry,
-		LegacyHandoff: transferCopyOwner,
-		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
-			return input.CopyID
+		BindSuccessor: transferCopyOwner,
+		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) (int64, int64) {
+			return input.CopyID, input.Generation
 		}),
-	}
-}
-
-func copyTaskKey(taskType model.TaskType, copyID, generation int64) string {
-	switch taskType {
-	case model.TaskTypeStorageTransferPlan:
-		return storagepipeline.TransferPlanKey(copyID, generation)
-	case model.TaskTypeStorageStore:
-		return storagepipeline.StoreKey(copyID, generation)
-	case model.TaskTypeStoragePull:
-		return storagepipeline.PullKey(copyID, generation)
-	default:
-		panic(fmt.Sprintf("unsupported copy task type %q", taskType))
 	}
 }
 

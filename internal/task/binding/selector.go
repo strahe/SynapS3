@@ -57,20 +57,21 @@ func (h *Selector) SelectBucketBindings(ctx context.Context, bucket *model.Bucke
 	if h.deps.Storage == nil {
 		return nil, errors.New("storage client is unavailable")
 	}
-
 	bindings, err := h.deps.Repositories.Contents.ListDataSetBindings(ctx, bucket.ID)
 	if err != nil {
 		return nil, err
 	}
 	targetCount = model.ClampStorageCopies(targetCount)
 	selected := make([]SelectedBinding, 0, targetCount)
-	excluded := make(map[string]bool)
+	excluded := make(map[string]providerselect.ExclusionReason)
+	for _, binding := range bindings {
+		if binding.Status != model.StorageDataSetStatusRetired {
+			excluded[binding.ProviderID.String()] = providerselect.ExclusionBucketInUse
+		}
+	}
 	usedIndexes := make(map[int]struct{}, len(bindings))
 	for i := range bindings {
 		binding := &bindings[i]
-		if binding.Status != model.StorageDataSetStatusRetired {
-			excluded[binding.ProviderID.String()] = true
-		}
 		if !binding.IsCurrent {
 			continue
 		}
@@ -89,7 +90,7 @@ func (h *Selector) SelectBucketBindings(ctx context.Context, bucket *model.Bucke
 		}
 		target, err := h.deps.Resolver.OpenBindingTarget(ctx, bucket.Name, binding)
 		if err != nil {
-			return nil, err
+			return nil, h.bindingContextError(ctx, bucket.ID, binding.ProviderID, targetCount, excluded, err)
 		}
 		selected = append(selected, SelectedBinding{CopyIndex: binding.CopyIndex, Target: target})
 	}
@@ -98,9 +99,6 @@ func (h *Selector) SelectBucketBindings(ctx context.Context, bucket *model.Bucke
 		sort.Slice(selected, func(i, j int) bool { return selected[i].CopyIndex < selected[j].CopyIndex })
 		return selected, nil
 	}
-	// Free positions come from the bucket's own slot rows, not from the global
-	// maximum: a data set can only exist on a slot the bucket opened, and the
-	// foreign key would reject anything else.
 	slots, err := h.deps.Repositories.Buckets.ActiveReplicaSlots(ctx, bucket.ID)
 	if err != nil {
 		return nil, err
@@ -118,53 +116,126 @@ func (h *Selector) SelectBucketBindings(ctx context.Context, bucket *model.Bucke
 		sort.Slice(selected, func(i, j int) bool { return selected[i].CopyIndex < selected[j].CopyIndex })
 		return selected, nil
 	}
-	if missing > len(indexes) {
-		missing = len(indexes)
-	}
+	missing = min(missing, len(indexes))
 	if h.deps.Observability == nil {
 		return nil, errors.New("observability service is unavailable")
 	}
-	in, err := h.deps.Observability.SelectionInventory(ctx, h.deps.AnchorProviderTier)
+	inventory, hasTrusted, err := h.selectionInventory(ctx, bucket.ID)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.deps.Repositories.EnrichProviderCandidates(ctx, &in); err != nil {
-		return nil, err
-	}
-	_, hasTrusted, err := h.deps.Repositories.ProviderSelectionState(ctx, bucket.ID, 0, in.Admission)
-	if err != nil {
-		return nil, err
-	}
+	refreshed := false
 	var openErr error
+	var contextErr error
+	failedCandidates := make(map[string]providerselect.Candidate)
+	finalize := func(selectionErr *providerselect.SelectionError) *providerselect.SelectionError {
+		selectionErr.Diagnostics.RequestedCount = targetCount
+		selectionErr.Diagnostics.EligibleCount += len(selected)
+		if openErr != nil {
+			selectionErr.Cause = errors.Join(selectionErr.Cause, openErr)
+		}
+		if contextErr != nil {
+			selectionErr.Kind = providerselect.SelectionProviderContext
+			selectionErr.Cause = contextErr
+		}
+		return selectionErr
+	}
 	for i := 0; i < missing; {
-		candidates, err := providerselect.Select(in, bucket.ProviderSelectionStrategy, 1, excluded, hasTrusted)
+		candidates, err := providerselect.Select(inventory, bucket.ProviderSelectionStrategy, missing-i, excluded, hasTrusted)
+		if err == nil && len(candidates) == 0 {
+			err = &providerselect.SelectionError{
+				Kind:        providerselect.SelectionTemporary,
+				Diagnostics: providerselect.Diagnose(inventory, missing-i, excluded, hasTrusted),
+			}
+		}
 		if err != nil {
-			if openErr != nil {
-				return nil, openErr
+			var selectionErr *providerselect.SelectionError
+			if errors.As(err, &selectionErr) && selectionErr.Kind == providerselect.SelectionTemporary &&
+				(selectionErr.Diagnostics.NeedsRefresh() || len(inventory.Candidates) == 0) && !refreshed {
+				refreshed = true
+				if refreshErr := h.deps.Observability.RefreshProviderStates(ctx); refreshErr != nil {
+					selectionErr.Cause = refreshErr
+				} else {
+					inventory, hasTrusted, err = h.selectionInventory(ctx, bucket.ID)
+					if err != nil {
+						selectionErr.Cause = err
+						return nil, finalize(selectionErr)
+					}
+					for id, candidate := range failedCandidates {
+						found := false
+						for j, current := range inventory.Candidates {
+							if current.ID.String() == id {
+								inventory.Candidates[j] = candidate
+								found = true
+								break
+							}
+						}
+						if !found {
+							inventory.Candidates = append(inventory.Candidates, candidate)
+						}
+					}
+					for _, binding := range selected {
+						hasTrusted = hasTrusted || inventory.Admission.Trusted(idtypes.OnChainIDFromSDK(binding.Target.ProviderID()))
+					}
+					continue
+				}
+			}
+			if selectionErr != nil {
+				return nil, finalize(selectionErr)
 			}
 			return nil, err
 		}
-		if len(candidates) == 0 {
-			break
-		}
 		candidate := candidates[0]
-		excluded[candidate.ID.String()] = true
-		target, err := h.deps.Storage.OpenProviderTarget(ctx, candidate.ID.SDK(), storage.NewProviderContextOptions{DataSetMetadata: map[string]string{"bucket": bucket.Name}})
-		if err != nil {
-			openErr = err
+		target, openTargetErr := h.deps.Storage.OpenProviderTarget(ctx, candidate.ID.SDK(), storage.NewProviderContextOptions{DataSetMetadata: map[string]string{"bucket": bucket.Name}})
+		if openTargetErr == nil && target == nil {
+			openTargetErr = errors.New("provider returned no context")
+		}
+		if openTargetErr != nil {
+			openErr = errors.Join(openErr, openTargetErr)
+			if !synapse.IsProviderUnavailable(openTargetErr) {
+				contextErr = errors.Join(contextErr, openTargetErr)
+			}
+			failedCandidates[candidate.ID.String()] = candidate
+			excluded[candidate.ID.String()] = providerselect.ExclusionContextOpenFailed
 			continue
 		}
-		if target == nil {
-			openErr = errors.New("provider returned no context")
-			continue
-		}
-		selected = append(selected, SelectedBinding{CopyIndex: indexes[i], Target: target, Admission: &in.Admission})
-		hasTrusted = hasTrusted || in.Admission.Trusted(candidate.ID)
+		excluded[candidate.ID.String()] = providerselect.ExclusionSelected
+		selected = append(selected, SelectedBinding{CopyIndex: indexes[i], Target: target, Admission: &inventory.Admission})
+		hasTrusted = hasTrusted || inventory.Admission.Trusted(candidate.ID)
 		i++
-	}
-	if len(selected) < targetCount && openErr != nil {
-		return nil, openErr
 	}
 	sort.Slice(selected, func(i, j int) bool { return selected[i].CopyIndex < selected[j].CopyIndex })
 	return selected, nil
+}
+
+func (h *Selector) selectionInventory(ctx context.Context, bucketID int64) (providerselect.Inventory, bool, error) {
+	inventory, err := h.deps.Observability.SelectionInventory(ctx, h.deps.AnchorProviderTier)
+	if err != nil {
+		return inventory, false, err
+	}
+	if err := h.deps.Repositories.EnrichProviderCandidates(ctx, &inventory); err != nil {
+		return inventory, false, err
+	}
+	_, hasTrusted, err := h.deps.Repositories.ProviderSelectionState(ctx, bucketID, 0, inventory.Admission)
+	return inventory, hasTrusted, err
+}
+
+func (h *Selector) bindingContextError(ctx context.Context, bucketID int64, providerID idtypes.OnChainID, count int, excluded map[string]providerselect.ExclusionReason, cause error) error {
+	inventory := providerselect.Inventory{Admission: providerselect.Admission{Tier: h.deps.AnchorProviderTier}}
+	hasTrusted := false
+	if h.deps.Observability != nil {
+		if current, trusted, err := h.selectionInventory(ctx, bucketID); err == nil {
+			inventory, hasTrusted = current, trusted
+		}
+	}
+	excluded[providerID.String()] = providerselect.ExclusionContextOpenFailed
+	found := false
+	for _, candidate := range inventory.Candidates {
+		found = found || candidate.ID.Equal(providerID)
+	}
+	if !found {
+		inventory.Candidates = append(inventory.Candidates, providerselect.Candidate{ID: providerID})
+	}
+	diagnostics := providerselect.Diagnose(inventory, count, excluded, hasTrusted)
+	return &providerselect.SelectionError{Kind: providerselect.SelectionProviderContext, Cause: cause, Diagnostics: diagnostics}
 }

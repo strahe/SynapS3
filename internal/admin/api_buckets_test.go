@@ -21,8 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/bucketlifecycle"
-
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -812,7 +810,7 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if bucket.Status != model.BucketStatusProvisioning {
 		t.Fatalf("bucket status = %s, want %s", bucket.Status, model.BucketStatusProvisioning)
 	}
-	provisionTask, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
+	provisionTask, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, "bucket", strconv.FormatInt(bucket.ID, 10), int64(bucket.DefaultCopies))
 	if err != nil || provisionTask == nil || provisionTask.Status != model.TaskStatusPending {
 		t.Fatalf("bucket provision task = %#v, err=%v", provisionTask, err)
 	}
@@ -2311,8 +2309,8 @@ func TestAPIBucketCopyPolicy_IndependentFieldsValidateFinalPolicyAndUseOneCoordi
 	if err != nil || latestBucket == nil {
 		t.Fatalf("GetByID: bucket=%#v err=%v", latestBucket, err)
 	}
-	if len(page.Tasks) != 4 || page.Tasks[0].SubjectType == nil || *page.Tasks[0].SubjectType != "bucket" ||
-		page.Tasks[0].SubjectKey == nil || *page.Tasks[0].SubjectKey != strconv.FormatInt(bucket.ID, 10) {
+	if len(page.Tasks) != 4 || page.Tasks[0].SubjectType != "bucket" ||
+		page.Tasks[0].SubjectKey != strconv.FormatInt(bucket.ID, 10) {
 		t.Fatalf("coordinator tasks=%#v, want four immutable policy generations", page.Tasks)
 	}
 	if latestBucket.DurabilityGeneration != 4 || latestBucket.DurabilityTaskID == nil || *latestBucket.DurabilityTaskID != page.Tasks[0].ID {
@@ -3099,9 +3097,8 @@ func TestAPIBucketDeletedObjectPermanentDeleteReportsActiveStorageWork(t *testin
 	}
 	// Ingest is scheduled against the content the version names.
 	if _, _, err := srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(*version.ContentID),
-		Input:       map[string]any{"content_id": *version.ContentID},
-		SubjectType: "storage_content", SubjectKey: strconv.FormatInt(*version.ContentID, 10),
+		Type:  model.TaskTypeUploadPlan,
+		Input: map[string]any{"content_id": *version.ContentID},
 	}); err != nil {
 		t.Fatalf("Enqueue upload task: %v", err)
 	}
@@ -4377,9 +4374,8 @@ func TestAPIBucketObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
 	}
 	// Ingest is scheduled against the content the version names.
 	if _, _, err := srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(*version.ContentID),
-		Input:       map[string]any{"content_id": *version.ContentID},
-		SubjectType: "storage_content", SubjectKey: strconv.FormatInt(*version.ContentID, 10),
+		Type:  model.TaskTypeUploadPlan,
+		Input: map[string]any{"content_id": *version.ContentID},
 	}); err != nil {
 		t.Fatalf("Enqueue upload task: %v", err)
 	}
@@ -4542,7 +4538,7 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
 	}
 	taskRow, _, err := srv.taskService.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageStore, IdempotencyKey: "progress-display",
+		Type:  model.TaskTypeStorageStore,
 		Input: storagepipeline.CopyGenerationInput{CopyID: copies[0].ID, Generation: 1},
 	})
 	if err != nil {
@@ -4601,7 +4597,7 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	counter := &storageUploadSelectCounter{}
-	db.AddQueryHook(counter)
+	testutil.AddQueryHook(db, counter)
 	localCache, err := cache.NewFilesystem(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatalf("creating test cache: %v", err)
@@ -4640,7 +4636,7 @@ func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	counter := &storageUploadSelectCounter{}
-	db.AddQueryHook(counter)
+	testutil.AddQueryHook(db, counter)
 	localCache, err := cache.NewFilesystem(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatalf("creating test cache: %v", err)

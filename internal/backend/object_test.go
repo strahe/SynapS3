@@ -28,7 +28,6 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
-	"github.com/strahe/synaps3/internal/storagepipeline"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
@@ -999,7 +998,7 @@ func TestPutObjectCreatesSuccessorForTerminalUploadPlan(t *testing.T) {
 			if err != nil || version == nil || version.ContentID == nil {
 				t.Fatalf("first version = %#v, err=%v", version, err)
 			}
-			taskRow, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, storagepipeline.UploadPlanKey(*version.ContentID))
+			taskRow, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, model.TaskSubjectStorageContent, strconv.FormatInt(*version.ContentID, 10), 0)
 			if err != nil || taskRow == nil {
 				t.Fatalf("upload plan = %#v, err=%v", taskRow, err)
 			}
@@ -1057,7 +1056,7 @@ func TestPutObjectRejectsCompletedUploadPlanForCachedContent(t *testing.T) {
 	if err != nil || version == nil || version.ContentID == nil {
 		t.Fatalf("first version = %#v, err=%v", version, err)
 	}
-	taskRow, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, storagepipeline.UploadPlanKey(*version.ContentID))
+	taskRow, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, model.TaskSubjectStorageContent, strconv.FormatInt(*version.ContentID, 10), 0)
 	if err != nil || taskRow == nil {
 		t.Fatalf("upload plan = %#v, err=%v", taskRow, err)
 	}
@@ -1109,15 +1108,15 @@ func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) 
 		t.Fatalf("load evict task = %#v, err=%v", task, err)
 	}
 	contentID := *firstObj.ContentID
-	if task.SubjectKey == nil || *task.SubjectKey != strconv.FormatInt(contentID, 10) {
+	if task.SubjectKey != strconv.FormatInt(contentID, 10) {
 		t.Fatalf("evict task content = %v, want %d", task.SubjectKey, contentID)
 	}
 	input, err := cacheeviction.ParseEvictInput(task)
 	if err != nil || input.ContentID != contentID || input.AccessedAt != nil {
 		t.Fatalf("evict input = %#v, err=%v", input, err)
 	}
-	if task.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, input.Generation) {
-		t.Fatalf("evict task key = %q", task.IdempotencyKey)
+	if task.Generation == nil || *task.Generation != input.Generation {
+		t.Fatalf("evict task generation = %v, want %d", task.Generation, input.Generation)
 	}
 	policy, policyErr := worker.DecodePolicy(task)
 	if policyErr != nil || policy.MaxAttempts != 6 {
@@ -1216,7 +1215,7 @@ func TestPutObjectDuringContentCleanupAsksClientToRetry(t *testing.T) {
 	}
 	contentID := *version.ContentID
 	// The upload fails before anything is stored remotely, so the delete is allowed.
-	plan, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, storagepipeline.UploadPlanKey(contentID))
+	plan, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, model.TaskSubjectStorageContent, strconv.FormatInt(contentID, 10), 0)
 	if err != nil || plan == nil {
 		t.Fatalf("upload plan = %#v, err=%v", plan, err)
 	}
@@ -3106,7 +3105,7 @@ func TestCopyObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 		t.Fatalf("List tasks: %v", err)
 	}
 	for _, task := range page.Tasks {
-		if task.SubjectType != nil && task.SubjectKey != nil && *task.SubjectType == "storage_content" && *task.SubjectKey == contentSubjectForVersion(t, tb, dstObj.VersionID) {
+		if task.SubjectType == "storage_content" && task.SubjectKey == contentSubjectForVersion(t, tb, dstObj.VersionID) {
 			policy, policyErr := worker.DecodePolicy(&task)
 			if policyErr != nil || policy.MaxAttempts != 6 {
 				t.Fatalf("copy upload task policy = %#v, err = %v; want six attempts", policy, policyErr)

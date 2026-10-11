@@ -3,9 +3,8 @@ package backend_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
-
-	"github.com/strahe/synaps3/internal/bucketlifecycle"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -40,7 +39,7 @@ func TestCreateBucket_HappyPath(t *testing.T) {
 	if bucket.ProviderSelectionStrategy != "distribution" {
 		t.Errorf("S3 bucket provider preference = %q, want distribution", bucket.ProviderSelectionStrategy)
 	}
-	provisionTask, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
+	provisionTask, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, "bucket", strconv.FormatInt(bucket.ID, 10), int64(bucket.DefaultCopies))
 	if err != nil || provisionTask == nil || provisionTask.Status != model.TaskStatusPending {
 		t.Fatalf("bucket provision task = %#v, err=%v", provisionTask, err)
 	}

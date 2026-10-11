@@ -554,7 +554,7 @@ func TestLoad_CommitMaxWait(t *testing.T) {
 
 func TestLoad_EnvOverride(t *testing.T) {
 	t.Setenv("SYNAPS3_SERVER_PORT", ":9999")
-	t.Setenv("SYNAPS3_DATABASE_DRIVER", "sqlite")
+	t.Setenv("SYNAPS3_DATABASE_MAX_OPEN_CONNS", "7")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -563,8 +563,8 @@ func TestLoad_EnvOverride(t *testing.T) {
 	if cfg.Server.Port != ":9999" {
 		t.Errorf("Server.Port = %q, want %q", cfg.Server.Port, ":9999")
 	}
-	if cfg.Database.Driver != "sqlite" {
-		t.Errorf("Database.Driver = %q, want %q", cfg.Database.Driver, "sqlite")
+	if cfg.Database.MaxOpenConns != 7 {
+		t.Errorf("Database.MaxOpenConns = %d, want 7", cfg.Database.MaxOpenConns)
 	}
 }
 

@@ -13,10 +13,8 @@ import (
 	"github.com/strahe/synaps3/tests/testutil/e2e"
 )
 
-// newSystemHarness starts a harness on the database selected by build tags.
 func newSystemHarness(t *testing.T, logger *slog.Logger, options systemtest.HarnessOptions) (*systemtest.Harness, error) {
 	t.Helper()
-	options.Database = systemDatabase(t)
 	return systemtest.NewHarness(t.Context(), logger, options)
 }
 

@@ -114,7 +114,7 @@ func TestRegistryRequiresClosedCommunicationDeclarations(t *testing.T) {
 
 func TestSchedulerRequiresRegisteredTypesAtFreeze(t *testing.T) {
 	registry := NewRegistry()
-	service, err := NewService(registry, repository.NewRepositories(testutil.NewTestFileDB(t)))
+	service, err := NewService(registry, repository.NewRepositories(testutil.NewTestDB(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestSchedulerRequiresRegisteredTypesAtFreeze(t *testing.T) {
 func TestMessengerRequiresTransactionPermissionsAndStableSubscriberOrder(t *testing.T) {
 	var messenger *Messenger
 	var received []string
-	harness := communicationHarness(t, testutil.NewTestFileDB(t), nil, func(r *Registry, _ *Service) {
+	harness := communicationHarness(t, testutil.NewTestDB(t), nil, func(r *Registry, _ *Service) {
 		declarations := []string{"ready"}
 		var err error
 		messenger, err = r.Messenger("source", nil, declarations)
@@ -183,7 +183,7 @@ func TestMessengerRequiresTransactionPermissionsAndStableSubscriberOrder(t *test
 }
 
 func TestMessengerRejectsUnfrozenAndRecursiveDispatch(t *testing.T) {
-	repos := repository.NewRepositories(testutil.NewTestFileDB(t))
+	repos := repository.NewRepositories(testutil.NewTestDB(t))
 	registry := NewRegistry()
 	messenger, err := registry.Messenger("source", []string{"recursive"}, nil)
 	if err != nil {
@@ -214,10 +214,9 @@ func TestMessengerRejectsUnfrozenAndRecursiveDispatch(t *testing.T) {
 func TestMessagesShareEngineSettlementTransaction(t *testing.T) {
 	for _, failure := range []string{"error", "panic"} {
 		t.Run(failure, func(t *testing.T) {
-			assertMessageSettlementRollback(t, testutil.NewTestFileDB(t), failure)
+			assertMessageSettlementRollback(t, testutil.NewTestDB(t), failure)
 		})
 	}
-	testPostgresMessageSettlement(t)
 }
 
 func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
@@ -242,7 +241,7 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 			t.Fatal(err)
 		}
 		if err := r.Subscribe("10.target", "ready", func(ctx context.Context, tx *repository.Repositories, _ Message) error {
-			_, _, err := target.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: "message_target", IdempotencyKey: "target", Input: testInput{"target"}})
+			_, _, err := target.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: "message_target", Input: testInput{"target"}})
 			return err
 		}); err != nil {
 			t.Fatal(err)
@@ -265,11 +264,11 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 			t.Fatal(err)
 		}
 	})
-	enqueueTestTask(t, harness, "source", "source")
+	enqueueTestTask(t, harness, "source")
 	claimed := claimTestTask(t, harness)
 	harness.engine.settlementRetryDelays = []time.Duration{0}
 	result := Complete("completed", func(ctx context.Context, tx *repository.Repositories) error {
-		if _, _, err := source.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: testTaskType, IdempotencyKey: "source-effect", Input: testInput{"source-effect"}}); err != nil {
+		if _, _, err := source.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: testTaskType, Input: testInput{"source-effect"}}); err != nil {
 			return err
 		}
 		return messenger.Notify(ctx, tx, testMessage("ready"))
@@ -285,7 +284,7 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 		taskType model.TaskType
 		key      string
 	}{{testTaskType, "source-effect"}, {"message_target", "target"}} {
-		if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), identity.taskType, identity.key); err != nil || row != nil {
+		if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), identity.taskType, "test_subject", identity.key, 0); err != nil || row != nil {
 			t.Fatalf("rolled-back %s task = %#v, error = %v", identity.key, row, err)
 		}
 	}
@@ -304,14 +303,13 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 	if err != nil || stored.Status != model.TaskStatusCompleted {
 		t.Fatalf("source status after replay = %#v, error = %v", stored, err)
 	}
-	if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), "message_target", "target"); err != nil || row == nil {
+	if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), "message_target", "test_subject", "target", 0); err != nil || row == nil {
 		t.Fatalf("target after replay = %#v, error = %v", row, err)
 	}
 }
 
 func TestSchedulerWakePreservesTypeAndWaitReasonBoundaries(t *testing.T) {
-	assertSchedulerWakeBoundaries(t, testutil.NewTestFileDB(t))
-	testPostgresSchedulerWake(t)
+	assertSchedulerWakeBoundaries(t, testutil.NewTestDB(t))
 }
 
 func assertSchedulerWakeBoundaries(t *testing.T, db *bun.DB) {
@@ -340,7 +338,7 @@ func assertSchedulerWakeBoundaries(t *testing.T, db *bun.DB) {
 	var ids []int64
 	for index := range rows {
 		row := &rows[index]
-		taskRow, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: row.taskType, IdempotencyKey: fmt.Sprintf("wake-%d", index), Input: testInput{"wake"}})
+		taskRow, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: row.taskType, Input: testInput{fmt.Sprintf("wake-%d", index)}})
 		if err != nil {
 			t.Fatal(err)
 		}

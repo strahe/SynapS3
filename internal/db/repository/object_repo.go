@@ -15,7 +15,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // BunObjectRepo implements ObjectRepository using Bun ORM.
@@ -651,7 +650,7 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 	// Listing walks the objects unique key and follows each pointer, so the
 	// bucket+key ordering comes from objects rather than from a partial index
 	// over every version.
-	keyExpr := keyOrderExpr(r.db, "current_object.key")
+	keyExpr := keyOrderExpr("current_object.key")
 	q := r.db.NewSelect().
 		Model(&versions).
 		ModelTableExpr("object_versions AS object_version")
@@ -662,17 +661,17 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 		OrderExpr(keyExpr + " ASC")
 
 	if prefix != "" {
-		q = applyCaseSensitivePrefixFilter(r.db, q, "current_object.key", prefix)
+		q = applyCaseSensitivePrefixFilter(q, "current_object.key", prefix)
 	}
 	if keyBoundary != "" {
 		if includeBoundary {
-			q = q.Where(keyComparisonSQL(r.db, "current_object.key", ">="), keyBoundary)
+			q = q.Where(keyComparisonSQL("current_object.key", ">="), keyBoundary)
 		} else {
-			q = q.Where(keyComparisonSQL(r.db, "current_object.key", ">"), keyBoundary)
+			q = q.Where(keyComparisonSQL("current_object.key", ">"), keyBoundary)
 		}
 	}
 	if maxKeys > 0 {
-		q = q.Limit(maxKeys)
+		q = q.Limit(int64(maxKeys))
 	}
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing current object versions: %w", err)
@@ -682,7 +681,7 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 
 func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error) {
 	var rows []ObjectVersionListItem
-	keyExpr := keyOrderExpr(r.db, "object_version.key")
+	keyExpr := keyOrderExpr("object_version.key")
 	q := r.db.NewSelect().
 		Model(&rows).
 		ModelTableExpr("object_versions AS object_version").
@@ -693,26 +692,38 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 	q = withObjectVersionStorageColumns(q, "object_version")
 
 	if prefix != "" {
-		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
+		q = applyCaseSensitivePrefixFilter(q, "object_version.key", prefix)
 	}
 	if keyMarker != "" {
 		if versionIDMarker == "" {
-			q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), keyMarker)
+			q = q.Where(keyComparisonSQL("object_version.key", ">"), keyMarker)
 		} else {
 			marker, err := r.GetVersionByBucketKeyAndID(ctx, bucketID, keyMarker, versionIDMarker)
 			if err != nil {
 				return nil, err
 			}
 			if marker == nil {
-				q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), keyMarker)
+				q = q.Where(keyComparisonSQL("object_version.key", ">"), keyMarker)
 			} else {
-				q = q.Where("("+keyComparisonSQL(r.db, "object_version.key", ">")+") OR ("+keyComparisonSQL(r.db, "object_version.key", "=")+" AND (object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?)))",
-					keyMarker, keyMarker, marker.CreatedAt, marker.CreatedAt, marker.VersionID)
+				sameKey := q.Clone().
+					Where(keyComparisonSQL("object_version.key", "="), keyMarker).
+					Where("(object_version.created_at, object_version.version_id) < (?, ?)", marker.CreatedAt, marker.VersionID)
+				laterKeys := q.Clone().Where(keyComparisonSQL("object_version.key", ">"), keyMarker)
+				if maxKeys > 0 {
+					sameKey = sameKey.Limit(int64(maxKeys))
+					laterKeys = laterKeys.Limit(int64(maxKeys))
+				}
+				q = r.db.NewSelect().Model(&rows).
+					ModelTableExpr("(?) AS object_version", sameKey.UnionAll(laterKeys)).
+					ColumnExpr("object_version.*").
+					OrderExpr(keyExpr + " ASC").
+					OrderExpr("object_version.created_at DESC").
+					OrderExpr("object_version.version_id DESC")
 			}
 		}
 	}
 	if maxKeys > 0 {
-		q = q.Limit(maxKeys)
+		q = q.Limit(int64(maxKeys))
 	}
 
 	if err := q.Scan(ctx); err != nil {
@@ -737,12 +748,11 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 			return nil, err
 		}
 		if marker != nil {
-			q = q.Where("(object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?))",
-				marker.CreatedAt, marker.CreatedAt, marker.VersionID)
+			q = q.Where("(object_version.created_at, object_version.version_id) < (?, ?)", marker.CreatedAt, marker.VersionID)
 		}
 	}
 	if maxKeys > 0 {
-		q = q.Limit(maxKeys)
+		q = q.Limit(int64(maxKeys))
 	}
 
 	if err := q.Scan(ctx); err != nil {
@@ -753,7 +763,7 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 
 func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error) {
 	var markers []model.ObjectVersion
-	keyExpr := keyOrderExpr(r.db, "current_object.key")
+	keyExpr := keyOrderExpr("current_object.key")
 	q := r.db.NewSelect().
 		Model(&markers).
 		ModelTableExpr("object_versions AS object_version")
@@ -765,13 +775,13 @@ func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucket
 		OrderExpr(keyExpr + " ASC")
 
 	if prefix != "" {
-		q = applyCaseSensitivePrefixFilter(r.db, q, "current_object.key", prefix)
+		q = applyCaseSensitivePrefixFilter(q, "current_object.key", prefix)
 	}
 	if afterKey != "" {
-		q = q.Where(keyComparisonSQL(r.db, "current_object.key", ">"), afterKey)
+		q = q.Where(keyComparisonSQL("current_object.key", ">"), afterKey)
 	}
 	if maxKeys > 0 {
-		q = q.Limit(maxKeys)
+		q = q.Limit(int64(maxKeys))
 	}
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing recoverable delete markers: %w", err)
@@ -1102,18 +1112,19 @@ func prepareObjectVersionsForPermanentDelete(
 			return fmt.Errorf("loading storage copies for permanent delete: %w", err)
 		}
 	}
-	for i := range copies {
-		res, err := db.NewUpdate().
-			Model((*model.StorageCopy)(nil)).
-			Set("updated_at = updated_at").
-			Where("id = ?", copies[i].ID).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("locking storage copy for permanent delete: %w", err)
+	if len(copies) > 0 {
+		copyIDs := make([]int64, len(copies))
+		for i := range copies {
+			copyIDs[i] = copies[i].ID
 		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
-			return fmt.Errorf("locking storage copy %d for permanent delete: %w", copies[i].ID, ErrConflict)
+		var locked []int64
+		if err := db.NewSelect().Model((*model.StorageCopy)(nil)).Column("id").
+			Where("id IN (?)", bun.List(copyIDs)).OrderExpr("id ASC").For("NO KEY UPDATE").
+			Scan(ctx, &locked); err != nil {
+			return fmt.Errorf("locking storage copies for permanent delete: %w", err)
+		}
+		if len(locked) != len(copyIDs) {
+			return fmt.Errorf("locking storage copies for permanent delete: %w", ErrConflict)
 		}
 	}
 
@@ -1127,14 +1138,11 @@ func prepareObjectVersionsForPermanentDelete(
 		contentSubjectKeys = append(contentSubjectKeys, strconv.FormatInt(contentID, 10))
 	}
 	var relatedTasks []model.Task
-	taskQuery := db.NewSelect().
-		Model(&relatedTasks).
+	taskQuery := taskScopeQuery(db, &relatedTasks, TaskScopeWork).
 		Column("id", "status").
 		Where("subject_type = ? AND subject_key IN (?)", model.TaskSubjectStorageContent, bun.List(contentSubjectKeys)).
-		OrderExpr("id ASC")
-	if db.Dialect().Name() == dialect.PG {
-		taskQuery = taskQuery.For("UPDATE")
-	}
+		OrderExpr("id ASC").
+		For("NO KEY UPDATE")
 	if err := taskQuery.Scan(ctx); err != nil {
 		return fmt.Errorf("loading storage tasks for permanent delete: %w", err)
 	}
@@ -1190,7 +1198,7 @@ func prepareObjectVersionsForPermanentDelete(
 					model.StorageCopyStatusCommitting,
 				})).
 				Where(`active_task_id IS NULL OR EXISTS (
-					SELECT 1 FROM (SELECT id,status FROM tasks UNION ALL SELECT task_id AS id,status FROM task_history) AS terminal_task
+					SELECT 1 FROM tasks AS terminal_task
 					WHERE terminal_task.id = storage_copy.active_task_id
 					  AND terminal_task.status IN (?, ?, ?)
 				)`, model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled).
@@ -1903,11 +1911,8 @@ func selectVersionsByObjectNewestFirst(ctx context.Context, db bun.IDB, objectID
 }
 
 func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, key string) error {
-	// Use an UPDATE as a cross-dialect row lock; SELECT FOR UPDATE is not supported by SQLite.
-	if _, err := db.NewUpdate().
-		Model((*model.Object)(nil)).
-		Set("updated_at = updated_at").
-		Where("bucket_id = ? AND key = ?", bucketID, key).
+	if _, err := db.NewSelect().Model((*model.Object)(nil)).Column("id").
+		Where("bucket_id = ? AND key = ?", bucketID, key).For("NO KEY UPDATE").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("locking current object: %w", err)
 	}
@@ -1915,26 +1920,18 @@ func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, 
 }
 
 func lockObjectVersionsByID(ctx context.Context, db bun.IDB, versionIDs []string) error {
-	ids := append([]string(nil), versionIDs...)
-	sort.Strings(ids)
-	previous := ""
-	for _, versionID := range ids {
-		if versionID == "" || versionID == previous {
-			continue
-		}
-		previous = versionID
-		res, err := db.NewUpdate().
-			Model((*model.ObjectVersion)(nil)).
-			Set("updated_at = updated_at").
-			Where("version_id = ?", versionID).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("locking object version for permanent delete: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
-			return ErrNotFound
-		}
+	ids := slices.DeleteFunc(slices.Compact(slices.Sorted(slices.Values(versionIDs))), func(id string) bool { return id == "" })
+	if len(ids) == 0 {
+		return nil
+	}
+	var locked []string
+	if err := db.NewSelect().Model((*model.ObjectVersion)(nil)).Column("version_id").
+		Where("version_id IN (?)", bun.List(ids)).OrderExpr(`version_id COLLATE "C" ASC`).For("NO KEY UPDATE").
+		Scan(ctx, &locked); err != nil {
+		return fmt.Errorf("locking object versions for permanent delete: %w", err)
+	}
+	if len(locked) != len(ids) {
+		return ErrNotFound
 	}
 	return nil
 }

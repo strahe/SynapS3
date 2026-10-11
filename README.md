@@ -1,7 +1,6 @@
 # SynapS3
 
 [![CI](https://github.com/strahe/SynapS3/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/ci.yml)
-[![S3 Compatibility](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml)
 [![Package](https://img.shields.io/badge/package-GHCR-blue?logo=github)](https://github.com/strahe/SynapS3/pkgs/container/synaps3)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/strahe/SynapS3?filename=go.mod)](go.mod)
 
@@ -59,7 +58,7 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Multipart | `ListMultipartUploads` | ✅ | Lists open uploads |
 | Multipart | `ListParts` | ✅ | Lists uploaded parts |
 
-See [S3 Compatibility runs](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml) for individual reports.
+See the system job in [CI runs](https://github.com/strahe/SynapS3/actions/workflows/ci.yml) for individual S3 compatibility reports.
 
 ## License
 

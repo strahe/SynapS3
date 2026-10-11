@@ -60,9 +60,19 @@ func testDefinition(retryLimit *int, allowRetry bool) Definition {
 			}
 			return nil
 		}),
+		Identity:   testIdentity,
 		Policy:     ExecutionPolicy{MaxAttempts: testAttempts(retryLimit), Backoff: DefaultBackoffPolicy()},
 		AllowRetry: allowRetry,
 	}
+}
+
+// testIdentity names each test round by its input value.
+func testIdentity(canonical json.RawMessage) (Identity, error) {
+	var input testInput
+	if err := json.Unmarshal(canonical, &input); err != nil {
+		return Identity{}, err
+	}
+	return Identity{SubjectType: "test_subject", SubjectKey: input.Value, Generation: new(int64(0))}, nil
 }
 
 type taskHarness struct {
@@ -75,7 +85,7 @@ type taskHarness struct {
 
 func newTaskHarness(t *testing.T, handler Handler, config *EngineConfig, others ...Handler) taskHarness {
 	t.Helper()
-	return newTaskHarnessWithDB(t, testutil.NewTestFileDB(t), handler, config, others...)
+	return newTaskHarnessWithDB(t, testutil.NewTestDB(t), handler, config, others...)
 }
 
 func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *EngineConfig, others ...Handler) taskHarness {
@@ -91,7 +101,7 @@ func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *Eng
 		}
 	}
 	if handler.Definition().Type.IsRecurringSystem() {
-		if err := registry.RegisterSchedule(ScheduleDefinition{Key: "test-cycle", Type: handler.Definition().Type, Input: testInput{Value: "cycle"}, Interval: time.Hour}); err != nil {
+		if err := registry.RegisterSchedule(ScheduleDefinition{Key: "test-cycle", Type: handler.Definition().Type, Interval: time.Hour}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -115,20 +125,14 @@ func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *Eng
 	return taskHarness{db: db, repos: repos, registry: registry, service: service, engine: engine}
 }
 
-func enqueueTestTask(t *testing.T, harness taskHarness, key, value string) *model.Task {
+func enqueueTestTask(t *testing.T, harness taskHarness, value string) *model.Task {
 	t.Helper()
-	taskRow, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type:           testTaskType,
-		IdempotencyKey: key,
-		Input:          testInput{Value: value},
-		SubjectType:    "test_subject",
-		SubjectKey:     key,
-	})
+	taskRow, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: testTaskType, Input: testInput{Value: value}})
 	if err != nil {
 		t.Fatalf("enqueue task: %v", err)
 	}
 	if !created {
-		t.Fatalf("task %s was not created", key)
+		t.Fatalf("task %s was not created", value)
 	}
 	return taskRow
 }
@@ -145,72 +149,62 @@ func claimTestTask(t *testing.T, harness taskHarness) *model.Task {
 	return claimed
 }
 
+type rowInput struct {
+	RowID int64  `json:"row_id"`
+	Note  string `json:"note,omitempty"`
+}
+
+func rowDefinition() Definition {
+	definition := testDefinition(nil, true)
+	definition.Codec = StrictJSONCodec[rowInput](nil)
+	definition.Identity = IdentityFromInput("test_row", func(input rowInput) (int64, int64) { return input.RowID, 0 })
+	return definition
+}
+
 func TestServiceCanonicalEnqueueAndConflict(t *testing.T) {
-	limit := 5
-	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
+	harness := newTaskHarness(t, scriptedHandler{definition: rowDefinition()}, nil)
 
 	first, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "same", Input: map[string]any{"value": "alpha"},
+		Type: testTaskType, Input: map[string]any{"note": "alpha", "row_id": 1},
 	})
 	if err != nil || !created {
 		t.Fatalf("first enqueue = task:%#v created:%v err:%v", first, created, err)
 	}
-	if string(first.Input) != `{"value":"alpha"}` {
+	if !testutil.JSONEqual(first.Input, []byte(`{"row_id":1,"note":"alpha"}`)) {
 		t.Fatalf("canonical input = %s", first.Input)
 	}
 
 	same, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "same", Input: testInput{Value: "alpha"},
+		Type: testTaskType, Input: rowInput{RowID: 1, Note: "alpha"},
 	})
 	if err != nil || created || same.ID != first.ID {
 		t.Fatalf("idempotent enqueue = task:%#v created:%v err:%v", same, created, err)
 	}
 
 	_, _, err = harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "same", Input: testInput{Value: "beta"},
+		Type: testTaskType, Input: rowInput{RowID: 1, Note: "beta"},
 	})
 	if !errors.Is(err, ErrInputConflict) {
 		t.Fatalf("conflicting enqueue error = %v, want %v", err, ErrInputConflict)
 	}
 
 	_, _, err = harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "unknown-field", Input: map[string]any{"value": "alpha", "extra": true},
+		Type: testTaskType, Input: map[string]any{"row_id": 2, "extra": true},
 	})
 	if err == nil {
 		t.Fatal("enqueue with unknown input field succeeded")
 	}
 }
 
-func TestServiceDerivesDeclaredSubjectFromInput(t *testing.T) {
-	type rowInput struct {
-		RowID int64 `json:"row_id"`
-	}
-	definition := testDefinition(nil, false)
-	definition.Codec = StrictJSONCodec[rowInput](nil)
-	definition.Subject = SubjectFromInput("test_row", func(input rowInput) int64 { return input.RowID })
-	harness := newTaskHarness(t, scriptedHandler{definition: definition}, nil)
+func TestServiceDerivesIdentityFromInput(t *testing.T) {
+	harness := newTaskHarness(t, scriptedHandler{definition: rowDefinition()}, nil)
 
-	derived, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "derived", Input: rowInput{RowID: 7},
-	})
-	if err != nil || derived.SubjectType == nil || *derived.SubjectType != "test_row" || derived.SubjectKey == nil || *derived.SubjectKey != "7" {
-		t.Fatalf("derived subject task = %#v, err=%v, want test_row/7", derived, err)
+	derived, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: testTaskType, Input: rowInput{RowID: 7}})
+	if err != nil || derived.SubjectType != "test_row" || derived.SubjectKey != "7" || derived.Generation == nil || *derived.Generation != 0 {
+		t.Fatalf("derived identity task = %#v, err=%v, want test_row/7 generation 0", derived, err)
 	}
-	if _, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "matching", Input: rowInput{RowID: 8},
-		SubjectType: "test_row", SubjectKey: "8",
-	}); err != nil {
-		t.Fatalf("enqueue with the input's own subject: %v", err)
-	}
-	_, _, err = harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "mismatched", Input: rowInput{RowID: 9},
-		SubjectType: "test_row", SubjectKey: "10",
-	})
-	if !errors.Is(err, repository.ErrInvalidInput) {
-		t.Fatalf("enqueue naming another row = %v, want invalid input", err)
-	}
-	if stored, err := harness.repos.Tasks.GetByIdentity(t.Context(), testTaskType, "mismatched"); err != nil || stored != nil {
-		t.Fatalf("refused task = %#v, err=%v, want nothing stored", stored, err)
+	if _, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: testTaskType, Input: rowInput{RowID: 0}}); err == nil {
+		t.Fatal("enqueue without a subject row succeeded")
 	}
 }
 
@@ -218,7 +212,7 @@ func TestServiceWakeMakesFuturePendingTaskReady(t *testing.T) {
 	limit := 5
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
 	row, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "wake", Input: testInput{Value: "wake"},
+		Type: testTaskType, Input: testInput{Value: "wake"},
 		AvailableAt: time.Now().Add(time.Hour),
 	})
 	if err != nil || !created {
@@ -250,7 +244,7 @@ func TestEngineConstructionFreezesRegistry(t *testing.T) {
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
 	err := harness.registry.Register(scriptedHandler{definition: Definition{
 		Type: "late_operation", InputVersion: 1, WorkStart: WorkStartOnEffect, Policy: ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy()},
-		Codec: StrictJSONCodec(func(input *testInput) error { return nil }),
+		Codec: StrictJSONCodec(func(input *testInput) error { return nil }), Identity: testIdentity,
 	}})
 	if !errors.Is(err, ErrRegistryFrozen) {
 		t.Fatalf("late registry mutation error = %v, want frozen registry", err)
@@ -300,7 +294,7 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 				definition: testDefinition(&limit, true),
 				execute:    func(context.Context, Execution) Result { return tt.result },
 			}, nil)
-			row := enqueueTestTask(t, harness, tt.name, tt.name)
+			row := enqueueTestTask(t, harness, tt.name)
 			claimed := claimTestTask(t, harness)
 			harness.engine.executeClaim(t.Context(), claimed)
 
@@ -338,14 +332,14 @@ func TestEngineNotifiesAfterSettlementCommits(t *testing.T) {
 	config := EngineConfig{
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
 		OnTaskSettled: func(taskRow *model.Task, transition repository.TaskTransition) {
-			if taskRow.IdempotencyKey != "notify" || transition.Status != model.TaskStatusCompleted {
+			if taskRow.SubjectKey != "notify" || transition.Status != model.TaskStatusCompleted {
 				t.Errorf("settlement notification = task:%#v transition:%#v", taskRow, transition)
 			}
 			notified.Add(1)
 		},
 	}
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, &config)
-	enqueueTestTask(t, harness, "notify", "notify")
+	enqueueTestTask(t, harness, "notify")
 	claimed := claimTestTask(t, harness)
 	harness.engine.executeClaim(t.Context(), claimed)
 	if notified.Load() != 1 {
@@ -363,7 +357,7 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 		return 37 * time.Second
 	}
 	now := time.Now()
-	row := enqueueTestTask(t, harness, "backoff", "backoff")
+	row := enqueueTestTask(t, harness, "backoff")
 	row.RetryCount = 3
 	transition := harness.engine.transitionFor(row, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
 	if transition.Status != model.TaskStatusPending || !transition.IncrementRetry {
@@ -401,7 +395,7 @@ func TestBackoffPolicyDelayIsExponentialJitteredAndCapped(t *testing.T) {
 func TestServiceRetryCreatesIndependentRoundAndAcknowledgeKeepsFailed(t *testing.T) {
 	limit := 5
 	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result { return Fail(errors.New("failed"), "test_failure", nil) }}, nil)
-	row := enqueueTestTask(t, h, "retry", "retry")
+	row := enqueueTestTask(t, h, "retry")
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	original, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	next, err := h.service.Retry(t.Context(), row.ID)
@@ -440,7 +434,7 @@ func TestServiceManualRetryPredicateUsesFailureEvidence(t *testing.T) {
 			return Fail(errors.New("outcome is unknown"), "unsafe_outcome", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "unsafe-retry", "unsafe-retry")
+	row := enqueueTestTask(t, harness, "unsafe-retry")
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
@@ -472,7 +466,7 @@ func TestCancellationWakesPendingTaskAndForcesRecovery(t *testing.T) {
 		},
 	}, nil)
 	row, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "cancel-pending", Input: testInput{Value: "cancel-pending"},
+		Type: testTaskType, Input: testInput{Value: "cancel-pending"},
 		AvailableAt: time.Now().Add(24 * time.Hour),
 	})
 	if err != nil || !created {
@@ -496,7 +490,7 @@ func TestCancellationWakesPendingTaskAndForcesRecovery(t *testing.T) {
 func TestCancellationOverridesPendingSettlementScheduleAndMode(t *testing.T) {
 	limit := 5
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
-	row := enqueueTestTask(t, harness, "cancel-running", "cancel-running")
+	row := enqueueTestTask(t, harness, "cancel-running")
 	claimed := claimTestTask(t, harness)
 	if err := harness.repos.Tasks.RequestCancellation(t.Context(), row.ID, "owner stopped"); err != nil {
 		t.Fatalf("request cancellation: %v", err)
@@ -529,7 +523,7 @@ func TestExpiredClaimIsRecoveredAndStaleGenerationIsFenced(t *testing.T) {
 			return Complete("recovered", nil)
 		},
 	}, nil)
-	enqueueTestTask(t, harness, "takeover", "takeover")
+	enqueueTestTask(t, harness, "takeover")
 	stale := claimTestTask(t, harness)
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), stale.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("expire first claim: %v", err)
@@ -566,7 +560,7 @@ func TestEngineRejectsCorruptInputBeforeHandler(t *testing.T) {
 			return Complete("unexpected", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "corrupt", "corrupt")
+	row := enqueueTestTask(t, harness, "corrupt")
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET input_hash = ? WHERE id = ?`, "00", row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("corrupt task hash: %v", err)
 	}
@@ -590,7 +584,7 @@ func TestEngineAcceptsDatabaseJSONNormalizationAndUsesCanonicalInput(t *testing.
 			return Complete("normalized", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "normalized", "normalized")
+	row := enqueueTestTask(t, harness, "normalized")
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET input_json = ? WHERE id = ?`, `{ "value" : "normalized" }`, row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("normalize stored task JSON: %v", err)
 	}
@@ -628,10 +622,10 @@ func TestCodecPanicFailsClosedDuringEnqueueAndExecution(t *testing.T) {
 			return Complete("unexpected", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "codec-panic", "codec-panic")
+	row := enqueueTestTask(t, harness, "codec-panic")
 	panicCodec.Store(true)
 	if _, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "codec-panic-enqueue", Input: testInput{Value: "value"},
+		Type: testTaskType, Input: testInput{Value: "value"},
 	}); !errors.Is(err, ErrCodecPanic) {
 		t.Fatalf("enqueue codec panic error = %v, want ErrCodecPanic", err)
 	}
@@ -654,7 +648,7 @@ func TestCodecInvalidCanonicalJSONFailsClosed(t *testing.T) {
 	})
 	harness := newTaskHarness(t, scriptedHandler{definition: definition}, nil)
 	if _, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, IdempotencyKey: "invalid-canonical", Input: testInput{Value: "value"},
+		Type: testTaskType, Input: testInput{Value: "value"},
 	}); !errors.Is(err, ErrInvalidCanonical) {
 		t.Fatalf("enqueue invalid canonical error = %v, want ErrInvalidCanonical", err)
 	}
@@ -668,7 +662,7 @@ func TestUnexpectedClaimPanicForcesRecoveryWithoutKillingWorker(t *testing.T) {
 			return Retry(panicError{}, "formatting_failed", 0, nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "claim-panic", "claim-panic")
+	row := enqueueTestTask(t, harness, "claim-panic")
 	harness.engine.executeClaimSafely(t.Context(), claimTestTask(t, harness))
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
 	if err != nil || stored.Status != model.TaskStatusRunning || stored.ResumeMode != model.TaskResumeModeRecover || stored.LeaseUntil == nil {
@@ -698,7 +692,7 @@ func TestEnginePanicAndInvalidResultFailClosed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: tt.execute}, nil)
-			row := enqueueTestTask(t, harness, tt.name, tt.name)
+			row := enqueueTestTask(t, harness, tt.name)
 			harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 			stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
 			if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != tt.wantReason {
@@ -717,7 +711,7 @@ func TestEngineShutdownDiscardsHandlerResultAndForcesRecovery(t *testing.T) {
 			return Complete("must be discarded", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "shutdown", "shutdown")
+	row := enqueueTestTask(t, harness, "shutdown")
 	claimed := claimTestTask(t, harness)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -751,7 +745,7 @@ func TestRecoverCannotStartExternalEffect(t *testing.T) {
 			return Complete("recovery remained read-only", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "recover-effect", "recover-effect")
+	row := enqueueTestTask(t, harness, "recover-effect")
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET resume_mode = ? WHERE id = ?`, model.TaskResumeModeRecover, row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("set recovery mode: %v", err)
 	}
@@ -834,7 +828,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 			return Fail(err, "effect_not_started", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "checkpoint-rollback", "checkpoint-rollback")
+	row := enqueueTestTask(t, harness, "checkpoint-rollback")
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
 	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "effect_not_started" || stored.CancellationRequestedAt != nil || len(stored.Checkpoint) != 0 || stored.WorkStartedAt != nil {
@@ -846,10 +840,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 }
 
 func TestCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) {
-		assertCheckpointedEffectCommitsCheckpointBeforeEffect(t, testutil.NewTestFileDB(t))
-	})
-	testPostgresCheckpointedEffect(t)
+	assertCheckpointedEffectCommitsCheckpointBeforeEffect(t, testutil.NewTestDB(t))
 }
 
 func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun.DB) {
@@ -878,7 +869,7 @@ func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun
 		},
 	}, nil)
 	repos = harness.repos
-	row := enqueueTestTask(t, harness, "checkpoint-commit", "checkpoint-commit")
+	row := enqueueTestTask(t, harness, "checkpoint-commit")
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
@@ -912,7 +903,7 @@ func TestExternalEffectRejectsStaleClaim(t *testing.T) {
 			return Complete("effect completed", nil)
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "stale-effect", "stale-effect")
+	row := enqueueTestTask(t, harness, "stale-effect")
 	stale := claimTestTask(t, harness)
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("expire stale claim: %v", err)
@@ -994,7 +985,7 @@ func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 			return Complete("must be discarded", nil)
 		},
 	}, &config)
-	row := enqueueTestTask(t, harness, "renewal", "renewal")
+	row := enqueueTestTask(t, harness, "renewal")
 	claimed := claimTestTask(t, harness)
 	harness.repos.Tasks = renewFailureRepository{TaskRepository: harness.repos.Tasks}
 	harness.engine.renewalRetryDelays = []time.Duration{0, time.Second}
@@ -1015,7 +1006,7 @@ func TestEngineSuccessfulRenewalKeepsHealthCurrent(t *testing.T) {
 		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 3 * time.Second,
 	}
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, &config)
-	enqueueTestTask(t, harness, "renewal-health", "renewal-health")
+	enqueueTestTask(t, harness, "renewal-health")
 	claimed := claimTestTask(t, harness)
 	harness.engine.lastTick.Store(time.Now().Add(-2 * time.Minute).UnixNano())
 
@@ -1059,18 +1050,14 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 			return Complete("recovered", nil)
 		},
 	}, &config)
-	row := enqueueTestTask(t, harness, "settlement", "settlement")
+	row := enqueueTestTask(t, harness, "settlement")
 	claimed := claimTestTask(t, harness)
 	ordered := &delayedShortenRepository{
 		TaskRepository: harness.repos.Tasks,
 		delay:          2 * config.LeaseDuration / 3,
 	}
 	harness.repos.Tasks = ordered
-	if _, err := harness.db.ExecContext(t.Context(), `CREATE TRIGGER fail_task_settlement
-		BEFORE INSERT ON task_history
-		BEGIN SELECT RAISE(FAIL, 'injected settlement failure'); END`); err != nil {
-		t.Fatalf("create settlement fault: %v", err)
-	}
+	restoreFailTaskSettlement := testutil.FailWrites(t, harness.db, "tasks", "UPDATE", "NEW.status = 'completed'", "injected settlement failure")
 	harness.engine.settlementRetryDelays = []time.Duration{0, 0, 0, 0}
 	harness.engine.executeClaim(t.Context(), claimed)
 	if got := ordered.renewalsAfterShort.Load(); got != 0 {
@@ -1083,9 +1070,7 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	if stored.LeaseUntil.After(time.Now().Add(2 * harness.engine.config.PollInterval)) {
 		t.Fatalf("settlement failure lease was not shortened: %s", stored.LeaseUntil)
 	}
-	if _, err := harness.db.ExecContext(t.Context(), `DROP TRIGGER fail_task_settlement`); err != nil {
-		t.Fatalf("drop settlement fault: %v", err)
-	}
+	restoreFailTaskSettlement()
 	if _, err := harness.db.NewRaw(`UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Millisecond), row.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("expire shortened lease: %v", err)
 	}
@@ -1110,7 +1095,7 @@ func TestEngineSettlementPanicRollsBackAndShortensLease(t *testing.T) {
 			})
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "settlement-panic", "settlement-panic")
+	row := enqueueTestTask(t, harness, "settlement-panic")
 	claimed := claimTestTask(t, harness)
 	harness.engine.settlementRetryDelays = []time.Duration{0, 0, 0, 0}
 
@@ -1137,7 +1122,7 @@ func TestEngineRecoveryQueueDoesNotDropLeaseShorteningWork(t *testing.T) {
 
 	claimed := make([]*model.Task, 0, 3)
 	for i := range 3 {
-		enqueueTestTask(t, harness, fmt.Sprintf("recovery-queue-%d", i), fmt.Sprintf("value-%d", i))
+		enqueueTestTask(t, harness, fmt.Sprintf("value-%d", i))
 		claimed = append(claimed, claimTestTask(t, harness))
 	}
 	for _, row := range claimed {
@@ -1193,7 +1178,7 @@ func TestEngineRenewsLeaseWhileSettlementIsRetried(t *testing.T) {
 			})
 		},
 	}, &config)
-	row := enqueueTestTask(t, harness, "settlement-renewal", "settlement-renewal")
+	row := enqueueTestTask(t, harness, "settlement-renewal")
 	claimed := claimTestTask(t, harness)
 	counting := &countingRenewRepository{TaskRepository: harness.repos.Tasks}
 	harness.repos.Tasks = counting
@@ -1225,7 +1210,7 @@ func TestEngineConfirmsLeaseBeforeSettlement(t *testing.T) {
 			})
 		},
 	}, nil)
-	row := enqueueTestTask(t, harness, "settlement-lease", "settlement-lease")
+	row := enqueueTestTask(t, harness, "settlement-lease")
 	claimed := claimTestTask(t, harness)
 	harness.repos.Tasks = renewFailureRepository{TaskRepository: harness.repos.Tasks}
 
@@ -1249,7 +1234,7 @@ func TestClaimNextConcurrentClaimsAreUnique(t *testing.T) {
 	harness.db.SetMaxOpenConns(8)
 	const total = 24
 	for i := range total {
-		enqueueTestTask(t, harness, fmt.Sprintf("claim-%02d", i), fmt.Sprintf("value-%02d", i))
+		enqueueTestTask(t, harness, fmt.Sprintf("value-%02d", i))
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)

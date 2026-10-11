@@ -2,11 +2,11 @@ package task_test
 
 import (
 	"bytes"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 )
 
@@ -41,7 +41,7 @@ func TestMinimumDurabilitySchedulesEvictionBeforeAllRequestedCopiesCommit(t *tes
 	if err != nil || content.AcceptedAt != nil {
 		t.Fatalf("content = %#v, %v, want target still incomplete", content, err)
 	}
-	eviction, err := f.runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheEvict, cacheeviction.EvictTaskKey(copyRow.ContentID, 1))
+	eviction, err := f.runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheEvict, model.TaskSubjectStorageContent, strconv.FormatInt(copyRow.ContentID, 10), 1)
 	if err != nil || eviction == nil {
 		t.Fatalf("minimum durability did not schedule eviction: %#v, %v", eviction, err)
 	}

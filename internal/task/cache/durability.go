@@ -34,9 +34,9 @@ func NewDurabilityHandler(deps DurabilityDependencies) (*DurabilityHandler, erro
 func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeCacheReconcileDurability, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:   taskengine.StrictJSONCodec(cacheeviction.ValidateDurabilityInput),
-		Subject: taskengine.SubjectFromInput("bucket", func(input cacheeviction.DurabilityInput) int64 { return input.BucketID }),
-		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Codec:    taskengine.StrictJSONCodec(cacheeviction.ValidateDurabilityInput),
+		Identity: taskengine.IdentityFromInput("bucket", func(input cacheeviction.DurabilityInput) (int64, int64) { return input.BucketID, input.Generation }),
+		Policy:   taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
 		var input cacheeviction.DurabilityInput
@@ -52,7 +52,7 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input cacheeviction.DurabilityInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

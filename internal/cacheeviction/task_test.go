@@ -44,12 +44,3 @@ func TestParseEvictInputRejectsIncompleteIdentity(t *testing.T) {
 		})
 	}
 }
-
-func TestCacheTaskKeysIncludeGeneration(t *testing.T) {
-	if cacheeviction.EvictTaskKey(41, 1) == cacheeviction.EvictTaskKey(41, 2) {
-		t.Fatal("eviction generations share an idempotency key")
-	}
-	if cacheeviction.DurabilityTaskKey(7, 1) == cacheeviction.DurabilityTaskKey(7, 2) {
-		t.Fatal("durability generations share an idempotency key")
-	}
-}

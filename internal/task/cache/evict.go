@@ -54,8 +54,8 @@ func (h *EvictHandler) newHandler() *taskengine.FuncHandler {
 		Type: model.TaskTypeCacheEvict, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		Codec:  taskengine.StrictJSONCodec(cacheeviction.ValidateEvictInput),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
-		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) int64 {
-			return input.ContentID
+		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) (int64, int64) {
+			return input.ContentID, input.Generation
 		}),
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
@@ -72,7 +72,7 @@ func (h *EvictHandler) newHandler() *taskengine.FuncHandler {
 		}
 		return nil
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input cacheeviction.EvictInput
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

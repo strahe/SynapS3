@@ -93,6 +93,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
   await upload.getByRole('button', { name: 'Upload', exact: true }).click()
   await expect(upload.getByText('Uploaded', { exact: true })).toBeVisible()
   await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog', { includeHidden: true })).toHaveCount(0)
   await page.getByRole('link', { name: 'Batches', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Batches', exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Submit next batch', exact: true }).first()).toBeVisible({
@@ -113,6 +114,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
   await expect(detail.getByRole('note', { name: /^Piece CID:/ })).toBeVisible()
   await expect(detail.getByText(/Smaller batches may increase transaction costs\./)).toBeVisible()
   await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog', { includeHidden: true })).toHaveCount(0)
   // Each of the default three replicas collects independently.
   for (let replica = 0; replica < 3; replica++) {
     await page.getByRole('button', { name: 'Refresh', exact: true }).click()
@@ -129,7 +131,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
     const batchID = detailsLabel.replace('Details for batch ', '')
     await row.getByRole('button', { name: 'Submit next batch', exact: true }).click()
     await expect(page.getByText(`Batch ${batchID}`, { exact: true })).toBeVisible()
-    await expect(detail).not.toBeVisible()
+    await expect(page.getByRole('dialog', { includeHidden: true })).toHaveCount(0)
     if (replica === 0) {
       await page.getByRole('combobox', { name: 'Status' }).click()
       await page.getByRole('option', { name: 'All statuses', exact: true }).click()
@@ -143,6 +145,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
     await expect(detail.locator('time[datetime]')).toHaveCount(2)
     await expect(detail.getByRole('button', { name: 'Submit next batch', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
+    await expect(page.getByRole('dialog', { includeHidden: true })).toHaveCount(0)
   }
   await page.getByRole('combobox', { name: 'Status' }).click()
   await page.getByRole('option', { name: 'Completed', exact: true }).click()
@@ -155,6 +158,7 @@ test('manual submission keeps the list open and exposes batch contents and confi
   await expect(detail.getByText('Completed', { exact: true })).toBeVisible()
   await expect(detail.getByRole('button', { name: 'Submit next batch', exact: true })).toHaveCount(0)
   await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog', { includeHidden: true })).toHaveCount(0)
   await page.getByRole('link', { name: 'Settings', exact: true }).click()
   await page.getByRole('tab', { name: 'Workers', exact: true }).click()
   await expect(page.getByRole('checkbox', { name: 'Submit batches early to free cache space' })).not.toBeChecked()

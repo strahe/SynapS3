@@ -35,9 +35,9 @@ func TestPrepareEvictionReusesOnlyMatchingLiveOwner(t *testing.T) {
 			t.Fatalf("marshal task input: %v", err)
 		}
 		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-			Type: taskType, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
+			Type:         taskType,
 			InputVersion: 1, InputHash: fmt.Sprintf("hash-%d-%d", contentID, generation),
-			Input: input, SubjectType: &subjectType, SubjectKey: &subjectKey,
+			Input: input, SubjectType: subjectType, SubjectKey: subjectKey, Generation: &generation,
 		}))
 		if err != nil || !created {
 			t.Fatalf("enqueue task = %#v created=%v err=%v", row, created, err)
@@ -142,7 +142,7 @@ func TestPrepareEvictionReusesOnlyMatchingLiveOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal mismatched generation input: %v", err)
 	}
-	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("input_json = ?", badInput).Where("id = ?", generationConflictTask.ID).Exec(ctx); err != nil {
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("input_json = ?", json.RawMessage(badInput)).Where("id = ?", generationConflictTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("corrupt generation input: %v", err)
 	}
 	if err := repos.CacheEvictions.BindEvictionTask(

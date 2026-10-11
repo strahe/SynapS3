@@ -10,11 +10,9 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
-
-	_ "modernc.org/sqlite"
 )
 
-// testDB creates a fresh in-memory SQLite DB with all migrations applied.
+// testDB creates a private PostgreSQL schema with all migrations applied.
 func testDB(t *testing.T) *bun.DB {
 	t.Helper()
 	return testutil.NewTestDB(t)

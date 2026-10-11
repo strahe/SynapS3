@@ -18,8 +18,8 @@ func enqueueCacheEvictionTask(t *testing.T, repos *repository.Repositories, cont
 		t.Fatal(err)
 	}
 	row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: key, InputVersion: 1, InputHash: key, Input: input,
-		SubjectType: new(model.TaskSubjectStorageContent), SubjectKey: new(strconv.FormatInt(contentID, 10)),
+		Type: model.TaskTypeCacheEvict, InputVersion: 1, InputHash: key, Input: input,
+		SubjectType: model.TaskSubjectStorageContent, SubjectKey: strconv.FormatInt(contentID, 10), Generation: &generation,
 	}))
 	if err != nil || !created {
 		t.Fatalf("enqueue eviction: created=%v, err=%v", created, err)
@@ -34,8 +34,8 @@ func enqueueProviderSpeedTask(t *testing.T, repos *repository.Repositories, prov
 		t.Fatal(err)
 	}
 	row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: key, InputVersion: 1, InputHash: key, Input: input,
-		SubjectType: new("provider"), SubjectKey: new(providerID),
+		Type: model.TaskTypeProviderUploadSpeedTest, InputVersion: 1, InputHash: key, Input: input,
+		SubjectType: "provider", SubjectKey: providerID,
 	}))
 	if err != nil || !created {
 		t.Fatalf("enqueue upload speed: created=%v, err=%v", created, err)

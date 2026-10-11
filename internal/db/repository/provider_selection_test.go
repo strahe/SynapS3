@@ -45,7 +45,7 @@ func TestProviderSelectionIgnoresRetiredLoadAndOldURLSpeed(t *testing.T) {
 		t.Fatalf("load and speed = %#v", in.Candidates)
 	}
 	excluded, _, err := repos.ProviderSelectionState(ctx, bucket.ID, 0, in.Admission)
-	if err != nil || excluded["101"] || !excluded["202"] {
+	if err != nil || excluded["101"] != "" || excluded["202"] != providerselect.ExclusionBucketInUse {
 		t.Fatalf("provider reuse = %v, err=%v", excluded, err)
 	}
 	in.Candidates[0].ServiceURL = "https://old.example"

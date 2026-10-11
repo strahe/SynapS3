@@ -502,7 +502,9 @@ type pullSlotProbe struct {
 }
 
 func (p *pullSlotProbe) Definition() taskengine.Definition {
-	return taskengine.Definition{Type: "pull_slot_probe", InputVersion: 1, Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, WorkStart: taskengine.WorkStartOnEffect, Codec: taskengine.StrictJSONCodec(func(*struct{}) error { return nil })}
+	return taskengine.Definition{Type: "pull_slot_probe", InputVersion: 1, Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, WorkStart: taskengine.WorkStartOnEffect, Codec: taskengine.StrictJSONCodec(func(*struct{}) error { return nil }), Identity: func(json.RawMessage) (taskengine.Identity, error) {
+		return taskengine.Identity{SubjectType: "test", SubjectKey: "probe"}, nil
+	}}
 }
 
 func (p *pullSlotProbe) Execute(ctx context.Context, execution taskengine.Execution) taskengine.Result {
@@ -552,7 +554,7 @@ func TestPullWaitReleasesExecutionSlot(t *testing.T) {
 			waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
 				return row.Status == model.TaskStatusPending && (row.WaitReason != nil || row.FailureReason != nil)
 			})
-			probeTask, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: "pull_slot_probe", IdempotencyKey: "probe", Input: struct{}{}})
+			probeTask, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: "pull_slot_probe", Input: struct{}{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -703,9 +705,7 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 				t.Fatal(err)
 			}
 			if rollback {
-				if _, err := runtime.db.Exec(`CREATE TRIGGER reject_pull BEFORE INSERT ON storage_pull_attempts BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END`); err != nil {
-					t.Fatal(err)
-				}
+				testutil.FailWrites(t, runtime.db, "storage_pull_attempts", "INSERT", "", "injected reservation failure")
 			} else {
 				sources, err := runtime.repos.Contents.ListReadableCommittedCopies(t.Context(), pipeline.upload.ID)
 				if err != nil || len(sources) != 1 {
@@ -990,7 +990,7 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 			if err != nil || commitClaim == nil || commitClaim.ID != *original.TaskID {
 				t.Fatalf("claim original Commit owner: %#v, %v", commitClaim, err)
 			}
-			ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(copyRow.StorageDataSetID), Input: storagepipeline.DataSetInput{DataSetID: copyRow.StorageDataSetID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+			ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: copyRow.StorageDataSetID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 				return repos.Contents.BindDataSetEnsureTask(ctx, copyRow.StorageDataSetID, row.ID)
 			})
 			if err != nil {
@@ -1001,8 +1001,8 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 				t.Fatal(err)
 			}
 			coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-				Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
-				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration}, SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(replacement.ID),
+				Type:  model.TaskTypeProviderReplacementCoordinate,
+				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
 			}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, row.ID)
 			})

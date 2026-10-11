@@ -174,7 +174,7 @@ func TestEnsureContentInsertsAgainWhenTheConflictingRowIsDeleted(t *testing.T) {
 	bucket := seedBucket(t, db, "vanishing-bucket")
 	leftID := seedContent(t, repos, bucket.ID, "vanishing", 10)
 	hook := &deleteConflictingContentHook{db: db, contentID: leftID}
-	db.AddQueryHook(hook)
+	testutil.AddQueryHook(db, hook)
 
 	content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
 		BucketID: bucket.ID, ContentSize: 10, Checksum: testutil.StorageChecksum("vanishing"), RequestedCopies: 1,

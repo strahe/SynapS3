@@ -1,6 +1,5 @@
-//go:build postgres
-
-// Package testpg provides isolated PostgreSQL schemas for tagged tests.
+// Package testpg provides isolated PostgreSQL schemas for tests and the
+// system-test server.
 package testpg
 
 import (
@@ -33,14 +32,32 @@ var (
 	closeErr  error
 )
 
+// Main runs a package's tests and then terminates the container this process
+// started. Call it from TestMain.
+func Main(m *testing.M) {
+	code := m.Run()
+	if err := Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "clean up PostgreSQL test container: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
+}
+
 // DSN returns the external test DSN or starts one PostgreSQL container per process.
 func DSN(t *testing.T) string {
 	t.Helper()
-	startOnce.Do(initialize)
-	if startErr != nil {
-		t.Fatalf("initialize PostgreSQL: %v", startErr)
+	dsn, err := BaseDSN()
+	if err != nil {
+		t.Fatalf("initialize PostgreSQL: %v", err)
 	}
-	return baseDSN
+	return dsn
+}
+
+// BaseDSN returns SYNAPS3_POSTGRES_TEST_DSN when set; otherwise it starts one
+// PostgreSQL container per process.
+func BaseDSN() (string, error) {
+	startOnce.Do(initialize)
+	return baseDSN, startErr
 }
 
 func initialize() {
@@ -86,37 +103,52 @@ func initialize() {
 // Register connection cleanup after calling it so connections close before the schema.
 func SchemaDSN(t *testing.T) string {
 	t.Helper()
-	dsn := DSN(t)
-	config, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse PostgreSQL DSN: %v", err)
-	}
-	admin := stdlib.OpenDB(*config)
-	admin.SetMaxOpenConns(1)
-	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Errorf("close PostgreSQL schema connection: %v", err)
-		}
-	})
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		t.Fatalf("generate PostgreSQL schema name: %v", err)
-	}
-	schema := "test_" + hex.EncodeToString(random[:])
-	name := pgx.Identifier{schema}.Sanitize()
 	ctx, cancel := context.WithTimeout(t.Context(), cleanupTimeout)
 	defer cancel()
-	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+name); err != nil {
-		t.Fatalf("create PostgreSQL test schema: %v", err)
+	dsn, drop, err := CreateSchema(ctx, DSN(t))
+	if err != nil {
+		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
-		if _, err := admin.ExecContext(ctx, "DROP SCHEMA "+name+" CASCADE"); err != nil {
-			t.Errorf("drop PostgreSQL test schema: %v", err)
+		if err := drop(ctx); err != nil {
+			t.Error(err)
 		}
 	})
-	return withSchema(dsn, schema)
+	return dsn
+}
+
+// CreateSchema creates an empty private schema in the database named by dsn
+// and returns a DSN whose connections use it. Close every connection to the
+// returned DSN before calling drop.
+func CreateSchema(ctx context.Context, dsn string) (string, func(context.Context) error, error) {
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse PostgreSQL DSN: %w", err)
+	}
+	admin := stdlib.OpenDB(*config)
+	admin.SetMaxOpenConns(1)
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", nil, errors.Join(fmt.Errorf("generate PostgreSQL schema name: %w", err), admin.Close())
+	}
+	schema := "test_" + hex.EncodeToString(random[:])
+	name := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+name); err != nil {
+		return "", nil, errors.Join(fmt.Errorf("create PostgreSQL test schema: %w", err), admin.Close())
+	}
+	drop := func(ctx context.Context) error {
+		var dropErr error
+		if _, err := admin.ExecContext(ctx, "DROP SCHEMA "+name+" CASCADE"); err != nil {
+			dropErr = fmt.Errorf("drop PostgreSQL test schema: %w", err)
+		}
+		if err := admin.Close(); err != nil {
+			dropErr = errors.Join(dropErr, fmt.Errorf("close PostgreSQL schema connection: %w", err))
+		}
+		return dropErr
+	}
+	return withSchema(dsn, schema), drop, nil
 }
 
 func withSchema(dsn, schema string) string {

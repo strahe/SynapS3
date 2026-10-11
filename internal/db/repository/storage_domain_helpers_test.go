@@ -145,9 +145,9 @@ func TestFailForEngineTaskLeavesTheReplacementRetryable(t *testing.T) {
 				t.Fatalf("Authorize: %v", err)
 			}
 			coordinator, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-				Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: "engine-failed-coordinator",
+				Type:         model.TaskTypeProviderReplacementCoordinate,
 				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: "engine-failed-coordinator",
-				SubjectType: new("storage_replacement"), SubjectKey: new(strconv.FormatInt(replacement.ID, 10)),
+				SubjectType: "storage_replacement", SubjectKey: strconv.FormatInt(replacement.ID, 10),
 			}))
 			if err != nil {
 				t.Fatalf("enqueue coordinator: %v", err)
@@ -299,9 +299,9 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 		t.Fatalf("Authorize(first): %v", err)
 	}
 	ensureTask, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "target-creating-ensure",
+		Type:         model.TaskTypeStorageDataSetEnsure,
 		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)), InputHash: "target-creating-ensure",
-		SubjectType: new("storage_data_set"), SubjectKey: new(strconv.FormatInt(first.TargetDataSetID, 10)),
+		SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(first.TargetDataSetID, 10),
 	}))
 	if err != nil {
 		t.Fatalf("enqueue target ensure: %v", err)
@@ -367,9 +367,9 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 				t.Fatalf("Authorize(first): %v", err)
 			}
 			ensureTask, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-				Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "dead-fence-ensure",
+				Type:         model.TaskTypeStorageDataSetEnsure,
 				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)), InputHash: "dead-fence-ensure",
-				SubjectType: new("storage_data_set"), SubjectKey: new(strconv.FormatInt(first.TargetDataSetID, 10)),
+				SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(first.TargetDataSetID, 10),
 			}))
 			if err != nil {
 				t.Fatalf("enqueue target ensure: %v", err)
@@ -847,9 +847,91 @@ func TestCopyFailureFlagsContentOnlyWhenNoCopyCanServeIt(t *testing.T) {
 	}
 }
 
-// A termination is a ledger row, so every path that asks "has the end of term
-// been recorded?" has to read that row. The retirement gate blocks forever if it
-// reads the replacement alone.
+func TestAbandonedTerminationEpochReplayPreservesEvidence(t *testing.T) {
+	for _, transactional := range []bool{false, true} {
+		name := "pool"
+		if transactional {
+			name = "transaction"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := t.Context()
+			bucket := seedBucket(t, db, "abandoned-termination-replay")
+			source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+				BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			markSourceReady(t, repos, source.ID)
+			replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+				BucketID: bucket.ID, SourceDataSetID: source.ID,
+				SelectionMode:    storagereplacement.SelectionModeManual,
+				TargetProviderID: onChainID(t, "202"), ClientRequestID: "abandoned-replay",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
+				Set("status = ?", storagereplacement.StatusSuperseded).
+				Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			input := repository.RecordTerminationEpochInput{ReplacementID: replacement.ID, TxHash: "0xoriginal", Epoch: 0}
+			if err := repos.Replacements.RecordAbandonedTerminationEpoch(ctx, input); err != nil {
+				t.Fatal(err)
+			}
+			var original storagereplacement.Termination
+			if err := db.NewSelect().Model(&original).
+				Where("replacement_id = ? AND role = ?", replacement.ID, storagereplacement.TerminationRoleAbandonedTarget).
+				Scan(ctx); err != nil {
+				t.Fatal(err)
+			}
+			replay := func(txRepos *repository.Repositories) error {
+				for _, hash := range []string{"0xreplayed", ""} {
+					input.TxHash = hash
+					if err := txRepos.Replacements.RecordAbandonedTerminationEpoch(ctx, input); err != nil {
+						return fmt.Errorf("same-epoch replay: %w", err)
+					}
+				}
+				input.Epoch = 1
+				if err := txRepos.Replacements.RecordAbandonedTerminationEpoch(ctx, input); !errors.Is(err, repository.ErrConflict) {
+					return fmt.Errorf("different-epoch replay returned %v, want ErrConflict", err)
+				}
+				stored, err := txRepos.Replacements.GetByID(ctx, replacement.ID)
+				if err != nil {
+					return fmt.Errorf("read after conflict: %w", err)
+				}
+				if stored == nil || stored.AbandonedTerminationEpoch == nil || *stored.AbandonedTerminationEpoch != 0 ||
+					stored.AbandonedTerminationTxHash == nil || *stored.AbandonedTerminationTxHash != "0xoriginal" {
+					return fmt.Errorf("replayed projection = %#v, want original evidence", stored)
+				}
+				return nil
+			}
+			if transactional {
+				err = repos.WithTx(ctx, func(txRepos *repository.Repositories) error { return replay(txRepos) })
+			} else {
+				err = replay(repos)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ledger []storagereplacement.Termination
+			if err := db.NewSelect().Model(&ledger).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(ledger) != 1 || ledger[0].ID != original.ID || ledger[0].Epoch != original.Epoch ||
+				ledger[0].TxHash == nil || *ledger[0].TxHash != *original.TxHash ||
+				ledger[0].AbandonedTargetDataSetID == nil || *ledger[0].AbandonedTargetDataSetID != replacement.TargetDataSetID ||
+				!ledger[0].CreatedAt.Equal(original.CreatedAt) || !ledger[0].UpdatedAt.Equal(original.UpdatedAt) {
+				t.Fatalf("ledger after replay = %#v, want one unchanged termination %#v", ledger, original)
+			}
+		})
+	}
+}
+
+// Retirement reads its termination evidence from the permanent ledger.
 func TestRecordedTerminationEpochIsVisibleToTheRetirementGate(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

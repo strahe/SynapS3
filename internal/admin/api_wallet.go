@@ -230,11 +230,8 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 			return createErr
 		}
 		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(r.Context(), txRepos, taskengine.EnqueueRequest{
-			Type:           model.TaskTypeWalletOperation,
-			IdempotencyKey: walletoperation.TaskKey(op.ID),
-			Input:          walletoperation.Input{OperationID: op.ID},
-			SubjectType:    "wallet_operation",
-			SubjectKey:     strconv.FormatInt(op.ID, 10),
+			Type:  model.TaskTypeWalletOperation,
+			Input: walletoperation.Input{OperationID: op.ID},
 		})
 		if enqueueErr != nil {
 			return enqueueErr

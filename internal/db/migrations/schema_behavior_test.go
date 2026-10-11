@@ -3,18 +3,16 @@ package migrations
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucket(t, db, "constraint-bucket")
 		var strategy string
 		if err := db.NewRaw("SELECT provider_selection_strategy FROM buckets WHERE id = ?", bucketID).Scan(t.Context(), &strategy); err != nil || strategy != "distribution" {
@@ -24,6 +22,8 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 		mustRejectStatement(t, db, `UPDATE buckets SET provider_selection_strategy = 'unknown' WHERE id = ?`, bucketID)
+		mustRejectStatement(t, db, `UPDATE buckets SET status = 'invalid' WHERE id = ?`, bucketID)
+		mustRejectStatement(t, db, `UPDATE bucket_replica_slots SET status = 'invalid' WHERE bucket_id = ? AND copy_index = 0`, bucketID)
 
 		for _, checksum := range []string{
 			"",
@@ -102,11 +102,6 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 		mustRejectStatement(t, db, `INSERT INTO object_versions
 			(version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type,
 			 metadata, is_delete_marker, created_at, updated_at)
-			VALUES ('v-data-without-content', 1, ?, 'failure-shape.txt', NULL, 1, 'etag',
-			 'application/octet-stream', '{}', FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID)
-		mustRejectStatement(t, db, `INSERT INTO object_versions
-			(version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type,
-			 metadata, is_delete_marker, created_at, updated_at)
 			VALUES ('v-marker-with-content', 1, ?, 'failure-shape.txt', ?, 0, '',
 			 '', '{}', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID, contentID)
 
@@ -118,6 +113,7 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			RETURNING id`, contentID, bucketID, dataSetID).Scan(&cleanupID); err != nil {
 			t.Fatalf("insert cleanup copy: %v", err)
 		}
+		mustRejectStatement(t, db, `UPDATE storage_cleanup_copies SET status = 'invalid' WHERE id = ?`, cleanupID)
 		mustRejectStatement(t, db, `UPDATE storage_cleanup_copies
 			SET status = 'delete_scheduled', delete_tx_hash = 'delete-tx' WHERE id = ?`, cleanupID)
 		mustRejectStatement(t, db, `UPDATE storage_cleanup_copies
@@ -127,23 +123,28 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			WHERE id = ?`, cleanupID); err != nil {
 			t.Fatalf("schedule valid cleanup copy: %v", err)
 		}
+		if _, err := db.Exec(`INSERT INTO observability_provider_states
+			(provider_id, status, reason_codes, last_checked_at, last_attempt_at, evidence_json)
+			VALUES ('cleanup-provider', 'unknown', '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}')`); err != nil {
+			t.Fatalf("insert provider observation: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE observability_provider_states SET status = 'invalid' WHERE provider_id = 'cleanup-provider'`)
+		if _, err := db.Exec(`INSERT INTO observability_data_set_states
+			(local_data_set_id, bucket_id, copy_index, provider_id, status, reason_codes, last_checked_at, evidence_json)
+			VALUES (?, ?, 2, 'cleanup-provider', 'unknown', '[]', CURRENT_TIMESTAMP, '{}')`, dataSetID, bucketID); err != nil {
+			t.Fatalf("insert data-set observation: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE observability_data_set_states SET status = 'invalid' WHERE local_data_set_id = ?`, dataSetID)
 
 		taskID := insertSchemaTestTask(t, db, "valid-before-update")
 		mustRejectStatement(t, db, `UPDATE tasks SET claim_generation = -1 WHERE id = ?`, taskID)
 		mustRejectStatement(t, db, `UPDATE tasks SET status = 'unknown' WHERE id = ?`, taskID)
 		mustRejectStatement(t, db, `UPDATE buckets SET default_copies = 2, minimum_durable_copies = 3 WHERE id = ?`, bucketID)
-		var generation int64
-		if err := db.NewRaw(`SELECT claim_generation FROM tasks WHERE id = ?`, taskID).Scan(t.Context(), &generation); err != nil {
-			t.Fatalf("read task after rejected update: %v", err)
-		}
-		if generation != 0 {
-			t.Fatalf("claim_generation = %d after rejected update, want 0", generation)
-		}
 	})
 }
 
 func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketA := insertSchemaTestBucket(t, db, "identity-a")
 		bucketB := insertSchemaTestBucket(t, db, "identity-b")
 		contentA := insertSchemaTestContent(t, db, bucketA, "upload-a")
@@ -153,7 +154,7 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 		if _, err := db.Exec(`UPDATE storage_data_sets SET creation_rejection = '{"version":99}' WHERE id = ?`, source); err != nil {
 			t.Fatal(err)
 		}
-		for _, invalid := range []string{"{", "[]", "null"} {
+		for _, invalid := range []string{"[]", "null"} {
 			mustRejectStatement(t, db, `UPDATE storage_data_sets SET creation_rejection = ? WHERE id = ?`, invalid, source)
 		}
 		copyID := insertSchemaTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
@@ -307,6 +308,7 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 			RETURNING id`, bucketA, source, target).Scan(&replacementID); err != nil {
 			t.Fatalf("insert replacement: %v", err)
 		}
+		mustRejectStatement(t, db, `UPDATE storage_replacements SET selection_mode = 'invalid' WHERE id = ?`, replacementID)
 		bucketBTarget := insertSchemaTestDataSet(t, db, bucketB, "303", 0, 2, false)
 		if _, err := db.Exec(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
@@ -425,7 +427,7 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 }
 
 func TestCurrentSchemaFailedIngressAllowsOneReplacementIngress(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucket(t, db, "retired-ingress")
 		contentID := insertSchemaTestContent(t, db, bucketID, "retired-ingress-content")
 		retiredDataSetID := insertSchemaTestDataSet(t, db, bucketID, "101", 0, 1, true)
@@ -446,47 +448,12 @@ func TestCurrentSchemaFailedIngressAllowsOneReplacementIngress(t *testing.T) {
 	})
 }
 
-func TestCurrentSchemaIdentitySupportsGenerationAndBackfill(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
-		first := insertSchemaTestTask(t, db, "identity-first")
-		if _, err := db.Exec(`DELETE FROM tasks WHERE id = ?`, first); err != nil {
-			t.Fatalf("delete first identity row: %v", err)
-		}
-		second := insertSchemaTestTask(t, db, "identity-second")
-		if second <= first {
-			t.Fatalf("generated ID %d reused deleted ID %d", second, first)
-		}
-
-		const backfilledID int64 = 5_000_000_000
-		if _, err := db.Exec(`INSERT INTO tasks
-			(id, type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-			VALUES (?, 'test', 'identity-backfill', 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]')`, backfilledID); err != nil {
-			t.Fatalf("backfill explicit identity: %v", err)
-		}
-		var storedID int64
-		if err := db.NewRaw(`SELECT id FROM tasks WHERE id = ?`, backfilledID).Scan(t.Context(), &storedID); err != nil {
-			t.Fatalf("read backfilled identity: %v", err)
-		}
-		if storedID != backfilledID {
-			t.Fatalf("backfilled ID = %d, want %d", storedID, backfilledID)
-		}
-
-		afterBackfill := insertSchemaTestTask(t, db, "identity-after-backfill")
-		if afterBackfill <= 0 || afterBackfill == backfilledID {
-			t.Fatalf("generated ID after backfill = %d", afterBackfill)
-		}
-		if db.Dialect().Name() == dialect.SQLite && afterBackfill <= backfilledID {
-			t.Fatalf("SQLite generated ID after backfill = %d, want > %d", afterBackfill, backfilledID)
-		}
-	})
-}
-
 func insertSchemaTestTask(t *testing.T, db *bun.DB, key string) int64 {
 	t.Helper()
 	var id int64
 	if err := db.QueryRow(`INSERT INTO tasks
-		(type,idempotency_key,input_version,input_hash,available_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
-		VALUES ('test',?,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]') RETURNING id`, key).Scan(&id); err != nil {
+		(type,subject_type,subject_key,generation,input_version,input_hash,available_at,created_at,updated_at,input_json,policy_json,runtime_json)
+		VALUES ('test','test',?,0,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}') RETURNING id`, key).Scan(&id); err != nil {
 		t.Fatalf("insert task %q: %v", key, err)
 	}
 	return id
@@ -604,12 +571,9 @@ func requireConstraintRejection(t *testing.T, err error, query string) {
 // exactly how three stale cases survived a column being removed.
 func rejectedByMissingSchema(err error) bool {
 	for _, missing := range []string{
-		"no such table",       // SQLite
-		"no such column",      // SQLite
-		"has no column named", // SQLite, INSERT column list
-		"does not exist",      // PostgreSQL, relation/column
-		"undefined_table",     // PostgreSQL, SQLSTATE name
-		"undefined_column",    // PostgreSQL, SQLSTATE name
+		"does not exist",   // relation/column
+		"undefined_table",  // SQLSTATE name
+		"undefined_column", // SQLSTATE name
 	} {
 		if strings.Contains(err.Error(), missing) {
 			return true
@@ -619,19 +583,11 @@ func rejectedByMissingSchema(err error) bool {
 }
 
 func rejectedByNullConstraint(err error) bool {
-	for _, nullConstraint := range []string{
-		"NOT NULL constraint failed", // SQLite
-		"null value in column",       // PostgreSQL
-	} {
-		if strings.Contains(err.Error(), nullConstraint) {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(err.Error(), "null value in column")
 }
 
 func TestCurrentSchemaReplicaIndexRequiresAnOpenSlot(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucketWithSlots(t, db, "two-slot-bucket", 2)
 
 		// The bucket opened 0 and 1, so a data set on 5 has no slot to belong to.
@@ -656,7 +612,7 @@ func TestCurrentSchemaReplicaIndexRequiresAnOpenSlot(t *testing.T) {
 // A termination names one data set through the role it ended, and the composite
 // foreign keys keep that data set inside the replacement it belongs to.
 func TestCurrentSchemaTerminationBelongsToItsReplacementRole(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		bucketID := insertSchemaTestBucket(t, db, "termination-bucket")
 		source := insertSchemaTestDataSet(t, db, bucketID, "101", 0, 1, true)
 		target := insertSchemaTestDataSet(t, db, bucketID, "202", 0, 2, false)
@@ -712,7 +668,7 @@ func TestCurrentSchemaTerminationBelongsToItsReplacementRole(t *testing.T) {
 // Accounts without a name share the empty default; set names are unique byte
 // for byte, so names differing only in case are distinct.
 func TestCurrentSchemaAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		const unnamed = `INSERT INTO s3_accounts (access_key, secret_key, role, is_root, created_at, updated_at)
 			VALUES (?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
@@ -736,34 +692,36 @@ func TestCurrentSchemaAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
 	})
 }
 
-func TestTaskTablesEnforceStateAndBudget(t *testing.T) {
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+func TestTaskTableEnforcesStateAndBudget(t *testing.T) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		id := insertSchemaTestTask(t, db, "working")
 		for _, statement := range []string{
-			`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP WHERE id=?`,
-			`UPDATE tasks SET status='cancelled',finished_at=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET status='completed' WHERE id=?`,
+			`UPDATE tasks SET finished_at=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET acknowledged_at=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET superseded_at=CURRENT_TIMESTAMP WHERE id=?`,
 			`UPDATE tasks SET retry_count=-1 WHERE id=?`,
 			`UPDATE tasks SET input_json='[]' WHERE id=?`,
-			`UPDATE tasks SET input_json='{' WHERE id=?`,
-			`UPDATE tasks SET events_json='{}' WHERE id=?`,
 			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":0}' WHERE id=?`,
 			`UPDATE tasks SET policy_json='{"version":2}' WHERE id=?`,
 			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":null}' WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":"6"}' WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":1.5}' WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"max_attempts":6}' WHERE id=?`,
+			`UPDATE tasks SET policy_json='{"version":1,"max_attempts":6}' WHERE id=?`,
 		} {
 			mustRejectStatement(t, db, statement, id)
 		}
-		if _, err := db.NewRaw(`UPDATE tasks SET policy_json=? WHERE id=?`, json.RawMessage(`{"version":2,"max_attempts":6}`), id).Exec(t.Context()); err != nil {
-			t.Fatal(err)
-		}
 		mustRejectStatement(t, db, `UPDATE tasks SET retry_count=6 WHERE id=?`, id)
-		if _, err := db.Exec(`INSERT INTO task_history
-			(task_id,type,idempotency_key,input_version,input_hash,input_json,policy_json,runtime_json,events_json,status,available_at,finished_at,created_at,updated_at)
-			VALUES (1001,'test','history',1,'hash','{}','{"version":2,"max_attempts":6}','{}','[]','completed',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
+		if _, err := db.Exec(`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP,superseded_at=CURRENT_TIMESTAMP WHERE id=?`, id); err != nil {
 			t.Fatal(err)
 		}
-		for _, status := range []string{"pending", "running", "failed"} {
-			mustRejectStatement(t, db, `UPDATE task_history SET status = ? WHERE task_id = 1001`, status)
+		for _, statement := range []string{
+			`UPDATE tasks SET acknowledged_at=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET status='pending' WHERE id=?`,
+			`UPDATE tasks SET status='running',claim_generation=1,claimed_at=CURRENT_TIMESTAMP,lease_until=CURRENT_TIMESTAMP,finished_at=NULL WHERE id=?`,
+		} {
+			mustRejectStatement(t, db, statement, id)
 		}
-		mustRejectStatement(t, db, `UPDATE task_history SET acknowledged_at = CURRENT_TIMESTAMP WHERE task_id = 1001`)
 	})
 }

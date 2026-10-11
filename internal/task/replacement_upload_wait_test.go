@@ -61,7 +61,7 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 				t.Fatal(err)
 			}
-			upload, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(content.ID), Input: storagepipeline.UploadPlanInput{ContentID: content.ID}})
+			upload, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeUploadPlan, Input: storagepipeline.UploadPlanInput{ContentID: content.ID}})
 			if err != nil {
 				t.Fatal(err)
 			}

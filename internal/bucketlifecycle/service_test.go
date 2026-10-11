@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -32,7 +33,8 @@ func newLifecycleTestService(t *testing.T, repos *repository.Repositories, c *te
 		Codec: taskengine.StrictJSONCodec(func(input *ProvisionInput) error {
 			return ValidateProvisionInput(*input)
 		}),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Identity: taskengine.IdentityFromInput("bucket", func(input ProvisionInput) (int64, int64) { return input.BucketID, int64(input.Copies) }),
+		Policy:   taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}})
 	if err != nil {
 		t.Fatalf("register bucket provision handler: %v", err)
@@ -85,7 +87,7 @@ func TestServiceCreatePrecreatesCacheBucketDir(t *testing.T) {
 	if persisted.Status != model.BucketStatusProvisioning {
 		t.Fatalf("persisted bucket status = %s, want %s", persisted.Status, model.BucketStatusProvisioning)
 	}
-	taskRow, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, ProvisionKey(bucket.ID, bucket.DefaultCopies))
+	taskRow, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, "bucket", strconv.FormatInt(bucket.ID, 10), int64(bucket.DefaultCopies))
 	if err != nil || taskRow == nil || taskRow.Status != model.TaskStatusPending {
 		t.Fatalf("bucket provision task = %#v, err=%v", taskRow, err)
 	}

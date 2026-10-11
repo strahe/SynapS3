@@ -5,45 +5,33 @@ import (
 	"unicode/utf8"
 
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
-func applyCaseSensitivePrefixFilter(db bun.IDB, q *bun.SelectQuery, column string, prefix string) *bun.SelectQuery {
-	condition, args := caseSensitivePrefixSQL(db, column, prefix)
+func applyCaseSensitivePrefixFilter(q *bun.SelectQuery, column string, prefix string) *bun.SelectQuery {
+	condition, args := caseSensitivePrefixSQL(column, prefix)
 	if condition == "" {
 		return q
 	}
 	return q.Where(condition, args...)
 }
 
-func caseSensitivePrefixSQL(db bun.IDB, column string, prefix string) (string, []interface{}) {
-	return caseSensitivePrefixSQLForDialect(db.Dialect().Name(), column, prefix)
-}
-
-func caseSensitivePrefixSQLForDialect(dialectName dialect.Name, column string, prefix string) (string, []interface{}) {
+func caseSensitivePrefixSQL(column string, prefix string) (string, []interface{}) {
 	if prefix == "" {
 		return "", nil
 	}
-	keyExpr := keyOrderExprForDialect(dialectName, column)
+	keyExpr := keyOrderExpr(column)
 	if upper, ok := stringPrefixUpperBound(prefix); ok {
 		return fmt.Sprintf("%s >= ? AND %s < ?", keyExpr, keyExpr), []interface{}{prefix, upper}
 	}
 	return fmt.Sprintf("%s >= ? AND substr(%s, 1, ?) = ?", keyExpr, column), []interface{}{prefix, utf8.RuneCountInString(prefix), prefix}
 }
 
-func keyOrderExpr(db bun.IDB, column string) string {
-	return keyOrderExprForDialect(db.Dialect().Name(), column)
+func keyOrderExpr(column string) string {
+	return fmt.Sprintf(`%s COLLATE "C"`, column)
 }
 
-func keyOrderExprForDialect(dialectName dialect.Name, column string) string {
-	if dialectName == dialect.PG {
-		return fmt.Sprintf(`%s COLLATE "C"`, column)
-	}
-	return column
-}
-
-func keyComparisonSQL(db bun.IDB, column string, operator string) string {
-	return fmt.Sprintf("%s %s ?", keyOrderExpr(db, column), operator)
+func keyComparisonSQL(column string, operator string) string {
+	return fmt.Sprintf("%s %s ?", keyOrderExpr(column), operator)
 }
 
 func stringPrefixUpperBound(prefix string) (string, bool) {

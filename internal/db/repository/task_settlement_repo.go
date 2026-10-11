@@ -7,7 +7,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transition TaskTransition) error {
@@ -21,7 +20,7 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 			return err
 		}
 		now := time.Now()
-		if row == nil || isHistoryTask(row) || row.Status != model.TaskStatusRunning || row.ClaimGeneration != generation || row.LeaseUntil == nil || !row.LeaseUntil.After(now) {
+		if row == nil || row.Status != model.TaskStatusRunning || row.ClaimGeneration != generation || row.LeaseUntil == nil || !row.LeaseUntil.After(now) {
 			return ErrTaskLeaseLost
 		}
 		row.Status, row.WaitReason, row.FailureReason = transition.Status, transition.WaitReason, transition.FailureReason
@@ -47,32 +46,27 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		} else {
 			row.FinishedAt = &now
 		}
-		eventType := ""
-		if transition.IncrementRetry {
-			eventType = "retry_scheduled"
-		} else if transition.Status != model.TaskStatusPending {
-			eventType = string(transition.Status)
-		}
-		if eventType != "" {
-			details, err := json.Marshal(map[string]any{"attempt": row.RetryCount + 1, "failure_reason": transition.FailureReason})
-			if err != nil {
-				return err
-			}
-			if err := appendTaskEvent(row, eventType, details); err != nil {
-				return err
-			}
-		}
-		if isHistoryTask(row) {
-			return tx.archive(ctx, row, &generation)
-		}
-		result, err := db.NewUpdate().Model(row).Column("status", "wait_reason", "failure_reason", "last_error", "status_message", "updated_at", "claimed_at", "lease_until", "work_started_at", "retry_count", "resume_mode", "available_at", "finished_at", "events_json").Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
+		result, err := db.NewUpdate().Model(row).Column("status", "wait_reason", "failure_reason", "last_error", "status_message", "updated_at", "claimed_at", "lease_until", "work_started_at", "retry_count", "resume_mode", "available_at", "finished_at").Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
 		if err != nil {
 			return err
 		}
 		if n, _ := result.RowsAffected(); n != 1 {
 			return ErrTaskLeaseLost
 		}
-		return nil
+		eventType := ""
+		if transition.IncrementRetry {
+			eventType = "retry_scheduled"
+		} else if transition.Status != model.TaskStatusPending {
+			eventType = string(transition.Status)
+		}
+		if eventType == "" {
+			return nil
+		}
+		details, err := json.Marshal(map[string]any{"attempt": row.RetryCount + 1, "failure_reason": transition.FailureReason})
+		if err != nil {
+			return err
+		}
+		return tx.AppendEvent(ctx, id, eventType, details)
 	})
 }
 
@@ -97,45 +91,25 @@ func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64) error {
 			return nil
 		}
 		now := time.Now()
-		cold := isHistoryTask(row)
-		row.AcknowledgedAt, row.UpdatedAt = &now, now
-		if err := appendTaskEvent(row, "acknowledged", json.RawMessage(`{}`)); err != nil {
+		if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("acknowledged_at = ?", now).Set("updated_at = ?", now).Where("id = ?", id).Exec(ctx); err != nil {
 			return err
 		}
-		if cold {
-			_, err = db.NewUpdate().TableExpr("task_history").Set("acknowledged_at = ?", now).Set("updated_at = ?", now).Set("events_json = ?", row.Events).Where("task_id = ?", id).Exec(ctx)
-			return err
-		}
-		return tx.archive(ctx, row, nil)
+		return tx.AppendEvent(ctx, id, "acknowledged", nil)
 	})
 }
 
+// acknowledgeQuery acknowledges every failure the built query selects, with
+// its event, in one statement.
 func (r *BunTaskRepo) acknowledgeQuery(ctx context.Context, build func(*bun.SelectQuery) *bun.SelectQuery) (int, error) {
-	count := 0
-	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		count = 0
-		var rows []model.Task
-		q := build(taskScopeQuery(db, &rows, TaskScopeWork, true)).OrderExpr("task.id ASC")
-		if db.Dialect().Name() == dialect.PG {
-			q.For("UPDATE")
-		}
-		if err := q.Scan(ctx); err != nil {
-			return err
-		}
-		tx := &BunTaskRepo{db: db}
-		for i := range rows {
-			now := time.Now()
-			rows[i].AcknowledgedAt, rows[i].UpdatedAt = &now, now
-			if err := appendTaskEvent(&rows[i], "acknowledged", json.RawMessage(`{}`)); err != nil {
-				return err
-			}
-			if err := tx.archive(ctx, &rows[i], nil); err != nil {
-				return err
-			}
-			count++
-		}
-		return nil
-	})
+	selected := build(taskScopeQuery(r.db, (*model.Task)(nil), TaskScopeWork)).Column("task.id").OrderExpr("task.id ASC").For("NO KEY UPDATE")
+	var count int
+	err := r.db.NewRaw(`WITH acknowledged AS (
+			UPDATE tasks SET acknowledged_at = ?0, updated_at = ?0 WHERE id IN (?1) RETURNING id
+		), recorded AS (
+			INSERT INTO task_events (task_id, type, details, created_at)
+			SELECT id, 'acknowledged', '{}', ?0 FROM acknowledged
+		)
+		SELECT COUNT(*) FROM acknowledged`, time.Now(), selected).Scan(ctx, &count)
 	return count, err
 }
 

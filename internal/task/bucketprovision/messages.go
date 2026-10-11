@@ -3,6 +3,7 @@ package bucketprovision
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -105,7 +106,7 @@ func wakeProvision(ctx context.Context, tx *repository.Repositories, scheduler *
 	if bucket == nil {
 		return repository.ErrNotFound
 	}
-	taskRow, err := tx.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
+	taskRow, err := tx.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, "bucket", strconv.FormatInt(bucket.ID, 10), int64(bucket.DefaultCopies))
 	if err != nil || taskRow == nil {
 		return err
 	}

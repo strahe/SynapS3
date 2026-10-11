@@ -62,7 +62,7 @@ func newCopyRetryAPIFixture(t *testing.T) copyRetryAPIFixture {
 	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{StorageCopyID: copyRow.ID, ContentID: content.ID, CopyIndex: 0, LastError: "transfer failed"}); err != nil {
 		t.Fatal(err)
 	}
-	old, _, err := server.taskService.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageStore, IdempotencyKey: storagepipeline.StoreKey(copyRow.ID, 1), Input: storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: 1}})
+	old, _, err := server.taskService.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageStore, Input: storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func (f copyRetryAPIFixture) startReplacement(ctx context.Context) error {
 			return err
 		}
 		row, _, err := f.server.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-			Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
+			Type:  model.TaskTypeProviderReplacementCoordinate,
 			Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
 		})
 		if err != nil {

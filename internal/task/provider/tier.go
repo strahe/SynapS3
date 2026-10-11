@@ -7,7 +7,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
-	"github.com/strahe/synaps3/internal/systemtask"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
@@ -31,7 +30,7 @@ func NewEndorsedRefreshHandler(deps TierRefreshDependencies) (*EndorsedRefreshHa
 func newTierHandler(deps TierRefreshDependencies, taskType model.TaskType, tier string) *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: taskType, InputVersion: 1, WorkStart: taskengine.WorkStartOnHandler,
-		Codec:  taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
+		Codec: taskengine.CycleCodec, Identity: taskengine.CycleIdentity(tier + "-providers"),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}
 	run := func(ctx context.Context, _ taskengine.Execution) taskengine.Result {

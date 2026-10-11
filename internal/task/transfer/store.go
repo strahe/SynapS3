@@ -134,7 +134,7 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 	}
 	if err != nil {
 		if hasCheckpoint {
-			return taskengine.Fail(err, "store_checkpoint_write_failed", nil)
+			return retryTask(err, "store_checkpoint_write_failed")
 		}
 		return h.retryStoreNotStarted(execution, err)
 	}
@@ -211,7 +211,7 @@ func (h *StoreHandler) storePiece(
 				ProviderServiceURL: target.ServiceURL(), IngressAttempt: copyRow.IngressStoreAttempt,
 			}
 			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-				return taskengine.Fail(err, "store_checkpoint_write_failed", nil)
+				return retryTask(err, "store_checkpoint_write_failed")
 			}
 			return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceInfo.CIDv2), pieceInfo.CIDv2, "")
 		}
@@ -264,7 +264,13 @@ func (h *StoreHandler) storePiece(
 			if errors.Is(err, taskengine.ErrEffectAlreadyAdmitted) {
 				return taskengine.RetryInMode(err, "store_resend_required", model.TaskResumeModeRecover, 0, nil)
 			}
-			if hasCheckpoint || copyRow.IngressStoreAttempt > 0 {
+			if errors.Is(err, repository.ErrTaskOperationUnresolved) || errors.Is(err, taskengine.ErrEffectForbidden) {
+				return taskengine.Fail(err, "store_checkpoint_conflict", nil)
+			}
+			if hasCheckpoint {
+				return retryTask(err, "store_checkpoint_write_failed")
+			}
+			if copyRow.IngressStoreAttempt > 0 {
 				return taskengine.Fail(err, "store_checkpoint_write_failed", nil)
 			}
 			return h.retryStoreNotStarted(execution, err)
@@ -365,7 +371,7 @@ func (h *StoreHandler) retryStoreNotStarted(_ taskengine.Execution, err error) t
 
 func (h *StoreHandler) storeCacheFailure(execution taskengine.Execution, hasCheckpoint bool, err error) taskengine.Result {
 	if hasCheckpoint {
-		return taskengine.Fail(err, "store_cache_read_failed", nil)
+		return retryTask(err, "store_cache_read_failed")
 	}
 	return h.retryStoreNotStarted(execution, err)
 }

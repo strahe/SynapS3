@@ -188,10 +188,11 @@ func TestSystemManualSealBypassesLongCollectionWindow(t *testing.T) {
 				t.Fatalf("seal returned a different batch: %#v", accepted)
 			}
 		}
-		e2e.Eventually(t, t.Context(), 15*time.Second, "manual batch confirmation", func(ctx context.Context) (batch, bool, error) {
+		// A seal requested during a running collection pass can wait for the next 30-second poll.
+		e2e.Eventually(t, t.Context(), 60*time.Second, "manual batch confirmation", func(ctx context.Context) (string, bool, error) {
 			var current batch
-			_, err := admin.GetJSON(ctx, path, &current)
-			return current, current.Status == "confirmed" && !current.CanSeal && current.MemberCount == 1, err
+			raw, err := admin.GetJSON(ctx, path, &current)
+			return raw, current.Status == "confirmed" && !current.CanSeal && current.MemberCount == 1, err
 		})
 	}
 	var page struct {

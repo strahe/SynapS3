@@ -19,14 +19,13 @@ import (
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 func TestRuntimeModelsMatchCurrentSchema(t *testing.T) {
 	models := runtimePersistentModels()
 	runtimeTablesFromAST := runtimePersistentModelTablesFromAST(t)
 
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		registeredTables := make([]string, 0, len(models))
 		for _, runtimeModel := range models {
 			typ := reflect.TypeOf(runtimeModel)
@@ -53,7 +52,7 @@ func TestRuntimeModelsMatchCurrentSchema(t *testing.T) {
 func runtimePersistentModels() []any {
 	return []any{
 		(*model.Task)(nil),
-		(*model.TaskHistory)(nil),
+		(*model.TaskEvent)(nil),
 		(*model.TaskSchedule)(nil),
 		(*model.S3Account)(nil),
 		(*model.Bucket)(nil),
@@ -175,9 +174,6 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 			PrimaryKey: field.IsPK,
 			Generated:  field.AutoIncrement && field.Identity,
 		}
-		if db.Dialect().Name() == dialect.SQLite && strings.EqualFold(field.CreateTableSQLType, "jsonb") {
-			want.Type = "text"
-		}
 		// A runtime default changes Bun insert behavior by omitting zero values.
 		// It is optional, but when present it must match the frozen DDL default.
 		if field.SQLDefault != "" {
@@ -190,11 +186,10 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 }
 
 func TestCurrentSchemaColumnContracts(t *testing.T) {
-	// A DEFAULT current_timestamp column is written by the database whenever bun
-	// omits it, and SQLite renders that as second-granularity local text while
-	// bun renders a fractional offset timestamp. One column would then hold two
-	// encodings whose lexical order disagrees with time inside the same second.
-	testSchemaDialects(t, func(t *testing.T, db *bun.DB) {
+	// The application writes every timestamp from its own clock. A database
+	// default would fill omitted values from the database clock instead, so one
+	// column could hold times from two clocks.
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		for _, table := range applicationSchemaTables(t, db) {
 			for _, column := range appliedTableColumns(t, db, table) {
 				if strings.Contains(strings.ToLower(column.Default), "current_timestamp") {
@@ -202,22 +197,20 @@ func TestCurrentSchemaColumnContracts(t *testing.T) {
 				}
 			}
 		}
-		if db.Dialect().Name() == dialect.PG {
-			var collations []string
-			if err := db.NewRaw(`SELECT c.relname || '.' || a.attname || '=' || co.collname
-				FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_collation co ON co.oid = a.attcollation
-				WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
-				AND ((c.relname = 'buckets' AND a.attname = 'name') OR (c.relname IN ('objects','object_versions','multipart_uploads','object_deletions') AND a.attname = 'key'))
-				ORDER BY c.relname`).Scan(t.Context(), &collations); err != nil {
-				t.Fatal(err)
-			}
-			if len(collations) != 5 {
-				t.Fatalf("missing key columns: %v", collations)
-			}
-			for _, value := range collations {
-				if !strings.HasSuffix(value, "=C") {
-					t.Errorf("key collation %s, want C", value)
-				}
+		var collations []string
+		if err := db.NewRaw(`SELECT c.relname || '.' || a.attname || '=' || co.collname
+			FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_collation co ON co.oid = a.attcollation
+			WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+			AND ((c.relname = 'buckets' AND a.attname = 'name') OR (c.relname IN ('objects','object_versions','multipart_uploads','object_deletions') AND a.attname = 'key'))
+			ORDER BY c.relname`).Scan(t.Context(), &collations); err != nil {
+			t.Fatal(err)
+		}
+		if len(collations) != 5 {
+			t.Fatalf("missing key columns: %v", collations)
+		}
+		for _, value := range collations {
+			if !strings.HasSuffix(value, "=C") {
+				t.Errorf("key collation %s, want C", value)
 			}
 		}
 	})

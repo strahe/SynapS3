@@ -31,16 +31,6 @@ func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Ti
 		if err != nil {
 			return in, err
 		}
-		// Rows and totals can observe different sides of a concurrent refresh.
-		if offset == 0 && len(page.Items) == 0 && s.checker != nil {
-			if err := s.RefreshProviderStates(ctx); err != nil {
-				return in, err
-			}
-			page, err = s.ListProviderObservations(ctx, ListOptions{Limit: 200})
-			if err != nil {
-				return in, err
-			}
-		}
 		observations = append(observations, page.Items...)
 		offset += len(page.Items)
 		if len(page.Items) == 0 || offset >= page.Total {
@@ -66,7 +56,7 @@ func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Ti
 			ID: o.Facts.ProviderID, HasProfile: exists, ProfileURL: p.ServiceURL,
 			Active: exists && p.Active && o.Facts.Active != nil && *o.Facts.Active,
 			HasPDP: o.Facts.HasPDP != nil && *o.Facts.HasPDP, Healthy: o.Signal.Status == StatusAvailable,
-			Fresh: !o.Signal.Freshness.Stale, TieBreak: rand.Uint64(),
+			Fresh: !o.Signal.Freshness.Stale, TieBreak: rand.Uint64(), ObservationCheckedAt: o.Signal.Freshness.LastCheckedAt,
 		}
 		if o.Facts.ServiceURL != nil {
 			c.ServiceURL = *o.Facts.ServiceURL
@@ -121,6 +111,8 @@ func (s *Service) SelectionAdmission(ctx context.Context, tier providerselect.Ti
 			}
 			in.Admission.TrustedIDs = append(in.Admission.TrustedIDs, id)
 		}
+		checkedAt := snapshot.CheckedAt
+		in.Admission.CheckedAt = &checkedAt
 	}
 	return in.Admission, nil
 }

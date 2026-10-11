@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -136,7 +137,7 @@ func TestWalletTaskBindingRejectsInvalidLogicalReferences(t *testing.T) {
 				case "wrong_subject":
 					query = query.Set("subject_key = ?", strconv.FormatInt(op.ID+1, 10))
 				case "wrong_operation":
-					query = query.Set("input_json = ?", []byte(fmt.Sprintf(`{"operation_id":%d}`, op.ID+1)))
+					query = query.Set("input_json = ?", json.RawMessage(fmt.Sprintf(`{"operation_id":%d}`, op.ID+1)))
 				case "archived":
 					query = query.Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "test_failure").Set("finished_at = ?", time.Now())
 				}
@@ -174,9 +175,9 @@ func createWalletOperation(t *testing.T, repos *repository.Repositories, operati
 func createWalletTask(t *testing.T, repos *repository.Repositories, operationID int64, key string) int64 {
 	t.Helper()
 	row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeWalletOperation, IdempotencyKey: "wallet:" + key,
+		Type:         model.TaskTypeWalletOperation,
 		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"operation_id":%d}`, operationID)), InputHash: key,
-		SubjectType: new("wallet_operation"), SubjectKey: new(strconv.FormatInt(operationID, 10)),
+		SubjectType: "wallet_operation", SubjectKey: strconv.FormatInt(operationID, 10),
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 		AvailableAt: time.Now(),
 	}))

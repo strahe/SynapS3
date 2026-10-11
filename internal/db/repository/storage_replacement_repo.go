@@ -12,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 var _ StorageReplacementRepository = (*BunStorageReplacementRepo)(nil)
@@ -57,9 +56,7 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		}
 		source := new(model.StorageDataSet)
 		query := db.NewSelect().Model(source).Where("id = ?", input.SourceDataSetID)
-		if db.Dialect().Name() == dialect.PG {
-			query = query.For("UPDATE")
-		}
+		query = query.For("UPDATE")
 		if err := query.Scan(ctx); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
@@ -268,8 +265,7 @@ func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSet
 	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
 		Set("task_generation = task_generation + 1").Set("task_id = NULL").
 		Where("id IN (?)", bun.List(ids)).
-		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?) UNION ALL SELECT task_id FROM task_history WHERE status IN (?, ?, ?))",
-			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted,
+		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?))",
 			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted).
 		Exec(ctx); err != nil {
 		return nil, fmt.Errorf("fencing stopped superseded coordinator: %w", err)
@@ -338,7 +334,7 @@ func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplac
 			Set("retirement_task_id = NULL").
 			Set("updated_at = ?", now).
 			Where("id = ?", row.SourceDataSetID).
-			Where("retirement_task_id IN (SELECT id FROM tasks WHERE status = ?)", model.TaskStatusFailed).
+			Where("retirement_task_id IN (SELECT id FROM live_tasks WHERE status = ?)", model.TaskStatusFailed).
 			Exec(ctx); err != nil {
 			return fmt.Errorf("releasing failed retirement task: %w", err)
 		}
@@ -623,10 +619,7 @@ func (r *BunStorageReplacementRepo) FailForEngineTask(ctx context.Context, taskI
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		row := new(storagereplacement.Replacement)
-		err := db.NewRaw(
-			`UPDATE storage_replacements SET updated_at = updated_at WHERE task_id = ? RETURNING *`,
-			taskID,
-		).Scan(ctx, row)
+		err := db.NewSelect().Model(row).Where("task_id = ?", taskID).For("NO KEY UPDATE").Scan(ctx)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -710,10 +703,17 @@ func (r *BunStorageReplacementRepo) RecordAbandonedTerminationEpoch(
 			TxHash:                   nullableString(input.TxHash),
 			Epoch:                    input.Epoch,
 		}
-		if _, err := db.NewInsert().Model(termination).Exec(ctx); err == nil {
-			return nil
-		} else if !isUniqueViolation(err) {
+		result, err := db.NewInsert().Model(termination).
+			On("CONFLICT (replacement_id, role) DO NOTHING").Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("reading abandoned target termination insertion: %w", err)
+		}
+		if inserted == 1 {
+			return nil
 		}
 		// A crash after the transaction was paid for replays with the same
 		// epoch; anything else is a genuine conflict.
@@ -803,7 +803,7 @@ func (r *BunStorageReplacementRepo) ListForBucket(ctx context.Context, bucketID 
 		Where("storage_replacement.bucket_id = ?", bucketID).
 		OrderExpr("storage_replacement.id DESC")
 	if limit > 0 {
-		q = q.Limit(limit)
+		q = q.Limit(int64(limit))
 	}
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing bucket provider replacements: %w", err)
@@ -873,7 +873,7 @@ func (r *BunStorageReplacementRepo) ListActive(ctx context.Context, afterID int6
 			storagereplacement.StatusWaiting,
 			storagereplacement.StatusRetiring).
 		OrderExpr("storage_replacement.id ASC").
-		Limit(limit).
+		Limit(int64(limit)).
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing active provider replacements: %w", err)
 	}
@@ -946,18 +946,15 @@ func transitionReplacement(
 
 func lockReplacementByID(ctx context.Context, db bun.IDB, replacementID int64) (*storagereplacement.Replacement, error) {
 	row := new(storagereplacement.Replacement)
-	err := db.NewRaw(
-		`UPDATE storage_replacements SET updated_at = updated_at WHERE id = ? RETURNING *`,
-		replacementID,
-	).Scan(ctx, row)
+	err := db.NewSelect().Model(row).Where("id = ?", replacementID).For("NO KEY UPDATE").Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("provider replacement %d: %w", replacementID, ErrNotFound)
 		}
 		return nil, fmt.Errorf("locking provider replacement: %w", err)
 	}
-	// The lock statement returns the replacement's own columns; the terminations
-	// it records live beside it and callers of this lock read them.
+	// The terminations the replacement records live beside it and callers of
+	// this lock read them.
 	if err := loadReplacementTerminations(ctx, db, row); err != nil {
 		return nil, err
 	}

@@ -82,8 +82,8 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		MaxConcurrency: 2,
 		Codec:          taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
 		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(), ObservationWindow: cleanupAttentionAfter}, AllowRetry: true,
-		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) int64 {
-			return input.ContentID
+		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) (int64, int64) {
+			return input.ContentID, input.Generation
 		}),
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
@@ -94,7 +94,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		_, err := repos.StorageCleanup.AuthorizeTask(ctx, input.ContentID, input.Generation, source.ID)
 		return err
 	}
-	definition.LegacyHandoff = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+	definition.BindSuccessor = func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
 		var input storagecleanup.Input
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err

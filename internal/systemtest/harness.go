@@ -23,6 +23,8 @@ import (
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/s3iam"
+	"github.com/strahe/synaps3/internal/testpg"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -42,12 +44,13 @@ type Harness struct {
 	AdminURL string
 	s3Socket string
 
-	runtime *app.Runtime
-	db      *bun.DB
-	tempDir string
-	cancel  context.CancelFunc
-	done    chan struct{}
-	runErr  error
+	runtime    *app.Runtime
+	db         *bun.DB
+	dropSchema func(context.Context) error
+	tempDir    string
+	cancel     context.CancelFunc
+	done       chan struct{}
+	runErr     error
 
 	cleanupOnce sync.Once
 	cleanupErr  error
@@ -55,8 +58,6 @@ type Harness struct {
 
 type HarnessOptions struct {
 	CommitMaxWait *time.Duration
-	// Database replaces the default private SQLite database.
-	Database *config.DatabaseConfig
 }
 
 // NewHarness creates and starts an isolated production runtime.
@@ -104,13 +105,24 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	cfg.Cache.Dir = filepath.Join(tempDir, "cache")
 	cfg.Cache.MaxSizeGB = 1
 	cfg.Cache.EvictionPolicy = "after_upload"
-	cfg.Database = config.DatabaseConfig{
-		Driver: "sqlite",
-		DSN: "file:" + filepath.ToSlash(filepath.Join(tempDir, "system.db")) +
-			"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)",
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
+	baseDSN, err := testpg.BaseDSN()
+	if err != nil {
+		return nil, fmt.Errorf("starting systemtest PostgreSQL: %w", err)
 	}
+	schemaDSN, dropSchema, err := testpg.CreateSchema(ctx, baseDSN)
+	if err != nil {
+		return nil, err
+	}
+	cleanupSchema := true
+	defer func() {
+		if cleanupSchema {
+			dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = dropSchema(dropCtx)
+		}
+	}()
+	// A private schema and a pool with several connections, as production uses.
+	cfg.Database = config.DatabaseConfig{Driver: "postgres", DSN: schemaDSN, MaxOpenConns: 8, MaxIdleConns: 2}
 	cfg.Filecoin.DefaultCopies = config.DefaultFilecoinCopies
 	// MemoryFilecoin is injected directly; this only satisfies production settings validation.
 	cfg.Filecoin.PrivateKey = offlinePrivateKeyPlaceholder
@@ -119,8 +131,8 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	cfg.Filecoin.Observability.Concurrency = 3
 	cfg.Worker.Tasks = config.TaskWorkerConfig{
 		Concurrency:       4,
-		PollInterval:      15 * time.Millisecond,
-		LeaseDuration:     time.Second,
+		PollInterval:      testutil.TaskPollInterval,
+		LeaseDuration:     testutil.TaskLeaseDuration,
 		UploadConcurrency: 4,
 		CommitMaxPieces:   config.DefaultCommitMaxPieces,
 		// Uploads made together still register together, without the
@@ -130,9 +142,6 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	}
 	if len(options) > 0 && options[0].CommitMaxWait != nil {
 		cfg.Worker.Tasks.CommitMaxWait = *options[0].CommitMaxWait
-	}
-	if len(options) > 0 && options[0].Database != nil {
-		cfg.Database = *options[0].Database
 	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(AdminPassword), bcrypt.MinCost)
 	if err != nil {
@@ -193,7 +202,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	runCtx, cancel := context.WithCancel(ctx)
 	harness := &Harness{
 		AdminURL: "http://" + runtime.AdminAddr(), s3Socket: socketPath,
-		runtime: runtime, db: database, tempDir: tempDir, cancel: cancel, done: make(chan struct{}),
+		runtime: runtime, db: database, dropSchema: dropSchema, tempDir: tempDir, cancel: cancel, done: make(chan struct{}),
 	}
 	go func() {
 		harness.runErr = runtime.Run(runCtx)
@@ -211,6 +220,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	}
 
 	cleanupDB = false
+	cleanupSchema = false
 	cleanupDir = false
 	cleanupSocket = false
 	return harness, nil
@@ -302,7 +312,8 @@ func (h *Harness) Close(ctx context.Context) error {
 		if errors.Is(socketErr, os.ErrNotExist) {
 			socketErr = nil
 		}
-		h.cleanupErr = errors.Join(h.db.Close(), socketErr, os.RemoveAll(h.tempDir))
+		dbErr := h.db.Close()
+		h.cleanupErr = errors.Join(dbErr, h.dropSchema(ctx), socketErr, os.RemoveAll(h.tempDir))
 	})
 	return errors.Join(h.runErr, h.cleanupErr)
 }

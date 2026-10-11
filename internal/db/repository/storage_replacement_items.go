@@ -190,8 +190,7 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 	var terminalErr error
 	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		item := new(storagereplacement.Item)
-		err := db.NewRaw(`UPDATE storage_replacement_items
-			SET updated_at = updated_at WHERE id = ? RETURNING *`, input.ItemID).Scan(ctx, item)
+		err := db.NewSelect().Model(item).Where("id = ?", input.ItemID).For("NO KEY UPDATE").Scan(ctx)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -333,10 +332,7 @@ func (r *BunStorageReplacementRepo) MarkReplacementItemAttention(ctx context.Con
 
 func lockReplacementItem(ctx context.Context, db bun.IDB, replacementID, itemID int64) (*storagereplacement.Item, error) {
 	item := new(storagereplacement.Item)
-	err := db.NewRaw(`UPDATE storage_replacement_items
-		SET updated_at = updated_at
-		WHERE id = ? AND replacement_id = ?
-		RETURNING *`, itemID, replacementID).Scan(ctx, item)
+	err := db.NewSelect().Model(item).Where("id = ? AND replacement_id = ?", itemID, replacementID).For("NO KEY UPDATE").Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

@@ -664,7 +664,7 @@ func TestReplacementResponseShowsBoundRetirementFailureWithoutChangingDomainEvid
 				}
 			}
 			retirement, _, err := f.srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
-				Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: "failed-retirement",
+				Type:  model.TaskTypeStorageDataSetRetire,
 				Input: storagereplacement.RetireInput{ReplacementID: row.ID, DataSetID: dataSetID, Generation: 1},
 			})
 			if err != nil {
@@ -817,6 +817,9 @@ func TestAPIListDataSetReplacementProviders(t *testing.T) {
 	}
 	if replacement.ProviderID != "303" || !replacement.ManualSelectable || replacement.ManualBlockReason != "" {
 		t.Fatalf("replacement provider = %#v, want it choosable", replacement)
+	}
+	if !source.UploadSpeedTestable || !replacement.UploadSpeedTestable || source.UploadSpeedUnavailableReason != "" || replacement.UploadSpeedUnavailableReason != "" {
+		t.Fatalf("speed test eligibility depended on replacement eligibility: source=%#v replacement=%#v", source, replacement)
 	}
 }
 

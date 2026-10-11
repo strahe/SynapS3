@@ -10,44 +10,27 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 )
 
 // lockStorageContentsByID serializes object-version references with permanent
 // deletion. Callers must acquire these locks before object or version locks.
 func lockStorageContentsByID(ctx context.Context, db bun.IDB, contentIDs []int64) (map[int64]*model.StorageContent, error) {
-	ids := append([]int64(nil), contentIDs...)
-	slices.Sort(ids)
-
+	ids := slices.DeleteFunc(slices.Compact(slices.Sorted(slices.Values(contentIDs))), func(id int64) bool { return id <= 0 })
 	uploads := make(map[int64]*model.StorageContent, len(ids))
-	var previous int64
+	if len(ids) == 0 {
+		return uploads, nil
+	}
+	var rows []model.StorageContent
+	if err := db.NewSelect().Model(&rows).Where("id IN (?)", bun.List(ids)).OrderExpr("id ASC").For("NO KEY UPDATE").Scan(ctx); err != nil {
+		return nil, fmt.Errorf("locking storage uploads: %w", err)
+	}
+	for i := range rows {
+		uploads[rows[i].ID] = &rows[i]
+	}
 	for _, contentID := range ids {
-		if contentID <= 0 || contentID == previous {
-			continue
-		}
-		previous = contentID
-
-		res, err := db.NewUpdate().
-			Model((*model.StorageContent)(nil)).
-			Set("updated_at = updated_at").
-			Where("id = ?", contentID).
-			Exec(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("locking storage upload %d: %w", contentID, err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
+		if uploads[contentID] == nil {
 			return nil, fmt.Errorf("locking storage upload %d: %w", contentID, ErrNotFound)
 		}
-
-		upload := new(model.StorageContent)
-		if err := db.NewSelect().Model(upload).Where("id = ?", contentID).Scan(ctx); err != nil {
-			if err == sql.ErrNoRows {
-				return nil, fmt.Errorf("loading locked storage upload %d: %w", contentID, ErrNotFound)
-			}
-			return nil, fmt.Errorf("loading locked storage upload %d: %w", contentID, err)
-		}
-		uploads[contentID] = upload
 	}
 	return uploads, nil
 }
@@ -154,19 +137,16 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 }
 
 // bucketCopyPolicyForReference reads the policy a first reference freezes into
-// its content. PostgreSQL holds a share lock until the reference commits, so a
-// policy change cannot commit in between: content named before the change
-// keeps the old target and content named after it gets the new one. SQLite
-// serializes writers, so it needs no lock.
+// its content. A share lock held until the reference commits keeps a policy
+// change from committing in between: content named before the change keeps
+// the old target and content named after it gets the new one.
 func bucketCopyPolicyForReference(ctx context.Context, db bun.IDB, bucketID int64) (int, error) {
 	var defaultCopies int
 	query := db.NewSelect().
 		Model((*model.Bucket)(nil)).
 		Column("default_copies").
 		Where("id = ?", bucketID)
-	if db.Dialect().Name() == dialect.PG {
-		query = query.For("SHARE")
-	}
+	query = query.For("SHARE")
 	if err := query.Scan(ctx, &defaultCopies); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("bucket %d: %w", bucketID, ErrNotFound)

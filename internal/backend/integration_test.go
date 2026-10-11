@@ -163,7 +163,7 @@ func TestIntegration_FullWritePath(t *testing.T) {
 		t.Fatalf("expected task type upload_plan, got %s", tasks[0].Type)
 	}
 	// Ingest is planned for the bytes, so the task names the content.
-	if want := contentSubject(t, ib.db, obj.VersionID); tasks[0].SubjectKey == nil || *tasks[0].SubjectKey != want {
+	if want := contentSubject(t, ib.db, obj.VersionID); tasks[0].SubjectKey != want {
 		t.Fatalf("expected task content=%s, got %v", want, tasks[0].SubjectKey)
 	}
 
@@ -424,7 +424,7 @@ func TestIntegration_OverwritePath(t *testing.T) {
 
 	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
 	firstSubject := contentSubject(t, ib.db, firstVersionID)
-	if len(tasks) != 1 || tasks[0].SubjectKey == nil || *tasks[0].SubjectKey != firstSubject {
+	if len(tasks) != 1 || tasks[0].SubjectKey != firstSubject {
 		t.Fatalf("expected 1 task with first content, got %d tasks", len(tasks))
 	}
 
@@ -442,11 +442,11 @@ func TestIntegration_OverwritePath(t *testing.T) {
 		t.Fatalf("expected 2 tasks, got %d", len(tasks))
 	}
 	secondSubject := contentSubject(t, ib.db, secondVersionID)
-	if tasks[1].SubjectKey == nil || *tasks[1].SubjectKey != secondSubject {
+	if tasks[1].SubjectKey != secondSubject {
 		t.Fatalf("expected second task content=%s, got %v", secondSubject, tasks[1].SubjectKey)
 	}
 
-	if tasks[0].SubjectKey == nil || *tasks[0].SubjectKey != firstSubject {
+	if tasks[0].SubjectKey != firstSubject {
 		t.Fatalf("expected first task content=%s, got %v", firstSubject, tasks[0].SubjectKey)
 	}
 

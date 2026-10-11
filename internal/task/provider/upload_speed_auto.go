@@ -2,8 +2,6 @@ package provider
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -40,16 +38,11 @@ func (h *ObservabilityHandler) scheduleMissingProviderSpeedTests(ctx context.Con
 		if !eligible {
 			continue
 		}
-		var nonce [16]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return err
-		}
 		input := providerbenchmark.Input{ProviderID: providerID, ServiceURLHash: providerbenchmark.URLHash(serviceURL)}
 		err = h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
 			taskRow, _, err := h.deps.Scheduler.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-				Type:           model.TaskTypeProviderUploadSpeedTest,
-				IdempotencyKey: "provider-upload-speed:auto:" + providerID + ":" + hex.EncodeToString(nonce[:]),
-				Input:          input, SubjectType: "provider", SubjectKey: providerID,
+				Type:  model.TaskTypeProviderUploadSpeedTest,
+				Input: input,
 			})
 			if err != nil {
 				return err

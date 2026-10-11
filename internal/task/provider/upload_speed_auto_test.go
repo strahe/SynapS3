@@ -20,7 +20,7 @@ type unusedSpeedProbe struct{}
 func (unusedSpeedProbe) Probe(context.Context, string) (time.Duration, error) { return 0, nil }
 
 func TestReadyBucketSchedulesOneSpeedTestWhenProviderBecomesAvailable(t *testing.T) {
-	db := testutil.NewTestFileDB(t)
+	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	bucket := &model.Bucket{Name: "auto-speed", Status: model.BucketStatusReady, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := repos.Buckets.Create(t.Context(), bucket); err != nil {

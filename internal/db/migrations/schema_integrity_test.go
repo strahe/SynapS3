@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/sqlitedialect"
+	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/migrate"
-	_ "modernc.org/sqlite"
 )
 
 func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
@@ -43,7 +43,7 @@ func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 }
 
 func TestValidateTargetRejectsLegacyDatabaseWithoutModification(t *testing.T) {
-	db := newSQLiteMigrationDB(t, "legacy_rejection")
+	db := newPostgresMigrationDB(t)
 	if _, err := db.Exec(`CREATE TABLE tasks (id INTEGER PRIMARY KEY, status TEXT)`); err != nil {
 		t.Fatalf("seed legacy table: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestValidateTargetAcceptsOnlyAppliedMigrationPrefixes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			db := newSQLiteMigrationDB(t, "migration_prefix_"+strings.ReplaceAll(tt.name, " ", "_"))
+			db := newPostgresMigrationDB(t)
 			if err := newMigrator(db, registry).Init(t.Context()); err != nil {
 				t.Fatalf("initialize migration metadata: %v", err)
 			}
@@ -131,12 +131,12 @@ func TestValidateTargetRejectsInvalidMigrationRegistry(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			db := newSQLiteMigrationDB(t, "invalid_registry_"+strings.ReplaceAll(tt.name, " ", "_"))
+			db := newPostgresMigrationDB(t)
 			if err := validateTarget(t.Context(), db, tt.registry); !errors.Is(err, ErrIncompatibleDatabase) {
 				t.Fatalf("validateTarget error = %v, want ErrIncompatibleDatabase", err)
 			}
-			if count, err := applicationTableCount(t.Context(), db); err != nil || count != 0 {
-				t.Fatalf("application table count after rejection = %d, err=%v", count, err)
+			if names, err := applicationTableNames(t.Context(), db); err != nil || len(names) != 0 {
+				t.Fatalf("application tables after rejection = %v, err=%v", names, err)
 			}
 		})
 	}
@@ -150,14 +150,17 @@ func migrationRegistryForTest(names ...string) *migrate.Migrations {
 	return registry
 }
 
-func newSQLiteMigrationDB(t *testing.T, name string) *bun.DB {
+func newPostgresMigrationDB(t *testing.T) *bun.DB {
 	t.Helper()
-	sqldb, err := sql.Open("sqlite", "file:"+name+"?mode=memory&cache=shared&_pragma=foreign_keys(1)")
+	sqlDB, err := sql.Open("pgx", testpg.SchemaDSN(t))
 	if err != nil {
-		t.Fatalf("open SQLite: %v", err)
+		t.Fatalf("open PostgreSQL test database: %v", err)
 	}
-	sqldb.SetMaxOpenConns(1)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
+	db := bun.NewDB(sqlDB, pgdialect.New())
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close PostgreSQL test database: %v", err)
+		}
+	})
 	return db
 }

@@ -75,7 +75,7 @@ func (h *CopyCoordinator) prepareCopyRetry(ctx context.Context, repos *repositor
 	}
 	if row.ActiveTaskID != nil {
 		return taskengine.RetryPreparation{
-			Request:    taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input},
+			Request:    taskengine.EnqueueRequest{Type: source.Type, Input: source.Input},
 			Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover,
 			PreserveCancellation: true, Bind: transferCopyOwner,
 		}, nil
@@ -114,8 +114,7 @@ func (h *CopyCoordinator) prepareCopyRecovery(ctx context.Context, repos *reposi
 	input := storagepipeline.CopyGenerationInput{CopyID: row.ID, Generation: previous.Generation + 1}
 	return taskengine.RetryPreparation{
 		Request: taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(input.CopyID, input.Generation), Input: input,
-			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(input.CopyID, 10),
+			Type: model.TaskTypeStorageTransferPlan, Input: input,
 		},
 		ResumeMode: model.TaskResumeModeExecute,
 		Bind: func(ctx context.Context, repos *repository.Repositories, _, next *model.Task) error {
