@@ -265,8 +265,7 @@ func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSet
 	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
 		Set("task_generation = task_generation + 1").Set("task_id = NULL").
 		Where("id IN (?)", bun.List(ids)).
-		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?) UNION ALL SELECT task_id FROM task_history WHERE status IN (?, ?, ?))",
-			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted,
+		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?))",
 			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted).
 		Exec(ctx); err != nil {
 		return nil, fmt.Errorf("fencing stopped superseded coordinator: %w", err)
@@ -335,7 +334,7 @@ func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplac
 			Set("retirement_task_id = NULL").
 			Set("updated_at = ?", now).
 			Where("id = ?", row.SourceDataSetID).
-			Where("retirement_task_id IN (SELECT id FROM tasks WHERE status = ?)", model.TaskStatusFailed).
+			Where("retirement_task_id IN (SELECT id FROM live_tasks WHERE status = ?)", model.TaskStatusFailed).
 			Exec(ctx); err != nil {
 			return fmt.Errorf("releasing failed retirement task: %w", err)
 		}
@@ -620,10 +619,7 @@ func (r *BunStorageReplacementRepo) FailForEngineTask(ctx context.Context, taskI
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		row := new(storagereplacement.Replacement)
-		err := db.NewRaw(
-			`UPDATE storage_replacements SET updated_at = updated_at WHERE task_id = ? RETURNING *`,
-			taskID,
-		).Scan(ctx, row)
+		err := db.NewSelect().Model(row).Where("task_id = ?", taskID).For("NO KEY UPDATE").Scan(ctx)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -943,18 +939,15 @@ func transitionReplacement(
 
 func lockReplacementByID(ctx context.Context, db bun.IDB, replacementID int64) (*storagereplacement.Replacement, error) {
 	row := new(storagereplacement.Replacement)
-	err := db.NewRaw(
-		`UPDATE storage_replacements SET updated_at = updated_at WHERE id = ? RETURNING *`,
-		replacementID,
-	).Scan(ctx, row)
+	err := db.NewSelect().Model(row).Where("id = ?", replacementID).For("NO KEY UPDATE").Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("provider replacement %d: %w", replacementID, ErrNotFound)
 		}
 		return nil, fmt.Errorf("locking provider replacement: %w", err)
 	}
-	// The lock statement returns the replacement's own columns; the terminations
-	// it records live beside it and callers of this lock read them.
+	// The terminations the replacement records live beside it and callers of
+	// this lock read them.
 	if err := loadReplacementTerminations(ctx, db, row); err != nil {
 		return nil, err
 	}

@@ -27,7 +27,7 @@ func TestPostgresConcurrentTaskClaimsAreUnique(t *testing.T) {
 	sum := sha256.Sum256(input)
 	for index := range taskCount {
 		if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-			Type: model.TaskType("postgres_claim_test"), IdempotencyKey: fmt.Sprintf("claim-%d", index),
+			Type: model.TaskType("postgres_claim_test"), SubjectType: "test", SubjectKey: fmt.Sprintf("claim-%d", index), Generation: new(int64(0)),
 			InputVersion: 1, Input: input, InputHash: hex.EncodeToString(sum[:]),
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		})); err != nil || !created {
@@ -97,20 +97,20 @@ func TestPostgresTaskClaimFilteredBacklogDiagnostics(t *testing.T) {
 	const backlogPerMode = 5000
 	old := time.Now().UTC().Add(-time.Hour)
 	if _, err := db.ExecContext(ctx, `INSERT INTO tasks
-		(id,type,idempotency_key,input_version,input_hash,status,resume_mode,available_at,
-		claim_generation,claimed_at,lease_until,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
-		SELECT id,'full','backlog-'||id,1,'hash',CASE WHEN id <= ? THEN 'running' ELSE 'pending' END,
+		(id,type,subject_type,subject_key,generation,input_version,input_hash,status,resume_mode,available_at,
+		claim_generation,claimed_at,lease_until,created_at,updated_at,input_json,policy_json,runtime_json)
+		SELECT id,'full','test','backlog-'||id,0,1,'hash',CASE WHEN id <= ? THEN 'running' ELSE 'pending' END,
 		'execute',?,CASE WHEN id <= ? THEN 1 ELSE 0 END,
 		CASE WHEN id <= ? THEN ?::timestamptz ELSE NULL END,CASE WHEN id <= ? THEN ?::timestamptz ELSE NULL END,
-		?,?,'{}','{"version":2,"max_attempts":6}','{}','[]' FROM generate_series(1, ?) AS id`,
+		?,?,'{}','{"version":2,"max_attempts":6}','{}' FROM generate_series(1, ?) AS id`,
 		backlogPerMode, old, backlogPerMode, backlogPerMode, old, backlogPerMode, old,
 		old, old, 2*backlogPerMode); err != nil {
 		t.Fatal(err)
 	}
 	for index, status := range []model.TaskStatus{model.TaskStatusRunning, model.TaskStatusPending} {
 		row := repositoryTestTask(&model.Task{
-			ID: int64(2*backlogPerMode + index + 1), Type: "available", IdempotencyKey: fmt.Sprintf("eligible-%d", index),
-			InputVersion: 1, Input: []byte(`{}`), InputHash: "hash", Status: status, Events: []byte(`[]`),
+			ID: int64(2*backlogPerMode + index + 1), Type: "available", SubjectType: "test", SubjectKey: fmt.Sprintf("eligible-%d", index), Generation: new(int64(0)),
+			InputVersion: 1, Input: []byte(`{}`), InputHash: "hash", Status: status,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: old.Add(time.Minute),
 		})
 		if status == model.TaskStatusRunning {
@@ -166,7 +166,7 @@ func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T)
 	availableAt := time.Now().Add(-time.Minute)
 	for index := range 2 {
 		if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-			Type: model.TaskType("postgres_skip_locked_test"), IdempotencyKey: fmt.Sprintf("claim-%d", index),
+			Type: model.TaskType("postgres_skip_locked_test"), SubjectType: "test", SubjectKey: fmt.Sprintf("claim-%d", index), Generation: new(int64(0)),
 			InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: fmt.Sprintf("hash-%d", index),
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: availableAt.Add(time.Duration(index) * time.Second),

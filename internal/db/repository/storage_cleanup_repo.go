@@ -318,46 +318,37 @@ func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, 
 // Replacement items do not hold it back; the coordinator cancels an item once
 // its content is gone.
 func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
-	unreferenced, err := contentIsUnreferenced(ctx, db, contentID)
-	if err != nil || !unreferenced {
-		return false, err
-	}
-	for _, check := range []struct {
-		what  string
-		query *bun.SelectQuery
-	}{
-		{"unresolved pulls", db.NewSelect().Model((*storagepull.Attempt)(nil)).
-			Where("content_id = ? AND resolved_at IS NULL", contentID)},
-		{"cache residency", db.NewSelect().Model((*model.ObjectCache)(nil)).
+	var ready bool
+	err := db.NewRaw(`SELECT NOT EXISTS (?) AND NOT EXISTS (?) AND NOT EXISTS (?) AND NOT EXISTS (?) AND NOT EXISTS (?)`,
+		db.NewSelect().Model((*model.ObjectVersion)(nil)).ColumnExpr("1").
+			Where("content_id = ?", contentID),
+		db.NewSelect().Model((*storagepull.Attempt)(nil)).ColumnExpr("1").
+			Where("content_id = ? AND resolved_at IS NULL", contentID),
+		db.NewSelect().Model((*model.ObjectCache)(nil)).ColumnExpr("1").
 			Where("content_id = ?", contentID).
 			Where(`in_cache = ? OR EXISTS (
 				SELECT 1 FROM tasks AS cache_task
 				WHERE cache_task.id = object_cache.cache_active_task_id
 				  AND cache_task.status IN (?, ?)
-			)`, true, model.TaskStatusPending, model.TaskStatusRunning)},
-		{"open storage registrations", db.NewSelect().Model((*model.StorageCopy)(nil)).
+			)`, true, model.TaskStatusPending, model.TaskStatusRunning),
+		db.NewSelect().Model((*model.StorageCopy)(nil)).ColumnExpr("1").
 			Join("JOIN storage_commit_requests AS commit_request ON commit_request.request_id = storage_copy.commit_request_id").
 			Where("storage_copy.content_id = ?", contentID).
 			Where("commit_request.status NOT IN (?)", bun.List([]storagecommit.RequestStatus{
 				storagecommit.RequestStatusConfirmed, storagecommit.RequestStatusAbandoned,
-			}))},
-		{"copy tasks", db.NewSelect().Model((*model.StorageCopy)(nil)).
+			})),
+		db.NewSelect().Model((*model.StorageCopy)(nil)).ColumnExpr("1").
 			Where("content_id = ?", contentID).
 			Where(`EXISTS (
 				SELECT 1 FROM tasks AS copy_task
 				WHERE copy_task.id = storage_copy.active_task_id
 				  AND copy_task.status IN (?, ?)
-			)`, model.TaskStatusPending, model.TaskStatusRunning)},
-	} {
-		count, err := check.query.Count(ctx)
-		if err != nil {
-			return false, fmt.Errorf("checking %s before finalizing storage cleanup: %w", check.what, err)
-		}
-		if count > 0 {
-			return false, nil
-		}
+			)`, model.TaskStatusPending, model.TaskStatusRunning),
+	).Scan(ctx, &ready)
+	if err != nil {
+		return false, fmt.Errorf("checking storage cleanup readiness: %w", err)
 	}
-	return true, nil
+	return ready, nil
 }
 
 func storageCleanupCopyUpdateResult(res sql.Result, err error, op string) error {

@@ -44,7 +44,7 @@ func (h *storageContentLockBarrier) AfterQuery(ctx context.Context, event *bun.Q
 
 func storageContentLockQuery(query string) bool {
 	query = strings.ToLower(query)
-	return strings.Contains(query, "update") && strings.Contains(query, "storage_contents") && strings.Contains(query, "updated_at = updated_at")
+	return strings.Contains(query, `from "storage_contents"`) && strings.Contains(query, "for no key update")
 }
 
 func waitPostgresSignal(t *testing.T, signal <-chan struct{}, name string) {

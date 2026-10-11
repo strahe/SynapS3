@@ -87,8 +87,8 @@ func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.DataSetInput) error {
 			return storagepipeline.ValidateDataSetInput(*input)
 		}),
-		Subject: taskengine.SubjectFromInput("storage_data_set", func(input storagepipeline.DataSetInput) int64 { return input.DataSetID }),
-		Policy:  taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagepipeline.DataSetInput) (int64, int64) { return input.DataSetID, 0 }),
+		Policy:   taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		// A refusal checkpoint resumes queries; only settled terminal failures
 		// have no remaining creation work to retry.
 		CanManualRetry: func(task *model.Task) bool {

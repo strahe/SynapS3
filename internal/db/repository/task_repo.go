@@ -30,7 +30,7 @@ WHERE id = (
     WHERE status = 'running' AND lease_until <= ?%s
     ORDER BY lease_until, id
     LIMIT 1
-    FOR UPDATE SKIP LOCKED
+    FOR NO KEY UPDATE SKIP LOCKED
 )
 AND status = 'running' AND lease_until <= ?
 RETURNING *`
@@ -51,7 +51,7 @@ WHERE id = (
     WHERE status = 'pending' AND available_at <= ?%s
     ORDER BY available_at, id
     LIMIT 1
-    FOR UPDATE SKIP LOCKED
+    FOR NO KEY UPDATE SKIP LOCKED
 )
 AND status = 'pending' AND available_at <= ?
 RETURNING *`
@@ -183,10 +183,9 @@ func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64,
 func (r *BunTaskRepo) ValidateClaim(ctx context.Context, id, generation int64) error {
 	now := time.Now()
 	var found int64
-	err := r.db.NewRaw(`UPDATE tasks
-		SET updated_at = updated_at
+	err := r.db.NewRaw(`SELECT id FROM tasks
 		WHERE id = ? AND status = 'running' AND claim_generation = ? AND lease_until > ?
-		RETURNING id`, id, generation, now).Scan(ctx, &found)
+		FOR NO KEY UPDATE`, id, generation, now).Scan(ctx, &found)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrTaskLeaseLost
 	}
@@ -343,8 +342,7 @@ func (r *BunTaskRepo) CountFailedMatching(ctx context.Context, filter TaskAcknow
 	if filter.FailedBefore.IsZero() {
 		return 0, fmt.Errorf("counting failed tasks: %w", ErrInvalidInput)
 	}
-	count, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
+	count, err := taskScopeQuery(r.db, (*model.Task)(nil), TaskScopeWork).
 		ApplyQueryBuilder(acknowledgeFailedMatching(filter)).
 		Count(ctx)
 	if err != nil {
@@ -354,8 +352,7 @@ func (r *BunTaskRepo) CountFailedMatching(ctx context.Context, filter TaskAcknow
 }
 
 func (r *BunTaskRepo) CountUnacknowledgedFailed(ctx context.Context) (int64, error) {
-	count, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
+	count, err := taskScopeQuery(r.db, (*model.Task)(nil), TaskScopeWork).
 		Where("status = ?", model.TaskStatusFailed).
 		Count(ctx)
 	if err != nil {

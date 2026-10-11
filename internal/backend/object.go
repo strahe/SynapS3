@@ -1293,11 +1293,8 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 			return nil
 		}
 		_, _, err := b.taskService.EnqueueOrReplaceTerminalInTransaction(ctx, repos, taskengine.EnqueueRequest{
-			Type:           model.TaskTypeUploadPlan,
-			IdempotencyKey: storagepipeline.UploadPlanKey(*contentID),
-			Input:          storagepipeline.UploadPlanInput{ContentID: *contentID},
-			SubjectType:    model.TaskSubjectStorageContent,
-			SubjectKey:     strconv.FormatInt(*contentID, 10),
+			Type:  model.TaskTypeUploadPlan,
+			Input: storagepipeline.UploadPlanInput{ContentID: *contentID},
 		})
 		return err
 	case model.ObjectStateStored:
@@ -1318,11 +1315,8 @@ func (b *SynapseBackend) bindStorageCleanupTask(ctx context.Context, repos *repo
 		return nil
 	}
 	taskRow, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeStorageCleanup,
-		IdempotencyKey: storagecleanup.TaskKey(cleanup.ContentID, cleanup.Generation),
-		Input:          storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
-		SubjectType:    model.TaskSubjectStorageContent,
-		SubjectKey:     strconv.FormatInt(cleanup.ContentID, 10),
+		Type:  model.TaskTypeStorageCleanup,
+		Input: storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
 	})
 	if err != nil {
 		return err

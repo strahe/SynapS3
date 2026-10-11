@@ -32,8 +32,7 @@ func seedSpeedTest(t *testing.T, runtime handlerTestRuntime) *model.Task {
 	}
 	input := providerbenchmark.Input{ProviderID: "101", ServiceURLHash: providerbenchmark.URLHash(serviceURL)}
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: "speed-101", Input: input,
-		SubjectType: "provider", SubjectKey: "101",
+		Type: model.TaskTypeProviderUploadSpeedTest, Input: input,
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.ProviderUploadSpeed.Begin(ctx, "101", input.ServiceURLHash, taskRow.ID)
 	})

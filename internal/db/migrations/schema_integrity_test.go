@@ -135,8 +135,8 @@ func TestValidateTargetRejectsInvalidMigrationRegistry(t *testing.T) {
 			if err := validateTarget(t.Context(), db, tt.registry); !errors.Is(err, ErrIncompatibleDatabase) {
 				t.Fatalf("validateTarget error = %v, want ErrIncompatibleDatabase", err)
 			}
-			if count, err := applicationTableCount(t.Context(), db); err != nil || count != 0 {
-				t.Fatalf("application table count after rejection = %d, err=%v", count, err)
+			if names, err := applicationTableNames(t.Context(), db); err != nil || len(names) != 0 {
+				t.Fatalf("application tables after rejection = %v, err=%v", names, err)
 			}
 		})
 	}

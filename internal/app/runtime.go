@@ -189,10 +189,10 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		capacityInterval = time.Hour
 	}
 	for _, schedule := range []taskengine.ScheduleDefinition{
-		{Key: systemtask.CacheCapacityKey, Type: model.TaskTypeCacheCapacityReconcile, Subject: taskengine.Subject{Type: "system", Key: "cache-capacity"}, Input: systemtask.Input{}, Interval: capacityInterval},
-		{Key: "system:observability-refresh", Type: model.TaskTypeObservabilityRefresh, Subject: taskengine.Subject{Type: "system", Key: "observability"}, Input: systemtask.Input{}, Interval: observabilityService.RefreshInterval()},
-		{Key: "system:approved-provider-refresh", Type: model.TaskTypeApprovedProviderRefresh, Subject: taskengine.Subject{Type: "system", Key: "approved-providers"}, Input: systemtask.Input{}, Interval: observabilityService.RefreshInterval()},
-		{Key: "system:endorsed-provider-refresh", Type: model.TaskTypeEndorsedProviderRefresh, Subject: taskengine.Subject{Type: "system", Key: "endorsed-providers"}, Input: systemtask.Input{}, Interval: observabilityService.RefreshInterval()},
+		{Key: systemtask.CacheCapacityKey, Type: model.TaskTypeCacheCapacityReconcile, Interval: capacityInterval},
+		{Key: "system:observability-refresh", Type: model.TaskTypeObservabilityRefresh, Interval: observabilityService.RefreshInterval()},
+		{Key: "system:approved-provider-refresh", Type: model.TaskTypeApprovedProviderRefresh, Interval: observabilityService.RefreshInterval()},
+		{Key: "system:endorsed-provider-refresh", Type: model.TaskTypeEndorsedProviderRefresh, Interval: observabilityService.RefreshInterval()},
 	} {
 		if err := registry.RegisterSchedule(schedule); err != nil {
 			return nil, fmt.Errorf("registering task schedule: %w", err)
@@ -346,15 +346,11 @@ func publishUploadTaskSettlement(events admin.EventPublisher, taskRow *model.Tas
 		return
 	}
 	payload := map[string]any{
-		"task_id":   taskRow.ID,
-		"task_type": taskRow.Type,
-		"status":    transition.Status,
-	}
-	if taskRow.SubjectType != nil {
-		payload["subject_type"] = *taskRow.SubjectType
-	}
-	if taskRow.SubjectKey != nil {
-		payload["subject_key"] = *taskRow.SubjectKey
+		"task_id":      taskRow.ID,
+		"task_type":    taskRow.Type,
+		"status":       transition.Status,
+		"subject_type": taskRow.SubjectType,
+		"subject_key":  taskRow.SubjectKey,
 	}
 	events.Publish("upload_state_changed", payload)
 }

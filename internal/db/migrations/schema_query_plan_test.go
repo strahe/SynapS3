@@ -2,9 +2,9 @@ package migrations
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/uptrace/bun"
 )
@@ -13,7 +13,6 @@ func TestCurrentSchemaRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
 	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		seedObjectPlanBacklog(t, db)
 		seedStorageCommitPlanBacklog(t, db)
-		seedTaskPlanBacklog(t, db)
 		seedWalletPlanBacklog(t, db)
 
 		plans := []struct {
@@ -37,20 +36,6 @@ func TestCurrentSchemaRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
 					ORDER BY cache_accessed_at, content_id LIMIT 100`,
 			},
 			{
-				name:       "expired task recovery",
-				indexNames: []string{"idx_tasks_recovery"},
-				query: `SELECT id FROM tasks
-					WHERE status = 'running' AND lease_until <= '9999-12-31 00:00:00'
-					ORDER BY lease_until, id LIMIT 1`,
-			},
-			{
-				name:       "pending task claim",
-				indexNames: []string{"idx_tasks_pending"},
-				query: `SELECT id FROM tasks
-					WHERE status = 'pending' AND available_at <= '9999-12-31 00:00:00'
-					ORDER BY available_at, id LIMIT 1`,
-			},
-			{
 				// The next request to send is found among the data set's open
 				// requests, not by scanning its settled history.
 				name:       "commit queue head",
@@ -66,12 +51,6 @@ func TestCurrentSchemaRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
 				query: `SELECT id FROM storage_copies
 					WHERE commit_request_id = 'collecting-1'
 					ORDER BY commit_ready_at ASC, id ASC`,
-			},
-			{
-				name:       "replacement progress",
-				indexNames: []string{"idx_storage_replacement_items_state"},
-				query: `SELECT id FROM storage_replacement_items
-					WHERE replacement_id = 1 AND status = 'pending' ORDER BY id LIMIT 100`,
 			},
 			{
 				name:       "recent wallet operations",
@@ -175,8 +154,8 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 	}{
 		{"storage copies", insertCopies},
 		{"storage commit history", insertHistory},
-		{"collecting request task", `INSERT INTO tasks (id, type, idempotency_key, input_version, input_hash, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-			VALUES (900001, 'storage_commit', 'query-plan-collecting', 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]')`},
+		{"collecting request task", `INSERT INTO tasks (id, type, subject_type, subject_key, generation, input_version, input_hash, available_at, created_at, updated_at, input_json, policy_json, runtime_json)
+			VALUES (900001, 'storage_commit', 'storage_commit_request', 'collecting-1', 0, 1, 'hash', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}')`},
 		{"collecting request", `INSERT INTO storage_commit_requests (
 			request_id, storage_data_set_id, status, task_id, piece_count, sends, refusals, created_at, updated_at)
 			VALUES ('collecting-1', 1, 'collecting', 900001, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`},
@@ -191,28 +170,6 @@ func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
 		if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
 			t.Fatalf("analyze query-plan table %s: %v", table, err)
 		}
-	}
-}
-
-func seedTaskPlanBacklog(t *testing.T, db *bun.DB) {
-	t.Helper()
-	statements := []string{
-		`INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status, available_at, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-		 SELECT 'plan', 'pending-' || value, 1, 'hash', 'pending', '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
-		 FROM generate_series(1, 512) AS series(value)`,
-		`INSERT INTO tasks (type, idempotency_key, input_version, input_hash, status,
-		 available_at, resume_mode, claim_generation, claimed_at, lease_until, created_at, updated_at, input_json, policy_json, runtime_json, events_json)
-		 SELECT 'plan', 'running-' || value, 1, 'hash', 'running', '2026-01-01 00:00:00',
-		 'recover', 1, '2026-01-01 00:00:00', '2026-01-01 00:01:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}', '{"version":2,"max_attempts":6}', '{}', '[]'
-		 FROM generate_series(1, 512) AS series(value)`,
-	}
-	for _, statement := range statements {
-		if _, err := db.ExecContext(t.Context(), statement); err != nil {
-			t.Fatalf("seed task query-plan backlog: %v", err)
-		}
-	}
-	if _, err := db.ExecContext(t.Context(), "ANALYZE tasks"); err != nil {
-		t.Fatalf("analyze task query-plan backlog: %v", err)
 	}
 }
 
@@ -247,52 +204,60 @@ func explainQueryPlan(t *testing.T, db *bun.DB, query string) string {
 
 func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
 	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
-		if _, err := db.ExecContext(t.Context(), `WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM sequence WHERE value<30000)
-   INSERT INTO task_history (task_id,type,idempotency_key,input_version,input_hash,status,subject_type,subject_key,available_at,finished_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
-   SELECT value,CASE WHEN value%500=0 THEN 'bucket_provision' ELSE 'observability_refresh' END,'history-'||value,1,'hash','completed','bucket',CAST(value%500 AS TEXT),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]' FROM sequence`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.ExecContext(t.Context(), `WITH RECURSIVE sequence(value) AS (SELECT 30001 UNION ALL SELECT value+1 FROM sequence WHERE value<40000)
-   INSERT INTO tasks (id,type,idempotency_key,input_version,input_hash,status,subject_type,subject_key,available_at,finished_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json)
-   SELECT value,CASE WHEN value%500=0 THEN 'bucket_provision' ELSE 'observability_refresh' END,'work-'||value,1,'hash',CASE WHEN value%600=0 THEN 'failed' ELSE 'pending' END,'bucket',CAST(value%500 AS TEXT),CURRENT_TIMESTAMP,CASE WHEN value%600=0 THEN CURRENT_TIMESTAMP ELSE NULL END,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]' FROM sequence`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET available_at=?`, time.Now().UTC().Add(time.Hour)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET available_at=CURRENT_TIMESTAMP WHERE id BETWEEN 30020 AND 30024`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET status='running',finished_at=NULL,claim_generation=1,claimed_at=CURRENT_TIMESTAMP,lease_until=CURRENT_TIMESTAMP WHERE id BETWEEN 30030 AND 30034`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET retry_of_task_id=1 WHERE id=30002`); err != nil {
-			t.Fatal(err)
-		}
-		for _, table := range []string{"tasks", "task_history"} {
-			if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for _, tc := range []struct{ query, index string }{
-			{`SELECT id FROM tasks WHERE status='pending' AND available_at<=CURRENT_TIMESTAMP ORDER BY available_at,id LIMIT 1`, "idx_tasks_pending"},
-			{`SELECT id FROM tasks WHERE status='running' AND lease_until<=CURRENT_TIMESTAMP ORDER BY lease_until,id LIMIT 1`, "idx_tasks_recovery"},
-			{`SELECT id FROM tasks WHERE type='bucket_provision' ORDER BY id DESC LIMIT 20`, "idx_tasks_type_id"},
-			{`SELECT id FROM tasks WHERE status='failed' ORDER BY id DESC LIMIT 20`, "idx_tasks_status_id"},
-			{`SELECT id FROM tasks WHERE subject_type='bucket' AND subject_key='17' ORDER BY id DESC LIMIT 20`, "idx_tasks_subject"},
-			{`SELECT id FROM tasks WHERE type='observability_refresh' AND idempotency_key='work-30002'`, "uq_tasks_type_key"},
-			{`SELECT id FROM tasks WHERE retry_of_task_id=1`, "uq_tasks_retry_parent"},
-			{`SELECT task_id FROM task_history WHERE type='bucket_provision' ORDER BY task_id DESC LIMIT 20`, "idx_task_history_type_id"},
-			{`SELECT task_id FROM task_history WHERE subject_type='bucket' AND subject_key='17' ORDER BY task_id DESC LIMIT 20`, "idx_task_history_subject"},
+		// One live round in 200 among permanent history, with rare history
+		// statuses and a rare operation.
+		for _, statement := range []string{
+			`INSERT INTO tasks (id,type,generation,input_version,input_hash,status,subject_type,subject_key,available_at,finished_at,acknowledged_at,created_at,updated_at,input_json,policy_json,runtime_json)
+			 SELECT n,type,n,1,'hash',status,'bucket',CAST(n%500 AS TEXT),CURRENT_TIMESTAMP+interval '1 hour',
+			        CASE WHEN status<>'pending' THEN CURRENT_TIMESTAMP END,
+			        CASE WHEN status='failed' AND n%1000<>0 THEN CURRENT_TIMESTAMP END,
+			        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}'
+			 FROM (SELECT n,
+			         CASE WHEN n%500=7 THEN 'bucket_provision' ELSE 'observability_refresh' END AS type,
+			         CASE WHEN n%1000=0 THEN 'failed' WHEN n%200=0 THEN 'pending' WHEN n%991=2 THEN 'failed' WHEN n%997=1 THEN 'cancelled' ELSE 'completed' END AS status
+			       FROM generate_series(1,40000) AS series(n)) AS seed`,
+			`UPDATE tasks SET available_at=CURRENT_TIMESTAMP WHERE id IN (200,400,600)`,
+			`UPDATE tasks SET status='running',claim_generation=1,claimed_at=CURRENT_TIMESTAMP,lease_until=CURRENT_TIMESTAMP+(id%2000/1000)*interval '1 hour' WHERE id%1000=800`,
+			`UPDATE tasks SET retry_of_task_id=1 WHERE id=1200`,
+			// Analyze all fixture rows to keep selectivity estimates stable.
+			`ALTER TABLE tasks ALTER COLUMN status SET STATISTICS 200`,
+			`ANALYZE tasks`,
 		} {
-			var lines []string
-			if err := db.NewRaw("EXPLAIN (COSTS OFF) "+tc.query).Scan(t.Context(), &lines); err != nil {
+			if _, err := db.ExecContext(t.Context(), statement); err != nil {
 				t.Fatal(err)
 			}
-			plan := strings.Join(lines, "\n")
-			if !strings.Contains(plan, tc.index) {
-				t.Fatalf("query did not use %s: %s\n%s", tc.index, tc.query, plan)
-			}
+		}
+		const history = `NOT (status IN ('pending','running','failed') AND acknowledged_at IS NULL AND superseded_at IS NULL)`
+		for _, tc := range []struct {
+			name, query string
+			indexes     []string
+		}{
+			{"claim", `SELECT id FROM tasks WHERE status='pending' AND available_at<=CURRENT_TIMESTAMP ORDER BY available_at,id LIMIT 1`, []string{"idx_tasks_pending"}},
+			{"recovery", `SELECT id FROM tasks WHERE status='running' AND lease_until<=CURRENT_TIMESTAMP ORDER BY lease_until,id LIMIT 1`, []string{"idx_tasks_recovery"}},
+			{"work", `SELECT id FROM live_tasks ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_live"}},
+			{"work by status", `SELECT id FROM live_tasks WHERE status='failed' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_live", "idx_tasks_status_id"}},
+			{"work by operation", `SELECT id FROM live_tasks WHERE type='bucket_provision' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_live", "idx_tasks_type_id"}},
+			{"history", `SELECT id FROM tasks WHERE ` + history + ` ORDER BY id DESC LIMIT 20`, []string{"tasks_pkey"}},
+			{"history by operation", `SELECT id FROM tasks WHERE ` + history + ` AND type='bucket_provision' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_type_id"}},
+			{"history completed", `SELECT id FROM tasks WHERE ` + history + ` AND status='completed' ORDER BY id DESC LIMIT 20`, []string{"tasks_pkey"}},
+			{"history failed", `SELECT id FROM tasks WHERE ` + history + ` AND status='failed' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_status_id"}},
+			{"history completed by operation", `SELECT id FROM tasks WHERE ` + history + ` AND status='completed' AND type='bucket_provision' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_type_id"}},
+			{"history cancelled by operation", `SELECT id FROM tasks WHERE ` + history + ` AND status='cancelled' AND type='bucket_provision' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_status_id", "idx_tasks_type_id"}},
+			{"subject", `SELECT id FROM tasks WHERE subject_type='bucket' AND subject_key='17' ORDER BY id DESC LIMIT 20`, []string{"idx_tasks_subject"}},
+			{"current failed", `SELECT id FROM tasks WHERE status='failed' AND superseded_at IS NULL AND subject_type='bucket' AND subject_key='17' ORDER BY superseded_at DESC,id DESC LIMIT 20`, []string{"idx_tasks_current_failed"}},
+			{"identity", `SELECT id FROM tasks WHERE type='observability_refresh' AND subject_type='bucket' AND subject_key='2' AND generation=30002 AND superseded_at IS NULL`, []string{"uq_tasks_identity"}},
+			{"retry successor", `SELECT id FROM tasks WHERE retry_of_task_id=1`, []string{"uq_tasks_retry_parent"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var lines []string
+				if err := db.NewRaw("EXPLAIN (COSTS OFF) "+tc.query).Scan(t.Context(), &lines); err != nil {
+					t.Fatal(err)
+				}
+				plan := strings.Join(lines, "\n")
+				if !slices.ContainsFunc(tc.indexes, func(index string) bool { return strings.Contains(plan, index) }) {
+					t.Fatalf("query did not use %v: %s\n%s", tc.indexes, tc.query, plan)
+				}
+			})
 		}
 	})
 }

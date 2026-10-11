@@ -326,23 +326,18 @@ func countReplacementActiveCommitAttempts(ctx context.Context, db bun.IDB, repla
 }
 
 func lockReplacementDataSets(ctx context.Context, db bun.IDB, ids ...int64) error {
-	ids = append([]int64(nil), ids...)
-	slices.Sort(ids)
-	for i, id := range ids {
-		if id <= 0 || (i > 0 && id == ids[i-1]) {
-			continue
-		}
-		res, err := db.NewUpdate().
-			Model((*model.StorageDataSet)(nil)).
-			Set("updated_at = updated_at").
-			Where("id = ?", id).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("locking replacement data set %d: %w", id, err)
-		}
-		if rows, _ := res.RowsAffected(); rows != 1 {
-			return fmt.Errorf("locking replacement data set %d: %w", id, ErrNotFound)
-		}
+	ids = slices.DeleteFunc(slices.Compact(slices.Sorted(slices.Values(ids))), func(id int64) bool { return id <= 0 })
+	if len(ids) == 0 {
+		return nil
+	}
+	var locked []int64
+	if err := db.NewSelect().Model((*model.StorageDataSet)(nil)).Column("id").
+		Where("id IN (?)", bun.List(ids)).OrderExpr("id ASC").For("NO KEY UPDATE").
+		Scan(ctx, &locked); err != nil {
+		return fmt.Errorf("locking replacement data sets %v: %w", ids, err)
+	}
+	if len(locked) != len(ids) {
+		return fmt.Errorf("locking replacement data sets %v: %w", ids, ErrNotFound)
 	}
 	return nil
 }

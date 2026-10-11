@@ -71,8 +71,8 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 			return storagepipeline.ValidateUploadPlanInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
-		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) int64 {
-			return input.ContentID
+		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) (int64, int64) {
+			return input.ContentID, 0
 		}),
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {

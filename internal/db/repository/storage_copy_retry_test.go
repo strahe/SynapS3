@@ -39,7 +39,7 @@ func TestPostgresCopyRetrySerializesReplacement(t *testing.T) {
 				if first == "retry" {
 					return strings.Contains(query, `"buckets"`) && strings.Contains(query, "for share")
 				}
-				return strings.HasPrefix(query, "update") && strings.Contains(query, `"buckets"`)
+				return strings.Contains(query, `"buckets"`) && strings.Contains(query, "for no key update")
 			})
 			testutil.AddQueryHook(db, hold)
 			defer hold.Release()
@@ -105,7 +105,7 @@ func TestPostgresCopyRetryConcurrentRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	hold := newPostgresRaceHold("first", func(query string) bool {
-		return strings.HasPrefix(query, "update") && strings.Contains(query, `"storage_contents"`)
+		return strings.Contains(query, `from "storage_contents"`) && strings.Contains(query, "for no key update")
 	})
 	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
@@ -163,7 +163,7 @@ func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	hold := newPostgresRaceHold("eviction", func(query string) bool {
-		return strings.HasPrefix(query, "update") && strings.Contains(query, `"storage_contents"`)
+		return strings.Contains(query, `from "storage_contents"`) && strings.Contains(query, "for no key update")
 	})
 	testutil.AddQueryHook(db, hold)
 	defer hold.Release()

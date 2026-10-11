@@ -3,27 +3,15 @@ package repository_test
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/strahe/synaps3/internal/testutil"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 )
 
-func TestPostgresTaskLockRelocatesAfterConcurrentArchive(t *testing.T) {
-	assertPostgresTaskArchiveLockRace(t, false)
-}
-
 func TestPostgresConcurrentTaskAcknowledgementArchivesOnce(t *testing.T) {
-	assertPostgresTaskArchiveLockRace(t, true)
-}
-
-func assertPostgresTaskArchiveLockRace(t *testing.T, acknowledge bool) {
-	t.Helper()
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -76,10 +64,8 @@ func assertPostgresTaskArchiveLockRace(t *testing.T, acknowledge bool) {
 	var relocated *model.Task
 	go func() {
 		second <- repos.WithTx(waiterCtx, func(tx *repository.Repositories) error {
-			if acknowledge {
-				if err := tx.Tasks.AcknowledgeFailed(waiterCtx, source.ID); err != nil {
-					return err
-				}
+			if err := tx.Tasks.AcknowledgeFailed(waiterCtx, source.ID); err != nil {
+				return err
 			}
 			var err error
 			relocated, err = tx.Tasks.GetForUpdate(waiterCtx, source.ID)
@@ -101,16 +87,7 @@ func assertPostgresTaskArchiveLockRace(t *testing.T, acknowledge bool) {
 		}
 	}
 	if relocated == nil || relocated.ID != source.ID || relocated.Status != model.TaskStatusFailed || relocated.AcknowledgedAt == nil {
-		t.Fatalf("waiting writer did not relocate to acknowledged history: %#v", relocated)
-	}
-	var counts struct {
-		Work    int
-		History int
-	}
-	if err := db.NewRaw(`SELECT
-		(SELECT count(*) FROM tasks WHERE id = ?) AS work,
-		(SELECT count(*) FROM task_history WHERE task_id = ?) AS history`, source.ID, source.ID).Scan(ctx, &counts); err != nil || counts.Work != 0 || counts.History != 1 {
-		t.Fatalf("physical round counts = %#v, %v", counts, err)
+		t.Fatalf("waiting writer did not see the acknowledgement: %#v", relocated)
 	}
 	events, err := repos.Tasks.ListEvents(ctx, source.ID, 0, 128)
 	if err != nil {
@@ -146,48 +123,5 @@ func waitForTaskArchiveLock(ctx context.Context, db *bun.DB, comment string) err
 		case <-ctx.Done():
 			return fmt.Errorf("task writer never waited for the hot row lock: %w", ctx.Err())
 		}
-	}
-}
-
-func TestPostgresTaskScopesLoadJSONForFinalPageOnly(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	for i := range 3 {
-		row := enqueueAndClaimTask(t, repos, fmt.Sprintf("history-projection-%d", i), time.Minute)
-		if err := repos.Tasks.Settle(t.Context(), row.ID, row.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i := range 3 {
-		if _, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-			Type: "repository_test", IdempotencyKey: fmt.Sprintf("work-projection-%d", i),
-			InputVersion: 1, InputHash: "projection", Input: []byte(`{"data":"only final page"}`),
-		})); err != nil {
-			t.Fatal(err)
-		}
-	}
-	capture := new(postgresQueryCapture)
-	testutil.AddQueryHook(db, capture)
-	for _, scope := range []repository.TaskScope{repository.TaskScopeWork, repository.TaskScopeHistory} {
-		t.Run(string(scope), func(t *testing.T) {
-			capture.reset()
-			page, err := repos.Tasks.List(t.Context(), repository.TaskListFilter{Scope: scope, Limit: 2})
-			if err != nil || len(page.Tasks) != 2 || page.NextBeforeID == 0 {
-				t.Fatalf("scope page = %#v, %v", page, err)
-			}
-			if len(capture.queries) != 2 || strings.Contains(capture.queries[0], "_json") {
-				t.Fatalf("candidate query loaded JSON: %#v", capture.queries)
-			}
-			loadedIDs := fmt.Sprintf("task.idIN(%d,%d)", page.Tasks[0].ID, page.Tasks[1].ID)
-			query := strings.ReplaceAll(capture.queries[1], " ", "")
-			if !strings.Contains(query, loadedIDs) || !strings.Contains(query, "input_json") {
-				t.Fatalf("JSON query did not target the final page only: %s", capture.queries[1])
-			}
-			for _, row := range page.Tasks {
-				if len(row.Input) == 0 || len(row.Policy) == 0 || len(row.Events) == 0 {
-					t.Fatalf("final page lost task evidence: %#v", row)
-				}
-			}
-		})
 	}
 }

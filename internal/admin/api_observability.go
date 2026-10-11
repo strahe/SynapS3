@@ -2,8 +2,6 @@ package admin
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"net/http"
 	"strconv"
@@ -219,15 +217,10 @@ func (s *Server) handleAPIProviderUploadSpeedTest(w http.ResponseWriter, r *http
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "provider is not available for testing"})
 		return
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
 	input := providerbenchmark.Input{ProviderID: id.String(), ServiceURLHash: providerbenchmark.URLHash(serviceURL)}
 	taskRow, _, err := s.taskService.EnqueueTx(r.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: "provider-upload-speed:" + id.String() + ":" + hex.EncodeToString(nonce[:]),
-		Input: input, SubjectType: "provider", SubjectKey: id.String(),
+		Type:  model.TaskTypeProviderUploadSpeedTest,
+		Input: input,
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.ProviderUploadSpeed.Begin(ctx, id.String(), input.ServiceURLHash, taskRow.ID)
 	})

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -14,8 +13,6 @@ import (
 type ScheduleDefinition struct {
 	Key      string
 	Type     model.TaskType
-	Subject  Subject
-	Input    any
 	Interval time.Duration
 }
 
@@ -99,7 +96,7 @@ func (s *Service) dispatchSchedules(ctx context.Context) error {
 				}
 			}
 			generation := schedule.Generation + 1
-			task, err := s.prepare(EnqueueRequest{Type: def.Type, IdempotencyKey: fmt.Sprintf("%s:%d", def.Key, generation), Input: def.Input, SubjectType: def.Subject.Type, SubjectKey: def.Subject.Key})
+			task, err := s.prepare(EnqueueRequest{Type: def.Type, Input: CycleInput{Cycle: generation}})
 			if err != nil {
 				return err
 			}
@@ -151,7 +148,7 @@ func (e *Engine) settleSchedule(ctx context.Context, tx *repository.Repositories
 	// Earlier failures remain actionable until a subsequent cycle ends.
 	var before int64
 	for {
-		page, err := tx.Tasks.ListCurrentFailedForSubject(ctx, dereference(claimed.SubjectType), dereference(claimed.SubjectKey), before, 100, claimed.Type)
+		page, err := tx.Tasks.ListCurrentFailedForSubject(ctx, claimed.SubjectType, claimed.SubjectKey, before, 100, claimed.Type)
 		if err != nil {
 			return err
 		}

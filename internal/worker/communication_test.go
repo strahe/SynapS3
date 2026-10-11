@@ -241,7 +241,7 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 			t.Fatal(err)
 		}
 		if err := r.Subscribe("10.target", "ready", func(ctx context.Context, tx *repository.Repositories, _ Message) error {
-			_, _, err := target.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: "message_target", IdempotencyKey: "target", Input: testInput{"target"}})
+			_, _, err := target.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: "message_target", Input: testInput{"target"}})
 			return err
 		}); err != nil {
 			t.Fatal(err)
@@ -264,11 +264,11 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 			t.Fatal(err)
 		}
 	})
-	enqueueTestTask(t, harness, "source", "source")
+	enqueueTestTask(t, harness, "source")
 	claimed := claimTestTask(t, harness)
 	harness.engine.settlementRetryDelays = []time.Duration{0}
 	result := Complete("completed", func(ctx context.Context, tx *repository.Repositories) error {
-		if _, _, err := source.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: testTaskType, IdempotencyKey: "source-effect", Input: testInput{"source-effect"}}); err != nil {
+		if _, _, err := source.EnqueueInTransaction(ctx, tx, EnqueueRequest{Type: testTaskType, Input: testInput{"source-effect"}}); err != nil {
 			return err
 		}
 		return messenger.Notify(ctx, tx, testMessage("ready"))
@@ -284,7 +284,7 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 		taskType model.TaskType
 		key      string
 	}{{testTaskType, "source-effect"}, {"message_target", "target"}} {
-		if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), identity.taskType, identity.key); err != nil || row != nil {
+		if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), identity.taskType, "test_subject", identity.key, 0); err != nil || row != nil {
 			t.Fatalf("rolled-back %s task = %#v, error = %v", identity.key, row, err)
 		}
 	}
@@ -303,7 +303,7 @@ func assertMessageSettlementRollback(t *testing.T, db *bun.DB, failure string) {
 	if err != nil || stored.Status != model.TaskStatusCompleted {
 		t.Fatalf("source status after replay = %#v, error = %v", stored, err)
 	}
-	if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), "message_target", "target"); err != nil || row == nil {
+	if row, err := harness.repos.Tasks.GetByIdentity(t.Context(), "message_target", "test_subject", "target", 0); err != nil || row == nil {
 		t.Fatalf("target after replay = %#v, error = %v", row, err)
 	}
 }
@@ -338,7 +338,7 @@ func assertSchedulerWakeBoundaries(t *testing.T, db *bun.DB) {
 	var ids []int64
 	for index := range rows {
 		row := &rows[index]
-		taskRow, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: row.taskType, IdempotencyKey: fmt.Sprintf("wake-%d", index), Input: testInput{"wake"}})
+		taskRow, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{Type: row.taskType, Input: testInput{fmt.Sprintf("wake-%d", index)}})
 		if err != nil {
 			t.Fatal(err)
 		}

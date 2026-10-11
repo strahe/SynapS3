@@ -45,7 +45,7 @@ func TestReplacementRecoversFailedCommitWithinCoordinatorBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			coordinator, _, err := f.runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-				Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
+				Type:  model.TaskTypeProviderReplacementCoordinate,
 				Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
 			}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 				return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)

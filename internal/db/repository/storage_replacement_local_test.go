@@ -34,7 +34,7 @@ func localReplacementSource(t *testing.T, db *bun.DB, name string) (*repository.
 func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int64) *model.Task {
 	t.Helper()
 	key := fmt.Sprintf("local-ensure/%d", dataSetID)
-	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"data_set_id":%d}`, dataSetID)), InputHash: key, SubjectType: new("storage_data_set"), SubjectKey: new(strconv.FormatInt(dataSetID, 10))}))
+	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"data_set_id":%d}`, dataSetID)), InputHash: key, SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(dataSetID, 10)}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,9 +48,9 @@ func localCoordinatorTask(t *testing.T, repos *repository.Repositories, row *sto
 	t.Helper()
 	key := fmt.Sprintf("local-coordinate/%d/%d", row.ID, row.TaskGeneration)
 	coordinator, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1,
+		Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1,
 		Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key,
-		SubjectType: new("storage_replacement"), SubjectKey: new(strconv.FormatInt(row.ID, 10)),
+		SubjectType: "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +393,7 @@ func replacementUploadWakeScope(t *testing.T, db *bun.DB) {
 		}
 		subjectType, subjectKey := string(model.TaskSubjectStorageContent), fmt.Sprint(content.ID)
 		input := json.RawMessage(fmt.Sprintf(`{"content_id":%d}`, content.ID))
-		row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(content.ID), InputVersion: 1, Input: input, InputHash: c.name, SubjectType: &subjectType, SubjectKey: &subjectKey}))
+		row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, InputVersion: 1, Input: input, InputHash: c.name, SubjectType: subjectType, SubjectKey: subjectKey}))
 		if err != nil {
 			t.Fatal(err)
 		}

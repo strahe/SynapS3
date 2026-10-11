@@ -70,7 +70,9 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		}),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 	}
-	definition.Subject = taskengine.SubjectFromInput("bucket", func(input bucketlifecycle.ProvisionInput) int64 { return input.BucketID })
+	definition.Identity = taskengine.IdentityFromInput("bucket", func(input bucketlifecycle.ProvisionInput) (int64, int64) {
+		return input.BucketID, int64(input.Copies)
+	})
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
 		var input bucketlifecycle.ProvisionInput
 		if err := json.Unmarshal(source.Input, &input); err != nil {
@@ -80,7 +82,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		if err != nil {
 			return err
 		}
-		if bucket == nil || source.IdempotencyKey != bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies) {
+		if bucket == nil || input.Copies != bucket.DefaultCopies {
 			return repository.ErrConflict
 		}
 		return nil

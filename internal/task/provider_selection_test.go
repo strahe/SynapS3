@@ -63,8 +63,8 @@ func TestBucketProvisionDistinguishesMissingTierFromReadFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			row, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-				Type:           model.TaskTypeBucketProvision,
-				IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, copies), Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+				Type:  model.TaskTypeBucketProvision,
+				Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -122,8 +122,8 @@ func TestBucketProvisionReplansWhenAnotherBindingTakesTheSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	row, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeBucketProvision,
-		IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, 1), Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+		Type:  model.TaskTypeBucketProvision,
+		Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,8 +176,8 @@ func TestUploadPlanWaitsForRequiredProvider(t *testing.T) {
 				t.Fatal(err)
 			}
 			row, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-				Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(content.ID),
-				Input: storagepipeline.UploadPlanInput{ContentID: content.ID}, SubjectType: "storage_content", SubjectKey: fmt.Sprint(content.ID),
+				Type:  model.TaskTypeUploadPlan,
+				Input: storagepipeline.UploadPlanInput{ContentID: content.ID},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -263,8 +263,8 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			request := taskengine.EnqueueRequest{
-				Type: taskType, IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, 2),
-				Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+				Type:  taskType,
+				Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 			}
 			var content *model.StorageContent
 			if taskType == model.TaskTypeUploadPlan {
@@ -280,8 +280,7 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 				}); err != nil {
 					t.Fatal(err)
 				}
-				request.IdempotencyKey, request.Input = storagepipeline.UploadPlanKey(content.ID), storagepipeline.UploadPlanInput{ContentID: content.ID}
-				request.SubjectType, request.SubjectKey = "storage_content", fmt.Sprint(content.ID)
+				request.Input = storagepipeline.UploadPlanInput{ContentID: content.ID}
 			}
 			row, _, err := runtime.service.Enqueue(ctx, request)
 			if err != nil {

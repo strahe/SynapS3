@@ -21,8 +21,8 @@ type taskListItem struct {
 	Operation              string  `json:"operation"`
 	Status                 string  `json:"status"`
 	Presentation           string  `json:"presentation_status"`
-	SubjectType            *string `json:"subject_type,omitempty"`
-	SubjectKey             *string `json:"subject_key,omitempty"`
+	SubjectType            string  `json:"subject_type"`
+	SubjectKey             string  `json:"subject_key"`
 	RetryCount             int     `json:"retry_count"`
 	MaxAttempts            *int    `json:"max_attempts"`
 	RetryOfTaskID          *int64  `json:"retry_of_task_id"`
@@ -597,7 +597,7 @@ func (s *Server) handleAPITaskEvents(w http.ResponseWriter, r *http.Request) {
 		NextCursor *int64          `json:"next_cursor,omitempty"`
 	}{Events: make([]taskEventView, 0, len(events))}
 	if len(events) > limit {
-		response.NextCursor = &events[limit-1].Sequence
+		response.NextCursor = &events[limit-1].ID
 		events = events[:limit]
 	}
 	for _, event := range events {
@@ -608,7 +608,7 @@ func (s *Server) handleAPITaskEvents(w http.ResponseWriter, r *http.Request) {
 			RetryTaskID   *int64  `json:"retry_task_id"`
 		}
 		_ = json.Unmarshal(event.Details, &safe)
-		response.Events = append(response.Events, taskEventView{Sequence: event.Sequence, Type: event.Type, CreatedAt: event.CreatedAt.Format(time.RFC3339Nano), FailureReason: safe.FailureReason, Attempt: safe.Attempt, NextAttempt: safe.NextAttempt, RetryTaskID: safe.RetryTaskID})
+		response.Events = append(response.Events, taskEventView{Sequence: event.ID, Type: event.Type, CreatedAt: event.CreatedAt.Format(time.RFC3339Nano), FailureReason: safe.FailureReason, Attempt: safe.Attempt, NextAttempt: safe.NextAttempt, RetryTaskID: safe.RetryTaskID})
 	}
 	writeJSON(w, 200, response)
 }

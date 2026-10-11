@@ -73,7 +73,7 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 	}
 	definition, _ := s.registry.Definition(source.Type)
 	preparation := RetryPreparation{
-		Request:    EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: source.Input, SubjectType: dereference(source.SubjectType), SubjectKey: dereference(source.SubjectKey)},
+		Request:    EnqueueRequest{Type: source.Type, Input: source.Input},
 		Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: definition.BindSuccessor,
 	}
 	if definition.PrepareRetry != nil {

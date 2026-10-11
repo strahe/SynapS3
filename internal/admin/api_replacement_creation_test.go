@@ -32,7 +32,7 @@ func pendingReplacementAPISource(t *testing.T, f *replacementAPIFixture) *model.
 		t.Fatal(err)
 	}
 	ensure, _, err := f.srv.taskService.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(f.source.ID),
+		Type:  model.TaskTypeStorageDataSetEnsure,
 		Input: storagepipeline.DataSetInput{DataSetID: f.source.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, f.source.ID, row.ID)
@@ -487,8 +487,8 @@ func TestConcurrentObservedReplacementServiceSchedulesOneCopyGeneration(t *testi
 		t.Fatal(err)
 	}
 	provision, _, err := f.srv.taskService.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeBucketProvision, IdempotencyKey: bucketlifecycle.ProvisionKey(f.bucket.ID, f.bucket.DefaultCopies),
-		Input: bucketlifecycle.ProvisionInput{BucketID: f.bucket.ID}, AvailableAt: time.Now().Add(time.Hour),
+		Type:  model.TaskTypeBucketProvision,
+		Input: bucketlifecycle.ProvisionInput{BucketID: f.bucket.ID, Copies: f.bucket.DefaultCopies}, AvailableAt: time.Now().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -647,7 +647,7 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 						t.Fatalf("stopped coordinator was not replaced: %#v err=%v", predecessor, err)
 					}
 					cleanup, err := f.srv.repos.Tasks.GetByID(t.Context(), *predecessor.TaskID)
-					if err != nil || cleanup.Status != model.TaskStatusPending || cleanup.IdempotencyKey != storagereplacement.CoordinateTaskKey(row.ID, predecessor.TaskGeneration) {
+					if err != nil || cleanup.Status != model.TaskStatusPending || cleanup.SubjectKey != strconv.FormatInt(row.ID, 10) || cleanup.Generation == nil || *cleanup.Generation != predecessor.TaskGeneration {
 						t.Fatalf("abandoned service has no cleanup work: %#v err=%v", cleanup, err)
 					}
 					replay := f.start(t, confirmation)

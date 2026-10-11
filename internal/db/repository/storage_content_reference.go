@@ -15,38 +15,22 @@ import (
 // lockStorageContentsByID serializes object-version references with permanent
 // deletion. Callers must acquire these locks before object or version locks.
 func lockStorageContentsByID(ctx context.Context, db bun.IDB, contentIDs []int64) (map[int64]*model.StorageContent, error) {
-	ids := append([]int64(nil), contentIDs...)
-	slices.Sort(ids)
-
+	ids := slices.DeleteFunc(slices.Compact(slices.Sorted(slices.Values(contentIDs))), func(id int64) bool { return id <= 0 })
 	uploads := make(map[int64]*model.StorageContent, len(ids))
-	var previous int64
+	if len(ids) == 0 {
+		return uploads, nil
+	}
+	var rows []model.StorageContent
+	if err := db.NewSelect().Model(&rows).Where("id IN (?)", bun.List(ids)).OrderExpr("id ASC").For("NO KEY UPDATE").Scan(ctx); err != nil {
+		return nil, fmt.Errorf("locking storage uploads: %w", err)
+	}
+	for i := range rows {
+		uploads[rows[i].ID] = &rows[i]
+	}
 	for _, contentID := range ids {
-		if contentID <= 0 || contentID == previous {
-			continue
-		}
-		previous = contentID
-
-		res, err := db.NewUpdate().
-			Model((*model.StorageContent)(nil)).
-			Set("updated_at = updated_at").
-			Where("id = ?", contentID).
-			Exec(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("locking storage upload %d: %w", contentID, err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
+		if uploads[contentID] == nil {
 			return nil, fmt.Errorf("locking storage upload %d: %w", contentID, ErrNotFound)
 		}
-
-		upload := new(model.StorageContent)
-		if err := db.NewSelect().Model(upload).Where("id = ?", contentID).Scan(ctx); err != nil {
-			if err == sql.ErrNoRows {
-				return nil, fmt.Errorf("loading locked storage upload %d: %w", contentID, ErrNotFound)
-			}
-			return nil, fmt.Errorf("loading locked storage upload %d: %w", contentID, err)
-		}
-		uploads[contentID] = upload
 	}
 	return uploads, nil
 }

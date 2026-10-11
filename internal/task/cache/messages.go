@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"errors"
-	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
@@ -77,9 +76,8 @@ func enqueueEviction(ctx context.Context, tx *repository.Repositories, scheduler
 	}
 	generation := reservation.Generation
 	taskRow, _, err := scheduler.EnqueueInTransaction(ctx, tx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
-		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation, AccessedAt: accessedAt},
-		SubjectType: model.TaskSubjectStorageContent, SubjectKey: strconv.FormatInt(contentID, 10),
+		Type:  model.TaskTypeCacheEvict,
+		Input: cacheeviction.EvictInput{ContentID: contentID, Generation: generation, AccessedAt: accessedAt},
 	})
 	if err != nil {
 		return false, err

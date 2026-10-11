@@ -4,23 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
-)
-
-func EvictTaskKey(contentID, generation int64) string {
-	return EvictTaskKeyPrefix + strconv.FormatInt(contentID, 10) + ":" + strconv.FormatInt(generation, 10)
-}
-
-func DurabilityTaskKey(bucketID, generation int64) string {
-	return DurabilityTaskKeyPrefix + strconv.FormatInt(bucketID, 10) + ":" + strconv.FormatInt(generation, 10)
-}
-
-const (
-	EvictTaskKeyPrefix      = "cache-evict:"
-	DurabilityTaskKeyPrefix = "cache-durability:"
 )
 
 var (

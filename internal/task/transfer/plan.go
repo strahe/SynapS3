@@ -2,8 +2,8 @@ package transfer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"strconv"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -121,16 +121,9 @@ func (h *CopyCoordinator) copyRetryAllowsCache(ctx context.Context, execution ta
 		return false, nil
 	}
 	// A Pull phase keeps the authorization of the recovery plan that created it.
-	previous, err := h.deps.Repositories.Tasks.GetByIdentity(ctx, model.TaskTypeStorageTransferPlan, storagepipeline.TransferPlanKey(input.CopyID, input.Generation-1))
-	if err != nil || previous == nil || previous.RetryOfTaskID == nil {
+	previous, err := h.deps.Repositories.Tasks.GetByIdentity(ctx, model.TaskTypeStorageTransferPlan, model.TaskSubjectStorageCopy, strconv.FormatInt(input.CopyID, 10), input.Generation-1)
+	if err != nil || previous == nil {
 		return false, err
 	}
-	var previousInput storagepipeline.CopyGenerationInput
-	if err := json.Unmarshal(previous.Input, &previousInput); err != nil {
-		return false, err
-	}
-	if previousInput.CopyID != input.CopyID || previousInput.Generation != input.Generation-1 {
-		return false, repository.ErrTaskDataCorrupted
-	}
-	return true, nil
+	return previous.RetryOfTaskID != nil, nil
 }

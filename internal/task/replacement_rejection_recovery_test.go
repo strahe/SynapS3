@@ -98,7 +98,7 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storager
 	if err != nil {
 		t.Fatal(err)
 	}
-	ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(row.TargetDataSetID), Input: storagepipeline.DataSetInput{DataSetID: row.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+	ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: row.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, row.TargetDataSetID, task.ID)
 	})
 	if err != nil {
@@ -120,7 +120,7 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storager
 	if _, err := runtime.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, failure_reason = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), "dataset_provider_rejected", ensure.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration), Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 		return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func TestObservedServiceAfterRefusalSettlementCanContinueOrRetire(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			coordinator, _, err = runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration), Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+			coordinator, _, err = runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 				return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
 			})
 			if err != nil {

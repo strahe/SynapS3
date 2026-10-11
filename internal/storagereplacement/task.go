@@ -8,11 +8,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 )
 
-const (
-	CoordinateTaskKeyPrefix = "provider-replacement:"
-	RetireTaskKeyPrefix     = "storage-dataset-retire:"
-)
-
 type CoordinateInput struct {
 	ReplacementID int64 `json:"replacement_id"`
 	Generation    int64 `json:"generation"`
@@ -22,14 +17,6 @@ type RetireInput struct {
 	ReplacementID int64 `json:"replacement_id"`
 	DataSetID     int64 `json:"data_set_id"`
 	Generation    int64 `json:"generation"`
-}
-
-func CoordinateTaskKey(replacementID, generation int64) string {
-	return fmt.Sprintf("%s%d:%d", CoordinateTaskKeyPrefix, replacementID, generation)
-}
-
-func RetireTaskKey(dataSetID, generation int64) string {
-	return fmt.Sprintf("%s%d:%d", RetireTaskKeyPrefix, dataSetID, generation)
 }
 
 func ParseCoordinateInput(task *model.Task) (CoordinateInput, error) {

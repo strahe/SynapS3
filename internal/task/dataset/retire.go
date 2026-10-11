@@ -68,11 +68,13 @@ func (h *RetireHandler) dataSetRetireHandler() *taskengine.FuncHandler {
 			return storagereplacement.ValidateRetireInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
-		Subject:       taskengine.SubjectFromInput("storage_data_set", func(input storagereplacement.RetireInput) int64 { return input.DataSetID }),
+		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagereplacement.RetireInput) (int64, int64) {
+			return input.DataSetID, input.Generation
+		}),
 		InspectRetry:  inspectRetirementRetry,
 		BindSuccessor: transferRetirementOwner,
 		PrepareRetry: func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
-			return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: json.RawMessage(source.Input)}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: transferRetirementOwner}, nil
+			return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, Input: json.RawMessage(source.Input)}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: transferRetirementOwner}, nil
 		},
 		CanManualRetry: func(task *model.Task) bool {
 			return task == nil || task.FailureReason == nil || *task.FailureReason != "termination_outcome_unknown"

@@ -21,85 +21,38 @@ func (r *BunTaskRepo) ListHistory(ctx context.Context, anchorID, beforeID int64,
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	var rows []struct {
-		ID          *int64
-		AnchorCount int
-		Corrupted   int
-		CursorFound int
-	}
-	// Each recursive step reads adjacent rows through primary or successor keys;
-	// the entire history relation must not be materialized before traversal.
+	// A cursor page also reads the cursor round, which proves the cursor
+	// belongs to this chain.
+	var rows []model.Task
 	err := r.db.NewRaw(`WITH RECURSIVE
-		parameters AS (SELECT CAST(? AS BIGINT) AS anchor_id, CAST(? AS BIGINT) AS before_id),
-		seed AS (
-			SELECT id, retry_of_task_id FROM tasks WHERE id = (SELECT anchor_id FROM parameters)
+		ancestors(id, retry_of_task_id) AS (
+			SELECT id, retry_of_task_id FROM tasks WHERE id = ?0
 			UNION ALL
-			SELECT task_id AS id, retry_of_task_id FROM task_history WHERE task_id = (SELECT anchor_id FROM parameters)
+			SELECT parent.id, parent.retry_of_task_id FROM tasks AS parent JOIN ancestors ON parent.id = ancestors.retry_of_task_id
 		),
-		chain(id, retry_of_task_id, direction, corrupted) AS (
-			SELECT seed.id, seed.retry_of_task_id, directions.direction,
-				CASE WHEN (SELECT COUNT(*) FROM seed) > 1 THEN 1 ELSE 0 END
-			FROM seed CROSS JOIN (SELECT -1 AS direction UNION ALL SELECT 1) AS directions
+		descendants(id) AS (
+			SELECT id FROM tasks WHERE id = ?0
 			UNION ALL
-			SELECT
-				CASE WHEN current.direction < 0 THEN COALESCE(parent_work.id, parent_history.task_id, 0)
-					ELSE COALESCE(child_work.id, child_history.task_id, 0) END,
-				CASE WHEN current.direction < 0 THEN COALESCE(parent_work.retry_of_task_id, parent_history.retry_of_task_id)
-					ELSE COALESCE(child_work.retry_of_task_id, child_history.retry_of_task_id) END,
-				current.direction,
-				CASE WHEN current.direction < 0 THEN
-					CASE WHEN (parent_work.id IS NULL AND parent_history.task_id IS NULL)
-						OR (parent_work.id IS NOT NULL AND parent_history.task_id IS NOT NULL)
-						OR COALESCE(parent_work.id, parent_history.task_id) >= current.id THEN 1 ELSE 0 END
-				ELSE
-					CASE WHEN (child_work.id IS NOT NULL AND child_history.task_id IS NOT NULL)
-						OR COALESCE(child_work.id, child_history.task_id) <= current.id
-						OR EXISTS (SELECT 1 FROM task_history AS duplicate WHERE duplicate.task_id = child_work.id)
-						OR EXISTS (SELECT 1 FROM tasks AS duplicate WHERE duplicate.id = child_history.task_id)
-						THEN 1 ELSE 0 END
-				END
-			FROM chain AS current
-			LEFT JOIN tasks AS parent_work ON current.direction < 0 AND parent_work.id = current.retry_of_task_id
-			LEFT JOIN task_history AS parent_history ON current.direction < 0 AND parent_history.task_id = current.retry_of_task_id
-			LEFT JOIN tasks AS child_work ON current.direction > 0 AND child_work.retry_of_task_id = current.id
-			LEFT JOIN task_history AS child_history ON current.direction > 0 AND child_history.retry_of_task_id = current.id
-			WHERE current.corrupted = 0 AND (
-				(current.direction < 0 AND current.retry_of_task_id IS NOT NULL)
-				OR (current.direction > 0 AND (child_work.id IS NOT NULL OR child_history.task_id IS NOT NULL))
-			)
-		),
-		summary AS (
-			SELECT (SELECT COUNT(*) FROM seed) AS anchor_count, COALESCE(MAX(corrupted), 0) AS corrupted,
-				CASE WHEN (SELECT before_id FROM parameters) = 0
-					OR MAX(CASE WHEN id = (SELECT before_id FROM parameters) THEN 1 ELSE 0 END) = 1
-					THEN 1 ELSE 0 END AS cursor_found FROM chain
-		),
-		page AS (
-			SELECT DISTINCT id FROM chain WHERE corrupted = 0 AND id > 0
-				AND ((SELECT before_id FROM parameters) = 0 OR id < (SELECT before_id FROM parameters))
-			ORDER BY id DESC LIMIT ?
+			SELECT child.id FROM tasks AS child JOIN descendants ON child.retry_of_task_id = descendants.id
 		)
-		SELECT page.id, summary.anchor_count, summary.corrupted, summary.cursor_found
-		FROM summary LEFT JOIN page ON TRUE ORDER BY page.id DESC`, anchorID, beforeID, limit+1).Scan(ctx, &rows)
+		SELECT task.* FROM tasks AS task
+		WHERE task.id IN (SELECT id FROM ancestors UNION SELECT id FROM descendants)
+		  AND (?1 = 0 OR task.id <= ?1)
+		ORDER BY task.id DESC LIMIT ?2`, anchorID, beforeID, limit+2).Scan(ctx, &rows)
 	if err != nil {
 		return TaskPage{}, fmt.Errorf("listing task execution history: %w", err)
 	}
-	if len(rows) == 0 || rows[0].AnchorCount == 0 {
-		return TaskPage{}, ErrNotFound
-	}
-	if rows[0].Corrupted != 0 {
-		return TaskPage{}, ErrTaskDataCorrupted
-	}
-	if rows[0].CursorFound == 0 {
+	if beforeID > 0 && len(rows) > 0 && rows[0].ID == beforeID {
+		rows = rows[1:]
+	} else if beforeID > 0 || len(rows) == 0 {
+		if anchor, err := r.GetByID(ctx, anchorID); err != nil {
+			return TaskPage{}, err
+		} else if anchor == nil {
+			return TaskPage{}, ErrNotFound
+		}
 		return TaskPage{}, ErrInvalidInput
 	}
-	tasks := make([]model.Task, 0, len(rows))
-	for _, row := range rows {
-		if row.ID != nil {
-			tasks = append(tasks, model.Task{ID: *row.ID})
-		}
-	}
-	return r.loadPage(ctx, taskPage(tasks, limit))
+	return taskPage(rows, limit), nil
 }
 
 func (r *BunTaskRepo) updateOperation(ctx context.Context, id, generation int64, fn func(*BunTaskRepo, *model.Task, *model.TaskRuntime) error) error {

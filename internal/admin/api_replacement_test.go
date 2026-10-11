@@ -664,7 +664,7 @@ func TestReplacementResponseShowsBoundRetirementFailureWithoutChangingDomainEvid
 				}
 			}
 			retirement, _, err := f.srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
-				Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: "failed-retirement",
+				Type:  model.TaskTypeStorageDataSetRetire,
 				Input: storagereplacement.RetireInput{ReplacementID: row.ID, DataSetID: dataSetID, Generation: 1},
 			})
 			if err != nil {

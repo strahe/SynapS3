@@ -274,10 +274,8 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 
 func (s *Server) enqueueReplacementCoordinator(ctx context.Context, repos *repository.Repositories, row *storagereplacement.Replacement) error {
 	taskRow, _, err := s.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeProviderReplacementCoordinate,
-		IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
-		Input:          storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
-		SubjectType:    "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
+		Type:  model.TaskTypeProviderReplacementCoordinate,
+		Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
 	})
 	if err != nil {
 		return err

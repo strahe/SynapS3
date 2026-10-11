@@ -118,9 +118,8 @@ func (r *BunCacheEvictionRepo) PrepareEviction(ctx context.Context, contentID in
 			taskRow.InputVersion != 1 || inputErr != nil ||
 			cacheeviction.ValidateEvictInput(&taskInput) != nil ||
 			taskInput.ContentID != contentID || taskInput.Generation != entry.CacheOperationGeneration ||
-			taskRow.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, entry.CacheOperationGeneration) ||
-			taskRow.SubjectType == nil || *taskRow.SubjectType != model.TaskSubjectStorageContent ||
-			taskRow.SubjectKey == nil || *taskRow.SubjectKey != expectedSubjectKey {
+			taskRow.Generation == nil || *taskRow.Generation != entry.CacheOperationGeneration ||
+			taskRow.SubjectType != model.TaskSubjectStorageContent || taskRow.SubjectKey != expectedSubjectKey {
 			return CacheEvictionReservation{}, ErrConflict
 		}
 		return CacheEvictionReservation{
@@ -205,7 +204,7 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int,
 		ColumnExpr("storage_content.bucket_id").
 		ColumnExpr("storage_content.content_size").
 		ColumnExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at) AS cache_accessed_at").
-		Where("object_cache.cache_active_task_id IS NULL OR object_cache.cache_active_task_id IN (SELECT id FROM (SELECT id,status,type FROM tasks UNION ALL SELECT task_id AS id,status,type FROM task_history) AS task_round WHERE status = ? AND type = ?)", model.TaskStatusFailed, model.TaskTypeCacheEvict).
+		Where("object_cache.cache_active_task_id IS NULL OR object_cache.cache_active_task_id IN (SELECT id FROM tasks WHERE status = ? AND type = ?)", model.TaskStatusFailed, model.TaskTypeCacheEvict).
 		OrderExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at), object_cache.content_id")
 	if len(after) == 1 {
 		cursor := after[0]
@@ -222,21 +221,21 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int,
 
 func (r *BunCacheEvictionRepo) ActiveEvictionBytes(ctx context.Context) (int64, error) {
 	var rows []struct {
-		ContentID      int64
-		ContentSize    int64
-		Generation     int64
-		AccessedAt     time.Time
-		IdempotencyKey string
-		Input          []byte
+		ContentID   int64
+		ContentSize int64
+		Generation  int64
+		AccessedAt  time.Time
+		Input       []byte
 	}
 	err := safeCacheEvictionQuery(r.db).
 		ColumnExpr("storage_content.id AS content_id, storage_content.content_size").
 		ColumnExpr("object_cache.cache_operation_generation AS generation").
 		ColumnExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at) AS accessed_at").
-		ColumnExpr("eviction_task.idempotency_key, eviction_task.input_json AS input").
+		ColumnExpr("eviction_task.input_json AS input").
 		Join("JOIN tasks AS eviction_task ON eviction_task.id = object_cache.cache_active_task_id").
 		Where("eviction_task.type = ? AND eviction_task.input_version = 1", model.TaskTypeCacheEvict).
 		Where("eviction_task.subject_type = ? AND eviction_task.subject_key = CAST(storage_content.id AS TEXT)", model.TaskSubjectStorageContent).
+		Where("eviction_task.generation = object_cache.cache_operation_generation").
 		Where("eviction_task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
 		Scan(ctx, &rows)
 	if err != nil {
@@ -246,8 +245,7 @@ func (r *BunCacheEvictionRepo) ActiveEvictionBytes(ctx context.Context) (int64, 
 	for _, row := range rows {
 		var input cacheeviction.EvictInput
 		if json.Unmarshal(row.Input, &input) != nil || cacheeviction.ValidateEvictInput(&input) != nil ||
-			input.ContentID != row.ContentID || input.Generation != row.Generation ||
-			row.IdempotencyKey != cacheeviction.EvictTaskKey(row.ContentID, row.Generation) {
+			input.ContentID != row.ContentID || input.Generation != row.Generation {
 			continue
 		}
 		if input.AccessedAt != nil && !input.AccessedAt.Equal(cacheeviction.NormalizeAccessTime(row.AccessedAt)) {
@@ -507,26 +505,13 @@ func (r *BunCacheEvictionRepo) CompleteBucketDurability(ctx context.Context, buc
 	return nil
 }
 
-// lockCacheEntry takes the row lock the same way the other repositories do: a
-// no-op update, which both dialects serialise without dialect-specific syntax.
 func lockCacheEntry(ctx context.Context, db bun.IDB, contentID int64) (*model.ObjectCache, error) {
-	lockResult, err := db.NewUpdate().
-		Model((*model.ObjectCache)(nil)).
-		Set("updated_at = updated_at").
-		Where("content_id = ?", contentID).
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("locking cache entry: %w", err)
-	}
-	if rows, _ := lockResult.RowsAffected(); rows == 0 {
-		return nil, ErrNotFound
-	}
 	entry := new(model.ObjectCache)
-	if err := db.NewSelect().Model(entry).Where("content_id = ?", contentID).Scan(ctx); err != nil {
+	if err := db.NewSelect().Model(entry).Where("content_id = ?", contentID).For("NO KEY UPDATE").Scan(ctx); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, err
+		return nil, fmt.Errorf("locking cache entry: %w", err)
 	}
 	return entry, nil
 }

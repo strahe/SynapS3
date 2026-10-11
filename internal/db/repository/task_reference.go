@@ -24,7 +24,7 @@ func taskForBinding(ctx context.Context, db bun.IDB, taskID int64, subjectType, 
 	if task == nil || (task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning) || task.SupersededAt != nil || !slices.Contains(types, task.Type) {
 		return nil, ErrConflict
 	}
-	if task.SubjectType == nil || task.SubjectKey == nil || *task.SubjectType != subjectType || *task.SubjectKey != subjectKey {
+	if task.SubjectType != subjectType || task.SubjectKey != subjectKey {
 		return nil, ErrConflict
 	}
 	return task, nil

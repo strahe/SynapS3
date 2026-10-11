@@ -82,8 +82,8 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		MaxConcurrency: 2,
 		Codec:          taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
 		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(), ObservationWindow: cleanupAttentionAfter}, AllowRetry: true,
-		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) int64 {
-			return input.ContentID
+		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) (int64, int64) {
+			return input.ContentID, input.Generation
 		}),
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {

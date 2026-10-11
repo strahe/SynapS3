@@ -126,18 +126,12 @@ func (r *BunS3AccountRepo) Delete(ctx context.Context, accessKey string) error {
 }
 
 func (r *BunS3AccountRepo) LockByAccessKey(ctx context.Context, accessKey string) (*model.S3Account, error) {
-	// A no-op UPDATE locks the row until the surrounding transaction ends.
-	res, err := r.db.NewUpdate().
-		Model((*model.S3Account)(nil)).
-		Set("access_key = access_key").
-		Where("access_key = ?", accessKey).
-		Exec(ctx)
-	if err != nil {
+	account := new(model.S3Account)
+	if err := r.db.NewSelect().Model(account).Where("access_key = ?", accessKey).For("NO KEY UPDATE").Scan(ctx); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("locking S3 account: %w", err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return nil, nil
-	}
-	return r.GetByAccessKey(ctx, accessKey)
+	return account, nil
 }

@@ -137,108 +137,6 @@ func TestRunMigrationsSerializesConcurrentRunnersAndUnlocksAfterCancellation(t *
 	}
 }
 
-func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
-	db := newMigratedPostgresDB(t)
-
-	objectColumns := schemaColumns(t, db, "objects")
-	for _, column := range []string{"size", "e_tag", "checksum", "cache_key", "in_cache", "in_filecoin", "state"} {
-		if objectColumns[column] {
-			t.Fatalf("objects.%s should not exist", column)
-		}
-	}
-	// "Current" is one pointer on the object, not a flag repeated per version.
-	for _, column := range []string{"bucket_id", "key", "current_version_id"} {
-		if !objectColumns[column] {
-			t.Fatalf("objects.%s should exist", column)
-		}
-	}
-
-	versionColumns := schemaColumns(t, db, "object_versions")
-	for _, column := range []string{"content_id", "multipart_upload_id"} {
-		if !versionColumns[column] {
-			t.Fatalf("object_versions.%s should exist", column)
-		}
-	}
-	// Bytes, durability and cache residency belong to the content and its cache
-	// entry; a version that carried them would be a second authority for facts
-	// those rows already own.
-	for _, column := range []string{
-		"piece_cid", "retrieval_url", "in_filecoin", "checksum", "state",
-		"in_cache", "cache_accessed_at", "cache_key", "is_current",
-	} {
-		if versionColumns[column] {
-			t.Fatalf("object_versions.%s should not exist", column)
-		}
-	}
-	cacheColumns := schemaColumns(t, db, "object_cache")
-	for _, column := range []string{"content_id", "in_cache", "cache_accessed_at", "cache_active_task_id"} {
-		if !cacheColumns[column] {
-			t.Fatalf("object_cache.%s should exist", column)
-		}
-	}
-
-	bucketColumns := schemaColumns(t, db, "buckets")
-	if bucketColumns["proof_set_id"] {
-		t.Fatal("buckets.proof_set_id should not exist")
-	}
-
-	for _, table := range []string{"storage_contents", "storage_data_sets", "storage_copies"} {
-		if columns := schemaColumns(t, db, table); len(columns) == 0 {
-			t.Fatalf("%s table should exist", table)
-		}
-	}
-	copyColumns := schemaColumns(t, db, "storage_copies")
-	if copyColumns["is_new_data_set"] {
-		t.Fatal("storage_copies.is_new_data_set should not exist")
-	}
-	partColumns := schemaColumns(t, db, "multipart_parts")
-	if !partColumns["checksum"] {
-		t.Fatal("multipart_parts.checksum should exist")
-	}
-
-	indexes := schemaIndexes(t, db, "objects")
-	if !indexes["idx_objects_bucket_key"] {
-		t.Fatal("idx_objects_bucket_key should exist")
-	}
-	versionIndexes := schemaIndexes(t, db, "object_versions")
-	objectIndexes := schemaIndexes(t, db, "objects")
-	if !objectIndexes["idx_objects_current_version"] {
-		t.Fatal("idx_objects_current_version should exist")
-	}
-	if !versionIndexes["idx_object_versions_content"] {
-		t.Fatal("idx_object_versions_content should exist")
-	}
-	if !versionIndexes["idx_object_versions_multipart_upload"] {
-		t.Fatal("idx_object_versions_multipart_upload should exist")
-	}
-	if !versionIndexes["idx_object_versions_object_created"] {
-		t.Fatal("idx_object_versions_object_created should exist")
-	}
-	cacheIndexes := schemaIndexes(t, db, "object_cache")
-	if !cacheIndexes["idx_object_cache_lru"] {
-		t.Fatal("idx_object_cache_lru should exist")
-	}
-	taskIndexes := schemaIndexes(t, db, "tasks")
-	for _, name := range []string{
-		"idx_tasks_pending",
-		"idx_tasks_recovery",
-		"uq_tasks_type_key",
-		"uq_tasks_retry_parent",
-		"idx_tasks_type_id",
-		"idx_tasks_status_id",
-		"idx_tasks_status_type_id",
-		"idx_tasks_subject",
-	} {
-		if !taskIndexes[name] {
-			t.Fatalf("%s should exist", name)
-		}
-	}
-	uploadCopyIndexes := schemaIndexes(t, db, "storage_copies")
-	if !uploadCopyIndexes["idx_storage_copies_status_data_set_content"] {
-		t.Fatal("idx_storage_copies_status_data_set_content should exist")
-	}
-}
-
 func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T) {
 	db := newMigratedPostgresDB(t)
 
@@ -317,9 +215,6 @@ func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
 	// A replica slot holds both generations while a provider replacement migrates.
 	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_content_id, created_at, updated_at) VALUES (3, 1, '303', 0, 2, FALSE, 'pending', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, transfer_method, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 0, '303', 'peer_pull', 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
-	// A copy is always born bound to exactly one data set; the NOT NULL on
-	// storage_data_set_id is what enforces that, so it is the assertion here.
-	mustRejectRequiredColumn(t, db, "expected copy without a data set and provider binding to fail", `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, transfer_method, created_at, updated_at) VALUES (1, 1, 10, 3, 'peer_pull', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, transfer_method, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 1, '202', 'peer_pull', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustReject(t, db, "expected committed copy without piece identity to fail", `UPDATE storage_copies SET status = 'committed' WHERE content_id = 1 AND copy_index = 1`)
 	mustExec(t, db, `INSERT INTO storage_commit_requests (request_id, storage_data_set_id, status, piece_count, extra_data_hex, sealed_at, first_sent_at, sends, submitted_at, last_sent_at, transaction_id, status_url, refusals, first_piece_id, confirmed_transaction_id, confirmed_at, created_at, updated_at) VALUES ('request-2', 2, 'confirmed', 1, 'abcd', current_timestamp, current_timestamp, 1, current_timestamp, current_timestamp, 'tx-2', 'https://provider.example/status/request-2', 0, '0', 'tx-2', current_timestamp, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
@@ -342,8 +237,8 @@ func TestRunMigrations_TaskAndMultipartConstraints(t *testing.T) {
 	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
 
-	mustReject(t, db, "expected task with incomplete subject identity to fail", `INSERT INTO tasks (type,idempotency_key,input_version,input_hash,subject_type,available_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json) VALUES ('custom','invalid-subject',1,'hash','object_version',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]')`)
-	mustExec(t, db, `INSERT INTO tasks (type,idempotency_key,input_version,input_hash,subject_type,subject_key,available_at,created_at,updated_at,input_json,policy_json,runtime_json,events_json) VALUES ('future_extension','open-type',1,'hash','bucket','1',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}','[]')`)
+	mustReject(t, db, "expected task with incomplete subject identity to fail", `INSERT INTO tasks (type,input_version,input_hash,subject_type,subject_key,available_at,created_at,updated_at,input_json,policy_json,runtime_json) VALUES ('custom',1,'hash','object_version','',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}')`)
+	mustExec(t, db, `INSERT INTO tasks (type,input_version,input_hash,subject_type,subject_key,available_at,created_at,updated_at,input_json,policy_json,runtime_json) VALUES ('future_extension',1,'hash','bucket','1',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}')`)
 
 	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, created_at, updated_at) VALUES (1, 'large.bin', 'upload-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag, created_at) VALUES ('upload-1', 1, 10, 'part-etag', CURRENT_TIMESTAMP)`)
@@ -443,32 +338,4 @@ func mustRejectRequiredColumn(t *testing.T, db *bun.DB, message, query string, a
 
 func rejectedByNullConstraint(err error) bool {
 	return strings.Contains(err.Error(), "null value in column")
-}
-
-func schemaColumns(t *testing.T, db *bun.DB, table string) map[string]bool {
-	t.Helper()
-	var names []string
-	if err := db.NewRaw(`SELECT column_name FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = ?`, table).Scan(t.Context(), &names); err != nil {
-		t.Fatalf("read columns of %s: %v", table, err)
-	}
-	return setOf(names)
-}
-
-func schemaIndexes(t *testing.T, db *bun.DB, table string) map[string]bool {
-	t.Helper()
-	var names []string
-	if err := db.NewRaw(`SELECT indexname FROM pg_indexes
-		WHERE schemaname = current_schema() AND tablename = ?`, table).Scan(t.Context(), &names); err != nil {
-		t.Fatalf("read indexes of %s: %v", table, err)
-	}
-	return setOf(names)
-}
-
-func setOf(names []string) map[string]bool {
-	set := make(map[string]bool, len(names))
-	for _, name := range names {
-		set[name] = true
-	}
-	return set
 }

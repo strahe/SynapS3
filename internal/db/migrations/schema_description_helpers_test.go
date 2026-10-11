@@ -117,20 +117,19 @@ func appliedTableColumns(t *testing.T, db *bun.DB, table string) []appliedColumn
 // complete migration chain.
 func withMigratedDB(t *testing.T, test func(*testing.T, *bun.DB)) {
 	t.Helper()
-	withMigrationDB(t, func(t *testing.T, db *bun.DB) {
-		ctx := t.Context()
-		if err := ValidateTarget(ctx, db); err != nil {
-			t.Fatalf("validate empty target: %v", err)
-		}
-		migrator := NewMigrator(db)
-		if err := migrator.Init(ctx); err != nil {
-			t.Fatalf("initialize migrator: %v", err)
-		}
-		if _, err := migrator.Migrate(ctx); err != nil {
-			t.Fatalf("apply complete migration chain: %v", err)
-		}
-		test(t, db)
-	})
+	db := newPostgresMigrationDB(t)
+	ctx := t.Context()
+	if err := ValidateTarget(ctx, db); err != nil {
+		t.Fatalf("validate empty target: %v", err)
+	}
+	migrator := NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("initialize migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("apply complete migration chain: %v", err)
+	}
+	test(t, db)
 }
 
 // Compare native definitions within one database; no cross-dialect rendering is needed.

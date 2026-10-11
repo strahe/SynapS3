@@ -31,7 +31,7 @@ func repositorySuccessor(t *testing.T, repos *repository.Repositories, source *m
 		if err := tx.Tasks.SupersedeTerminal(t.Context(), source.ID); err != nil {
 			return err
 		}
-		child := repositoryTestTask(&model.Task{Type: source.Type, IdempotencyKey: source.IdempotencyKey, InputVersion: source.InputVersion, InputHash: source.InputHash, Input: source.Input, Checkpoint: source.Checkpoint, Policy: source.Policy, Runtime: json.RawMessage(`{}`), RetryOfTaskID: &source.ID, SubjectType: source.SubjectType, SubjectKey: source.SubjectKey, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
+		child := repositoryTestTask(&model.Task{Type: source.Type, Generation: source.Generation, InputVersion: source.InputVersion, InputHash: source.InputHash, Input: source.Input, Checkpoint: source.Checkpoint, Policy: source.Policy, Runtime: json.RawMessage(`{}`), RetryOfTaskID: &source.ID, SubjectType: source.SubjectType, SubjectKey: source.SubjectKey, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
 		if retainCancellation {
 			child.CancellationRequestedAt = source.CancellationRequestedAt
 			child.CancellationReason = source.CancellationReason

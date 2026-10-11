@@ -80,13 +80,8 @@ func assertTaskOperationAdmissionAndRollback(t *testing.T, db *bun.DB) {
 	}
 }
 
-func TestTaskEventsAreBoundedAndTransactional(t *testing.T) {
-	assertTaskEventsAreBoundedAndTransactional(t, testDB(t))
-}
-
-func assertTaskEventsAreBoundedAndTransactional(t *testing.T, db *bun.DB) {
-	t.Helper()
-	repos := repository.NewRepositories(db)
+func TestTaskEventsArePagedAndTransactional(t *testing.T) {
+	repos := repository.NewRepositories(testDB(t))
 	ctx := t.Context()
 	row := enqueueAndClaimTask(t, repos, "events", time.Minute)
 	for i := range 140 {
@@ -94,12 +89,8 @@ func assertTaskEventsAreBoundedAndTransactional(t *testing.T, db *bun.DB) {
 			t.Fatal(err)
 		}
 	}
-	before, err := repos.Tasks.ListEvents(ctx, row.ID, 0, 128)
-	if err != nil || len(before) != 128 || before[0].Sequence != 141 || before[127].Sequence != 14 {
-		t.Fatalf("events count/order=%v,%v", before, err)
-	}
 	aborted := errors.New("abort")
-	err = repos.WithTx(ctx, func(tx *repository.Repositories) error {
+	err := repos.WithTx(ctx, func(tx *repository.Repositories) error {
 		if err := tx.Tasks.AppendEvent(ctx, row.ID, "rolled_back", nil); err != nil {
 			return err
 		}
@@ -108,13 +99,29 @@ func assertTaskEventsAreBoundedAndTransactional(t *testing.T, db *bun.DB) {
 	if !errors.Is(err, aborted) {
 		t.Fatal(err)
 	}
-	after, err := repos.Tasks.ListEvents(ctx, row.ID, 0, 1)
-	if err != nil || after[0].Sequence != before[0].Sequence {
-		t.Fatalf("rollback appended=%#v,%v", after, err)
+	var all []model.TaskEvent
+	for cursor := int64(0); ; {
+		page, err := repos.Tasks.ListEvents(ctx, row.ID, cursor, 128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, page...)
+		if len(page) < 128 {
+			break
+		}
+		cursor = page[len(page)-1].ID
 	}
-	next, err := repos.Tasks.ListEvents(ctx, row.ID, before[0].Sequence, 2)
-	if err != nil || len(next) != 2 || next[0].Sequence != 140 {
-		t.Fatalf("event paging=%#v,%v", next, err)
+	// The created event plus every observation is kept, newest first.
+	if len(all) != 141 || all[0].Type != "observation" || all[140].Type != "created" {
+		t.Fatalf("events=%d first=%q last=%q", len(all), all[0].Type, all[len(all)-1].Type)
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i].ID >= all[i-1].ID || all[i].TaskID != row.ID {
+			t.Fatalf("event order at %d: %#v", i, all[i])
+		}
+	}
+	if err := repos.Tasks.AppendEvent(ctx, row.ID+1_000_000, "missing", nil); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("missing task event err=%v", err)
 	}
 }
 
@@ -153,7 +160,7 @@ func TestTaskRoundIdentityAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := repositorySuccessor(t, repos, source, false)
-	duplicate, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: child.Type, IdempotencyKey: child.IdempotencyKey, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
+	duplicate, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: child.Type, SubjectType: child.SubjectType, SubjectKey: child.SubjectKey, Generation: child.Generation, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
 	if err != nil || created || duplicate.ID != child.ID {
 		t.Fatalf("current identity=%#v,%v,%v", duplicate, created, err)
 	}

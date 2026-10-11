@@ -35,9 +35,9 @@ func TestPrepareEvictionReusesOnlyMatchingLiveOwner(t *testing.T) {
 			t.Fatalf("marshal task input: %v", err)
 		}
 		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-			Type: taskType, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
+			Type:         taskType,
 			InputVersion: 1, InputHash: fmt.Sprintf("hash-%d-%d", contentID, generation),
-			Input: input, SubjectType: &subjectType, SubjectKey: &subjectKey,
+			Input: input, SubjectType: subjectType, SubjectKey: subjectKey, Generation: &generation,
 		}))
 		if err != nil || !created {
 			t.Fatalf("enqueue task = %#v created=%v err=%v", row, created, err)

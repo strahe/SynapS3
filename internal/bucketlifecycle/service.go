@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -118,11 +117,8 @@ func (s *Service) CreateWithOptions(ctx context.Context, options CreateOptions) 
 			return err
 		}
 		_, _, err := s.tasks.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
-			Type:           model.TaskTypeBucketProvision,
-			IdempotencyKey: ProvisionKey(bucket.ID, bucket.DefaultCopies),
-			Input:          ProvisionInput{BucketID: bucket.ID},
-			SubjectType:    "bucket",
-			SubjectKey:     strconv.FormatInt(bucket.ID, 10),
+			Type:  model.TaskTypeBucketProvision,
+			Input: ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 		})
 		return err
 	}); err != nil {
@@ -157,11 +153,8 @@ func (s *Service) ScheduleProvision(ctx context.Context, repos *repository.Repos
 		return errors.New("bucket lifecycle requires a task service")
 	}
 	_, _, err := s.tasks.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeBucketProvision,
-		IdempotencyKey: ProvisionKey(bucket.ID, bucket.DefaultCopies),
-		Input:          ProvisionInput{BucketID: bucket.ID},
-		SubjectType:    "bucket",
-		SubjectKey:     strconv.FormatInt(bucket.ID, 10),
+		Type:  model.TaskTypeBucketProvision,
+		Input: ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 	})
 	return err
 }

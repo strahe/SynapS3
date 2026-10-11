@@ -494,10 +494,8 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 			return err
 		}
 		taskRow, _, err := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
-			Type:           model.TaskTypeCacheReconcileDurability,
-			IdempotencyKey: cacheeviction.DurabilityTaskKey(updated.ID, generation),
-			Input:          cacheeviction.DurabilityInput{BucketID: updated.ID, Generation: generation},
-			SubjectType:    "bucket", SubjectKey: strconv.FormatInt(updated.ID, 10),
+			Type:  model.TaskTypeCacheReconcileDurability,
+			Input: cacheeviction.DurabilityInput{BucketID: updated.ID, Generation: generation},
 		})
 		if err != nil {
 			return err
@@ -1425,11 +1423,8 @@ func (s *Server) bindStorageCleanupTask(ctx context.Context, repos *repository.R
 		return nil
 	}
 	taskRow, _, err := s.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeStorageCleanup,
-		IdempotencyKey: storagecleanup.TaskKey(cleanup.ContentID, cleanup.Generation),
-		Input:          storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
-		SubjectType:    model.TaskSubjectStorageContent,
-		SubjectKey:     strconv.FormatInt(cleanup.ContentID, 10),
+		Type:  model.TaskTypeStorageCleanup,
+		Input: storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
 	})
 	if err != nil {
 		return err

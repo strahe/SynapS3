@@ -3,7 +3,6 @@ package dataset
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -31,8 +30,8 @@ func NewEnsureDataSetReceiver(deps EnsureReceiverDependencies) (taskengine.Messa
 			return repository.ErrNotFound
 		}
 		taskRow, _, err := deps.Scheduler.EnqueueInTransaction(ctx, tx, taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(row.ID),
-			Input: storagepipeline.DataSetInput{DataSetID: row.ID}, SubjectType: "storage_data_set", SubjectKey: fmt.Sprintf("%d", row.ID),
+			Type:  model.TaskTypeStorageDataSetEnsure,
+			Input: storagepipeline.DataSetInput{DataSetID: row.ID},
 		})
 		if err != nil {
 			return err
@@ -67,9 +66,8 @@ func NewRetireDataSetReceiver(deps RetireReceiverDependencies) (taskengine.Messa
 			return err
 		}
 		taskRow, _, err := deps.Scheduler.EnqueueInTransaction(ctx, tx, taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: storagereplacement.RetireTaskKey(row.ID, generation),
-			Input:       storagereplacement.RetireInput{ReplacementID: msg.ReplacementID, DataSetID: row.ID, Generation: generation},
-			SubjectType: "storage_data_set", SubjectKey: fmt.Sprintf("%d", row.ID),
+			Type:  model.TaskTypeStorageDataSetRetire,
+			Input: storagereplacement.RetireInput{ReplacementID: msg.ReplacementID, DataSetID: row.ID, Generation: generation},
 		})
 		if err != nil {
 			return err

@@ -3,17 +3,6 @@ package storagepipeline
 
 import (
 	"errors"
-	"fmt"
-	"strconv"
-)
-
-const (
-	UploadPlanKeyPrefix    = "upload-plan:"
-	DataSetEnsureKeyPrefix = "storage-dataset-ensure:"
-	TransferPlanKeyPrefix  = "storage-transfer-plan:"
-	StoreKeyPrefix         = "storage-store:"
-	PullKeyPrefix          = "storage-pull:"
-	CommitKeyPrefix        = "storage-commit:"
 )
 
 // UploadPlanReplacementWaitReason isolates uploads blocked by a reserved replacement slot.
@@ -42,30 +31,6 @@ type CopyGenerationInput struct {
 // CommitRequestInput names the commit request a storage_commit task drives.
 type CommitRequestInput struct {
 	RequestID string `json:"request_id"`
-}
-
-func UploadPlanKey(contentID int64) string {
-	return UploadPlanKeyPrefix + strconv.FormatInt(contentID, 10)
-}
-
-func DataSetEnsureKey(dataSetID int64) string {
-	return DataSetEnsureKeyPrefix + strconv.FormatInt(dataSetID, 10)
-}
-
-func TransferPlanKey(copyID, generation int64) string {
-	return copyGenerationKey(TransferPlanKeyPrefix, copyID, generation)
-}
-
-func StoreKey(copyID, generation int64) string {
-	return copyGenerationKey(StoreKeyPrefix, copyID, generation)
-}
-
-func PullKey(copyID, generation int64) string {
-	return copyGenerationKey(PullKeyPrefix, copyID, generation)
-}
-
-func CommitKey(requestID string) string {
-	return CommitKeyPrefix + requestID
 }
 
 func ValidateCommitRequestInput(input CommitRequestInput) error {
@@ -101,8 +66,4 @@ func ValidateCopyGenerationInput(input CopyGenerationInput) error {
 		return errors.New("copy_id and generation must be positive")
 	}
 	return nil
-}
-
-func copyGenerationKey(prefix string, id, generation int64) string {
-	return fmt.Sprintf("%s%d:%d", prefix, id, generation)
 }

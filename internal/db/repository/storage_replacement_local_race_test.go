@@ -53,7 +53,7 @@ func TestPostgresUncreatedReplacementSerializesWithCreatePermission(t *testing.T
 			repos, source, ensure := localReplacementSource(t, db, "create-permission-race")
 			hold := newPostgresRaceHold(first, func(query string) bool {
 				return strings.Contains(query, "storage_data_sets") &&
-					(strings.Contains(query, "for update") || strings.HasPrefix(query, "update"))
+					(strings.Contains(query, "for update") || strings.Contains(query, "for no key update") || strings.HasPrefix(query, "update"))
 			})
 			testutil.AddQueryHook(db, hold)
 			defer hold.Release()
@@ -122,7 +122,7 @@ func TestPostgresReadyBindingSerializesWithRefusalSettlement(t *testing.T) {
 			localRefusal(t, db, repos, target, localEnsureTask(t, repos, target.ID))
 			hold := newPostgresRaceHold(first, func(query string) bool {
 				return strings.Contains(query, "storage_replacements") &&
-					(strings.Contains(query, "for update") || strings.HasPrefix(query, "update"))
+					(strings.Contains(query, "for update") || strings.Contains(query, "for no key update") || strings.HasPrefix(query, "update"))
 			})
 			testutil.AddQueryHook(db, hold)
 			defer hold.Release()

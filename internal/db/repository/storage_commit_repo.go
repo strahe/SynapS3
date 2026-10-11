@@ -15,6 +15,7 @@ import (
 	idtypes "github.com/strahe/synaps3/internal/types"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 // A commit request moves through its lifecycle only under its own task: every
@@ -268,6 +269,8 @@ func (r *BunStorageContentRepo) SealCommitRequest(ctx context.Context, input Sea
 			byID[copyRow.ID] = copyRow
 		}
 		signed := make(map[int64]bool, len(input.Members))
+		pieces := make([]storagecommit.RequestPiece, len(input.Members))
+		copyIDs := make([]int64, len(input.Members))
 		for position, member := range input.Members {
 			copyRow, ok := byID[member.CopyID]
 			if !ok || copyRow.ContentID != member.ContentID || copyRow.Status != model.StorageCopyStatusPieceReady ||
@@ -275,24 +278,24 @@ func (r *BunStorageContentRepo) SealCommitRequest(ctx context.Context, input Sea
 				return ErrConflict
 			}
 			signed[member.CopyID] = true
-			piece := &storagecommit.RequestPiece{
+			pieces[position] = storagecommit.RequestPiece{
 				RequestID: input.RequestID, Position: position, ContentID: member.ContentID,
 				StorageDataSetID: request.StorageDataSetID, PieceCID: member.PieceCID, CreatedAt: now,
 			}
-			if _, err := db.NewInsert().Model(piece).Exec(ctx); err != nil {
-				return fmt.Errorf("recording storage commit request piece: %w", err)
-			}
-			res, err := db.NewUpdate().
-				Model((*model.StorageCopy)(nil)).
-				Set("commit_position = ?", position).
-				Set("status = ?", model.StorageCopyStatusCommitting).
-				Set("updated_at = ?", now).
-				Where("id = ? AND commit_request_id = ?", member.CopyID, input.RequestID).
-				Where("status = ? AND commit_position IS NULL", model.StorageCopyStatusPieceReady).
-				Exec(ctx)
-			if err := requireCommitRows(res, err, "positioning storage commit request member"); err != nil {
-				return err
-			}
+			copyIDs[position] = member.CopyID
+		}
+		if _, err := db.NewInsert().Model(&pieces).Exec(ctx); err != nil {
+			return fmt.Errorf("recording storage commit request pieces: %w", err)
+		}
+		// Each member takes its position in the signed list.
+		res, err := db.NewRaw(`UPDATE storage_copies
+			SET commit_position = member.position - 1, status = ?, updated_at = ?
+			FROM unnest(?::bigint[]) WITH ORDINALITY AS member(id, position)
+			WHERE storage_copies.id = member.id AND storage_copies.commit_request_id = ?
+			  AND storage_copies.status = ? AND storage_copies.commit_position IS NULL`,
+			model.StorageCopyStatusCommitting, now, pgdialect.Array(copyIDs), input.RequestID, model.StorageCopyStatusPieceReady).Exec(ctx)
+		if err := requireCommitRowCount(res, err, len(copyIDs), "positioning storage commit request members"); err != nil {
+			return err
 		}
 		for _, copyRow := range current {
 			if !signed[copyRow.ID] {
@@ -311,7 +314,7 @@ func (r *BunStorageContentRepo) SealCommitRequest(ctx context.Context, input Sea
 			}
 		}
 		extra := input.ExtraDataHex
-		res, err := db.NewUpdate().
+		res, err = db.NewUpdate().
 			Model((*storagecommit.Request)(nil)).
 			Set("status = ?", storagecommit.RequestStatusReady).
 			Set("piece_count = ?", len(input.Members)).
@@ -648,32 +651,35 @@ func (r *BunStorageContentRepo) ConfirmCommitRequest(ctx context.Context, input 
 		if err := requireCommitRows(res, err, "confirming storage commit request"); err != nil {
 			return err
 		}
-		// The request was set to confirmed just above, so the copies can name
-		// it; the composite foreign key refuses any other status.
-		for _, piece := range pieces {
+		positions := make([]int, len(pieces))
+		contentIDs := make([]int64, len(pieces))
+		pieceIDs := make([]string, len(pieces))
+		retrievalURLs := make([]string, len(pieces))
+		pieceCIDs := make([]string, len(pieces))
+		for i, piece := range pieces {
 			pieceID, err := commitPieceID(firstPieceID, piece.Position)
 			if err != nil {
 				return err
 			}
-			res, err := db.NewUpdate().
-				Model((*model.StorageCopy)(nil)).
-				Set("status = ?", model.StorageCopyStatusCommitted).
-				Set("piece_id = ?", &pieceID).
-				Set("retrieval_url = ?", input.RetrievalURLs[piece.Position]).
-				Set("commit_request_status = ?", string(storagecommit.RequestStatusConfirmed)).
-				Set("commit_ready_at = NULL").
-				Set("last_error = NULL").
-				Set("updated_at = ?", now).
-				Where("commit_request_id = ? AND commit_position = ?", input.RequestID, piece.Position).
-				Where("content_id = ?", piece.ContentID).
-				Where("status IN (?)", bun.List([]model.StorageCopyStatus{model.StorageCopyStatusCommitting, model.StorageCopyStatusPending})).
-				Exec(ctx)
-			if err := requireCommitRows(res, err, "committing storage commit request member"); err != nil {
-				return err
-			}
-			if err := updateUploadReadable(ctx, db, piece.ContentID, piece.PieceCID, now); err != nil {
-				return err
-			}
+			positions[i], contentIDs[i], pieceIDs[i] = piece.Position, piece.ContentID, pieceID.String()
+			retrievalURLs[i], pieceCIDs[i] = input.RetrievalURLs[piece.Position], piece.PieceCID
+		}
+		// The request was set to confirmed just above, so the copies can name
+		// it; the composite foreign key refuses any other status.
+		res, err = db.NewRaw(`UPDATE storage_copies
+			SET status = ?, piece_id = piece.piece_id, retrieval_url = piece.retrieval_url, commit_request_status = ?,
+			    commit_ready_at = NULL, last_error = NULL, updated_at = ?
+			FROM unnest(?::integer[], ?::bigint[], ?::text[], ?::text[]) AS piece(position, content_id, piece_id, retrieval_url)
+			WHERE storage_copies.commit_request_id = ? AND storage_copies.commit_position = piece.position
+			  AND storage_copies.content_id = piece.content_id AND storage_copies.status IN (?)`,
+			model.StorageCopyStatusCommitted, string(storagecommit.RequestStatusConfirmed), now,
+			pgdialect.Array(positions), pgdialect.Array(contentIDs), pgdialect.Array(pieceIDs), pgdialect.Array(retrievalURLs),
+			input.RequestID, bun.List([]model.StorageCopyStatus{model.StorageCopyStatusCommitting, model.StorageCopyStatusPending})).Exec(ctx)
+		if err := requireCommitRowCount(res, err, len(pieces), "committing storage commit request members"); err != nil {
+			return err
+		}
+		if err := updateUploadsReadable(ctx, db, contentIDs, pieceCIDs, now); err != nil {
+			return err
 		}
 		return wakeCommitQueue(ctx, db, request.StorageDataSetID, now)
 	})
@@ -794,22 +800,17 @@ func (r *BunStorageContentRepo) ReturnCommitMembersToTransfer(ctx context.Contex
 			(request.Status != storagecommit.RequestStatusReady && request.Status != storagecommit.RequestStatusSubmitted) {
 			return ErrConflict
 		}
-		for _, copyID := range copyIDs {
-			res, err := db.NewUpdate().
-				Model((*model.StorageCopy)(nil)).
-				Set("status = ?", model.StorageCopyStatusPending).
-				Set("retrieval_url = NULL").
-				Set("commit_ready_at = NULL").
-				Set("updated_at = ?", at).
-				Where("id = ? AND commit_request_id = ?", copyID, requestID).
-				Where("commit_position IS NOT NULL AND status = ?", model.StorageCopyStatusCommitting).
-				Where("active_task_id IS NULL").
-				Exec(ctx)
-			if err := requireCommitRows(res, err, "returning storage commit member to transfer"); err != nil {
-				return err
-			}
-		}
-		return nil
+		res, err := db.NewUpdate().
+			Model((*model.StorageCopy)(nil)).
+			Set("status = ?", model.StorageCopyStatusPending).
+			Set("retrieval_url = NULL").
+			Set("commit_ready_at = NULL").
+			Set("updated_at = ?", at).
+			Where("id IN (?) AND commit_request_id = ?", bun.List(copyIDs), requestID).
+			Where("commit_position IS NOT NULL AND status = ?", model.StorageCopyStatusCommitting).
+			Where("active_task_id IS NULL").
+			Exec(ctx)
+		return requireCommitRowCount(res, err, len(copyIDs), "returning storage commit members to transfer")
 	})
 }
 
@@ -1014,7 +1015,7 @@ func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64, excludedW
 	if len(excludedWaitReasons) > 0 {
 		ids = ids.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(excludedWaitReasons))
 	}
-	ids = ids.For("UPDATE SKIP LOCKED")
+	ids = ids.For("NO KEY UPDATE SKIP LOCKED")
 	if _, err := db.NewUpdate().
 		Model((*model.Task)(nil)).
 		Set("available_at = ?", now).
@@ -1108,10 +1109,7 @@ func lockCommitMemberContents(ctx context.Context, db bun.IDB, requestID string)
 
 func lockCommitDataSet(ctx context.Context, db bun.IDB, storageDataSetID int64) (*model.StorageDataSet, error) {
 	dataSet := new(model.StorageDataSet)
-	err := db.NewRaw(`UPDATE storage_data_sets
-		SET updated_at = updated_at
-		WHERE id = ?
-		RETURNING *`, storageDataSetID).Scan(ctx, dataSet)
+	err := db.NewSelect().Model(dataSet).Where("id = ?", storageDataSetID).For("NO KEY UPDATE").Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -1139,13 +1137,11 @@ func lockCommitRequestDataSet(ctx context.Context, db bun.IDB, requestID string)
 // lockCommitRequest locks the request row, requiring status when it is set.
 func lockCommitRequest(ctx context.Context, db bun.IDB, requestID string, status storagecommit.RequestStatus) (*storagecommit.Request, error) {
 	request := new(storagecommit.Request)
-	q := `UPDATE storage_commit_requests SET updated_at = updated_at WHERE request_id = ?`
-	args := []any{requestID}
+	q := db.NewSelect().Model(request).Where("request_id = ?", requestID).For("NO KEY UPDATE")
 	if status != "" {
-		q += ` AND status = ?`
-		args = append(args, status)
+		q = q.Where("status = ?", status)
 	}
-	err := db.NewRaw(q+` RETURNING *`, args...).Scan(ctx, request)
+	err := q.Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrConflict
 	}
@@ -1227,11 +1223,10 @@ func (r *BunStorageContentRepo) CountStoppedCommitAttentionByDataSet(ctx context
 		TableExpr("storage_commit_requests AS commit_request").
 		ColumnExpr("commit_request.storage_data_set_id").
 		ColumnExpr("COUNT(*) AS count").
-		Join("LEFT JOIN tasks AS owner_task ON owner_task.id = commit_request.task_id").
-		Join("LEFT JOIN task_history AS history_owner ON history_owner.task_id = commit_request.task_id").
+		Join("JOIN tasks AS owner_task ON owner_task.id = commit_request.task_id").
 		Where("commit_request.status = ?", storagecommit.RequestStatusSubmitted).
 		Where("commit_request.attention_at IS NOT NULL").
-		Where("COALESCE(owner_task.status, history_owner.status) = ?", model.TaskStatusFailed).
+		Where("owner_task.status = ?", model.TaskStatusFailed).
 		GroupExpr("commit_request.storage_data_set_id").
 		Scan(ctx, &rows)
 	if err != nil {

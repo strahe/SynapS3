@@ -22,6 +22,7 @@ func periodicHarnessWithDB(t *testing.T, db *bun.DB) taskHarness {
 	t.Helper()
 	definition := testDefinition(nil, true)
 	definition.Type = model.TaskTypeObservabilityRefresh
+	definition.Codec, definition.Identity = CycleCodec, CycleIdentity("test-cycle")
 	h := newTaskHarnessWithDB(t, db, scriptedHandler{definition: definition, execute: func(context.Context, Execution) Result {
 		return Fail(errors.New("refresh failed"), "refresh_failed", nil)
 	}, recover: func(context.Context, Execution) Result { return CompleteCycle(time.Hour, "Refreshed", nil) }}, nil)

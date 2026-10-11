@@ -15,7 +15,6 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -24,7 +23,7 @@ import (
 
 func TestCacheCapacityIdleChecksKeepOneRound(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyLRU, maxBytes: 100, highPercent: 90, lowPercent: 60})
-	planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}})
+	planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +56,7 @@ func (*capacityArchiveObserver) BeforeQuery(ctx context.Context, _ *bun.QueryEve
 }
 
 func (h *capacityArchiveObserver) AfterQuery(_ context.Context, event *bun.QueryEvent) {
-	if event.Err != nil && strings.Contains(event.Query, "task_history") && !h.reported.Swap(true) {
+	if event.Err != nil && strings.Contains(event.Err.Error(), "injected") && !h.reported.Swap(true) {
 		close(h.failed)
 	}
 }
@@ -67,7 +66,7 @@ func TestCacheCapacityCompletionPreservesDemandUntilArchiveCommits(t *testing.T)
 		t.Run(string(policy), func(t *testing.T) {
 			checkpoint := json.RawMessage(`{"cycle_active":true,"refused_write_bytes":20}`)
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: policy, maxBytes: 100, highPercent: 90, lowPercent: 60, commitSealOnCachePressure: policy == cache.EvictionPolicyAfterUpload})
-			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}})
+			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +75,7 @@ func TestCacheCapacityCompletionPreservesDemandUntilArchiveCommits(t *testing.T)
 			}
 			observer := &capacityArchiveObserver{failed: make(chan struct{})}
 			testutil.AddQueryHook(runtime.db, observer)
-			restoreRejectCapacityArchive := testutil.FailWrites(t, runtime.db, "task_history", "INSERT", "", "injected capacity archive failure")
+			restoreRejectCapacityArchive := testutil.FailWrites(t, runtime.db, "tasks", "UPDATE", "NEW.status = 'completed'", "injected capacity archive failure")
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			select {
@@ -112,7 +111,7 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runtime := newScheduledCapacityRuntime(t, handlerRuntimeOptions{policy: tc.policy, maxBytes: 100, highPercent: 90, lowPercent: 60})
 			const key = "capacity-policy"
-			source, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: key + ":1", Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			source, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -125,10 +124,10 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "test_capacity_failed").Set("finished_at = ?", time.Now()).Where("id = ?", source.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			healthyKey, nextKey, historyCount := key+":2", key+":3", 2
+			historyCount := 2
 			observer := &capacityArchiveObserver{failed: make(chan struct{})}
 			testutil.AddQueryHook(runtime.db, observer)
-			restoreRejectHealthyCapacityArchive := testutil.FailWrites(t, runtime.db, "task_history", "INSERT", "NEW.status = 'completed'", "injected healthy capacity archive failure")
+			restoreRejectHealthyCapacityArchive := testutil.FailWrites(t, runtime.db, "tasks", "UPDATE", "NEW.status = 'completed'", "injected healthy capacity archive failure")
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			select {
@@ -136,7 +135,7 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			case <-time.After(3 * time.Second):
 				t.Fatal("healthy capacity completion did not reach the archive fault")
 			}
-			unsettled, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, healthyKey)
+			unsettled, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, "system", "cache-capacity", 2)
 			if err != nil || unsettled == nil || unsettled.Status != model.TaskStatusRunning || !strings.Contains(string(unsettled.Checkpoint), `"previous_cycle_failed": true`) {
 				t.Fatalf("uncommitted healthy completion lost failure evidence: %#v, err=%v", unsettled, err)
 			}
@@ -146,7 +145,7 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			}
 			restoreRejectHealthyCapacityArchive()
 			waitForTask(t, runtime.repos, source.ID, func(row *model.Task) bool { return row.SupersededAt != nil })
-			completed, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, healthyKey)
+			completed, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, "system", "cache-capacity", 2)
 			if err != nil || completed == nil || completed.Status != model.TaskStatusCompleted || strings.Contains(string(completed.Checkpoint), "previous_cycle_failed") {
 				t.Fatalf("first healthy cycle = %#v, err=%v", completed, err)
 			}
@@ -156,7 +155,7 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			var next *model.Task
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) {
-				next, err = runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, nextKey)
+				next, err = runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, "system", "cache-capacity", 3)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -197,7 +196,7 @@ func TestCacheCapacityMergesRefusalBeforeCompletingAfterUpload(t *testing.T) {
 					return 0
 				},
 			}})
-			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}})
+			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -239,7 +238,7 @@ func TestCacheCapacityNextCyclePreservesUnparseableDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}})
+	planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +264,7 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, Cache: runtime.cache, CacheGate: runtime.gate, CacheTracker: runtime.tracker, Storage: runtime.storage, EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent, DefaultCopies: 1, Logger: slog.Default()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.RegisterSchedule(taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Subject: taskengine.Subject{Type: "system", Key: "cache-capacity"}, Input: systemtask.Input{}, Interval: 5 * time.Second}); err != nil {
+	if err := registry.RegisterSchedule(taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, registry, slog.Default())
@@ -302,7 +301,7 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 					t.Fatal(err)
 				}
 				accessedAt := base.Add(time.Duration(i) * time.Second)
-				source, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(*version.ContentID, reservation.Generation), Input: cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: reservation.Generation, AccessedAt: &accessedAt}})
+				source, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheEvict, Input: cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: reservation.Generation, AccessedAt: &accessedAt}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -314,7 +313,7 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 				}
 				failures = append(failures, source.ID)
 			}
-			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}})
+			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}

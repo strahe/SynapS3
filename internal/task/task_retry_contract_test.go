@@ -13,7 +13,6 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
-	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
@@ -24,8 +23,7 @@ func TestPeriodicManualRetryPreservesSubjectAndArchivesFailure(t *testing.T) {
 	runtime := newScheduledCapacityRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
 	const scheduleKey = "capacity-policy"
 	source, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: scheduleKey + ":1", Input: systemtask.Input{},
-		SubjectType: "system", SubjectKey: "cache-capacity",
+		Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -44,14 +42,14 @@ func TestPeriodicManualRetryPreservesSubjectAndArchivesFailure(t *testing.T) {
 	}
 	schedule, err := runtime.repos.TaskSchedules.GetByTaskID(t.Context(), successor.ID)
 	if err != nil || schedule == nil || schedule.Generation != 1 || schedule.LatestTaskID == nil || *schedule.LatestTaskID != successor.ID ||
-		successor.SubjectType == nil || *successor.SubjectType != "system" || successor.SubjectKey == nil || *successor.SubjectKey != "cache-capacity" {
+		successor.SubjectType != "system" || successor.SubjectKey != "cache-capacity" {
 		t.Fatalf("periodic recovery = %#v, schedule = %#v, error = %v", successor, schedule, err)
 	}
 	settleHandlerTaskFixture(t, runtime, successor.ID, model.TaskStatusFailed, &reason)
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, successor.ID, func(row *model.Task) bool { return row.SupersededAt != nil })
-	healthy, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, scheduleKey+":2")
+	healthy, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, "system", "cache-capacity", 2)
 	if err != nil || healthy == nil || healthy.Status != model.TaskStatusCompleted {
 		t.Fatalf("healthy cycle did not finish the manual recovery failure: task=%#v, error=%v", healthy, err)
 	}

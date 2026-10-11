@@ -53,7 +53,7 @@ func TestPostgresCopiesTransferredTogetherShareOneRequest(t *testing.T) {
 	first, second := f.transferredCopy(t, "first"), f.transferredCopy(t, "second")
 
 	hold := newPostgresRaceHold("first", func(query string) bool {
-		return strings.Contains(query, "update storage_data_sets") && strings.Contains(query, "updated_at = updated_at")
+		return strings.Contains(query, `from "storage_data_sets"`) && strings.Contains(query, "for no key update")
 	})
 	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
@@ -96,7 +96,7 @@ func TestPostgresCopyArrivingDuringASealStartsTheNextRequest(t *testing.T) {
 	taskID := f.collecting(t, "batch", signed)
 
 	hold := newPostgresRaceHold("seal", func(query string) bool {
-		return strings.Contains(query, "update storage_commit_requests") && strings.Contains(query, "updated_at = updated_at")
+		return strings.Contains(query, `from "storage_commit_requests"`) && strings.Contains(query, "for no key update")
 	})
 	testutil.AddQueryHook(db, hold)
 	defer hold.Release()
@@ -141,7 +141,7 @@ func TestPostgresSealThatQueuesLateCopiesDoesNotDeadlockAJoin(t *testing.T) {
 	taskID := f.collecting(t, "batch", signed, late)
 
 	hold := newPostgresRaceHold("seal", func(query string) bool {
-		return strings.Contains(query, "update storage_commit_requests") && strings.Contains(query, "updated_at = updated_at")
+		return strings.Contains(query, `from "storage_commit_requests"`) && strings.Contains(query, "for no key update")
 	})
 	testutil.AddQueryHook(db, hold)
 	defer hold.Release()

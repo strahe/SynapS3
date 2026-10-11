@@ -61,9 +61,9 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 		t.Fatalf("last delete cleanup = %#v", cleanup)
 	}
 	taskRow, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-		Type: model.TaskTypeStorageCleanup, IdempotencyKey: "cleanup-finalize", InputVersion: 1,
+		Type: model.TaskTypeStorageCleanup, InputVersion: 1,
 		Input: []byte(fmt.Sprintf(`{"content_id":%d,"generation":%d}`, contentID, cleanup.Generation)), InputHash: "cleanup-finalize", Status: model.TaskStatusPending,
-		SubjectType: new(model.TaskSubjectStorageContent), SubjectKey: new(strconv.FormatInt(contentID, 10)),
+		SubjectType: model.TaskSubjectStorageContent, SubjectKey: strconv.FormatInt(contentID, 10),
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {
@@ -431,7 +431,7 @@ func collectCleanupBoundaryCopy(t *testing.T, repos *repository.Repositories, co
 	t.Helper()
 	requestID := "cleanup-boundary-request"
 	taskRow, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeStorageCommit, IdempotencyKey: "cleanup-boundary-commit", InputVersion: 1,
+		Type: model.TaskTypeStorageCommit, SubjectType: "test", SubjectKey: "cleanup-boundary-commit", Generation: new(int64(0)), InputVersion: 1,
 		Input: []byte(`{"request_id":"cleanup-boundary-request"}`), InputHash: "cleanup-boundary-commit",
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))

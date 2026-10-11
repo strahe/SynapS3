@@ -101,10 +101,9 @@ type Definition struct {
 	// OnEngineFailure settles domain state when the engine fails a claim before
 	// the handler can return its own result.
 	OnEngineFailure func(*model.Task, string) Settlement
-	// Subject derives the task's subject from its canonical input. Types whose
-	// tasks repository logic finds by subject declare it; enqueue then fills
-	// the subject and refuses one that names a different row.
-	Subject      SubjectFunc
+	// Identity derives the task's identity from its canonical input, so a
+	// caller can never enqueue a round under another row's identity.
+	Identity     IdentityFunc
 	InspectRetry func(context.Context, *repository.Repositories, *model.Task) error
 	PrepareRetry func(context.Context, *repository.Repositories, *model.Task) (RetryPreparation, error)
 	// BindSuccessor moves domain ownership from a superseded round to its
@@ -134,28 +133,55 @@ const (
 	WorkStartOnEffect
 )
 
-// Subject names the domain row a task works on.
-type Subject struct {
-	Type string
-	Key  string
+// Identity names the domain row a task works on and the round of work on it.
+// Enqueue returns the current round of an identity instead of creating
+// another; a nil Generation opts the task out of deduplication.
+type Identity struct {
+	SubjectType string
+	SubjectKey  string
+	Generation  *int64
 }
 
-// SubjectFunc derives a task's subject from its canonical input.
-type SubjectFunc func(canonical json.RawMessage) (Subject, error)
+// IdentityFunc derives a task's identity from its canonical input.
+type IdentityFunc func(canonical json.RawMessage) (Identity, error)
 
-// SubjectFromInput decodes the canonical input as T and names the row id
-// returns, keyed by its decimal ID.
-func SubjectFromInput[T any](subjectType string, id func(T) int64) SubjectFunc {
-	return func(canonical json.RawMessage) (Subject, error) {
+// IdentityFromInput decodes the canonical input as T; identify returns the
+// subject row ID, keyed by its decimal form, and the generation of work on it.
+func IdentityFromInput[T any](subjectType string, identify func(T) (rowID, generation int64)) IdentityFunc {
+	return func(canonical json.RawMessage) (Identity, error) {
 		var value T
 		if err := json.Unmarshal(canonical, &value); err != nil {
-			return Subject{}, fmt.Errorf("decoding task subject: %w", err)
+			return Identity{}, fmt.Errorf("decoding task identity: %w", err)
 		}
-		rowID := id(value)
-		if rowID <= 0 {
-			return Subject{}, errors.New("task subject ID must be positive")
+		rowID, generation := identify(value)
+		if rowID <= 0 || generation < 0 {
+			return Identity{}, errors.New("task identity needs a positive row ID and a non-negative generation")
 		}
-		return Subject{Type: subjectType, Key: strconv.FormatInt(rowID, 10)}, nil
+		return Identity{SubjectType: subjectType, SubjectKey: strconv.FormatInt(rowID, 10), Generation: &generation}, nil
+	}
+}
+
+// CycleInput is the input of a scheduled system task; Cycle numbers its round.
+type CycleInput struct {
+	Cycle int64 `json:"cycle"`
+}
+
+// CycleCodec validates scheduled system task input.
+var CycleCodec = StrictJSONCodec(func(input *CycleInput) error {
+	if input.Cycle < 1 {
+		return errors.New("cycle must be positive")
+	}
+	return nil
+})
+
+// CycleIdentity identifies the cycles of one scheduled system task.
+func CycleIdentity(subjectKey string) IdentityFunc {
+	return func(canonical json.RawMessage) (Identity, error) {
+		var input CycleInput
+		if err := json.Unmarshal(canonical, &input); err != nil {
+			return Identity{}, fmt.Errorf("decoding task identity: %w", err)
+		}
+		return Identity{SubjectType: "system", SubjectKey: subjectKey, Generation: &input.Cycle}, nil
 	}
 }
 
@@ -164,7 +190,7 @@ func (d Definition) manualRetryAllowed(task *model.Task) bool {
 }
 
 func (d Definition) validate() error {
-	if d.Type == "" || d.InputVersion < 1 || d.Codec == nil || d.MaxConcurrency < 0 {
+	if d.Type == "" || d.InputVersion < 1 || d.Codec == nil || d.Identity == nil || d.MaxConcurrency < 0 {
 		return fmt.Errorf("incomplete definition for %q", d.Type)
 	}
 	if err := d.Policy.validate(); err != nil {

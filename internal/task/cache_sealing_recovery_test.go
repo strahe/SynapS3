@@ -15,7 +15,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
-	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -62,7 +61,7 @@ func TestSealIntentAndCachePressureSurviveRuntimeRestart(t *testing.T) {
 				if _, err := fs.Put(ctx, bucket.Name, "next", bytes.NewReader(make([]byte, 256)), 256); !errors.Is(err, cache.ErrCacheFull) {
 					t.Fatal(err)
 				}
-				planner, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+				planner, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -190,7 +189,7 @@ func TestPressureSealsLaterReplicasUntilMinimumDurability(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.collect(t)
-	if _, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"}); err != nil {
+	if _, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	cancel, done := runHandlerEngine(t, f.runtime)

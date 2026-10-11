@@ -2,7 +2,6 @@ package repository_test
 
 import (
 	"encoding/json"
-	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -20,16 +19,16 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 	now := time.Now().UTC()
 	st, sk := "periodic", "cache"
 	template := repositoryTestTask(&model.Task{
-		ID: 700001, Type: model.TaskTypeUploadPlan, IdempotencyKey: "history-template",
-		InputVersion: 1, InputHash: "history", Input: json.RawMessage(`{}`), Events: json.RawMessage(`[]`),
+		ID: 700001, Type: model.TaskTypeUploadPlan,
+		InputVersion: 1, InputHash: "history", Input: json.RawMessage(`{}`),
 		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute,
-		SubjectType: &st, SubjectKey: &sk, AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
+		SubjectType: st, SubjectKey: sk, AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
-	if _, err := db.NewInsert().Model(model.TaskHistoryFromTask(template)).Exec(ctx); err != nil {
+	if _, err := db.NewInsert().Model(template).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var columns []string
-	if err := db.NewRaw(`SELECT attname FROM pg_attribute WHERE attrelid = 'task_history'::regclass
+	if err := db.NewRaw(`SELECT attname FROM pg_attribute WHERE attrelid = 'tasks'::regclass
 		AND attnum > 0 AND NOT attisdropped ORDER BY attnum`).Scan(ctx, &columns); err != nil {
 		t.Fatal(err)
 	}
@@ -37,46 +36,44 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 	for i, column := range columns {
 		expressions[i] = "base." + column
 		switch column {
-		case "task_id":
+		case "id":
 			expressions[i] = "n"
-		case "idempotency_key":
-			expressions[i] = "'history-' || n::text"
 		case "status":
 			expressions[i] = "CASE WHEN n <= 100006 THEN 'failed' WHEN n <= 100009 THEN 'cancelled' ELSE 'completed' END"
 		case "acknowledged_at":
 			expressions[i] = "CASE WHEN n > 100000 AND n <= 100006 THEN base.finished_at ELSE NULL END"
 		case "superseded_at":
 			expressions[i] = "CASE WHEN n <= 100000 THEN base.finished_at + n * interval '1 microsecond' ELSE NULL END"
-		case "subject_type", "subject_key":
-			expressions[i] = "CASE WHEN n % 2 = 0 THEN base." + column + " ELSE NULL END"
+		case "subject_key":
+			expressions[i] = "CASE WHEN n % 2 = 0 THEN base.subject_key ELSE 'other' END"
 		}
 	}
 	// Most failed rows have distinct supersession times; only six remain
 	// current. This defeats the planner's independence assumption for status
 	// and superseded_at unless the ordered subject index is usable.
-	query := "INSERT INTO task_history (" + strings.Join(columns, ",") + ") SELECT " + strings.Join(expressions, ",") +
-		" FROM task_history base CROSS JOIN generate_series(1,600000) series(n) WHERE base.task_id = 700001"
+	query := "INSERT INTO tasks (" + strings.Join(columns, ",") + ") SELECT " + strings.Join(expressions, ",") +
+		" FROM tasks base CROSS JOIN generate_series(1,600000) series(n) WHERE base.id = 700001"
 	if _, err := db.ExecContext(ctx, query); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `DELETE FROM task_history WHERE task_id = 700001`); err != nil {
+	if _, err := db.ExecContext(ctx, `DELETE FROM tasks WHERE id = 700001`); err != nil {
 		t.Fatal(err)
 	}
 	for i, id := range []int64{600001, 600002} {
 		row := repositoryTestTask(&model.Task{
-			ID: id, Type: model.TaskTypeUploadPlan, IdempotencyKey: fmt.Sprintf("work-%d", id),
-			InputVersion: 1, InputHash: "work", Input: json.RawMessage(`{}`), Events: json.RawMessage(`[]`),
+			ID: id, Type: model.TaskTypeUploadPlan, SubjectType: st, SubjectKey: "other",
+			InputVersion: 1, InputHash: "work", Input: json.RawMessage(`{}`),
 			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})
 		if i == 0 {
-			row.SubjectType, row.SubjectKey = &st, &sk
+			row.SubjectKey = sk
 		}
 		if _, err := db.NewInsert().Model(row).Exec(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, "ANALYZE tasks, task_history"); err != nil {
+	if _, err := db.ExecContext(ctx, "ANALYZE tasks"); err != nil {
 		t.Fatal(err)
 	}
 	capture := new(taskHistoryQueries)
@@ -89,9 +86,9 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 		want                          []int64
 	}{
 		{"subject", st, sk, 0, nil, []int64{600001, 100006}},
-		{"null_subject", "", "", 0, nil, []int64{600002, 100005}},
+		{"other_subject", st, "other", 0, nil, []int64{600002, 100005}},
 		{"subject_cursor_type", st, sk, 100006, []model.TaskType{model.TaskTypeUploadPlan}, []int64{100004, 100002}},
-		{"null_cursor_type", "", "", 100005, []model.TaskType{model.TaskTypeUploadPlan}, []int64{100003, 100001}},
+		{"other_cursor_type", st, "other", 100005, []model.TaskType{model.TaskTypeUploadPlan}, []int64{100003, 100001}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			capture.queries = nil
@@ -110,7 +107,7 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 			if !slices.Equal(ids, scenario.want) || page.NextBeforeID != wantCursor {
 				t.Fatalf("page IDs=%v, cursor=%v; want %v, %v", ids, page.NextBeforeID, scenario.want, wantCursor)
 			}
-			assertPostgresPlanUsesIndex(t, db, "idx_task_history_current_failed_subject", capture.queries[0])
+			assertPostgresPlanUsesIndex(t, db, "idx_tasks_current_failed", capture.queries[0])
 		})
 	}
 	capture.queries = nil
@@ -129,5 +126,5 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 	if err != nil || len(page.Tasks) != 2 || page.Tasks[0].ID != 100009 || page.Tasks[1].ID != 100008 || page.NextBeforeID != 100008 {
 		t.Fatalf("cancelled page=%+v, err=%v", page, err)
 	}
-	assertPostgresPlanUsesIndex(t, db, "idx_task_history_status_id", capture.queries[0])
+	assertPostgresPlanUsesIndex(t, db, "idx_tasks_status_id", capture.queries[0])
 }

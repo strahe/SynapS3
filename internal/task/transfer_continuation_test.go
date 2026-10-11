@@ -103,7 +103,7 @@ func TestCommittedSourceWakesPeerPullPlanWaitingForSource(t *testing.T) {
 	}
 	future := time.Now().Add(time.Hour)
 	peer, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(copies[2].ID, generation),
+		Type:  model.TaskTypeStorageTransferPlan,
 		Input: storagepipeline.CopyGenerationInput{CopyID: copies[2].ID, Generation: generation}, AvailableAt: future,
 	})
 	if err != nil || !created {
@@ -156,8 +156,8 @@ func TestCommittedSourceWakesPeerPullPlanWaitingForSource(t *testing.T) {
 	if err := json.Unmarshal(recovery.Input, &input); err != nil || input.CopyID != reopened.ID || input.Generation != reopened.WorkGeneration {
 		t.Fatalf("recovery input = %#v, %v", input, err)
 	}
-	if recovery.IdempotencyKey != storagepipeline.TransferPlanKey(reopened.ID, reopened.WorkGeneration) {
-		t.Fatalf("recovery key = %s", recovery.IdempotencyKey)
+	if recovery.Generation == nil || *recovery.Generation != reopened.WorkGeneration {
+		t.Fatalf("recovery generation = %v", recovery.Generation)
 	}
 	woken, err := repos.Tasks.GetByID(t.Context(), peer.ID)
 	if err != nil || woken == nil || woken.Status != model.TaskStatusPending || !woken.AvailableAt.Before(future) {

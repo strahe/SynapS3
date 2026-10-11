@@ -22,7 +22,7 @@ func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db *bu
 	seed := func(key, taskType string, availableAt time.Time, expired bool) *model.Task {
 		t.Helper()
 		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-			Type: model.TaskType(taskType), IdempotencyKey: key, InputVersion: 1,
+			Type: model.TaskType(taskType), SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, AvailableAt: availableAt,
 		}))
 		if err != nil || !created {
@@ -89,7 +89,7 @@ func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db *bu
 func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key string, lease time.Duration) *model.Task {
 	t.Helper()
 	if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: "repository_test", IdempotencyKey: key, InputVersion: 1,
+		Type: "repository_test", SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	})); err != nil || !created {
@@ -111,7 +111,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	ctx := t.Context()
 	repos := repository.NewRepositories(db)
 	row, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: "claim-timing", InputVersion: 1,
+		Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "claim-timing", Generation: new(int64(0)), InputVersion: 1,
 		Input: []byte(`{}`), InputHash: "test", AvailableAt: time.Now(),
 		WaitReason: new("dependency"), StatusMessage: new("Old wait"), LastError: new("Old error"),
 	}))
@@ -220,7 +220,7 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 	seedFailed := func(key string, taskType model.TaskType, failedAt time.Time) int64 {
 		t.Helper()
 		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
-			Type: taskType, IdempotencyKey: key, InputVersion: 1,
+			Type: taskType, SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
 			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		}))

@@ -20,7 +20,6 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
-	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
@@ -338,9 +337,8 @@ func (f registrationFixture) collectAt(t *testing.T, requestID string, now time.
 	var taskID int64
 	if err := f.runtime.repos.WithTx(t.Context(), func(tx *repository.Repositories) error {
 		taskRow, _, err := f.runtime.service.EnqueueInTransaction(t.Context(), tx, taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageCommit, IdempotencyKey: storagepipeline.CommitKey(requestID),
-			Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
-			SubjectType: model.TaskSubjectStorageCommitRequest, SubjectKey: requestID,
+			Type:  model.TaskTypeStorageCommit,
+			Input: storagepipeline.CommitRequestInput{RequestID: requestID},
 		})
 		if err != nil {
 			return fmt.Errorf("enqueue commit task: %w", err)
@@ -483,7 +481,7 @@ func TestCachePressureSealsAndRecoversWriteCapacity(t *testing.T) {
 			if _, err := fs.Put(t.Context(), bucket.Name, "next", bytes.NewReader(make([]byte, 256)), 256); !errors.Is(err, cache.ErrCacheFull) {
 				t.Fatalf("admission = %v", err)
 			}
-			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -542,7 +540,7 @@ func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T
 				t.Fatal(err)
 			}
 			requestID, taskID := f.collect(t)
-			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey, Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity"})
+			planner, _, err := f.runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -738,8 +736,8 @@ func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
 			}
 			requestID, taskID := f.collectAt(t, "pressure-collecting", time.Now(), f.copies[5])
 			if _, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-				Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-				Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+				Type:  model.TaskTypeCacheCapacityReconcile,
+				Input: taskengine.CycleInput{Cycle: 1},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -817,9 +815,8 @@ func (f registrationFixture) queueTransferredCopy(t *testing.T, copyRow *model.S
 			return err
 		}
 		task, _, err := f.runtime.service.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
-			Type: model.TaskTypeStorageTransferPlan, IdempotencyKey: storagepipeline.TransferPlanKey(copyRow.ID, generation),
-			Input:       storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation},
-			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID),
+			Type:  model.TaskTypeStorageTransferPlan,
+			Input: storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation},
 		})
 		if err != nil {
 			return err

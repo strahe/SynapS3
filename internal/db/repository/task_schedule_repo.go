@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -64,8 +63,7 @@ func (r *BunTaskScheduleRepo) SetHead(ctx context.Context, key string, expectedG
 			if task == nil || !task.Type.IsRecurringSystem() || task.SupersededAt != nil {
 				return ErrConflict
 			}
-			identity := fmt.Sprintf("%s:%d", key, generation)
-			if task.IdempotencyKey != identity {
+			if task.Generation == nil || *task.Generation != generation {
 				return ErrConflict
 			}
 			if task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning {

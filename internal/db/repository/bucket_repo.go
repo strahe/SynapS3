@@ -287,24 +287,11 @@ func (r *BunBucketRepo) SetDefaultCopies(ctx context.Context, name string, copie
 }
 
 func lockBucketByName(ctx context.Context, db bun.IDB, name string) (*model.Bucket, error) {
-	lockResult, err := db.NewUpdate().
-		Model((*model.Bucket)(nil)).
-		Set("updated_at = updated_at").
-		Where("name = ?", name).
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("locking bucket copy policy: %w", err)
-	}
-	rows, _ := lockResult.RowsAffected()
-	if rows == 0 {
-		return nil, nil
-	}
-
 	bucket := new(model.Bucket)
-	if err := db.NewSelect().
-		Model(bucket).
-		Where("name = ?", name).
-		Scan(ctx); err != nil {
+	if err := db.NewSelect().Model(bucket).Where("name = ?", name).For("NO KEY UPDATE").Scan(ctx); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("locking bucket copy policy: %w", err)
 	}
 	return bucket, nil
@@ -322,21 +309,12 @@ func (r *BunBucketRepo) LockByID(ctx context.Context, id int64) error {
 }
 
 func lockBucketByID(ctx context.Context, db bun.IDB, id int64) (*model.Bucket, error) {
-	lockResult, err := db.NewUpdate().
-		Model((*model.Bucket)(nil)).
-		Set("updated_at = updated_at").
-		Where("id = ?", id).
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("locking bucket %d: %w", id, err)
-	}
-	rows, _ := lockResult.RowsAffected()
-	if rows == 0 {
-		return nil, nil
-	}
 	bucket := new(model.Bucket)
-	if err := db.NewSelect().Model(bucket).Where("id = ?", id).Scan(ctx); err != nil {
-		return nil, fmt.Errorf("loading locked bucket %d: %w", id, err)
+	if err := db.NewSelect().Model(bucket).Where("id = ?", id).For("NO KEY UPDATE").Scan(ctx); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("locking bucket %d: %w", id, err)
 	}
 	return bucket, nil
 }

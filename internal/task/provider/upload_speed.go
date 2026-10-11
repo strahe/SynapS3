@@ -52,12 +52,14 @@ func (h *UploadSpeedTestHandler) newHandler() *taskengine.FuncHandler {
 			}
 		},
 	}
-	definition.Subject = func(raw json.RawMessage) (taskengine.Subject, error) {
+	// Measurements are not deduplicated; the provider's speed test row admits
+	// one at a time.
+	definition.Identity = func(raw json.RawMessage) (taskengine.Identity, error) {
 		var input providerbenchmark.Input
 		if err := json.Unmarshal(raw, &input); err != nil {
-			return taskengine.Subject{}, err
+			return taskengine.Identity{}, err
 		}
-		return taskengine.Subject{Type: "provider", Key: input.ProviderID}, nil
+		return taskengine.Identity{SubjectType: "provider", SubjectKey: input.ProviderID}, nil
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
 		var input providerbenchmark.Input
@@ -97,7 +99,7 @@ func (h *UploadSpeedTestHandler) newHandler() *taskengine.FuncHandler {
 			return taskengine.RetryPreparation{}, repository.ErrConflict
 		}
 		input.ServiceURLHash = providerbenchmark.URLHash(url)
-		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, IdempotencyKey: source.IdempotencyKey, Input: input}, ResumeMode: model.TaskResumeModeExecute, Bind: func(ctx context.Context, repos *repository.Repositories, _, next *model.Task) error {
+		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, Input: input}, ResumeMode: model.TaskResumeModeExecute, Bind: func(ctx context.Context, repos *repository.Repositories, _, next *model.Task) error {
 			return repos.ProviderUploadSpeed.Begin(ctx, input.ProviderID, input.ServiceURLHash, next.ID)
 		}}, nil
 	}

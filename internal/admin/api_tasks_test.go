@@ -35,6 +35,39 @@ func (adminTaskHandler) Recover(context.Context, taskengine.Execution) taskengin
 	return taskengine.Complete("", nil)
 }
 
+func adminTestIdentity(taskType model.TaskType, canonical json.RawMessage) (taskengine.Identity, error) {
+	var input struct {
+		Key         string `json:"key"`
+		SubjectType string `json:"subject_type"`
+		SubjectKey  string `json:"subject_key"`
+		OperationID int64  `json:"operation_id"`
+		ProviderID  string `json:"provider_id"`
+	}
+	if err := json.Unmarshal(canonical, &input); err != nil {
+		return taskengine.Identity{}, err
+	}
+	if input.SubjectType != "" || input.SubjectKey != "" {
+		if input.SubjectType == "" || input.SubjectKey == "" {
+			return taskengine.Identity{}, repository.ErrInvalidInput
+		}
+		return taskengine.Identity{SubjectType: input.SubjectType, SubjectKey: input.SubjectKey}, nil
+	}
+	if input.Key != "" {
+		return taskengine.Identity{SubjectType: "test", SubjectKey: string(canonical), Generation: new(int64(0))}, nil
+	}
+	switch taskType {
+	case model.TaskTypeWalletOperation:
+		if input.OperationID > 0 {
+			return taskengine.Identity{SubjectType: "wallet_operation", SubjectKey: strconv.FormatInt(input.OperationID, 10), Generation: new(int64(0))}, nil
+		}
+	case model.TaskTypeProviderUploadSpeedTest:
+		if input.ProviderID != "" {
+			return taskengine.Identity{SubjectType: "provider", SubjectKey: input.ProviderID}, nil
+		}
+	}
+	return taskengine.Identity{}, repository.ErrInvalidInput
+}
+
 func newAdminTestTaskService(t *testing.T, repos *repository.Repositories, overrides ...func(*taskengine.Definition)) *taskengine.Service {
 	t.Helper()
 
@@ -62,8 +95,11 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories, overr
 			WorkStart:    taskengine.WorkStartOnEffect,
 			InputVersion: 1,
 			Codec:        taskengine.StrictJSONCodec[map[string]any](nil),
-			Policy:       taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()},
-			AllowRetry:   taskType != model.TaskTypeProviderReplacementCoordinate,
+			Identity: func(canonical json.RawMessage) (taskengine.Identity, error) {
+				return adminTestIdentity(taskType, canonical)
+			},
+			Policy:     taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()},
+			AllowRetry: taskType != model.TaskTypeProviderReplacementCoordinate,
 		}
 		if taskType == model.TaskTypeWalletOperation {
 			definition.CanManualRetry = func(task *model.Task) bool {
@@ -144,9 +180,9 @@ func TestAPITasksPreservesDurationPrecision(t *testing.T) {
 	})
 	started := time.Date(2026, 10, 3, 0, 0, 0, 900_000_000, time.UTC)
 	finished := started.Add(200 * time.Millisecond)
-	if _, err := fixture.db.NewUpdate().Table("task_history").
+	if _, err := fixture.db.NewUpdate().Table("tasks").
 		Set("started_at = ?", started.Add(-30*time.Minute)).Set("work_started_at = ?", started).Set("finished_at = ?", finished).
-		Where("task_id = ?", row.ID).Exec(t.Context()); err != nil {
+		Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks?scope=history&type=storage_store", nil)
@@ -783,9 +819,12 @@ func newAdminTaskFixture(t *testing.T) *adminTaskFixture {
 
 func (f *adminTaskFixture) enqueue(t *testing.T, taskType model.TaskType, key string, availableAt time.Time, subjectType, subjectKey string) *model.Task {
 	t.Helper()
+	if subjectType == "" {
+		subjectType, subjectKey = "test", key
+	}
 	row, _, err := f.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: taskType, IdempotencyKey: key, Input: map[string]any{"key": key},
-		AvailableAt: availableAt, SubjectType: subjectType, SubjectKey: subjectKey,
+		Type: taskType, Input: map[string]any{"key": key, "subject_type": subjectType, "subject_key": subjectKey},
+		AvailableAt: availableAt,
 	})
 	if err != nil {
 		t.Fatalf("Enqueue(%s): %v", key, err)
@@ -944,7 +983,7 @@ func TestAPITaskScopesKeepAllTerminalRoundsAndSeparateWork(t *testing.T) {
 	if len(page.Tasks) != 1 || page.Tasks[0].ID != completed.ID || page.NextCursor != nil || page.Tasks[0].MaxAttempts == nil || *page.Tasks[0].MaxAttempts != 6 {
 		t.Fatalf("periodic history = %d %s", rr.Code, rr.Body.String())
 	}
-	if strings.Contains(rr.Body.String(), "retry_limit") || strings.Contains(rr.Body.String(), "events_json") || strings.Contains(rr.Body.String(), "checkpoint") {
+	if strings.Contains(rr.Body.String(), "retry_limit") || strings.Contains(rr.Body.String(), "checkpoint") {
 		t.Fatalf("list exposes internal payload: %s", rr.Body.String())
 	}
 }

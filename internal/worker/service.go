@@ -19,12 +19,9 @@ type Service struct {
 }
 
 type EnqueueRequest struct {
-	Type           model.TaskType
-	IdempotencyKey string
-	Input          any
-	SubjectType    string
-	SubjectKey     string
-	AvailableAt    time.Time
+	Type        model.TaskType
+	Input       any
+	AvailableAt time.Time
 }
 
 func NewService(registry *Registry, repos *repository.Repositories) (*Service, error) {
@@ -130,9 +127,6 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownType, request.Type)
 	}
-	if request.IdempotencyKey == "" || (request.SubjectType == "") != (request.SubjectKey == "") {
-		return nil, fmt.Errorf("task identity is incomplete: %w", repository.ErrInvalidInput)
-	}
 	raw, err := json.Marshal(request.Input)
 	if err != nil {
 		return nil, fmt.Errorf("encoding task input: %w", err)
@@ -141,16 +135,9 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("validating %s input: %w", request.Type, err)
 	}
-	subjectType, subjectKey := request.SubjectType, request.SubjectKey
-	if definition.Subject != nil {
-		subject, err := definition.Subject(canonical)
-		if err != nil {
-			return nil, fmt.Errorf("deriving %s subject: %w", request.Type, err)
-		}
-		if subjectType != "" && (subjectType != subject.Type || subjectKey != subject.Key) {
-			return nil, fmt.Errorf("%s subject %s/%s does not name its input: %w", request.Type, subjectType, subjectKey, repository.ErrInvalidInput)
-		}
-		subjectType, subjectKey = subject.Type, subject.Key
+	identity, err := definition.Identity(canonical)
+	if err != nil {
+		return nil, fmt.Errorf("deriving %s identity: %w", request.Type, err)
 	}
 	sum := sha256.Sum256(canonical)
 	availableAt := request.AvailableAt
@@ -158,19 +145,15 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 		availableAt = time.Now()
 	}
 	task := &model.Task{
-		Type: request.Type, IdempotencyKey: request.IdempotencyKey,
+		Type: request.Type, SubjectType: identity.SubjectType, SubjectKey: identity.SubjectKey, Generation: identity.Generation,
 		InputVersion: definition.InputVersion, Input: canonical,
 		InputHash: hex.EncodeToString(sum[:]),
 		Status:    model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
-		AvailableAt: availableAt, Runtime: json.RawMessage(`{}`), Events: json.RawMessage(`[]`),
+		AvailableAt: availableAt, Runtime: json.RawMessage(`{}`),
 	}
 	task.Policy, err = encodePolicy(definition.Policy)
 	if err != nil {
 		return nil, err
-	}
-	if subjectType != "" {
-		task.SubjectType = &subjectType
-		task.SubjectKey = &subjectKey
 	}
 	return task, nil
 }
@@ -181,7 +164,7 @@ func (s *Service) enqueuePrepared(ctx context.Context, tasks repository.TaskRepo
 		return nil, false, err
 	}
 	if stored.InputVersion != task.InputVersion || stored.InputHash != task.InputHash {
-		return nil, false, fmt.Errorf("%w for %s/%s", ErrInputConflict, task.Type, task.IdempotencyKey)
+		return nil, false, fmt.Errorf("%w for %s %s/%s", ErrInputConflict, task.Type, task.SubjectType, task.SubjectKey)
 	}
 	return stored, created, nil
 }

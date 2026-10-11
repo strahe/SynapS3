@@ -38,7 +38,6 @@ import (
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
-	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/task/dataset"
 	"github.com/strahe/synaps3/internal/task/wallet"
@@ -315,10 +314,9 @@ func handlerTaskFixture(t *testing.T, runtime handlerTestRuntime, row *model.Tas
 	if !ok {
 		definition.Policy = taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}
 	}
-	if definition.Subject != nil && row.SubjectType == nil && row.SubjectKey == nil {
-		subject, err := definition.Subject(row.Input)
-		if err == nil {
-			row.SubjectType, row.SubjectKey = &subject.Type, &subject.Key
+	if definition.Identity != nil && row.SubjectType == "" {
+		if identity, err := definition.Identity(row.Input); err == nil {
+			row.SubjectType, row.SubjectKey, row.Generation = identity.SubjectType, identity.SubjectKey, identity.Generation
 		}
 	}
 	var err error
@@ -588,8 +586,8 @@ func TestLRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess(t *testing.T) {
 		t.Fatalf("open protected cache entry: %v", err)
 	}
 	planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-		Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+		Type:  model.TaskTypeCacheCapacityReconcile,
+		Input: taskengine.CycleInput{Cycle: 1},
 	})
 	if err != nil {
 		t.Fatalf("enqueue cache capacity task: %v", err)
@@ -672,8 +670,8 @@ func TestObservabilityTaskRetriesAfterPartialCatalogSuccess(t *testing.T) {
 	events := &recordingWorkerEvents{events: make(chan recordedWorkerEvent, 2)}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{events: events, observabilityChecker: checker})
 	taskRow, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeObservabilityRefresh, IdempotencyKey: "observability-partial-test",
-		Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "observability",
+		Type:  model.TaskTypeObservabilityRefresh,
+		Input: taskengine.CycleInput{Cycle: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1883,8 +1881,8 @@ func seedStorageCleanup(t *testing.T, runtime handlerTestRuntime, statuses ...mo
 		}
 	}
 	taskRow, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageCleanup, IdempotencyKey: storagecleanup.TaskKey(content.ID, 1),
-		Input: storagecleanup.Input{ContentID: content.ID, Generation: 1}, SubjectType: "storage_content", SubjectKey: fmt.Sprint(content.ID),
+		Type:  model.TaskTypeStorageCleanup,
+		Input: storagecleanup.Input{ContentID: content.ID, Generation: 1},
 	})
 	if err != nil {
 		t.Fatalf("enqueue cleanup task: %v", err)
@@ -1947,8 +1945,8 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 		t.Fatalf("create cleanup admission copy: %v", err)
 	}
 	taskRow, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageCleanup, IdempotencyKey: storagecleanup.TaskKey(content.ID, 1),
-		Input: storagecleanup.Input{ContentID: content.ID, Generation: 1}, SubjectType: "storage_content", SubjectKey: fmt.Sprint(content.ID),
+		Type:  model.TaskTypeStorageCleanup,
+		Input: storagecleanup.Input{ContentID: content.ID, Generation: 1},
 	})
 	if err != nil {
 		t.Fatalf("enqueue cleanup admission task: %v", err)
@@ -1979,8 +1977,8 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 func TestCacheCapacityWaitsWhenLRUDisabled(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
 	planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-		Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+		Type:  model.TaskTypeCacheCapacityReconcile,
+		Input: taskengine.CycleInput{Cycle: 1},
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
@@ -1995,8 +1993,8 @@ func TestCacheCapacityWaitsWhenLRUDisabled(t *testing.T) {
 		t.Fatalf("disabled recurring round did not wait: %#v", stored)
 	}
 	same, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-		Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+		Type:  model.TaskTypeCacheCapacityReconcile,
+		Input: taskengine.CycleInput{Cycle: 1},
 	})
 	if err != nil || created || same.ID != planner.ID {
 		t.Fatalf("reseed disabled cache capacity task = %#v created=%v err=%v", same, created, err)
@@ -2060,8 +2058,8 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 				seedStoredCacheObject(t, runtime, 11, base.Add(2*time.Hour)),
 			}
 			planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-				Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
-				Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+				Type:  model.TaskTypeCacheCapacityReconcile,
+				Input: taskengine.CycleInput{Cycle: 1},
 			})
 			if err != nil || !created {
 				t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
@@ -2150,9 +2148,8 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 		t.Fatalf("next eviction generation: %v", err)
 	}
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(*version.ContentID, generation),
-		Input:       cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: generation},
-		SubjectType: "storage_content", SubjectKey: fmt.Sprint(*version.ContentID),
+		Type:  model.TaskTypeCacheEvict,
+		Input: cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: generation},
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.CacheEvictions.BindEvictionTask(ctx, *version.ContentID, generation, taskRow.ID)
 	})
@@ -2222,9 +2219,8 @@ func TestCacheEvictionRecoverConvergesAfterDeletionWasAlreadyRecorded(t *testing
 		t.Fatalf("next eviction generation: %v", err)
 	}
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(*version.ContentID, generation),
-		Input:       cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: generation},
-		SubjectType: "storage_content", SubjectKey: fmt.Sprint(*version.ContentID),
+		Type:  model.TaskTypeCacheEvict,
+		Input: cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: generation},
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.CacheEvictions.BindEvictionTask(ctx, *version.ContentID, generation, taskRow.ID)
 	})
@@ -2276,9 +2272,8 @@ func TestCacheEvictionRecoverCancelsAfterNewGenerationCompletes(t *testing.T) {
 		t.Fatalf("next first eviction generation: %v", err)
 	}
 	firstTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, firstGeneration),
-		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: firstGeneration},
-		SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
+		Type:  model.TaskTypeCacheEvict,
+		Input: cacheeviction.EvictInput{ContentID: contentID, Generation: firstGeneration},
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.CacheEvictions.BindEvictionTask(ctx, contentID, firstGeneration, taskRow.ID)
 	})
@@ -2300,9 +2295,8 @@ func TestCacheEvictionRecoverCancelsAfterNewGenerationCompletes(t *testing.T) {
 		t.Fatalf("replacement eviction reservation = %#v", reservation)
 	}
 	secondTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, reservation.Generation),
+		Type:        model.TaskTypeCacheEvict,
 		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: reservation.Generation},
-		SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
 		AvailableAt: time.Now().Add(time.Hour),
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.CacheEvictions.BindEvictionTask(ctx, contentID, reservation.Generation, taskRow.ID)
@@ -2364,9 +2358,8 @@ func TestCacheEvictionPersistentDeleteFailureRetainsOwner(t *testing.T) {
 				t.Fatalf("next eviction generation: %v", err)
 			}
 			taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-				Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
-				Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
-				SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
+				Type:  model.TaskTypeCacheEvict,
+				Input: cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
 			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 				return repos.CacheEvictions.BindEvictionTask(ctx, contentID, generation, taskRow.ID)
 			})
@@ -2758,16 +2751,8 @@ func bindCopyTask(t *testing.T, runtime handlerTestRuntime, copyRow *model.Stora
 		t.Fatalf("next copy generation: %v", err)
 	}
 	input := storagepipeline.CopyGenerationInput{CopyID: copyRow.ID, Generation: generation}
-	key := storagepipeline.PullKey(copyRow.ID, generation)
-	switch taskType {
-	case model.TaskTypeStorageTransferPlan:
-		key = storagepipeline.TransferPlanKey(copyRow.ID, generation)
-	case model.TaskTypeStorageStore:
-		key = storagepipeline.StoreKey(copyRow.ID, generation)
-	}
 	taskRow, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: taskType, IdempotencyKey: key, Input: input,
-		SubjectType: "storage_copy", SubjectKey: fmt.Sprintf("%d", copyRow.ID),
+		Type: taskType, Input: input,
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue copy task = %#v created=%v err=%v", taskRow, created, err)
@@ -2788,21 +2773,20 @@ func TestCompetingCoordinatorsBindOnlyOneCopyTask(t *testing.T) {
 		t.Fatalf("next copy generation: %v", err)
 	}
 	input := storagepipeline.CopyGenerationInput{CopyID: pipeline.target.ID, Generation: generation}
-	bind := func(taskType model.TaskType, key string) (*model.Task, error) {
+	bind := func(taskType model.TaskType) (*model.Task, error) {
 		returnTask, _, enqueueErr := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-			Type: taskType, IdempotencyKey: key, Input: input,
-			SubjectType: "storage_copy", SubjectKey: fmt.Sprint(pipeline.target.ID),
+			Type: taskType, Input: input,
 		}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 			return repos.Contents.BindCopyTask(ctx, pipeline.target.ID, generation, taskRow.ID)
 		})
 		return returnTask, enqueueErr
 	}
 
-	winner, err := bind(model.TaskTypeStorageTransferPlan, storagepipeline.TransferPlanKey(pipeline.target.ID, generation))
+	winner, err := bind(model.TaskTypeStorageTransferPlan)
 	if err != nil {
 		t.Fatalf("bind winning copy task: %v", err)
 	}
-	if _, err := bind(model.TaskTypeStoragePull, storagepipeline.PullKey(pipeline.target.ID, generation)); !errors.Is(err, repository.ErrConflict) {
+	if _, err := bind(model.TaskTypeStoragePull); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("bind competing copy task error = %v, want conflict", err)
 	}
 
@@ -2855,8 +2839,8 @@ func TestBucketProvisionCreatesDataSetsBeforeMarkingReady(t *testing.T) {
 		t.Fatalf("create bucket: %v", err)
 	}
 	taskRow, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeBucketProvision, IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies),
-		Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+		Type:  model.TaskTypeBucketProvision,
+		Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue bucket provision task = %#v created=%v err=%v", taskRow, created, err)
@@ -2949,8 +2933,8 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 					t.Fatal(err)
 				}
 				request := taskengine.EnqueueRequest{
-					Type: taskType, IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, 1),
-					Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+					Type:  taskType,
+					Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 				}
 				if taskType == model.TaskTypeUploadPlan {
 					content, err := runtime.repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
@@ -2966,9 +2950,7 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 					}); err != nil {
 						t.Fatal(err)
 					}
-					request.IdempotencyKey = storagepipeline.UploadPlanKey(content.ID)
 					request.Input = storagepipeline.UploadPlanInput{ContentID: content.ID}
-					request.SubjectType, request.SubjectKey = "storage_content", fmt.Sprint(content.ID)
 				}
 				taskRow, _, err := runtime.service.Enqueue(t.Context(), request)
 				if err != nil {
@@ -3092,8 +3074,8 @@ func TestDataSetEnsureSchedulesBoundCopyWorkWhenReady(t *testing.T) {
 		t.Fatalf("bound copy = %#v err=%v", copyRow, err)
 	}
 	ensureTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(binding.ID),
-		Input: storagepipeline.DataSetInput{DataSetID: binding.ID}, SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(binding.ID),
+		Type:  model.TaskTypeStorageDataSetEnsure,
+		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -3172,8 +3154,8 @@ func TestDataSetDiscoveryFailureNeverCreatesDataSet(t *testing.T) {
 	}
 	input := storagepipeline.DataSetInput{DataSetID: binding.ID}
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(binding.ID),
-		Input: input, SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(binding.ID),
+		Type:  model.TaskTypeStorageDataSetEnsure,
+		Input: input,
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -3226,8 +3208,8 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 		t.Fatalf("create pending data set: %v", err)
 	}
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(binding.ID),
-		Input: storagepipeline.DataSetInput{DataSetID: binding.ID}, SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(binding.ID),
+		Type:  model.TaskTypeStorageDataSetEnsure,
+		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -4135,8 +4117,8 @@ func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 			return err
 		}
 		taskRow, _, err = runtime.service.EnqueueInTransaction(t.Context(), repos, taskengine.EnqueueRequest{
-			Type: model.TaskTypeWalletOperation, IdempotencyKey: walletoperation.TaskKey(operation.ID),
-			Input: walletoperation.Input{OperationID: operation.ID}, SubjectType: "wallet_operation", SubjectKey: fmt.Sprint(operation.ID),
+			Type:  model.TaskTypeWalletOperation,
+			Input: walletoperation.Input{OperationID: operation.ID},
 		})
 		if err != nil {
 			return err
@@ -4296,8 +4278,8 @@ func seedWalletTask(t *testing.T, runtime handlerTestRuntime, requestID string) 
 			return err
 		}
 		taskRow, _, err = runtime.service.EnqueueInTransaction(t.Context(), repos, taskengine.EnqueueRequest{
-			Type: model.TaskTypeWalletOperation, IdempotencyKey: walletoperation.TaskKey(operation.ID),
-			Input: walletoperation.Input{OperationID: operation.ID}, SubjectType: "wallet_operation", SubjectKey: fmt.Sprint(operation.ID),
+			Type:  model.TaskTypeWalletOperation,
+			Input: walletoperation.Input{OperationID: operation.ID},
 		})
 		if err != nil {
 			return err
@@ -4307,34 +4289,6 @@ func seedWalletTask(t *testing.T, runtime handlerTestRuntime, requestID string) 
 		t.Fatalf("seed wallet task: %v", err)
 	}
 	return operation, taskRow
-}
-
-// Content and copy tasks are found by subject when bytes are deleted or a Store
-// checkpoint is adopted, so an enqueue whose subject names another row than
-// its input is refused before anything is stored.
-func TestContentAndCopyTasksRefuseSubjectsNamingAnotherRow(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	for _, request := range []taskengine.EnqueueRequest{
-		{
-			Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(7),
-			Input:       storagepipeline.UploadPlanInput{ContentID: 7},
-			SubjectType: model.TaskSubjectStorageContent, SubjectKey: "8",
-		},
-		{
-			Type: model.TaskTypeStorageCleanup, IdempotencyKey: "cleanup-7",
-			Input:       storagecleanup.Input{ContentID: 7, Generation: 1},
-			SubjectType: model.TaskSubjectStorageContent, SubjectKey: "8",
-		},
-		{
-			Type: model.TaskTypeStorageStore, IdempotencyKey: "store-7",
-			Input:       storagepipeline.CopyGenerationInput{CopyID: 7, Generation: 1},
-			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: "8",
-		},
-	} {
-		if _, _, err := runtime.service.Enqueue(t.Context(), request); !errors.Is(err, repository.ErrInvalidInput) {
-			t.Errorf("%s naming another row = %v, want invalid input", request.Type, err)
-		}
-	}
 }
 
 func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing.T) {
@@ -4416,12 +4370,10 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 		t.Fatalf("complete replacement seeding: %v", err)
 	}
 	coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeProviderReplacementCoordinate,
-		IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
+		Type: model.TaskTypeProviderReplacementCoordinate,
 		Input: storagereplacement.CoordinateInput{
 			ReplacementID: replacement.ID, Generation: replacement.TaskGeneration,
 		},
-		SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(replacement.ID),
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
 	})
@@ -4570,10 +4522,8 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				t.Fatalf("fail migration task: %v", err)
 			}
 			coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-				Type:           model.TaskTypeProviderReplacementCoordinate,
-				IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
-				Input:          storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
-				SubjectType:    "storage_replacement", SubjectKey: fmt.Sprint(replacement.ID),
+				Type:  model.TaskTypeProviderReplacementCoordinate,
+				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
 			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
 			})
@@ -4706,10 +4656,8 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				t.Fatalf("mark target ready: %v", err)
 			}
 			coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-				Type:           model.TaskTypeProviderReplacementCoordinate,
-				IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
-				Input:          storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
-				SubjectType:    "storage_replacement", SubjectKey: fmt.Sprint(replacement.ID),
+				Type:  model.TaskTypeProviderReplacementCoordinate,
+				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
 			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
 			})
@@ -4785,7 +4733,7 @@ func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 	}
 	// A coordinator written by a build whose input this one cannot read.
 	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, handlerTaskFixture(t, runtime, &model.Task{
-		Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: bucket.Name,
+		Type:         model.TaskTypeProviderReplacementCoordinate,
 		InputVersion: 99, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: bucket.Name,
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
@@ -4867,9 +4815,8 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 		t.Fatalf("next retirement admission generation: %v", err)
 	}
 	taskRow, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: storagereplacement.RetireTaskKey(target.ID, generation),
-		Input:       storagereplacement.RetireInput{ReplacementID: first.ID, DataSetID: target.ID, Generation: generation},
-		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(target.ID),
+		Type:  model.TaskTypeStorageDataSetRetire,
+		Input: storagereplacement.RetireInput{ReplacementID: first.ID, DataSetID: target.ID, Generation: generation},
 	})
 	if err != nil {
 		t.Fatalf("enqueue retirement admission task: %v", err)
@@ -4977,9 +4924,8 @@ func seedAbandonedTargetRetirement(t *testing.T, runtime handlerTestRuntime, seq
 		t.Fatalf("next retirement generation: %v", err)
 	}
 	taskRow, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: storagereplacement.RetireTaskKey(first.TargetDataSetID, generation),
-		Input:       storagereplacement.RetireInput{ReplacementID: first.ID, DataSetID: first.TargetDataSetID, Generation: generation},
-		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(first.TargetDataSetID),
+		Type:  model.TaskTypeStorageDataSetRetire,
+		Input: storagereplacement.RetireInput{ReplacementID: first.ID, DataSetID: first.TargetDataSetID, Generation: generation},
 	})
 	if err != nil {
 		t.Fatalf("enqueue retirement: %v", err)
@@ -5093,9 +5039,8 @@ func seedSourceRetirement(t *testing.T, runtime handlerTestRuntime, sequence int
 		t.Fatalf("next retirement generation: %v", err)
 	}
 	taskRow, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: storagereplacement.RetireTaskKey(source.ID, generation),
-		Input:       storagereplacement.RetireInput{ReplacementID: replacement.ID, DataSetID: source.ID, Generation: generation},
-		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(source.ID),
+		Type:  model.TaskTypeStorageDataSetRetire,
+		Input: storagereplacement.RetireInput{ReplacementID: replacement.ID, DataSetID: source.ID, Generation: generation},
 	})
 	if err != nil {
 		t.Fatalf("enqueue retirement: %v", err)
@@ -5308,12 +5253,10 @@ func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *t
 		t.Fatalf("next retirement generation: %v", err)
 	}
 	retirementTask, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type:           model.TaskTypeStorageDataSetRetire,
-		IdempotencyKey: storagereplacement.RetireTaskKey(target.ID, generation),
+		Type: model.TaskTypeStorageDataSetRetire,
 		Input: storagereplacement.RetireInput{
 			ReplacementID: first.ID, DataSetID: target.ID, Generation: generation,
 		},
-		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(target.ID),
 	})
 	if err != nil {
 		t.Fatalf("enqueue retirement task: %v", err)
@@ -5407,9 +5350,8 @@ func TestUploadPlanAllocatesOnlyWithinTheBucketsOpenSlots(t *testing.T) {
 	}
 
 	taskRow, created, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(content.ID),
-		Input:       storagepipeline.UploadPlanInput{ContentID: content.ID},
-		SubjectType: "storage_content", SubjectKey: fmt.Sprint(content.ID),
+		Type:  model.TaskTypeUploadPlan,
+		Input: storagepipeline.UploadPlanInput{ContentID: content.ID},
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue upload plan = %#v created=%v err=%v", taskRow, created, err)
@@ -5482,8 +5424,8 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	}
 
 	taskRow, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type: model.TaskTypeBucketProvision, IdempotencyKey: bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies),
-		Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID}, SubjectType: "bucket", SubjectKey: fmt.Sprint(bucket.ID),
+		Type:  model.TaskTypeBucketProvision,
+		Input: bucketlifecycle.ProvisionInput{BucketID: bucket.ID, Copies: bucket.DefaultCopies},
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue bucket provision task = %#v created=%v err=%v", taskRow, created, err)
@@ -5566,9 +5508,8 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 		t.Fatalf("MarkDataSetCreating: %v", err)
 	}
 	ensureTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(binding.ID),
-		Input:       storagepipeline.DataSetInput{DataSetID: binding.ID},
-		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(binding.ID),
+		Type:  model.TaskTypeStorageDataSetEnsure,
+		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -5649,9 +5590,8 @@ func seedDataSetEnsure(t *testing.T, runtime handlerTestRuntime, providerID idty
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
 	ensureTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(binding.ID),
-		Input:       storagepipeline.DataSetInput{DataSetID: binding.ID},
-		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(binding.ID),
+		Type:  model.TaskTypeStorageDataSetEnsure,
+		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -6245,7 +6185,7 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 		return runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, *row.TaskID)
 	}
 	key := fmt.Sprintf("activation-fixture/%d", id)
-	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: key, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key, SubjectType: new("storage_replacement"), SubjectKey: new(fmt.Sprint(row.ID))}))
+	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key, SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(row.ID)}))
 	if err != nil {
 		return err
 	}

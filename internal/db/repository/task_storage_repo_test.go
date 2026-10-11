@@ -10,7 +10,6 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
-	"github.com/uptrace/bun"
 )
 
 func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
@@ -28,16 +27,13 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restoreRefuseTaskArchive := testutil.FailWrites(t, db, "tasks", "DELETE", "", "archive refused")
+	restoreRefuseTaskArchive := testutil.FailWrites(t, db, "tasks", "UPDATE", "NEW.status = 'completed'", "archive refused")
 	transition := repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover}
 	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, transition); err == nil {
 		t.Fatal("archive unexpectedly committed")
 	}
-	if count, err := db.NewSelect().TableExpr("task_history").Where("task_id = ?", row.ID).Count(ctx); err != nil || count != 0 {
-		t.Fatalf("partial history = %d, %v", count, err)
-	}
 	failed, err := repos.Tasks.GetByID(ctx, row.ID)
-	if err != nil || failed == nil || failed.Status != model.TaskStatusRunning || !bytes.Equal(failed.Events, before.Events) || !bytes.Equal(failed.Checkpoint, before.Checkpoint) {
+	if err != nil || failed == nil || failed.Status != model.TaskStatusRunning || !bytes.Equal(failed.Checkpoint, before.Checkpoint) {
 		t.Fatalf("rollback changed source: %#v, %v", failed, err)
 	}
 	restoreRefuseTaskArchive()
@@ -54,32 +50,5 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 	}
 	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, transition); !errors.Is(err, repository.ErrTaskLeaseLost) {
 		t.Fatalf("repeated settlement = %v", err)
-	}
-}
-
-func TestTaskDuplicateAcrossTablesIsReported(t *testing.T) {
-	assertTaskDuplicateAcrossTablesIsReported(t, testDB(t))
-}
-
-func assertTaskDuplicateAcrossTablesIsReported(t *testing.T, db *bun.DB) {
-	t.Helper()
-	repos := repository.NewRepositories(db)
-	ctx := t.Context()
-	row := enqueueAndClaimTask(t, repos, "duplicate-round", time.Minute)
-	snapshot := model.TaskHistoryFromTask(row)
-	now := time.Now()
-	snapshot.Status, snapshot.FinishedAt = model.TaskStatusCompleted, &now
-	snapshot.ClaimedAt, snapshot.LeaseUntil = nil, nil
-	if _, err := db.NewInsert().Model(snapshot).Exec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repos.Tasks.GetByID(ctx, row.ID); !errors.Is(err, repository.ErrTaskDataCorrupted) {
-		t.Fatalf("duplicate ID error = %v", err)
-	}
-	if _, err := repos.Tasks.GetByIdentity(ctx, row.Type, row.IdempotencyKey); !errors.Is(err, repository.ErrTaskDataCorrupted) {
-		t.Fatalf("duplicate identity error = %v", err)
-	}
-	if _, err := repos.Tasks.List(ctx, repository.TaskListFilter{}); !errors.Is(err, repository.ErrTaskDataCorrupted) {
-		t.Fatalf("duplicate list error = %v", err)
 	}
 }

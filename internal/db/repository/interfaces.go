@@ -787,11 +787,11 @@ type TaskRepository interface {
 	ListCurrentFailedForSubject(ctx context.Context, subjectType, subjectKey string, beforeID int64, limit int, types ...model.TaskType) (TaskPage, error)
 	ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error)
 	AppendEvent(ctx context.Context, taskID int64, eventType string, details json.RawMessage) error
-	ListEvents(ctx context.Context, taskID, beforeSequence int64, limit int) ([]model.TaskEvent, error)
+	ListEvents(ctx context.Context, taskID, beforeID int64, limit int) ([]model.TaskEvent, error)
 	ObserveOperation(ctx context.Context, id, generation int64, key string) (time.Time, error)
 	AdmitEffect(ctx context.Context, id, generation int64, key string, checkpoint json.RawMessage) error
 	ResolveOperation(ctx context.Context, id, generation int64, key string) error
-	GetByIdentity(ctx context.Context, taskType model.TaskType, idempotencyKey string) (*model.Task, error)
+	GetByIdentity(ctx context.Context, taskType model.TaskType, subjectType, subjectKey string, generation int64) (*model.Task, error)
 	PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error)
 	ClaimNext(ctx context.Context, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error)
 	RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error)

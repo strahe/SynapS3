@@ -245,7 +245,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			}
 			enqueueEnsure := func(id int64) *model.Task {
 				task, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-					Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(id), Input: storagepipeline.DataSetInput{DataSetID: id}, SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(id),
+					Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: id},
 				}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 					return repos.Contents.BindDataSetEnsureTask(ctx, id, task.ID)
 				})
@@ -312,8 +312,8 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			}
 			enqueueCoordinator := func() *model.Task {
 				coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-					Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
-					Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}, SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(row.ID),
+					Type:  model.TaskTypeProviderReplacementCoordinate,
+					Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
 				}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 					return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
 				})
@@ -455,7 +455,7 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: testOnChainID(t, 2002)}); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration), Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 		return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
 	})
 	if err != nil {
