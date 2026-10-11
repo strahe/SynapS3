@@ -208,7 +208,7 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int,
 		OrderExpr("COALESCE(object_cache.cache_accessed_at, object_cache.created_at), object_cache.content_id")
 	if len(after) == 1 {
 		cursor := after[0]
-		query = query.Where("(COALESCE(object_cache.cache_accessed_at, object_cache.created_at) > ? OR (COALESCE(object_cache.cache_accessed_at, object_cache.created_at) = ? AND object_cache.content_id > ?))", cursor.AccessedAt, cursor.AccessedAt, cursor.ContentID)
+		query = query.Where("(COALESCE(object_cache.cache_accessed_at, object_cache.created_at), object_cache.content_id) > (?, ?)", cursor.AccessedAt, cursor.ContentID)
 	}
 	if limit > 0 {
 		query = query.Limit(int64(limit))

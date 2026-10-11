@@ -4,6 +4,7 @@ INTEGRATION_BINARY := synaps3-integration-server
 MODULE   := github.com/strahe/synaps3
 PKG      := ./cmd/synaps3
 GOFLAGS  := -trimpath
+GO_TEST_PACKAGE_PARALLELISM ?=
 CGO_ENABLED := 1
 CGO      := CGO_ENABLED=$(CGO_ENABLED)
 
@@ -23,7 +24,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-race-ci test-system test-system-support test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-ci verify-norace clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-race-ci test-system test-system-support test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-ci verify-code verify-norace clean run ui-install ui-build ui-dev ui-e2e-install
 .PHONY: docker-init docker-up docker-verify docker-down docker-status docker-logs docker-password
 
 all: build
@@ -54,19 +55,19 @@ build-integration-server:
 test: test-fast
 
 test-fast:
-	$(CGO) go test -count=1 ./cmd/... ./internal/...
+	$(CGO) go test $(GOFLAGS) $(if $(GO_TEST_PACKAGE_PARALLELISM),-p $(GO_TEST_PACKAGE_PARALLELISM)) -count=1 ./cmd/... ./internal/...
 
 test-race:
-	$(CGO) go test -race -tags dev -count=1 $(RACE_PACKAGES)
+	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 $(RACE_PACKAGES)
 
 # Keep PR race checks focused on shared-memory contracts; run test-race for
 # the complete package suites when investigating concurrency changes.
 test-race-ci:
-	$(CGO) go test -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/s3access ./internal/task/transfer
-	$(CGO) go test -race -tags dev -count=1 -run '^Test(AdminEventHub.*|CachedWalletQuerier_(CoalescesConcurrentMisses|WaiterContextCanCancel))$$' ./internal/admin
-	$(CGO) go test -race -tags dev -count=1 -run '^Test((PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction|RequestContext.*)$$' ./internal/backend
-	$(CGO) go test -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task
-	$(CGO) go test -race -tags dev -count=1 -run '^TestEngine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork|TypeConcurrencyPreservesQueueAndFairness|GlobalConcurrencyIncludesUnrestrictedTypes|ActiveClaimCannotBeReclaimedBeforeInvocationReturns|ConcurrencyHeldThroughSettlement|ShutdownWaitsForInvocations)$$' ./internal/worker
+	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/s3access ./internal/task/transfer
+	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^Test(AdminEventHub.*|CachedWalletQuerier_(CoalescesConcurrentMisses|WaiterContextCanCancel))$$' ./internal/admin
+	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^Test((PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction|RequestContext.*)$$' ./internal/backend
+	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task
+	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^TestEngine(ShutdownDiscardsHandlerResultAndForcesRecovery|RenewalFailureCancelsBeforeSafetyBoundary|RecoveryQueueDoesNotDropLeaseShorteningWork|TypeConcurrencyPreservesQueueAndFairness|GlobalConcurrencyIncludesUnrestrictedTypes|ActiveClaimCannotBeReclaimedBeforeInvocationReturns|ConcurrencyHeldThroughSettlement|ShutdownWaitsForInvocations)$$' ./internal/worker
 
 test-system:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./tests/testutil/... ./internal/systemtest ./tests/system
@@ -138,15 +139,17 @@ check: ui-build
 	cd ui && pnpm run test
 	$(MAKE) test
 
-verify-norace: ui-build
+verify-code: ui-build
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
 	golangci-lint config verify
 	golangci-lint fmt --diff
 	$(CGO) golangci-lint run
 	cd ui && pnpm run check
 	cd ui && pnpm run test
-	$(MAKE) test-docker-entrypoint
 	$(MAKE) build-go
+
+verify-norace: verify-code
+	$(MAKE) test-docker-entrypoint
 
 verify-fast: verify-norace
 	$(MAKE) test-fast

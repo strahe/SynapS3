@@ -61,6 +61,8 @@ CREATE INDEX idx_tasks_status_id ON tasks (status, id) WHERE (status <> 'complet
 CREATE INDEX idx_tasks_live ON tasks (id) WHERE (status IN ('pending','running','failed') AND acknowledged_at IS NULL AND superseded_at IS NULL);
 CREATE INDEX idx_tasks_pending ON tasks (available_at, id) WHERE (status = 'pending');
 CREATE INDEX idx_tasks_recovery ON tasks (lease_until, id) WHERE (status = 'running');
+CREATE INDEX idx_tasks_pending_type_available ON tasks (type, available_at, id) WHERE (status = 'pending');
+CREATE INDEX idx_tasks_recovery_type_lease ON tasks (type, lease_until, id) WHERE (status = 'running');
 -- superseded_at is NULL in every entry; ordering by it keeps the planner on
 -- this index when it misjudges how few failures are still current.
 CREATE INDEX idx_tasks_current_failed ON tasks (subject_type, subject_key, superseded_at, id) WHERE (status = 'failed' AND superseded_at IS NULL);
@@ -134,6 +136,7 @@ CREATE TABLE buckets (
   CONSTRAINT chk_buckets_minimum_durable_copies CHECK (minimum_durable_copies >= 1),
   CONSTRAINT chk_buckets_explicit_copy_policy CHECK (minimum_durable_copies <= default_copies),
   CONSTRAINT chk_buckets_durability_generation CHECK (durability_generation >= 0),
+  CONSTRAINT chk_buckets_status CHECK (status IN ('provisioning', 'ready')),
   CHECK (provider_selection_strategy IN ('distribution', 'speed')),
   PRIMARY KEY (id),
   UNIQUE (name),
@@ -154,6 +157,7 @@ CREATE TABLE bucket_replica_slots (
   updated_at timestamptz NOT NULL,
   CONSTRAINT uq_bucket_replica_slots_identity UNIQUE (bucket_id, copy_index),
   CONSTRAINT chk_bucket_replica_slots_copy_index CHECK (copy_index >= 0),
+  CONSTRAINT chk_bucket_replica_slots_status CHECK (status IN ('active', 'decommissioned')),
   PRIMARY KEY (id),
   FOREIGN KEY (bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );
@@ -471,6 +475,7 @@ CREATE TABLE storage_replacements (
   CONSTRAINT chk_storage_replacements_identity CHECK (client_request_id <> '' AND (requested_provider_id IS NULL OR requested_provider_id <> '')),
   CONSTRAINT fk_storage_replacements_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT chk_storage_replacements_status CHECK (status IN ('preparing_target', 'migrating', 'waiting', 'retiring', 'cleanup_attention', 'failed', 'completed', 'superseded')),
+  CONSTRAINT chk_storage_replacements_selection_mode CHECK (selection_mode IN ('automatic', 'manual')),
   CONSTRAINT chk_storage_replacements_wait_reason CHECK (wait_reason IS NULL OR wait_reason <> ''),
   CONSTRAINT chk_storage_replacements_failure_reason CHECK (failure_reason IS NULL OR failure_reason <> ''),
   CONSTRAINT chk_storage_replacements_distinct_data_sets CHECK (source_data_set_id <> target_data_set_id),
@@ -563,6 +568,7 @@ CREATE TABLE storage_cleanup_copies (
   CONSTRAINT chk_storage_cleanup_copies_identity CHECK (provider_id <> '' AND piece_id <> '' AND piece_cid <> '' AND checksum <> '' AND (data_set_id IS NULL OR data_set_id <> '') AND (client_data_set_id IS NULL OR client_data_set_id <> '') AND (delete_tx_hash IS NULL OR delete_tx_hash <> '')),
   CONSTRAINT fk_storage_cleanup_copies_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT chk_storage_cleanup_copies_delete_scheduled CHECK (status <> 'delete_scheduled' OR (delete_tx_hash IS NOT NULL AND scheduled_at IS NOT NULL)),
+  CONSTRAINT chk_storage_cleanup_copies_status CHECK (status IN ('pending', 'delete_scheduled', 'removed', 'failed', 'unsupported')),
   CONSTRAINT uq_storage_cleanup_copies_physical UNIQUE (content_id, storage_data_set_id, piece_id),
   PRIMARY KEY (id),
   FOREIGN KEY (storage_data_set_id, bucket_id, copy_index, provider_id) REFERENCES storage_data_sets (id, bucket_id, copy_index, provider_id) ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -570,7 +576,6 @@ CREATE TABLE storage_cleanup_copies (
 CREATE INDEX idx_storage_cleanup_copies_replica_slot ON storage_cleanup_copies (bucket_id, copy_index);
 CREATE INDEX idx_storage_cleanup_copies_content_status ON storage_cleanup_copies (content_id, status, id);
 CREATE INDEX idx_storage_cleanup_copies_data_set_identity ON storage_cleanup_copies (storage_data_set_id, bucket_id, copy_index, provider_id);
-CREATE INDEX idx_storage_cleanup_copies_status_scheduled ON storage_cleanup_copies (status, scheduled_at, id);
 
 --bun:split
 
@@ -619,7 +624,7 @@ CREATE TABLE object_cache (
   FOREIGN KEY (content_id) REFERENCES storage_contents (id) ON UPDATE RESTRICT ON DELETE RESTRICT,
   FOREIGN KEY (cache_active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );
-CREATE INDEX idx_object_cache_lru ON object_cache (cache_accessed_at, content_id) WHERE (in_cache = TRUE);
+CREATE INDEX idx_object_cache_lru ON object_cache (COALESCE(cache_accessed_at, created_at), content_id) WHERE (in_cache = TRUE);
 CREATE UNIQUE INDEX idx_object_cache_active_task ON object_cache (cache_active_task_id) WHERE (cache_active_task_id IS NOT NULL);
 
 --bun:split
@@ -672,7 +677,6 @@ CREATE TABLE wallet_operations (
   FOREIGN KEY (task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 CREATE UNIQUE INDEX idx_wallet_operations_request ON wallet_operations (type, client_request_id);
-CREATE INDEX idx_wallet_operations_status_created ON wallet_operations (status, created_at, id);
 CREATE INDEX idx_wallet_operations_recent ON wallet_operations (created_at DESC, id DESC);
 CREATE UNIQUE INDEX idx_wallet_operations_task ON wallet_operations (task_id) WHERE (task_id IS NOT NULL);
 
@@ -699,6 +703,7 @@ CREATE TABLE observability_provider_states (
   last_error text,
   evidence_json jsonb NOT NULL,
   CONSTRAINT chk_observability_provider_identity CHECK (provider_id <> ''),
+  CONSTRAINT chk_observability_provider_states_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown')),
   CONSTRAINT chk_observability_provider_states_reason_codes_json CHECK (jsonb_typeof(reason_codes) = 'array'),
   CONSTRAINT chk_observability_provider_states_evidence_json_json CHECK (jsonb_typeof(evidence_json) = 'object'),
   PRIMARY KEY (provider_id)
@@ -770,6 +775,7 @@ CREATE TABLE observability_data_set_states (
   last_error text,
   evidence_json jsonb NOT NULL,
   CONSTRAINT chk_observability_data_set_identity CHECK (provider_id <> '' AND (chain_data_set_id IS NULL OR chain_data_set_id <> '') AND (client_data_set_id IS NULL OR client_data_set_id <> '')),
+  CONSTRAINT chk_observability_data_set_states_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown')),
   CONSTRAINT fk_observability_data_set_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT chk_observability_data_set_states_reason_codes_json CHECK (jsonb_typeof(reason_codes) = 'array'),
   CONSTRAINT chk_observability_data_set_states_evidence_json_json CHECK (jsonb_typeof(evidence_json) = 'object'),

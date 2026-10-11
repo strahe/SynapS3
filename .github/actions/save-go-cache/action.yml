@@ -1,0 +1,45 @@
+name: Save Go caches
+description: Save valid Go caches after completed work, including failed tests, without saving canceled jobs.
+inputs:
+  gocache:
+    description: Compiled Go package cache directory.
+    required: true
+  gomodcache:
+    description: Downloaded Go module cache directory.
+    required: true
+  build-primary-key:
+    description: Exact compiled package cache key from setup-go.
+    required: true
+  modules-primary-key:
+    description: Exact module cache key from setup-go.
+    required: true
+  build-cache-hit:
+    description: Whether the exact compiled package cache was restored.
+    required: true
+  modules-cache-hit:
+    description: Whether the exact module cache was restored.
+    required: true
+  modules-ready:
+    description: Whether all modules were restored or successfully downloaded.
+    required: true
+  module-writer:
+    description: Whether this job owns the module cache for this run.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Save Go modules
+      if: ${{ !cancelled() && inputs.module-writer == 'true' && inputs.modules-ready == 'true' && inputs.modules-cache-hit != 'true' && inputs.gomodcache != '' && inputs.modules-primary-key != '' }}
+      continue-on-error: true
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ inputs.gomodcache }}
+        key: ${{ inputs.modules-primary-key }}
+
+    - name: Save compiled Go packages
+      if: ${{ !cancelled() && inputs.build-cache-hit != 'true' && inputs.gocache != '' && inputs.build-primary-key != '' }}
+      continue-on-error: true
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ inputs.gocache }}
+        key: ${{ inputs.build-primary-key }}

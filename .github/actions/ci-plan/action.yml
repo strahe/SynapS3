@@ -1,0 +1,40 @@
+name: Plan CI work
+description: Select CI jobs from the event diff, running everything when the diff is unavailable.
+outputs:
+  verify:
+    description: Run code verification and production builds.
+    value: ${{ steps.plan.outputs.verify }}
+  go_tests:
+    description: Run ordinary Go tests.
+    value: ${{ steps.plan.outputs.go_tests }}
+  race:
+    description: Run the CI race checks.
+    value: ${{ steps.plan.outputs.race }}
+  system:
+    description: Run system and S3 compatibility tests.
+    value: ${{ steps.plan.outputs.system }}
+  dashboard:
+    description: Run dashboard end-to-end tests.
+    value: ${{ steps.plan.outputs.dashboard }}
+  docker_image:
+    description: Build Docker images.
+    value: ${{ steps.plan.outputs.docker_image }}
+  docker_deployment:
+    description: Verify Docker deployment and entrypoint behavior.
+    value: ${{ steps.plan.outputs.docker_deployment }}
+  docs:
+    description: Build documentation.
+    value: ${{ steps.plan.outputs.docs }}
+  modules_writer:
+    description: The scheduled Go job allowed to save the module cache.
+    value: ${{ steps.plan.outputs.modules_writer }}
+  plan:
+    description: The complete JSON plan used to validate job results.
+    value: ${{ steps.plan.outputs.plan }}
+runs:
+  using: composite
+  steps:
+    - name: Classify changed paths
+      id: plan
+      shell: bash
+      run: python3 "${{ github.action_path }}/../../../scripts/ci_plan.py" plan

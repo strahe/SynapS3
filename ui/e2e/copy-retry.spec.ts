@@ -188,15 +188,56 @@ test('provenance retries a failed replica and shows its updated recovery state',
   await page.keyboard.press('Escape')
   await expect(upload).toBeHidden()
   let retried = false
-  await page.route('**/api/v1/buckets/copy-retry-e2e/objects/provenance?*', async (route) => {
-    const response = await route.fetch()
-    const provenance: ObjectProvenance = await response.json()
-    const copy = provenance.copies[0]
-    copy.status = retried ? 'pending' : 'failed'
-    copy.last_error = retried ? undefined : 'Storage provider 101 could not copy the piece from provider 100'
-    copy.retryable = !retried
-    copy.retry_task_id = retried ? null : 201
-    await route.fulfill({ json: provenance })
+  await page.route('**/api/v1/buckets/copy-retry-e2e/objects/provenance?*', (route) => {
+    const versionID = new URL(route.request().url()).searchParams.get('version_id')
+    if (!versionID) throw new Error('Provenance request is missing its version ID')
+    const updatedAt = new Date().toISOString()
+    const reason = retried ? 'copy_pending' : 'copy_failed'
+    const lastError = retried ? undefined : 'Storage provider 101 could not copy the piece from provider 100'
+    const provenance: ObjectProvenance = {
+      version_id: versionID,
+      state: 'replicating',
+      status: 'syncing',
+      requested_copies: 3,
+      success_copies: 2,
+      copy_health: {
+        status: retried ? 'degraded' : 'unavailable',
+        reason_codes: [reason, 'copy_under_replicated'],
+        stale: false,
+        last_checked_at: updatedAt,
+        last_error: lastError,
+        total_objects: 1,
+        unhealthy_objects: 1,
+        requested_copies: 3,
+        readable_copies: 2,
+        pending_copies: retried ? 1 : 0,
+        failed_copies: retried ? 0 : 1,
+        unknown_copies: 0,
+      },
+      copies: [0, 1, 2].map<ObjectProvenance['copies'][number]>((copyIndex) => ({
+        copy_id: 128 + copyIndex,
+        copy_index: copyIndex,
+        status: copyIndex === 0 ? (retried ? 'pending' : 'failed') : 'committed',
+        last_error: copyIndex === 0 ? lastError : undefined,
+        retryable: copyIndex === 0 && !retried,
+        retry_task_id: copyIndex === 0 && !retried ? 201 : null,
+        health: {
+          status: copyIndex === 0 ? (retried ? 'degraded' : 'unavailable') : 'available',
+          reason_codes: copyIndex === 0 ? [reason] : [],
+          stale: false,
+          last_checked_at: copyIndex === 0 ? undefined : updatedAt,
+          last_error: copyIndex === 0 ? lastError : undefined,
+        },
+        provider_id: String(101 + copyIndex),
+        data_set_id: String(copyIndex + 1),
+        piece_id: copyIndex === 0 ? undefined : '1',
+        transfer_method: 'pull',
+        retrieval_url: copyIndex === 0 ? undefined : `https://provider-${101 + copyIndex}.example/pieces/1`,
+        is_new_data_set: false,
+      })),
+      updated_at: updatedAt,
+    }
+    return route.fulfill({ json: provenance })
   })
   await page.route('**/api/v1/tasks/201/retry', (route) => {
     expect(new URL(route.request().url()).pathname).toBe('/api/v1/tasks/201/retry')

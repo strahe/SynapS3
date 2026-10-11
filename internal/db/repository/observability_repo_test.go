@@ -93,8 +93,7 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 		t.Fatalf("provider page after prune = total:%d items:%+v, want only provider 101", page.Total, page.Items)
 	}
 
-	// Status values are not checked by the schema, so an unknown one is refused
-	// before a snapshot claims its collection time.
+	// Reject an unknown status before updating the snapshot's collection time.
 	unknown := observability.ProviderState{
 		ProviderID: onChainID(t, "101"), Status: observability.Status("terminated"),
 		ReasonCodes: []observability.ReasonCode{}, LastCheckedAt: checkedAt.Add(2 * time.Minute), Evidence: map[string]any{},
@@ -304,6 +303,15 @@ func TestObservabilityRepoSummaryCountsUnrecognizedStatusAsUnknown(t *testing.T)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 	unrecognized := observability.Status("terminated")
+	// A newer schema can admit a status this reader does not recognize.
+	for _, table := range []string{"observability_provider_states", "observability_data_set_states"} {
+		constraint := "chk_" + table + "_status"
+		if _, err := db.ExecContext(ctx, `ALTER TABLE ? DROP CONSTRAINT ?, ADD CONSTRAINT ?
+			CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown', 'terminated'))`,
+			bun.Ident(table), bun.Ident(constraint), bun.Ident(constraint)); err != nil {
+			t.Fatalf("extend fixture status vocabulary: %v", err)
+		}
+	}
 
 	bucket := seedBucket(t, db, "unrecognized-status")
 	local := seedStorageDataSet(t, db, bucket.ID, "101", "1001", model.StorageDataSetStatusReady)

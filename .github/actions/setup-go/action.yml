@@ -1,5 +1,37 @@
 name: Set up Go
-description: Install the repository Go version and cache modules separately from compiled packages.
+description: Install Go and resolve environment-aware cache keys without restoring or saving caches.
+inputs:
+  profile:
+    description: Compiled package profile (normal or race).
+    default: normal
+  writer:
+    description: Job that owns the compiled package cache.
+    default: ${{ github.job }}
+  production-ui:
+    description: Include production UI inputs in the compiled package cache key.
+    default: 'false'
+  node-version:
+    description: Node version used by the production UI build.
+    default: '22'
+  pnpm-version:
+    description: pnpm version used by the production UI build.
+    default: '11.1.2'
+outputs:
+  gocache:
+    description: Compiled Go package cache directory.
+    value: ${{ steps.keys.outputs.gocache }}
+  gomodcache:
+    description: Downloaded Go module cache directory.
+    value: ${{ steps.keys.outputs.gomodcache }}
+  build-primary-key:
+    description: Exact compiled package cache key.
+    value: ${{ steps.keys.outputs.build-primary-key }}
+  build-restore-keys:
+    description: Compiled package fallback keys, from the same writer to the same profile.
+    value: ${{ steps.keys.outputs.build-restore-keys }}
+  modules-primary-key:
+    description: Exact module cache key.
+    value: ${{ steps.keys.outputs.modules-primary-key }}
 runs:
   using: composite
   steps:
@@ -8,37 +40,20 @@ runs:
         go-version-file: go.mod
         cache: false
 
-    - name: Resolve Go cache paths
-      id: paths
+    - name: Resolve Go cache paths and keys
+      id: keys
       shell: bash
+      env:
+        CACHE_PROFILE: ${{ inputs.profile }}
+        CACHE_WRITER: ${{ inputs.writer }}
+        CACHE_PRODUCTION_UI: ${{ inputs.production-ui }}
+        CACHE_NODE_VERSION: ${{ inputs.node-version }}
+        CACHE_PNPM_VERSION: ${{ inputs.pnpm-version }}
       run: |
-        echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
-        echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
-        echo "goversion=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
-
-    - name: Cache Go modules
-      id: modules
-      uses: actions/cache@v5
-      with:
-        path: ${{ steps.paths.outputs.gomodcache }}
-        key: go-modules-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}
-
-    - name: Restore existing Go cache
-      if: steps.modules.outputs.cache-hit != 'true'
-      uses: actions/cache/restore@v5
-      with:
-        path: |
-          ${{ steps.paths.outputs.gocache }}
-          ${{ steps.paths.outputs.gomodcache }}
-        key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}
-        restore-keys: |
-          go-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-
-
-    - name: Cache compiled Go packages
-      uses: actions/cache@v5
-      with:
-        path: ${{ steps.paths.outputs.gocache }}
-        key: go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ hashFiles('cmd/**/*.go', 'internal/**/*.go', 'ui/*.go', 'ui/src/**', 'ui/pnpm-lock.yaml', 'go.mod', 'Makefile', '.github/actions/setup-go/action.yml', '.github/workflows/ci.yml', '.github/workflows/s3-compatibility.yml') }}
-        restore-keys: |
-          go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}-${{ github.job }}-
-          go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.goversion }}-${{ hashFiles('go.sum') }}-
+        python3 scripts/go_cache_key.py \
+          --profile "$CACHE_PROFILE" \
+          --writer "$CACHE_WRITER" \
+          --production-ui "$CACHE_PRODUCTION_UI" \
+          --node-version "$CACHE_NODE_VERSION" \
+          --pnpm-version "$CACHE_PNPM_VERSION" \
+          --github-output "$GITHUB_OUTPUT"

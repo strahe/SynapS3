@@ -22,6 +22,8 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 		mustRejectStatement(t, db, `UPDATE buckets SET provider_selection_strategy = 'unknown' WHERE id = ?`, bucketID)
+		mustRejectStatement(t, db, `UPDATE buckets SET status = 'invalid' WHERE id = ?`, bucketID)
+		mustRejectStatement(t, db, `UPDATE bucket_replica_slots SET status = 'invalid' WHERE bucket_id = ? AND copy_index = 0`, bucketID)
 
 		for _, checksum := range []string{
 			"",
@@ -111,6 +113,7 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			RETURNING id`, contentID, bucketID, dataSetID).Scan(&cleanupID); err != nil {
 			t.Fatalf("insert cleanup copy: %v", err)
 		}
+		mustRejectStatement(t, db, `UPDATE storage_cleanup_copies SET status = 'invalid' WHERE id = ?`, cleanupID)
 		mustRejectStatement(t, db, `UPDATE storage_cleanup_copies
 			SET status = 'delete_scheduled', delete_tx_hash = 'delete-tx' WHERE id = ?`, cleanupID)
 		mustRejectStatement(t, db, `UPDATE storage_cleanup_copies
@@ -120,6 +123,18 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			WHERE id = ?`, cleanupID); err != nil {
 			t.Fatalf("schedule valid cleanup copy: %v", err)
 		}
+		if _, err := db.Exec(`INSERT INTO observability_provider_states
+			(provider_id, status, reason_codes, last_checked_at, last_attempt_at, evidence_json)
+			VALUES ('cleanup-provider', 'unknown', '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{}')`); err != nil {
+			t.Fatalf("insert provider observation: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE observability_provider_states SET status = 'invalid' WHERE provider_id = 'cleanup-provider'`)
+		if _, err := db.Exec(`INSERT INTO observability_data_set_states
+			(local_data_set_id, bucket_id, copy_index, provider_id, status, reason_codes, last_checked_at, evidence_json)
+			VALUES (?, ?, 2, 'cleanup-provider', 'unknown', '[]', CURRENT_TIMESTAMP, '{}')`, dataSetID, bucketID); err != nil {
+			t.Fatalf("insert data-set observation: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE observability_data_set_states SET status = 'invalid' WHERE local_data_set_id = ?`, dataSetID)
 
 		taskID := insertSchemaTestTask(t, db, "valid-before-update")
 		mustRejectStatement(t, db, `UPDATE tasks SET claim_generation = -1 WHERE id = ?`, taskID)
@@ -293,6 +308,7 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 			RETURNING id`, bucketA, source, target).Scan(&replacementID); err != nil {
 			t.Fatalf("insert replacement: %v", err)
 		}
+		mustRejectStatement(t, db, `UPDATE storage_replacements SET selection_mode = 'invalid' WHERE id = ?`, replacementID)
 		bucketBTarget := insertSchemaTestDataSet(t, db, bucketB, "303", 0, 2, false)
 		if _, err := db.Exec(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,

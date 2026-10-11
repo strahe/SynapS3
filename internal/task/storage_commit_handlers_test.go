@@ -1267,9 +1267,14 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	f.provider.statusDown = true
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
-	defer stopHandlerEngine(t, cancel, done)
+	defer func() { stopHandlerEngine(t, cancel, done) }()
 
-	waitForCommitTask(t, f.runtime, taskID, func(*model.Task) bool { return f.request(t, requestID).TransactionID != nil })
+	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
+			f.request(t, requestID).TransactionID != nil
+	})
+	// Rewriting fixture history must not race with settlement of the same rows.
+	stopHandlerEngine(t, cancel, done)
 	// The provider accepted the request but its transaction never landed, and
 	// its status endpoint stays down past the attention threshold.
 	legacyStart := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
@@ -1283,6 +1288,7 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("age submission: %v", err)
 	}
+	cancel, done = runHandlerEngine(t, f.runtime)
 	completed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
 	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(legacyStart) {
 		t.Fatalf("registration recovery start = %v, must be after the original submission %v", completed.WorkStartedAt, legacyStart)

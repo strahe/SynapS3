@@ -53,10 +53,9 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// Business-flow tests leave enough lease time for settlement under the race detector.
 const (
-	handlerTestPollInterval  = 25 * time.Millisecond
-	handlerTestLeaseDuration = 5 * time.Second
+	handlerTestPollInterval  = testutil.TaskPollInterval
+	handlerTestLeaseDuration = testutil.TaskLeaseDuration
 )
 
 type handlerTestRuntime struct {
@@ -1224,6 +1223,13 @@ func TestStorageCleanupLeavesUnknownCopyStatusUntouched(t *testing.T) {
 	ctx := t.Context()
 	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
 	unknown := model.StorageCleanupCopyStatus("removal_queued")
+	// A newer schema can admit a status this handler does not recognize.
+	if _, err := runtime.db.ExecContext(ctx, `ALTER TABLE storage_cleanup_copies
+		DROP CONSTRAINT chk_storage_cleanup_copies_status,
+		ADD CONSTRAINT chk_storage_cleanup_copies_status
+		CHECK (status IN ('pending', 'delete_scheduled', 'removed', 'failed', 'unsupported', 'removal_queued'))`); err != nil {
+		t.Fatalf("extend fixture cleanup vocabulary: %v", err)
+	}
 	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
 		Set("status = ?", unknown).Where("content_id = ?", content.ID).Exec(ctx); err != nil {
 		t.Fatalf("store unknown cleanup status: %v", err)

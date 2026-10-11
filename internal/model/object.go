@@ -109,9 +109,7 @@ type ObjectCache struct {
 
 var _ bun.BeforeAppendModelHook = (*Object)(nil)
 
-// BeforeAppendModel stamps the audit columns on insert. The database has no
-// timestamp default, so every row is written with one encoding instead of two
-// that sort against each other inside the same second.
+// BeforeAppendModel fills unset audit timestamps on insert.
 func (o *Object) BeforeAppendModel(_ context.Context, query bun.Query) error {
 	if _, ok := query.(*bun.InsertQuery); !ok {
 		return nil
@@ -128,9 +126,7 @@ func (o *Object) BeforeAppendModel(_ context.Context, query bun.Query) error {
 
 var _ bun.BeforeAppendModelHook = (*ObjectVersion)(nil)
 
-// BeforeAppendModel stamps the audit columns on insert. The database has no
-// timestamp default, so every row is written with one encoding instead of two
-// that sort against each other inside the same second.
+// BeforeAppendModel fills unset audit timestamps on insert.
 func (o *ObjectVersion) BeforeAppendModel(_ context.Context, query bun.Query) error {
 	if _, ok := query.(*bun.InsertQuery); !ok {
 		return nil
@@ -147,9 +143,7 @@ func (o *ObjectVersion) BeforeAppendModel(_ context.Context, query bun.Query) er
 
 var _ bun.BeforeAppendModelHook = (*ObjectCache)(nil)
 
-// BeforeAppendModel stamps the audit columns on insert. The database has no
-// timestamp default, so every row is written with one encoding instead of two
-// that sort against each other inside the same second.
+// BeforeAppendModel fills unset audit timestamps on insert.
 func (o *ObjectCache) BeforeAppendModel(_ context.Context, query bun.Query) error {
 	if _, ok := query.(*bun.InsertQuery); !ok {
 		return nil

@@ -56,6 +56,58 @@ WHERE id = (
 AND status = 'pending' AND available_at <= ?
 RETURNING *`
 
+// Type/time bounds keep each head lookup aligned with the type-leading index;
+// ordering only by time can repeatedly scan an excluded type's older tasks.
+const filteredTaskCandidatePostgresSQL = `WITH RECURSIVE task_types(type) AS (
+    (SELECT type FROM tasks WHERE status = '%[1]s' ORDER BY type, %[2]s, id LIMIT 1)
+    UNION ALL
+    SELECT next_type.type
+    FROM task_types AS previous_type
+    CROSS JOIN LATERAL (
+        SELECT type FROM tasks
+        WHERE status = '%[1]s' AND type > previous_type.type
+        ORDER BY type, %[2]s, id LIMIT 1
+    ) AS next_type
+), allowed_types AS MATERIALIZED (
+    SELECT type FROM task_types WHERE type NOT IN (?)
+)
+SELECT candidate.id, candidate.type, candidate.claim_generation,
+       candidate.%[2]s AS ordering_time
+FROM allowed_types
+CROSS JOIN LATERAL (
+    SELECT id, type, claim_generation, %[2]s FROM tasks
+    WHERE status = '%[1]s'
+      AND (type, %[2]s) >= (allowed_types.type, '-infinity'::timestamptz)
+      AND (type, %[2]s) <= (allowed_types.type, ?)%[3]s
+    ORDER BY type, %[2]s, id LIMIT 1
+) AS candidate
+ORDER BY candidate.%[2]s, candidate.id LIMIT 1`
+
+const claimTaskCandidatePostgresSQL = `UPDATE tasks
+SET status = 'running',
+    %[1]sclaim_generation = claim_generation + 1,
+    claimed_at = ?,
+    lease_until = ?,
+    started_at = COALESCE(started_at, ?),
+    finished_at = NULL,
+    wait_reason = NULL,
+    status_message = NULL,
+    updated_at = ?
+WHERE id = (
+    SELECT id FROM tasks
+    WHERE id = ? AND type = ? AND status = '%[2]s'
+      AND claim_generation = ? AND %[3]s = ? AND %[3]s <= ?
+    FOR NO KEY UPDATE SKIP LOCKED
+)
+RETURNING *`
+
+type taskClaimCandidate struct {
+	ID              int64
+	Type            model.TaskType
+	ClaimGeneration int64
+	OrderingTime    time.Time
+}
+
 // BunTaskRepo is the persistence boundary used by TaskService and Engine.
 type BunTaskRepo struct {
 	db bun.IDB
@@ -101,7 +153,55 @@ func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration
 }
 
 func (r *BunTaskRepo) claimNextPostgres(ctx context.Context, db bun.IDB, leaseDuration time.Duration, filter TaskClaimFilter) (*model.Task, error) {
+	if len(filter.ExcludedTypes) > 0 {
+		selectionNow := time.Now()
+		task, err := claimFilteredTask(ctx, db, leaseDuration, filter, selectionNow, model.TaskStatusRunning, "lease_until")
+		if err != nil || task != nil {
+			return task, err
+		}
+		return claimFilteredTask(ctx, db, leaseDuration, filter, selectionNow, model.TaskStatusPending, "available_at")
+	}
 	return claimNextTask(ctx, db, leaseDuration, filter, claimExpiredTaskPostgresSQL, claimPendingTaskPostgresSQL)
+}
+
+func claimFilteredTask(ctx context.Context, db bun.IDB, leaseDuration time.Duration, filter TaskClaimFilter, selectionNow time.Time, status model.TaskStatus, orderingColumn string) (*model.Task, error) {
+	excludedIDs := slices.Clone(filter.ExcludedTaskIDs)
+	resumeAssignment := ""
+	if status == model.TaskStatusRunning {
+		resumeAssignment = "resume_mode = 'recover',\n    "
+	}
+	claimSQL := fmt.Sprintf(claimTaskCandidatePostgresSQL, resumeAssignment, status, orderingColumn)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conditions := ""
+		args := []any{bun.List(filter.ExcludedTypes), selectionNow}
+		if len(excludedIDs) > 0 {
+			conditions = " AND id NOT IN (?)"
+			args = append(args, bun.List(excludedIDs))
+		}
+		var candidate taskClaimCandidate
+		err := db.NewRaw(fmt.Sprintf(filteredTaskCandidatePostgresSQL, status, orderingColumn, conditions), args...).Scan(ctx, &candidate)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("selecting next task: %w", err)
+		}
+		claimNow := time.Now()
+		task := new(model.Task)
+		err = db.NewRaw(claimSQL, claimNow, claimNow.Add(leaseDuration), claimNow, claimNow,
+			candidate.ID, candidate.Type, candidate.ClaimGeneration, candidate.OrderingTime, selectionNow).Scan(ctx, task)
+		if err == nil {
+			return task, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("claiming next task: %w", err)
+		}
+		// A locked or changed head must not hide its type's next eligible task.
+		excludedIDs = append(excludedIDs, candidate.ID)
+	}
 }
 
 func claimNextTask(

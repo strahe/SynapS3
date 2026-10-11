@@ -703,10 +703,17 @@ func (r *BunStorageReplacementRepo) RecordAbandonedTerminationEpoch(
 			TxHash:                   nullableString(input.TxHash),
 			Epoch:                    input.Epoch,
 		}
-		if _, err := db.NewInsert().Model(termination).Exec(ctx); err == nil {
-			return nil
-		} else if !isUniqueViolation(err) {
+		result, err := db.NewInsert().Model(termination).
+			On("CONFLICT (replacement_id, role) DO NOTHING").Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("reading abandoned target termination insertion: %w", err)
+		}
+		if inserted == 1 {
+			return nil
 		}
 		// A crash after the transaction was paid for replays with the same
 		// epoch; anything else is a genuine conflict.

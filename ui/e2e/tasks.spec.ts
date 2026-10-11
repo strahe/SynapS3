@@ -381,7 +381,9 @@ test('an unfinished subject read survives overlay switching and cancels after it
   await expect(page.getByRole('tooltip')).toHaveCount(1)
   await expect(page.getByRole('tooltip').getByText('Loading…', { exact: true })).toBeVisible()
   expect(await state()).toEqual({ requests: 1, aborted: 0 })
-  await page.mouse.move(1000, 100, { steps: 5 })
+  await page.mouse.move(0, 0)
+  // A subsequent move leaves the hoverable tooltip's pointer grace area.
+  await page.getByRole('heading', { name: 'Tasks', exact: true }).hover()
   await expect(page.getByRole('tooltip')).toHaveCount(0)
   expect(await state()).toEqual({ requests: 1, aborted: 0 })
   await page.keyboard.press('Escape')

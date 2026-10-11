@@ -705,8 +705,20 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 			if marker == nil {
 				q = q.Where(keyComparisonSQL("object_version.key", ">"), keyMarker)
 			} else {
-				q = q.Where("("+keyComparisonSQL("object_version.key", ">")+") OR ("+keyComparisonSQL("object_version.key", "=")+" AND (object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?)))",
-					keyMarker, keyMarker, marker.CreatedAt, marker.CreatedAt, marker.VersionID)
+				sameKey := q.Clone().
+					Where(keyComparisonSQL("object_version.key", "="), keyMarker).
+					Where("(object_version.created_at, object_version.version_id) < (?, ?)", marker.CreatedAt, marker.VersionID)
+				laterKeys := q.Clone().Where(keyComparisonSQL("object_version.key", ">"), keyMarker)
+				if maxKeys > 0 {
+					sameKey = sameKey.Limit(int64(maxKeys))
+					laterKeys = laterKeys.Limit(int64(maxKeys))
+				}
+				q = r.db.NewSelect().Model(&rows).
+					ModelTableExpr("(?) AS object_version", sameKey.UnionAll(laterKeys)).
+					ColumnExpr("object_version.*").
+					OrderExpr(keyExpr + " ASC").
+					OrderExpr("object_version.created_at DESC").
+					OrderExpr("object_version.version_id DESC")
 			}
 		}
 	}
@@ -736,8 +748,7 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 			return nil, err
 		}
 		if marker != nil {
-			q = q.Where("(object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?))",
-				marker.CreatedAt, marker.CreatedAt, marker.VersionID)
+			q = q.Where("(object_version.created_at, object_version.version_id) < (?, ?)", marker.CreatedAt, marker.VersionID)
 		}
 	}
 	if maxKeys > 0 {

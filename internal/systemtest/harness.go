@@ -24,6 +24,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testpg"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -130,8 +131,8 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	cfg.Filecoin.Observability.Concurrency = 3
 	cfg.Worker.Tasks = config.TaskWorkerConfig{
 		Concurrency:       4,
-		PollInterval:      15 * time.Millisecond,
-		LeaseDuration:     time.Second,
+		PollInterval:      testutil.TaskPollInterval,
+		LeaseDuration:     testutil.TaskLeaseDuration,
 		UploadConcurrency: 4,
 		CommitMaxPieces:   config.DefaultCommitMaxPieces,
 		// Uploads made together still register together, without the

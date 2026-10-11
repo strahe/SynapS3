@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -12,10 +13,28 @@ import (
 )
 
 func TestTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T) {
-	assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, testDB(t))
+	for _, transaction := range []bool{false, true} {
+		name := "pool"
+		if transaction {
+			name = "transaction"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := testDB(t)
+			if transaction {
+				if err := db.RunInTx(t.Context(), nil, func(_ context.Context, tx bun.Tx) error {
+					assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, tx)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t, db)
+			}
+		})
+	}
 }
 
-func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db *bun.DB) {
+func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db bun.IDB) {
 	t.Helper()
 	repos := repository.NewRepositories(db)
 	now := time.Now().UTC().Truncate(time.Microsecond)

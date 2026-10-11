@@ -90,6 +90,78 @@ func TestPostgresPrefixPlan(t *testing.T) {
 		t.Fatalf("storage risk versions = %#v, want %s", riskPage.Versions, riskVersionID)
 	}
 	assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.match(t, `ORDER BY object_version.key COLLATE "C" ASC`))
+
+	t.Run("deep version cursors", func(t *testing.T) {
+		current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "prefix/00015000.txt")
+		if err != nil || current == nil || current.ContentID == nil {
+			t.Fatalf("deep-page current version = %#v, err=%v", current, err)
+		}
+		base := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+		if _, err := db.ExecContext(ctx, `INSERT INTO object_versions
+			(version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type, is_delete_marker, created_at, updated_at)
+			SELECT 'pg-version-deep-' || lpad(value::text, 6, '0'), ?, ?, ?, ?, 10, 'etag', 'text/plain', FALSE,
+			?::timestamptz + (value / 2) * interval '1 second', ?
+			FROM generate_series(1, 4096) AS series(value)`, current.ObjectID, bucket.ID, current.Key, *current.ContentID, base, base); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "ANALYZE object_versions"); err != nil {
+			t.Fatal(err)
+		}
+		for _, marker := range []int{512, 16} {
+			t.Run(fmt.Sprintf("after-%d", marker), func(t *testing.T) {
+				markerID := fmt.Sprintf("pg-version-deep-%06d", marker)
+				capture.reset()
+				byKey, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, current.Key, markerID, 16)
+				wantLength := min(marker-1, 16)
+				if err != nil || len(byKey) != wantLength {
+					t.Fatalf("deep key page = %#v, err=%v, want %d versions", byKey, err, wantLength)
+				}
+				for i, version := range byKey {
+					if wantID := fmt.Sprintf("pg-version-deep-%06d", marker-i-1); version.VersionID != wantID {
+						t.Fatalf("key page version %d = %s, want %s", i, version.VersionID, wantID)
+					}
+				}
+				keyConditions := planIndexConditions(explainPostgresPlan(t, db, capture.last(t)), "idx_object_versions_bucket_key_created")
+				assertVersionTupleIndexCondition(t, keyConditions)
+
+				capture.reset()
+				byBucket, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", current.Key, markerID, 16)
+				if err != nil || len(byBucket) != 16 {
+					t.Fatalf("deep bucket page = %#v, err=%v", byBucket, err)
+				}
+				for i := range wantLength {
+					version := byBucket[i]
+					if version.VersionID != byKey[i].VersionID || version.IsCurrent || version.Checksum != current.Checksum || version.State != current.State || version.InCache != current.InCache {
+						t.Fatalf("bucket version %d = %#v, want projected key-page version %s", i, version, byKey[i].VersionID)
+					}
+				}
+				if wantLength < 16 && (byBucket[15].Key != "prefix/00015001.txt" || !byBucket[15].IsCurrent) {
+					t.Fatalf("bucket page did not continue to the next key: %#v", byBucket[15])
+				}
+				bucketConditions := planIndexConditions(explainPostgresPlan(t, db, capture.last(t)), "idx_object_versions_bucket_key_created")
+				assertVersionTupleIndexCondition(t, bucketConditions)
+				hasLaterKeyRange := false
+				for _, condition := range bucketConditions {
+					if strings.Contains(condition, "key") && strings.Contains(condition, current.Key) && strings.Contains(condition, " > ") {
+						hasLaterKeyRange = true
+					}
+				}
+				if !hasLaterKeyRange {
+					t.Fatalf("later keys do not have an index lower bound: %v", bucketConditions)
+				}
+			})
+		}
+	})
+}
+
+func assertVersionTupleIndexCondition(t *testing.T, conditions []string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if strings.Contains(condition, "ROW(") && strings.Contains(condition, "created_at") && strings.Contains(condition, "version_id") && strings.Contains(condition, " < ") {
+			return
+		}
+	}
+	t.Fatalf("version cursor is not an index condition: %v", conditions)
 }
 
 func seedPostgresPrefixObjects(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64) {
