@@ -335,6 +335,8 @@ func (c *ReadinessChecker) checkStorage(
 		message := fmt.Sprintf("Only %d eligible providers are available; %d copies are configured.", len(selected), cfg.DefaultCopies)
 		if errors.Is(selectErr, providerselect.ErrNoTrustedProvider) {
 			message = "No healthy provider meets the configured provider requirement."
+		} else if errors.Is(selectErr, providerselect.ErrCandidatesTemporarilyUnavailable) {
+			message = "Storage providers are temporarily unavailable or need refreshed health information."
 		}
 		result.blocked("providers", message, "Review provider availability and the configured provider requirement.")
 		addStorageDependencyUnknowns(result, "Storage cost estimate needs enough eligible providers.", "Payment funding needs a storage cost estimate.", "FWSS approval needs a storage cost estimate.")

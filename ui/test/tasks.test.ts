@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import type { TaskItem, TaskPolicy } from '../src/api/client.ts'
 import { APIError } from '../src/api/client.ts'
 import {
   taskDetailsView,
   taskRetryErrorMessage,
+  taskRetryPolicyView,
   taskStatusesForScope,
   taskSubjectFields,
   taskSubjectLabel,
@@ -15,6 +17,49 @@ test('Retry explains a rejected recovery without exposing server diagnostics', (
   for (const error of [new APIError('private database diagnostics', 500), new Error('fetch failed'), null]) {
     assert.equal(taskRetryErrorMessage(error), 'Could not retry. Refresh and try again.')
   }
+})
+
+test('retry policy distinguishes stopped tasks from available automatic retries and counts scheduled retries', () => {
+  const policy: TaskPolicy = {
+    max_attempts: 6,
+    initial_delay: '1s',
+    maximum_delay: '1m',
+    multiplier: 2,
+    jitter: 0,
+    invocation_timeout: '1m',
+    observation_window: '0s',
+  }
+  const task = {
+    status: 'running' as TaskItem['status'],
+    retry_count: 0,
+    available_at: '2026-10-11T01:00:00Z',
+  }
+  for (const [status, retry_count, failure_reason, expected] of [
+    ['pending', 0, undefined, '5 remaining'],
+    ['running', 2, undefined, '3 remaining'],
+    ['failed', 0, 'provider_unavailable', 'Stopped'],
+    ['failed', 5, 'attempts_exhausted', 'Limit reached'],
+    ['completed', 2, undefined, 'Finished'],
+    ['cancelled', 1, undefined, 'Cancelled'],
+  ] as const) {
+    const view = taskRetryPolicyView({ ...task, status, retry_count, failure_reason }, policy)
+    assert.equal(view.attemptLimit, '6')
+    assert.equal(view.retriesScheduled, `${retry_count} / 5`)
+    assert.equal(view.status, expected)
+    assert.equal(view.nextRetryAt, undefined)
+  }
+  const pending = { ...task, status: 'pending' as const, retry_count: 1, failure_reason: 'provider_unavailable' }
+  assert.equal(taskRetryPolicyView(pending, policy).nextRetryAt, task.available_at)
+  assert.equal(taskRetryPolicyView({ ...pending, wait_reason: 'storage_pending' }, policy).nextRetryAt, undefined)
+  assert.equal(taskRetryPolicyView({ ...pending, retry_count: 0 }, policy).nextRetryAt, undefined)
+  assert.equal(taskRetryPolicyView(task, { ...policy, max_attempts: 1 }).status, 'Disabled')
+  assert.deepEqual(taskRetryPolicyView(task, { ...policy, max_attempts: null }), {
+    attemptLimit: 'Unknown',
+    retriesScheduled: 'Unknown',
+    status: 'Unknown',
+    nextRetryAt: undefined,
+  })
+  assert.equal(taskRetryPolicyView(task, policy).retriesScheduled, '0 / 5')
 })
 
 test('Details shows current progress and keeps earlier errors separate', () => {

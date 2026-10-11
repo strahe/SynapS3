@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Database, Gauge, Loader2 } from 'lucide-react'
+import { Database } from 'lucide-react'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation, ProviderProfile } from '@/api/client'
 import { CopyableValue, OptionalCopyableValue } from '@/components/app/CopyableValue'
 import { CursorPagination } from '@/components/app/CursorPagination'
@@ -9,16 +9,15 @@ import {
   RowDetailsButton,
   tableHeaderRowClassName,
 } from '@/components/app/DataTable'
+import { ProviderUploadSpeedButton } from '@/components/app/ProviderUploadSpeedButton'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
-import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { activePiecesValue } from '@/lib/data-set-storage-health'
 import { providerDisplayName, providerLocationLabel, providerRegistryLabel } from '@/lib/provider-display'
-import { canTestProviderUploadSpeed } from '@/lib/provider-upload-speed'
 import { replicaLabel } from '@/lib/storage-status-labels'
 import {
   dataSetChainIDValue,
@@ -189,26 +188,8 @@ function ProviderHealthCell({
       <div>
         {test?.retryable ? (
           <RetryButton taskID={test.retry_task_id} />
-        ) : testing ? (
-          <Button variant="ghost" size="icon-xs" disabled aria-label={`Testing upload speed for ${name}`}>
-            <Loader2 className="animate-spin" />
-          </Button>
         ) : (
-          canTestProviderUploadSpeed(row.provider) && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={`Test upload speed for ${name} (32 MiB)`}
-                  onClick={onTest}
-                >
-                  <Gauge />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Test upload speed with 32 MiB</TooltipContent>
-            </Tooltip>
-          )
+          <ProviderUploadSpeedButton provider={row.provider} name={name} starting={starting} compact onTest={onTest} />
         )}
       </div>
       <UploadSpeedText test={test} testing={testing} hideUntested />

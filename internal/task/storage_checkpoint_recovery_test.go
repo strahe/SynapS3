@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -80,6 +81,202 @@ func seedStoreCheckpoint(t *testing.T, runtime handlerTestRuntime, taskID, copyI
 	}
 	if _, err := runtime.db.NewRaw(`UPDATE storage_copies SET ingress_store_attempt = 1 WHERE id = ?`, copyID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStorePreparationFailuresRetainCheckpointAndRetry(t *testing.T) {
+	for _, failure := range []string{"cache open", "cache calculation", "cache close", "upload reader", "claim check", "effect admission"} {
+		for _, persistent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/persistent=%v", failure, persistent), func(t *testing.T) {
+				payload := strings.Repeat("r", 128)
+				var ready atomic.Bool
+				var cacheOpens, stores atomic.Int64
+				fault := errors.New("temporary Store preparation failure")
+				cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+					open := cacheOpens.Add(1)
+					if failure == "cache open" || failure == "upload reader" && open%2 == 0 {
+						return nil, nil, fault
+					}
+					if failure == "cache calculation" {
+						return &storeFaultReader{readErr: fault}, &cache.ObjectInfo{Size: 128}, nil
+					}
+					if failure == "cache close" {
+						return &storeFaultReader{Reader: strings.NewReader(payload), closeErr: fault}, &cache.ObjectInfo{Size: 128}, nil
+					}
+					return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: 128}, nil
+				}}
+				parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+					if ready.Load() {
+						return synapse.ParkedPieceReady, nil
+					}
+					return synapse.ParkedPieceMissing, nil
+				})
+				target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+					stores.Add(1)
+					return nil, errors.New("unexpected Store call")
+				}}
+				runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
+				row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+				seedStoreCheckpoint(t, runtime, row.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), time.Now())
+				if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = 'execute' WHERE id = ?`, row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				before, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				baseTasks := runtime.repos.Tasks
+				if failure == "claim check" {
+					failing := &validateFailureRepository{TaskRepository: baseTasks, err: fault}
+					failing.remaining.Store(10)
+					runtime.repos.Tasks = failing
+				}
+				restoreAdmission := func() {}
+				if failure == "effect admission" {
+					restoreAdmission = testutil.FailWrites(t, runtime.db, "tasks", "UPDATE OF checkpoint_json", fmt.Sprintf("NEW.id = %d", row.ID), fault.Error())
+				}
+				if !persistent {
+					runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
+				}
+				cancel, done := runHandlerEngine(t, runtime)
+				t.Cleanup(func() { stopHandlerEngine(t, cancel, done) })
+				observed := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool {
+					if persistent {
+						return task.Status == model.TaskStatusFailed
+					}
+					return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.ResumeMode == model.TaskResumeModeRecover
+				})
+				if !testutil.JSONEqual(observed.Checkpoint, before.Checkpoint) || observed.LastError == nil || stores.Load() != 0 {
+					t.Fatalf("preparation failure lost evidence or sent bytes: task=%#v stores=%d", observed, stores.Load())
+				}
+				copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+				if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.IngressStoreAttempt != 1 || copyRow.IngressBytesTransferred != 0 {
+					t.Fatalf("preparation failure changed copy ownership or progress: copy=%#v err=%v", copyRow, err)
+				}
+				if persistent {
+					if observed.FailureReason == nil || *observed.FailureReason != "attempts_exhausted" || observed.RetryCount != 2 {
+						t.Fatalf("preparation failure bypassed retry budget: %#v", observed)
+					}
+					restoreAdmission()
+					return
+				}
+				stopHandlerEngine(t, cancel, done)
+				restoreAdmission()
+				runtime.repos.Tasks = baseTasks
+				ready.Store(true)
+				opensBeforeRecovery := cacheOpens.Load()
+				cancel, done = runHandlerEngine(t, runtime)
+				completed := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+				if completed.RetryCount != 1 || stores.Load() != 0 || cacheOpens.Load() != opensBeforeRecovery {
+					t.Fatalf("recovery did not confirm the existing piece: task=%#v stores=%d cache_opens=%d", completed, stores.Load(), cacheOpens.Load())
+				}
+			})
+		}
+	}
+}
+
+type storeFaultReader struct {
+	io.Reader
+	readErr  error
+	closeErr error
+}
+
+func (r *storeFaultReader) Read(p []byte) (int, error) {
+	if r.readErr != nil {
+		return 0, r.readErr
+	}
+	return r.Reader.Read(p)
+}
+
+func (r *storeFaultReader) Close() error { return r.closeErr }
+
+func TestStoreReadyCheckpointWriteFailureRetriesWithoutSending(t *testing.T) {
+	payload := strings.Repeat("q", 128)
+	var stores, checks atomic.Int64
+	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+		return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: 128}, nil
+	}}
+	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+		checks.Add(1)
+		return synapse.ParkedPieceReady, nil
+	})
+	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+		stores.Add(1)
+		return nil, errors.New("unexpected Store call")
+	}}
+	runtime, pipeline, _ := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
+	row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+	if _, err := runtime.db.NewRaw(`UPDATE storage_copies SET ingress_store_attempt = 1 WHERE id = ?`, pipeline.target.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restore := testutil.FailWrites(t, runtime.db, "tasks", "UPDATE OF checkpoint_json", fmt.Sprintf("NEW.id = %d", row.ID), "temporary checkpoint write failure")
+	baseTasks := runtime.repos.Tasks
+	runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: baseTasks, maximum: 1}
+	cancel, done := runHandlerEngine(t, runtime)
+	t.Cleanup(func() { stopHandlerEngine(t, cancel, done) })
+	retrying := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if len(retrying.Checkpoint) != 0 || stores.Load() != 0 || checks.Load() != 1 {
+		t.Fatalf("Ready write failure = task:%#v stores:%d checks:%d", retrying, stores.Load(), checks.Load())
+	}
+	stopHandlerEngine(t, cancel, done)
+	restore()
+	runtime.repos.Tasks = baseTasks
+	cancel, done = runHandlerEngine(t, runtime)
+	completed := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	if completed.RetryCount != 1 || len(completed.Checkpoint) == 0 || stores.Load() != 0 || checks.Load() < 2 {
+		t.Fatalf("Ready write recovery = task:%#v stores:%d checks:%d", completed, stores.Load(), checks.Load())
+	}
+}
+
+func TestStoreAdmissionStopsWithoutRecoveryEvidenceOrWithConflictingOperation(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("conflicting operation=%v", conflict), func(t *testing.T) {
+			payload := strings.Repeat("u", 128)
+			var stores atomic.Int64
+			cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+				return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: 128}, nil
+			}}
+			parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+				return synapse.ParkedPieceMissing, nil
+			})
+			target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+				stores.Add(1)
+				return nil, errors.New("unexpected Store call")
+			}}
+			runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, cacheStore, target)
+			row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+			if conflict {
+				seedStoreCheckpoint(t, runtime, row.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), time.Now())
+				raw, err := json.Marshal(map[string]any{"operation_key": "store:another-piece", "operation_started_at": time.Now()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = 'execute', runtime_json = ? WHERE id = ?`, json.RawMessage(raw), row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := runtime.db.NewRaw(`UPDATE storage_copies SET ingress_store_attempt = 1 WHERE id = ?`, pipeline.target.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				testutil.FailWrites(t, runtime.db, "tasks", "UPDATE OF checkpoint_json", fmt.Sprintf("NEW.id = %d", row.ID), "temporary checkpoint write failure")
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			failed := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
+			wantReason := "store_checkpoint_write_failed"
+			if conflict {
+				wantReason = "store_checkpoint_conflict"
+			}
+			if failed.FailureReason == nil || *failed.FailureReason != wantReason || failed.RetryCount != 0 || stores.Load() != 0 || (len(failed.Checkpoint) != 0) != conflict {
+				t.Fatalf("unsafe admission retried or sent bytes: task=%#v stores=%d", failed, stores.Load())
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.IngressStoreAttempt != 1 || copyRow.IngressBytesTransferred != 0 {
+				t.Fatalf("unsafe admission lost ownership or progress: copy=%#v err=%v", copyRow, err)
+			}
+		})
 	}
 }
 

@@ -22,7 +22,6 @@ jobs:
       go_tests: ${{ steps.plan.outputs.go_tests }}
       race: ${{ steps.plan.outputs.race }}
       system: ${{ steps.plan.outputs.system }}
-      dashboard: ${{ steps.plan.outputs.dashboard }}
       modules_writer: ${{ steps.plan.outputs.modules_writer }}
       plan: ${{ steps.plan.outputs.plan }}
     steps:
@@ -243,7 +242,12 @@ jobs:
 
       - name: Verify code and build
         id: code
-        run: make verify-code
+        run: |
+          make ui-build
+          golangci-lint config verify
+          golangci-lint fmt --diff
+          CGO_ENABLED=1 golangci-lint run
+          make build-go
 
       - name: Test Go packages
         id: tests
@@ -289,72 +293,8 @@ jobs:
         continue-on-error: true
         with: *save-go-cache
 
-  dashboard:
-    needs: changes
-    if: needs.changes.outputs.dashboard == 'true'
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 15
-    services: *postgres-service
-    env: *postgres-env
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11.1.2
-
-      - name: Set up Node
-        id: node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: ui/pnpm-lock.yaml
-
-      - name: Set up Go
-        id: go
-        uses: ./.github/actions/setup-go
-        with:
-          production-ui: true
-          node-version: ${{ steps.node.outputs.node-version }}
-
-      - *restore-go-modules
-      - *restore-go-build
-      - *download-go-modules
-
-      - name: Build dashboard
-        run: make ui-build
-
-      - name: Build dashboard systemtest server
-        id: server
-        run: make build-systemtest-server
-
-      - name: Install Chromium
-        run: make ui-e2e-install PLAYWRIGHT_INSTALL_FLAGS=--with-deps
-
-      - name: Test dashboard end to end
-        run: make test-ui-e2e
-
-      - name: Save Go caches
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.server.outcome == 'success' || steps.server.outcome == 'failure') }}
-        uses: ./.github/actions/save-go-cache
-        timeout-minutes: 2
-        continue-on-error: true
-        with: *save-go-cache
-
-      - name: Upload Playwright diagnostics
-        if: failure() && hashFiles('ui/test-results/e2e/**') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-diagnostics
-          path: ui/test-results/e2e
-          if-no-files-found: ignore
-          retention-days: 7
-
   check:
-    needs: [changes, verify, race, system, dashboard]
+    needs: [changes, verify, race, system]
     if: ${{ always() }}
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 5

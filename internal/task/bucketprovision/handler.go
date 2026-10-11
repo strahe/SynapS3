@@ -145,13 +145,20 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 
 		selected, err := h.deps.Selector.SelectBucketBindings(ctx, bucket, required)
 		if err != nil {
-			if errors.Is(err, providerselect.ErrNoTrustedProvider) {
-				return taskengine.Fail(providerselect.ErrNoTrustedProvider, "required_provider_unavailable", nil)
+			if bindingtask.SelectionNeedsWait(err) {
+				return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", bindingtask.SelectionWaitSettlement(execution.ID(), err))
+			}
+			settlement := bindingtask.SelectionSettlement(execution.ID(), err)
+			if errors.Is(err, providerselect.ErrCandidatesTemporarilyUnavailable) {
+				return taskengine.RetryBackoff(h.logStorageDependencyFailure(ctx, execution, "providers", err), "provider_selection_unavailable", settlement).WithResumeMode(model.TaskResumeModeExecute).WithMinimumDelay(storageDependencyWait)
+			}
+			if errors.Is(err, providerselect.ErrNoTrustedProvider) && !bindingtask.SelectionFailed(err) {
+				return taskengine.Fail(err, "required_provider_unavailable", settlement)
 			}
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
 				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
-			return retryTask(err, "storage_selection_failed")
+			return taskengine.RetryBackoff(synapse.SummarizedError(err), "storage_selection_failed", settlement)
 		}
 		if len(selected) < required {
 			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
@@ -263,9 +270,13 @@ func (h *Handler) effectiveBucketCopies(bucket *model.Bucket) int {
 }
 
 func (h *Handler) waitForStorageDependency(ctx context.Context, execution taskengine.Execution, reason, message string, err error) taskengine.Result {
-	if synapse.IsProviderCandidateWait(err) {
-		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, reason, message, nil)
+	if synapse.IsProviderCandidateWait(err) && !bindingtask.SelectionFailed(err) {
+		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, reason, message, bindingtask.SelectionWaitSettlement(execution.ID(), err))
 	}
+	return taskengine.RetryInMode(h.logStorageDependencyFailure(ctx, execution, reason, err), reason, model.TaskResumeModeExecute, storageDependencyWait, bindingtask.SelectionSettlement(execution.ID(), err))
+}
+
+func (h *Handler) logStorageDependencyFailure(ctx context.Context, execution taskengine.Execution, reason string, err error) error {
 	summary := synapse.SummarizedError(err)
 	level := slog.LevelWarn
 	if execution.LastError() == summary.Error() {
@@ -273,7 +284,7 @@ func (h *Handler) waitForStorageDependency(ctx context.Context, execution tasken
 	}
 	h.deps.Logger.Log(ctx, level, "storage task waiting for dependency",
 		"task_id", execution.ID(), "task_type", execution.Type(), "wait_reason", reason, "error", summary)
-	return taskengine.RetryInMode(summary, reason, model.TaskResumeModeExecute, storageDependencyWait, nil)
+	return summary
 }
 
 func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {

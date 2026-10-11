@@ -23,11 +23,11 @@ class RoutingTest(unittest.TestCase):
             ("README.md", {"system", "docs"}),
             ("docs/en/reference/s3-compatibility.md", {"system", "docs"}),
             ("docs/zh/reference/s3-compatibility.md", {"system", "docs"}),
-            ("ui/src/main.tsx", {"verify", "dashboard", "docker_image"}),
-            ("ui/package.json", {"verify", "dashboard", "docker_image"}),
-            ("ui/test/tasks.test.ts", {"verify"}),
-            ("ui/e2e/fixtures.ts", {"verify", "dashboard"}),
-            ("ui/playwright.config.ts", {"verify", "dashboard"}),
+            ("ui/src/main.tsx", {"verify", "docker_image"}),
+            ("ui/package.json", {"verify", "docker_image"}),
+            ("ui/test/tasks.test.ts", set()),
+            ("ui/e2e/fixtures.ts", set()),
+            ("ui/playwright.config.ts", set()),
             ("ui/embed.go", core | {"docker_image"}),
             ("ui/embed_dev.go", core | {"docker_image"}),
             ("internal/backend/object.go", core | {"docker_image"}),
@@ -70,8 +70,8 @@ class RoutingTest(unittest.TestCase):
                 self.assertEqual(ci_plan.plan_for_paths([path]), ci_plan.full_plan())
 
     def test_mixed_paths_are_a_union_and_writer_is_scheduled(self):
-        plan = ci_plan.plan_for_paths(["docs/index.md", "ui/e2e/dashboard.spec.ts"])
-        self.assertEqual({flag for flag in ci_plan.FLAGS if plan[flag]}, {"docs", "verify", "dashboard"})
+        plan = ci_plan.plan_for_paths(["docs/index.md", "ui/src/main.tsx"])
+        self.assertEqual({flag for flag in ci_plan.FLAGS if plan[flag]}, {"docs", "verify", "docker_image"})
         self.assertEqual(plan["modules_writer"], "verify")
         self.assertEqual(ci_plan.plan_for_paths(["tests/system/main_test.go"])["modules_writer"], "system")
         self.assertEqual(ci_plan.plan_for_paths(["docs/index.md"])["modules_writer"], "")

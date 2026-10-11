@@ -4,6 +4,7 @@ package providerselect
 import (
 	"errors"
 	"slices"
+	"time"
 
 	"github.com/strahe/synaps3/internal/types"
 )
@@ -44,17 +45,18 @@ func (s Strategy) Valid() bool {
 }
 
 type Candidate struct {
-	ID             types.OnChainID
-	Active         bool
-	HasPDP         bool
-	HasProfile     bool
-	Healthy        bool
-	Fresh          bool
-	ServiceURL     string
-	ProfileURL     string
-	Load           int
-	BytesPerSecond int64
-	TieBreak       uint64
+	ID                   types.OnChainID
+	Active               bool
+	HasPDP               bool
+	HasProfile           bool
+	Healthy              bool
+	Fresh                bool
+	ServiceURL           string
+	ProfileURL           string
+	Load                 int
+	BytesPerSecond       int64
+	TieBreak             uint64
+	ObservationCheckedAt *time.Time
 }
 
 func (c Candidate) IneligibleReason() string {
@@ -78,6 +80,7 @@ func (c Candidate) IneligibleReason() string {
 type Admission struct {
 	Tier       Tier
 	TrustedIDs []types.OnChainID
+	CheckedAt  *time.Time
 }
 
 func (a Admission) Trusted(id types.OnChainID) bool {
@@ -94,22 +97,25 @@ type Inventory struct {
 }
 
 var (
-	ErrNoTrustedProvider    = errors.New("no eligible provider meets the required provider tier")
-	ErrInventoryUnavailable = errors.New("provider selection inventory unavailable")
+	ErrNoTrustedProvider                = errors.New("no eligible provider meets the required provider tier")
+	ErrInventoryUnavailable             = errors.New("provider selection inventory unavailable")
+	ErrCandidatesTemporarilyUnavailable = errors.New("storage providers are temporarily unavailable")
 )
 
 // Select reserves a trusted candidate first when the remaining set needs one.
 // Random values are supplied by the caller; they only break exact ranking ties.
-func Select(in Inventory, strategy Strategy, count int, excluded map[string]bool, hasTrusted bool) ([]Candidate, error) {
+func Select(in Inventory, strategy Strategy, count int, excluded map[string]ExclusionReason, hasTrusted bool) ([]Candidate, error) {
 	if !in.Admission.Tier.Valid() || !strategy.Valid() {
 		return nil, ErrInventoryUnavailable
 	}
-	eligible := make([]Candidate, 0, len(in.Candidates))
-	for _, c := range in.Candidates {
-		if c.IneligibleReason() == "" && !excluded[c.ID.String()] {
-			eligible = append(eligible, c)
-		}
+	if count <= 0 {
+		return []Candidate{}, nil
 	}
+	eligible, diagnostics, kind := inspectSelection(in, count, excluded, hasTrusted)
+	if kind != "" {
+		return nil, &SelectionError{Kind: kind, Diagnostics: diagnostics}
+	}
+	needsTrusted := !in.Admission.Satisfied(hasTrusted)
 	slices.SortFunc(eligible, func(a, b Candidate) int {
 		if strategy == StrategyDistribution {
 			if n := compare(a.Load, b.Load); n != 0 {
@@ -124,15 +130,9 @@ func Select(in Inventory, strategy Strategy, count int, excluded map[string]bool
 		}
 		return compare(a.TieBreak, b.TieBreak)
 	})
-	selected := make([]Candidate, 0, max(count, 0))
-	if count <= 0 {
-		return selected, nil
-	}
-	if !in.Admission.Satisfied(hasTrusted) {
+	selected := make([]Candidate, 0, count)
+	if needsTrusted {
 		i := slices.IndexFunc(eligible, func(c Candidate) bool { return in.Admission.Trusted(c.ID) })
-		if i < 0 {
-			return nil, ErrNoTrustedProvider
-		}
 		selected = append(selected, eligible[i])
 		eligible = slices.Delete(eligible, i, i+1)
 	}

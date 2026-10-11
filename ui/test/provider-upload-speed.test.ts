@@ -7,30 +7,56 @@ import {
   providerUploadSampleSize,
   providerUploadSpeedLabel,
   providerUploadSpeedShortLabel,
+  providerUploadSpeedUnavailableReason,
 } from '../src/lib/provider-upload-speed.ts'
 
 const available: ObservabilityProviderObservation = {
+  upload_speed_testable: true,
   facts: { provider_id: '101', active: true, has_pdp: true, service_url: 'https://provider.example' },
   signal: { status: 'available', level: 'ok', reason_codes: [], freshness: { stale: false, warnings: [] } },
 }
 
-test('upload speed action requires a fresh available provider and no active test', () => {
+test('upload speed actions follow server eligibility and explain unavailable or unknown providers', () => {
   assert.equal(canTestProviderUploadSpeed(available), true)
   assert.equal(
     canTestProviderUploadSpeed({ ...available, upload_speed_test: { state: 'testing', sample_bytes: 32 << 20 } }),
     false
   )
+  for (const reason of [
+    'Health information is out of date. Refresh this provider.',
+    'The provider service URL changed. Refresh this provider.',
+    'This provider is inactive.',
+    'This provider does not support PDP.',
+    'This provider has no service URL.',
+  ]) {
+    const provider = { ...available, upload_speed_testable: false, upload_speed_unavailable_reason: reason }
+    assert.equal(canTestProviderUploadSpeed(provider), false)
+    assert.equal(providerUploadSpeedUnavailableReason(provider), reason)
+  }
+  const unknown = { ...available, upload_speed_testable: undefined }
+  assert.equal(canTestProviderUploadSpeed(unknown), false)
+  assert.equal(canTestProviderUploadSpeed(), false)
   assert.equal(
-    canTestProviderUploadSpeed({
-      ...available,
-      signal: { ...available.signal, freshness: { stale: true, warnings: [] } },
-    }),
-    false
+    providerUploadSpeedUnavailableReason(unknown),
+    'Provider availability could not be checked. Refresh this provider.'
   )
-  assert.equal(canTestProviderUploadSpeed({ ...available, facts: { ...available.facts, has_pdp: false } }), false)
+  assert.equal(providerUploadSpeedUnavailableReason(available), undefined)
   assert.equal(
     canTestProviderUploadSpeed({ ...available, upload_speed_test: { state: 'stale', sample_bytes: 32 << 20 } }),
     true
+  )
+  const unavailableForReplacement = {
+    ...available,
+    manual_selectable: false,
+    manual_block_reason: 'already_serves_bucket',
+  }
+  assert.equal(canTestProviderUploadSpeed(unavailableForReplacement), true)
+  assert.equal(
+    providerUploadSpeedUnavailableReason({
+      ...available,
+      upload_speed_test: { state: 'testing', sample_bytes: 32 << 20 },
+    }),
+    'A test is already running.'
   )
 })
 

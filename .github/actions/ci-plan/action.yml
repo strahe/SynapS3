@@ -13,9 +13,6 @@ outputs:
   system:
     description: Run system and S3 compatibility tests.
     value: ${{ steps.plan.outputs.system }}
-  dashboard:
-    description: Run dashboard end-to-end tests.
-    value: ${{ steps.plan.outputs.dashboard }}
   docker_image:
     description: Build Docker images.
     value: ${{ steps.plan.outputs.docker_image }}

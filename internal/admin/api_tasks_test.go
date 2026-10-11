@@ -942,6 +942,19 @@ func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].Attempt == nil || *page.Events[0].Attempt != 1 || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), "checkpoint") {
 		t.Fatalf("unsafe event page: %d %s", rr.Code, rr.Body.String())
 	}
+	selection := json.RawMessage(`{"provider_selection":{"tier":"approved","has_trusted":false,"requested_count":3,"eligible_count":1,"rejected_total":2,"rejected_omitted":0,"service_url":"private-url","rejections":[{"provider_id":"2","reason":"observation_stale","observation_checked_at":"2026-10-11T09:00:00Z","error":"private-provider-error"},{"provider_id":"4","reason":"private-reason"}]},"checkpoint":{"secret":"private-payload"}}`)
+	if err := f.repos.Tasks.AppendEvent(t.Context(), row.ID, "provider_selection", selection); err != nil {
+		t.Fatal(err)
+	}
+	rr = f.request(http.MethodGet, path, nil)
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].ProviderSelection == nil {
+		t.Fatalf("selection event: %d %s", rr.Code, rr.Body.String())
+	}
+	report := page.Events[0].ProviderSelection
+	if report.RequestedCount != 3 || report.RejectedTotal != 2 || len(report.Rejections) != 2 || report.Rejections[0].Reason != "observation_stale" || report.Rejections[1].Reason != "provider_unavailable" || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), "checkpoint") {
+		t.Fatalf("unsafe selection report: %s", rr.Body.String())
+	}
 }
 
 func TestAPITaskRetryRequiresEmptyBody(t *testing.T) {

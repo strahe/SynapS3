@@ -24,6 +24,7 @@ test('failed tasks retry through their task ID before and after acknowledgement'
     presentation_status: 'failed',
     subject_type: 'storage_copy',
     subject_key: String(copyID),
+    failure_reason: 'attempts_exhausted',
     retry_count: 5,
     max_attempts: 6,
     retry_of_task_id: null,
@@ -83,7 +84,9 @@ test('failed tasks retry through their task ID before and after acknowledgement'
       const details = page.getByRole('dialog', { name: 'Task 201', exact: true })
       await expect(details.getByRole('tab', { name: 'Overview', exact: true })).toHaveAttribute('aria-selected', 'true')
       await expect(details.getByRole('heading', { name: 'Execution policy' })).toBeVisible()
-      await expect(details.getByText('6 / 6', { exact: true })).toBeVisible()
+      await expect(details.getByText('Attempt limit', { exact: true }).locator('..')).toContainText('6')
+      await expect(details.getByText('Retries scheduled', { exact: true }).locator('..')).toContainText('5 / 5')
+      await expect(details.getByText('Automatic retries', { exact: true }).locator('..')).toContainText('Limit reached')
       await expect(details.getByRole('note', { name: `Task error: ${failedTask().last_error}` })).toBeVisible()
       await details.getByRole('tab', { name: 'History', exact: true }).click()
       await expect(

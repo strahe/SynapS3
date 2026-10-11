@@ -1,4 +1,4 @@
-import type { TaskItem, TaskScope, TaskSubjectInfo, TaskSubjectProvider } from '../api/client.ts'
+import type { TaskItem, TaskPolicy, TaskScope, TaskSubjectInfo, TaskSubjectProvider } from '../api/client.ts'
 import { APIError } from '../api/client.ts'
 
 export function taskRetryErrorMessage(error: unknown) {
@@ -76,6 +76,39 @@ export function taskDetailsView(task: Pick<TaskItem, 'status' | 'last_error' | '
     value,
     label: failed && task.last_error ? 'Task error' : 'Task details',
     lastError: !failed && task.last_error !== value ? task.last_error : undefined,
+  }
+}
+
+export function taskRetryPolicyView(
+  task: Pick<TaskItem, 'status' | 'failure_reason' | 'wait_reason' | 'retry_count' | 'available_at'>,
+  policy: TaskPolicy
+) {
+  const limit = policy.max_attempts
+  const known = limit != null && Number.isInteger(limit) && limit >= 1
+  const retryLimit = known ? limit - 1 : undefined
+  const remaining = retryLimit === undefined ? undefined : Math.max(0, retryLimit - task.retry_count)
+  let status: string
+  if (task.status === 'failed') {
+    status = task.failure_reason === 'attempts_exhausted' ? 'Limit reached' : 'Stopped'
+  } else if (task.status === 'completed') {
+    status = 'Finished'
+  } else if (task.status === 'cancelled') {
+    status = 'Cancelled'
+  } else if (remaining === undefined) {
+    status = 'Unknown'
+  } else if (retryLimit === 0) {
+    status = 'Disabled'
+  } else {
+    status = `${remaining} remaining`
+  }
+  return {
+    attemptLimit: known ? String(limit) : 'Unknown',
+    retriesScheduled: retryLimit === undefined ? 'Unknown' : `${task.retry_count} / ${retryLimit}`,
+    status,
+    nextRetryAt:
+      task.status === 'pending' && task.failure_reason && !task.wait_reason && task.retry_count > 0
+        ? task.available_at
+        : undefined,
   }
 }
 

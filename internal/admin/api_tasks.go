@@ -11,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
@@ -602,23 +603,44 @@ func (s *Server) handleAPITaskEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, event := range events {
 		var safe struct {
-			FailureReason *string `json:"failure_reason"`
-			Attempt       *int    `json:"attempt"`
-			NextAttempt   *int    `json:"next_attempt"`
-			RetryTaskID   *int64  `json:"retry_task_id"`
+			FailureReason     *string                              `json:"failure_reason"`
+			Attempt           *int                                 `json:"attempt"`
+			NextAttempt       *int                                 `json:"next_attempt"`
+			RetryTaskID       *int64                               `json:"retry_task_id"`
+			ProviderSelection *providerselect.SelectionDiagnostics `json:"provider_selection"`
 		}
 		_ = json.Unmarshal(event.Details, &safe)
-		response.Events = append(response.Events, taskEventView{Sequence: event.ID, Type: event.Type, CreatedAt: event.CreatedAt.Format(time.RFC3339Nano), FailureReason: safe.FailureReason, Attempt: safe.Attempt, NextAttempt: safe.NextAttempt, RetryTaskID: safe.RetryTaskID})
+		response.Events = append(response.Events, taskEventView{Sequence: event.ID, Type: event.Type, CreatedAt: event.CreatedAt.Format(time.RFC3339Nano), FailureReason: safe.FailureReason, Attempt: safe.Attempt, NextAttempt: safe.NextAttempt, RetryTaskID: safe.RetryTaskID, ProviderSelection: safeProviderSelection(safe.ProviderSelection)})
 	}
 	writeJSON(w, 200, response)
 }
 
 type taskEventView struct {
-	FailureReason *string `json:"failure_reason,omitempty"`
-	Attempt       *int    `json:"attempt,omitempty"`
-	NextAttempt   *int    `json:"next_attempt,omitempty"`
-	RetryTaskID   *int64  `json:"retry_task_id,omitempty"`
-	Sequence      int64   `json:"sequence"`
-	Type          string  `json:"type"`
-	CreatedAt     string  `json:"created_at"`
+	ProviderSelection *providerselect.SelectionDiagnostics `json:"provider_selection,omitempty"`
+	FailureReason     *string                              `json:"failure_reason,omitempty"`
+	Attempt           *int                                 `json:"attempt,omitempty"`
+	NextAttempt       *int                                 `json:"next_attempt,omitempty"`
+	RetryTaskID       *int64                               `json:"retry_task_id,omitempty"`
+	Sequence          int64                                `json:"sequence"`
+	Type              string                               `json:"type"`
+	CreatedAt         string                               `json:"created_at"`
+}
+
+func safeProviderSelection(report *providerselect.SelectionDiagnostics) *providerselect.SelectionDiagnostics {
+	if report == nil || !report.Tier.Valid() || report.RequestedCount < 0 || report.EligibleCount < 0 || report.RejectedTotal < 0 || report.RejectedOmitted < 0 {
+		return nil
+	}
+	view := *report
+	view.Rejections = make([]providerselect.ProviderRejection, 0, min(len(report.Rejections), 100))
+	for _, rejection := range report.Rejections[:min(len(report.Rejections), 100)] {
+		switch rejection.Reason {
+		case "observation_missing", "observation_stale", "profile_missing", "profile_url_changed", "provider_inactive", "provider_missing_pdp", "provider_unhealthy", "service_url_missing", "provider_unavailable", "bucket_in_use", "context_open_failed":
+		default:
+			rejection.Reason = "provider_unavailable"
+		}
+		view.Rejections = append(view.Rejections, rejection)
+	}
+	view.RejectedTotal = max(report.RejectedTotal, len(report.Rejections))
+	view.RejectedOmitted = view.RejectedTotal - len(view.Rejections)
+	return &view
 }

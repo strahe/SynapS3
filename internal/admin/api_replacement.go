@@ -13,6 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -553,6 +554,8 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 		writeJSON(w, http.StatusConflict, map[string]string{"error": message, "code": code})
 	case errors.Is(err, providerselect.ErrNoTrustedProvider):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Replacement must retain a provider that meets the configured requirement", "code": "required_provider_unavailable"})
+	case errors.Is(err, providerselect.ErrCandidatesTemporarilyUnavailable):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "No provider is currently available for this replica. Refresh providers and try again.", "code": "no_eligible_provider"})
 	case errors.Is(err, errApprovalCheckUnavailable):
 		s.logger.Warn("api: provider requirement check failed", "error", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Could not confirm the provider requirement. Try again.", "code": "approval_check_unavailable"})
@@ -845,15 +848,17 @@ func (s *Server) replacementDataSet(w http.ResponseWriter, ctx context.Context, 
 // providers are included with the reason, so an operator can see why the
 // provider they were looking for cannot take this replica.
 type replacementProviderResponse struct {
-	ProviderID        string                             `json:"provider_id"`
-	ManualSelectable  bool                               `json:"manual_selectable"`
-	ManualBlockReason string                             `json:"manual_block_reason,omitempty"`
-	ApprovedFresh     bool                               `json:"approved_fresh"`
-	PreviouslyUsed    bool                               `json:"previously_used"`
-	ProviderIdentity  *providerIdentityResponse          `json:"provider_identity,omitempty"`
-	ProviderProfile   *observability.ProviderProfile     `json:"provider_profile,omitempty"`
-	Observation       *observability.ProviderObservation `json:"observation,omitempty"`
-	UploadSpeedTest   *providerUploadSpeedView           `json:"upload_speed_test,omitempty"`
+	ProviderID                   string                             `json:"provider_id"`
+	ManualSelectable             bool                               `json:"manual_selectable"`
+	ManualBlockReason            string                             `json:"manual_block_reason,omitempty"`
+	ApprovedFresh                bool                               `json:"approved_fresh"`
+	PreviouslyUsed               bool                               `json:"previously_used"`
+	ProviderIdentity             *providerIdentityResponse          `json:"provider_identity,omitempty"`
+	ProviderProfile              *observability.ProviderProfile     `json:"provider_profile,omitempty"`
+	Observation                  *observability.ProviderObservation `json:"observation,omitempty"`
+	UploadSpeedTest              *providerUploadSpeedView           `json:"upload_speed_test,omitempty"`
+	UploadSpeedTestable          bool                               `json:"upload_speed_testable"`
+	UploadSpeedUnavailableReason string                             `json:"upload_speed_unavailable_reason,omitempty"`
 }
 
 // handleAPIListDataSetReplacementProviders lists the providers this replica can
@@ -934,12 +939,19 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 			Observation:       candidate.Observation,
 			ProviderProfile:   candidate.Profile,
 		}
+		var test *providerbenchmark.Result
 		if row, ok := speedTests[candidate.ProviderID.String()]; ok {
+			test = &row
 			var observedServiceURL *string
 			if candidate.Observation != nil {
 				observedServiceURL = candidate.Observation.Facts.ServiceURL
 			}
 			view.UploadSpeedTest = s.uploadSpeedViewWithRetry(ctx, candidate.ProviderID.String(), row, view.ProviderProfile, observedServiceURL)
+		}
+		view.UploadSpeedTestable, view.UploadSpeedUnavailableReason = uploadSpeedAvailability(candidate.Observation, view.ProviderProfile, test)
+		if s.taskService == nil {
+			view.UploadSpeedTestable = false
+			view.UploadSpeedUnavailableReason = "Upload speed testing is unavailable. Try again."
 		}
 		providers = append(providers, view)
 	}

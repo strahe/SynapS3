@@ -38,7 +38,7 @@ func (r *Repositories) EnrichProviderCandidates(ctx context.Context, in *provide
 
 // ProviderSelectionState uses the existing binding and replacement ledgers.
 // Failed replacements remain reservations because their accepted target can retry.
-func (r *Repositories) ProviderSelectionState(ctx context.Context, bucketID, sourceID int64, admission providerselect.Admission) (map[string]bool, bool, error) {
+func (r *Repositories) ProviderSelectionState(ctx context.Context, bucketID, sourceID int64, admission providerselect.Admission) (map[string]providerselect.ExclusionReason, bool, error) {
 	bindings, err := r.Contents.ListDataSetBindings(ctx, bucketID)
 	if err != nil {
 		return nil, false, err
@@ -53,13 +53,13 @@ func (r *Repositories) ProviderSelectionState(ctx context.Context, bucketID, sou
 			blocked[row.SourceDataSetID], blocked[row.TargetDataSetID] = true, true
 		}
 	}
-	excluded := make(map[string]bool)
+	excluded := make(map[string]providerselect.ExclusionReason)
 	hasTrusted := admission.Tier == providerselect.TierNone
 	for _, binding := range bindings {
 		if binding.Status == model.StorageDataSetStatusRetired {
 			continue
 		}
-		excluded[binding.ProviderID.String()] = true
+		excluded[binding.ProviderID.String()] = providerselect.ExclusionBucketInUse
 		if binding.IsCurrent && !blocked[binding.ID] && admission.Trusted(binding.ProviderID) {
 			hasTrusted = true
 		}

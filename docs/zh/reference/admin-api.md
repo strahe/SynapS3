@@ -280,7 +280,7 @@ Provenance 副本和替换详情提供 `retryable`、`retry_task_id`，使用该
 | `GET` | `/api/v1/tasks/stats` | 按状态统计 `scope=work` 或 `scope=history` 范围内的任务。 |
 | `GET` | `/api/v1/tasks/{id}` | 读取任务及冻结的执行策略。 |
 | `GET` | `/api/v1/tasks/{id}/history` | 用 `limit`、`cursor` 分页读取执行链。 |
-| `GET` | `/api/v1/tasks/{id}/events` | 用 `limit`、`cursor` 分页读取保留的关键事件。 |
+| `GET` | `/api/v1/tasks/{id}/events` | 用 `limit`、`cursor` 分页读取保留的关键事件；选择失败时包含经过筛选的 `provider_selection` 证据。 |
 | `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | 读取一个任务主体及已知关联信息。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时创建新的执行轮次。 |
 | `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时将已核对的失败移入 `history` 范围，保留结果和 Retry 资格。 |
@@ -343,7 +343,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的批次数量。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
-存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。最新失败测速可通过统一任务 Retry 接口创建新的测速轮次。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
+存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。最新失败测速可通过统一任务 Retry 接口创建新的测速轮次。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
 
 存储提供方健康检查失败时，该提供方的 `signal.last_error` 会说明原因：检查超时、无法连接、被重定向、返回 HTTP 错误状态，或收到的不是 PDP 服务的应答。
 

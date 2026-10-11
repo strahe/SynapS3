@@ -818,6 +818,9 @@ func TestAPIListDataSetReplacementProviders(t *testing.T) {
 	if replacement.ProviderID != "303" || !replacement.ManualSelectable || replacement.ManualBlockReason != "" {
 		t.Fatalf("replacement provider = %#v, want it choosable", replacement)
 	}
+	if !source.UploadSpeedTestable || !replacement.UploadSpeedTestable || source.UploadSpeedUnavailableReason != "" || replacement.UploadSpeedUnavailableReason != "" {
+		t.Fatalf("speed test eligibility depended on replacement eligibility: source=%#v replacement=%#v", source, replacement)
+	}
 }
 
 func TestAPIListDataSetReplacementProvidersRejections(t *testing.T) {

@@ -280,7 +280,7 @@ Provenance replicas and replacement details expose `retryable` and `retry_task_i
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status within `scope=work` or `scope=history`. |
 | `GET` | `/api/v1/tasks/{id}` | Read the task and its frozen execution policy. |
 | `GET` | `/api/v1/tasks/{id}/history` | Read its execution chain with `limit` and `cursor`. |
-| `GET` | `/api/v1/tasks/{id}/events` | Read retained key events with `limit` and `cursor`. |
+| `GET` | `/api/v1/tasks/{id}/events` | Read retained key events with `limit` and `cursor`. Selection failures include sanitized `provider_selection` evidence. |
 | `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | Read one task subject and its known related information. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Create a new execution when `retryable` is true. |
 | `POST` | `/api/v1/tasks/{id}/acknowledge` | Move a reviewed failure to the `history` scope when `acknowledgeable` is true; preserve its result and Retry eligibility. |
@@ -343,7 +343,9 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 | `GET` | `/api/v1/observability/data-sets` | Local data set health data, with stopped batches per listed data set in `storage_confirmations_by_data_set`. |
 | `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
 
-Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests expose `retry_task_id` and support the same task Retry endpoint, creating a fresh measurement. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
+Provider listings include `upload_speed_testable`, an optional `upload_speed_unavailable_reason`, and `upload_speed_test` when a result is recorded. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests expose `retry_task_id` and support the same task Retry endpoint, creating a fresh measurement. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
+
+Replacement candidates return the same speed-test eligibility; bucket replacement eligibility does not restrict testing.
 
 When a provider health check fails, the provider's `signal.last_error` says why: the check timed out, could not connect, was redirected, received an HTTP error status, or got a reply that is not from a PDP service.
 

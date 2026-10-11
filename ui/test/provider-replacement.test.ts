@@ -16,6 +16,7 @@ import {
   providerCandidateMatches,
   providerCandidateNote,
   providerCandidateRegistryLine,
+  providerSelectionBlockedReason,
   replacementConfirmationDescription,
   replacementConfirmationSummary,
   replacementErrorMessage,
@@ -329,6 +330,20 @@ test('a provider that cannot take the replica says why', () => {
     'Cannot take this replica'
   )
   assert.equal(providerCandidateDisabledReason(candidate()), null)
+})
+
+test('recorded selection exclusions explain each known obstacle', () => {
+  const reasons = {
+    bucket_in_use: 'Already stores a replica of this bucket',
+    context_open_failed: 'Could not prepare storage with this provider.',
+    observation_missing: 'Health information is unavailable. Refresh this provider.',
+    provider_inactive: 'Provider is not active.',
+    provider_missing_pdp: 'Provider does not offer PDP storage.',
+    provider_unhealthy: 'Provider health check failed.',
+    service_url_missing: 'Provider has no service URL.',
+  }
+  for (const [reason, message] of Object.entries(reasons)) assert.equal(providerSelectionBlockedReason(reason), message)
+  assert.equal(providerSelectionBlockedReason('unknown'), 'Provider unavailable')
 })
 
 test('a provider reads as its name and falls back to its registry ID', () => {

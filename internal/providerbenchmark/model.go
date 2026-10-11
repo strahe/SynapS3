@@ -67,17 +67,35 @@ func CurrentServiceURL(ctx context.Context, service *observability.Service, prov
 		return "", false, nil
 	}
 	item := page.Items[0]
-	if item.Signal.Status != observability.StatusAvailable || item.Signal.Freshness.Stale ||
-		item.Facts.Active == nil || !*item.Facts.Active || item.Facts.HasPDP == nil || !*item.Facts.HasPDP ||
-		item.Facts.ServiceURL == nil || *item.Facts.ServiceURL == "" {
+	if _, reason := Eligibility(&item, nil); reason != "" {
 		return "", false, nil
 	}
 	profile, err := service.ProviderProfile(ctx, providerID)
 	if err != nil {
 		return "", false, err
 	}
-	if profile != nil && profile.ServiceURL != *item.Facts.ServiceURL {
-		return "", false, nil
+	serviceURL, reason := Eligibility(&item, profile)
+	return serviceURL, reason == "", nil
+}
+
+// Eligibility uses the same provider evidence for admission and action views.
+func Eligibility(item *observability.ProviderObservation, profile *observability.ProviderProfile) (string, string) {
+	switch {
+	case item == nil:
+		return "", "Refresh this provider to check its availability."
+	case item.Signal.Freshness.Stale:
+		return "", "Refresh this provider's health information."
+	case item.Facts.Active == nil || !*item.Facts.Active:
+		return "", "Provider is not active."
+	case item.Facts.HasPDP == nil || !*item.Facts.HasPDP:
+		return "", "Provider does not offer PDP storage."
+	case item.Facts.ServiceURL == nil || *item.Facts.ServiceURL == "":
+		return "", "Provider has no service URL."
+	case item.Signal.Status != observability.StatusAvailable:
+		return "", "Provider is currently unavailable."
+	case profile != nil && profile.ServiceURL != *item.Facts.ServiceURL:
+		return "", "Refresh this provider after its service URL changed."
+	default:
+		return *item.Facts.ServiceURL, ""
 	}
-	return *item.Facts.ServiceURL, true, nil
 }

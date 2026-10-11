@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Circle, CircleCheck, CircleX, Clock3, History } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { api, type TaskItem } from '@/api/client'
+import { api, type TaskItem, type TaskProviderSelection } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { CursorPagination } from '@/components/app/CursorPagination'
 import { RelativeTime } from '@/components/app/RelativeTime'
@@ -14,8 +14,10 @@ import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empt
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { taskDetailsView, taskOperationLabel, taskSubjectLabel, taskTook } from '@/lib/tasks'
+import { providerSelectionBlockedReason } from '@/lib/provider-replacement'
+import { taskDetailsView, taskOperationLabel, taskRetryPolicyView, taskSubjectLabel, taskTook } from '@/lib/tasks'
 import { enumLabel } from '@/lib/utils'
 
 const eventLabels: Record<string, string> = {
@@ -32,6 +34,7 @@ const eventLabels: Record<string, string> = {
   retired: 'Retired',
   waiting: 'Waiting',
   wait: 'Waiting',
+  provider_selection: 'Provider selection',
 }
 
 function TaskStatus({ task }: { task: TaskItem }) {
@@ -67,6 +70,57 @@ function LoadError({ label, onRetry }: { label: string; onRetry: () => void }) {
         </Button>
       </AlertDescription>
     </Alert>
+  )
+}
+
+function ProviderSelectionDetails({ selection }: { selection: TaskProviderSelection }) {
+  const tierLabels: Record<string, string> = { approved: 'Approved', endorsed: 'Endorsed', none: 'None' }
+  const tier = tierLabels[selection.tier] ?? 'Unknown'
+  return (
+    <div className="flex min-w-0 flex-col gap-2 text-xs text-muted-foreground">
+      <span>
+        Eligible providers: {selection.eligible_count} · Needed: {selection.requested_count}
+      </span>
+      <span>Required tier: {tier}</span>
+      {selection.tier !== 'none' && (
+        <span>Required provider already included: {selection.has_trusted ? 'Yes' : 'No'}</span>
+      )}
+      {selection.tier_checked_at && (
+        <span>
+          Tier checked: <TaskTime value={selection.tier_checked_at} />
+        </span>
+      )}
+      {selection.rejected_total > 0 && (
+        <details>
+          <summary className="cursor-pointer">Excluded providers ({selection.rejected_total})</summary>
+          <Table aria-label="Provider exclusions" className="mt-2">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Provider</TableHead>
+                <TableHead>Reason</TableHead>
+                <TableHead>Health checked</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {selection.rejections.map((provider) => (
+                <TableRow key={provider.provider_id}>
+                  <TableCell>#{provider.provider_id}</TableCell>
+                  <TableCell className="whitespace-normal">{providerSelectionBlockedReason(provider.reason)}</TableCell>
+                  <TableCell>
+                    {provider.observation_checked_at ? (
+                      <TaskTime value={provider.observation_checked_at} />
+                    ) : (
+                      'Not checked'
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          {selection.rejected_omitted > 0 && <p>{selection.rejected_omitted} more providers omitted.</p>}
+        </details>
+      )}
+    </div>
   )
 }
 
@@ -113,6 +167,7 @@ export function TaskDetailsDialog({
   const task = detail.data?.task
   const policy = detail.data?.policy
   const message = task ? taskDetailsView(task) : undefined
+  const retryPolicy = task && policy ? taskRetryPolicyView(task, policy) : undefined
   const visibleEvents = events.data?.events
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -131,7 +186,14 @@ export function TaskDetailsDialog({
                 {task.acknowledged_at && <StatusBadge tone="neutral">Acknowledged</StatusBadge>}
                 <span className="text-xs text-muted-foreground">{taskSubjectLabel(task)}</span>
               </div>
-              {task.retryable && <RetryButton taskID={task.retry_task_id} />}
+              {task.retryable && (
+                <div className="flex max-w-full flex-col items-end gap-1 text-right">
+                  <RetryButton taskID={task.retry_task_id} />
+                  <span className="text-xs text-muted-foreground">
+                    Retry starts a new task with a fresh retry allowance.
+                  </span>
+                </div>
+              )}
             </div>
             {task.retry_unavailable_reason && (
               <p className="shrink-0 text-sm text-muted-foreground">{task.retry_unavailable_reason}</p>
@@ -175,15 +237,9 @@ export function TaskDetailsDialog({
                       {policy ? (
                         <dl className="grid gap-3 sm:grid-cols-2">
                           {[
-                            ['Current attempt', `${task.retry_count + 1} / ${policy.max_attempts ?? 'Unknown'}`],
-                            [
-                              'Automatic retries',
-                              policy.max_attempts == null
-                                ? 'Unknown'
-                                : policy.max_attempts === 1
-                                  ? 'Disabled'
-                                  : 'Enabled',
-                            ],
+                            ['Attempt limit', retryPolicy?.attemptLimit ?? 'Unknown'],
+                            ['Retries scheduled', retryPolicy?.retriesScheduled ?? 'Unknown'],
+                            ['Automatic retries', retryPolicy?.status ?? 'Unknown'],
                             ...(policy.max_attempts == null || policy.max_attempts === 1
                               ? []
                               : [
@@ -210,6 +266,11 @@ export function TaskDetailsDialog({
                         </dl>
                       ) : (
                         <p className="text-muted-foreground">Policy is unavailable for this record.</p>
+                      )}
+                      {retryPolicy?.nextRetryAt && (
+                        <p className="text-xs text-muted-foreground">
+                          Next retry: <TaskTime value={retryPolicy.nextRetryAt} />
+                        </p>
                       )}
                     </section>
                     {message?.lastError && (
@@ -314,6 +375,11 @@ export function TaskDetailsDialog({
                               <span className="text-xs text-muted-foreground">
                                 <TaskTime value={event.created_at} />
                               </span>
+                              {event.provider_selection && (
+                                <div className="w-full">
+                                  <ProviderSelectionDetails selection={event.provider_selection} />
+                                </div>
+                              )}
                             </div>
                           </li>
                         )

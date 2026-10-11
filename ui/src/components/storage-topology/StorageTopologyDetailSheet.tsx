@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { ChevronRight, Database, Gauge, Info, Loader2, RefreshCw, TriangleAlert } from 'lucide-react'
+import { ChevronRight, Database, Info, RefreshCw, TriangleAlert } from 'lucide-react'
 import { type RefObject, useEffect, useMemo, useRef } from 'react'
 import type {
   ObservabilityDataSetObservation,
@@ -21,6 +21,7 @@ import {
   DisclosureSection,
 } from '@/components/app/DetailPanel'
 import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
+import { ProviderUploadSpeedButton } from '@/components/app/ProviderUploadSpeedButton'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -31,7 +32,6 @@ import { useRefreshProvider, useRefreshProviderTiers, useTestProviderUploadSpeed
 import { activePiecesValue } from '@/lib/data-set-storage-health'
 import { providerDisplayName, providerLocationLabel, providerRegistryLabel } from '@/lib/provider-display'
 import {
-  canTestProviderUploadSpeed,
   providerUploadSampleSize,
   providerUploadSpeedLabel,
   providerUploadSpeedTestErrorMessage,
@@ -259,7 +259,6 @@ function ProviderActions({
 }) {
   const refreshProvider = useRefreshProvider()
   const testUploadSpeed = useTestProviderUploadSpeed()
-  const testing = testUploadSpeed.isPending || provider?.upload_speed_test?.state === 'testing'
   const refreshResult = refreshProvider.data
 
   return (
@@ -268,16 +267,12 @@ function ProviderActions({
         {provider?.upload_speed_test?.retryable ? (
           <RetryButton taskID={provider.upload_speed_test.retry_task_id} />
         ) : (
-          (testing || canTestProviderUploadSpeed(provider)) && (
-            <Button size="sm" variant="outline" disabled={testing} onClick={() => testUploadSpeed.mutate(providerID)}>
-              {testing ? (
-                <Loader2 data-icon="inline-start" className="animate-spin" />
-              ) : (
-                <Gauge data-icon="inline-start" />
-              )}
-              {testing ? 'Testing upload speed…' : 'Test upload speed'}
-            </Button>
-          )
+          <ProviderUploadSpeedButton
+            provider={provider}
+            name={name}
+            starting={testUploadSpeed.isPending}
+            onTest={() => testUploadSpeed.mutate(providerID)}
+          />
         )}
         <Button
           size="sm"

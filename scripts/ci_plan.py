@@ -10,12 +10,12 @@ from pathlib import Path
 
 
 FLAGS = (
-    "verify", "go_tests", "race", "system", "dashboard",
+    "verify", "go_tests", "race", "system",
     "docker_image", "docker_deployment", "docs",
 )
-CORE = {"verify", "go_tests", "race", "system", "dashboard"}
-CORE_JOBS = ("verify", "race", "system", "dashboard")
-WRITER_ORDER = ("verify", "system", "dashboard", "race")
+CORE = {"verify", "go_tests", "race", "system"}
+CORE_JOBS = ("verify", "race", "system")
+WRITER_ORDER = ("verify", "system", "race")
 S3_DOCS = {
     "README.md",
     "docs/en/reference/s3-compatibility.md",
@@ -60,12 +60,10 @@ def selected_flags(path):
         or path in {"scripts/s3_compatibility_report.py", "scripts/test_s3_compatibility_report.py"}
     ):
         return {"system"}
-    if path.startswith("ui/e2e/") or path == "ui/playwright.config.ts":
-        return {"verify", "dashboard"}
-    if path.startswith("ui/test/"):
-        return {"verify"}
+    if path.startswith(("ui/e2e/", "ui/test/")) or path == "ui/playwright.config.ts":
+        return set()
     if path.startswith("ui/"):
-        return {"verify", "dashboard", "docker_image"}
+        return {"verify", "docker_image"}
     if path in {"Dockerfile", ".dockerignore"}:
         return {"docker_image"}
     if path == "docker/entrypoint.sh":

@@ -136,8 +136,10 @@ func uploadSpeedView(row providerbenchmark.Result, profile *observability.Provid
 
 type providerObservationWithSpeed struct {
 	observability.ProviderObservation
-	UploadSpeedTest *providerUploadSpeedView       `json:"upload_speed_test,omitempty"`
-	ProviderProfile *observability.ProviderProfile `json:"provider_profile,omitempty"`
+	UploadSpeedTest              *providerUploadSpeedView       `json:"upload_speed_test,omitempty"`
+	ProviderProfile              *observability.ProviderProfile `json:"provider_profile,omitempty"`
+	UploadSpeedTestable          bool                           `json:"upload_speed_testable"`
+	UploadSpeedUnavailableReason string                         `json:"upload_speed_unavailable_reason,omitempty"`
 }
 
 type providerPageWithSpeed struct {
@@ -150,25 +152,27 @@ type providerPageWithSpeed struct {
 }
 
 func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Request, page observability.ProviderObservationPage) {
-	if s.repos == nil || s.repos.ProviderUploadSpeed == nil {
-		writeJSON(w, http.StatusOK, page)
-		return
-	}
 	ids := make([]string, 0, len(page.Items))
 	profileIDs := make([]idtypes.OnChainID, 0, len(page.Items))
 	for _, item := range page.Items {
 		ids = append(ids, item.Facts.ProviderID.String())
 		profileIDs = append(profileIDs, item.Facts.ProviderID)
 	}
-	profiles, profileErr := s.repos.Observability.ProviderProfiles(r.Context(), profileIDs)
+	profiles := make(map[string]observability.ProviderProfile)
+	tests := make(map[string]providerbenchmark.Result)
+	var profileErr, testErr error
+	available := s.repos != nil && s.repos.Observability != nil && s.repos.ProviderUploadSpeed != nil && s.taskService != nil
+	if s.repos != nil && s.repos.Observability != nil {
+		profiles, profileErr = s.repos.Observability.ProviderProfiles(r.Context(), profileIDs)
+	}
 	if profileErr != nil {
 		s.logger.Warn("api: failed to load provider profiles", "error", profileErr)
 	}
-	tests, err := s.repos.ProviderUploadSpeed.ListByProviderIDs(r.Context(), ids)
-	if err != nil {
-		s.logger.Error("api: failed to list provider upload speed tests", "error", err)
-		writeJSON(w, http.StatusOK, page)
-		return
+	if s.repos != nil && s.repos.ProviderUploadSpeed != nil {
+		tests, testErr = s.repos.ProviderUploadSpeed.ListByProviderIDs(r.Context(), ids)
+	}
+	if testErr != nil {
+		s.logger.Error("api: failed to list provider upload speed tests", "error", testErr)
 	}
 	items := make([]providerObservationWithSpeed, 0, len(page.Items))
 	for _, item := range page.Items {
@@ -177,8 +181,15 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 			copy := profile
 			view.ProviderProfile = &copy
 		}
+		var test *providerbenchmark.Result
 		if row, ok := tests[item.Facts.ProviderID.String()]; ok {
+			test = &row
 			view.UploadSpeedTest = s.uploadSpeedViewWithRetry(r.Context(), item.Facts.ProviderID.String(), row, view.ProviderProfile, item.Facts.ServiceURL)
+		}
+		view.UploadSpeedTestable, view.UploadSpeedUnavailableReason = uploadSpeedAvailability(&item, view.ProviderProfile, test)
+		if !available || profileErr != nil || testErr != nil {
+			view.UploadSpeedTestable = false
+			view.UploadSpeedUnavailableReason = "Upload speed testing is unavailable. Try again."
 		}
 		items = append(items, view)
 	}
@@ -186,6 +197,14 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 		Items: items, Summary: page.Summary,
 		SummarySignal: page.SummarySignal, Total: page.Total, Limit: page.Limit, Offset: page.Offset,
 	})
+}
+
+func uploadSpeedAvailability(observation *observability.ProviderObservation, profile *observability.ProviderProfile, test *providerbenchmark.Result) (bool, string) {
+	if test != nil && test.State == providerbenchmark.StateTesting {
+		return false, "An upload speed test is already running."
+	}
+	_, reason := providerbenchmark.Eligibility(observation, profile)
+	return reason == "", reason
 }
 
 func (s *Server) handleAPIProviderUploadSpeedTest(w http.ResponseWriter, r *http.Request) {

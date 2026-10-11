@@ -180,7 +180,9 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   )
   const candidates = (await candidatesResponse.json()) as { providers: ReplacementProviderCandidate[] }
   const target = candidates.providers.find((candidate) => candidate.manual_selectable)
-  const otherTarget = candidates.providers.find((candidate) => candidate.provider_id !== target?.provider_id)
+  const otherTarget = candidates.providers.find(
+    (candidate) => !candidate.manual_selectable && candidate.upload_speed_testable
+  )
   if (!target || !otherTarget) throw new Error('Replacement choices are missing')
   await dataSetRows.first().getByRole('button', { name: 'Actions for Replica 1' }).click()
   await page.getByRole('menuitem', { name: 'Replace provider' }).click()
@@ -206,6 +208,7 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await expect(confirmation).toHaveValue('')
   await expect(replacement.getByText('Could not refresh this provider. Try again.')).toHaveCount(0)
   await expect(replacement.getByRole('button', { name: 'Replace provider' })).toBeDisabled()
+  await expect(replacement.getByRole('button', { name: 'Test upload speed', exact: true })).toBeEnabled()
   await replacement.getByRole('button', { name: 'Cancel' }).click()
   await expect(replacement).toBeHidden()
 
@@ -348,6 +351,73 @@ test('provider details keep FWSS collection times independent and preserve the d
     await expect(details.getByText(declaredLocation, { exact: true })).toBeVisible()
   }
   await page.unrouteAll({ behavior: 'wait' })
+})
+
+test('upload speed controls remain visible with keyboard reasons and use refreshed server eligibility', async ({
+  page,
+  systemServer,
+}) => {
+  const reason = 'Health information is out of date. Refresh this provider.'
+  let eligible = false
+  let testing = false
+  let submitted = 0
+  await page.route('**/api/v1/observability/providers**', async (route) => {
+    if (
+      route.request().method() !== 'GET' ||
+      new URL(route.request().url()).pathname !== '/api/v1/observability/providers'
+    ) {
+      return route.continue()
+    }
+    const response = await route.fetch()
+    const body = (await response.json()) as { items: ObservabilityProviderObservation[] }
+    const provider = body.items.find((item) => item.facts.provider_id === '101')
+    if (!provider) throw new Error('System provider 101 is missing')
+    provider.upload_speed_testable = eligible && !testing
+    provider.upload_speed_unavailable_reason = testing ? 'A test is already running.' : eligible ? undefined : reason
+    provider.upload_speed_test = testing ? { state: 'testing', sample_bytes: 32 << 20 } : undefined
+    await route.fulfill({ response, json: body })
+  })
+  await page.route('**/api/v1/observability/providers/101/refresh', (route) => {
+    eligible = true
+    return route.fulfill({
+      json: {
+        provider_id: '101',
+        profile_result: { success: true, attempted_at: new Date().toISOString() },
+        health_result: { success: true, attempted_at: new Date().toISOString() },
+      },
+    })
+  })
+  await page.route('**/api/v1/observability/providers/101/upload-speed-test', (route) => {
+    expect(route.request().method()).toBe('POST')
+    submitted++
+    testing = true
+    return route.fulfill({ status: 202, json: { task_id: 9901, state: 'testing' } })
+  })
+  await page.goto(systemServer.adminURL)
+  await page.getByLabel('Username').fill('admin')
+  await page.getByLabel('Password').fill('system-test-admin-password')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible()
+  await page.goto(new URL('/storage-topology?tab=providers', systemServer.adminURL).toString())
+  const providerRow = page.getByRole('row').filter({ hasText: 'Registry 101' })
+  const action = providerRow.getByRole('button', { name: 'Test upload speed for System provider 101', exact: true })
+  await expect(action).toBeVisible()
+  await expect(action).toBeDisabled()
+  const availability = providerRow.getByRole('group', { name: 'Upload speed test unavailable for System provider 101' })
+  await availability.focus()
+  await expect(availability).toBeFocused()
+  await expect(page.getByRole('tooltip')).toContainText(reason)
+  await page.keyboard.press('Escape')
+  await providerRow.getByRole('button', { name: 'Details for System provider 101' }).click()
+  const details = page.getByRole('dialog', { name: 'System provider 101' })
+  const detailAction = details.getByRole('button', { name: 'Test upload speed', exact: true })
+  await expect(detailAction).toBeDisabled()
+  await expect(detailAction).toHaveAccessibleDescription(reason)
+  await details.getByRole('button', { name: 'Refresh provider', exact: true }).click()
+  await expect(detailAction).toBeEnabled()
+  await detailAction.click()
+  await expect(details.getByRole('button', { name: 'Testing upload speed…', exact: true })).toBeDisabled()
+  expect(submitted).toBe(1)
 })
 
 test('S3 user name appears in user and owner flows while copying the full access key', async ({
