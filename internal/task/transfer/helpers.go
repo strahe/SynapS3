@@ -109,15 +109,7 @@ func choosePullSource(sources []repository.ReadableStorageCopy, last *storagepul
 	return sources[0]
 }
 
-func retryPullDependency(execution taskengine.Execution, err error, reason string) taskengine.Result {
-	return retryTask(err, reason)
-}
-
-func retryPullOutcome(execution taskengine.Execution, err error, reason string) taskengine.Result {
-	return retryTask(err, reason)
-}
-
-func failPullOutcome(execution taskengine.Execution, err error) taskengine.Result {
+func failPullOutcome(err error) taskengine.Result {
 	return taskengine.Fail(err, storagepull.FailureOutcomeUnknown, nil)
 }
 

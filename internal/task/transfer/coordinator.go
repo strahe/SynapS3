@@ -69,9 +69,6 @@ func (h *CopyCoordinator) authorizeCopyTask(
 		return input, nil, true, taskengine.Cancel("Storage work was superseded", nil)
 	}
 	if err != nil {
-		if execution.Type() == model.TaskTypeStoragePull {
-			return input, nil, true, retryPullDependency(execution, err, "copy_authorization_failed")
-		}
 		return input, nil, true, retryTask(err, "copy_authorization_failed")
 	}
 	return input, copyRow, false, taskengine.Result{}

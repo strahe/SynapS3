@@ -264,15 +264,15 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, Cache: runtime.cache, CacheGate: runtime.gate, CacheTracker: runtime.tracker, Storage: runtime.storage, EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent, DefaultCopies: 1, Logger: slog.Default()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.RegisterSchedule(taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}); err != nil {
+	schedule := taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}
+	if err := registry.RegisterSchedule(schedule); err != nil {
 		t.Fatal(err)
 	}
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, registry, slog.Default())
-	if err != nil {
+	if _, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, registry, slog.Default()); err != nil {
 		t.Fatal(err)
 	}
-	runtime.registry, runtime.service, runtime.engine = registry, service, engine
-	runtime.schedules = []taskengine.ScheduleDefinition{{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}}
+	runtime.registry, runtime.service = registry, service
+	runtime.schedules = []taskengine.ScheduleDefinition{schedule}
 	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)

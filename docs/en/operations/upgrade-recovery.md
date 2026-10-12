@@ -25,9 +25,11 @@ Expected result: health is `ok`, effective settings match the deployment, and ba
 
 ## If the Database Is Incompatible
 
-Stop SynapS3 and confirm that the configured database is the intended one. Preserve the database and matching cache unchanged, and restore a verified recovery point. Do not edit either location to bypass the compatibility check.
+Stop SynapS3 and confirm that the configured database is the intended one. Preserve the database and matching cache unchanged. Restore a verified backup into a separate empty database and runtime directory, using the executable saved with that recovery point. Follow [Restore Order](../configuration/runtime-data.md#restore-order). Do not edit the preserved data to bypass the compatibility check.
 
 SynapS3 leaves an incompatible database unchanged.
+
+Starting with an empty database initializes separate records; it does not import buckets, objects, users, tasks, or wallet operations from a backup. It does not delete remote data sets or stop their storage charges. Do not let independent operation ledgers control the same wallet concurrently.
 
 ## Recover Background Work
 
@@ -40,7 +42,7 @@ After a restart, unfinished work becomes eligible to continue automatically.
 - **Retry** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
 - Acknowledgement moves a failure to **Closed**; use `scope=history&status=failed` to view it.
 - Batch recovery preserves the signed request and checks the chain before resubmitting. Missing pieces are transferred again when safe. Provider errors and failed transfers use a finite budget. If a batch was conclusively refused and the chain confirms it did not land, the remaining pieces can continue when one cannot be recovered. When recovery stops, the batch keeps the saved evidence. Find it in **Tasks** (Submit batch, Failed) or with `synaps3 admin storage-confirmation list`, restore its dependencies, and use **Retry**. An accepted request with conflicting chain evidence remains stopped for review.
-- A provider with a full Pull queue is tried again after its requested delay without using the retry budget. Other Pull failures use up to 12 opportunities. After restart, current limits apply to further automatic retries; already scheduled work can finish, and manual Retry starts with a fresh budget.
+- A provider with a full Pull queue is tried again after its requested delay without using the retry budget. Other Pull failures use up to 12 opportunities. Restarting does not reset the used opportunities; manual Retry starts with a fresh budget.
 
 Useful commands:
 
@@ -64,14 +66,14 @@ Restore failed dependencies before retrying work. Use the dashboard, Admin API, 
 | Cache disk full | Increase disk or `cache.max_size_gb`, or restore remote storage and cache-cleanup progress. |
 | Provider must be evacuated | Open the bucket's **Storage** tab and replace the provider from **Data sets**. Do not retry the replacement from Tasks. |
 | Process crash | Restart SynapS3, verify health and task statistics, then retry any stopped batch and review any wallet outcome. |
-| Startup reports an incompatible database | Stop the process, confirm the configured database, and preserve it unchanged before restoring a verified recovery point. |
+| Startup reports an incompatible database | Stop the process, confirm the configured database, and preserve the database and matching cache. Follow [If the Database Is Incompatible](#if-the-database-is-incompatible). |
 
-## Restore or Roll Back
+## Restore a Backup
 
 1. Stop S3 traffic and SynapS3.
 2. Verify backup checksums and select database and cache artifacts from the same recovery point.
-3. Restore the database-native backup first, then the matching configuration and cache data.
-4. If rolling back the application, use only data compatible with the selected version. When compatibility is uncertain, restore the pre-upgrade recovery point.
+3. Restore the database-native backup into a separate empty database, then restore the matching configuration and cache data into a separate empty runtime directory.
+4. Use the executable saved with that recovery point.
 5. Start SynapS3, then check `/healthz`, effective settings, task statistics, failed tasks, wallet readiness, and a known S3 object.
 
 Do not resume normal traffic until these checks pass.
