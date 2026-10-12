@@ -37,7 +37,7 @@ func (h *CopyCoordinator) copyDefinition(taskType model.TaskType) taskengine.Def
 }
 
 func waitForCommitBacklog() taskengine.Result {
-	return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "commit_backlog",
+	return taskengine.Wait(model.TaskResumeModeExecute, "commit_backlog",
 		"Waiting for earlier transfers to this data set to be submitted", nil)
 }
 

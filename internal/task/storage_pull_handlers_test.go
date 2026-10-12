@@ -154,7 +154,7 @@ func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
 			waiting := runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 			delay := retryAfter
 			if delay <= 0 {
-				delay = time.Minute
+				delay = handlerTestPollInterval
 			}
 			if waiting.WaitReason == nil || *waiting.WaitReason != storagepull.WaitQueueFull || waiting.RetryCount != 0 || waiting.ResumeMode != model.TaskResumeModeRecover ||
 				waiting.AvailableAt.Before(before.Add(delay)) || waiting.AvailableAt.After(time.Now().Add(delay)) {
@@ -171,7 +171,7 @@ func TestPullQueueFullRetainsRequestAndRetryAfter(t *testing.T) {
 			if woken, err := runtime.repos.Tasks.WakePendingOfTypes(t.Context(), []int64{row.ID}, []model.TaskType{model.TaskTypeStoragePull}, []string{storagepull.WaitQueueFull}); err != nil || woken != 0 {
 				t.Fatalf("early queue-full wake = %d, %v", woken, err)
 			}
-			for step := range 2 {
+			for step := 0; retryAfter > 0 && step < 2; step++ {
 				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
@@ -713,7 +713,7 @@ func seedSealedReplacementBatch(t *testing.T, runtime handlerTestRuntime, member
 	if err := runtime.repos.Contents.ReturnCommitMembersToTransfer(t.Context(), requestID, taskID, []int64{copyRow.ID}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(time.Hour)).Where("id = ?", taskID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(time.Hour)).Set("wait_reason = ?", "commit_members").Where("id = ?", taskID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	request, err := runtime.repos.Contents.GetCommitRequest(t.Context(), requestID)
@@ -729,9 +729,17 @@ func seedSealedReplacementBatch(t *testing.T, runtime handlerTestRuntime, member
 
 func runOneStorageTask(t *testing.T, runtime handlerTestRuntime, row *model.Task, status model.TaskStatus) *model.Task {
 	t.Helper()
+	return runStorageTaskClaims(t, runtime, row, status, 1)
+}
 
+func runStorageTaskClaims(t *testing.T, runtime handlerTestRuntime, row *model.Task, status model.TaskStatus, claims int64, timeout ...time.Duration) *model.Task {
+	t.Helper()
+	var excluded []int64
+	if err := runtime.db.NewSelect().Model((*model.Task)(nil)).Column("id").Where("id <> ?", row.ID).Scan(t.Context(), &excluded); err != nil {
+		t.Fatal(err)
+	}
 	repos := *runtime.repos
-	repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
+	repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: claims, excludedTaskIDs: excluded}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -739,8 +747,8 @@ func runOneStorageTask(t *testing.T, runtime handlerTestRuntime, row *model.Task
 	cancel, done := runEngine(t, engine)
 	defer stopHandlerEngine(t, cancel, done)
 	return waitForTask(t, runtime.repos, row.ID, func(current *model.Task) bool {
-		return current.ClaimGeneration > row.ClaimGeneration && current.Status == status
-	})
+		return current.ClaimGeneration >= row.ClaimGeneration+claims && current.Status == status
+	}, timeout...)
 }
 
 func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {

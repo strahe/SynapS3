@@ -623,6 +623,9 @@ type StorageReplacementRepository interface {
 	BindTask(ctx context.Context, replacementID, generation, taskID int64) error
 	TransferTaskOwner(ctx context.Context, replacementID, generation, oldTaskID, newTaskID int64) error
 	ResumeCoordinatorTask(ctx context.Context, replacementID, generation, oldTaskID, newTaskID int64) error
+	PrepareCoordinatorRetry(ctx context.Context, replacementID, generation, taskID int64) (*model.StorageDataSet, error)
+	MarkInitializationFailed(ctx context.Context, replacementID, generation, taskID, childID int64, message string) error
+	EnsureTaskReplacement(ctx context.Context, taskID int64) (*storagereplacement.Replacement, error)
 	AuthorizeTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
 	CompleteTask(ctx context.Context, replacementID, generation, taskID int64) error
 

@@ -120,7 +120,7 @@ func (s *Service) dispatchSchedules(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine) settleSchedule(ctx context.Context, tx *repository.Repositories, claimed *model.Task, result Result, transition repository.TaskTransition) error {
+func (e *Engine) settleSchedule(ctx context.Context, tx *repository.Repositories, claimed *model.Task, transition repository.TaskTransition) error {
 	if !claimed.Type.IsRecurringSystem() || transition.Status == model.TaskStatusPending {
 		return nil
 	}
@@ -136,9 +136,6 @@ func (e *Engine) settleSchedule(ctx context.Context, tx *repository.Repositories
 		return repository.ErrConflict
 	}
 	delay := def.Interval
-	if result.cycleDelay > 0 {
-		delay = result.cycleDelay
-	}
 	if err := tx.TaskSchedules.ScheduleNext(ctx, def.Key, claimed.ID, time.Now().UTC().Add(delay)); err != nil {
 		return err
 	}

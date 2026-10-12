@@ -116,7 +116,7 @@ test('only operator-owned states are retryable', () => {
   assert.equal(replacementRetryable(replacement({ status: 'failed' })), true)
   assert.equal(replacementRetryable(replacement({ status: 'cleanup_attention' })), true)
   assert.equal(replacementRetryable(replacement({ status: 'failed', failure_reason: 'target_in_use' })), false)
-  assert.equal(replacementRetryable(replacement({ status: 'failed', failure_reason: 'target_rejected' })), false)
+  assert.equal(replacementRetryable(replacement({ status: 'failed', failure_reason: 'target_rejected' })), true)
   for (const status of ['preparing_target', 'migrating', 'waiting', 'retiring', 'completed', 'superseded'] as const) {
     assert.equal(replacementRetryable(replacement({ status })), false, status)
   }
@@ -216,19 +216,28 @@ test('errors explain what to do next', () => {
   assert.equal(replacementErrorMessage('nope'), 'Could not complete the request.')
 })
 
-test('provider refusal directs the operator to another provider', () => {
+test('stopped storage setup permits retry or another provider', () => {
   const refused = dataSet({
     status: 'pending',
-    setup_error: 'Storage provider rejected setup. Choose another provider.',
+    setup_error: 'Storage setup stopped. Retry or choose another provider.',
   })
-  assert.match(dataSetSetupMessage(refused) ?? '', /Choose another provider/)
+  assert.match(dataSetSetupMessage(refused) ?? '', /choose another provider/)
   assert.match(
-    replacementNextStep(replacement({ status: 'failed', failure_reason: 'target_rejected' })) ?? '',
+    replacementNextStep(
+      replacement({
+        status: 'failed',
+        failure_reason: 'target_rejected',
+        retryable: true,
+        source: { ...replacement().source, is_current: true, status: 'pending', data_set_id: null },
+        target: { ...replacement().target, is_current: false, status: 'creating', data_set_id: null },
+      }),
+      true
+    ) ?? '',
     /different provider/
   )
   assert.match(
     dataSetSetupMessage(dataSet({ status: 'pending', replacement_blocked_reason: 'replacement_source_running' })) ?? '',
-    /running/
+    /in progress/
   )
   assert.equal(dataSetSetupMessage(dataSet({ setup_error: refused.setup_error })), null)
 })
@@ -257,12 +266,10 @@ test('the next step never echoes the recorded error', () => {
   assert.equal(replacementNextStep(replacement({ status: 'migrating' })), null)
 })
 
-// Changing provider is only open while the old one still holds the replica.
-// Once the new one has taken it over, the copy has to be finished, not restarted
-// somewhere else.
 test('the next step offers a different provider only when one can be chosen', () => {
   const beforeHandover = replacement({ status: 'failed', source: { ...replacement().source, is_current: true } })
-  assert.match(replacementNextStep(beforeHandover) ?? '', /different provider/)
+  assert.match(replacementNextStep(beforeHandover, true) ?? '', /different provider/)
+  assert.ok(!(replacementNextStep(beforeHandover, false) ?? '').includes('different provider'))
   const afterHandover = replacement({ status: 'failed', source: { ...replacement().source, is_current: false } })
   const step = replacementNextStep(afterHandover) ?? ''
   assert.match(step, /Retry/)

@@ -52,8 +52,6 @@ func NewHandler(deps Dependencies) (*Handler, error) {
 	return h, nil
 }
 
-const externalPollInterval = 5 * time.Second
-
 func (h *Handler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeWalletOperation, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
@@ -159,11 +157,11 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 	if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 	}); err != nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Recording wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Recording wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 		})
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", nil)
+	return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", nil)
 }
 
 func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengine.Execution) (result taskengine.Result) {
@@ -195,7 +193,7 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 	}
 	if txHash == "" {
 		if !hasCheckpoint && op.BroadcastAttemptedAt == nil {
-			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Wallet operation is ready", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Wallet operation is ready", nil)
 		}
 		err := errors.New("wallet transaction identity could not be recovered")
 		return taskengine.Fail(err, "wallet_broadcast_unknown", func(ctx context.Context, repos *repository.Repositories) error {
@@ -203,7 +201,7 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		})
 	}
 	if h.deps.Receipts == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 		})
 	}
@@ -214,10 +212,10 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 	}
 	if err != nil && !errors.Is(err, ethereum.NotFound) {
-		return taskengine.RetryInMode(synapse.SummarizedError(err), "transaction_confirmation", model.TaskResumeModeRecover, externalPollInterval, markSubmitted)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "transaction_confirmation", model.TaskResumeModeRecover, markSubmitted)
 	}
 	if err != nil || receipt == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
+		return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
 	}
 	if receipt.Status == ethtypes.ReceiptStatusSuccessful {
 		return taskengine.Complete("Wallet transaction confirmed", func(ctx context.Context, repos *repository.Repositories) error {

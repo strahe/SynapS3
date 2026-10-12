@@ -164,7 +164,7 @@ func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
 				case "complete":
 					return Complete("Done", nil)
 				case "wait":
-					return Wait(tc.mode, time.Millisecond, "observing", "Waiting", nil)
+					return Wait(tc.mode, "observing", "Waiting", nil)
 				default:
 					return RetryBackoff(errors.New("temporary"), "temporary", nil).WithRetrySettlements(
 						func(context.Context, *repository.Repositories, time.Time) error { retried = true; return nil },
@@ -241,7 +241,7 @@ func TestInvocationTimeoutAllocatesRecoveryButPreservesObservedCompletion(t *tes
 				if completed {
 					return Complete("Done", nil)
 				}
-				return Wait(model.TaskResumeModeRecover, time.Minute, "observing", "Waiting", nil)
+				return Wait(model.TaskResumeModeRecover, "observing", "Waiting", nil)
 			}}, nil)
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)

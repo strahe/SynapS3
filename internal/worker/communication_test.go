@@ -46,7 +46,6 @@ func communicationHarness(t *testing.T, db *bun.DB, types []model.TaskType, conf
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine.retryDelay = func(int) time.Duration { return 0 }
 	return taskHarness{db: db, repos: repos, registry: registry, service: service, engine: engine}
 }
 
@@ -332,7 +331,7 @@ func assertSchedulerWakeBoundaries(t *testing.T, db *bun.DB) {
 		{model.TaskTypeStoragePull, storagepull.WaitQueueFull, false, 0},
 		{model.TaskTypeStoragePull, "source", true, 0},
 		{model.TaskTypeStorageStore, storagepull.WaitQueueFull, true, 0},
-		{model.TaskTypeStorageTransferPlan, "", true, 0},
+		{model.TaskTypeStorageTransferPlan, "", false, 0},
 		{model.TaskTypeWalletOperation, "", false, 0},
 	}
 	var ids []int64
@@ -372,7 +371,7 @@ func assertSchedulerWakeBoundaries(t *testing.T, db *bun.DB) {
 				return fmt.Errorf("unauthorized wake error = %v", err)
 			}
 		}
-		if count, err := scheduler.WakeInTransaction(t.Context(), tx, ids, filter); err != nil || count != 2 {
+		if count, err := scheduler.WakeInTransaction(t.Context(), tx, ids, filter); err != nil || count != 1 {
 			return fmt.Errorf("plan/store wake count=%d, error=%v", count, err)
 		}
 		count, err := scheduler.WakeInTransaction(t.Context(), tx, ids, WakePendingFilter{Types: []model.TaskType{model.TaskTypeStoragePull}, SkipWaitReasons: []string{storagepull.WaitQueueFull}})

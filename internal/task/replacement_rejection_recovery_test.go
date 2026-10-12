@@ -2,6 +2,8 @@ package task_test
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
-	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
@@ -74,7 +75,8 @@ func TestCoordinatorDiscardsRefusalAfterObservedService(t *testing.T) {
 	if err != nil || ready.Status != model.StorageDataSetStatusReady || !ready.IsCurrent || ready.DataSetID == nil || !ready.DataSetID.Equal(testOnChainID(t, 2002)) || len(ready.CreationRejection) != 0 {
 		t.Fatalf("observed service did not take the slot: %#v %v", ready, err)
 	}
-	ensureCount, err := runtime.db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeStorageDataSetEnsure).Count(t.Context())
+	ensureCount, err := runtime.db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeStorageDataSetEnsure).
+		Where("subject_key = ?", strconv.FormatInt(target.ID, 10)).Count(t.Context())
 	if err != nil || ensureCount != 1 {
 		t.Fatalf("unexpected new setup: count=%d %v", ensureCount, err)
 	}
@@ -92,6 +94,16 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storager
 	}
 	source, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: testOnChainID(t, 101), CopyIndex: 0})
 	if err != nil {
+		t.Fatal(err)
+	}
+	sourceEnsure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: source.ID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+		return repos.Contents.BindDataSetEnsureTask(ctx, source.ID, task.ID)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+		Set("finished_at = ?", time.Now()).Where("id = ?", sourceEnsure.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	row, _, err := runtime.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: testOnChainID(t, 202), ClientRequestID: "first"})
@@ -142,11 +154,11 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storager
 	return row, target, coordinator, repository.BindObservedReplacementServiceInput{Preflight: *check, StorageDataSetID: target.ID, DataSetID: testOnChainID(t, 2002), ClientDataSetID: clientID}
 }
 
-func TestObservedServiceAfterRefusalSettlementCanContinueOrRetire(t *testing.T) {
+func TestObservedServiceAfterRefusalSettlementKeepsReplacementReserved(t *testing.T) {
 	for _, action := range []string{"retry", "another provider"} {
 		t.Run(action, func(t *testing.T) {
-			terminator := &testServiceTerminator{result: &synapse.TerminationResult{TxHash: "0xretired", EndEpoch: 84}}
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator, epochs: testEpochReader{epoch: 90}})
+			terminator := &testServiceTerminator{}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator})
 			row, target, coordinator, _ := seedRefusedReplacement(t, runtime)
 			cancel, done := runHandlerEngine(t, runtime)
 			waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
@@ -167,55 +179,28 @@ func TestObservedServiceAfterRefusalSettlementCanContinueOrRetire(t *testing.T) 
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if action == "retry" {
-				row, err = runtime.repos.Replacements.Retry(t.Context(), repository.RetryReplacementInput{ReplacementID: row.ID})
-			} else {
-				_, _, err = runtime.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: row.BucketID, SourceDataSetID: row.SourceDataSetID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: testOnChainID(t, 303), ClientRequestID: "successor"})
-				if err == nil {
-					row, err = runtime.repos.Replacements.GetByID(t.Context(), row.ID)
+			if action == "another provider" {
+				_, _, err := runtime.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: row.BucketID, SourceDataSetID: row.SourceDataSetID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: testOnChainID(t, 303), ClientRequestID: "successor"})
+				if !errors.Is(err, storagereplacement.ErrActiveReplacement) {
+					t.Fatalf("ready target released the replacement slot: %v", err)
 				}
+				target, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
+				if err != nil || target.Status != model.StorageDataSetStatusReady || target.IsCurrent || target.RetirementTaskID != nil || terminator.calls.Load() != 0 {
+					t.Fatalf("reserved target changed: %#v err=%v", target, err)
+				}
+				return
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			coordinator, _, err = runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
-				return repos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, task.ID)
-			})
+			coordinator, err = runtime.service.Retry(t.Context(), coordinator.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			cancel, done = runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-			if action == "another provider" {
-				target, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
-				if err != nil || target.RetirementTaskID == nil {
-					t.Fatalf("cleanup coordinator did not enqueue retirement: %#v err=%v", target, err)
-				}
-				retirementID := *target.RetirementTaskID
-				waitForTask(t, runtime.repos, retirementID, func(task *model.Task) bool {
-					return task.Status == model.TaskStatusPending && terminator.calls.Load() == 1
-				})
-				wakeTask(t, runtime, retirementID)
-				waitForTask(t, runtime.repos, retirementID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-				target, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				stored, err := runtime.repos.Replacements.GetByID(t.Context(), row.ID)
-				if err != nil || target.Status != model.StorageDataSetStatusRetired || target.IsCurrent || stored.AbandonedTerminationEpoch == nil || *stored.AbandonedTerminationEpoch != 84 || terminator.calls.Load() != 1 {
-					t.Fatalf("recovered abandoned service was not retired: target=%#v replacement=%#v calls=%d err=%v", target, stored, terminator.calls.Load(), err)
-				}
-				source, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), row.SourceDataSetID)
-				if err != nil || !source.IsCurrent {
-					t.Fatalf("source lost its slot before successor setup: %#v err=%v", source, err)
-				}
-			} else {
-				target, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
-				stored, loadErr := runtime.repos.Replacements.GetByID(t.Context(), row.ID)
-				if err != nil || loadErr != nil || !target.IsCurrent || stored.Status != storagereplacement.StatusCompleted || stored.FailureReason != nil || terminator.calls.Load() != 0 {
-					t.Fatalf("recovered replacement did not continue: target=%#v replacement=%#v err=%v/%v", target, stored, err, loadErr)
-				}
+			target, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
+			stored, loadErr := runtime.repos.Replacements.GetByID(t.Context(), row.ID)
+			if err != nil || loadErr != nil || !target.IsCurrent || stored.Status != storagereplacement.StatusCompleted || stored.FailureReason != nil || terminator.calls.Load() != 0 {
+				t.Fatalf("recovered replacement did not continue: target=%#v replacement=%#v err=%v/%v", target, stored, err, loadErr)
 			}
 		})
 	}

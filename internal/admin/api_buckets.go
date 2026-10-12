@@ -626,10 +626,8 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			s.logger.Warn("api: failed to check data set replacement eligibility", "bucket_id", summary.BucketID, "data_set_id", summary.ID, "error", eligibilityErr)
 		}
 		setupError := ""
-		if source != nil {
-			if evidence, err := source.CreationRejectionEvidence(); err == nil && evidence != nil && source.Status != model.StorageDataSetStatusRetired {
-				setupError = storagereplacement.ProviderRejectedMessage
-			}
+		if source != nil && source.Status != model.StorageDataSetStatusReady && eligibilityErr == nil {
+			setupError = "Storage setup stopped. Retry or choose another provider."
 		}
 		if detail, ok := errors.AsType[*storagereplacement.SourceOutcomeError](eligibilityErr); ok {
 			setupError = detail.Message

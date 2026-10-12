@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -36,11 +35,6 @@ type Dependencies struct {
 	DefaultCopies int
 	Logger        *slog.Logger
 }
-
-const (
-	storageDependencyWait = time.Minute
-	storagePollInterval   = 5 * time.Second
-)
 
 type Handler struct {
 	*taskengine.FuncHandler
@@ -140,17 +134,17 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			})
 		}
 		if covered == required && allPendingWorkBound {
-			return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "storage_service", "Preparing bucket storage", nil)
 		}
 
 		selected, err := h.deps.Selector.SelectBucketBindings(ctx, bucket, required)
 		if err != nil {
 			if bindingtask.SelectionNeedsWait(err) {
-				return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", bindingtask.SelectionWaitSettlement(execution.ID(), err))
+				return taskengine.Wait(model.TaskResumeModeExecute, "providers", "Waiting for storage providers", bindingtask.SelectionWaitSettlement(execution.ID(), err))
 			}
 			settlement := bindingtask.SelectionSettlement(execution.ID(), err)
 			if errors.Is(err, providerselect.ErrCandidatesTemporarilyUnavailable) {
-				return taskengine.RetryBackoff(h.logStorageDependencyFailure(ctx, execution, "providers", err), "provider_selection_unavailable", settlement).WithResumeMode(model.TaskResumeModeExecute).WithMinimumDelay(storageDependencyWait)
+				return taskengine.RetryBackoff(h.logStorageDependencyFailure(ctx, execution, "providers", err), "provider_selection_unavailable", settlement).WithResumeMode(model.TaskResumeModeExecute)
 			}
 			if errors.Is(err, providerselect.ErrNoTrustedProvider) && !bindingtask.SelectionFailed(err) {
 				return taskengine.Fail(err, "required_provider_unavailable", settlement)
@@ -161,7 +155,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			return taskengine.RetryBackoff(synapse.SummarizedError(err), "storage_selection_failed", settlement)
 		}
 		if len(selected) < required {
-			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "providers", "Waiting for storage providers", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "providers", "Waiting for storage providers", nil)
 		}
 		targets := make([]synapse.StorageTarget, 0, len(selected))
 		for i := range selected {
@@ -175,7 +169,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			return retryTask(err, "storage_funding_failed")
 		}
 		if costs == nil || !costs.Ready {
-			return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, "funding", uploadFundingWaitMessage(costs), nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "funding", uploadFundingWaitMessage(costs), nil)
 		}
 
 		plan := make([]bindingtask.Plan, 0, len(selected))
@@ -253,7 +247,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		if allResolved {
 			return taskengine.Complete("Bucket storage is ready", settlement)
 		}
-		return taskengine.Wait(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", settlement)
+		return taskengine.Wait(model.TaskResumeModeExecute, "storage_service", "Preparing bucket storage", settlement)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }
@@ -271,9 +265,9 @@ func (h *Handler) effectiveBucketCopies(bucket *model.Bucket) int {
 
 func (h *Handler) waitForStorageDependency(ctx context.Context, execution taskengine.Execution, reason, message string, err error) taskengine.Result {
 	if synapse.IsProviderCandidateWait(err) && !bindingtask.SelectionFailed(err) {
-		return taskengine.Wait(model.TaskResumeModeExecute, storageDependencyWait, reason, message, bindingtask.SelectionWaitSettlement(execution.ID(), err))
+		return taskengine.Wait(model.TaskResumeModeExecute, reason, message, bindingtask.SelectionWaitSettlement(execution.ID(), err))
 	}
-	return taskengine.RetryInMode(h.logStorageDependencyFailure(ctx, execution, reason, err), reason, model.TaskResumeModeExecute, storageDependencyWait, bindingtask.SelectionSettlement(execution.ID(), err))
+	return taskengine.RetryInMode(h.logStorageDependencyFailure(ctx, execution, reason, err), reason, model.TaskResumeModeExecute, bindingtask.SelectionSettlement(execution.ID(), err))
 }
 
 func (h *Handler) logStorageDependencyFailure(ctx context.Context, execution taskengine.Execution, reason string, err error) error {

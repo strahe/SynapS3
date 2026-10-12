@@ -58,12 +58,6 @@ func (h *CapacityHandler) lruLowBytes() int64 {
 	return lruLowBytes(h.deps.MaxCacheBytes, h.deps.MaxWriteBytes, h.deps.LRULowPercent)
 }
 
-const (
-	dependencyWait        = time.Minute
-	externalPollInterval  = 5 * time.Second
-	disabledCycleInterval = time.Hour
-)
-
 type cacheCapacityCheckpoint struct {
 	CycleActive         bool  `json:"cycle_active"`
 	RefusedWriteBytes   int64 `json:"refused_write_bytes,omitempty"`
@@ -109,15 +103,15 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 			(h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload && !h.deps.CommitSealOnCachePressure) {
 			if checkpoint.PreviousCycleFailed {
 				checkpoint.PreviousCycleFailed = false
-				return completeCapacityCycle(execution, checkpoint, disabledCycleInterval, "Automatic cache cleanup is disabled")
+				return completeCapacityCycle(execution, checkpoint, "Automatic cache cleanup is disabled")
 			}
-			return taskengine.Wait(model.TaskResumeModeExecute, disabledCycleInterval, "scheduled", "Automatic cache cleanup is disabled", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "scheduled", "Automatic cache cleanup is disabled", nil)
 		}
 		if h.deps.Cache == nil || h.deps.CacheTracker == nil || h.deps.Scheduler == nil || h.deps.MaxCacheBytes <= 0 {
 			return taskengine.Fail(errors.New("cache capacity dependencies are unavailable"), "dependency_unavailable", nil)
 		}
 		if h.deps.EvictionPolicy == cache.EvictionPolicyLRU && !h.deps.CacheTracker.SafeForLRU() {
-			return taskengine.Wait(model.TaskResumeModeRecover, dependencyWait, "cache_access", "Waiting for reliable cache access records", nil)
+			return taskengine.Wait(model.TaskResumeModeRecover, "cache_access", "Waiting for reliable cache access records", nil)
 		}
 		usedBytes := h.deps.Cache.CapacitySnapshot().OccupiedBytes()
 		highBytes := cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRUHighPercent)
@@ -149,7 +143,7 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 		}
 		if !cycleActive && (cycleCompleted || checkpoint.PreviousCycleFailed) {
 			next.PreviousCycleFailed = false
-			return completeCapacityCycle(execution, next, externalPollInterval, "Local cache usage is within its target")
+			return completeCapacityCycle(execution, next, "Local cache usage is within its target")
 		}
 		if next != checkpoint {
 			if err := execution.WriteCheckpoint(ctx, next); err != nil {
@@ -158,7 +152,7 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 			}
 		}
 		if !cycleActive {
-			return taskengine.Wait(model.TaskResumeModeExecute, externalPollInterval, "scheduled", "Local cache usage is within its target", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "scheduled", "Local cache usage is within its target", nil)
 		}
 		activeBytes, err := h.deps.Repositories.CacheEvictions.ActiveEvictionBytes(ctx)
 		if err != nil {
@@ -196,13 +190,13 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 		if plannedTasks > 0 {
 			message = fmt.Sprintf("Scheduled cleanup for %d cached items (%d bytes)", plannedTasks, plannedBytes)
 		}
-		return taskengine.Wait(model.TaskResumeModeExecute, externalPollInterval, "cache_cleanup", message, nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, "cache_cleanup", message, nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }
 
-func completeCapacityCycle(execution taskengine.Execution, checkpoint cacheCapacityCheckpoint, delay time.Duration, message string) taskengine.Result {
-	return taskengine.CompleteCycle(delay, message, func(ctx context.Context, repos *repository.Repositories) error {
+func completeCapacityCycle(execution taskengine.Execution, checkpoint cacheCapacityCheckpoint, message string) taskengine.Result {
+	return taskengine.CompleteCycle(message, func(ctx context.Context, repos *repository.Repositories) error {
 		raw, err := json.Marshal(checkpoint)
 		if err != nil {
 			return err

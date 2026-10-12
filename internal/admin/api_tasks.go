@@ -184,7 +184,7 @@ func validTaskType(taskType model.TaskType) bool {
 	}
 }
 
-func (s *Server) taskListItem(_ context.Context, row *model.Task) taskListItem {
+func (s *Server) taskListItem(ctx context.Context, row *model.Task) taskListItem {
 	item := taskListItem{
 		ID: row.ID, Type: string(row.Type), Operation: taskOperationLabel(row.Type),
 		Status: string(row.Status), Presentation: taskPresentationStatus(row, time.Now()),
@@ -205,6 +205,15 @@ func (s *Server) taskListItem(_ context.Context, row *model.Task) taskListItem {
 			item.RetryTaskID = &row.ID
 		}
 		item.Acknowledgeable = s.taskService.Acknowledgeable(row)
+	}
+	if row.Type == model.TaskTypeStorageDataSetEnsure && row.Status == model.TaskStatusFailed {
+		canonical, handled, err := s.replacementRetryTask(ctx, row)
+		if handled {
+			item.Retryable, item.RetryTaskID = err == nil && canonical != nil, nil
+			if item.Retryable {
+				item.RetryTaskID = &canonical.ID
+			}
+		}
 	}
 	if row.Status == model.TaskStatusRunning && row.WaitReason != nil && *row.WaitReason != "" {
 		item.WaitReason = nil
@@ -481,7 +490,7 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item := s.taskListItem(r.Context(), row)
-	retryID, retryReason, err := s.inspectTaskRetry(r.Context(), row)
+	retryID, retryReason, err := s.inspectManualTaskRetry(r.Context(), row)
 	if err != nil {
 		s.logger.Error("api: failed to inspect task retry", "error", err, "taskID", id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -498,19 +507,36 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 		Policy *taskPolicyView `json:"policy"`
 	}{Task: items[0]}
 	if policy, ok := s.taskPolicy(row); ok {
-		response.Policy = &taskPolicyView{MaxAttempts: new(policy.MaxAttempts), InitialDelay: policy.Backoff.InitialDelay.String(), MaximumDelay: policy.Backoff.MaximumDelay.String(), Multiplier: policy.Backoff.Multiplier, Jitter: policy.Backoff.Jitter, InvocationTimeout: policy.InvocationTimeout.String(), ObservationWindow: policy.ObservationWindow.String()}
+		response.Policy = toTaskPolicyView(policy)
 	}
 	writeJSON(w, 200, response)
 }
 
+type taskBackoffView struct {
+	InitialDelay string  `json:"initial_delay"`
+	MaximumDelay string  `json:"maximum_delay"`
+	Multiplier   float64 `json:"multiplier"`
+	Jitter       float64 `json:"jitter"`
+}
+
+func toTaskPolicyView(policy taskengine.ExecutionPolicy) *taskPolicyView {
+	view := &taskPolicyView{MaxAttempts: new(policy.MaxAttempts), InitialDelay: policy.Backoff.InitialDelay.String(), MaximumDelay: policy.Backoff.MaximumDelay.String(), Multiplier: policy.Backoff.Multiplier, Jitter: policy.Backoff.Jitter, InvocationTimeout: policy.InvocationTimeout.String(), ObservationWindow: policy.ObservationWindow.String()}
+	if policy.ResendBackoff != nil {
+		b := policy.ResendBackoff
+		view.ResendBackoff = &taskBackoffView{InitialDelay: b.InitialDelay.String(), MaximumDelay: b.MaximumDelay.String(), Multiplier: b.Multiplier, Jitter: b.Jitter}
+	}
+	return view
+}
+
 type taskPolicyView struct {
-	MaxAttempts       *int    `json:"max_attempts"`
-	InitialDelay      string  `json:"initial_delay"`
-	MaximumDelay      string  `json:"maximum_delay"`
-	Multiplier        float64 `json:"multiplier"`
-	Jitter            float64 `json:"jitter"`
-	InvocationTimeout string  `json:"invocation_timeout"`
-	ObservationWindow string  `json:"observation_window"`
+	ResendBackoff     *taskBackoffView `json:"resend_backoff,omitempty"`
+	MaxAttempts       *int             `json:"max_attempts"`
+	InitialDelay      string           `json:"initial_delay"`
+	MaximumDelay      string           `json:"maximum_delay"`
+	Multiplier        float64          `json:"multiplier"`
+	Jitter            float64          `json:"jitter"`
+	InvocationTimeout string           `json:"invocation_timeout"`
+	ObservationWindow string           `json:"observation_window"`
 }
 
 func taskPageParameters(w http.ResponseWriter, r *http.Request) (int64, int, bool) {
@@ -642,4 +668,36 @@ func safeProviderSelection(report *providerselect.SelectionDiagnostics) *provide
 	view.RejectedTotal = max(report.RejectedTotal, len(report.Rejections))
 	view.RejectedOmitted = view.RejectedTotal - len(view.Rejections)
 	return &view
+}
+
+func (s *Server) replacementRetryTask(ctx context.Context, requested *model.Task) (*model.Task, bool, error) {
+	if requested.Type != model.TaskTypeStorageDataSetEnsure {
+		return requested, false, nil
+	}
+	row, err := s.repos.Replacements.EnsureTaskReplacement(ctx, requested.ID)
+	if err != nil || row == nil {
+		return requested, false, err
+	}
+	parent, err := s.repos.Tasks.GetByID(ctx, *row.TaskID)
+	if err != nil {
+		return nil, true, err
+	}
+	if parent == nil || parent.Status != model.TaskStatusFailed || parent.SupersededAt != nil || requested.Status != model.TaskStatusFailed {
+		return nil, true, repository.ErrConflict
+	}
+	return parent, true, nil
+}
+
+func (s *Server) inspectManualTaskRetry(ctx context.Context, row *model.Task) (*int64, string, error) {
+	canonical, handled, err := s.replacementRetryTask(ctx, row)
+	if err != nil {
+		if reason, known := taskRetryUnavailableReason(err); known {
+			return nil, reason, nil
+		}
+		return nil, "", err
+	}
+	if handled {
+		return s.inspectTaskRetry(ctx, canonical)
+	}
+	return s.inspectTaskRetry(ctx, row)
 }

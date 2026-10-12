@@ -297,11 +297,8 @@ func (s *Server) preflightReplacementSource(ctx context.Context, bucket *model.B
 	if source.BucketID != bucket.ID {
 		return nil, nil, repository.ErrNotFound
 	}
-	if source.DataSetID == nil && len(source.CreationRejection) != 0 {
-		check.VerifiedCreationRejection, err = s.checkReplacementRefusal(ctx, bucket, check, source)
-		if err != nil {
-			return source, nil, err
-		}
+	if source.Status != model.StorageDataSetStatusReady {
+		return source, check, nil
 	}
 	for i := range check.Targets {
 		target := &check.Targets[i]

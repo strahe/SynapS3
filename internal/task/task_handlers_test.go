@@ -71,6 +71,7 @@ type handlerTestRuntime struct {
 	service         *taskengine.Service
 	engine          *taskengine.Engine
 	testMaxAttempts *int
+	testBackoff     *taskengine.BackoffPolicy
 	schedules       []taskengine.ScheduleDefinition
 }
 
@@ -103,6 +104,7 @@ type handlerRuntimeOptions struct {
 	concurrency          int
 	uploadConcurrency    int
 	maxAttempts          *int
+	testBackoff          *taskengine.BackoffPolicy
 	leaseDuration        time.Duration
 	observabilityChecker observability.RefreshChecker
 	retireOnly           bool
@@ -207,6 +209,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	runtime := handlerTestRuntime{
 		db: db, repos: repos, cache: cacheStore, gate: gate, tracker: tracker,
 		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, engine: engine, testMaxAttempts: options.maxAttempts,
+		testBackoff: options.testBackoff,
 	}
 	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
@@ -386,6 +389,14 @@ func handlerExecutionRegistry(t *testing.T, runtime handlerTestRuntime) *taskeng
 		}
 		definition.Policy.Backoff = taskengine.BackoffPolicy{
 			InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond,
+		}
+		if runtime.testBackoff != nil {
+			definition.Policy.Backoff = *runtime.testBackoff
+		}
+		if definition.Policy.ResendBackoff != nil && taskType != model.TaskTypeStorageCommit {
+			definition.Policy.ResendBackoff = &taskengine.BackoffPolicy{
+				InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond,
+			}
 		}
 		if err := registry.Register(handlerPolicyFixture{Handler: handler, definition: definition}); err != nil {
 			t.Fatal(err)
@@ -2397,7 +2408,8 @@ type limitedClaimRepository struct {
 	maximum int64
 	claims  atomic.Int64
 	// countType, when set, counts only claims of that task type.
-	countType model.TaskType
+	countType       model.TaskType
+	excludedTaskIDs []int64
 }
 
 type validateFailureRepository struct {
@@ -2422,6 +2434,7 @@ func (r *limitedClaimRepository) ClaimNext(ctx context.Context, lease time.Durat
 	if r.claims.Load() >= r.maximum {
 		return nil, nil
 	}
+	filter.ExcludedTaskIDs = append(filter.ExcludedTaskIDs, r.excludedTaskIDs...)
 	claimed, err := r.TaskRepository.ClaimNext(ctx, lease, filter)
 	if claimed != nil && err == nil && (r.countType == "" || claimed.Type == r.countType) {
 		r.claims.Add(1)
@@ -3592,7 +3605,6 @@ func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 
 func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	var pullCalls, statusCalls, presignCalls atomic.Int64
-	statusObserved := make(chan struct{})
 	type observedPull struct {
 		piece string
 		extra string
@@ -3624,9 +3636,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: storageClient, policy: cache.EvictionPolicyNone,
 		parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
-			if statusCalls.Add(1) == 1 {
-				close(statusObserved)
-			}
+			statusCalls.Add(1)
 			if pullCalls.Load() >= 2 {
 				return synapse.ParkedPieceReady, nil
 			}
@@ -3650,22 +3660,10 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 		return target, nil
 	}
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
-	limitedRepos := *runtime.repos
-	// Stop before the new Commit task is claimed.
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3, countType: model.TaskTypeStoragePull}
-	limitedRepos.Tasks = limited
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
-	if err != nil {
-		t.Fatalf("new limited task engine: %v", err)
+	recovering := runOneStorageTask(t, runtime, taskRow, model.TaskStatusPending)
+	if recovering.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("pull after ambiguous response = %#v", recovering)
 	}
-	cancel, done := runEngine(t, engine)
-	defer stopHandlerEngine(t, cancel, done)
-
-	recovering := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
 	var checkpoint struct {
 		AttemptID string `json:"attempt_id"`
 	}
@@ -3696,20 +3694,14 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ?, work_started_at = NULL WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("make pull recovery ready: %v", err)
 	}
-	select {
-	case <-statusObserved:
-	case <-time.After(3 * time.Second):
-		t.Fatal("pull recovery did not inspect target piece")
+	replayed := runOneStorageTask(t, runtime, recovering, model.TaskStatusPending)
+	if replayed.ResumeMode != model.TaskResumeModeExecute || statusCalls.Load() != 1 || pullCalls.Load() != 1 {
+		t.Fatalf("pull observation mode=%s observations=%d submissions=%d", replayed.ResumeMode, statusCalls.Load(), pullCalls.Load())
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
-	})
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("make repeated pull ready: %v", err)
 	}
-	completed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusCompleted
-	})
+	completed := runOneStorageTask(t, runtime, replayed, model.TaskStatusCompleted)
 	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(attempt.AttemptedAt) {
 		t.Fatalf("pull recovery start = %v, want %v", completed.WorkStartedAt, attempt.AttemptedAt)
 	}
@@ -4955,9 +4947,8 @@ func TestRetirementWithUnobservedTerminationTriesAgain(t *testing.T) {
 	defer stopHandlerEngine(t, cancel, done)
 
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return terminator.calls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+		return terminator.calls.Load() == 1 && task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.ResumeMode == model.TaskResumeModeRecover
 	})
-	wakeTask(t, runtime, taskRow.ID)
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return terminator.calls.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
@@ -5411,8 +5402,7 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	// The state the real failure path leaves behind: a generation that never
-	// reached the chain, recorded through the same repository call.
+	// A failed generation does not hold a current slot or qualify for selection.
 	failed, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
 		BucketID: bucket.ID, ProviderID: failedProvider, CopyIndex: 0,
 	})
@@ -5467,7 +5457,7 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 // and its provider becomes available to the bucket again. Keeping it would
 // reserve that provider forever: a failed generation can neither be retired nor
 // replaced, and the unique index covers every non-retired row.
-func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
+func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *testing.T) {
 	sequence := storedObjectSequence.Add(1)
 	providerID := testOnChainID(t, 26000+sequence)
 	target := &testutil.MockStorageTarget{
@@ -5475,14 +5465,18 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 		WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 			return nil, pdp.ErrTxRejected
 		},
+		FindDataSetByClientIDFunc: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+			return storage.DataSetRef{}, false, nil
+		},
 	}
 	storageClient := &testutil.MockStorageClient{
 		OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 			return target, nil
 		},
 	}
+	budget := 1
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: storageClient, policy: cache.EvictionPolicyNone,
+		storage: storageClient, policy: cache.EvictionPolicyNone, maxAttempts: &budget,
 	})
 	ctx := t.Context()
 	bucket := &model.Bucket{
@@ -5533,20 +5527,32 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, ensureTask.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if handlerTaskRetryable(t, runtime, failed) {
-		t.Fatal("a rejected creation offers a retry that could only fail again")
+	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, failed) {
+		t.Fatalf("failure=%v retryable=%v, want an exhausted round with manual recovery", failed.FailureReason, handlerTaskRetryable(t, runtime, failed))
 	}
 
 	ended, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, binding.ID)
-	if err != nil || ended == nil || ended.Status != model.StorageDataSetStatusRetired || ended.EnsureTaskID != nil {
-		t.Fatalf("rejected generation = %#v err=%v, want it retired rather than deleted, with its creation fence released", ended, err)
+	if err != nil || ended == nil || ended.Status != model.StorageDataSetStatusCreating || ended.EnsureTaskID == nil || *ended.EnsureTaskID != failed.ID || !ended.IsCurrent || ended.ClientDataSetID == nil || !ended.ClientDataSetID.Equal(clientDataSetID) {
+		t.Fatalf("rejected generation = %#v err=%v, want its request and current owner preserved", ended, err)
 	}
-	// The provider is what retirement buys back.
-	reused, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: providerID, CopyIndex: 0,
-	})
-	if err != nil || reused == nil || reused.ID == binding.ID {
-		t.Fatalf("rebinding the freed provider = %#v err=%v", reused, err)
+	if ended.CreateTransactionID != nil || ended.CreateStatusURL != nil {
+		t.Fatalf("rejected submission remains active: %#v", ended)
+	}
+	events, err := runtime.repos.Tasks.ListEvents(ctx, failed.ID, 0, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserved := false
+	for _, event := range events {
+		if event.Type == "dataset_transaction_rejected" && strings.Contains(string(event.Details), "0xrejected") && strings.Contains(string(event.Details), clientDataSetID.String()) {
+			preserved = true
+		}
+	}
+	if !preserved || strings.Contains(string(failed.Checkpoint), `"transaction_id"`) {
+		t.Fatalf("rejected submission evidence not preserved before clearing: checkpoint=%s events=%v", failed.Checkpoint, events)
+	}
+	if _, local, err := runtime.repos.Replacements.SourceEligibility(ctx, ended.ID); err != nil || !local {
+		t.Fatalf("failed source eligibility = %v, %v", local, err)
 	}
 }
 
@@ -5608,9 +5614,7 @@ func wakeTask(t *testing.T, runtime handlerTestRuntime, taskID int64) {
 	}
 }
 
-// A create request whose outcome was lost is never given up on: the chain is
-// checked for its client data set ID, the same ID is sent again while nothing
-// is visible. A later chain transaction rejection cannot settle earlier sends.
+// A lost create response is recovered with the same request identity.
 func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	sequence := storedObjectSequence.Add(1)
 	providerID := testOnChainID(t, 31000+sequence)
@@ -5691,7 +5695,7 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	if err := json.Unmarshal(stored.Checkpoint, &checkpoint); err != nil {
 		t.Fatalf("decode checkpoint: %v", err)
 	}
-	checkpoint["attempted_at"] = time.Now().UTC().Add(-time.Hour)
+	checkpoint["next_resend_at"] = time.Now().UTC().Add(-time.Second)
 	aged, err := json.Marshal(checkpoint)
 	if err != nil {
 		t.Fatalf("encode checkpoint: %v", err)
@@ -5699,11 +5703,6 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, string(aged), fixture.ensureTask.ID).Exec(ctx); err != nil {
 		t.Fatalf("age checkpoint: %v", err)
 	}
-	wakeTask(t, runtime, fixture.ensureTask.ID)
-	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
-		return sends() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
-
 	wakeTask(t, runtime, fixture.ensureTask.ID)
 	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
@@ -5865,10 +5864,8 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			fenceHeld: true, retryable: true, incompleteCopies: 1,
 		},
 		{
-			// The chain resolved the ID to a record that is not ours, and said so
-			// on two reads. Nothing will ever serve these copies.
 			name: "correlation conflict", reason: "dataset_correlation_conflict",
-			status: model.StorageDataSetStatusRetired, fenceHeld: false, retryable: false, incompleteCopies: 0,
+			status: model.StorageDataSetStatusPending, fenceHeld: true, retryable: false, incompleteCopies: 1,
 			lookup: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {
 				return storage.DataSetRef{}, false, fmt.Errorf("lookup: %w", storage.ErrDataSetCorrelationConflict)
 			},
@@ -5963,45 +5960,21 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 	}
 }
 
-// TestDataSetCreationRecoversFromAnUnusableCheckpointThroughTheRow checks that a
-// checkpoint that can no longer name its request is resolved through the ID the
-// row recorded before the provider call, and that nothing is sent when the chain
-// holds nothing under it.
-func TestDataSetCreationRecoversFromAnUnusableCheckpointThroughTheRow(t *testing.T) {
-	for _, tt := range []struct {
-		name      string
-		found     bool
-		status    model.StorageDataSetStatus
-		fenceHeld bool
-	}{
-		{name: "chain holds the data set", found: true, status: model.StorageDataSetStatusReady, fenceHeld: false},
-		{name: "chain holds nothing", found: false, status: model.StorageDataSetStatusPending, fenceHeld: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
+func TestDataSetCreationWithUnusableCheckpointPreservesConfirmedOrPendingFacts(t *testing.T) {
+	for _, confirmed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("confirmed=%t", confirmed), func(t *testing.T) {
 			sequence := storedObjectSequence.Add(1)
 			providerID := testOnChainID(t, 41000+sequence)
 			clientID := testOnChainID(t, 42000+sequence)
-			createdID := testOnChainID(t, 43000+sequence)
-			var sends, lookups atomic.Int64
+			var calls atomic.Int64
 			target := &testutil.MockStorageTarget{
 				ProviderIDValue: providerID.SDK(),
-				FindDataSetByClientIDFunc: func(_ context.Context, asked sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-					lookups.Add(1)
-					if asked.String() != clientID.SDK().String() {
-						t.Errorf("looked up %s, want the recorded %s", asked.String(), clientID.String())
-					}
-					if !tt.found {
-						return storage.DataSetRef{}, false, nil
-					}
-					ref, err := storage.NewDataSetRef(providerID.SDK(), createdID.SDK(), asked)
-					if err != nil {
-						t.Errorf("new data set ref: %v", err)
-						return storage.DataSetRef{}, false, err
-					}
-					return ref, true, nil
+				FindDataSetByClientIDFunc: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+					calls.Add(1)
+					return storage.DataSetRef{}, false, errors.New("unexpected observation without original identity")
 				},
 				CreateDataSetFunc: func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
-					sends.Add(1)
+					calls.Add(1)
 					return nil, errors.New("unexpected create request")
 				},
 			}
@@ -6010,50 +5983,51 @@ func TestDataSetCreationRecoversFromAnUnusableCheckpointThroughTheRow(t *testing
 					OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 						return target, nil
 					},
-				},
-				policy: cache.EvictionPolicyNone,
+				}, policy: cache.EvictionPolicyNone,
 			})
 			ctx := t.Context()
 			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("unnamed-creation-%d", sequence))
 			if err := runtime.repos.Contents.RecordDataSetClientID(ctx, fixture.binding.ID, fixture.ensureTask.ID, clientID); err != nil {
-				t.Fatalf("record client data set ID: %v", err)
+				t.Fatal(err)
 			}
-			// A checkpoint this build cannot decode: the ID arrives as a number
-			// where the record expects text.
-			if _, err := runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`,
-				`{"client_data_set_id": 12}`, fixture.ensureTask.ID).Exec(ctx); err != nil {
-				t.Fatalf("write checkpoint: %v", err)
+			if confirmed {
+				if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+					ID: fixture.binding.ID, DataSetID: testOnChainID(t, 43000+sequence), ClientDataSetID: &clientID,
+				}); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if _, err := runtime.db.NewRaw(`UPDATE tasks SET resume_mode = ? WHERE id = ?`, model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(ctx); err != nil {
-				t.Fatalf("resume in recovery: %v", err)
+			if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = ?, resume_mode = ? WHERE id = ?",
+				`{"client_data_set_id":12}`, model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
 			}
-
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
-			settled := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
-				if tt.found {
-					return task.Status == model.TaskStatusCompleted
+			settled := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(row *model.Task) bool {
+				if confirmed {
+					return row.Status == model.TaskStatusCompleted
 				}
-				return task.Status == model.TaskStatusFailed
+				return row.Status == model.TaskStatusFailed
 			})
-			if !tt.found && (settled.FailureReason == nil || *settled.FailureReason != "invalid_checkpoint") {
-				t.Fatalf("failure = %v, want invalid_checkpoint", settled.FailureReason)
+			if !confirmed && (settled.FailureReason == nil || *settled.FailureReason != "invalid_checkpoint") {
+				t.Fatalf("failure=%v, want invalid_checkpoint", settled.FailureReason)
 			}
-			if sends.Load() != 0 || lookups.Load() == 0 {
-				t.Fatalf("sends = %d lookups = %d, want the recorded ID looked up and nothing sent", sends.Load(), lookups.Load())
+			if calls.Load() != 0 {
+				t.Fatalf("external calls=%d, want zero", calls.Load())
 			}
 			kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
-			if err != nil || kept.Status != tt.status || (kept.EnsureTaskID != nil) != tt.fenceHeld {
-				t.Fatalf("generation = %#v err=%v, want status %s with fence held=%v", kept, err, tt.status, tt.fenceHeld)
+			expectedStatus := model.StorageDataSetStatusPending
+			if confirmed {
+				expectedStatus = model.StorageDataSetStatusReady
+			}
+			if err != nil || kept.Status != expectedStatus || (kept.EnsureTaskID != nil) == confirmed || !kept.IsCurrent || !kept.ClientDataSetID.Equal(clientID) {
+				t.Fatalf("generation=%#v err=%v", kept, err)
 			}
 		})
 	}
 }
 
-// TestDataSetEnsureGivesUpAGenerationThatNeverSent checks that a task that
-// cannot run gives up its generation — and its creation fence — only because the
-// row proves no request ever went out.
-func TestDataSetEnsureGivesUpAGenerationThatNeverSent(t *testing.T) {
+func TestDataSetEnsurePreservesAnUnsentGenerationWithIncompleteIdentity(t *testing.T) {
 	sequence := storedObjectSequence.Add(1)
 	providerID := testOnChainID(t, 44000+sequence)
 	target := &testutil.MockStorageTarget{
@@ -6082,12 +6056,12 @@ func TestDataSetEnsureGivesUpAGenerationThatNeverSent(t *testing.T) {
 	failed := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "dataset_creation_unsent" || handlerTaskRetryable(t, runtime, failed) {
-		t.Fatalf("failure = %v retryable=%v, want dataset_creation_unsent with no retry offered", failed.FailureReason, handlerTaskRetryable(t, runtime, failed))
+	if failed.FailureReason == nil || *failed.FailureReason != "dependency_unavailable" || !handlerTaskRetryable(t, runtime, failed) {
+		t.Fatalf("failure = %v retryable=%v, want recovery after restoring the signing identity", failed.FailureReason, handlerTaskRetryable(t, runtime, failed))
 	}
 	kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
-	if err != nil || kept.Status != model.StorageDataSetStatusRetired || kept.EnsureTaskID != nil {
-		t.Fatalf("generation = %#v err=%v, want it retired with its creation fence released", kept, err)
+	if err != nil || kept.Status != model.StorageDataSetStatusPending || kept.EnsureTaskID == nil || *kept.EnsureTaskID != failed.ID || !kept.IsCurrent || kept.ClientDataSetID != nil {
+		t.Fatalf("generation = %#v err=%v, want its unsent owner and current slot preserved", kept, err)
 	}
 }
 
@@ -6145,8 +6119,8 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(*model.Task) bool {
-		return lookups.Load() > 0
+	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
+		return lookups.Load() > 0 && task.Status == model.TaskStatusPending && task.RetryCount > 0 && !strings.Contains(string(task.Checkpoint), `"transaction_id"`)
 	})
 	kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
 	if err != nil || kept.Status != model.StorageDataSetStatusCreating || kept.EnsureTaskID == nil {

@@ -14,7 +14,6 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
-	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	bindings "github.com/strahe/synaps3/internal/task/binding"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -31,13 +30,6 @@ type EnsureDependencies struct {
 	Logger *slog.Logger
 }
 
-const (
-	storageDependencyWait      = time.Minute
-	storagePollInterval        = 5 * time.Second
-	unobservedOutcomeBaseDelay = time.Minute
-	unobservedOutcomeMaxDelay  = 30 * time.Minute
-)
-
 type dataSetCreationCheckpoint struct {
 	// AttemptedAt is when the latest create request was sent.
 	AttemptedAt     time.Time `json:"attempted_at"`
@@ -47,10 +39,9 @@ type dataSetCreationCheckpoint struct {
 	// Identity is the payer, chain, and record keeper the request was signed
 	// for; a client data set ID is only unique within it.
 	Identity *storage.ContextIdentity `json:"identity,omitempty"`
-	// Sends counts requests carrying ClientDataSetID. A later HTTP refusal and
-	// absence check permit replacement, but cannot rule out an earlier request
-	// succeeding late. A rejected transaction only resolves its own submission.
+	// Sends counts admitted requests carrying ClientDataSetID.
 	Sends             int                       `json:"sends,omitempty"`
+	NextResendAt      time.Time                 `json:"next_resend_at,omitempty"`
 	ProviderRejection *dataSetProviderRejection `json:"provider_rejection,omitempty"`
 }
 
@@ -88,19 +79,15 @@ func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 			return storagepipeline.ValidateDataSetInput(*input)
 		}),
 		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagepipeline.DataSetInput) (int64, int64) { return input.DataSetID, 0 }),
-		Policy:   taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
-		// A refusal checkpoint resumes queries; only settled terminal failures
-		// have no remaining creation work to retry.
+		Policy: taskengine.ExecutionPolicy{
+			MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(),
+			ResendBackoff: &taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
+		}, AllowRetry: true,
 		CanManualRetry: func(task *model.Task) bool {
 			if task == nil || task.FailureReason == nil {
 				return true
 			}
-			switch *task.FailureReason {
-			case "dataset_creation_rejected", "dataset_correlation_conflict", "dataset_creation_unsent", "dataset_provider_rejected":
-				return false
-			default:
-				return true
-			}
+			return *task.FailureReason != "dataset_correlation_conflict"
 		},
 	}
 	definition.InspectRetry = func(ctx context.Context, repos *repository.Repositories, source *model.Task) error {
@@ -153,7 +140,7 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 		return retryTask(err, "dataset_authorization_failed")
 	}
 	if h.deps.Storage == nil {
-		return failDataSetEnsure(binding, execution.ID(), errors.New("storage client is unavailable"), "dependency_unavailable")
+		return retryTask(errors.New("storage client is unavailable"), "dependency_unavailable")
 	}
 	if binding.Status == model.StorageDataSetStatusReady && binding.DataSetID != nil && !binding.DataSetID.IsZero() {
 		return taskengine.Complete("Data set is ready", func(ctx context.Context, repos *repository.Repositories) error {
@@ -171,33 +158,11 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 		DataSetMetadata: map[string]string{"bucket": bucket.Name},
 	})
 	if err != nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
-	}
-	// A request that already went out is resolved by the ID it used, before any
-	// metadata search: every generation this bucket ever had at this provider
-	// shares that metadata, so a match proves nothing about which one is ours.
-	if len(binding.CreationRejection) != 0 {
-		evidence, err := binding.CreationRejectionEvidence()
-		if err != nil {
-			return taskengine.Fail(err, "invalid_checkpoint", nil)
-		}
-		identity := storage.ContextIdentity{Payer: evidence.Payer, ChainID: sdktypes.ChainID(evidence.ChainID), RecordKeeper: evidence.RecordKeeper}
-		checkpoint := dataSetCreationCheckpoint{
-			ClientDataSetID: evidence.ClientDataSetID.String(), Identity: &identity,
-			ProviderRejection: &dataSetProviderRejection{StatusCode: evidence.StatusCode, RejectedAt: evidence.RejectedAt},
-		}
-		clientID, reason, err := checkpoint.requestIdentity(provider)
-		if err != nil {
-			if reason == "dataset_identity_changed" {
-				return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider_confirmation", "Restore the original wallet and network to check storage setup", nil)
-			}
-			return taskengine.Fail(err, reason, nil)
-		}
-		return h.resolveProviderRejection(ctx, execution, binding, provider, checkpoint, clientID)
+		return retryTask(err, "provider_unavailable")
 	}
 	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[dataSetCreationCheckpoint](execution)
 	if err != nil {
-		return h.recoverUnnamedCreation(ctx, execution, binding, provider, err)
+		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
 	if hasCheckpoint {
 		// Whether or not its submission was recorded, a request is resolved only
@@ -205,38 +170,19 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 		// nothing about who pays for the data set it created.
 		clientDataSetID, reason, err := checkpoint.requestIdentity(provider)
 		if err != nil {
-			if checkpoint.ProviderRejection != nil && reason == "dataset_identity_changed" {
-				return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider_confirmation", "Restore the original wallet and network to check storage setup", nil)
-			}
-			if reason == "invalid_checkpoint" {
-				return h.recoverUnnamedCreation(ctx, execution, binding, provider, err)
-			}
-			// The wallet or network moved. That proves only that this context
-			// cannot look the ID up, wait on it, or resend it safely — the data
-			// set the original identity asked for may exist and be billing — so
-			// the generation, its copies, and its fence are all kept for an
-			// operator who restores the configuration and retries.
 			return taskengine.Fail(err, reason, nil)
 		}
-		if checkpoint.ProviderRejection != nil {
-			return h.resolveProviderRejection(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+		if binding.ClientDataSetID != nil && !binding.ClientDataSetID.Equal(idtypes.OnChainIDFromSDK(clientDataSetID)) {
+			return taskengine.Fail(errors.New("data set creation identity changed"), "dataset_identity_mismatch", nil)
 		}
-		if checkpoint.TransactionID != "" {
+		if checkpoint.TransactionID != "" || checkpoint.StatusURL != "" {
 			startedAt := time.Now().UTC()
 			return h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID).WithWorkStartedAt(startedAt)
 		}
-		// The request went out without its submission being recorded, so it may
-		// or may not have created the data set. Only the chain can tell.
-		if !mayCreate {
-			return h.findRequestedDataSet(ctx, execution, binding, provider, checkpoint, clientDataSetID)
-		}
-		return h.sendDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+		return h.findRequestedDataSet(ctx, execution, binding, provider, checkpoint, clientDataSetID, mayCreate)
 	}
 	if dataSetCreationSent(binding) {
-		// The row remembers a request this task no longer can: resolve it by that
-		// ID rather than adopting a data set by metadata or minting a new one.
-		return h.recoverUnnamedCreation(ctx, execution, binding, provider,
-			errors.New("data set creation checkpoint is missing"))
+		return taskengine.Fail(errors.New("data set creation checkpoint is missing"), "invalid_checkpoint", nil)
 	}
 
 	// Nothing was ever sent for this generation, so a data set the provider
@@ -245,22 +191,19 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 	if err == nil && matching != nil {
 		dataSetID, clientDataSetID, identityErr := bindings.DataSetRefIDs(binding, *matching)
 		if identityErr != nil {
-			return failDataSetEnsure(binding, execution.ID(), identityErr, "dataset_identity_mismatch")
+			return taskengine.Fail(identityErr, "dataset_identity_mismatch", nil)
 		}
 		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, clientDataSetID)
 	}
 	if err != nil {
-		if synapse.IsProviderUnavailable(err) {
-			return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
-		}
 		return retryTask(err, "dataset_discovery_failed")
 	}
 	if !mayCreate {
-		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Data set is ready to create", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Data set is ready to create", nil)
 	}
 	identity := provider.ContextIdentity()
 	if !contextIdentityComplete(identity) {
-		return failDataSetEnsure(binding, execution.ID(), errors.New("storage signing identity is incomplete"), "dependency_unavailable")
+		return taskengine.Fail(errors.New("storage signing identity is incomplete"), "dependency_unavailable", nil)
 	}
 	clientDataSetID, err := newClientDataSetID()
 	if err != nil {
@@ -280,6 +223,11 @@ func (h *EnsureHandler) sendDataSetCreation(
 ) taskengine.Result {
 	checkpoint.AttemptedAt = time.Now().UTC()
 	checkpoint.Sends++
+	nextResendAt, err := execution.ResendAt(checkpoint.AttemptedAt, checkpoint.Sends)
+	if err != nil {
+		return taskengine.Fail(err, "invalid_policy", nil)
+	}
+	checkpoint.NextResendAt = nextResendAt
 	recordedID := idtypes.OnChainIDFromSDK(clientDataSetID)
 	var (
 		created     *storage.CreateDataSetResult
@@ -300,6 +248,9 @@ func (h *EnsureHandler) sendDataSetCreation(
 					checkpoint.TransactionID = sub.TransactionID
 					checkpoint.StatusURL = sub.StatusURL
 					evidenceErr = execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+						if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, binding.ID, execution.ID()); err != nil {
+							return err
+						}
 						return repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
 							ID: binding.ID, TransactionID: sub.TransactionID,
 							StatusURL: sub.StatusURL, ClientDataSetID: &recordedID,
@@ -317,17 +268,7 @@ func (h *EnsureHandler) sendDataSetCreation(
 		}
 		return retryTask(createErr, "dataset_creation_not_started")
 	}
-	if evidenceErr != nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Recording data set creation", func(ctx context.Context, repos *repository.Repositories) error {
-			if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, binding.ID, execution.ID()); err != nil {
-				return err
-			}
-			return repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-				ID: binding.ID, TransactionID: submission.TransactionID,
-				StatusURL: submission.StatusURL, ClientDataSetID: &recordedID,
-			})
-		})
-	}
+	binding.ClientDataSetID = &recordedID
 	if created != nil {
 		dataSetID, createdClientID, identityErr := bindings.DataSetResultIDs(binding, created)
 		if identityErr != nil {
@@ -335,76 +276,40 @@ func (h *EnsureHandler) sendDataSetCreation(
 		}
 		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, createdClientID)
 	}
-	if submission.TransactionID != "" {
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking data set creation", nil)
-	}
-	if rejection, ok := errors.AsType[*synapse.DataSetProviderRejectionError](createErr); ok &&
-		binding.CreateTransactionID == nil && binding.CreateStatusURL == nil && checkpoint.TransactionID == "" {
-		checkpoint.ProviderRejection = &dataSetProviderRejection{StatusCode: rejection.StatusCode, RejectedAt: time.Now().UTC(), Message: synapse.ErrorSummary(createErr)}
-		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-			encoded, encodeErr := json.Marshal(checkpoint)
-			if encodeErr != nil {
-				return taskengine.Fail(encodeErr, "dataset_rejection_record_failed", nil)
-			}
-			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Recording storage provider refusal",
-				func(ctx context.Context, repos *repository.Repositories) error {
-					return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), encoded)
-				})
+	if evidenceErr != nil {
+		encoded, err := json.Marshal(checkpoint)
+		if err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
 		}
-		return h.resolveProviderRejection(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+		return taskengine.RetryInMode(synapse.SummarizedError(evidenceErr), "dataset_submission_record_failed", model.TaskResumeModeRecover,
+			func(ctx context.Context, repos *repository.Repositories) error {
+				if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, binding.ID, execution.ID()); err != nil {
+					return err
+				}
+				if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), encoded); err != nil {
+					return err
+				}
+				return repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+					ID: binding.ID, TransactionID: submission.TransactionID,
+					StatusURL: submission.StatusURL, ClientDataSetID: &recordedID,
+				})
+			})
 	}
-	// The request may have reached the provider without its submission reaching
-	// us, so the chain is checked before anything is sent again.
-	delay := unobservedOutcomeDelay(checkpoint.Sends)
-	if summary := synapse.ErrorSummary(createErr); summary != "" && ctx.Err() == nil {
+	if submission.TransactionID != "" || submission.StatusURL != "" {
+		return h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+	}
+	if createErr == nil {
+		createErr = errors.New("data set creation has no confirmed result")
+	}
+	summary := synapse.ErrorSummary(createErr)
+	if ctx.Err() == nil {
 		h.deps.Logger.Warn("storage service creation request failed",
 			"task_id", execution.ID(), "storage_data_set_id", binding.ID, "provider_id", binding.ProviderID,
 			"sends", checkpoint.Sends, "error", summary)
-		return taskengine.RetryInMode(errors.New(summary), "provider_confirmation", model.TaskResumeModeRecover, delay, func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Contents.RecordDataSetCreationError(ctx, binding.ID, execution.ID(), summary)
-		})
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, delay, "provider_confirmation", "Checking data set creation", nil)
-}
-
-func (h *EnsureHandler) resolveProviderRejection(ctx context.Context, execution taskengine.Execution, binding *model.StorageDataSet, provider synapse.ProviderTarget, checkpoint dataSetCreationCheckpoint, clientID sdktypes.BigInt) taskengine.Result {
-	refusal := checkpoint.ProviderRejection
-	if refusal == nil || refusal.RejectedAt.IsZero() || (refusal.StatusCode != 400 && refusal.StatusCode != 401 && refusal.StatusCode != 403) ||
-		checkpoint.TransactionID != "" || checkpoint.StatusURL != "" || binding.CreateTransactionID != nil || binding.CreateStatusURL != nil {
-		return taskengine.Fail(errors.New("invalid storage provider refusal evidence"), "invalid_checkpoint", nil)
-	}
-	if binding.ClientDataSetID != nil && !binding.ClientDataSetID.Equal(idtypes.OnChainIDFromSDK(clientID)) {
-		return taskengine.Fail(errors.New("data set creation identity changed"), "dataset_identity_mismatch", nil)
-	}
-	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, clientID)
-	if errors.Is(err, storage.ErrDataSetCorrelationConflict) {
-		return taskengine.Fail(err, "dataset_identity_mismatch", nil)
-	}
-	if err != nil {
-		return retryTask(err, "dataset_observation_failed")
-	}
-	if found {
-		dataSetID, foundClientID, err := bindings.DataSetRefIDs(binding, ref)
-		if err != nil {
-			return taskengine.Fail(err, "dataset_identity_mismatch", nil)
-		}
-		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID)
-	}
-	identity := checkpoint.Identity
-	evidence := model.DataSetCreationRejection{
-		Version: 1, StatusCode: refusal.StatusCode, RejectedAt: refusal.RejectedAt, AbsenceCheckedAt: time.Now().UTC(),
-		ClientDataSetID: idtypes.OnChainIDFromSDK(clientID), Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper,
-	}
-	message := storagereplacement.ProviderRejectedMessage
-	if refusal.Message != "" {
-		message = synapse.ErrorSummary(errors.New(refusal.Message))
-	}
-	return taskengine.Fail(errors.New(message), "dataset_provider_rejected",
+	return taskengine.RetryInMode(synapse.SummarizedError(createErr), "provider_confirmation", model.TaskResumeModeRecover,
 		func(ctx context.Context, repos *repository.Repositories) error {
-			if err := repos.Contents.RecordDataSetCreationRejection(ctx, binding.ID, binding.Generation, execution.ID(), evidence); err != nil {
-				return err
-			}
-			return repos.Contents.RecordDataSetCreationError(ctx, binding.ID, execution.ID(), message)
+			return repos.Contents.RecordDataSetCreationError(ctx, binding.ID, execution.ID(), summary)
 		})
 }
 
@@ -415,12 +320,11 @@ func (h *EnsureHandler) findRequestedDataSet(
 	provider synapse.ProviderTarget,
 	checkpoint dataSetCreationCheckpoint,
 	clientDataSetID sdktypes.BigInt,
+	mayCreate bool,
 ) taskengine.Result {
 	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
 	if errors.Is(err, storage.ErrDataSetCorrelationConflict) {
-		// The ID is consumed on chain but does not resolve to this request's
-		// data set, so it is never sent again.
-		return taskengine.Fail(err, "dataset_correlation_conflict", dataSetFailureSettlement(binding.ID, execution.ID(), err.Error(), true))
+		return taskengine.Fail(err, "dataset_correlation_conflict", nil)
 	}
 	if err != nil {
 		return retryTask(err, "dataset_observation_failed")
@@ -432,10 +336,25 @@ func (h *EnsureHandler) findRequestedDataSet(
 		}
 		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID)
 	}
-	if wait := time.Until(checkpoint.AttemptedAt.Add(unobservedOutcomeDelay(checkpoint.Sends))); wait > 0 {
-		return taskengine.Wait(model.TaskResumeModeRecover, wait, "provider_confirmation", "Checking data set creation", nil)
+	if checkpoint.NextResendAt.IsZero() {
+		checkpoint.NextResendAt, err = execution.ResendAt(checkpoint.AttemptedAt, checkpoint.Sends)
+		if err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
+		}
+		if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+			_, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, binding.ID, execution.ID())
+			return err
+		}); err != nil {
+			return retryTask(err, "dataset_checkpoint_record_failed")
+		}
 	}
-	return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Retrying data set creation", nil)
+	if time.Now().Before(checkpoint.NextResendAt) {
+		return taskengine.WaitUntil(model.TaskResumeModeRecover, checkpoint.NextResendAt, "provider_confirmation", "Checking data set creation", nil)
+	}
+	if !mayCreate {
+		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Retrying data set creation", nil)
+	}
+	return h.sendDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
 }
 
 func (c dataSetCreationCheckpoint) requestIdentity(provider synapse.ProviderTarget) (sdktypes.BigInt, string, error) {
@@ -465,14 +384,6 @@ func contextIdentityComplete(identity storage.ContextIdentity) bool {
 	return identity.Payer != (common.Address{}) && identity.ChainID.IsValid() && identity.RecordKeeper != (common.Address{})
 }
 
-func unobservedOutcomeDelay(sends int) time.Duration {
-	delay := unobservedOutcomeBaseDelay
-	for i := 1; i < sends && delay < unobservedOutcomeMaxDelay; i++ {
-		delay *= 2
-	}
-	return min(delay, unobservedOutcomeMaxDelay)
-}
-
 func (h *EnsureHandler) waitDataSetCreation(
 	ctx context.Context,
 	execution taskengine.Execution,
@@ -482,24 +393,57 @@ func (h *EnsureHandler) waitDataSetCreation(
 	clientDataSetID sdktypes.BigInt,
 ) taskengine.Result {
 	result, err := provider.WaitForDataSetCreated(ctx, checkpoint.StatusURL, clientDataSetID)
-	if err != nil {
-		if errors.Is(err, synapse.ErrProviderTransactionRejected) {
-			if checkpoint.Sends > 1 {
-				// An earlier request with this ID had no observed outcome, so the
-				// rejection may only mean that request created the data set first.
-				// The dead submission is dropped and the ID is looked up instead.
-				checkpoint.TransactionID, checkpoint.StatusURL = "", ""
-				if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-					return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for data set", nil)
-				}
-				return taskengine.Wait(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking data set creation", nil)
-			}
-			return taskengine.Fail(err, "dataset_creation_rejected", dataSetFailureSettlement(binding.ID, execution.ID(), err.Error(), true))
+	if errors.Is(err, synapse.ErrProviderTransactionRejected) {
+		ref, found, lookupErr := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
+		if errors.Is(lookupErr, storage.ErrDataSetCorrelationConflict) {
+			return taskengine.Fail(lookupErr, "dataset_correlation_conflict", nil)
 		}
-		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, nil)
+		if lookupErr != nil {
+			return retryTask(lookupErr, "dataset_observation_failed")
+		}
+		if found {
+			dataSetID, foundClientID, identityErr := bindings.DataSetRefIDs(binding, ref)
+			if identityErr != nil {
+				return taskengine.Fail(identityErr, "dataset_identity_mismatch", nil)
+			}
+			return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID)
+		}
+		history, encodeErr := json.Marshal(map[string]any{
+			"transaction_id": checkpoint.TransactionID, "status_url": checkpoint.StatusURL,
+			"client_data_set_id": checkpoint.ClientDataSetID, "identity": checkpoint.Identity,
+			"sends": checkpoint.Sends, "attempted_at": checkpoint.AttemptedAt,
+			"next_resend_at": checkpoint.NextResendAt, "error": synapse.ErrorSummary(err),
+		})
+		if encodeErr != nil {
+			return taskengine.Fail(encodeErr, "invalid_checkpoint", nil)
+		}
+		checkpoint.TransactionID, checkpoint.StatusURL = "", ""
+		encoded, encodeErr := json.Marshal(checkpoint)
+		if encodeErr != nil {
+			return taskengine.Fail(encodeErr, "invalid_checkpoint", nil)
+		}
+		recordedID := idtypes.OnChainIDFromSDK(clientDataSetID)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover,
+			func(ctx context.Context, repos *repository.Repositories) error {
+				if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, binding.ID, execution.ID()); err != nil {
+					return err
+				}
+				if err := repos.Tasks.AppendEvent(ctx, execution.ID(), "dataset_transaction_rejected", history); err != nil {
+					return err
+				}
+				if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), encoded); err != nil {
+					return err
+				}
+				return repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+					ID: binding.ID, ClientDataSetID: &recordedID,
+				})
+			})
+	}
+	if err != nil {
+		return retryTask(err, "provider_confirmation")
 	}
 	if result == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for data set", nil)
+		return retryTask(errors.New("data set creation is awaiting confirmation"), "provider_confirmation")
 	}
 	dataSetID, createdClientID, err := bindings.DataSetResultIDs(binding, result)
 	if err != nil {
@@ -516,96 +460,6 @@ func dataSetCreationSent(binding *model.StorageDataSet) bool {
 		return true
 	}
 	return binding.CreateTransactionID != nil && *binding.CreateTransactionID != ""
-}
-
-func failDataSetEnsure(binding *model.StorageDataSet, taskID int64, err error, reason string) taskengine.Result {
-	if dataSetCreationSent(binding) {
-		return taskengine.Fail(err, reason, nil)
-	}
-	return taskengine.Fail(err, "dataset_creation_unsent", dataSetFailureSettlement(binding.ID, taskID, err.Error(), true))
-}
-
-func (h *EnsureHandler) recoverUnnamedCreation(
-	ctx context.Context,
-	execution taskengine.Execution,
-	binding *model.StorageDataSet,
-	provider synapse.ProviderTarget,
-	cause error,
-) taskengine.Result {
-	if binding.ClientDataSetID == nil || binding.ClientDataSetID.IsZero() {
-		return failDataSetEnsure(binding, execution.ID(), cause, "invalid_checkpoint")
-	}
-	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, binding.ClientDataSetID.SDK())
-	if errors.Is(err, storage.ErrDataSetCorrelationConflict) {
-		return taskengine.Fail(err, "dataset_correlation_conflict",
-			dataSetFailureSettlement(binding.ID, execution.ID(), err.Error(), true))
-	}
-	if err != nil {
-		return retryTask(err, "dataset_observation_failed")
-	}
-	if found {
-		dataSetID, foundClientID, identityErr := bindings.DataSetRefIDs(binding, ref)
-		if identityErr != nil {
-			return taskengine.Fail(identityErr, "dataset_identity_mismatch", nil)
-		}
-		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID)
-	}
-	// The chain holds nothing under that ID, and nothing here can prove which
-	// identity signed the request, so it is never sent again from this task.
-	return taskengine.Fail(cause, "invalid_checkpoint", nil)
-}
-
-func dataSetFailureSettlement(dataSetID, taskID int64, message string, terminal bool) taskengine.Settlement {
-	return func(ctx context.Context, repos *repository.Repositories) error {
-		if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, dataSetID, taskID); err != nil {
-			return err
-		}
-		if err := repos.Contents.MarkDataSetFailed(ctx, dataSetID, message); err != nil {
-			return err
-		}
-		if !terminal {
-			// The outcome is unknown, so the generation may still exist on the
-			// provider. Retrying this task looks the recorded ID up again and
-			// continues the copies bound to it, and continuation skips copies that
-			// already failed — so they are left alone rather than terminated on a
-			// guess.
-			return nil
-		}
-		// Nothing will ever serve these copies: the data set they name will not
-		// exist, and continuation would have nothing to rediscover. Failing them
-		// keeps their objects from sitting at "uploading" forever.
-		if err := failDataSetCopies(ctx, repos, dataSetID, message); err != nil {
-			return err
-		}
-		// The generation ends here rather than being deleted. Retiring it frees
-		// the provider for the bucket while keeping the record that this one was
-		// tried, and it is the only status the provider reservation index lets
-		// go of.
-		if _, err := repos.Contents.RetireRejectedDataSet(ctx, dataSetID); err != nil {
-			return err
-		}
-		// Nothing will be created for the retired generation, so its creation
-		// fence is released: a new replacement of the slot is refused while an
-		// earlier target still holds one.
-		return repos.Contents.CompleteDataSetEnsureTask(ctx, dataSetID, taskID)
-	}
-}
-
-func failDataSetCopies(ctx context.Context, repos *repository.Repositories, dataSetID int64, message string) error {
-	copies, err := repos.Contents.ListIncompleteCopiesForDataSet(ctx, dataSetID)
-	if err != nil {
-		return err
-	}
-	for i := range copies {
-		copyRow := &copies[i]
-		if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{
-			StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex,
-			LastError: message,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (h *EnsureHandler) completeDataSetEnsure(binding *model.StorageDataSet, taskID int64, dataSetID, clientDataSetID idtypes.OnChainID) taskengine.Result {

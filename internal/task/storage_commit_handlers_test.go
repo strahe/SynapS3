@@ -177,12 +177,11 @@ func sameSends(sends [][]cid.Cid, extras [][]byte) bool {
 	return true
 }
 
-// wakeCommitTasks makes sleeping registration tasks runnable, except one
-// backing off after a refusal, so a test does not wait out the poll.
+// wakeCommitTasks wakes observations without bypassing failure backoff.
 func wakeCommitTasks(t *testing.T, runtime handlerTestRuntime) {
 	t.Helper()
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE type = ? AND status = 'pending' AND (wait_reason IS NULL OR wait_reason <> ?)`,
-		time.Now().Add(-time.Second), model.TaskTypeStorageCommit, storagecommit.ProviderRejectedWaitReason).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE type = ? AND status = 'pending' AND wait_reason IS NOT NULL`,
+		time.Now().Add(-time.Second), model.TaskTypeStorageCommit).Exec(t.Context()); err != nil {
 		t.Fatalf("wake registration tasks: %v", err)
 	}
 }
@@ -415,8 +414,8 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	if first.RetryCount != 0 || first.ResumeMode != model.TaskResumeModeRecover {
 		t.Fatalf("collecting task = %#v, want recovery without retries", first)
 	}
-	if delay := first.AvailableAt.Sub(first.UpdatedAt); delay < 29*time.Second || delay > 31*time.Second {
-		t.Fatalf("collection check delay = %s, want 30s", delay)
+	if delay := first.AvailableAt.Sub(first.UpdatedAt); delay < 0 || delay > handlerTestPollInterval {
+		t.Fatalf("collection check delay = %s, want engine polling", delay)
 	}
 	for i, copyRow := range f.copies[1:] {
 		joined, _, err := f.runtime.repos.Contents.JoinCollectingCommitRequest(t.Context(), repository.JoinCommitRequestInput{
@@ -441,6 +440,9 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	})
 	if recovered.RetryCount != 0 {
 		t.Fatalf("recovered retry count = %d, want 0", recovered.RetryCount)
+	}
+	if delay := recovered.AvailableAt.Sub(recovered.UpdatedAt); delay < 0 || delay > handlerTestPollInterval {
+		t.Fatalf("recovered collection check delay = %s, want engine polling", delay)
 	}
 	members, err := f.runtime.repos.Contents.ListCommitRequestMembers(t.Context(), requestID)
 	if err != nil || len(members) != 3 {
@@ -674,8 +676,8 @@ func TestReadyCommitQueueWakeAndFallbackDoNotConsumeRetries(t *testing.T) {
 			cancel()
 			<-done
 			if waiting.ResumeMode != model.TaskResumeModeExecute || waiting.RetryCount != 0 || waiting.WorkStartedAt != nil ||
-				len(waiting.Checkpoint) != 0 || waiting.AvailableAt.Before(waitStartedAt.Add(30*time.Second)) || waiting.AvailableAt.After(time.Now().Add(30*time.Second)) {
-				t.Fatalf("queue wait = %#v, want unchanged budget and a 30-second execution wait", waiting)
+				len(waiting.Checkpoint) != 0 || waiting.AvailableAt.Before(waitStartedAt.Add(handlerTestPollInterval)) || waiting.AvailableAt.After(time.Now().Add(handlerTestPollInterval)) {
+				t.Fatalf("queue wait = %#v, want unchanged budget and engine polling", waiting)
 			}
 			if sends, _ := f.provider.sent(); len(sends) != 0 || f.provider.nonces.Reads() != 0 {
 				t.Fatalf("blocked request sent %d times or read the chain %d times", len(sends), f.provider.nonces.Reads())
@@ -735,23 +737,34 @@ func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
 				}
 			}
 			requestID, taskID := f.collectAt(t, "pressure-collecting", time.Now(), f.copies[5])
-			if _, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
+			capacityTask, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
 				Type:  model.TaskTypeCacheCapacityReconcile,
 				Input: taskengine.CycleInput{Cycle: 1},
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatal(err)
 			}
-			cancel, done := runHandlerEngine(t, f.runtime)
-			defer stopHandlerEngine(t, cancel, done)
-			blocked := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == storagecommit.CommitQueueWaitReason
-			})
+			if _, err := f.runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-2*time.Hour), capacityTask.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			runOneStorageTask(t, f.runtime, capacityTask, model.TaskStatusPending)
+			queued, err := f.runtime.repos.Tasks.GetByID(ctx, taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Hour), taskID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			blocked := runOneStorageTask(t, f.runtime, queued, model.TaskStatusPending)
+			if blocked.WaitReason == nil || *blocked.WaitReason != storagecommit.CommitQueueWaitReason {
+				t.Fatalf("collection is not queue blocked: %#v", blocked)
+			}
 			original, err := f.runtime.repos.Contents.GetUploadCopy(ctx, f.copies[5].ContentID, 0)
 			if err != nil || original == nil || original.CommitReadyAt == nil {
 				t.Fatalf("load original member: %#v, %v", original, err)
 			}
 			for _, copyRow := range f.copies[6:] {
-				f.queueTransferredCopy(t, copyRow)
+				runOneStorageTask(t, f.runtime, f.planTransferredCopy(t, copyRow), model.TaskStatusCompleted)
 				joined, err := f.runtime.repos.Contents.GetUploadCopy(ctx, copyRow.ContentID, 0)
 				if err != nil || joined == nil || joined.CommitRequestID == nil || *joined.CommitRequestID != requestID {
 					t.Fatalf("member joined a different batch: copy = %#v, error = %v", joined, err)
@@ -777,17 +790,28 @@ func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			// Advance only confirmation polling; collection must wake through the queue.
-			for _, id := range []int64{readyTaskID, taskID} {
-				waiting := waitForTask(t, f.runtime.repos, id, func(task *model.Task) bool {
-					return task.Status == model.TaskStatusCompleted || task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
-				})
-				if waiting.Status != model.TaskStatusCompleted {
-					wakeTask(t, f.runtime, id)
-				}
-				waitForTask(t, f.runtime.repos, id, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			readyTask, err := f.runtime.repos.Tasks.GetByID(ctx, readyTaskID)
+			if err != nil {
+				t.Fatal(err)
 			}
-			completed := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			readyTask = runOneStorageTask(t, f.runtime, readyTask, model.TaskStatusPending)
+			if readyTask.WaitReason == nil || *readyTask.WaitReason != "provider_confirmation" {
+				t.Fatalf("earlier batch did not submit: %#v", readyTask)
+			}
+			runOneStorageTask(t, f.runtime, readyTask, model.TaskStatusCompleted)
+			unblocked, err := f.runtime.repos.Tasks.GetByID(ctx, taskID)
+			if err != nil || unblocked.AvailableAt.After(time.Now()) {
+				t.Fatalf("queue release did not wake collection: %#v, %v", unblocked, err)
+			}
+			unblocked = runOneStorageTask(t, f.runtime, unblocked, model.TaskStatusPending)
+			if unblocked.ResumeMode != model.TaskResumeModeExecute || unblocked.WaitReason == nil || *unblocked.WaitReason != "safe_to_execute" {
+				t.Fatalf("collection did not become ready to seal: %#v", unblocked)
+			}
+			unblocked = runOneStorageTask(t, f.runtime, unblocked, model.TaskStatusPending)
+			if unblocked.WaitReason == nil || *unblocked.WaitReason != "provider_confirmation" {
+				t.Fatalf("collection did not submit: %#v", unblocked)
+			}
+			completed := runOneStorageTask(t, f.runtime, unblocked, model.TaskStatusCompleted)
 			sends, _ := f.provider.sent()
 			if len(sends) != 2 || len(sends[0]) != 1 || sends[0][0].String() != f.pieceCID(t, f.copies[4]) || len(sends[1]) != 3 {
 				t.Fatalf("submissions = %v, want earlier ready followed by the three-member batch", sends)
@@ -805,10 +829,10 @@ func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
 	}
 }
 
-func (f registrationFixture) queueTransferredCopy(t *testing.T, copyRow *model.StorageCopy) {
+func (f registrationFixture) planTransferredCopy(t *testing.T, copyRow *model.StorageCopy) *model.Task {
 	t.Helper()
 	ctx := t.Context()
-	var transferTaskID int64
+	var transferTask *model.Task
 	if err := f.runtime.repos.WithTx(ctx, func(repos *repository.Repositories) error {
 		generation, err := repos.Contents.NextCopyWorkGeneration(ctx, copyRow.ID)
 		if err != nil {
@@ -821,12 +845,18 @@ func (f registrationFixture) queueTransferredCopy(t *testing.T, copyRow *model.S
 		if err != nil {
 			return err
 		}
-		transferTaskID = task.ID
+		transferTask = task
 		return repos.Contents.BindCopyTask(ctx, copyRow.ID, generation, task.ID)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForTask(t, f.runtime.repos, transferTaskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	return transferTask
+}
+
+func (f registrationFixture) queueTransferredCopy(t *testing.T, copyRow *model.StorageCopy) {
+	t.Helper()
+	task := f.planTransferredCopy(t, copyRow)
+	waitForTask(t, f.runtime.repos, task.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
 }
 
 func TestCollectingCommitWaitsForSubmissionCapacity(t *testing.T) {
@@ -912,13 +942,19 @@ func TestCollectingCommitFormsBatchesWhenSlotsOpen(t *testing.T) {
 	if _, err := f.runtime.repos.Contents.RequestCommitSeal(ctx, requestID); err != nil {
 		t.Fatal(err)
 	}
-	cancel, done := runHandlerEngine(t, f.runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	blocked := waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == storagecommit.CommitQueueWaitReason
-	})
+	queued, err := f.runtime.repos.Tasks.GetByID(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Hour), taskID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocked := runOneStorageTask(t, f.runtime, queued, model.TaskStatusPending)
+	if blocked.WaitReason == nil || *blocked.WaitReason != storagecommit.CommitQueueWaitReason {
+		t.Fatalf("collection is not queue blocked: %#v", blocked)
+	}
 	for _, copyRow := range f.copies[5:] {
-		f.queueTransferredCopy(t, copyRow)
+		runOneStorageTask(t, f.runtime, f.planTransferredCopy(t, copyRow), model.TaskStatusCompleted)
 	}
 	members, err := f.runtime.repos.Contents.ListCommitRequestMembers(ctx, requestID)
 	if err != nil || len(members) != 65 {
@@ -942,9 +978,18 @@ func TestCollectingCommitFormsBatchesWhenSlotsOpen(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
-			return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
-		})
+		batchTask, err := f.runtime.repos.Tasks.GetByID(ctx, taskID)
+		if err != nil || batchTask.AvailableAt.After(time.Now()) {
+			t.Fatalf("queue release did not wake batch: %#v, %v", batchTask, err)
+		}
+		batchTask = runOneStorageTask(t, f.runtime, batchTask, model.TaskStatusPending)
+		if batchTask.ResumeMode != model.TaskResumeModeExecute || batchTask.WaitReason == nil || *batchTask.WaitReason != "safe_to_execute" {
+			t.Fatalf("batch did not become ready to seal: %#v", batchTask)
+		}
+		batchTask = runOneStorageTask(t, f.runtime, batchTask, model.TaskStatusPending)
+		if batchTask.WaitReason == nil || *batchTask.WaitReason != "provider_confirmation" {
+			t.Fatalf("batch did not submit: %#v", batchTask)
+		}
 		sends, _ := f.provider.sent()
 		if len(sends) != batch+1 || len(sends[batch]) != 32 {
 			t.Fatalf("submissions = %v, want %d batches of 32", sends, batch+1)
@@ -965,9 +1010,14 @@ func TestCollectingCommitFormsBatchesWhenSlotsOpen(t *testing.T) {
 		if batch == 1 {
 			waitReason = "collecting"
 		}
-		waitForTask(t, f.runtime.repos, taskID, func(task *model.Task) bool {
-			return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == waitReason
-		})
+		spilledTask, err := f.runtime.repos.Tasks.GetByID(ctx, taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spilledTask = runOneStorageTask(t, f.runtime, spilledTask, model.TaskStatusPending)
+		if spilledTask.WaitReason == nil || *spilledTask.WaitReason != waitReason || spilledTask.RetryCount != 0 {
+			t.Fatalf("spilled collection scheduling = %#v", spilledTask)
+		}
 		remaining, err := f.runtime.repos.Contents.ListCommitRequestMembers(ctx, requestID)
 		if err != nil || len(remaining) != 65-(batch+1)*32 || request.SealRequestedAt != nil || remaining[0].CommitReadyAt == nil {
 			t.Fatalf("spilled collection = %#v, members = %d, %v", request, len(remaining), err)
@@ -1014,7 +1064,9 @@ func TestCommitRequestRegistersEveryMemberInOneSubmission(t *testing.T) {
 }
 
 func TestRefusedCommitRequestBacksOffAndSendsTheSameRequest(t *testing.T) {
-	f := newRegistrationFixture(t, 2, nil, 0)
+	f := newRegistrationFixture(t, 2, nil, 0, func(options *handlerRuntimeOptions) {
+		options.testBackoff = &taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: time.Minute}
+	})
 	f.provider.script = []sendOutcome{sendRefuse}
 	requestID, taskID := f.collect(t)
 	cancel, done := runHandlerEngine(t, f.runtime)
@@ -1026,6 +1078,9 @@ func TestRefusedCommitRequestBacksOffAndSendsTheSameRequest(t *testing.T) {
 	})
 	if waiting.ResumeMode != model.TaskResumeModeExecute {
 		t.Fatalf("refused task = %#v, want an execute wait", waiting)
+	}
+	if waiting.WaitReason != nil || !f.request(t, requestID).RetryAt.Equal(waiting.AvailableAt) {
+		t.Fatalf("refusal schedule differs from task policy: task=%#v request=%#v", waiting, f.request(t, requestID))
 	}
 	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusReady || request.Refusals != 1 || request.RetryAt == nil || !request.RetryAt.After(time.Now()) {
 		t.Fatalf("refused request = %#v", request)
@@ -1221,10 +1276,46 @@ func TestLostSendIsResentUnchangedOnceItsDelayPasses(t *testing.T) {
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+	waiting := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
 		return f.request(t, requestID).Status == storagecommit.RequestStatusSubmitted &&
 			task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
+	var checkpoint struct {
+		RequestID    string    `json:"request_id"`
+		Sends        int       `json:"sends"`
+		SentAt       time.Time `json:"sent_at"`
+		NextResendAt time.Time `json:"next_resend_at"`
+	}
+	request := f.request(t, requestID)
+	if err := json.Unmarshal(waiting.Checkpoint, &checkpoint); err != nil || request.LastSentAt == nil ||
+		checkpoint.RequestID != requestID || checkpoint.Sends != request.Sends ||
+		!checkpoint.SentAt.Equal(*request.LastSentAt) || !checkpoint.NextResendAt.Equal(request.LastSentAt.Add(5*time.Minute)) {
+		t.Fatalf("send deadline = %#v, request=%#v, err=%v", checkpoint, request, err)
+	}
+	wantDeadline := checkpoint.NextResendAt
+	checkpoint.RequestID = "another-request"
+	checkpoint.NextResendAt = time.Now().Add(-time.Hour)
+	raw, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runtime.db.NewRaw(`UPDATE tasks SET checkpoint_json = ? WHERE id = ?`, json.RawMessage(raw), taskID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	staleClaim := waiting.ClaimGeneration
+	if _, err := f.runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ? AND status = 'pending'`, time.Now().Add(-time.Second), taskID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	corrected := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+		var current struct {
+			RequestID string `json:"request_id"`
+		}
+		return task.Status == model.TaskStatusPending && task.ClaimGeneration > staleClaim &&
+			json.Unmarshal(task.Checkpoint, &current) == nil && current.RequestID == requestID
+	})
+	if err := json.Unmarshal(corrected.Checkpoint, &checkpoint); err != nil || !checkpoint.NextResendAt.Equal(wantDeadline) {
+		t.Fatalf("corrected deadline = %#v, err=%v", checkpoint, err)
+	}
 	// Recovery reads the chain on every wake but sends nothing before the
 	// resend delay.
 	for range 10 {
@@ -1233,6 +1324,13 @@ func TestLostSendIsResentUnchangedOnceItsDelayPasses(t *testing.T) {
 	}
 	if sends, _ := f.provider.sent(); len(sends) != 1 {
 		t.Fatalf("submissions before the resend delay = %d, want 1", len(sends))
+	}
+	recovered, err := f.runtime.repos.Tasks.GetByID(t.Context(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(recovered.Checkpoint, &checkpoint); err != nil || checkpoint.RequestID != requestID || !checkpoint.NextResendAt.Equal(wantDeadline) {
+		t.Fatalf("recovery deadline = %#v, err=%v", checkpoint, err)
 	}
 	f.makeResendDue(t, requestID)
 	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })

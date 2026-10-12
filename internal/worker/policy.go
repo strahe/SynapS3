@@ -17,10 +17,11 @@ type BackoffPolicy struct {
 }
 
 type ExecutionPolicy struct {
-	MaxAttempts       int           `json:"max_attempts"`
-	Backoff           BackoffPolicy `json:"backoff"`
-	InvocationTimeout time.Duration `json:"invocation_timeout"`
-	ObservationWindow time.Duration `json:"observation_window"`
+	MaxAttempts       int            `json:"max_attempts"`
+	Backoff           BackoffPolicy  `json:"backoff"`
+	ResendBackoff     *BackoffPolicy `json:"resend_backoff,omitempty"`
+	InvocationTimeout time.Duration  `json:"invocation_timeout"`
+	ObservationWindow time.Duration  `json:"observation_window"`
 }
 
 func DefaultBackoffPolicy() BackoffPolicy {
@@ -28,14 +29,29 @@ func DefaultBackoffPolicy() BackoffPolicy {
 }
 
 func (p ExecutionPolicy) validate() error {
-	b := p.Backoff
-	if p.MaxAttempts < 1 || p.InvocationTimeout < 0 || p.ObservationWindow < 0 || b.InitialDelay <= 0 || b.MaximumDelay < b.InitialDelay || math.IsNaN(b.Multiplier) || math.IsInf(b.Multiplier, 0) || b.Multiplier < 1 || math.IsNaN(b.Jitter) || math.IsInf(b.Jitter, 0) || b.Jitter < 0 || b.Jitter > 1 {
+	if p.MaxAttempts < 1 || p.InvocationTimeout < 0 || p.ObservationWindow < 0 || !p.Backoff.valid() || (p.ResendBackoff != nil && (!p.ResendBackoff.valid() || p.ResendBackoff.Jitter != 0)) {
 		return ErrInvalidPolicy
 	}
 	return nil
 }
 
+func (p ExecutionPolicy) clone() ExecutionPolicy {
+	if p.ResendBackoff != nil {
+		resend := *p.ResendBackoff
+		p.ResendBackoff = &resend
+	}
+	return p
+}
+
+func (p BackoffPolicy) valid() bool {
+	return p.InitialDelay > 0 && p.MaximumDelay >= p.InitialDelay && !math.IsNaN(p.Multiplier) && !math.IsInf(p.Multiplier, 0) && p.Multiplier >= 1 && !math.IsNaN(p.Jitter) && !math.IsInf(p.Jitter, 0) && p.Jitter >= 0 && p.Jitter <= 1
+}
+
+func (p BackoffPolicy) baseDelay(retryCount int) float64 {
+	return math.Min(float64(p.MaximumDelay), float64(p.InitialDelay)*math.Pow(p.Multiplier, float64(retryCount)))
+}
+
 func (p BackoffPolicy) delay(retryCount int) time.Duration {
-	base := math.Min(float64(p.MaximumDelay), float64(p.InitialDelay)*math.Pow(p.Multiplier, float64(retryCount)))
+	base := p.baseDelay(retryCount)
 	return min(time.Duration(base*(1-p.Jitter+2*p.Jitter*rand.Float64())), p.MaximumDelay)
 }

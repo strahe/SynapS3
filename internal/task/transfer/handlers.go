@@ -18,12 +18,9 @@ import (
 )
 
 const (
-	storageDependencyWait     = time.Minute
-	storagePollInterval       = 5 * time.Second
-	storageSourcePollInterval = 30 * time.Second
-	storeAttentionAfter       = 30 * time.Minute
-	pullSubmitTimeout         = 30 * time.Second
-	pullStatusTimeout         = 4 * time.Second
+	storeAttentionAfter = 30 * time.Minute
+	pullSubmitTimeout   = 30 * time.Second
+	pullStatusTimeout   = 4 * time.Second
 )
 
 type ReadyDataSetResolver interface {

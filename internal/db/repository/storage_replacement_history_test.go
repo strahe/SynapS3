@@ -11,6 +11,9 @@ import (
 
 func TestSupersededReplacementReschedulesArchivedCoordinator(t *testing.T) {
 	repos, source, _ := localReplacementSource(t, testDB(t), "replacement-history")
+	if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+		t.Fatal(err)
+	}
 	first, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 		TargetProviderID: onChainID(t, "202"), ClientRequestID: "first",
@@ -29,7 +32,6 @@ func TestSupersededReplacementReschedulesArchivedCoordinator(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim = %#v, %v", claimed, err)
 	}
-	// The original local ensure precedes the coordinator and is already fenced.
 	if claimed.ID != coordinator.ID {
 		if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusCancelled, ResumeMode: model.TaskResumeModeRecover}); err != nil {
 			t.Fatal(err)

@@ -28,7 +28,17 @@ func localReplacementSource(t *testing.T, db *bun.DB, name string) (*repository.
 		t.Fatal(err)
 	}
 	ensure := localEnsureTask(t, repos, source.ID)
+	failLocalEnsure(t, db, ensure)
 	return repos, source, ensure
+}
+
+func failLocalEnsure(t *testing.T, db *bun.DB, task *model.Task) {
+	t.Helper()
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+		Set("lease_until = NULL").Set("finished_at = ?", time.Now()).Where("id = ?", task.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.TaskStatusFailed
 }
 
 func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int64) *model.Task {
@@ -92,11 +102,16 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 	}{
 		{name: "unsent"},
 		{name: "provider rejected", refusal: true},
-		{name: "unknown request", mutate: "request", want: storagereplacement.ErrSourceOutcomeUnknown},
+		{name: "unknown request", mutate: "request"},
 		{name: "running", mutate: "running", want: storagereplacement.ErrSourceRunning},
-		{name: "known transaction", mutate: "transaction", want: storagereplacement.ErrSourceOutcomeUnknown},
-		{name: "future evidence", refusal: true, mutate: "version", want: storagereplacement.ErrSourceOutcomeUnknown},
-		{name: "wrong identity", refusal: true, mutate: "identity", want: storagereplacement.ErrSourceOutcomeUnknown},
+		{name: "pending retry", mutate: "pending", want: storagereplacement.ErrSourceRunning},
+		{name: "cancelled", mutate: "cancelled", want: storagereplacement.ErrSourceOutcomeUnknown},
+		{name: "missing owner", mutate: "missing", want: storagereplacement.ErrSourceOutcomeUnknown},
+		{name: "superseded owner", mutate: "superseded", want: storagereplacement.ErrSourceOutcomeUnknown},
+		{name: "unrelated owner", mutate: "unrelated", want: storagereplacement.ErrSourceOutcomeUnknown},
+		{name: "known transaction", mutate: "transaction"},
+		{name: "future evidence", refusal: true, mutate: "version"},
+		{name: "wrong identity", refusal: true, mutate: "identity"},
 		{name: "external effect", mutate: "effect", want: storagereplacement.ErrSourceOutcomeUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,13 +121,33 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 				evidence = localRefusal(t, db, repos, source, ensure)
 			}
 			switch tc.mutate {
+			case "missing":
+				if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("ensure_task_id = NULL").Where("id = ?", source.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			case "superseded":
+				if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("superseded_at = ?", time.Now()).Where("id = ?", ensure.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			case "unrelated":
+				if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("subject_key = ?", "9999").Where("id = ?", ensure.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
 			case "request":
 				if err := repos.Contents.RecordDataSetClientID(t.Context(), source.ID, ensure.ID, onChainID(t, "909")); err != nil {
 					t.Fatal(err)
 				}
+			case "pending", "cancelled":
+				status := model.TaskStatusPending
+				if tc.mutate == "cancelled" {
+					status = model.TaskStatusCancelled
+				}
+				if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", status).Set("finished_at = CASE WHEN ? = ? THEN NULL ELSE finished_at END", status, model.TaskStatusPending).Where("id = ?", ensure.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
 			case "running":
 				now := time.Now()
-				if _, err := db.NewRaw("UPDATE tasks SET status = ?, claim_generation = 1, lease_until = ? WHERE id = ?", model.TaskStatusRunning, now.Add(time.Minute), ensure.ID).Exec(t.Context()); err != nil {
+				if _, err := db.NewRaw("UPDATE tasks SET status = ?, claim_generation = 1, lease_until = ?, finished_at = NULL WHERE id = ?", model.TaskStatusRunning, now.Add(time.Minute), ensure.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			case "transaction":
@@ -146,13 +181,6 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 			input := repository.AuthorizeReplacementInput{
 				BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 				TargetProviderID: onChainID(t, "202"), ClientRequestID: "replace", VerifiedCreationRejection: evidence,
-			}
-			if tc.refusal && tc.want == nil {
-				unchecked := input
-				unchecked.VerifiedCreationRejection = nil
-				if _, _, err := repos.Replacements.Authorize(t.Context(), unchecked); !errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
-					t.Fatalf("unchecked refusal accepted: %v", err)
-				}
 			}
 			row, created, err := repos.Replacements.Authorize(t.Context(), input)
 			if !errors.Is(err, tc.want) {
@@ -231,6 +259,8 @@ func localReplacementBatchesPreserveFrozenCopyObligations(t *testing.T, db *bun.
 	if err != nil {
 		t.Fatal(err)
 	}
+	ensure := localEnsureTask(t, repos, source.ID)
+	failLocalEnsure(t, db, ensure)
 	for i := range 129 {
 		localWaitingCopy(t, repos, source, fmt.Sprintf("waiting-%d", i))
 	}
@@ -435,13 +465,6 @@ func rejectedLocalTargetCanBeReplacedAgain(t *testing.T, db *bun.DB) {
 			t.Fatal("unsent source omitted its refused target's late service risk")
 		}
 	}
-	reason := storagereplacement.FailureReasonTargetRejected
-	if err := repos.Replacements.MarkFailed(t.Context(), first.ID, &reason, "refused"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repos.Replacements.Retry(t.Context(), repository.RetryReplacementInput{ReplacementID: first.ID}); !errors.Is(err, storagereplacement.ErrNotRetryable) {
-		t.Fatalf("refused target retried: %v", err)
-	}
 	check, err := repos.Replacements.Preflight(t.Context(), source.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -520,7 +543,7 @@ func readyTargetRejectsStaleRefusalSettlement(t *testing.T, db *bun.DB) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			localCoordinatorTask(t, repos, row)
+			coordinator := localCoordinatorTask(t, repos, row)
 			target, err := repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
 			if err != nil {
 				t.Fatal(err)
@@ -552,6 +575,9 @@ func readyTargetRejectsStaleRefusalSettlement(t *testing.T, db *bun.DB) {
 			reason := storagereplacement.FailureReasonTargetRejected
 			if err := repos.Replacements.MarkFailed(t.Context(), row.ID, &reason, "obsolete refusal"); !errors.Is(err, repository.ErrConflict) {
 				t.Fatalf("ready target accepted refusal settlement: %v", err)
+			}
+			if err := repos.Replacements.MarkInitializationFailed(t.Context(), row.ID, row.TaskGeneration, coordinator.ID, ensure.ID, "obsolete initialization failure"); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("ready target accepted initialization failure settlement: %v", err)
 			}
 			current, err := repos.Replacements.GetByID(t.Context(), row.ID)
 			if err != nil || current.Status != storagereplacement.StatusPreparingTarget || current.FailureReason != nil {
@@ -616,6 +642,12 @@ func replacementObservationAuthorization(t *testing.T, db *bun.DB) {
 					}
 				}
 				if role == "source" {
+					target, err := repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					failed := localEnsureTask(t, repos, target.ID)
+					failLocalEnsure(t, db, failed)
 					if err := repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "replacement stopped"); err != nil {
 						t.Fatal(err)
 					}
@@ -647,13 +679,20 @@ func replacementObservationAuthorization(t *testing.T, db *bun.DB) {
 							t.Fatalf("concurrent observation: %v", result)
 						}
 					}
-					if bound != 1 {
+					wantBound := 1
+					if role == "source" {
+						wantBound = 0
+					}
+					if bound != wantBound {
 						t.Fatalf("observation accepted %d concurrent bindings", bound)
+					}
+					if role == "source" {
+						return
 					}
 				} else {
 					err = repos.Replacements.BindObservedService(t.Context(), input)
 				}
-				if operation == "stale" {
+				if operation == "stale" || role == "source" {
 					if !errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
 						t.Fatalf("changed ownership accepted: %v", err)
 					}

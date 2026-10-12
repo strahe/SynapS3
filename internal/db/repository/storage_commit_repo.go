@@ -1011,6 +1011,7 @@ func wakeCommitTasks(ctx context.Context, db bun.IDB, taskIDs []int64, excludedW
 		Column("id").
 		Where("id IN (?)", bun.List(taskIDs)).
 		Where("status = ?", model.TaskStatusPending).
+		Where("wait_reason IS NOT NULL").
 		Where("available_at > ?", now)
 	if len(excludedWaitReasons) > 0 {
 		ids = ids.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(excludedWaitReasons))

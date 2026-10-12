@@ -108,6 +108,7 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	}
 	normal := commitTask("ordinary-wake")
 	normal.AvailableAt = due
+	normal.WaitReason = new("provider_confirmation")
 	normal, _, err = f.repos.Tasks.Enqueue(ctx, normal)
 	if err != nil {
 		t.Fatal(err)

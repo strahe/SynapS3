@@ -278,7 +278,7 @@ func testCommitSubmissionTakesTheOldestEligibleRequestWithinCapacity(t *testing.
 	}
 	later := time.Now().Add(time.Hour)
 	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
-		Where("id IN (?)", bun.List(tasks)).Exec(ctx); err != nil {
+		Set("wait_reason = ?", "commit_queue").Where("id IN (?)", bun.List(tasks)).Exec(ctx); err != nil {
 		t.Fatalf("park tasks: %v", err)
 	}
 	if err := begin(0); err != nil {
@@ -342,7 +342,7 @@ func testCommitQueueWakesOldestBlockedCollection(t *testing.T, f commitFixture) 
 	first, _ := f.sealedRequest(t, "ready-first")
 	second, _ := f.sealedRequest(t, "ready-second")
 	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", later).
-		Where("id = ?", second).Exec(ctx); err != nil {
+		Set("wait_reason = ?", "commit_queue").Where("id = ?", second).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	assertWoken := func(taskID int64, want bool) {
@@ -391,7 +391,7 @@ func testCollectingCommitWakePreservesQueueWait(t *testing.T, f commitFixture) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if woken := task.AvailableAt.Before(later.Add(-time.Minute)); woken != (reason != storagecommit.CommitQueueWaitReason) {
+			if woken := task.AvailableAt.Before(later.Add(-time.Minute)); woken != (reason == "collecting") {
 				t.Fatalf("collection wake with reason %q: task = %#v", reason, task)
 			}
 			if reason == storagecommit.CommitQueueWaitReason {

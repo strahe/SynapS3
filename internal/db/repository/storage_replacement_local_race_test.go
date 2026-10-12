@@ -90,7 +90,7 @@ func TestPostgresUncreatedReplacementSerializesWithCreatePermission(t *testing.T
 			}
 			want := repository.ErrConflict
 			if second == "replacement" {
-				want = storagereplacement.ErrSourceOutcomeUnknown
+				want = nil
 			}
 			if err := <-secondResult; !errors.Is(err, want) {
 				t.Fatalf("second operation = %v, want %v", err, want)
@@ -101,6 +101,9 @@ func TestPostgresUncreatedReplacementSerializesWithCreatePermission(t *testing.T
 			}
 			if (stored.ClientDataSetID != nil) != (first == "creation") {
 				t.Fatalf("creation permission escaped replacement: %#v", stored)
+			}
+			if stored.EnsureTaskID != nil {
+				t.Fatalf("replacement retained creation permission: %#v", stored)
 			}
 		})
 	}

@@ -216,6 +216,7 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	}
 	f.server.WithTaskService(newAdminTestTaskService(t, f.repos, func(definition *taskengine.Definition) {
 		definition.Policy.MaxAttempts = 3
+		definition.Policy.ResendBackoff = &taskengine.BackoffPolicy{InitialDelay: time.Minute, MaximumDelay: 30 * time.Minute, Multiplier: 2}
 	}))
 
 	rr := f.request(http.MethodGet, "/api/v1/tasks/"+strconv.FormatInt(row.ID, 10), nil)
@@ -226,6 +227,9 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	decodeJSON(t, rr, &detail)
 	if rr.Code != http.StatusOK || detail.Task.RetryCount != 5 || detail.Task.MaxAttempts == nil || *detail.Task.MaxAttempts != 3 || detail.Policy == nil || detail.Policy.MaxAttempts == nil || *detail.Policy.MaxAttempts != 3 {
 		t.Fatalf("current execution policy: %d %s", rr.Code, rr.Body.String())
+	}
+	if detail.Policy.ResendBackoff == nil || detail.Policy.ResendBackoff.InitialDelay != "1m0s" || detail.Policy.ResendBackoff.MaximumDelay != "30m0s" || detail.Policy.ResendBackoff.Multiplier != 2 || detail.Policy.ResendBackoff.Jitter != 0 {
+		t.Fatalf("resend policy missing: %s", rr.Body.String())
 	}
 	rr = f.request(http.MethodGet, "/api/v1/tasks", nil)
 	var page taskListResponse

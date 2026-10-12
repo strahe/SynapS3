@@ -476,7 +476,7 @@ func (s *Server) handleAPITaskRetry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	row, err := s.taskService.Retry(r.Context(), id)
+	row, err := s.retryTaskRequest(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			source, sourceErr := s.repos.Tasks.GetByID(r.Context(), id)
@@ -595,4 +595,32 @@ func isActiveTaskStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func (s *Server) retryTaskRequest(ctx context.Context, requestedID int64) (*model.Task, error) {
+	if next, err := s.repos.Tasks.GetDirectSuccessor(ctx, requestedID); err != nil || next != nil {
+		return next, err
+	}
+	requested, err := s.repos.Tasks.GetByID(ctx, requestedID)
+	if err != nil || requested == nil {
+		return nil, errors.Join(err, repository.ErrNotFound)
+	}
+	canonical, handled, err := s.replacementRetryTask(ctx, requested)
+	if err != nil {
+		if next, replayErr := s.repos.Tasks.GetDirectSuccessor(ctx, requestedID); replayErr != nil || next != nil {
+			return next, replayErr
+		}
+		return nil, err
+	}
+	if !handled {
+		return s.taskService.Retry(ctx, requestedID)
+	}
+	if _, err := s.taskService.Retry(ctx, canonical.ID); err != nil {
+		return nil, err
+	}
+	next, err := s.repos.Tasks.GetDirectSuccessor(ctx, requestedID)
+	if err == nil && next == nil {
+		return nil, repository.ErrConflict
+	}
+	return next, err
 }

@@ -76,7 +76,7 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 				return repos.CacheEvictions.CompleteBucketDurability(ctx, input.BucketID, input.Generation, execution.ID())
 			})
 		}
-		return taskengine.Wait(model.TaskResumeModeExecute, 0, "more_work", "Applying bucket storage policy", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Wait(model.TaskResumeModeExecute, "more_work", "Applying bucket storage policy", func(ctx context.Context, repos *repository.Repositories) error {
 			if h.deps.EvictionPolicy != cache.EvictionPolicyAfterUpload {
 				return nil
 			}

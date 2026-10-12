@@ -51,7 +51,7 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 					if !attempted || err == nil {
 						t.Fatalf("effect = %v, %v", attempted, err)
 					}
-					return Retry(err, "effect_uncertain", 0, nil)
+					return Retry(err, "effect_uncertain", nil)
 				},
 				recover: func(context.Context, Execution) Result { return Complete("recovered", nil) },
 			}
@@ -76,9 +76,9 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: func(context.Context, Execution) Result {
 		calls++
 		if calls == 1 {
-			return Wait(model.TaskResumeModeExecute, 0, "dependency", "Waiting for a dependency", nil)
+			return Wait(model.TaskResumeModeExecute, "dependency", "Waiting for a dependency", nil)
 		}
-		return CompleteCycle(time.Hour, "Done", nil)
+		return CompleteCycle("Done", nil)
 	}}, nil)
 	if err := h.service.bootstrap(t.Context()); err != nil {
 		t.Fatal(err)

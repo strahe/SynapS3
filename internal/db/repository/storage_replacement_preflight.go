@@ -130,7 +130,11 @@ func (r *BunStorageReplacementRepo) BindObservedService(ctx context.Context, inp
 		if err != nil || evidence == nil || !evidence.ClientDataSetID.Equal(input.ClientDataSetID) {
 			return storagereplacement.ErrSourceOutcomeUnknown
 		}
-		if err := uncreatedDataSetEligibility(ctx, db, observed); err != nil {
+		eligibility := uncreatedDataSetEligibility
+		if input.Preflight.Source.Status == model.StorageDataSetStatusReady {
+			eligibility = remoteReplacementTargetEligibility
+		}
+		if err := eligibility(ctx, db, observed); err != nil {
 			return err
 		}
 		if err := markDataSetReady(ctx, db, observed.ID, input.DataSetID, &input.ClientDataSetID); err != nil {

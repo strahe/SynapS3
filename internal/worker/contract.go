@@ -226,8 +226,7 @@ type Settlement func(context.Context, *repository.Repositories) error
 // Result is a closed set constructed through the helpers below.
 type Result struct {
 	kind          ResultKind
-	delay         time.Duration
-	retryBackoff  bool
+	waitUntil     *time.Time
 	resumeMode    model.TaskResumeMode
 	waitReason    string
 	failureReason string
@@ -236,7 +235,6 @@ type Result struct {
 	settlement    Settlement
 	onRetry       RetrySettlement
 	onExhausted   Settlement
-	cycleDelay    time.Duration
 	workStartedAt *time.Time
 }
 
@@ -254,26 +252,30 @@ func Complete(message string, settlement Settlement) Result {
 	return Result{kind: resultComplete, message: message, settlement: settlement}
 }
 
-func Wait(mode model.TaskResumeMode, delay time.Duration, reason, message string, settlement Settlement) Result {
+func Wait(mode model.TaskResumeMode, reason, message string, settlement Settlement) Result {
 	return Result{
-		kind: resultWait, resumeMode: mode, delay: delay,
+		kind: resultWait, resumeMode: mode,
 		waitReason: reason, message: message, settlement: settlement,
 	}
 }
 
-func Retry(err error, failureReason string, delay time.Duration, settlement Settlement) Result {
+func WaitUntil(mode model.TaskResumeMode, until time.Time, reason, message string, settlement Settlement) Result {
+	r := Wait(mode, reason, message, settlement)
+	until = until.UTC()
+	r.waitUntil = &until
+	return r
+}
+
+func Retry(err error, failureReason string, settlement Settlement) Result {
 	return Result{
-		kind: resultRetry, resumeMode: model.TaskResumeModeRecover, delay: delay, retryBackoff: true,
+		kind: resultRetry, resumeMode: model.TaskResumeModeRecover,
 		failureReason: failureReason, err: err, settlement: settlement,
 	}
 }
 
 // RetryBackoff retries with the engine's bounded exponential backoff.
 func RetryBackoff(err error, failureReason string, settlement Settlement) Result {
-	return Result{
-		kind: resultRetry, resumeMode: model.TaskResumeModeRecover, retryBackoff: true,
-		failureReason: failureReason, err: err, settlement: settlement,
-	}
+	return Retry(err, failureReason, settlement)
 }
 
 func Fail(err error, failureReason string, settlement Settlement) Result {
@@ -382,23 +384,24 @@ func (r Result) WithRetrySettlements(onRetry RetrySettlement, onExhausted Settle
 }
 
 func (r Result) WithResumeMode(mode model.TaskResumeMode) Result { r.resumeMode = mode; return r }
-func (r Result) WithMinimumDelay(delay time.Duration) Result {
-	r.delay = delay
-	r.retryBackoff = true
-	return r
+func RetryInMode(err error, reason string, mode model.TaskResumeMode, settlement Settlement) Result {
+	return RetryBackoff(err, reason, settlement).WithResumeMode(mode)
 }
 
-func RetryInMode(err error, reason string, mode model.TaskResumeMode, minimumDelay time.Duration, settlement Settlement) Result {
-	return RetryBackoff(err, reason, settlement).WithResumeMode(mode).WithMinimumDelay(minimumDelay)
+func CompleteCycle(message string, settlement Settlement) Result {
+	return Complete(message, settlement)
 }
 
-func CompleteCycle(delay time.Duration, message string, settlement Settlement) Result {
-	r := Complete(message, settlement)
-	r.cycleDelay = delay
-	return r
+func (e Execution) Policy() ExecutionPolicy { return e.policy.clone() }
+
+func (e Execution) ResendAt(sentAt time.Time, sends int) (time.Time, error) {
+	p := e.policy.ResendBackoff
+	if sentAt.IsZero() || sends < 1 || p == nil || !p.valid() || p.Jitter != 0 {
+		return time.Time{}, ErrInvalidPolicy
+	}
+	return sentAt.UTC().Add(time.Duration(p.baseDelay(sends - 1))), nil
 }
 
-func (e Execution) Policy() ExecutionPolicy { return e.policy }
 func (e Execution) ObserveOperation(ctx context.Context, key string) (time.Time, error) {
 	if e.observe == nil {
 		return time.Time{}, errors.New("operation observation is unavailable")

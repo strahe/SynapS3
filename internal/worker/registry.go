@@ -36,6 +36,7 @@ func (r *Registry) Register(handler Handler) error {
 		return fmt.Errorf("registering nil handler: %w", ErrUnknownType)
 	}
 	definition := handler.Definition()
+	definition.Policy = definition.Policy.clone()
 	if err := definition.validate(); err != nil {
 		return err
 	}
@@ -92,6 +93,7 @@ func (r *Registry) Definition(taskType model.TaskType) (Definition, bool) {
 	if !ok {
 		return Definition{}, false
 	}
+	definition.Policy = definition.Policy.clone()
 	return definition, true
 }
 

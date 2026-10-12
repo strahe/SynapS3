@@ -263,6 +263,14 @@ export function TaskDetailsSheet({
                                       ],
                                       ['Delay variation', `±${Math.round(policy.jitter * 100)}%`],
                                     ]),
+                                ...(policy.resend_backoff
+                                  ? [
+                                      [
+                                        'Resend interval',
+                                        `${policy.resend_backoff.initial_delay} × ${policy.resend_backoff.multiplier}, up to ${policy.resend_backoff.maximum_delay}`,
+                                      ],
+                                    ]
+                                  : []),
                                 [
                                   'Execution timeout',
                                   policy.invocation_timeout === '0s' ? 'Not set' : policy.invocation_timeout,

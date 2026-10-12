@@ -295,9 +295,9 @@ func TestEngineConcurrencyReleasedAfterHandlerResults(t *testing.T) {
 				}
 				switch outcome {
 				case "wait":
-					return Wait(model.TaskResumeModeRecover, time.Hour, "dependency", "Waiting", nil)
+					return Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil)
 				case "retry":
-					return Retry(errors.New("temporary"), "temporary", time.Hour, nil)
+					return Retry(errors.New("temporary"), "temporary", nil)
 				case "fail":
 					return Fail(errors.New("failed"), "failed", nil)
 				case "cancel":

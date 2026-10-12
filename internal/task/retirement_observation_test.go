@@ -25,7 +25,7 @@ func (t *observingRetirementTerminator) ObserveTermination(context.Context, sdkt
 	return nil, t.pending, t.observeErr
 }
 
-func TestRetirementObservationPreservesSafeTerminationAndPendingWait(t *testing.T) {
+func TestRetirementObservationPreservesSafeTerminationAndProtocolWait(t *testing.T) {
 	tests := []struct {
 		name         string
 		pending      bool
@@ -38,7 +38,8 @@ func TestRetirementObservationPreservesSafeTerminationAndPendingWait(t *testing.
 		{name: "provider observation unavailable", observeErr: errors.Join(synapse.ErrTerminationObservationUnavailable, &synapse.ProviderUnavailableError{Cause: errors.New("provider unavailable")}), wantRequests: 1},
 		{name: "no provider request", wantRequests: 1},
 		{name: "pending provider relay", pending: true},
-		{name: "backpressure", observeErr: &synapse.ProviderUnavailableError{Cause: &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour}}, wantRetries: 1, minimumDelay: time.Hour},
+		{name: "backpressure", observeErr: &synapse.ProviderUnavailableError{Cause: &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour}}, minimumDelay: time.Hour},
+		{name: "unavailable with Retry-After", observeErr: errors.Join(synapse.ErrTerminationObservationUnavailable, &pdp.HTTPError{StatusCode: 503, RetryAfter: time.Hour}), minimumDelay: time.Hour},
 		{name: "chain state unknown", observeErr: errors.New("reading storage service state: RPC unavailable"), wantRetries: 2, wantFailed: true},
 		{name: "different payer", observeErr: synapse.ErrServicePaidByAnother, wantRetries: 2, wantFailed: true},
 	}
@@ -56,7 +57,7 @@ func TestRetirementObservationPreservesSafeTerminationAndPendingWait(t *testing.
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 
-			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+			settled := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 				wantStatus := model.TaskStatusPending
 				if tt.wantFailed {
 					wantStatus = model.TaskStatusFailed
@@ -67,6 +68,16 @@ func TestRetirementObservationPreservesSafeTerminationAndPendingWait(t *testing.
 			})
 			if got := terminator.calls.Load(); got != tt.wantRequests {
 				t.Fatalf("termination requests = %d, want %d", got, tt.wantRequests)
+			}
+			if tt.minimumDelay > 0 {
+				deadline, observations := settled.AvailableAt, terminator.observations.Load()
+				wakeTask(t, runtime, taskRow.ID)
+				waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusPending && task.ClaimGeneration > settled.ClaimGeneration && task.AvailableAt.Equal(deadline)
+				})
+				if terminator.observations.Load() != observations || terminator.calls.Load() != 0 {
+					t.Fatal("early wake bypassed the provider observation deadline")
+				}
 			}
 			if tt.wantRequests > 0 {
 				wakeTask(t, runtime, taskRow.ID)

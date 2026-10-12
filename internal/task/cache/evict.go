@@ -198,7 +198,7 @@ func (h *EvictHandler) deleteAuthorizedCacheEntry(
 			if closeErr := body.Close(); closeErr != nil {
 				return h.retryCacheEviction(execution, input, closeErr, "cache_observation_failed")
 			}
-			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Local cache removal is ready", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Local cache removal is ready", nil)
 		case os.IsNotExist(err):
 			finalizeErr := h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
 				if err := repos.Tasks.ValidateClaim(ctx, execution.ID(), execution.ClaimGeneration()); err != nil {
@@ -245,7 +245,7 @@ func (h *EvictHandler) deleteAuthorizedCacheEntry(
 		}
 		switch {
 		case errors.Is(deleteErr, cacheeviction.ErrDurabilityThreshold) && input.AccessedAt == nil:
-			return taskengine.Wait(model.TaskResumeModeExecute, dependencyWait, "durability", "Waiting for durable storage", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "durability", "Waiting for durable storage", nil)
 		case errors.Is(deleteErr, cacheeviction.ErrDurabilityThreshold), errors.Is(deleteErr, cacheeviction.ErrNoLongerEligible),
 			errors.Is(deleteErr, cacheeviction.ErrAccessChanged), errors.Is(deleteErr, repository.ErrNotFound), errors.Is(deleteErr, repository.ErrConflict):
 			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")

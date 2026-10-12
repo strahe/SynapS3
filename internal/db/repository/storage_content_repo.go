@@ -617,7 +617,7 @@ func (r *BunStorageContentRepo) ListDataSetSummaries(ctx context.Context, bucket
 			 OR EXISTS (SELECT 1 FROM storage_replacements AS prior
 			 JOIN storage_data_sets AS prior_target ON prior_target.id = prior.target_data_set_id
 			 WHERE prior.source_data_set_id = storage_data_set.id AND prior.status NOT IN (?, ?)
-			 AND prior_target.data_set_id IS NULL AND prior_target.creation_rejection IS NOT NULL)) AS replacement_has_late_service_risk,
+			 AND prior_target.data_set_id IS NULL AND prior_target.client_data_set_id IS NOT NULL)) AS replacement_has_late_service_risk,
 			storage_data_set.provider_id,
 			storage_data_set.data_set_id,
 			storage_data_set.client_data_set_id,
@@ -794,7 +794,6 @@ func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id, e
 		Where("id = ?", id).
 		Where("ensure_task_id = ?", ensureTaskID).
 		Where("status IN (?, ?)", model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating).
-		Where("creation_rejection IS NULL").
 		Where("NOT "+dataSetCreationStoppedSQL("storage_data_set")).
 		Where("(client_data_set_id IS NULL OR client_data_set_id = ?)", clientDataSetID).
 		Exec(ctx)

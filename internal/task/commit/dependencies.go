@@ -15,11 +15,6 @@ import (
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
-const (
-	storageDependencyWait = time.Minute
-	storagePollInterval   = 5 * time.Second
-)
-
 type ReadyDataSetResolver interface {
 	OpenReadyDataSet(context.Context, *model.StorageDataSet) (synapse.DataSetTarget, error)
 }

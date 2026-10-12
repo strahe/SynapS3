@@ -21,8 +21,7 @@ import (
 )
 
 const (
-	commitQueueMessage           = "Waiting to submit the batch"
-	commitCollectionPollInterval = 30 * time.Second
+	commitQueueMessage = "Waiting to submit the batch"
 )
 
 // commitCheckpoint records the latest send of a commit request. The request
@@ -32,6 +31,7 @@ type commitCheckpoint struct {
 	Sends         int       `json:"sends"`
 	SentAt        time.Time `json:"sent_at"`
 	TransactionID string    `json:"transaction_id,omitempty"`
+	NextResendAt  time.Time `json:"next_resend_at,omitempty"`
 }
 
 func (h *Handler) commitHandler() *taskengine.FuncHandler {
@@ -41,7 +41,10 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CommitRequestInput) error {
 			return storagepipeline.ValidateCommitRequestInput(*input)
 		}),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{
+			MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(),
+			ResendBackoff: &taskengine.BackoffPolicy{InitialDelay: 5 * time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
+		}, AllowRetry: true,
 		CanManualRetry: func(source *model.Task) bool {
 			return source != nil && source.FailureReason != nil && *source.FailureReason != "invalid_checkpoint"
 		},
@@ -91,11 +94,12 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 
 // commitRun is one claim of a request's task.
 type commitRun struct {
-	execution taskengine.Execution
-	request   *storagecommit.Request
-	binding   *model.StorageDataSet
-	advancer  storagecommit.Advancer
-	mayExec   bool
+	execution  taskengine.Execution
+	checkpoint commitCheckpoint
+	request    *storagecommit.Request
+	binding    *model.StorageDataSet
+	advancer   storagecommit.Advancer
+	mayExec    bool
 }
 
 func (r commitRun) taskID() int64 { return r.execution.ID() }
@@ -167,14 +171,14 @@ func (h *Handler) runCollectingCommit(ctx context.Context, run commitRun) tasken
 		Draining:        run.binding.Status == model.StorageDataSetStatusDraining,
 		ManualRequested: run.request.SealRequestedAt != nil,
 	}
-	seal, wait := storagecommit.ShouldSeal(input)
+	seal, _ := storagecommit.ShouldSeal(input)
 	waitReason, message := "collecting", "Waiting for more stored data to submit together"
 	if !seal {
 		input.CachePressure, err = h.commitCachePressure(ctx, run.request.RequestID)
 		if err != nil {
 			return retryTask(err, "cache_pressure_load_failed")
 		}
-		seal, wait = storagecommit.ShouldSeal(input)
+		seal, _ = storagecommit.ShouldSeal(input)
 	}
 	if seal {
 		queue, err := h.deps.Repositories.Contents.CommitQueueState(ctx, run.request.StorageDataSetID, now)
@@ -184,7 +188,6 @@ func (h *Handler) runCollectingCommit(ctx context.Context, run commitRun) tasken
 		seal = queue.Submitted < storagecommit.MaxSubmittedRequestsPerDataSet && queue.ReadyHead == ""
 		if !seal {
 			waitReason, message = storagecommit.CommitQueueWaitReason, "Collecting more data; waiting for earlier batches"
-			wait = input.MaxWait - now.Sub(oldest)
 		}
 		h.deps.Logger.DebugContext(ctx, "commit batch scheduling",
 			"request_id", run.request.RequestID, "storage_data_set_id", run.request.StorageDataSetID,
@@ -193,13 +196,10 @@ func (h *Handler) runCollectingCommit(ctx context.Context, run commitRun) tasken
 			"ready_head", queue.ReadyHead, "seal", seal)
 	}
 	if !seal {
-		if wait <= 0 || wait > commitCollectionPollInterval {
-			wait = commitCollectionPollInterval
-		}
-		return taskengine.Wait(model.TaskResumeModeRecover, wait, waitReason, message, nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, waitReason, message, nil)
 	}
 	if !run.mayExec {
-		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Batch is ready to submit", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Batch is ready to submit", nil)
 	}
 
 	target, err := h.deps.Resolver.OpenReadyDataSet(ctx, run.binding)
@@ -221,7 +221,7 @@ func (h *Handler) runCollectingCommit(ctx context.Context, run commitRun) tasken
 		signed = signed[:len(signed)/2]
 	}
 	if errors.Is(err, repository.ErrConflict) {
-		return taskengine.Wait(model.TaskResumeModeRecover, 0, "collecting", "Stored data waiting to submit changed", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, "collecting", "Stored data waiting to submit changed", nil)
 	}
 	if err != nil {
 		return retryTask(err, "commit_seal_failed")
@@ -305,7 +305,7 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 		return waitForCommitMembers(nil)
 	}
 	if request.RetryAt != nil && request.RetryAt.After(time.Now()) {
-		return taskengine.Wait(model.TaskResumeModeExecute, time.Until(*request.RetryAt), storagecommit.ProviderRejectedWaitReason,
+		return taskengine.WaitUntil(model.TaskResumeModeExecute, *request.RetryAt, storagecommit.ProviderRejectedWaitReason,
 			"Provider refused the batch; trying again later", nil)
 	}
 	// Requests leave in order and a data set holds few in flight. Settling one
@@ -316,20 +316,20 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 		return retryTask(err, "commit_queue_load_failed")
 	}
 	if queue.Submitted >= storagecommit.MaxSubmittedRequestsPerDataSet || queue.ReadyHead != request.RequestID {
-		return taskengine.Wait(model.TaskResumeModeExecute, commitCollectionPollInterval, storagecommit.CommitQueueWaitReason, commitQueueMessage, nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, storagecommit.CommitQueueWaitReason, commitQueueMessage, nil)
 	}
 	target, commit, result, ok := h.loadCommit(ctx, run)
 	if !ok {
 		return result
 	}
 	if !run.mayExec {
-		return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Batch is ready to submit", nil)
+		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Batch is ready to submit", nil)
 	}
 	prepared := run.advancer.Prepare(ctx, commit)
 	//exhaustive:enforce
 	switch prepared.Outcome {
 	case storagecommit.PrepareRetry:
-		return taskengine.RetryInMode(synapse.SummarizedError(prepared.Cause), "dataset", model.TaskResumeModeExecute, prepared.RetryAfter, nil)
+		return taskengine.RetryInMode(synapse.SummarizedError(prepared.Cause), "dataset", model.TaskResumeModeExecute, nil)
 	case storagecommit.PrepareConfirmed:
 		return h.confirmCommit(run, target, commit, storagecommit.Confirmation{FirstPieceID: prepared.Proof.FirstPieceID})
 	case storagecommit.PrepareConflict:
@@ -342,9 +342,14 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 	}
 
 	var sent storagecommit.SendResult
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	resendAt, err := run.execution.ResendAt(now, 1)
+	if err != nil {
+		return retryTask(err, "commit_policy_invalid")
+	}
+	run.checkpoint = commitCheckpoint{RequestID: request.RequestID, Sends: 1, SentAt: now, NextResendAt: resendAt}
 	attempted, err := run.execution.WithCheckpointedEffect(ctx, "commit:"+request.RequestID,
-		commitCheckpoint{RequestID: request.RequestID, Sends: 1, SentAt: now},
+		run.checkpoint,
 		func(ctx context.Context, repos *repository.Repositories) error {
 			if err := repos.Contents.BeginCommitSubmission(ctx, repository.BeginCommitSubmissionInput{
 				RequestID: request.RequestID, TaskID: run.taskID(), Now: now,
@@ -359,7 +364,7 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 		})
 	if !attempted {
 		if errors.Is(err, storagecommit.ErrNotEligible) {
-			return taskengine.Wait(model.TaskResumeModeExecute, commitCollectionPollInterval, storagecommit.CommitQueueWaitReason, commitQueueMessage, nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, storagecommit.CommitQueueWaitReason, commitQueueMessage, nil)
 		}
 		return retryTask(err, "commit_submit_not_started")
 	}
@@ -378,38 +383,29 @@ func (h *Handler) settleFirstSend(
 	//exhaustive:enforce
 	switch sent.Kind {
 	case storagecommit.SendAccepted:
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation",
+		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation",
 			"Waiting for batch confirmation", h.submissionSettlement(run, 1, sent.Submission))
 	case storagecommit.SendRefused, storagecommit.SendNotSent:
 		refused := sent.Kind == storagecommit.SendRefused
-		refusals := request.Refusals
-		if refused {
-			refusals++
-		}
-		retryAfter := storagecommit.RefusedRetryDelay(max(refusals, 1))
-		if !refused {
-			retryAfter = storagePollInterval
-		}
 		message := synapse.ErrorSummary(sent.Err)
 		dropped := h.droppedCommitMembers(ctx, target, commit)
 		h.deps.Logger.Warn("storage provider refused the registration",
 			"task_id", run.taskID(), "commit_request_id", request.RequestID, "storage_data_set_id", request.StorageDataSetID,
-			"pieces", request.PieceCount, "retry_after", retryAfter, "error", message)
-		recordRefusal := func(ctx context.Context, repos *repository.Repositories) error {
-			if err := repos.Contents.ReturnCommitRequestToReady(ctx, repository.ReturnCommitRequestInput{
+			"pieces", request.PieceCount, "error", message)
+		recordRefusal := func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+			return repos.Contents.ReturnCommitRequestToReady(ctx, repository.ReturnCommitRequestInput{
 				RequestID: request.RequestID, TaskID: run.taskID(), Refused: refused,
-				SubmitError: message, RetryAt: time.Now().Add(retryAfter),
-			}); err != nil {
-				return err
-			}
-			return nil
+				SubmitError: message, RetryAt: availableAt,
+			})
 		}
-		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), storagecommit.ProviderRejectedWaitReason, model.TaskResumeModeExecute, retryAfter, nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
-			if err := recordRefusal(ctx, repos); err != nil {
+		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), storagecommit.ProviderRejectedWaitReason, model.TaskResumeModeExecute, nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+			if err := recordRefusal(ctx, repos, availableAt); err != nil {
 				return err
 			}
 			return h.returnDroppedMembers(ctx, repos, run, dropped, availableAt)
-		}, recordRefusal)
+		}, func(ctx context.Context, repos *repository.Repositories) error {
+			return recordRefusal(ctx, repos, time.Time{})
+		})
 	case storagecommit.SendUnknown:
 		return h.unknownSend(run, 1, sent)
 	default:
@@ -440,12 +436,12 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 		if request.AttentionAt == nil && request.SubmittedAt != nil && time.Since(*request.SubmittedAt) >= storagecommit.DefaultAttentionAfter {
 			settlement = h.attentionSettlement(run, storagecommit.AttentionDataSetUnavailable)
 		}
-		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, settlement)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, settlement)
 	}
 	commit := storagecommit.Commit{Request: *request, Pieces: pieces, Target: target}
 	observation, err := run.advancer.Observe(ctx, commit)
 	if err != nil {
-		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, storagecommit.ChainRetryDelay, nil)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, nil)
 	}
 	noted := h.observationSettlement(run, observation)
 	transferring, stalled := false, []int64(nil)
@@ -457,18 +453,14 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 	//exhaustive:enforce
 	switch observation.Kind {
 	case storagecommit.ObservePending:
-		delay := observation.RetryAfter
-		if delay <= 0 {
-			delay = storagePollInterval
-		}
 		if len(stalled) > 0 {
 			return h.retryStalledMembers(ctx, run, stalled, noted)
 		}
 		settlement := noted
 		if observation.Cause != nil {
-			return taskengine.RetryInMode(synapse.SummarizedError(observation.Cause), "provider_confirmation", model.TaskResumeModeRecover, delay, settlement)
+			return taskengine.RetryInMode(synapse.SummarizedError(observation.Cause), "provider_confirmation", model.TaskResumeModeRecover, settlement)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, delay, "provider_confirmation", "Waiting for batch confirmation", settlement)
+		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for batch confirmation", settlement)
 	case storagecommit.ObserveConfirmed:
 		return h.confirmCommit(run, target, commit, *observation.Confirmation)
 	case storagecommit.ObserveStop:
@@ -484,18 +476,30 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 			}
 			return waitForCommitMembers(noted)
 		}
+		resendAt, err := h.commitResendDeadline(ctx, run)
+		if err != nil {
+			return retryTask(err, "commit_checkpoint_invalid")
+		}
+		if time.Now().Before(resendAt) {
+			return taskengine.WaitUntil(model.TaskResumeModeRecover, resendAt, "provider_confirmation", "Waiting for batch confirmation", noted)
+		}
 		if !run.mayExec {
-			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Sending the batch again", noted)
+			return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Sending the batch again", noted)
 		}
 	default:
 		return taskengine.Fail(fmt.Errorf("unknown batch observation %d", observation.Kind), "commit_observation_invalid", nil)
 	}
 
 	sends := request.Sends + 1
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	resendAt, err := run.execution.ResendAt(now, sends)
+	if err != nil {
+		return retryTask(err, "commit_policy_invalid")
+	}
+	run.checkpoint = commitCheckpoint{RequestID: request.RequestID, Sends: sends, SentAt: now, NextResendAt: resendAt}
 	var sent storagecommit.SendResult
 	attempted, err := run.execution.WithCheckpointedEffect(ctx, "commit:"+request.RequestID,
-		commitCheckpoint{RequestID: request.RequestID, Sends: sends, SentAt: now},
+		run.checkpoint,
 		func(ctx context.Context, repos *repository.Repositories) error {
 			if noted != nil {
 				if err := noted(ctx, repos); err != nil {
@@ -514,12 +518,12 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 			return nil
 		})
 	if !attempted {
-		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, nil)
+		return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, nil)
 	}
 	//exhaustive:enforce
 	switch sent.Kind {
 	case storagecommit.SendAccepted:
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation",
+		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation",
 			"Waiting for batch confirmation", h.submissionSettlement(run, sends, sent.Submission))
 	case storagecommit.SendRefused, storagecommit.SendNotSent:
 		// Refusing a resend proves only that this send produced nothing; an
@@ -538,7 +542,7 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 			}
 			return nil
 		}
-		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), "provider_confirmation", model.TaskResumeModeRecover, nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
 			if err := recordRefusal(ctx, repos); err != nil {
 				return err
 			}
@@ -549,6 +553,35 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 	default:
 		return taskengine.Fail(fmt.Errorf("unknown batch send result %d", sent.Kind), "commit_send_invalid", nil)
 	}
+}
+
+func (h *Handler) commitResendDeadline(ctx context.Context, run commitRun) (time.Time, error) {
+	request := run.request
+	if request.LastSentAt == nil || request.Sends < 1 {
+		return time.Time{}, errors.New("submitted batch has no send evidence")
+	}
+	checkpoint, found, err := taskengine.DecodeCheckpoint[commitCheckpoint](run.execution)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if found && checkpoint.RequestID == request.RequestID && checkpoint.Sends == request.Sends &&
+		checkpoint.SentAt.Equal(*request.LastSentAt) && !checkpoint.NextResendAt.IsZero() {
+		return checkpoint.NextResendAt, nil
+	}
+	resendAt, err := run.execution.ResendAt(*request.LastSentAt, request.Sends)
+	if err != nil {
+		return time.Time{}, err
+	}
+	checkpoint = commitCheckpoint{
+		RequestID: request.RequestID, Sends: request.Sends, SentAt: *request.LastSentAt, NextResendAt: resendAt,
+	}
+	if request.TransactionID != nil {
+		checkpoint.TransactionID = *request.TransactionID
+	}
+	if err := run.execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+		return time.Time{}, err
+	}
+	return resendAt, nil
 }
 
 // unknownSend waits on a send whose outcome cannot be told. Recovery reads the
@@ -570,9 +603,9 @@ func (h *Handler) unknownSend(run commitRun, sends int, sent storagecommit.SendR
 		h.deps.Logger.Warn("storage registration submission failed",
 			"task_id", run.taskID(), "commit_request_id", run.request.RequestID,
 			"storage_data_set_id", run.request.StorageDataSetID, "error", synapse.ErrorSummary(sent.Err))
-		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), "provider_confirmation", model.TaskResumeModeRecover, storagePollInterval, settlement)
+		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), "provider_confirmation", model.TaskResumeModeRecover, settlement)
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking batch confirmation", settlement)
+	return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking batch confirmation", settlement)
 }
 
 // recordCommitEvidence keeps the provider's receipt as soon as the SDK
@@ -584,9 +617,9 @@ func (h *Handler) recordCommitEvidence(ctx context.Context, run commitRun, sends
 		}
 		evidenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		err := run.execution.WriteCheckpointWith(evidenceCtx, commitCheckpoint{
-			RequestID: run.request.RequestID, Sends: sends, SentAt: time.Now().UTC(), TransactionID: submission.TransactionID,
-		}, func(ctx context.Context, repos *repository.Repositories) error {
+		checkpoint := run.checkpoint
+		checkpoint.TransactionID = submission.TransactionID
+		err := run.execution.WriteCheckpointWith(evidenceCtx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
 				CommitSendInput: repository.CommitSendInput{RequestID: run.request.RequestID, TaskID: run.taskID(), Sends: sends},
 				TransactionID:   submission.TransactionID, StatusURL: submission.StatusURL,
@@ -605,6 +638,15 @@ func (h *Handler) submissionSettlement(run commitRun, sends int, submission *sto
 	}
 	transactionID, statusURL := submission.TransactionID, submission.StatusURL
 	return func(ctx context.Context, repos *repository.Repositories) error {
+		checkpoint := run.checkpoint
+		checkpoint.TransactionID = transactionID
+		raw, err := json.Marshal(checkpoint)
+		if err != nil {
+			return err
+		}
+		if err := repos.Tasks.WriteCheckpoint(ctx, run.taskID(), run.execution.ClaimGeneration(), raw); err != nil {
+			return err
+		}
 		return repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
 			CommitSendInput: repository.CommitSendInput{RequestID: run.request.RequestID, TaskID: run.taskID(), Sends: sends},
 			TransactionID:   transactionID, StatusURL: statusURL,
@@ -705,10 +747,6 @@ func (h *Handler) finishCommittedContent(ctx context.Context, repos *repository.
 	return h.deps.Messenger.Notify(ctx, repos, storagepipeline.ContentDurabilityReached{ContentIDs: ids})
 }
 
-// commitMemberRetransferDelay is how long a submitted request waits before
-// transferring again a member whose transfer gave up.
-const commitMemberRetransferDelay = 5 * time.Minute
-
 // commitMemberProgress reports whether a member of a sealed request is still
 // being transferred, and which members' transfers gave up. Members transfer
 // again after the provider drops their pieces.
@@ -743,7 +781,7 @@ func (h *Handler) commitMemberProgress(ctx context.Context, run commitRun) (tran
 // every member is transferred. settlement records what the caller observed
 // meanwhile.
 func waitForCommitMembers(settlement taskengine.Settlement) taskengine.Result {
-	return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "commit_members",
+	return taskengine.Wait(model.TaskResumeModeRecover, "commit_members",
 		"Waiting for stored data to finish transferring", settlement)
 }
 
@@ -777,7 +815,7 @@ func (h *Handler) retransferStalledMembers(run commitRun, stalled []int64, then 
 				continue
 			}
 			h.deps.Logger.Warn("storage registration member could not be transferred again; trying later",
-				"task_id", run.taskID(), "commit_request_id", run.request.RequestID, "copy_id", copyID, "retry_after", commitMemberRetransferDelay)
+				"task_id", run.taskID(), "commit_request_id", run.request.RequestID, "copy_id", copyID, "available_at", availableAt)
 			failed, err := repos.Tasks.LatestForSubject(ctx, model.TaskSubjectStorageCopy, fmt.Sprint(copyID), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
 			if err != nil {
 				return err
@@ -943,7 +981,7 @@ func (h *Handler) loadCommitPieces(ctx context.Context, run commitRun) ([]cid.Ci
 }
 
 func (h *Handler) commitTargetUnavailable(err error) taskengine.Result {
-	return taskengine.RetryInMode(synapse.SummarizedError(err), "provider", model.TaskResumeModeRecover, storagePollInterval, nil)
+	return taskengine.RetryInMode(synapse.SummarizedError(err), "provider", model.TaskResumeModeRecover, nil)
 }
 
 // commitMaxPieces is how many pieces one request to the data set carries.
@@ -1064,7 +1102,7 @@ func (h *Handler) retryStalledMembers(ctx context.Context, run commitRun, stalle
 			return taskengine.Fail(errors.New("batch member cannot be recovered safely"), "commit_member_recovery_blocked", observed)
 		}
 	}
-	return taskengine.RetryInMode(errors.New("batch member transfer failed"), "commit_member_retry", model.TaskResumeModeRecover, commitMemberRetransferDelay, nil).WithRetrySettlements(h.retransferStalledMembers(run, stalled, observed), observed)
+	return taskengine.RetryInMode(errors.New("batch member transfer failed"), "commit_member_retry", model.TaskResumeModeRecover, nil).WithRetrySettlements(h.retransferStalledMembers(run, stalled, observed), observed)
 }
 
 func (h *Handler) giveUpUnacceptedCommit(ctx context.Context, run commitRun) taskengine.Result {

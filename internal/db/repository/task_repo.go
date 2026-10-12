@@ -342,6 +342,7 @@ func (r *BunTaskRepo) WakePending(ctx context.Context, ids []int64) (int, error)
 		Set("updated_at = ?", now).
 		Where("id IN (?)", bun.List(ids)).
 		Where("status = ?", model.TaskStatusPending).
+		Where("wait_reason IS NOT NULL").
 		Where("available_at > ?", now).
 		Exec(ctx)
 	if err != nil {
@@ -375,6 +376,7 @@ func (r *BunTaskRepo) WakePendingOfTypes(ctx context.Context, ids []int64, types
 		Where("id IN (?)", bun.List(ids)).
 		Where("type IN (?)", bun.List(types)).
 		Where("status = ?", model.TaskStatusPending).
+		Where("wait_reason IS NOT NULL").
 		Where("available_at > ?", now)
 	if len(skipWaitReasons) != 0 {
 		query = query.Where("wait_reason IS NULL OR wait_reason NOT IN (?)", bun.List(skipWaitReasons))
