@@ -3,7 +3,6 @@ package repository
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"reflect"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -82,22 +81,6 @@ func validateReplacementPreflight(ctx context.Context, db bun.IDB, expected Repl
 			return storagereplacement.ErrSourceOutcomeUnknown
 		}
 	}
-	return nil
-}
-
-func verifyCreationRejection(source *model.StorageDataSet, checked *model.DataSetCreationRejection) error {
-	previous, err := source.CreationRejectionEvidence()
-	if err != nil || previous == nil || checked == nil || !checked.Valid() || checked.StatusCode != previous.StatusCode ||
-		!checked.RejectedAt.Equal(previous.RejectedAt) || !checked.ClientDataSetID.Equal(previous.ClientDataSetID) ||
-		checked.Payer != previous.Payer || checked.ChainID != previous.ChainID || checked.RecordKeeper != previous.RecordKeeper ||
-		checked.AbsenceCheckedAt.Before(previous.AbsenceCheckedAt) {
-		return storagereplacement.ErrSourceOutcomeUnknown
-	}
-	encoded, err := json.Marshal(checked)
-	if err != nil {
-		return err
-	}
-	source.CreationRejection = encoded
 	return nil
 }
 

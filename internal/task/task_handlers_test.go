@@ -384,6 +384,7 @@ func handlerExecutionRegistry(t *testing.T, runtime handlerTestRuntime) *taskeng
 	for _, taskType := range runtime.registry.Types() {
 		handler, _ := runtime.registry.Handler(taskType)
 		definition, _ := runtime.registry.Definition(taskType)
+		definition.Policy.ObservationInterval = handlerTestPollInterval
 		if runtime.testMaxAttempts != nil {
 			definition.Policy.MaxAttempts = *runtime.testMaxAttempts
 		}
@@ -987,8 +988,8 @@ func TestStorageCleanupKeepsCheckingScheduledDeletionBeforeDeadline(t *testing.T
 		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
 			task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
 	})
-	if pending.RetryCount != 0 || pending.AvailableAt.Before(time.Now().Add(45*time.Second)) {
-		t.Fatalf("scheduled cleanup did not keep a low-frequency confirmation wait: %#v", pending)
+	if pending.RetryCount != 0 || pending.AvailableAt.Sub(pending.UpdatedAt) > handlerTestPollInterval {
+		t.Fatalf("scheduled cleanup did not keep its observation wait: %#v", pending)
 	}
 	if deleteCalls.Load() != 0 {
 		t.Fatalf("scheduled cleanup sent %d duplicate deletions", deleteCalls.Load())
@@ -1985,30 +1986,27 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	}
 }
 
-func TestCacheCapacityWaitsWhenLRUDisabled(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
-	planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type:  model.TaskTypeCacheCapacityReconcile,
-		Input: taskengine.CycleInput{Cycle: 1},
-	})
-	if err != nil || !created {
-		t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
-	}
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-
-	stored := waitForTask(t, runtime.repos, planner.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "scheduled"
-	})
-	if stored.FinishedAt != nil || stored.RetryCount != 0 || stored.AvailableAt.Before(time.Now().Add(59*time.Minute)) {
-		t.Fatalf("disabled recurring round did not wait: %#v", stored)
-	}
-	same, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type:  model.TaskTypeCacheCapacityReconcile,
-		Input: taskengine.CycleInput{Cycle: 1},
-	})
-	if err != nil || created || same.ID != planner.ID {
-		t.Fatalf("reseed disabled cache capacity task = %#v created=%v err=%v", same, created, err)
+func TestCacheCapacityCompletesHourlyCycleWhenCleanupDisabled(t *testing.T) {
+	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyNone, cache.EvictionPolicyAfterUpload} {
+		t.Run(string(policy), func(t *testing.T) {
+			runtime := newScheduledCapacityRuntime(t, handlerRuntimeOptions{policy: policy})
+			planner, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
+				Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1},
+			})
+			if err != nil || !created {
+				t.Fatalf("enqueue capacity = %#v created=%v err=%v", planner, created, err)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			stored := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+			if stored.FinishedAt == nil || stored.RetryCount != 0 || stored.WaitReason != nil {
+				t.Fatalf("disabled capacity round = %#v", stored)
+			}
+			schedule, err := runtime.repos.TaskSchedules.GetForUpdate(t.Context(), "capacity-policy")
+			if err != nil || schedule == nil || schedule.NextRunAt.Before(stored.FinishedAt.Add(59*time.Minute)) {
+				t.Fatalf("disabled capacity schedule = %#v, err=%v", schedule, err)
+			}
+		})
 	}
 }
 
@@ -2561,8 +2559,8 @@ func TestInitialPeerPullWaitsForCommittedSourceEvenWithCache(t *testing.T) {
 			waiting := waitForTask(t, runtime.repos, plan.ID, func(task *model.Task) bool {
 				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "source"
 			})
-			if delay := waiting.AvailableAt.Sub(waiting.UpdatedAt); delay < 29*time.Second || delay > 31*time.Second {
-				t.Fatalf("source check delay = %s, want 30s", delay)
+			if delay := waiting.AvailableAt.Sub(waiting.UpdatedAt); delay > handlerTestPollInterval || waiting.RetryCount != 0 {
+				t.Fatalf("source dependency wait = %#v", waiting)
 			}
 			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 			if err != nil || copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != plan.ID {
@@ -5409,8 +5407,8 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetFailed(t.Context(), failed.ID, "creation outcome unknown"); err != nil {
-		t.Fatalf("MarkDataSetFailed: %v", err)
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("status = ?", model.StorageDataSetStatusFailed).Set("is_current = ?", false).Where("id = ?", failed.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 
 	taskRow, created, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
@@ -5453,10 +5451,6 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	}
 }
 
-// A creation the chain refused leaves no data set, so the generation is removed
-// and its provider becomes available to the bucket again. Keeping it would
-// reserve that provider forever: a failed generation can neither be retired nor
-// replaced, and the unique index covers every non-retired row.
 func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *testing.T) {
 	sequence := storedObjectSequence.Add(1)
 	providerID := testOnChainID(t, 26000+sequence)

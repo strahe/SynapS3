@@ -200,7 +200,7 @@ func (s *Server) taskListItem(ctx context.Context, row *model.Task) taskListItem
 		item.MaxAttempts = new(policy.MaxAttempts)
 	}
 	if s.taskService != nil {
-		item.Retryable = s.taskService.Retryable(row)
+		item.Retryable, _ = s.taskService.RetryableContext(ctx, row)
 		if item.Retryable {
 			item.RetryTaskID = &row.ID
 		}
@@ -521,6 +521,9 @@ type taskBackoffView struct {
 
 func toTaskPolicyView(policy taskengine.ExecutionPolicy) *taskPolicyView {
 	view := &taskPolicyView{MaxAttempts: new(policy.MaxAttempts), InitialDelay: policy.Backoff.InitialDelay.String(), MaximumDelay: policy.Backoff.MaximumDelay.String(), Multiplier: policy.Backoff.Multiplier, Jitter: policy.Backoff.Jitter, InvocationTimeout: policy.InvocationTimeout.String(), ObservationWindow: policy.ObservationWindow.String()}
+	if policy.ObservationInterval > 0 {
+		view.ObservationInterval = policy.ObservationInterval.String()
+	}
 	if policy.ResendBackoff != nil {
 		b := policy.ResendBackoff
 		view.ResendBackoff = &taskBackoffView{InitialDelay: b.InitialDelay.String(), MaximumDelay: b.MaximumDelay.String(), Multiplier: b.Multiplier, Jitter: b.Jitter}
@@ -529,14 +532,15 @@ func toTaskPolicyView(policy taskengine.ExecutionPolicy) *taskPolicyView {
 }
 
 type taskPolicyView struct {
-	ResendBackoff     *taskBackoffView `json:"resend_backoff,omitempty"`
-	MaxAttempts       *int             `json:"max_attempts"`
-	InitialDelay      string           `json:"initial_delay"`
-	MaximumDelay      string           `json:"maximum_delay"`
-	Multiplier        float64          `json:"multiplier"`
-	Jitter            float64          `json:"jitter"`
-	InvocationTimeout string           `json:"invocation_timeout"`
-	ObservationWindow string           `json:"observation_window"`
+	ResendBackoff       *taskBackoffView `json:"resend_backoff,omitempty"`
+	MaxAttempts         *int             `json:"max_attempts"`
+	InitialDelay        string           `json:"initial_delay"`
+	MaximumDelay        string           `json:"maximum_delay"`
+	Multiplier          float64          `json:"multiplier"`
+	Jitter              float64          `json:"jitter"`
+	InvocationTimeout   string           `json:"invocation_timeout"`
+	ObservationWindow   string           `json:"observation_window"`
+	ObservationInterval string           `json:"observation_interval,omitempty"`
 }
 
 func taskPageParameters(w http.ResponseWriter, r *http.Request) (int64, int, bool) {
@@ -684,6 +688,9 @@ func (s *Server) replacementRetryTask(ctx context.Context, requested *model.Task
 	}
 	if parent == nil || parent.Status != model.TaskStatusFailed || parent.SupersededAt != nil || requested.Status != model.TaskStatusFailed {
 		return nil, true, repository.ErrConflict
+	}
+	if err := s.taskService.InspectRetryWithRepositories(ctx, s.repos, parent); err != nil {
+		return nil, true, err
 	}
 	return parent, true, nil
 }

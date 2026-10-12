@@ -284,7 +284,7 @@ func (h *EvictHandler) retryCacheEviction(
 	err error,
 	reason string,
 ) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func (h *EvictHandler) reserveLRUDeletion(size int64) bool {

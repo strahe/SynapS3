@@ -31,7 +31,7 @@ type commitCheckpoint struct {
 	Sends         int       `json:"sends"`
 	SentAt        time.Time `json:"sent_at"`
 	TransactionID string    `json:"transaction_id,omitempty"`
-	NextResendAt  time.Time `json:"next_resend_at,omitempty"`
+	NextResendAt  time.Time `json:"next_resend_at,omitzero"`
 }
 
 func (h *Handler) commitHandler() *taskengine.FuncHandler {
@@ -42,7 +42,7 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 			return storagepipeline.ValidateCommitRequestInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{
-			MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(),
+			MaxAttempts: 6, Backoff: taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute, Jitter: 0.2},
 			ResendBackoff: &taskengine.BackoffPolicy{InitialDelay: 5 * time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
 		}, AllowRetry: true,
 		CanManualRetry: func(source *model.Task) bool {
@@ -383,7 +383,7 @@ func (h *Handler) settleFirstSend(
 	//exhaustive:enforce
 	switch sent.Kind {
 	case storagecommit.SendAccepted:
-		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation",
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation",
 			"Waiting for batch confirmation", h.submissionSettlement(run, 1, sent.Submission))
 	case storagecommit.SendRefused, storagecommit.SendNotSent:
 		refused := sent.Kind == storagecommit.SendRefused
@@ -460,7 +460,7 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 		if observation.Cause != nil {
 			return taskengine.RetryInMode(synapse.SummarizedError(observation.Cause), "provider_confirmation", model.TaskResumeModeRecover, settlement)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for batch confirmation", settlement)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for batch confirmation", settlement)
 	case storagecommit.ObserveConfirmed:
 		return h.confirmCommit(run, target, commit, *observation.Confirmation)
 	case storagecommit.ObserveStop:
@@ -523,7 +523,7 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 	//exhaustive:enforce
 	switch sent.Kind {
 	case storagecommit.SendAccepted:
-		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation",
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation",
 			"Waiting for batch confirmation", h.submissionSettlement(run, sends, sent.Submission))
 	case storagecommit.SendRefused, storagecommit.SendNotSent:
 		// Refusing a resend proves only that this send produced nothing; an
@@ -605,7 +605,7 @@ func (h *Handler) unknownSend(run commitRun, sends int, sent storagecommit.SendR
 			"storage_data_set_id", run.request.StorageDataSetID, "error", synapse.ErrorSummary(sent.Err))
 		return taskengine.RetryInMode(synapse.SummarizedError(sent.Err), "provider_confirmation", model.TaskResumeModeRecover, settlement)
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking batch confirmation", settlement)
+	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Checking batch confirmation", settlement)
 }
 
 // recordCommitEvidence keeps the provider's receipt as soon as the SDK

@@ -20,6 +20,10 @@ func (s *Service) RetryableContext(ctx context.Context, task *model.Task) (bool,
 // InspectRetry preserves domain rejection evidence for callers presenting an unavailable action.
 // Retry rechecks eligibility inside its transaction before creating a successor.
 func (s *Service) InspectRetry(ctx context.Context, task *model.Task) error {
+	return s.InspectRetryWithRepositories(ctx, s.repos, task)
+}
+
+func (s *Service) InspectRetryWithRepositories(ctx context.Context, repos *repository.Repositories, task *model.Task) error {
 	if !s.Retryable(task) {
 		return ErrRetryUnsupported
 	}
@@ -32,7 +36,7 @@ func (s *Service) InspectRetry(ctx context.Context, task *model.Task) error {
 		return repository.ErrConflict
 	}
 	if task.Type.IsRecurringSystem() {
-		schedule, err := s.repos.TaskSchedules.GetByTaskID(ctx, task.ID)
+		schedule, err := repos.TaskSchedules.GetByTaskID(ctx, task.ID)
 		if err != nil {
 			return err
 		}
@@ -41,7 +45,7 @@ func (s *Service) InspectRetry(ctx context.Context, task *model.Task) error {
 		}
 	}
 	if definition.InspectRetry != nil {
-		return definition.InspectRetry(ctx, s.repos, task)
+		return definition.InspectRetry(ctx, repos, task)
 	}
 	return nil
 }

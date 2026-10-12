@@ -279,6 +279,9 @@ export function TaskDetailsSheet({
                                   'Result wait limit',
                                   policy.observation_window === '0s' ? 'Not set' : policy.observation_window,
                                 ],
+                                ...(policy.observation_interval
+                                  ? [['Observation interval', policy.observation_interval]]
+                                  : []),
                               ].map(([label, value]) => (
                                 <div
                                   key={label}

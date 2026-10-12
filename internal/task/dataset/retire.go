@@ -36,8 +36,8 @@ type retirementCheckpoint struct {
 	// Sends counts termination requests; it paces the ones that follow an
 	// unobserved outcome.
 	Sends                     int       `json:"sends,omitempty"`
-	NextResendAt              time.Time `json:"next_resend_at,omitempty"`
-	ProtocolNextObservationAt time.Time `json:"protocol_next_observation_at,omitempty"`
+	NextResendAt              time.Time `json:"next_resend_at,omitzero"`
+	ProtocolNextObservationAt time.Time `json:"protocol_next_observation_at,omitzero"`
 	// Identity is what the first request signed for. A numeric data set ID means
 	// something else on another chain, so recovery compares this before it reads
 	// the chain or sends again.
@@ -227,7 +227,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 				return taskengine.Wait(model.TaskResumeModeRecover, "termination_epoch", "Recording data set retirement", retirementEvidenceSettlement(abandoned, row.ID, observed.EndEpoch, observed.TxHash))
 			}
 			if pending {
-				return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set retirement", nil)
+				return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set retirement", nil)
 			}
 		}
 		if checkpoint.Sends > 0 {
@@ -318,7 +318,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 			return taskengine.Wait(model.TaskResumeModeRecover, "termination_epoch", "Recording data set retirement", settlement)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, "termination_epoch", "Waiting for data set retirement", settlement)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "termination_epoch", "Waiting for data set retirement", settlement)
 	}
 	if h.deps.Epochs == nil {
 		return taskengine.Fail(errors.New("chain epoch reader is unavailable"), "dependency_unavailable", nil)
@@ -328,7 +328,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		return retryTask(err, "termination_epoch_observation_failed")
 	}
 	if observedEpoch < *terminationEpoch {
-		return taskengine.Wait(model.TaskResumeModeRecover, "termination_epoch", "Waiting for data set retirement", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "termination_epoch", "Waiting for data set retirement", nil)
 	}
 	return taskengine.Complete("Data set retired", func(ctx context.Context, repos *repository.Repositories) error {
 		if abandoned {

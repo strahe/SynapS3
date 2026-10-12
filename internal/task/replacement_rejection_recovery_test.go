@@ -2,7 +2,9 @@ package task_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -86,7 +88,7 @@ func TestCoordinatorDiscardsRefusalAfterObservedService(t *testing.T) {
 	}
 }
 
-func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storagereplacement.Replacement, *model.StorageDataSet, *model.Task, repository.BindObservedReplacementServiceInput) {
+func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime, readySource ...bool) (*storagereplacement.Replacement, *model.StorageDataSet, *model.Task, repository.BindObservedReplacementServiceInput) {
 	t.Helper()
 	bucket := &model.Bucket{Name: "review-stale-rejection", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
@@ -105,6 +107,14 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storager
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
 		Set("finished_at = ?", time.Now()).Where("id = ?", sourceEnsure.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+	if len(readySource) != 0 && readySource[0] {
+		if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 1001)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.repos.Contents.CompleteDataSetEnsureTask(t.Context(), source.ID, sourceEnsure.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	row, _, err := runtime.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: testOnChainID(t, 202), ClientRequestID: "first"})
 	if err != nil {
@@ -126,7 +136,11 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime) (*storager
 	}
 	identity := testutil.DefaultContextIdentity
 	evidence := model.DataSetCreationRejection{Version: 1, StatusCode: 403, RejectedAt: time.Now().Add(-time.Minute), AbsenceCheckedAt: time.Now(), ClientDataSetID: clientID, Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper}
-	if err := runtime.repos.Contents.RecordDataSetCreationRejection(t.Context(), target.ID, target.Generation, ensure.ID, evidence); err != nil {
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("creation_rejection = ?", json.RawMessage(encoded)).Where("id = ?", target.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, failure_reason = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), "dataset_provider_rejected", ensure.ID).Exec(t.Context()); err != nil {
@@ -201,6 +215,32 @@ func TestObservedServiceAfterRefusalSettlementKeepsReplacementReserved(t *testin
 			stored, loadErr := runtime.repos.Replacements.GetByID(t.Context(), row.ID)
 			if err != nil || loadErr != nil || !target.IsCurrent || stored.Status != storagereplacement.StatusCompleted || stored.FailureReason != nil || terminator.calls.Load() != 0 {
 				t.Fatalf("recovered replacement did not continue: target=%#v replacement=%#v err=%v/%v", target, stored, err, loadErr)
+			}
+		})
+	}
+}
+
+func TestInitializationCoordinatorStopsOnFailedChild(t *testing.T) {
+	for _, readySource := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ready_source=%v", readySource), func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
+			row, target, coordinator, _ := seedRefusedReplacement(t, runtime, readySource)
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("creation_rejection = NULL").Where("id = ?", target.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			stopped := runStorageTaskClaims(t, runtime, coordinator, model.TaskStatusFailed, 1)
+			if stopped.FailureReason == nil || *stopped.FailureReason != "replacement_target_failed" || stopped.RetryCount != 0 {
+				t.Fatalf("coordinator reopened initialization budget: %#v", stopped)
+			}
+			if next, err := runtime.repos.Tasks.GetDirectSuccessor(t.Context(), *target.EnsureTaskID); err != nil || next != nil {
+				t.Fatalf("automatic child successor: %#v %v", next, err)
+			}
+			stored, err := runtime.repos.Replacements.GetByID(t.Context(), row.ID)
+			if err != nil || stored.Status != storagereplacement.StatusFailed || stored.TaskID == nil || *stored.TaskID != coordinator.ID {
+				t.Fatalf("failed coordinator owner: %#v %v", stored, err)
+			}
+			if _, _, err := runtime.repos.Replacements.SourceEligibility(t.Context(), row.SourceDataSetID); err != nil {
+				t.Fatalf("failed initialization cannot be replaced: %v", err)
 			}
 		})
 	}

@@ -29,6 +29,7 @@ func replacementSourceEligibility(ctx context.Context, db bun.IDB, source *model
 		return false, storagereplacement.ErrSourceNotCurrent
 	}
 	initializing := source.Status != model.StorageDataSetStatusReady
+
 	var outgoing []storagereplacement.Replacement
 	if err := db.NewSelect().Model(&outgoing).Where("source_data_set_id = ?", source.ID).
 		Where("status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).Scan(ctx); err != nil {
@@ -44,6 +45,13 @@ func replacementSourceEligibility(ctx context.Context, db bun.IDB, source *model
 		}
 	} else {
 		for _, row := range outgoing {
+			target, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
+			if err != nil || target == nil {
+				return false, errors.Join(err, ErrNotFound)
+			}
+			if target.Status != model.StorageDataSetStatusReady && target.Status != model.StorageDataSetStatusRetired {
+				continue
+			}
 			if row.Status != storagereplacement.StatusFailed && row.Status != storagereplacement.StatusCleanupAttention {
 				return false, storagereplacement.ErrActiveReplacement
 			}
@@ -71,14 +79,24 @@ func replaceableEarlierTargets(ctx context.Context, db bun.IDB, sourceDataSetID 
 		return nil, errors.Join(err, ErrNotFound)
 	}
 	initializing := source.Status != model.StorageDataSetStatusReady
+	if initializing {
+		ready, err := db.NewSelect().Model((*model.StorageDataSet)(nil)).
+			Where(`id IN (SELECT target_data_set_id FROM storage_replacements WHERE source_data_set_id = ? AND status NOT IN (?, ?))`,
+				sourceDataSetID, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+			Where("status = ?", model.StorageDataSetStatusReady).Exists(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ready {
+			return nil, storagereplacement.ErrActiveReplacement
+		}
+	}
 	var targets []model.StorageDataSet
 	query := db.NewSelect().Model(&targets).
 		Where(`id IN (SELECT target_data_set_id FROM storage_replacements WHERE source_data_set_id = ? AND status NOT IN (?, ?))`,
 			sourceDataSetID, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
 		Where("status <> ?", model.StorageDataSetStatusRetired)
-	if !initializing {
-		query = query.Where("data_set_id IS NULL")
-	}
+	query = query.Where("status <> ?", model.StorageDataSetStatusReady)
 	if err := query.Scan(ctx); err != nil {
 		return nil, err
 	}
@@ -86,14 +104,7 @@ func replaceableEarlierTargets(ctx context.Context, db bun.IDB, sourceDataSetID 
 		return nil, storagereplacement.ErrTargetCreating
 	}
 	for i := range targets {
-		if initializing && targets[i].Status == model.StorageDataSetStatusReady {
-			return nil, storagereplacement.ErrActiveReplacement
-		}
-		check := failedInitializationOwner
-		if !initializing {
-			check = remoteReplacementTargetEligibility
-		}
-		if err := check(ctx, db, &targets[i]); err != nil {
+		if err := failedInitializationOwner(ctx, db, &targets[i]); err != nil {
 			if errors.Is(err, storagereplacement.ErrSourceRunning) || errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
 				return nil, storagereplacement.ErrTargetCreating
 			}

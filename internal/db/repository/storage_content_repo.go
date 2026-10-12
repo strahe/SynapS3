@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -803,26 +802,6 @@ func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id, e
 	return requireDataSetStatusUpdate(ctx, r.db, id, res, "recording storage client data set ID")
 }
 
-func (r *BunStorageContentRepo) RecordDataSetCreationRejection(ctx context.Context, id, generation, ensureTaskID int64, evidence model.DataSetCreationRejection) error {
-	if id <= 0 || generation <= 0 || ensureTaskID <= 0 || !evidence.Valid() {
-		return ErrInvalidInput
-	}
-	encoded, err := json.Marshal(evidence)
-	if err != nil {
-		return err
-	}
-	result, err := r.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
-		Set("creation_rejection = ?", json.RawMessage(encoded)).
-		Set("last_error = ?", storagereplacement.ProviderRejectedMessage).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND generation = ? AND ensure_task_id = ?", id, generation, ensureTaskID).
-		Where("client_data_set_id = ?", evidence.ClientDataSetID).
-		Where("status IN (?, ?)", model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating).
-		Where("data_set_id IS NULL AND create_transaction_id IS NULL AND create_status_url IS NULL").
-		Exec(ctx)
-	return requireTaskFenceRows(result, err, "recording storage service creation rejection")
-}
-
 func (r *BunStorageContentRepo) MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		return markDataSetReady(ctx, db, input.ID, input.DataSetID, input.ClientDataSetID)
@@ -892,30 +871,6 @@ func (r *BunStorageContentRepo) MarkDataSetDraining(ctx context.Context, id int6
 	return requireDataSetStatusUpdate(ctx, r.db, id, res, "marking storage data set draining")
 }
 
-// MarkDataSetFailed records why a generation could not be created and gives up
-// its slot. Keeping is_current would leave the failed row owning the bucket's
-// replica slot with nothing able to release it, which stalls provisioning
-// permanently; the slot has to be free for the next generation to take it.
-func (r *BunStorageContentRepo) MarkDataSetFailed(ctx context.Context, id int64, lastError string) error {
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageDataSet)(nil)).
-		Set("status = ?", model.StorageDataSetStatusFailed).
-		Set("is_current = ?", false).
-		Set("last_error = ?", lastError).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", id).
-		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
-			model.StorageDataSetStatusPending,
-			model.StorageDataSetStatusCreating,
-			model.StorageDataSetStatusFailed,
-		})).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("marking storage data set failed: %w", err)
-	}
-	return requireDataSetStatusUpdate(ctx, r.db, id, res, "marking storage data set failed")
-}
-
 func requireDataSetStatusUpdate(ctx context.Context, db bun.IDB, id int64, result sql.Result, operation string) error {
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -935,41 +890,6 @@ func requireDataSetStatusUpdate(ctx context.Context, db bun.IDB, id int64, resul
 		return fmt.Errorf("%s: %w", operation, ErrNotFound)
 	}
 	return fmt.Errorf("%s: data set state changed: %w", operation, ErrConflict)
-}
-
-// RetireRejectedDataSet ends a generation whose creation the chain refused, so
-// the provider it had reserved becomes available to the bucket again. Without
-// this a rejected creation leaks that provider permanently: the unique partial
-// index on (bucket_id, provider_id) covers every non-retired row, and a failed
-// generation can neither be retired by the replacement gate nor replaced.
-//
-// The row and its copies are kept. Retirement is the honest end state here —
-// the generation holds nothing and owes nothing, and that is provable — while
-// deleting it would erase that the bucket ever tried this provider.
-//
-// The caller must have proof that no data set was created. A rejected
-// transaction is proof; an unknown outcome is not, because a creation can be
-// submitted and the process can die before the callback records it. Missing
-// identity columns are not proof on their own, so the only guard here is the
-// one fact that settles it from this side: no data set identity was recorded.
-func (r *BunStorageContentRepo) RetireRejectedDataSet(ctx context.Context, storageDataSetID int64) (bool, error) {
-	if storageDataSetID <= 0 {
-		return false, fmt.Errorf("retiring rejected storage data set: %w", ErrInvalidInput)
-	}
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageDataSet)(nil)).
-		Set("status = ?", model.StorageDataSetStatusRetired).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", storageDataSetID).
-		Where("status = ?", model.StorageDataSetStatusFailed).
-		Where("is_current = ?", false).
-		Where("(data_set_id IS NULL OR data_set_id = '')").
-		Exec(ctx)
-	if err != nil {
-		return false, fmt.Errorf("retiring rejected storage data set: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	return rows == 1, nil
 }
 
 func (r *BunStorageContentRepo) CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error {

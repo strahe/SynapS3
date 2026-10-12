@@ -80,7 +80,11 @@ func localRefusal(t *testing.T, db *bun.DB, repos *repository.Repositories, sour
 		Version: 1, StatusCode: 403, RejectedAt: time.Now().UTC().Add(-time.Minute), AbsenceCheckedAt: time.Now().UTC(),
 		ClientDataSetID: clientID, Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper,
 	}
-	if err := repos.Contents.RecordDataSetCreationRejection(t.Context(), source.ID, source.Generation, ensure.ID, *evidence); err != nil {
+	encoded, err := json.Marshal(*evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("creation_rejection = ?", json.RawMessage(encoded)).Where("id = ?", source.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.NewRaw("UPDATE tasks SET status = ?, failure_reason = ?, finished_at = ? WHERE id = ?", model.TaskStatusFailed, "dataset_provider_rejected", time.Now(), ensure.ID).Exec(t.Context()); err != nil {

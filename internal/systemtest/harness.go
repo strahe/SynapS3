@@ -25,6 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -186,6 +187,11 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	market := memoryWarmStorageMarket{filecoin: filecoin}
 	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
 		Config: cfg, Database: database, Settings: settings, Logger: logger,
+		DecorateTaskHandler: func(handler taskengine.Handler) taskengine.Handler {
+			definition := handler.Definition()
+			definition.Policy.ObservationInterval = testutil.TaskPollInterval
+			return taskengine.NewFuncHandler(definition, handler.Execute, handler.Recover)
+		},
 		UploadSpeedProbe: filecoin,
 		Filecoin: app.FilecoinServices{
 			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314, USDFCAddress: memoryUSDFCAddress.Hex(),

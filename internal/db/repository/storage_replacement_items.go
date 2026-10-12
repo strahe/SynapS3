@@ -12,56 +12,135 @@ import (
 	"github.com/uptrace/bun"
 )
 
-func (r *BunStorageReplacementRepo) SeedMigrationBatch(
-	ctx context.Context,
-	replacementID int64,
-	limit int,
-) (int, bool, error) {
+func lockReplacementProgress(ctx context.Context, db bun.IDB, replacementID int64) (*storagereplacement.Replacement, error) {
+	var bucketID int64
+	if err := db.NewSelect().Model((*storagereplacement.Replacement)(nil)).Column("bucket_id").Where("id = ?", replacementID).Scan(ctx, &bucketID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	bucket, err := lockBucketByID(ctx, db, bucketID)
+	if err != nil {
+		return nil, err
+	}
+	if bucket == nil {
+		return nil, ErrNotFound
+	}
+	row, err := lockReplacementByID(ctx, db, replacementID)
+	if err != nil {
+		return nil, err
+	}
+	if row.BucketID != bucketID {
+		return nil, ErrConflict
+	}
+	if err := lockReplacementDataSets(ctx, db, row.SourceDataSetID, row.TargetDataSetID); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// LockCoordinatorTask holds the replacement's domain fence for transaction-local writes.
+func (r *BunStorageReplacementRepo) LockCoordinatorTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error) {
+	if replacementID <= 0 || generation <= 0 || taskID <= 0 {
+		return nil, ErrInvalidInput
+	}
+	row, err := lockReplacementProgress(ctx, r.db, replacementID)
+	if err != nil {
+		return nil, err
+	}
+	if row.TaskGeneration != generation || row.TaskID == nil || *row.TaskID != taskID || row.Status == storagereplacement.StatusCompleted || row.Status == storagereplacement.StatusSuperseded {
+		return nil, ErrConflict
+	}
+	return row, nil
+}
+
+func (r *BunStorageReplacementRepo) LockCoordinatorProgress(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error) {
+	row, err := r.LockCoordinatorTask(ctx, replacementID, generation, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if row.Status != storagereplacement.StatusMigrating && row.Status != storagereplacement.StatusWaiting {
+		return nil, ErrConflict
+	}
+	target, err := (&BunStorageContentRepo{db: r.db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
+	if err != nil {
+		return nil, err
+	}
+	if target == nil || !target.IsCurrent || target.Status != model.StorageDataSetStatusReady || target.DataSetID == nil || target.DataSetID.IsZero() {
+		return nil, ErrConflict
+	}
+	return row, nil
+}
+
+func (r *BunStorageReplacementRepo) ListPendingReplacementItemsAfter(ctx context.Context, replacementID, afterID int64, limit int) ([]storagereplacement.Item, error) {
+	if replacementID <= 0 || afterID < 0 || limit <= 0 {
+		return nil, ErrInvalidInput
+	}
+	var items []storagereplacement.Item
+	if err := r.db.NewSelect().Model(&items).
+		Where("replacement_id = ? AND status = ? AND id > ?", replacementID, storagereplacement.ItemStatusPending, afterID).
+		OrderExpr("id").Limit(int64(limit)).Scan(ctx); err != nil {
+		return nil, fmt.Errorf("scanning replacement items: %w", err)
+	}
+	return items, nil
+}
+
+func (r *BunStorageReplacementRepo) AcquireItemsForCoordinator(ctx context.Context, replacementID, generation, taskID, afterID int64, limit int) (ReplacementItemBatch, error) {
+	var batch ReplacementItemBatch
+	row, err := r.LockCoordinatorProgress(ctx, replacementID, generation, taskID)
+	if err != nil {
+		return batch, err
+	}
+	items, err := r.ListPendingReplacementItemsAfter(ctx, replacementID, afterID, limit)
+	if err != nil {
+		return batch, err
+	}
+	for _, item := range items {
+		snapshot, err := acquireReplacementItemLocked(ctx, r.db, row, item.ID)
+		if err != nil && !errors.Is(err, storagereplacement.ErrItemCancelled) && !errors.Is(err, storagereplacement.ErrItemDeferred) {
+			return batch, err
+		}
+		if snapshot != nil {
+			batch.Items = append(batch.Items, *snapshot)
+		}
+		batch.LastItemID = item.ID
+		batch.Scanned++
+	}
+	return batch, nil
+}
+
+func (r *BunStorageReplacementRepo) SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (int, bool, error) {
 	if replacementID <= 0 || limit <= 0 {
 		return 0, false, ErrInvalidInput
 	}
-	row, err := r.GetByID(ctx, replacementID)
-	if err != nil {
-		return 0, false, err
-	}
-	if row == nil {
-		return 0, false, ErrNotFound
-	}
-	if row.SeedingComplete {
-		return 0, true, nil
-	}
-	eligible, cursor, scanned, err := r.scanMigrationCandidates(ctx, row, limit)
-	if err != nil {
-		return 0, false, err
-	}
-	if scanned == 0 {
-		return 0, true, markSeedingComplete(ctx, r.db, row.ID, row.SeedCursorContentID)
-	}
-	inserted := 0
-	done := scanned < limit
-	err = runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		locked, err := lockReplacementByID(ctx, db, replacementID)
+	var inserted int
+	var done bool
+	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		row, err := lockReplacementProgress(ctx, db, replacementID)
 		if err != nil {
 			return err
 		}
-		if locked.SeedCursorContentID != row.SeedCursorContentID {
+		if row.Status != storagereplacement.StatusPreparingTarget && row.Status != storagereplacement.StatusWaiting && row.Status != storagereplacement.StatusMigrating {
 			return ErrConflict
 		}
-		if locked.Status != storagereplacement.StatusPreparingTarget && locked.Status != storagereplacement.StatusWaiting && locked.Status != storagereplacement.StatusMigrating {
-			return ErrConflict
+		if row.SeedingComplete {
+			done = true
+			return nil
 		}
+		eligible, cursor, scanned, err := (&BunStorageReplacementRepo{db: db}).scanMigrationCandidates(ctx, row, limit)
+		if err != nil {
+			return err
+		}
+		done = scanned < limit
 		if len(eligible) > 0 {
-			// The target copy is created before the item that names it, so the
-			// item is born with a target and its composite foreign key to the
-			// replacement's target is checked from the first write rather than
-			// skipped while the column is still null.
 			contents := &BunStorageContentRepo{db: db}
 			target, err := contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
 			if err != nil {
 				return err
 			}
 			if target == nil {
-				return fmt.Errorf("seeding replacement items: %w", ErrNotFound)
+				return ErrNotFound
 			}
 			items := make([]storagereplacement.Item, 0, len(eligible))
 			now := time.Now()
@@ -74,25 +153,18 @@ func (r *BunStorageReplacementRepo) SeedMigrationBatch(
 				}
 				items = append(items, storagereplacement.Item{
 					ReplacementID: row.ID, ContentID: contentID,
-					TargetDataSetID: target.ID,
-					Status:          storagereplacement.ItemStatusPending,
-					CreatedAt:       now, UpdatedAt: now,
+					TargetDataSetID: target.ID, Status: storagereplacement.ItemStatusPending, CreatedAt: now, UpdatedAt: now,
 				})
 			}
-			result, err := db.NewInsert().
-				Model(&items).
-				On("CONFLICT (replacement_id, content_id) DO NOTHING").
-				Exec(ctx)
+			result, err := db.NewInsert().Model(&items).On("CONFLICT (replacement_id, content_id) DO NOTHING").Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("seeding replacement items: %w", err)
 			}
 			rows, _ := result.RowsAffected()
 			inserted = int(rows)
 		}
-		query := db.NewUpdate().
-			Model((*storagereplacement.Replacement)(nil)).
-			Set("seed_cursor_content_id = ?", cursor).
-			Set("updated_at = ?", time.Now()).
+		query := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
+			Set("seed_cursor_content_id = ?", cursor).Set("updated_at = ?", time.Now()).
 			Where("id = ? AND seed_cursor_content_id = ?", row.ID, row.SeedCursorContentID)
 		if done {
 			query = query.Set("seeding_complete = ?", true)
@@ -146,23 +218,6 @@ func storageUploadMigrationWindowSQL() string {
 	return `SELECT id FROM storage_contents WHERE bucket_id = ? AND id > ? ORDER BY id LIMIT ?`
 }
 
-func markSeedingComplete(ctx context.Context, db bun.IDB, replacementID, cursor int64) error {
-	result, err := db.NewUpdate().
-		Model((*storagereplacement.Replacement)(nil)).
-		Set("seeding_complete = ?", true).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND seed_cursor_content_id = ?", replacementID, cursor).
-		Where("status IN (?)", bun.List([]storagereplacement.Status{storagereplacement.StatusPreparingTarget, storagereplacement.StatusWaiting, storagereplacement.StatusMigrating})).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("completing replacement seeding: %w", err)
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return ErrConflict
-	}
-	return nil
-}
-
 func (r *BunStorageReplacementRepo) NextPendingReplacementItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error) {
 	item := new(storagereplacement.Item)
 	err := r.db.NewSelect().
@@ -182,6 +237,28 @@ func (r *BunStorageReplacementRepo) NextPendingReplacementItem(ctx context.Conte
 
 // AcquireItem re-derives the current domain snapshot. Replacement items are
 // ledgers, not workers; task claim and lease state never appears here.
+func (r *BunStorageReplacementRepo) InspectItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error) {
+	if input.ReplacementID <= 0 || input.ItemID <= 0 {
+		return nil, ErrInvalidInput
+	}
+	replacement, err := r.GetByID(ctx, input.ReplacementID)
+	if err != nil {
+		return nil, err
+	}
+	if replacement == nil {
+		return nil, ErrNotFound
+	}
+	item := new(storagereplacement.Item)
+	if err := r.db.NewSelect().Model(item).Where("id = ?", input.ItemID).Scan(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	snapshot, _, err := inspectReplacementItem(ctx, r.db, replacement, item)
+	return snapshot, err
+}
+
 func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error) {
 	if input.ReplacementID <= 0 || input.ItemID <= 0 {
 		return nil, ErrInvalidInput
@@ -189,102 +266,102 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 	var snapshot *ReplacementItemSnapshot
 	var terminalErr error
 	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		item := new(storagereplacement.Item)
-		err := db.NewSelect().Model(item).Where("id = ?", input.ItemID).For("NO KEY UPDATE").Scan(ctx)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
+		replacement, err := lockReplacementProgress(ctx, db, input.ReplacementID)
 		if err != nil {
 			return err
 		}
-		if item.ReplacementID != input.ReplacementID {
-			return ErrConflict
-		}
-		if item.Status != storagereplacement.ItemStatusPending {
-			terminalErr = storagereplacement.ErrItemCancelled
+		snapshot, terminalErr = acquireReplacementItemLocked(ctx, db, replacement, input.ItemID)
+		if errors.Is(terminalErr, storagereplacement.ErrItemCancelled) || errors.Is(terminalErr, storagereplacement.ErrItemDeferred) {
 			return nil
 		}
-		replacement, err := lockReplacementByID(ctx, db, input.ReplacementID)
-		if err != nil {
-			return err
-		}
-		if replacement.Status.Terminal() {
-			terminalErr = storagereplacement.ErrItemCancelled
-			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled, "")
-		}
-		uploads := &BunStorageContentRepo{db: db}
-		source, err := uploads.GetDataSetBindingByID(ctx, replacement.SourceDataSetID)
-		if err != nil {
-			return err
-		}
-		target, err := uploads.GetDataSetBindingByID(ctx, replacement.TargetDataSetID)
-		if err != nil {
-			return err
-		}
-		upload, err := uploads.GetByID(ctx, item.ContentID)
-		if err != nil {
-			return err
-		}
-		// Cleanup finalizes deleted content without waiting for its items, so
-		// an item whose content is gone has nothing left to migrate.
-		if upload == nil {
-			terminalErr = storagereplacement.ErrItemCancelled
-			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled, "")
-		}
-		if source == nil || target == nil || upload.BucketID != replacement.BucketID {
-			return ErrConflict
-		}
-		version, err := selectLiveObjectVersionForStorageContent(ctx, db, upload, nil)
-		if err != nil {
-			return err
-		}
-		if version == nil {
-			terminalErr = storagereplacement.ErrItemCancelled
-			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled, "")
-		}
-		owed, inFlight, err := sourceCopyState(ctx, db, upload.ID, source.ID)
-		if err != nil {
-			return err
-		}
-		if source.DataSetID == nil {
-			owed = localSlotObligation(upload, version, replacement.CopyIndex)
-			inFlight = false
-		}
-		if !owed {
-			if inFlight {
-				_, err := db.NewUpdate().
-					Model((*storagereplacement.Item)(nil)).
-					Set("last_error = ?", "the retiring provider has not finished storing this content").
-					Set("updated_at = ?", time.Now()).
-					Where("id = ? AND status = ?", item.ID, storagereplacement.ItemStatusPending).
-					Exec(ctx)
-				terminalErr = storagereplacement.ErrItemDeferred
-				return err
-			}
-			terminalErr = storagereplacement.ErrItemCancelled
-			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled, "")
-		}
-		covered, err := targetHoldsReadableCopy(ctx, db, upload.ID, target.ID)
-		if err != nil {
-			return err
-		}
-		if covered {
-			terminalErr = storagereplacement.ErrItemCancelled
-			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCopied, "")
-		}
-		snapshot = &ReplacementItemSnapshot{
-			Replacement: *replacement, Item: *item, Source: *source,
-			Target: *target, Upload: *upload, Version: *version,
-		}
-		return nil
+		return terminalErr
 	})
 	if err != nil {
 		return nil, err
 	}
-	if terminalErr != nil {
+	return snapshot, terminalErr
+}
+
+func acquireReplacementItemLocked(ctx context.Context, db bun.IDB, replacement *storagereplacement.Replacement, itemID int64) (*ReplacementItemSnapshot, error) {
+	item, err := lockReplacementItem(ctx, db, replacement.ID, itemID)
+	if err != nil {
+		return nil, err
+	}
+	snapshot, status, terminalErr := inspectReplacementItem(ctx, db, replacement, item)
+	if errors.Is(terminalErr, storagereplacement.ErrItemCancelled) {
+		if item.Status == storagereplacement.ItemStatusPending {
+			if err := settleReplacementItem(ctx, db, item, status, ""); err != nil {
+				return nil, err
+			}
+		}
 		return nil, terminalErr
 	}
-	return snapshot, nil
+	if errors.Is(terminalErr, storagereplacement.ErrItemDeferred) {
+		_, err := db.NewUpdate().Model((*storagereplacement.Item)(nil)).
+			Set("last_error = ?", "the retiring provider has not finished storing this content").
+			Set("updated_at = ?", time.Now()).Where("id = ? AND status = ?", item.ID, storagereplacement.ItemStatusPending).Exec(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return snapshot, terminalErr
+}
+
+func inspectReplacementItem(ctx context.Context, db bun.IDB, replacement *storagereplacement.Replacement, item *storagereplacement.Item) (*ReplacementItemSnapshot, storagereplacement.ItemStatus, error) {
+	if item.ReplacementID != replacement.ID {
+		return nil, "", ErrConflict
+	}
+	if item.Status != storagereplacement.ItemStatusPending || replacement.Status.Terminal() {
+		return nil, storagereplacement.ItemStatusCancelled, storagereplacement.ErrItemCancelled
+	}
+	contents := &BunStorageContentRepo{db: db}
+	source, err := contents.GetDataSetBindingByID(ctx, replacement.SourceDataSetID)
+	if err != nil {
+		return nil, "", err
+	}
+	target, err := contents.GetDataSetBindingByID(ctx, replacement.TargetDataSetID)
+	if err != nil {
+		return nil, "", err
+	}
+	content, err := contents.GetByID(ctx, item.ContentID)
+	if err != nil {
+		return nil, "", err
+	}
+	if content == nil {
+		return nil, storagereplacement.ItemStatusCancelled, storagereplacement.ErrItemCancelled
+	}
+	if source == nil || target == nil || content.BucketID != replacement.BucketID {
+		return nil, "", ErrConflict
+	}
+	version, err := selectLiveObjectVersionForStorageContent(ctx, db, content, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if version == nil {
+		return nil, storagereplacement.ItemStatusCancelled, storagereplacement.ErrItemCancelled
+	}
+	owed, inFlight, err := sourceCopyState(ctx, db, content.ID, source.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	if source.DataSetID == nil {
+		owed = localSlotObligation(content, version, replacement.CopyIndex)
+		inFlight = false
+	}
+	if !owed {
+		if inFlight {
+			return nil, storagereplacement.ItemStatusPending, storagereplacement.ErrItemDeferred
+		}
+		return nil, storagereplacement.ItemStatusCancelled, storagereplacement.ErrItemCancelled
+	}
+	covered, err := targetHoldsReadableCopy(ctx, db, content.ID, target.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	if covered {
+		return nil, storagereplacement.ItemStatusCopied, storagereplacement.ErrItemCancelled
+	}
+	return &ReplacementItemSnapshot{Replacement: *replacement, Item: *item, Source: *source, Target: *target, Upload: *content, Version: *version}, storagereplacement.ItemStatusPending, nil
 }
 
 func (r *BunStorageReplacementRepo) MarkReplacementItemCopied(ctx context.Context, replacementID, itemID, targetCopyID int64) error {

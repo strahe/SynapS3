@@ -97,7 +97,7 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		if inUse > 0 {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrTargetInUse)
 		}
-		if err := abandonUnsentReplacementTargets(ctx, db, source.ID, source.Status != model.StorageDataSetStatusReady, input.Preflight); err != nil {
+		if err := abandonUnsentReplacementTargets(ctx, db, source.ID); err != nil {
 			return err
 		}
 
@@ -173,7 +173,7 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 	return result, created, nil
 }
 
-func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceDataSetID int64, initializing bool, preflight *ReplacementPreflight) error {
+func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceDataSetID int64) error {
 	var ids []int64
 	if err := db.NewSelect().Model((*storagereplacement.Replacement)(nil)).Column("target_data_set_id").
 		Where("source_data_set_id = ? AND status NOT IN (?, ?)", sourceDataSetID, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).Scan(ctx, &ids); err != nil {
@@ -190,22 +190,6 @@ func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceData
 		return err
 	}
 	for _, target := range targets {
-		if !initializing && len(target.CreationRejection) != 0 {
-			var checked *model.DataSetCreationRejection
-			if preflight != nil {
-				for _, entry := range preflight.Targets {
-					if entry.DataSet.ID == target.ID {
-						checked = entry.VerifiedCreationRejection
-					}
-				}
-			}
-			if err := verifyCreationRejection(&target, checked); err != nil {
-				return err
-			}
-		}
-		if !initializing && target.DataSetID != nil {
-			return storagereplacement.ErrTargetCreating
-		}
 		status := model.StorageDataSetStatusRetired
 		if target.DataSetID != nil {
 			status = model.StorageDataSetStatusDraining
@@ -268,8 +252,8 @@ func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSet
 	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
 		Set("task_generation = task_generation + 1").Set("task_id = NULL").
 		Where("id IN (?)", bun.List(ids)).
-		Where("? OR task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?))",
-			initializing, model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted).
+		Where("? OR task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?)) OR target_data_set_id IN (SELECT id FROM storage_data_sets WHERE status <> ?)",
+			initializing, model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted, model.StorageDataSetStatusReady).
 		Exec(ctx); err != nil {
 		return nil, fmt.Errorf("fencing stopped superseded coordinator: %w", err)
 	}

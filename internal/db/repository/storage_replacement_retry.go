@@ -60,8 +60,7 @@ func replacementRetryEligibility(ctx context.Context, db bun.IDB, row *storagere
 		if err != nil {
 			return err
 		}
-		if task == nil || task.Status == model.TaskStatusCancelled || task.SupersededAt != nil ||
-			(source.Status == model.StorageDataSetStatusReady && task.Status == model.TaskStatusFailed) {
+		if task == nil || task.Status == model.TaskStatusCancelled || task.SupersededAt != nil {
 			return &storagereplacement.NotRetryableError{Message: "Storage setup stopped. Check its task before retrying the replacement."}
 		}
 	}
@@ -73,7 +72,7 @@ func (r *BunStorageReplacementRepo) EnsureTaskReplacement(ctx context.Context, t
 	err := r.db.NewSelect().Model(row).
 		Join("JOIN storage_data_sets AS target ON target.id = storage_replacement.target_data_set_id").
 		Join("JOIN storage_data_sets AS source ON source.id = storage_replacement.source_data_set_id").
-		Where("source.status <> ? AND source.is_current = ?", model.StorageDataSetStatusReady, true).
+		Where("source.is_current = ?", true).
 		Where("target.ensure_task_id = ? AND target.status <> ?", taskID, model.StorageDataSetStatusReady).
 		Where("storage_replacement.status NOT IN (?, ?) AND storage_replacement.task_id IS NOT NULL", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
 		Scan(ctx)
@@ -159,7 +158,7 @@ func (r *BunStorageReplacementRepo) MarkInitializationFailed(ctx context.Context
 		if err != nil {
 			return err
 		}
-		if source == nil || source.Status == model.StorageDataSetStatusReady || !source.IsCurrent ||
+		if source == nil || !source.IsCurrent ||
 			target == nil || target.Status == model.StorageDataSetStatusReady || target.EnsureTaskID == nil || *target.EnsureTaskID != childID {
 			return ErrConflict
 		}

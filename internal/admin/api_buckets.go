@@ -627,7 +627,7 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 		}
 		setupError := ""
 		if source != nil && source.Status != model.StorageDataSetStatusReady && eligibilityErr == nil {
-			setupError = "Storage setup stopped. Retry or choose another provider."
+			setupError = "Storage setup stopped. Retry from Tasks or choose another provider."
 		}
 		if detail, ok := errors.AsType[*storagereplacement.SourceOutcomeError](eligibilityErr); ok {
 			setupError = detail.Message

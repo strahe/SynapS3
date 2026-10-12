@@ -231,6 +231,9 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	if detail.Policy.ResendBackoff == nil || detail.Policy.ResendBackoff.InitialDelay != "1m0s" || detail.Policy.ResendBackoff.MaximumDelay != "30m0s" || detail.Policy.ResendBackoff.Multiplier != 2 || detail.Policy.ResendBackoff.Jitter != 0 {
 		t.Fatalf("resend policy missing: %s", rr.Body.String())
 	}
+	if detail.Policy.ObservationInterval != "30s" {
+		t.Fatalf("observation policy missing: %s", rr.Body.String())
+	}
 	rr = f.request(http.MethodGet, "/api/v1/tasks", nil)
 	var page taskListResponse
 	decodeJSON(t, rr, &page)

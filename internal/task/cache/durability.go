@@ -64,27 +64,38 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 		if err != nil {
 			return decodeFailure(string(definition.Type), err)
 		}
-		candidate, err := h.deps.Repositories.CacheEvictions.NextBucketDurabilityCandidate(ctx, input.BucketID, input.Generation, execution.ID())
+		candidates, err := h.deps.Repositories.CacheEvictions.ListBucketDurabilityCandidates(ctx, input.BucketID, input.Generation, execution.ID(), 100)
 		if err != nil {
 			if errors.Is(err, repository.ErrConflict) {
 				return taskengine.Cancel("A newer storage policy update replaced this operation", nil)
 			}
 			return retryTask(err, "durability_scan_failed")
 		}
-		if candidate == nil {
+		if len(candidates) == 0 {
 			return taskengine.Complete("Bucket storage policy applied", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.CacheEvictions.CompleteBucketDurability(ctx, input.BucketID, input.Generation, execution.ID())
 			})
 		}
 		return taskengine.Wait(model.TaskResumeModeExecute, "more_work", "Applying bucket storage policy", func(ctx context.Context, repos *repository.Repositories) error {
+			if err := repos.Buckets.LockByID(ctx, input.BucketID); err != nil {
+				return err
+			}
+			candidates, err := repos.CacheEvictions.ListBucketDurabilityCandidates(ctx, input.BucketID, input.Generation, execution.ID(), 100)
+			if err != nil {
+				return err
+			}
 			if h.deps.EvictionPolicy != cache.EvictionPolicyAfterUpload {
 				return nil
 			}
 			if h.deps.Scheduler == nil {
 				return errors.New("task service is unavailable")
 			}
-			_, err := enqueueEviction(ctx, repos, h.deps.Scheduler, candidate.ID, nil)
-			return err
+			for _, candidate := range candidates {
+				if _, err := enqueueEviction(ctx, repos, h.deps.Scheduler, candidate.ID, nil); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	}
 	return taskengine.NewFuncHandler(definition, run, run)

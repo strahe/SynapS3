@@ -345,7 +345,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	}
 	if invocationCtx.Err() != nil && parent.Err() == nil && leaseSafe.Load() && (result.kind == resultWait || result.kind == resultInvalid) {
 		// Preserve observed terminal results and evidence returned by the handler.
-		result = RetryBackoff(invocationCtx.Err(), "invocation_timeout", result.settlement).WithRetrySettlements(result.onRetry, result.onExhausted)
+		result = Retry(invocationCtx.Err(), "invocation_timeout", result.settlement).WithRetrySettlements(result.onRetry, result.onExhausted)
 	}
 	if parent.Err() != nil || !leaseSafe.Load() {
 		logger.Warn("task result discarded because the lease is uncertain")
@@ -570,6 +570,10 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.Status = model.TaskStatusPending
 		transition.ResumeMode = result.resumeMode
 		transition.AvailableAt = now.Add(e.config.PollInterval)
+		if result.observationWait {
+			definition, _ := e.registry.Definition(claimed.Type)
+			transition.AvailableAt = now.Add(definition.Policy.ObservationInterval)
+		}
 		if result.waitUntil != nil {
 			transition.AvailableAt = *result.waitUntil
 			if transition.AvailableAt.Before(now) {

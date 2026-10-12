@@ -90,7 +90,7 @@ func pressureActive(reader PressureReader) bool {
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

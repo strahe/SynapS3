@@ -287,7 +287,7 @@ func (h *StoreHandler) storePiece(
 		return taskengine.Fail(err, "store_result_invalid", nil)
 	}
 	progress.Flush(content.ContentSize, true)
-	return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for storage transfer", nil)
+	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for storage transfer", nil)
 }
 
 func (h *StoreHandler) recoverStore(
@@ -362,7 +362,7 @@ func (h *StoreHandler) waitForStoreStatus(ctx context.Context, execution taskeng
 	if window > 0 && time.Since(startedAt) >= window {
 		return taskengine.Fail(fmt.Errorf("storage provider still reports %s", state), "store_processing_timeout", nil)
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
+	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
 }
 
 func (h *StoreHandler) retryStoreNotStarted(_ taskengine.Execution, err error) taskengine.Result {

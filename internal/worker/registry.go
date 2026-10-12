@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 )
@@ -37,6 +38,9 @@ func (r *Registry) Register(handler Handler) error {
 	}
 	definition := handler.Definition()
 	definition.Policy = definition.Policy.clone()
+	if definition.Policy.ObservationInterval == 0 {
+		definition.Policy.ObservationInterval = 30 * time.Second
+	}
 	if err := definition.validate(); err != nil {
 		return err
 	}

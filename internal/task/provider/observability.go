@@ -63,5 +63,5 @@ func (h *ObservabilityHandler) newHandler() *taskengine.FuncHandler {
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }

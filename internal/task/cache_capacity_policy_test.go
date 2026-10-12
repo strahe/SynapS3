@@ -34,7 +34,7 @@ func TestCacheCapacityIdleChecksKeepOneRound(t *testing.T) {
 		current := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool {
 			return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "scheduled" && row.ClaimGeneration > generation
 		})
-		if current.FinishedAt != nil || current.RetryCount != 0 || current.ResumeMode != model.TaskResumeModeExecute || !current.AvailableAt.After(time.Now().Add(4*time.Second)) {
+		if current.FinishedAt != nil || current.RetryCount != 0 || current.ResumeMode != model.TaskResumeModeExecute || current.AvailableAt.Sub(current.UpdatedAt) > handlerTestPollInterval {
 			t.Fatalf("idle capacity round = %#v", current)
 		}
 		generation = current.ClaimGeneration
@@ -261,10 +261,14 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, Cache: runtime.cache, CacheGate: runtime.gate, CacheTracker: runtime.tracker, Storage: runtime.storage, EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent, DefaultCopies: 1, Logger: slog.Default()}); err != nil {
+	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, Cache: runtime.cache, CacheGate: runtime.gate, CacheTracker: runtime.tracker, Storage: runtime.storage, EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent, CommitSealOnCachePressure: options.commitSealOnCachePressure, DefaultCopies: 1, Logger: slog.Default()}); err != nil {
 		t.Fatal(err)
 	}
-	schedule := taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}
+	interval := 5 * time.Second
+	if options.policy == cache.EvictionPolicyNone || options.policy == cache.EvictionPolicyAfterUpload && !options.commitSealOnCachePressure {
+		interval = time.Hour
+	}
+	schedule := taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: interval}
 	if err := registry.RegisterSchedule(schedule); err != nil {
 		t.Fatal(err)
 	}

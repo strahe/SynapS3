@@ -38,6 +38,7 @@ type EventPublisher interface {
 
 type Dependencies struct {
 	Repositories           *repository.Repositories
+	DecorateTaskHandler    func(taskengine.Handler) taskengine.Handler
 	Events                 EventPublisher
 	Cache                  cache.Cache
 	CacheGate              *cacheaccess.Gate
@@ -280,6 +281,9 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 		return points, fmt.Errorf("constructing speed: %w", err)
 	}
 	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
+		if deps.DecorateTaskHandler != nil {
+			handler = deps.DecorateTaskHandler(handler)
+		}
 		if err := registry.Register(handler); err != nil {
 			return points, err
 		}

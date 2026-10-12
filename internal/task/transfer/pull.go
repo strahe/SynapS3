@@ -259,7 +259,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		if !checkpoint.NextRequestAt.IsZero() {
 			return taskengine.WaitUntil(model.TaskResumeModeRecover, checkpoint.NextRequestAt, storagepull.WaitQueueFull, "Waiting for the provider to accept storage transfers", nil)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, storagepull.WaitQueueFull, "Waiting for the provider to accept storage transfers", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, storagepull.WaitQueueFull, "Waiting for the provider to accept storage transfers", nil)
 	}
 	if err != nil {
 		if synapse.ClassifyPullError(err) == synapse.PullErrorTerminal {
@@ -279,7 +279,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 	}
 	switch status {
 	case storage.PullStatusPending, storage.PullStatusInProgress, storage.PullStatusRetrying:
-		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
 	case storage.PullStatusFailed:
 		return h.failConfirmedPull(ctx, execution, input, copyRow, attempt, pdp.ErrPullFailed)
 	case storage.PullStatusComplete:
@@ -308,7 +308,7 @@ func (h *PullHandler) observePullPiece(
 	}
 	switch state {
 	case synapse.ParkedPieceProcessing:
-		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
 	case synapse.ParkedPieceMissing:
 		if reportedComplete {
 			return h.failConfirmedPull(ctx, execution, input, copyRow, attempt, errors.New("provider no longer has the completed pull piece"))

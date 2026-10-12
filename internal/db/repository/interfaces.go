@@ -494,17 +494,9 @@ type StorageContentRepository interface {
 	// create request before sending, under the expected ensure fence. The ID
 	// never changes later.
 	RecordDataSetClientID(ctx context.Context, id, ensureTaskID int64, clientDataSetID types.OnChainID) error
-	// RecordDataSetCreationRejection retains refusal evidence under the same
-	// generation, request identity, and ensure fence as the failed settlement.
-	RecordDataSetCreationRejection(ctx context.Context, id, generation, ensureTaskID int64, evidence model.DataSetCreationRejection) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
 	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
-	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
-	// RetireRejectedDataSet ends a failed generation whose creation the chain
-	// refused, so its provider stops being reserved. The caller must have proof
-	// that no data set was created. Reports whether it was retired.
-	RetireRejectedDataSet(ctx context.Context, storageDataSetID int64) (bool, error)
 	CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, contentID int64, copyIndex int) (*model.StorageCopy, error)
 	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageCopy, error)
@@ -648,6 +640,10 @@ type StorageReplacementRepository interface {
 	// settlement with its engine claim; row count is independent of bucket history.
 	Activate(ctx context.Context, replacementID, generation, taskID int64) error
 	SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (inserted int, done bool, err error)
+	LockCoordinatorProgress(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
+	LockCoordinatorTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
+	ListPendingReplacementItemsAfter(ctx context.Context, replacementID, afterID int64, limit int) ([]storagereplacement.Item, error)
+	AcquireItemsForCoordinator(ctx context.Context, replacementID, generation, taskID, afterID int64, limit int) (ReplacementItemBatch, error)
 	NextPendingReplacementItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error)
 	MarkReplacementItemCopied(ctx context.Context, replacementID, itemID, targetCopyID int64) error
 	MarkReplacementItemCancelled(ctx context.Context, replacementID, itemID int64) error
@@ -655,6 +651,7 @@ type StorageReplacementRepository interface {
 	ReplacementExecution(ctx context.Context, replacementID int64) (storagereplacement.ExecutionSnapshot, error)
 	ReplacementProgresses(ctx context.Context, replacementIDs []int64) (map[int64]storagereplacement.ProgressSnapshot, error)
 	AcquireItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
+	InspectItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
 	AttachTargetCopy(ctx context.Context, input AttachReplacementTargetCopyInput) (*model.StorageCopy, error)
 
 	MarkMigrating(ctx context.Context, replacementID int64) error
@@ -742,6 +739,12 @@ type ReplacementItemSnapshot struct {
 	Target      model.StorageDataSet
 	Upload      model.StorageContent
 	Version     model.ObjectVersion
+}
+
+type ReplacementItemBatch struct {
+	Items      []ReplacementItemSnapshot
+	LastItemID int64
+	Scanned    int
 }
 
 type AttachReplacementTargetCopyInput struct {

@@ -101,11 +101,8 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 		}
 		if h.deps.EvictionPolicy == cache.EvictionPolicyNone ||
 			(h.deps.EvictionPolicy == cache.EvictionPolicyAfterUpload && !h.deps.CommitSealOnCachePressure) {
-			if checkpoint.PreviousCycleFailed {
-				checkpoint.PreviousCycleFailed = false
-				return completeCapacityCycle(execution, checkpoint, "Automatic cache cleanup is disabled")
-			}
-			return taskengine.Wait(model.TaskResumeModeExecute, "scheduled", "Automatic cache cleanup is disabled", nil)
+			checkpoint.PreviousCycleFailed = false
+			return completeCapacityCycle(execution, checkpoint, "Automatic cache cleanup is disabled")
 		}
 		if h.deps.Cache == nil || h.deps.CacheTracker == nil || h.deps.Scheduler == nil || h.deps.MaxCacheBytes <= 0 {
 			return taskengine.Fail(errors.New("cache capacity dependencies are unavailable"), "dependency_unavailable", nil)
@@ -169,7 +166,7 @@ func (h *CapacityHandler) newHandler() *taskengine.FuncHandler {
 			}
 		}
 		if len(failedTasks) > 0 {
-			return taskengine.RetryBackoff(errors.New("cache cleanup work failed"), "cache_cleanup_retry", nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+			return taskengine.Retry(errors.New("cache cleanup work failed"), "cache_cleanup_retry", nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
 				for _, id := range failedTasks {
 					if _, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, id, availableAt); err != nil {
 						return err
@@ -310,7 +307,7 @@ func (h *CapacityHandler) updateCachePressure(ctx context.Context, targetBytes i
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

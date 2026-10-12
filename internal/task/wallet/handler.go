@@ -161,7 +161,7 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 		})
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", nil)
+	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", nil)
 }
 
 func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengine.Execution) (result taskengine.Result) {
@@ -201,7 +201,7 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		})
 	}
 	if h.deps.Receipts == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkSubmitted(ctx, op.ID, execution.ID(), txHash)
 		})
 	}
@@ -215,7 +215,7 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 		return taskengine.RetryInMode(synapse.SummarizedError(err), "transaction_confirmation", model.TaskResumeModeRecover, markSubmitted)
 	}
 	if err != nil || receipt == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "transaction_confirmation", "Waiting for wallet transaction", markSubmitted)
 	}
 	if receipt.Status == ethtypes.ReceiptStatusSuccessful {
 		return taskengine.Complete("Wallet transaction confirmed", func(ctx context.Context, repos *repository.Repositories) error {
@@ -285,7 +285,7 @@ func broadcastWalletOperation(ctx context.Context, operator synapse.WalletOperat
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

@@ -225,17 +225,18 @@ type Settlement func(context.Context, *repository.Repositories) error
 
 // Result is a closed set constructed through the helpers below.
 type Result struct {
-	kind          ResultKind
-	waitUntil     *time.Time
-	resumeMode    model.TaskResumeMode
-	waitReason    string
-	failureReason string
-	err           error
-	message       string
-	settlement    Settlement
-	onRetry       RetrySettlement
-	onExhausted   Settlement
-	workStartedAt *time.Time
+	kind            ResultKind
+	waitUntil       *time.Time
+	observationWait bool
+	resumeMode      model.TaskResumeMode
+	waitReason      string
+	failureReason   string
+	err             error
+	message         string
+	settlement      Settlement
+	onRetry         RetrySettlement
+	onExhausted     Settlement
+	workStartedAt   *time.Time
 }
 
 // WithWorkStartedAt carries observed operation timing into fenced settlement.
@@ -259,6 +260,12 @@ func Wait(mode model.TaskResumeMode, reason, message string, settlement Settleme
 	}
 }
 
+func WaitForObservation(mode model.TaskResumeMode, reason, message string, settlement Settlement) Result {
+	r := Wait(mode, reason, message, settlement)
+	r.observationWait = true
+	return r
+}
+
 func WaitUntil(mode model.TaskResumeMode, until time.Time, reason, message string, settlement Settlement) Result {
 	r := Wait(mode, reason, message, settlement)
 	until = until.UTC()
@@ -271,11 +278,6 @@ func Retry(err error, failureReason string, settlement Settlement) Result {
 		kind: resultRetry, resumeMode: model.TaskResumeModeRecover,
 		failureReason: failureReason, err: err, settlement: settlement,
 	}
-}
-
-// RetryBackoff retries with the engine's bounded exponential backoff.
-func RetryBackoff(err error, failureReason string, settlement Settlement) Result {
-	return Retry(err, failureReason, settlement)
 }
 
 func Fail(err error, failureReason string, settlement Settlement) Result {
@@ -385,7 +387,7 @@ func (r Result) WithRetrySettlements(onRetry RetrySettlement, onExhausted Settle
 
 func (r Result) WithResumeMode(mode model.TaskResumeMode) Result { r.resumeMode = mode; return r }
 func RetryInMode(err error, reason string, mode model.TaskResumeMode, settlement Settlement) Result {
-	return RetryBackoff(err, reason, settlement).WithResumeMode(mode)
+	return Retry(err, reason, settlement).WithResumeMode(mode)
 }
 
 func CompleteCycle(message string, settlement Settlement) Result {

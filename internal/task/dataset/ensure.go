@@ -41,7 +41,7 @@ type dataSetCreationCheckpoint struct {
 	Identity *storage.ContextIdentity `json:"identity,omitempty"`
 	// Sends counts admitted requests carrying ClientDataSetID.
 	Sends             int                       `json:"sends,omitempty"`
-	NextResendAt      time.Time                 `json:"next_resend_at,omitempty"`
+	NextResendAt      time.Time                 `json:"next_resend_at,omitzero"`
 	ProviderRejection *dataSetProviderRejection `json:"provider_rejection,omitempty"`
 }
 
@@ -81,7 +81,8 @@ func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagepipeline.DataSetInput) (int64, int64) { return input.DataSetID, 0 }),
 		Policy: taskengine.ExecutionPolicy{
 			MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(),
-			ResendBackoff: &taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
+			ObservationWindow: 30 * time.Minute,
+			ResendBackoff:     &taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
 		}, AllowRetry: true,
 		CanManualRetry: func(task *model.Task) bool {
 			if task == nil || task.FailureReason == nil {
@@ -392,6 +393,10 @@ func (h *EnsureHandler) waitDataSetCreation(
 	checkpoint dataSetCreationCheckpoint,
 	clientDataSetID sdktypes.BigInt,
 ) taskengine.Result {
+	startedAt, err := execution.ObserveOperation(ctx, fmt.Sprintf("ensure:%d", binding.ID))
+	if err != nil {
+		return retryTask(err, "dataset_observation_failed")
+	}
 	result, err := provider.WaitForDataSetCreated(ctx, checkpoint.StatusURL, clientDataSetID)
 	if errors.Is(err, synapse.ErrProviderTransactionRejected) {
 		ref, found, lookupErr := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
@@ -443,6 +448,9 @@ func (h *EnsureHandler) waitDataSetCreation(
 		return retryTask(err, "provider_confirmation")
 	}
 	if result == nil {
+		if time.Since(startedAt) < execution.Policy().ObservationWindow {
+			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set confirmation", nil)
+		}
 		return retryTask(errors.New("data set creation is awaiting confirmation"), "provider_confirmation")
 	}
 	dataSetID, createdClientID, err := bindings.DataSetResultIDs(binding, result)
@@ -488,7 +496,7 @@ func (h *EnsureHandler) finishDataSetEnsure(ctx context.Context, repos *reposito
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

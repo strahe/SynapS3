@@ -193,7 +193,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			continue
 		}
 		if state.Queued {
-			return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
+			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
 		}
 		previousHash := ""
 		if copyRow.DeleteTxHash != nil {
@@ -273,7 +273,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			}
 			return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, nil)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}
 	return h.finishStorageCleanup(ctx, execution, input)
 }
@@ -325,7 +325,7 @@ func waitForStorageCleanupOutcome(ctx context.Context, execution taskengine.Exec
 			return repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, message)
 		})
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", waitingMessage, nil)
+	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", waitingMessage, nil)
 }
 
 // finishStorageCleanup releases the content's cached bytes and then deletes its
@@ -365,7 +365,7 @@ func (h *Handler) finishStorageCleanup(ctx context.Context, execution taskengine
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

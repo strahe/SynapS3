@@ -37,7 +37,7 @@ After a restart, unfinished work becomes eligible to continue automatically.
 
 - Use **Retry** for a stopped task. The task list shows whether its result permits retry; opening details checks the current conditions. If another operation has taken over or recovery is unsafe, Retry explains why and refreshes the list.
 - Recover provider replacements from the bucket's **Storage** tab.
-- When a bucket's initial data set setup is **Failed**, use **Retry** to continue with the same provider or choose another provider from **Storage**. Replacement is unavailable while setup is running. A request that completes after replacement can leave an unused data set and incur creation charges.
+- When data set setup is **Failed**, use **Retry** from **Tasks** to continue with the same provider or choose another provider from **Storage**. This also applies to a replacement provider whose data set is not ready. Replacement is unavailable while setup is running. A request that completes after replacement can leave an unused data set and incur creation charges.
 - A storage transfer task that stopped because of an internal error stays retryable. Retry checks what the earlier attempt already did before continuing.
 - A wallet operation can be retried from Tasks when no broadcast started, or when it stopped because of an internal error. Retry checks the operation first: it sends the transaction only if none was ever broadcast, and otherwise checks the transaction already sent. If a broadcast may have gone out without a recorded transaction, the operation is marked unknown and cannot be retried.
 - **Retry** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.

@@ -364,7 +364,7 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 	now := time.Now()
 	row := enqueueTestTask(t, harness, "backoff")
 	row.RetryCount = 3
-	transition := harness.engine.transitionFor(row, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
+	transition := harness.engine.transitionFor(row, Retry(errors.New("temporary"), "temporary_failure", nil))
 	if transition.Status != model.TaskStatusPending || !transition.IncrementRetry {
 		t.Fatalf("transition = %#v, want pending retry", transition)
 	}
@@ -411,14 +411,19 @@ func TestResendAtRequiresDeclaredDeterministicPolicy(t *testing.T) {
 }
 
 func TestWaitUsesPollIntervalAndAbsoluteDeadline(t *testing.T) {
-	engine := &Engine{config: EngineConfig{PollInterval: 17 * time.Second}}
-	row := &model.Task{}
+	registry := NewRegistry()
+	if err := registry.Register(scriptedHandler{definition: testDefinition(nil, true)}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{config: EngineConfig{PollInterval: 17 * time.Second}, registry: registry}
+	row := &model.Task{Type: testTaskType}
 	deadline := time.Now().Add(time.Hour)
 	for _, test := range []struct {
 		name     string
 		result   Result
 		deadline time.Time
-	}{{"poll", Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil), time.Time{}}, {"deadline", WaitUntil(model.TaskResumeModeRecover, deadline, "protocol", "Waiting", nil), deadline}} {
+		delay    time.Duration
+	}{{"poll", Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil), time.Time{}, 17 * time.Second}, {"observation", WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting", nil), time.Time{}, 30 * time.Second}, {"deadline", WaitUntil(model.TaskResumeModeRecover, deadline, "protocol", "Waiting", nil), deadline, 0}} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Now()
 			transition := engine.transitionFor(row, test.result)
@@ -429,13 +434,51 @@ func TestWaitUsesPollIntervalAndAbsoluteDeadline(t *testing.T) {
 				if !transition.AvailableAt.Equal(test.deadline) {
 					t.Fatalf("wait deadline = %s, want %s", transition.AvailableAt, test.deadline)
 				}
-			} else if transition.AvailableAt.Before(now.Add(17*time.Second)) || transition.AvailableAt.After(time.Now().Add(17*time.Second)) {
-				t.Fatalf("poll deadline = %s", transition.AvailableAt)
+			} else if transition.AvailableAt.Before(now.Add(test.delay)) || transition.AvailableAt.After(time.Now().Add(test.delay)) {
+				t.Fatalf("%s deadline = %s", test.name, transition.AvailableAt)
 			}
 		})
 	}
 	if err := validateResult(WaitUntil(model.TaskResumeModeRecover, time.Time{}, "protocol", "Waiting", nil), nil); !errors.Is(err, ErrInvalidResult) {
 		t.Fatalf("zero wait deadline error = %v", err)
+	}
+}
+
+func TestRegistryResolvesObservationInterval(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval time.Duration
+		want     time.Duration
+		invalid  bool
+	}{
+		{name: "default", want: 30 * time.Second},
+		{name: "explicit", interval: 11 * time.Second, want: 11 * time.Second},
+		{name: "negative", interval: -time.Second, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			definition := testDefinition(nil, true)
+			definition.Policy.ObservationInterval = tc.interval
+			registry := NewRegistry()
+			err := registry.Register(scriptedHandler{definition: definition})
+			if tc.invalid {
+				if !errors.Is(err, ErrInvalidPolicy) {
+					t.Fatalf("negative interval: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			registered, ok := registry.Definition(testTaskType)
+			if !ok || registered.Policy.ObservationInterval != tc.want || definition.Policy.ObservationInterval != tc.interval {
+				t.Fatalf("registered policy=%#v input=%#v", registered.Policy, definition.Policy)
+			}
+			registered.Policy.ObservationInterval = time.Hour
+			again, _ := registry.Definition(testTaskType)
+			if again.Policy.ObservationInterval != tc.want {
+				t.Fatal("returned policy changed registry")
+			}
+		})
 	}
 }
 

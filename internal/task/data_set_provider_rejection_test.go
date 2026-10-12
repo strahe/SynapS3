@@ -145,18 +145,23 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 					}
 				})
 			}
-			cancel, done := runHandlerEngine(t, runtime)
-			stopped := false
-			defer func() {
-				if !stopped {
-					stopHandlerEngine(t, cancel, done)
+			var terminal *model.Task
+			if tc.pending && !tc.failEvidence {
+				waiting := runOneStorageTask(t, runtime, fixture.ensureTask, model.TaskStatusPending)
+				if waiting.RetryCount != 0 || confirmations.Load() != 1 || creates.Load() != 1 {
+					t.Fatalf("submitted creation consumed its confirmation budget: task=%#v creates=%d confirmations=%d", waiting, creates.Load(), confirmations.Load())
 				}
-			}()
-			terminal := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusFailed
-			})
-			stopHandlerEngine(t, cancel, done)
-			stopped = true
+				waiting = setDataSetConfirmationStart(t, runtime, waiting, time.Now().UTC().Add(-31*time.Minute))
+				terminal = runStorageTaskClaims(t, runtime, waiting, model.TaskStatusFailed, int64(budget))
+			} else {
+				terminal = func() *model.Task {
+					cancel, done := runHandlerEngine(t, runtime)
+					defer stopHandlerEngine(t, cancel, done)
+					return waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
+						return task.Status == model.TaskStatusFailed
+					})
+				}()
+			}
 			binding, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
 			expectedCreates := int64(budget)
 			expectedRetries, expectedReason := budget-1, "attempts_exhausted"
@@ -172,8 +177,14 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 			if err != nil || terminal.FailureReason == nil || *terminal.FailureReason != expectedReason || terminal.RetryCount != expectedRetries || creates.Load() != expectedCreates {
 				t.Fatalf("creation outcome: failure=%v retries=%d calls=%d err=%v", terminal.FailureReason, terminal.RetryCount, creates.Load(), err)
 			}
-			if tc.pending && !tc.failEvidence && confirmations.Load() != int64(budget) {
-				t.Fatalf("confirmation attempts=%d, want %d", confirmations.Load(), budget)
+			if tc.pending && !tc.failEvidence && confirmations.Load() != int64(budget+1) {
+				t.Fatalf("confirmation attempts=%d, want one observation plus %d expired opportunities", confirmations.Load(), budget)
+			}
+			if tc.pending && !tc.failEvidence {
+				var operation model.TaskRuntime
+				if err := json.Unmarshal(terminal.Runtime, &operation); err != nil || operation.OperationStartedAt == nil || time.Since(*operation.OperationStartedAt) < 31*time.Minute {
+					t.Fatalf("automatic retries extended the confirmation window: runtime=%#v err=%v", operation, err)
+				}
 			}
 			if tc.failEvidence && (confirmations.Load() != 0 || binding.CreateTransactionID == nil || *binding.CreateTransactionID != "0xpending" || binding.CreateStatusURL == nil) {
 				t.Fatalf("submission facts lost at exhaustion: binding=%#v confirmations=%d", binding, confirmations.Load())
