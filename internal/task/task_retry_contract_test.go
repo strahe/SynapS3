@@ -114,7 +114,8 @@ func TestManualPullRetryPreservesEarliestRequestTime(t *testing.T) {
 	}
 	runtime.testMaxAttempts = nil
 	waiting := runOneStorageTask(t, runtime, child, model.TaskStatusPending)
-	if calls.Load() != 1 || waiting.RetryCount != 0 || waiting.AvailableAt.Before(checkpoint.NextRequestAt) || handlerTaskMaxAttempts(t, runtime, waiting) != 12 {
+	deadline := checkpoint.NextRequestAt.Truncate(time.Microsecond)
+	if calls.Load() != 1 || waiting.RetryCount != 0 || waiting.AvailableAt.Before(deadline) || handlerTaskMaxAttempts(t, runtime, waiting) != 12 {
 		t.Fatalf("manual recovery bypassed provider delay: calls=%d task=%#v", calls.Load(), waiting)
 	}
 }

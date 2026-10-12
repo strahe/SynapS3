@@ -901,7 +901,18 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 3, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
+			retryAt := make(chan time.Time, 1)
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+				Concurrency: 3, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+				OnTaskSettled: func(row *model.Task, transition repository.TaskTransition) {
+					if row.ID == *original.TaskID && transition.IncrementRetry {
+						select {
+						case retryAt <- transition.AvailableAt:
+						default:
+						}
+					}
+				},
+			}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -926,9 +937,19 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("lease_until = ?", time.Now().Add(-time.Second)).Where("id = ? AND claim_generation = ?", commitClaim.ID, commitClaim.ClaimGeneration).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			retried := waitForCopy(t, runtime, copyRow.ID, func(row *model.StorageCopy) bool { return row.ActiveTaskID != nil })
+			var scheduledAt time.Time
+			select {
+			case scheduledAt = <-retryAt:
+			case <-time.After(3 * time.Second):
+				t.Fatal("Commit did not schedule member recovery")
+			}
+			stopHandlerEngine(t, cancel, done)
+			retried, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
+			if err != nil || retried.ActiveTaskID == nil {
+				t.Fatalf("Commit did not retain the recovery owner: %#v, %v", retried, err)
+			}
 			next, err := runtime.repos.Tasks.GetByID(t.Context(), *retried.ActiveTaskID)
-			if err != nil || next == nil || next.Type != model.TaskTypeStorageTransferPlan || !next.AvailableAt.After(time.Now().Add(time.Minute)) || retried.CommitRequestID == nil || *retried.CommitRequestID != original.RequestID || retried.CommitPosition == nil || *retried.CommitPosition != *released.CommitPosition || retried.WorkGeneration != released.WorkGeneration+1 {
+			if err != nil || next == nil || next.Type != model.TaskTypeStorageTransferPlan || !next.AvailableAt.Equal(scheduledAt.Truncate(time.Microsecond)) || retried.CommitRequestID == nil || *retried.CommitRequestID != original.RequestID || retried.CommitPosition == nil || *retried.CommitPosition != *released.CommitPosition || retried.WorkGeneration != released.WorkGeneration+1 {
 				t.Fatalf("Commit retry = %#v, %#v, %v", retried, next, err)
 			}
 			parent := waitForTask(t, runtime.repos, *original.TaskID, func(row *model.Task) bool {

@@ -312,39 +312,30 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 		TargetProviderID: onChainID(t, "303"), ClientRequestID: "target-creating-successor",
 	}
-	if _, _, err := repos.Replacements.Authorize(t.Context(), successor); !errors.Is(err, storagereplacement.ErrActiveReplacement) {
-		t.Fatalf("Authorize(successor) error = %v, want ErrActiveReplacement", err)
+	if _, _, err := repos.Replacements.Authorize(t.Context(), successor); !errors.Is(err, storagereplacement.ErrTargetCreating) {
+		t.Fatalf("Authorize(successor) error = %v, want ErrTargetCreating", err)
 	}
 	if kept, err := repos.Replacements.GetByID(t.Context(), first.ID); err != nil || kept.Status == storagereplacement.StatusSuperseded {
 		t.Fatalf("first replacement = %#v err=%v, want it still in charge of its target", kept, err)
 	}
 
-	if err := repos.Contents.CompleteDataSetEnsureTask(t.Context(), first.TargetDataSetID, ensureTask.ID); err != nil {
-		t.Fatalf("release target ensure: %v", err)
-	}
-	if err := repos.Replacements.MarkFailed(t.Context(), first.ID, nil, "setup stopped"); err != nil {
-		t.Fatal(err)
-	}
+	failLocalEnsure(t, db, ensureTask)
 	if _, created, err := repos.Replacements.Authorize(t.Context(), successor); err != nil || !created {
-		t.Fatalf("Authorize(successor after creation) created=%v err=%v", created, err)
+		t.Fatalf("Authorize(successor after failed initialization) created=%v err=%v", created, err)
 	}
 	if superseded, err := repos.Replacements.GetByID(t.Context(), first.ID); err != nil || superseded.Status != storagereplacement.StatusSuperseded {
 		t.Fatalf("first replacement = %#v err=%v, want it superseded", superseded, err)
 	}
 }
 
-// TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent checks that a
-// creation fence left behind by a dead task holds the replica slot only while
-// the target row shows a request that may have reached the chain.
-func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) {
+func TestAuthorizeReplacementAllowsFailedInitializationWithRequestEvidence(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
 		bucket   string
 		recordID bool
-		blocked  bool
 	}{
-		{name: "nothing was sent", bucket: "replacement-dead-fence-unsent", recordID: false, blocked: false},
-		{name: "a request may have gone out", bucket: "replacement-dead-fence-sent", recordID: true, blocked: true},
+		{name: "nothing was sent", bucket: "replacement-dead-fence-unsent", recordID: false},
+		{name: "a request may have gone out", bucket: "replacement-dead-fence-sent", recordID: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			db := testDB(t)
@@ -396,12 +387,6 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 				TargetProviderID: onChainID(t, "303"), ClientRequestID: "dead-fence-successor",
 			}
 			_, created, err := repos.Replacements.Authorize(ctx, successor)
-			if tt.blocked {
-				if !errors.Is(err, storagereplacement.ErrTargetCreating) {
-					t.Fatalf("Authorize(successor) error = %v, want ErrTargetCreating", err)
-				}
-				return
-			}
 			if err != nil || !created {
 				t.Fatalf("Authorize(successor) created=%v err=%v, want the slot released", created, err)
 			}
@@ -410,6 +395,9 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 			abandoned, err := repos.Contents.GetDataSetBindingByID(ctx, first.TargetDataSetID)
 			if err != nil || abandoned == nil || abandoned.Status != model.StorageDataSetStatusRetired || abandoned.EnsureTaskID != nil {
 				t.Fatalf("earlier target = %#v err=%v, want it retired with its creation fence released", abandoned, err)
+			}
+			if tt.recordID && (abandoned.ClientDataSetID == nil || !abandoned.ClientDataSetID.Equal(onChainID(t, "909"))) {
+				t.Fatalf("abandoned target lost request evidence: %#v", abandoned)
 			}
 			if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, first.TargetDataSetID, ensureTask.ID); !errors.Is(err, repository.ErrConflict) {
 				t.Fatalf("authorizing the dead creation task error = %v, want ErrConflict", err)

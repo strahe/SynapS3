@@ -549,11 +549,16 @@ func TestSafeCleanupKeepsCollectionWindowAndManualSealIgnoresPolicy(t *testing.T
 			cancel, done := runHandlerEngine(t, f.runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			waiting := waitForTask(t, f.runtime.repos, planner.ID, func(task *model.Task) bool {
-				return task.ClaimGeneration > 0 && task.Status == model.TaskStatusPending &&
-					(policy == cache.EvictionPolicyLRU || (task.WaitReason != nil && *task.WaitReason == "scheduled"))
+				if task.ClaimGeneration == 0 {
+					return false
+				}
+				if policy == cache.EvictionPolicyNone {
+					return task.Status == model.TaskStatusCompleted
+				}
+				return task.Status == model.TaskStatusPending
 			})
-			if policy == cache.EvictionPolicyNone && (waiting.FinishedAt != nil || waiting.RetryCount != 0) {
-				t.Fatalf("disabled cleanup completed or spent its failure budget: %#v", waiting)
+			if policy == cache.EvictionPolicyNone && (waiting.FinishedAt == nil || waiting.RetryCount != 0) {
+				t.Fatalf("disabled cleanup did not complete its healthy cycle: %#v", waiting)
 			}
 			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.WaitReason != nil && *task.WaitReason == "collecting" })
 			if f.request(t, requestID).Status != storagecommit.RequestStatusCollecting {

@@ -469,6 +469,8 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 		t.Fatalf("source copies: %#v %v", copies, err)
 	}
 	oldCopyTask := bindCopyTask(t, runtime, &copies[0], model.TaskTypeStorageTransferPlan)
+	reason := "attempts_exhausted"
+	settleHandlerTaskFixture(t, runtime, fixture.ensureTask.ID, model.TaskStatusFailed, &reason)
 	row, _, err := runtime.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: fixture.binding.BucketID, SourceDataSetID: fixture.binding.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: testOnChainID(t, 202), ClientRequestID: "recover"})
 	if err != nil {
 		t.Fatal(err)
@@ -482,6 +484,7 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	coordinator = runStorageTaskClaims(t, runtime, coordinator, model.TaskStatusPending, 2)
 	settled := make(chan struct{}, 1)
 	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
@@ -499,7 +502,10 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	}
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCancelled })
+	failedSource, err := runtime.repos.Tasks.GetByID(t.Context(), fixture.ensureTask.ID)
+	if err != nil || failedSource.Status != model.TaskStatusFailed || failedSource.FailureReason == nil || *failedSource.FailureReason != reason {
+		t.Fatalf("source creation failure evidence = %#v, %v", failedSource, err)
+	}
 	waitForTask(t, runtime.repos, oldCopyTask.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCancelled })
 	waitCtx, cancelWait := context.WithTimeout(t.Context(), 2*handlerTestLeaseDuration)
 	defer cancelWait()

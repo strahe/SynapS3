@@ -478,7 +478,7 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	}
 }
 
-func TestAPITaskRetryCandidatesKeepDomainValidationAtDetailsAndAction(t *testing.T) {
+func TestAPITaskRetryEligibilityMatchesListDetailsAndAction(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		err          error
@@ -507,15 +507,17 @@ func TestAPITaskRetryCandidatesKeepDomainValidationAtDetailsAndAction(t *testing
 			f.transition(t, source.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
 			path := "/api/v1/tasks/" + strconv.FormatInt(source.ID, 10)
 			for _, endpoint := range []string{"/api/v1/tasks", path + "/history"} {
+				beforeInspections := inspections
 				rr := f.request(http.MethodGet, endpoint, nil)
 				var page taskListResponse
 				decodeJSON(t, rr, &page)
-				if rr.Code != http.StatusOK || len(page.Tasks) != 1 || !page.Tasks[0].Retryable || inspections != 0 {
-					t.Fatalf("candidate list %s = %d %s, inspections=%d", endpoint, rr.Code, rr.Body.String(), inspections)
+				if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].Retryable || page.Tasks[0].RetryTaskID != nil || inspections <= beforeInspections || strings.Contains(rr.Body.String(), "private database diagnostics") {
+					t.Fatalf("retry list %s = %d %s, inspections=%d", endpoint, rr.Code, rr.Body.String(), inspections)
 				}
 			}
+			beforeInspections := inspections
 			rr := f.request(http.MethodGet, path, nil)
-			if rr.Code != tc.detailStatus || inspections != 1 || strings.Contains(rr.Body.String(), "private database diagnostics") {
+			if rr.Code != tc.detailStatus || inspections <= beforeInspections || strings.Contains(rr.Body.String(), "private database diagnostics") {
 				t.Fatalf("details = %d %s, inspections=%d", rr.Code, rr.Body.String(), inspections)
 			}
 			if tc.reason != "" {

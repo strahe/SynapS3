@@ -89,6 +89,15 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	if waiting.WorkStartedAt == nil {
 		t.Fatal("Wait lost work start")
 	}
+	if _, err := h.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(time.Hour)).
+		Where("id = ? AND status = ?", waiting.ID, model.TaskStatusPending).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("schedule dependency wait: %v", err)
+	}
+	if woken, err := h.repos.Tasks.WakePending(t.Context(), []int64{waiting.ID}); err != nil || woken != 1 {
+		t.Fatalf("wake dependency wait: woken=%d err=%v", woken, err)
+	}
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	finished, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	if finished.Status != model.TaskStatusCompleted || !finished.WorkStartedAt.Equal(*waiting.WorkStartedAt) {
