@@ -77,7 +77,7 @@ func (h *CopyCoordinator) prepareCopyRetry(ctx context.Context, repos *repositor
 		return taskengine.RetryPreparation{
 			Request:    taskengine.EnqueueRequest{Type: source.Type, Input: source.Input},
 			Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover,
-			PreserveCancellation: true, Bind: transferCopyOwner,
+			Bind: transferCopyOwner,
 		}, nil
 	}
 	if h.deps.CacheGate == nil {

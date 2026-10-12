@@ -146,7 +146,7 @@ func TestFailForEngineTaskLeavesTheReplacementRetryable(t *testing.T) {
 			}
 			coordinator, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 				Type:         model.TaskTypeProviderReplacementCoordinate,
-				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: "engine-failed-coordinator",
+				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)),
 				SubjectType: "storage_replacement", SubjectKey: strconv.FormatInt(replacement.ID, 10),
 			}))
 			if err != nil {
@@ -300,7 +300,7 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 	}
 	ensureTask, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type:         model.TaskTypeStorageDataSetEnsure,
-		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)), InputHash: "target-creating-ensure",
+		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)),
 		SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(first.TargetDataSetID, 10),
 	}))
 	if err != nil {
@@ -368,7 +368,7 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 			}
 			ensureTask, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 				Type:         model.TaskTypeStorageDataSetEnsure,
-				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)), InputHash: "dead-fence-ensure",
+				InputVersion: 1, Input: []byte(fmt.Sprintf(`{"data_set_id":%d}`, first.TargetDataSetID)),
 				SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(first.TargetDataSetID, 10),
 			}))
 			if err != nil {

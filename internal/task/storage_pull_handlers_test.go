@@ -306,23 +306,21 @@ func (r *pullEvidenceFailureRepository) GetUnresolvedPullAttempt(ctx context.Con
 	return r.StorageContentRepository.GetUnresolvedPullAttempt(ctx, contentID, dataSetID)
 }
 
-func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
+func TestPullEvidenceFailuresPreserveRecovery(t *testing.T) {
 	for _, stage := range []string{"authorization", "attempt"} {
 		for _, attempted := range []bool{false, true} {
 			for _, exhausted := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/attempted=%v/exhausted=%v", stage, attempted, exhausted), func(t *testing.T) {
 					limit := 1
-					var calls, queries atomic.Int64
+					var calls atomic.Int64
 					runtime, pipeline, row := newPullTask(t, func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 						calls.Add(1)
 						return pullStatusResult(request, storage.PullStatusPending), nil
-					}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
-						queries.Add(1)
-						return synapse.ParkedPieceMissing, nil
-					}), &limit)
+					}, nil, &limit)
 					if attempted {
 						row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 					}
+					before := row
 					faults := &pullEvidenceFailureRepository{StorageContentRepository: runtime.repos.Contents, stage: stage}
 					failures := int64(1)
 					if exhausted {
@@ -330,170 +328,56 @@ func TestPullCancellationPreservesIntentAcrossEvidenceFailures(t *testing.T) {
 					}
 					faults.remaining.Store(failures)
 					runtime.repos.Contents = faults
-					if err := runtime.repos.Tasks.RequestCancellation(t.Context(), row.ID, "cancel pull"); err != nil {
-						t.Fatal(err)
-					}
+					wakeTask(t, runtime, row.ID)
 					row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-					if row.RetryCount != 1 || !row.CancellationRequested() || row.ResumeMode != model.TaskResumeModeRecover {
-						t.Fatalf("evidence failure did not retry cancellation: %#v", row)
+					if row.RetryCount != 1 || row.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(row.Checkpoint, before.Checkpoint) {
+						t.Fatalf("evidence failure changed recovery state: %#v", row)
 					}
 					if exhausted {
 						row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
 						if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" || !handlerTaskRetryable(t, runtime, row) {
-							t.Fatalf("blocked cancellation = %#v", row)
-						}
-						copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-						if err != nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.Status != model.StorageCopyStatusPending {
-							t.Fatalf("blocked cancellation lost its owner: %#v, %v", copyRow, err)
+							t.Fatalf("blocked recovery = %#v", row)
 						}
 						source := row
-						{
-							var retryErr error
-							row, retryErr = runtime.service.Retry(t.Context(), row.ID)
-							if retryErr != nil {
-								t.Fatal(retryErr)
-							}
+						var err error
+						row, err = runtime.service.Retry(t.Context(), source.ID)
+						if err != nil {
+							t.Fatal(err)
 						}
-						retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
-						if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" || !retried.CancellationRequestedAt.Equal(*source.CancellationRequestedAt) || retried.ID == source.ID || retried.RetryOfTaskID == nil || *retried.RetryOfTaskID != source.ID ||
-							retried.RetryCount != 0 || handlerTaskMaxAttempts(t, retried) != 12 || retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, source.Checkpoint) {
-							t.Fatalf("manual retry did not create an independent recovery round: %#v, %v", retried, err)
+						if row.ID == source.ID || row.RetryOfTaskID == nil || *row.RetryOfTaskID != source.ID ||
+							row.RetryCount != 0 || row.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(row.Checkpoint, source.Checkpoint) {
+							t.Fatalf("manual retry lost recovery evidence: %#v", row)
 						}
-						storedSource, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
-						if err != nil || storedSource.Status != model.TaskStatusFailed || !storedSource.CancellationRequested() || storedSource.RetryCount != source.RetryCount || storedSource.SupersededAt == nil {
-							t.Fatalf("retry changed the original cancelled execution: %#v, %v", storedSource, err)
+						stored, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
+						if err != nil || stored.Status != model.TaskStatusFailed || stored.RetryCount != source.RetryCount ||
+							stored.SupersededAt == nil || !bytes.Equal(stored.Checkpoint, source.Checkpoint) {
+							t.Fatalf("retry changed the original execution: %#v, %v", stored, err)
 						}
-						row = retried
 					}
 					wantCalls := int64(0)
 					if attempted {
 						wantCalls = 1
 					}
-					if calls.Load() != wantCalls || queries.Load() != 0 {
-						t.Fatalf("blocked recovery reached provider: calls=%d, queries=%d", calls.Load(), queries.Load())
+					if calls.Load() != wantCalls {
+						t.Fatalf("evidence failure reached provider: calls=%d, want=%d", calls.Load(), wantCalls)
 					}
-					if exhausted {
-						status := model.TaskStatusCancelled
-						if attempted {
-							status = model.TaskStatusFailed
-						}
-						row = runOneStorageTask(t, runtime, row, status)
-						if !row.CancellationRequested() || calls.Load() != wantCalls || (attempted && (queries.Load() != 1 || row.FailureReason == nil || *row.FailureReason != storagepull.FailureCancelOutcomeUnknown)) {
-							t.Fatalf("new recovery lost cancellation or repeated the transfer: cancellation=%v, calls=%d, queries=%d", row.CancellationRequested(), calls.Load(), queries.Load())
-						}
-						return
+					copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+					if err != nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.Status != model.StorageCopyStatusPending {
+						t.Fatalf("blocked recovery lost its owner: %#v, %v", copyRow, err)
 					}
-					status := model.TaskStatusCancelled
+					resumed := runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+					if !attempted && (resumed.ResumeMode != model.TaskResumeModeExecute || calls.Load() != 0) {
+						t.Fatalf("recovery sent a request without first returning to execute: %#v, calls=%d", resumed, calls.Load())
+					}
 					if attempted {
-						status = model.TaskStatusFailed
-					}
-					row = runOneStorageTask(t, runtime, row, status)
-					if !row.CancellationRequested() || calls.Load() != wantCalls || (attempted && (queries.Load() != 1 || row.FailureReason == nil || *row.FailureReason != storagepull.FailureCancelOutcomeUnknown)) {
-						t.Fatalf("recovered cancellation = %#v, calls=%d, queries=%d", row, calls.Load(), queries.Load())
+						attempt, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
+						if err != nil || attempt.ResolvedAt != nil || !bytes.Equal(resumed.Checkpoint, before.Checkpoint) {
+							t.Fatalf("resumed pull lost unresolved evidence: %#v, %v", attempt, err)
+						}
 					}
 				})
 			}
 		}
-	}
-}
-
-func TestPullCancellationPreservesUnresolvedOutcome(t *testing.T) {
-	for _, tt := range []struct {
-		name         string
-		attempted    bool
-		state        synapse.ParkedPieceState
-		queryError   bool
-		recoverReady bool
-		wantStatus   model.TaskStatus
-	}{
-		{name: "not attempted", wantStatus: model.TaskStatusCancelled},
-		{name: "ready", attempted: true, state: synapse.ParkedPieceReady, wantStatus: model.TaskStatusCompleted},
-		{name: "processing", attempted: true, state: synapse.ParkedPieceProcessing, wantStatus: model.TaskStatusFailed},
-		{name: "missing", attempted: true, state: synapse.ParkedPieceMissing, wantStatus: model.TaskStatusFailed},
-		{name: "query failed", attempted: true, queryError: true, wantStatus: model.TaskStatusFailed},
-		{name: "ready after retry", attempted: true, state: synapse.ParkedPieceMissing, recoverReady: true, wantStatus: model.TaskStatusFailed},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			limit := 1
-			var calls, queries atomic.Int64
-			runtime, pipeline, row := newPullTask(t, func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
-				calls.Add(1)
-				return nil, errors.Join(pdp.ErrPullQueueFull, &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour})
-			}, parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
-				if queries.Add(1) > 1 && tt.recoverReady {
-					return synapse.ParkedPieceReady, nil
-				}
-				if tt.queryError {
-					return "", errors.New("provider unavailable during cancellation")
-				}
-				return tt.state, nil
-			}), &limit)
-			if tt.attempted {
-				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-			}
-			if tt.state == synapse.ParkedPieceReady || tt.recoverReady {
-				version := &model.ObjectVersion{
-					VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID,
-					Key: "cancelled-ready-pull", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
-					ETag: "cancelled-ready-pull", ContentType: "application/octet-stream",
-				}
-				if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := runtime.repos.Tasks.RequestCancellation(t.Context(), row.ID, "cancel pull"); err != nil {
-				t.Fatal(err)
-			}
-			result := runOneStorageTask(t, runtime, row, tt.wantStatus)
-			wantCalls := int64(0)
-			if tt.attempted {
-				wantCalls = 1
-			}
-			if calls.Load() != wantCalls {
-				t.Fatalf("cancellation submitted %d requests, want %d", calls.Load(), wantCalls)
-			}
-			if tt.wantStatus != model.TaskStatusFailed {
-				if _, err := runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID); !errors.Is(err, repository.ErrNotFound) {
-					t.Fatalf("settled cancellation retains unresolved pull: %v", err)
-				}
-				return
-			}
-			if result.FailureReason == nil || *result.FailureReason != storagepull.FailureCancelOutcomeUnknown || !handlerTaskRetryable(t, runtime, result) {
-				t.Fatalf("cancelled outcome = %#v", result)
-			}
-			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
-			if err != nil || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != row.ID || copyRow.Status != model.StorageCopyStatusPending {
-				t.Fatalf("cancelled pull owner = %#v, %v", copyRow, err)
-			}
-			{
-				var retryErr error
-				row, retryErr = runtime.service.Retry(t.Context(), row.ID)
-				if retryErr != nil {
-					t.Fatal(retryErr)
-				}
-			}
-			retried, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
-			if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" || !retried.CancellationRequestedAt.Equal(*result.CancellationRequestedAt) || retried.RetryCount != 0 ||
-				retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, result.Checkpoint) {
-				t.Fatalf("cancelled pull retry = %#v, %v", retried, err)
-			}
-			recoveryStatus := model.TaskStatusFailed
-			if tt.recoverReady {
-				recoveryStatus = model.TaskStatusCompleted
-			}
-			afterRetry := runOneStorageTask(t, runtime, retried, recoveryStatus)
-			if !afterRetry.CancellationRequested() || calls.Load() != 1 || queries.Load() != 2 {
-				t.Fatalf("manual recovery lost cancellation or repeated POST: %#v, calls=%d", afterRetry, calls.Load())
-			}
-			_, err = runtime.repos.Contents.GetUnresolvedPullAttempt(t.Context(), pipeline.target.ContentID, pipeline.target.StorageDataSetID)
-			if tt.recoverReady {
-				if !errors.Is(err, repository.ErrNotFound) {
-					t.Fatalf("completed recovery retains unresolved pull: %v", err)
-				}
-			} else if err != nil || afterRetry.FailureReason == nil || *afterRetry.FailureReason != storagepull.FailureCancelOutcomeUnknown {
-				t.Fatalf("manual recovery lost pull evidence: task=%#v, error=%v", afterRetry, err)
-			}
-		})
 	}
 }
 
@@ -545,7 +429,7 @@ func TestPullWaitReleasesExecutionSlot(t *testing.T) {
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency:  1,
 				PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-			}, runtime.repos, runtime.registry, slog.Default())
+			}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -640,7 +524,7 @@ func TestPullCopiesJoinOneBatchWithIndependentAuthorizations(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, runtime.registry, slog.Default())
+	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,10 +625,10 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			prepareHandlerTaskFixtures(t, runtime)
+
 			limitedRepos := *runtime.repos
 			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &limitedRepos, runtime.registry, slog.Default())
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -845,10 +729,10 @@ func seedSealedReplacementBatch(t *testing.T, runtime handlerTestRuntime, member
 
 func runOneStorageTask(t *testing.T, runtime handlerTestRuntime, row *model.Task, status model.TaskStatus) *model.Task {
 	t.Helper()
-	prepareHandlerTaskFixtures(t, runtime)
+
 	repos := *runtime.repos
 	repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &repos, runtime.registry, slog.Default())
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1009,7 +893,7 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 3, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, runtime.registry, slog.Default())
+			engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 3, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}

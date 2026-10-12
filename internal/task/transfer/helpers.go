@@ -114,18 +114,11 @@ func retryPullDependency(execution taskengine.Execution, err error, reason strin
 }
 
 func retryPullOutcome(execution taskengine.Execution, err error, reason string) taskengine.Result {
-	if execution.CancellationRequested() {
-		return failPullOutcome(execution, err)
-	}
 	return retryTask(err, reason)
 }
 
 func failPullOutcome(execution taskengine.Execution, err error) taskengine.Result {
-	reason := storagepull.FailureOutcomeUnknown
-	if execution.CancellationRequested() {
-		reason = storagepull.FailureCancelOutcomeUnknown
-	}
-	return taskengine.Fail(err, reason, nil)
+	return taskengine.Fail(err, storagepull.FailureOutcomeUnknown, nil)
 }
 
 func pullAttemptRequest(attempt *storagepull.Attempt) (cid.Cid, []byte, error) {

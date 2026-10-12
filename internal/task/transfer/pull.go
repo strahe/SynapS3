@@ -53,9 +53,6 @@ func (h *PullHandler) recoverPullFromCache(ctx context.Context, execution tasken
 	if err != nil {
 		return retryPullDependency(execution, err, "replacement_load_failed"), true
 	}
-	if !migration && execution.CancellationRequested() {
-		return taskengine.Result{}, false
-	}
 	if !migration {
 		entry, err := h.CopyCoordinator.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, copyRow.ContentID)
 		if err != nil {
@@ -152,15 +149,6 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 	if attempt != nil && attempt.ResolvedAt != nil {
 		return failPullOutcome(execution, errors.New("pull attempt is already finished"))
 	}
-	if attempt == nil && execution.CancellationRequested() {
-		message := "Storage transfer cancelled"
-		if copyRow.CommitDecidedByRequest() {
-			return taskengine.Cancel(message, h.releaseMemberTransfer(execution, input, copyRow, message, ""))
-		}
-		return taskengine.Cancel(message, func(ctx context.Context, repos *repository.Repositories) error {
-			return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
-		})
-	}
 	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress && attempt == nil {
 		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Replica is ready for ingress")
 	}
@@ -224,7 +212,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		}
 		checkpoint = pullCheckpoint{AttemptID: attemptID}
 	}
-	if (!mayPull && !checkpoint.Accepted) || execution.CancellationRequested() {
+	if !mayPull && !checkpoint.Accepted {
 		return h.observePullPiece(ctx, execution, input, copyRow, target, attempt, pieceCID, false)
 	}
 	if delay := time.Until(checkpoint.NextRequestAt); delay > 0 {
@@ -312,9 +300,6 @@ func (h *PullHandler) observePullPiece(
 	state, err := h.pullPieceState(ctx, target, pieceCID)
 	if err == nil && state == synapse.ParkedPieceReady {
 		return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, attempt.AttemptID)
-	}
-	if execution.CancellationRequested() {
-		return failPullOutcome(execution, errors.Join(err, errors.New("cancelled pull has no confirmed outcome")))
 	}
 	if err != nil {
 		return retryPullOutcome(execution, err, "pull_status_failed")

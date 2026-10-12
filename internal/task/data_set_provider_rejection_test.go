@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -461,16 +462,42 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	settled := make(chan struct{}, 1)
+	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+		OnTaskSettled: func(claimed *model.Task, _ repository.TaskTransition) {
+			if claimed.ID == coordinator.ID {
+				select {
+				case settled <- struct{}{}:
+				default:
+				}
+			}
+		},
+	}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCancelled })
 	waitForTask(t, runtime.repos, oldCopyTask.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCancelled })
-	waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool {
-		if task.Status == model.TaskStatusPending {
-			wakeTask(t, runtime, task.ID)
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 2*handlerTestLeaseDuration)
+	defer cancelWait()
+	for failed := false; !failed; {
+		select {
+		case <-settled:
+			observed, err := runtime.repos.Tasks.GetByID(t.Context(), coordinator.ID)
+			if err != nil || observed == nil {
+				t.Fatalf("read settled coordinator: %v", err)
+			}
+			failed = observed.Status == model.TaskStatusFailed
+			if observed.Status == model.TaskStatusPending {
+				wakeTask(t, runtime, coordinator.ID)
+			}
+		case <-waitCtx.Done():
+			t.Fatal("coordinator did not settle required content recovery")
 		}
-		return task.Status == model.TaskStatusFailed
-	})
+	}
 	item, err := runtime.repos.Replacements.ReplacementExecution(t.Context(), row.ID)
 	if err != nil || !item.HasFailed {
 		t.Fatalf("required content did not request attention: %#v %v", item, err)

@@ -449,66 +449,6 @@ func TestServiceManualRetryPredicateUsesFailureEvidence(t *testing.T) {
 	}
 }
 
-func TestCancellationWakesPendingTaskAndForcesRecovery(t *testing.T) {
-	limit := 5
-	var executed atomic.Bool
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&limit, true),
-		execute: func(context.Context, Execution) Result {
-			executed.Store(true)
-			return Complete("must not execute", nil)
-		},
-		recover: func(_ context.Context, execution Execution) Result {
-			if !execution.CancellationRequested() || execution.CancellationReason() != "owner stopped" {
-				return Fail(errors.New("missing cancellation request"), "test_failure", nil)
-			}
-			return Cancel("cancelled", nil)
-		},
-	}, nil)
-	row, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
-		Type: testTaskType, Input: testInput{Value: "cancel-pending"},
-		AvailableAt: time.Now().Add(24 * time.Hour),
-	})
-	if err != nil || !created {
-		t.Fatalf("enqueue delayed task = %#v created=%v err=%v", row, created, err)
-	}
-	if err := harness.repos.Tasks.RequestCancellation(t.Context(), row.ID, "owner stopped"); err != nil {
-		t.Fatalf("request cancellation: %v", err)
-	}
-	claimed := claimTestTask(t, harness)
-	if claimed.ResumeMode != model.TaskResumeModeRecover || claimed.CancellationRequestedAt == nil ||
-		claimed.AvailableAt.Before(*claimed.CancellationRequestedAt) {
-		t.Fatalf("cancelled claim = %#v", claimed)
-	}
-	harness.engine.executeClaim(t.Context(), claimed)
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusCancelled || executed.Load() {
-		t.Fatalf("cancelled task = %#v executed=%v err=%v", stored, executed.Load(), err)
-	}
-}
-
-func TestCancellationOverridesPendingSettlementScheduleAndMode(t *testing.T) {
-	limit := 5
-	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
-	row := enqueueTestTask(t, harness, "cancel-running")
-	claimed := claimTestTask(t, harness)
-	if err := harness.repos.Tasks.RequestCancellation(t.Context(), row.ID, "owner stopped"); err != nil {
-		t.Fatalf("request cancellation: %v", err)
-	}
-	if err := harness.repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
-		AvailableAt: time.Now().Add(24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("suspend cancellation-requested task: %v", err)
-	}
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover ||
-		stored.CancellationRequestedAt == nil || stored.AvailableAt.Before(*stored.CancellationRequestedAt) ||
-		stored.AvailableAt.After(time.Now().Add(time.Second)) {
-		t.Fatalf("suspended cancellation-requested task = %#v, err=%v", stored, err)
-	}
-}
-
 func TestExpiredClaimIsRecoveredAndStaleGenerationIsFenced(t *testing.T) {
 	limit := 5
 	var executes, recovers atomic.Int64
@@ -550,51 +490,88 @@ func TestExpiredClaimIsRecoveredAndStaleGenerationIsFenced(t *testing.T) {
 	}
 }
 
-func TestEngineRejectsCorruptInputBeforeHandler(t *testing.T) {
-	limit := 5
-	var called atomic.Bool
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&limit, true),
-		execute: func(context.Context, Execution) Result {
-			called.Store(true)
-			return Complete("unexpected", nil)
-		},
-	}, nil)
-	row := enqueueTestTask(t, harness, "corrupt")
-	if _, err := harness.db.NewRaw(`UPDATE tasks SET input_hash = ? WHERE id = ?`, "00", row.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("corrupt task hash: %v", err)
+func TestCompatibleInputChangesPreserveEnqueueExecutionAndRetry(t *testing.T) {
+	type reorderedInput struct {
+		Note  string `json:"note,omitempty"`
+		RowID int64  `json:"row_id"`
 	}
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "invalid_input_hash" {
-		t.Fatalf("corrupt task result = %#v, err=%v", stored, err)
+	type extendedInput struct {
+		RowID    int64  `json:"row_id"`
+		Note     string `json:"note,omitempty"`
+		Priority int    `json:"priority"`
 	}
-	if called.Load() {
-		t.Fatal("handler ran with corrupt input")
-	}
-}
-
-func TestEngineAcceptsDatabaseJSONNormalizationAndUsesCanonicalInput(t *testing.T) {
-	limit := 5
-	var gotInput string
-	harness := newTaskHarness(t, scriptedHandler{
-		definition: testDefinition(&limit, true),
-		execute: func(_ context.Context, execution Execution) Result {
-			gotInput = string(execution.Input())
-			return Complete("normalized", nil)
-		},
-	}, nil)
-	row := enqueueTestTask(t, harness, "normalized")
-	if _, err := harness.db.NewRaw(`UPDATE tasks SET input_json = ? WHERE id = ?`, `{ "value" : "normalized" }`, row.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("normalize stored task JSON: %v", err)
-	}
-	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
-	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusCompleted {
-		t.Fatalf("normalized task result = %#v, err=%v", stored, err)
-	}
-	if gotInput != `{"value":"normalized"}` {
-		t.Fatalf("handler input = %q, want canonical JSON", gotInput)
+	for _, tc := range []struct {
+		name      string
+		codec     Codec
+		version   int
+		canonical string
+	}{
+		{"jsonb normalization", StrictJSONCodec[rowInput](nil), 1, `{"row_id":1,"note":"alpha"}`},
+		{"field order", StrictJSONCodec[reorderedInput](nil), 1, `{"note":"alpha","row_id":1}`},
+		{"optional default", StrictJSONCodec[extendedInput](nil), 1, `{"row_id":1,"note":"alpha","priority":0}`},
+		{"unsupported version", StrictJSONCodec[rowInput](nil), 2, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := newTaskHarness(t, scriptedHandler{definition: rowDefinition()}, nil)
+			row, _, err := old.service.Enqueue(t.Context(), EnqueueRequest{Type: testTaskType, Input: rowInput{RowID: 1, Note: "alpha"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			definition := rowDefinition()
+			definition.Codec, definition.InputVersion = tc.codec, tc.version
+			calls := 0
+			checkInput := func(execution Execution) {
+				calls++
+				if string(execution.Input()) != tc.canonical {
+					t.Fatalf("handler input = %s, want %s", execution.Input(), tc.canonical)
+				}
+			}
+			current := newTaskHarnessWithDB(t, old.db, scriptedHandler{
+				definition: definition,
+				execute: func(_ context.Context, execution Execution) Result {
+					checkInput(execution)
+					return Fail(errors.New("stopped"), "stopped", nil)
+				},
+				recover: func(_ context.Context, execution Execution) Result {
+					checkInput(execution)
+					return Complete("Recovered", nil)
+				},
+			}, nil)
+			duplicate, created, err := current.service.Enqueue(t.Context(), EnqueueRequest{Type: testTaskType, Input: rowInput{RowID: 1, Note: "alpha"}})
+			if tc.version != 1 {
+				if !errors.Is(err, ErrInputConflict) {
+					t.Fatalf("version conflict = %v", err)
+				}
+				current.engine.executeClaim(t.Context(), claimTestTask(t, current))
+				failed, err := current.repos.Tasks.GetByID(t.Context(), row.ID)
+				if err != nil || failed.Status != model.TaskStatusFailed || dereference(failed.FailureReason) != "input_version_unsupported" || calls != 0 {
+					t.Fatalf("unsupported input result = %#v, calls=%d, err=%v", failed, calls, err)
+				}
+				if _, err := current.service.Retry(t.Context(), row.ID); !errors.Is(err, repository.ErrConflict) {
+					t.Fatalf("unsupported input retry = %v", err)
+				}
+				return
+			}
+			if err != nil || created || duplicate.ID != row.ID {
+				t.Fatalf("compatible enqueue = %#v, created=%v, err=%v", duplicate, created, err)
+			}
+			if tc.name == "optional default" {
+				_, _, err := current.service.Enqueue(t.Context(), EnqueueRequest{Type: testTaskType, Input: extendedInput{RowID: 1, Note: "alpha", Priority: 1}})
+				if !errors.Is(err, ErrInputConflict) {
+					t.Fatalf("nondefault input conflict = %v", err)
+				}
+			}
+			current.engine.executeClaim(t.Context(), claimTestTask(t, current))
+			next, err := current.service.Retry(t.Context(), row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.engine.executeClaim(t.Context(), claimTestTask(t, current))
+			completed, err := current.repos.Tasks.GetByID(t.Context(), next.ID)
+			if err != nil || completed.Status != model.TaskStatusCompleted || calls != 2 {
+				t.Fatalf("compatible retry = %#v, calls=%d, err=%v", completed, calls, err)
+			}
+		})
 	}
 }
 
@@ -814,7 +791,7 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 		definition: testDefinition(&limit, true),
 		execute: func(ctx context.Context, execution Execution) Result {
 			attempted, err := execution.WithCheckpointedEffect(ctx, "test-effect", map[string]bool{"attempted": true}, func(ctx context.Context, repos *repository.Repositories) error {
-				if err := repos.Tasks.RequestCancellation(ctx, execution.ID(), "must roll back"); err != nil {
+				if err := repos.Tasks.AppendEvent(ctx, execution.ID(), "rejected_evidence", json.RawMessage(`{}`)); err != nil {
 					return err
 				}
 				return errors.New("reject checkpoint evidence")
@@ -831,11 +808,20 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 	row := enqueueTestTask(t, harness, "checkpoint-rollback")
 	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "effect_not_started" || stored.CancellationRequestedAt != nil || len(stored.Checkpoint) != 0 || stored.WorkStartedAt != nil {
+	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "effect_not_started" || len(stored.Checkpoint) != 0 || stored.WorkStartedAt != nil {
 		t.Fatalf("rolled-back task = %#v, err=%v", stored, err)
 	}
 	if effectCalled.Load() {
 		t.Fatal("effect ran after checkpoint settlement failed")
+	}
+	events, err := harness.repos.Tasks.ListEvents(t.Context(), row.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type == "rejected_evidence" {
+			t.Fatal("checkpoint evidence committed after settlement failed")
+		}
 	}
 }
 
@@ -987,7 +973,9 @@ func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 	}, &config)
 	row := enqueueTestTask(t, harness, "renewal")
 	claimed := claimTestTask(t, harness)
-	harness.repos.Tasks = renewFailureRepository{TaskRepository: harness.repos.Tasks}
+	controlled := &controlledShortenRepository{TaskRepository: renewFailureRepository{TaskRepository: harness.repos.Tasks}}
+	controlled.fail.Store(true)
+	harness.repos.Tasks = controlled
 	harness.engine.renewalRetryDelays = []time.Duration{0, time.Second}
 	started := time.Now()
 	harness.engine.executeClaim(t.Context(), claimed)
@@ -995,8 +983,14 @@ func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 		t.Fatalf("renewal uncertainty cancelled after %s", elapsed)
 	}
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-	if err != nil || stored.Status != model.TaskStatusRunning || stored.ResumeMode != model.TaskResumeModeRecover {
+	if err != nil || stored.Status != model.TaskStatusRunning {
 		t.Fatalf("renewal failure task = %#v, err=%v", stored, err)
+	}
+	if stored.ResumeMode != model.TaskResumeModeRecover {
+		request, queued := harness.engine.nextRecovery()
+		if !queued || request.id != row.ID || request.generation != claimed.ClaimGeneration {
+			t.Fatalf("renewal failure recovery = %#v, queued=%t; task=%#v", request, queued, stored)
+		}
 	}
 }
 

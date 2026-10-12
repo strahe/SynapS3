@@ -83,4 +83,4 @@ synaps3 admin task stats
 
 不要把一个时间点的数据库备份与另一个时间点的缓存数据混用。
 
-只使用兼容的 SynapS3 版本恢复备份。如果启动时报告数据库不兼容，请保持备份不变，并按[升级与恢复](../operations/upgrade-recovery.md)处理。
+使用与备份匹配的程序恢复。如果启动时报告数据库不兼容，请保持备份不变，并按[备份与恢复](../operations/upgrade-recovery.md)处理。

@@ -1,33 +1,17 @@
 ---
-title: Upgrade and Recovery
-description: Upgrade SynapS3 safely and recover background work.
+title: Backup and Recovery
+description: Back up runtime data and recover background work.
 ---
 
-# Upgrade and Recovery
+# Backup and Recovery
 
-Before changing versions, protect the database and cache as one recovery point. Restore failed dependencies before retrying background work.
+Protect the database, cache, and executable as one recovery point. Restore failed dependencies before retrying background work.
 
-## Before Upgrading
+## Back Up Runtime Data
 
-Run:
+Stop incoming S3 traffic and SynapS3 before creating a backup. Keep the database, cache, configuration, credentials, and matching executable together. Follow [Runtime Data](../configuration/runtime-data.md) for backup and verification steps.
 
-```bash
-curl http://127.0.0.1:9090/healthz
-synaps3 admin task stats
-synaps3 admin task list --status failed --limit 50
-```
-
-Expected result: health is `ok`, and every failed task has a clear handling decision before the process is replaced.
-
-Stop incoming S3 traffic and SynapS3 before creating a backup. Keep the database, cache, configuration, and credentials at the same recovery point. Follow [Runtime Data](../configuration/runtime-data.md) for backup and verification steps.
-
-## Upgrade SynapS3
-
-Replace the executable, package, or container image through the same installation method used for the deployment. Docker-specific commands are documented on the [Docker Deployment](../getting-started/docker.md) page.
-
-Deprecated `worker.upload`, `worker.provider_replacement`, `worker.evictor`, and `worker.storage_cleanup` configuration sections are rejected; replace them with `worker.tasks` settings. Remove `worker.tasks.max_retries`, `worker.tasks.retention`, `SYNAPS3_WORKER_TASKS_MAX_RETRIES`, and `SYNAPS3_WORKER_TASKS_RETENTION` before starting the upgraded version; these settings are rejected. Retry budgets belong to each task type, and history is retained permanently.
-
-Start SynapS3 with the intended database and cache. If startup reports that the database is incompatible, stop the process, leave the database unchanged, and follow [If the Database Is Incompatible](#if-the-database-is-incompatible).
+## Verify After a Restart
 
 After startup, run:
 
@@ -41,19 +25,9 @@ Expected result: health is `ok`, effective settings match the deployment, and ba
 
 ## If the Database Is Incompatible
 
-1. Stop incoming S3 traffic and every SynapS3 process using the deployment.
-2. Back up the reported database and verify the backup.
-3. Keep the database and matching cache read-only. Do not edit either location to bypass the compatibility check.
-4. Configure an empty database and cache directory for the replacement installation.
-5. Start SynapS3 and verify health, effective settings, and background task processing before restoring traffic.
-
-Back up the database with `pg_dump` or the deployment's approved database snapshot after the process stops, and verify that artifact. Protect the backup, the matching cache, and the configuration as one recovery set.
+Stop SynapS3 and confirm that the configured database is the intended one. Preserve the database and matching cache unchanged, and restore a verified recovery point. Do not edit either location to bypass the compatibility check.
 
 SynapS3 leaves an incompatible database unchanged.
-
-Starting with an empty database does not import existing buckets, objects, users, storage data sets, wallet operations, provider replacements, or tasks. Existing paid remote data sets remain active. Keep the verified backup so those data sets and records can be reviewed and handled separately.
-
-Do not run the preserved installation and its replacement against the same database, cache, wallet workflow, or S3 traffic. After starting the replacement, create an S3 user and test bucket, then write and read a test object before restoring normal traffic.
 
 ## Recover Background Work
 
@@ -61,12 +35,12 @@ After a restart, unfinished work becomes eligible to continue automatically.
 
 - Use **Retry** for a stopped task. The task list shows whether its result permits retry; opening details checks the current conditions. If another operation has taken over or recovery is unsafe, Retry explains why and refreshes the list.
 - Recover provider replacements from the bucket's **Storage** tab.
-- A storage transfer task that stopped because of an internal error stays retryable. Retry checks what the earlier attempt already did before continuing. If the error came from a version that cannot run the task, install a compatible version first.
+- A storage transfer task that stopped because of an internal error stays retryable. Retry checks what the earlier attempt already did before continuing.
 - A wallet operation can be retried from Tasks when no broadcast started, or when it stopped because of an internal error. Retry checks the operation first: it sends the transaction only if none was ever broadcast, and otherwise checks the transaction already sent. If a broadcast may have gone out without a recorded transaction, the operation is marked unknown and cannot be retried.
 - **Retry** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
 - Acknowledgement moves a failure to **Closed**; use `scope=history&status=failed` to view it.
 - Batch recovery preserves the signed request and checks the chain before resubmitting. Missing pieces are transferred again when safe. Provider errors and failed transfers use a finite budget. If a batch was conclusively refused and the chain confirms it did not land, the remaining pieces can continue when one cannot be recovered. When recovery stops, the batch keeps the saved evidence. Find it in **Tasks** (Submit batch, Failed) or with `synaps3 admin storage-confirmation list`, restore its dependencies, and use **Retry**. An accepted request with conflicting chain evidence remains stopped for review.
-- A provider with a full Pull queue is tried again after its requested delay without using the retry budget. Other failures use up to 12 opportunities in new or manually retried Pull rounds; existing rounds keep their original policy.
+- A provider with a full Pull queue is tried again after its requested delay without using the retry budget. Other Pull failures use up to 12 opportunities. After restart, current limits apply to further automatic retries; already scheduled work can finish, and manual Retry starts with a fresh budget.
 
 Useful commands:
 
@@ -90,7 +64,7 @@ Restore failed dependencies before retrying work. Use the dashboard, Admin API, 
 | Cache disk full | Increase disk or `cache.max_size_gb`, or restore remote storage and cache-cleanup progress. |
 | Provider must be evacuated | Open the bucket's **Storage** tab and replace the provider from **Data sets**. Do not retry the replacement from Tasks. |
 | Process crash | Restart SynapS3, verify health and task statistics, then retry any stopped batch and review any wallet outcome. |
-| Startup reports an incompatible database | Stop the process, verify that the configured database is the intended one, and preserve it unchanged before using an empty replacement database. |
+| Startup reports an incompatible database | Stop the process, confirm the configured database, and preserve it unchanged before restoring a verified recovery point. |
 
 ## Restore or Roll Back
 

@@ -25,7 +25,7 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		}
 		row.Status, row.WaitReason, row.FailureReason = transition.Status, transition.WaitReason, transition.FailureReason
 		row.LastError, row.StatusMessage, row.UpdatedAt = transition.LastError, transition.StatusMessage, now
-		row.ClaimedAt, row.LeaseUntil = nil, nil
+		row.LeaseUntil = nil
 		if transition.ClearWorkStartedAt {
 			row.WorkStartedAt = nil
 		} else if row.WorkStartedAt == nil && transition.WorkStartedAt != nil {
@@ -37,16 +37,10 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		row.ResumeMode = transition.ResumeMode
 		if transition.Status == model.TaskStatusPending {
 			row.AvailableAt, row.FinishedAt = transition.AvailableAt, nil
-			if row.CancellationRequested() {
-				row.ResumeMode = model.TaskResumeModeRecover
-				if !transition.CancellationObserved {
-					row.AvailableAt = now
-				}
-			}
 		} else {
 			row.FinishedAt = &now
 		}
-		result, err := db.NewUpdate().Model(row).Column("status", "wait_reason", "failure_reason", "last_error", "status_message", "updated_at", "claimed_at", "lease_until", "work_started_at", "retry_count", "resume_mode", "available_at", "finished_at").Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
+		result, err := db.NewUpdate().Model(row).Column("status", "wait_reason", "failure_reason", "last_error", "status_message", "updated_at", "lease_until", "work_started_at", "retry_count", "resume_mode", "available_at", "finished_at").Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
 		if err != nil {
 			return err
 		}

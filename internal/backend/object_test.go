@@ -29,7 +29,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
-	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
 	"github.com/uptrace/bun"
@@ -715,9 +714,8 @@ func TestPutObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	if task == nil {
 		t.Fatal("expected upload task")
 	}
-	policy, policyErr := worker.DecodePolicy(task)
-	if task.Type != model.TaskTypeUploadPlan || policyErr != nil || policy.MaxAttempts != 6 {
-		t.Fatalf("task = %#v, policy = %#v, err = %v; want upload_plan with six attempts", task, policy, policyErr)
+	if task.Type != model.TaskTypeUploadPlan {
+		t.Fatalf("task type = %s, want upload_plan", task.Type)
 	}
 }
 
@@ -1009,9 +1007,6 @@ func TestPutObjectCreatesSuccessorForTerminalUploadPlan(t *testing.T) {
 			if err := tb.repos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, []byte(`{"old":true}`)); err != nil {
 				t.Fatalf("write old checkpoint: %v", err)
 			}
-			if err := tb.repos.Tasks.RequestCancellation(ctx, claimed.ID, "old owner stopped"); err != nil {
-				t.Fatalf("request old cancellation: %v", err)
-			}
 			transition := repository.TaskTransition{
 				Status: terminalStatus, ResumeMode: model.TaskResumeModeRecover,
 				FailureReason: new("old_plan_failed"), LastError: new("old upload plan failed"), IncrementRetry: true,
@@ -1040,7 +1035,7 @@ func TestPutObjectCreatesSuccessorForTerminalUploadPlan(t *testing.T) {
 			}
 			if reactivated.Status != model.TaskStatusPending || reactivated.ResumeMode != model.TaskResumeModeExecute ||
 				reactivated.RetryCount != 0 || len(reactivated.Checkpoint) != 0 || reactivated.FailureReason != nil ||
-				reactivated.CancellationRequestedAt != nil || reactivated.CancellationReason != nil || reactivated.AcknowledgedAt != nil {
+				reactivated.AcknowledgedAt != nil {
 				t.Fatalf("reactivated task retained terminal state: %#v", reactivated)
 			}
 		})
@@ -1117,10 +1112,6 @@ func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) 
 	}
 	if task.Generation == nil || *task.Generation != input.Generation {
 		t.Fatalf("evict task generation = %v, want %d", task.Generation, input.Generation)
-	}
-	policy, policyErr := worker.DecodePolicy(task)
-	if policyErr != nil || policy.MaxAttempts != 6 {
-		t.Fatalf("evict task policy = %#v, err = %v; want six attempts", policy, policyErr)
 	}
 }
 
@@ -3106,10 +3097,6 @@ func TestCopyObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	}
 	for _, task := range page.Tasks {
 		if task.SubjectType == "storage_content" && task.SubjectKey == contentSubjectForVersion(t, tb, dstObj.VersionID) {
-			policy, policyErr := worker.DecodePolicy(&task)
-			if policyErr != nil || policy.MaxAttempts != 6 {
-				t.Fatalf("copy upload task policy = %#v, err = %v; want six attempts", policy, policyErr)
-			}
 			return
 		}
 	}

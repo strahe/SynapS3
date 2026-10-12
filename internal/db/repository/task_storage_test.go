@@ -29,7 +29,7 @@ func TestPostgresTaskArchiveAndCreationKeepOneIdentity(t *testing.T) {
 	for i := 0; i < 16; i++ {
 		wg.Go(func() {
 			<-gate
-			row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: source.Type, SubjectType: source.SubjectType, SubjectKey: source.SubjectKey, Generation: source.Generation, InputVersion: source.InputVersion, Input: source.Input, InputHash: source.InputHash}))
+			row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: source.Type, SubjectType: source.SubjectType, SubjectKey: source.SubjectKey, Generation: source.Generation, InputVersion: source.InputVersion, Input: source.Input}))
 			if err == nil && (created || row.ID != source.ID) {
 				err = errors.New("creation lost archived identity")
 			}
@@ -62,7 +62,7 @@ func TestPostgresTaskIdentityContentionHonorsDeadline(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- repos.WithTx(t.Context(), func(tx *repository.Repositories) error {
-			_, _, err := tx.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "held-identity", Generation: new(int64(0)), InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
+			_, _, err := tx.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "held-identity", Generation: new(int64(0)), InputVersion: 1, Input: json.RawMessage(`{}`)}))
 			if err != nil {
 				close(held)
 				return err
@@ -75,7 +75,7 @@ func TestPostgresTaskIdentityContentionHonorsDeadline(t *testing.T) {
 	<-held
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	_, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "held-identity", Generation: new(int64(0)), InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
+	_, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "held-identity", Generation: new(int64(0)), InputVersion: 1, Input: json.RawMessage(`{}`)}))
 	close(release)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("contention error = %v", err)
@@ -137,7 +137,7 @@ func TestPostgresTaskEnqueueRetriesAfterConcurrentSupersession(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	input := repositoryTestTask(&model.Task{
 		Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "superseded-identity", Generation: new(int64(0)),
-		InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test",
+		InputVersion: 1, Input: json.RawMessage(`{}`),
 	})
 	hook := &taskIdentitySupersessionRace{repos: repos, input: input}
 	testutil.AddQueryHook(db, hook)
@@ -192,7 +192,7 @@ func TestPostgresConcurrentEnqueueCreatesOneRound(t *testing.T) {
 	for range 16 {
 		wg.Go(func() {
 			<-gate
-			row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "racing-identity", Generation: new(int64(0)), InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
+			row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "racing-identity", Generation: new(int64(0)), InputVersion: 1, Input: json.RawMessage(`{}`)}))
 			if err != nil {
 				results <- result{err: err}
 				return

@@ -17,9 +17,7 @@ const claimExpiredTaskPostgresSQL = `UPDATE tasks
 SET status = 'running',
     resume_mode = 'recover',
     claim_generation = claim_generation + 1,
-    claimed_at = ?,
     lease_until = ?,
-    started_at = COALESCE(started_at, ?),
     finished_at = NULL,
     wait_reason = NULL,
     status_message = NULL,
@@ -38,9 +36,7 @@ RETURNING *`
 const claimPendingTaskPostgresSQL = `UPDATE tasks
 SET status = 'running',
     claim_generation = claim_generation + 1,
-    claimed_at = ?,
     lease_until = ?,
-    started_at = COALESCE(started_at, ?),
     finished_at = NULL,
     wait_reason = NULL,
     status_message = NULL,
@@ -86,9 +82,7 @@ ORDER BY candidate.%[2]s, candidate.id LIMIT 1`
 const claimTaskCandidatePostgresSQL = `UPDATE tasks
 SET status = 'running',
     %[1]sclaim_generation = claim_generation + 1,
-    claimed_at = ?,
     lease_until = ?,
-    started_at = COALESCE(started_at, ?),
     finished_at = NULL,
     wait_reason = NULL,
     status_message = NULL,
@@ -191,7 +185,7 @@ func claimFilteredTask(ctx context.Context, db bun.IDB, leaseDuration time.Durat
 		}
 		claimNow := time.Now()
 		task := new(model.Task)
-		err = db.NewRaw(claimSQL, claimNow, claimNow.Add(leaseDuration), claimNow, claimNow,
+		err = db.NewRaw(claimSQL, claimNow.Add(leaseDuration), claimNow,
 			candidate.ID, candidate.Type, candidate.ClaimGeneration, candidate.OrderingTime, selectionNow).Scan(ctx, task)
 		if err == nil {
 			return task, nil
@@ -223,7 +217,7 @@ func claimNextTask(
 
 func claimTaskWithSQL(ctx context.Context, db bun.IDB, query string, now, leaseUntil time.Time, filter TaskClaimFilter) (*model.Task, error) {
 	conditions := ""
-	args := []any{now, leaseUntil, now, now, now}
+	args := []any{leaseUntil, now, now}
 	if len(filter.ExcludedTypes) > 0 {
 		conditions += " AND type NOT IN (?)"
 		args = append(args, bun.List(filter.ExcludedTypes))
@@ -392,27 +386,6 @@ func (r *BunTaskRepo) WakePendingOfTypes(ctx context.Context, ids []int64, types
 	}
 	rows, err := result.RowsAffected()
 	return int(rows), err
-}
-
-func (r *BunTaskRepo) RequestCancellation(ctx context.Context, id int64, reason string) error {
-	now := time.Now()
-	result, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("cancellation_requested_at = COALESCE(cancellation_requested_at, ?)", now).
-		Set("cancellation_reason = COALESCE(cancellation_reason, ?)", nullableText(reason)).
-		Set("resume_mode = ?", model.TaskResumeModeRecover).
-		Set("available_at = CASE WHEN status = ? AND cancellation_requested_at IS NULL THEN ? ELSE available_at END", model.TaskStatusPending, now).
-		Set("updated_at = ?", now).
-		Where("id = ? AND status IN (?, ?)", id, model.TaskStatusPending, model.TaskStatusRunning).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("requesting cancellation for task %d: %w", id, err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 const awaitingCommitReviewSQL = `EXISTS (

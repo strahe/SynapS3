@@ -50,7 +50,7 @@ func TestIngressProgressRejectsStaleTransferWriters(t *testing.T) {
 		taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskTypeStorageStore, InputVersion: 1,
 			Input:       []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copies[0].ID, generation)),
-			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copies[0].ID, 10), InputHash: key, Status: model.TaskStatusPending,
+			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copies[0].ID, 10), Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		}))
 		if err != nil || !created {
@@ -172,7 +172,7 @@ func TestPermanentDeleteClearsTerminalStoreFence(t *testing.T) {
 	}
 	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageStore, InputVersion: 1,
-		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copies[0].ID)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copies[0].ID, 10), InputHash: "terminal-store-delete", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copies[0].ID)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copies[0].ID, 10), Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {

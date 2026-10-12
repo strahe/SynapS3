@@ -237,8 +237,8 @@ func TestRunMigrations_TaskAndMultipartConstraints(t *testing.T) {
 	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
 
-	mustReject(t, db, "expected task with incomplete subject identity to fail", `INSERT INTO tasks (type,input_version,input_hash,subject_type,subject_key,available_at,created_at,updated_at,input_json,policy_json,runtime_json) VALUES ('custom',1,'hash','object_version','',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}')`)
-	mustExec(t, db, `INSERT INTO tasks (type,input_version,input_hash,subject_type,subject_key,available_at,created_at,updated_at,input_json,policy_json,runtime_json) VALUES ('future_extension',1,'hash','bucket','1',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}')`)
+	mustReject(t, db, "expected task with incomplete subject identity to fail", `INSERT INTO tasks (type,input_version,subject_type,subject_key,available_at,created_at,updated_at,input_json,runtime_json) VALUES ('custom',1,'object_version','',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{}')`)
+	mustExec(t, db, `INSERT INTO tasks (type,input_version,subject_type,subject_key,available_at,created_at,updated_at,input_json,runtime_json) VALUES ('future_extension',1,'bucket','1',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{}')`)
 
 	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, created_at, updated_at) VALUES (1, 'large.bin', 'upload-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag, created_at) VALUES ('upload-1', 1, 10, 'part-etag', CURRENT_TIMESTAMP)`)

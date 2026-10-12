@@ -1,9 +1,8 @@
 package worker
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -139,7 +138,6 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("deriving %s identity: %w", request.Type, err)
 	}
-	sum := sha256.Sum256(canonical)
 	availableAt := request.AvailableAt
 	if availableAt.IsZero() {
 		availableAt = time.Now()
@@ -147,13 +145,8 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 	task := &model.Task{
 		Type: request.Type, SubjectType: identity.SubjectType, SubjectKey: identity.SubjectKey, Generation: identity.Generation,
 		InputVersion: definition.InputVersion, Input: canonical,
-		InputHash: hex.EncodeToString(sum[:]),
-		Status:    model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 		AvailableAt: availableAt, Runtime: json.RawMessage(`{}`),
-	}
-	task.Policy, err = encodePolicy(definition.Policy)
-	if err != nil {
-		return nil, err
 	}
 	return task, nil
 }
@@ -163,10 +156,23 @@ func (s *Service) enqueuePrepared(ctx context.Context, tasks repository.TaskRepo
 	if err != nil {
 		return nil, false, err
 	}
-	if stored.InputVersion != task.InputVersion || stored.InputHash != task.InputHash {
+	if created {
+		return stored, true, nil
+	}
+	if stored.InputVersion != task.InputVersion {
+		return nil, false, fmt.Errorf("%w for %s %s/%s", ErrInputConflict, task.Type, task.SubjectType, task.SubjectKey)
+	}
+	definition, _ := s.registry.Definition(task.Type)
+	canonical, codecErr := canonicalizeInput(definition.Codec, stored.Input)
+	if codecErr != nil || !bytes.Equal(canonical, task.Input) {
 		return nil, false, fmt.Errorf("%w for %s %s/%s", ErrInputConflict, task.Type, task.SubjectType, task.SubjectKey)
 	}
 	return stored, created, nil
+}
+
+func (s *Service) Policy(taskType model.TaskType) (ExecutionPolicy, bool) {
+	definition, ok := s.registry.Definition(taskType)
+	return definition.Policy, ok
 }
 
 func (s *Service) Get(ctx context.Context, id int64) (*model.Task, error) {

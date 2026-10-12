@@ -17,9 +17,6 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
 	row := enqueueAndClaimTask(t, repos, "archive-evidence", time.Minute)
-	if err := repos.Tasks.RequestCancellation(ctx, row.ID, "stop"); err != nil {
-		t.Fatal(err)
-	}
 	if err := repos.Tasks.AdmitEffect(ctx, row.ID, row.ClaimGeneration, "effect", json.RawMessage(`{"proof":"accepted"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +38,7 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	archived, err := repos.Tasks.GetByID(ctx, row.ID)
-	if err != nil || archived == nil || archived.Status != model.TaskStatusCompleted || archived.CancellationRequestedAt == nil || archived.WorkStartedAt == nil || archived.FinishedAt == nil || !bytes.Equal(archived.Input, before.Input) || !bytes.Equal(archived.Policy, before.Policy) || !bytes.Equal(archived.Runtime, before.Runtime) || !bytes.Equal(archived.Checkpoint, before.Checkpoint) {
+	if err != nil || archived == nil || archived.Status != model.TaskStatusCompleted || archived.WorkStartedAt == nil || archived.FinishedAt == nil || !bytes.Equal(archived.Input, before.Input) || !bytes.Equal(archived.Runtime, before.Runtime) || !bytes.Equal(archived.Checkpoint, before.Checkpoint) {
 		t.Fatalf("incomplete archive: %#v, %v", archived, err)
 	}
 	events, err := repos.Tasks.ListEvents(ctx, row.ID, 0, 128)

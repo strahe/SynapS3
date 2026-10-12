@@ -425,7 +425,16 @@ function TaskTable({
                   </StatusBadge>
                   {task.acknowledged_at && <span className="text-xs text-muted-foreground">Acknowledged</span>}
                   {task.retry_count > 0 && (
-                    <span className="whitespace-nowrap text-xs text-muted-foreground">{taskRetriesLabel(task)}</span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="whitespace-nowrap text-xs text-muted-foreground">
+                          {taskRetriesLabel(task)}
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {task.max_attempts == null ? 'Scheduled retries' : 'Scheduled retries / current limit'}
+                      </TooltipContent>
+                    </Tooltip>
                   )}
                 </div>
               </TableCell>

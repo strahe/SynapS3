@@ -58,11 +58,7 @@ func (r *BunTaskRepo) GetDirectSuccessor(ctx context.Context, id int64) (*model.
 
 func (r *BunTaskRepo) Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error) {
 	if task == nil || task.Type == "" || task.SubjectType == "" || task.SubjectKey == "" || task.Generation != nil && *task.Generation < 0 ||
-		task.InputVersion < 1 || task.InputHash == "" || !jsonObject(task.Input) || !jsonObject(task.Policy) {
-		return nil, false, ErrInvalidInput
-	}
-	budget, err := taskAttemptBudget(task.Policy)
-	if err != nil || task.RetryCount < 0 || task.RetryCount >= budget {
+		task.InputVersion < 1 || !jsonObject(task.Input) || task.RetryCount < 0 {
 		return nil, false, ErrInvalidInput
 	}
 	prepared := *task
@@ -87,7 +83,7 @@ func (r *BunTaskRepo) Enqueue(ctx context.Context, task *model.Task) (*model.Tas
 	}
 	var stored *model.Task
 	var created bool
-	err = runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		stored, created = nil, false
 		row := prepared
 		tx := &BunTaskRepo{db: db}
@@ -149,17 +145,6 @@ func (r *BunTaskRepo) Enqueue(ctx context.Context, task *model.Task) (*model.Tas
 func jsonObject(raw json.RawMessage) bool {
 	var object map[string]json.RawMessage
 	return json.Unmarshal(raw, &object) == nil && object != nil
-}
-
-func taskAttemptBudget(raw json.RawMessage) (int, error) {
-	var policy struct {
-		Version     int  `json:"version"`
-		MaxAttempts *int `json:"max_attempts"`
-	}
-	if json.Unmarshal(raw, &policy) != nil || policy.Version != 2 || policy.MaxAttempts == nil || *policy.MaxAttempts < 1 {
-		return 0, ErrInvalidInput
-	}
-	return *policy.MaxAttempts, nil
 }
 
 func (r *BunTaskRepo) SupersedeTerminal(ctx context.Context, id int64) error {

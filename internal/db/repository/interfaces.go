@@ -802,7 +802,6 @@ type TaskRepository interface {
 	ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error
 	WakePending(ctx context.Context, ids []int64) (int, error)
 	WakePendingOfTypes(ctx context.Context, ids []int64, types []model.TaskType, skipWaitReasons []string) (int, error)
-	RequestCancellation(ctx context.Context, id int64, reason string) error
 	AcknowledgeFailed(ctx context.Context, id int64) error
 	AcknowledgeFailedForSubject(ctx context.Context, subjectType, subjectKey string) (int, error)
 	// AcknowledgeFailedMatching acknowledges every unacknowledged failure the filter
@@ -827,17 +826,16 @@ type TaskScheduleRepository interface {
 }
 
 type TaskTransition struct {
-	WorkStartedAt        *time.Time
-	ClearWorkStartedAt   bool
-	Status               model.TaskStatus
-	ResumeMode           model.TaskResumeMode
-	AvailableAt          time.Time
-	WaitReason           *string
-	FailureReason        *string
-	LastError            *string
-	StatusMessage        *string
-	IncrementRetry       bool
-	CancellationObserved bool
+	WorkStartedAt      *time.Time
+	ClearWorkStartedAt bool
+	Status             model.TaskStatus
+	ResumeMode         model.TaskResumeMode
+	AvailableAt        time.Time
+	WaitReason         *string
+	FailureReason      *string
+	LastError          *string
+	StatusMessage      *string
+	IncrementRetry     bool
 }
 
 // TaskAcknowledgeFilter selects the failures one bulk confirmation covers. The

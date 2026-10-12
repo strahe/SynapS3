@@ -2,8 +2,6 @@ package repository_test
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -40,11 +38,10 @@ func assertConcurrentTaskClaimsAreUnique(t *testing.T, filter repository.TaskCla
 	repos := repository.NewRepositories(db)
 	const taskCount = 24
 	input := json.RawMessage(`{}`)
-	sum := sha256.Sum256(input)
 	for index := range taskCount {
 		if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskType("postgres_claim_test"), SubjectType: "test", SubjectKey: fmt.Sprintf("claim-%d", index), Generation: new(int64(0)),
-			InputVersion: 1, Input: input, InputHash: hex.EncodeToString(sum[:]),
+			InputVersion: 1, Input: input,
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		})); err != nil || !created {
 			t.Fatalf("enqueue task %d: created=%t err=%v", index, created, err)
@@ -164,17 +161,17 @@ func taskClaimIndexMaintenanceDiagnostics(t *testing.T) {
 				query string
 			}{
 				{name: "insert", query: `INSERT INTO tasks
-					(type,subject_type,subject_key,generation,input_version,input_hash,status,resume_mode,available_at,
-					created_at,updated_at,input_json,policy_json,runtime_json)
-					SELECT 'write-test','test',id::text,0,1,'hash','pending','execute',CURRENT_TIMESTAMP,
-					CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}'
+					(type,subject_type,subject_key,generation,input_version,status,resume_mode,available_at,
+					created_at,updated_at,input_json,runtime_json)
+					SELECT 'write-test','test',id::text,0,1,'pending','execute',CURRENT_TIMESTAMP,
+					CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{}'
 					FROM generate_series(1,500) AS id`},
 				{name: "claim", query: `UPDATE tasks SET status='running', claim_generation=1,
-					claimed_at=CURRENT_TIMESTAMP, lease_until=CURRENT_TIMESTAMP+interval '1 minute'
+					lease_until=CURRENT_TIMESTAMP+interval '1 minute'
 					WHERE type='write-test'`},
 				{name: "renew", query: `UPDATE tasks SET lease_until=lease_until+interval '1 minute'
 					WHERE type='write-test'`},
-				{name: "settle", query: `UPDATE tasks SET status='completed', claimed_at=NULL,
+				{name: "settle", query: `UPDATE tasks SET status='completed',
 					lease_until=NULL, finished_at=CURRENT_TIMESTAMP WHERE type='write-test'`},
 			} {
 				var plan []string
@@ -241,16 +238,15 @@ func TestPostgresTaskClaimFilteredBacklogPlans(t *testing.T) {
 				ctx := t.Context()
 				old := time.Now().UTC().Add(-time.Hour)
 				if _, err := db.ExecContext(ctx, `INSERT INTO tasks
-					(id,type,subject_type,subject_key,generation,input_version,input_hash,status,resume_mode,available_at,
-					claim_generation,claimed_at,lease_until,created_at,updated_at,input_json,policy_json,runtime_json)
+					(id,type,subject_type,subject_key,generation,input_version,status,resume_mode,available_at,
+					claim_generation,lease_until,created_at,updated_at,input_json,runtime_json)
 					SELECT id,CASE WHEN id <= ? THEN 'full' ELSE 'available-'||(id%3) END,
-					       'test','backlog-'||id,0,1,'hash',?,'execute',?,
+					       'test','backlog-'||id,0,1,?,'execute',?,
 					       CASE WHEN ?='running' THEN 1 ELSE 0 END,
 					       CASE WHEN ?='running' THEN ?::timestamptz ELSE NULL END,
-					       CASE WHEN ?='running' THEN ?::timestamptz ELSE NULL END,
-					       ?,?,'{}','{"version":2,"max_attempts":6}','{}'
+					       ?,?,'{}','{}'
 					FROM generate_series(1, ?) AS id`,
-					tc.excluded, status, old, status, status, old.Add(-time.Minute), status, old,
+					tc.excluded, status, old, status, status, old,
 					old, old, tc.excluded+tc.allowed); err != nil {
 					t.Fatal(err)
 				}
@@ -357,7 +353,7 @@ func assertTaskClaimSkipsLockedHead(t *testing.T, status model.TaskStatus, filte
 	for index := range 2 {
 		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskType("postgres_skip_locked_test"), SubjectType: "test", SubjectKey: fmt.Sprintf("claim-%d", index), Generation: new(int64(0)),
-			InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: fmt.Sprintf("hash-%d", index),
+			InputVersion: 1, Input: json.RawMessage(`{}`),
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: availableAt.Add(time.Duration(index) * time.Second),
 		}))
@@ -366,7 +362,7 @@ func assertTaskClaimSkipsLockedHead(t *testing.T, status model.TaskStatus, filte
 		}
 		if status == model.TaskStatusRunning {
 			if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET status='running', claim_generation=1,
-				claimed_at=?, lease_until=? WHERE id=?`, availableAt.Add(-time.Minute), row.AvailableAt, row.ID); err != nil {
+				lease_until=? WHERE id=?`, row.AvailableAt, row.ID); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -426,7 +422,7 @@ func TestFilteredTaskClaimRechecksCandidateAndPreservesLease(t *testing.T) {
 		{name: "ordering changed", mutation: "available_at=available_at+interval '30 minutes'"},
 		{
 			name: "recovery became pending", recovery: true, wantFirst: true,
-			mutation: "status='pending', claimed_at=NULL, lease_until=NULL",
+			mutation: "status='pending', lease_until=NULL",
 		},
 		{name: "due cutoff stays fixed", lateDue: true, mutation: "claim_generation=claim_generation+1"},
 		{name: "context canceled after discovery", canceled: true},
@@ -443,7 +439,7 @@ func TestFilteredTaskClaimRechecksCandidateAndPreservesLease(t *testing.T) {
 				}
 				row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 					Type: "available", SubjectType: "test", SubjectKey: fmt.Sprintf("race-%d", index), Generation: new(int64(0)),
-					InputVersion: 1, Input: []byte(`{}`), InputHash: "hash", AvailableAt: availableAt,
+					InputVersion: 1, Input: []byte(`{}`), AvailableAt: availableAt,
 				}))
 				if err != nil {
 					t.Fatal(err)
@@ -452,7 +448,7 @@ func TestFilteredTaskClaimRechecksCandidateAndPreservesLease(t *testing.T) {
 			}
 			if tc.recovery {
 				if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET status='running', claim_generation=1,
-					claimed_at=?, lease_until=? WHERE id=?`, old.Add(-time.Minute), old, rows[0].ID); err != nil {
+						lease_until=? WHERE id=?`, old, rows[0].ID); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -506,7 +502,7 @@ func TestFilteredTaskClaimRechecksCandidateAndPreservesLease(t *testing.T) {
 							t.Fatal(err)
 						}
 						if stored.Status != model.TaskStatusPending || stored.ClaimGeneration != original.ClaimGeneration ||
-							stored.ClaimedAt != nil || stored.LeaseUntil != nil {
+							stored.LeaseUntil != nil {
 							t.Fatalf("canceled claim changed task: %#v", stored)
 						}
 					}
@@ -529,8 +525,8 @@ func TestFilteredTaskClaimRechecksCandidateAndPreservesLease(t *testing.T) {
 				if got.err != nil || got.task == nil || got.task.ID != want.ID {
 					t.Fatalf("claim = %#v, %v; want %d", got.task, got.err, want.ID)
 				}
-				if got.task.ClaimedAt == nil || got.task.ClaimedAt.Before(releasedAt) || got.task.LeaseUntil == nil ||
-					got.task.LeaseUntil.Sub(*got.task.ClaimedAt) != time.Minute {
+				if got.task.LeaseUntil == nil || got.task.LeaseUntil.Before(releasedAt.Add(time.Minute)) ||
+					got.task.LeaseUntil.After(time.Now().Add(time.Minute)) {
 					t.Fatalf("claim after retry did not retain its full lease: %#v", got.task)
 				}
 			case <-ctx.Done():

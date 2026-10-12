@@ -113,13 +113,12 @@ type Definition struct {
 }
 
 type RetryPreparation struct {
-	Request              EnqueueRequest
-	Checkpoint           json.RawMessage
-	ResumeMode           model.TaskResumeMode
-	PreserveCancellation bool
-	Validate             func(context.Context, *repository.Repositories, *model.Task) error
-	Bind                 func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
-	Release              func()
+	Request    EnqueueRequest
+	Checkpoint json.RawMessage
+	ResumeMode model.TaskResumeMode
+	Validate   func(context.Context, *repository.Repositories, *model.Task) error
+	Bind       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	Release    func()
 }
 
 // WorkStartPolicy identifies when a task begins its own work.
@@ -290,6 +289,7 @@ type checkpointWriter func(context.Context, any, Settlement, bool) error
 // Execution is an immutable view of one fenced claim.
 type Execution struct {
 	task       model.Task
+	policy     ExecutionPolicy
 	checkpoint checkpointWriter
 	admit      func(context.Context, string, any, Settlement) error
 	observe    func(context.Context, string) (time.Time, error)
@@ -303,8 +303,6 @@ func (e Execution) ClaimGeneration() int64      { return e.task.ClaimGeneration 
 func (e Execution) Mode() model.TaskResumeMode  { return e.task.ResumeMode }
 func (e Execution) RetryCount() int             { return e.task.RetryCount }
 func (e Execution) LastError() string           { return dereference(e.task.LastError) }
-func (e Execution) CancellationRequested() bool { return e.task.CancellationRequested() }
-func (e Execution) CancellationReason() string  { return dereference(e.task.CancellationReason) }
 func (e Execution) Input() json.RawMessage      { return bytes.Clone(e.task.Input) }
 func (e Execution) Checkpoint() json.RawMessage { return bytes.Clone(e.task.Checkpoint) }
 
@@ -400,7 +398,7 @@ func CompleteCycle(delay time.Duration, message string, settlement Settlement) R
 	return r
 }
 
-func (e Execution) Policy() ExecutionPolicy { p, _ := DecodePolicy(&e.task); return p }
+func (e Execution) Policy() ExecutionPolicy { return e.policy }
 func (e Execution) ObserveOperation(ctx context.Context, key string) (time.Time, error) {
 	if e.observe == nil {
 		return time.Time{}, errors.New("operation observation is unavailable")

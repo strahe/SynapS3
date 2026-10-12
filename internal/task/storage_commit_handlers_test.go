@@ -429,7 +429,7 @@ func TestCollectingCommitKeepsItsWindowAcrossJoinsAndRecovery(t *testing.T) {
 	stopHandlerEngine(t, cancel, done)
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, f.runtime.repos, f.runtime.registry, slog.Default())
+	}, f.runtime.repos, handlerExecutionRegistry(t, f.runtime), slog.Default())
 	if err != nil {
 		t.Fatalf("restart engine: %v", err)
 	}

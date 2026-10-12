@@ -83,11 +83,11 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 
 `{"status":"unhealthy"}` 表示数据库、缓存或后台任务检查失败，需要处理。
 
-## 升级准备
+## 恢复准备
 
-更改版本前先备份数据库和缓存，再按[升级与恢复](./upgrade-recovery.md)操作。如果启动时报告数据库不兼容，请保持该数据库不变，并改用新的数据库和缓存目录。
+保留经过验证的数据库备份、匹配缓存和对应程序。恢复检查见[备份与恢复](./upgrade-recovery.md)。
 
-升级前运行：
+检查：
 
 ```bash
 curl http://127.0.0.1:9090/healthz
@@ -95,10 +95,10 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 50
 ```
 
-预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 failed 任务都有明确处理方式，然后再替换正在运行的进程。
+预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 failed 任务都有明确处理方式。
 
 ## 恢复入口
 
 - 健康问题：先看[健康检查与指标](./health-metrics.md)。
 - 后台任务失败：使用[故障排查](./troubleshooting.md)。
-- 版本变更：按[升级与恢复](./upgrade-recovery.md)处理。
+- 备份或恢复：按[备份与恢复](./upgrade-recovery.md)处理。

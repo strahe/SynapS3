@@ -181,7 +181,7 @@ func TestAPITasksPreservesDurationPrecision(t *testing.T) {
 	started := time.Date(2026, 10, 3, 0, 0, 0, 900_000_000, time.UTC)
 	finished := started.Add(200 * time.Millisecond)
 	if _, err := fixture.db.NewUpdate().Table("tasks").
-		Set("started_at = ?", started.Add(-30*time.Minute)).Set("work_started_at = ?", started).Set("finished_at = ?", finished).
+		Set("work_started_at = ?", started).Set("finished_at = ?", finished).
 		Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -208,12 +208,65 @@ func TestAPITasksPreservesDurationPrecision(t *testing.T) {
 	}
 }
 
+func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
+	f := newAdminTaskFixture(t)
+	row := f.enqueue(t, model.TaskTypeUploadPlan, "current-policy", time.Now(), "bucket", "1")
+	if _, err := f.db.NewUpdate().Table("tasks").Set("retry_count = 5").Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.server.WithTaskService(newAdminTestTaskService(t, f.repos, func(definition *taskengine.Definition) {
+		definition.Policy.MaxAttempts = 3
+	}))
+
+	rr := f.request(http.MethodGet, "/api/v1/tasks/"+strconv.FormatInt(row.ID, 10), nil)
+	var detail struct {
+		Task   taskListItem    `json:"task"`
+		Policy *taskPolicyView `json:"policy"`
+	}
+	decodeJSON(t, rr, &detail)
+	if rr.Code != http.StatusOK || detail.Task.RetryCount != 5 || detail.Task.MaxAttempts == nil || *detail.Task.MaxAttempts != 3 || detail.Policy == nil || detail.Policy.MaxAttempts == nil || *detail.Policy.MaxAttempts != 3 {
+		t.Fatalf("current execution policy: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = f.request(http.MethodGet, "/api/v1/tasks", nil)
+	var page taskListResponse
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].RetryCount != 5 || page.Tasks[0].MaxAttempts == nil || *page.Tasks[0].MaxAttempts != 3 {
+		t.Fatalf("current list policy: %d %s", rr.Code, rr.Body.String())
+	}
+
+	for _, test := range []struct {
+		name   string
+		status model.TaskStatus
+		typeID model.TaskType
+		server *Server
+		known  bool
+	}{
+		{"pending", model.TaskStatusPending, row.Type, f.server, true},
+		{"running", model.TaskStatusRunning, row.Type, f.server, true},
+		{"failed", model.TaskStatusFailed, row.Type, f.server, false},
+		{"completed", model.TaskStatusCompleted, row.Type, f.server, false},
+		{"cancelled", model.TaskStatusCancelled, row.Type, f.server, false},
+		{"unregistered", model.TaskStatusPending, model.TaskType("unregistered"), f.server, false},
+		{"no service", model.TaskStatusPending, row.Type, new(Server), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := *row
+			candidate.Status, candidate.Type, candidate.RetryCount = test.status, test.typeID, 5
+			item := test.server.taskListItem(t.Context(), &candidate)
+			_, known := test.server.taskPolicy(&candidate)
+			if known != test.known || (item.MaxAttempts != nil) != test.known || item.RetryCount != 5 {
+				t.Fatalf("policy availability: %#v, known=%t", item, known)
+			}
+		})
+	}
+}
+
 func TestAPITasksHidesStaleRunningWaitWithoutInventingStart(t *testing.T) {
 	claimedAt := time.Now().Add(-30 * time.Minute)
 	row := &model.Task{
 		Type: model.TaskTypeStorageStore, Status: model.TaskStatusRunning,
 		WaitReason: new("resource"), StatusMessage: new("Old wait"), LastError: new("Previous request failed"),
-		StartedAt: &claimedAt, AvailableAt: claimedAt, CreatedAt: claimedAt,
+		AvailableAt: claimedAt, CreatedAt: claimedAt,
 	}
 	item := new(Server).taskListItem(t.Context(), row)
 	if item.StartedAt != nil || item.WaitReason != nil || item.StatusMessage != nil || item.LastError == nil {
@@ -877,6 +930,9 @@ func decodeJSON(t *testing.T, rr *httptest.ResponseRecorder, target any) {
 func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 	f := newAdminTaskFixture(t)
 	first := f.enqueue(t, model.TaskTypeUploadPlan, "task-history", time.Now(), "bucket", "1")
+	if _, err := f.db.NewUpdate().Table("tasks").Set("retry_count = 5").Where("id = ?", first.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	f.transition(t, first.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, LastError: new("first failure")})
 	second, err := f.service.Retry(t.Context(), first.ID)
 	if err != nil {
@@ -894,7 +950,7 @@ func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 		Policy *taskPolicyView `json:"policy"`
 	}
 	decodeJSON(t, rr, &detail)
-	if rr.Code != http.StatusOK || detail.Task.Status != "failed" || (detail.Task.LastError == nil || *detail.Task.LastError != "first failure") || detail.Policy == nil || detail.Policy.MaxAttempts == nil || *detail.Policy.MaxAttempts != 6 {
+	if rr.Code != http.StatusOK || detail.Task.Status != "failed" || detail.Task.RetryCount != 5 || (detail.Task.LastError == nil || *detail.Task.LastError != "first failure") || detail.Policy != nil || detail.Task.MaxAttempts != nil {
 		t.Fatalf("original execution details: %d %s", rr.Code, rr.Body.String())
 	}
 	if strings.Contains(rr.Body.String(), "checkpoint") || strings.Contains(rr.Body.String(), "input") {
@@ -993,7 +1049,7 @@ func TestAPITaskScopesKeepAllTerminalRoundsAndSeparateWork(t *testing.T) {
 	rr = f.request(http.MethodGet, "/api/v1/tasks?scope=history&limit=1&cursor="+strconv.FormatInt(*page.NextCursor, 10), nil)
 	page = taskListResponse{}
 	decodeJSON(t, rr, &page)
-	if len(page.Tasks) != 1 || page.Tasks[0].ID != completed.ID || page.NextCursor != nil || page.Tasks[0].MaxAttempts == nil || *page.Tasks[0].MaxAttempts != 6 {
+	if len(page.Tasks) != 1 || page.Tasks[0].ID != completed.ID || page.NextCursor != nil || page.Tasks[0].MaxAttempts != nil {
 		t.Fatalf("periodic history = %d %s", rr.Code, rr.Body.String())
 	}
 	if strings.Contains(rr.Body.String(), "retry_limit") || strings.Contains(rr.Body.String(), "checkpoint") {

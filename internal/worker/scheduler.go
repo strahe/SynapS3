@@ -59,8 +59,6 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 	}
 	prepared.RetryOfTaskID = &source.ID
 	prepared.Checkpoint = source.Checkpoint
-	prepared.CancellationRequestedAt = source.CancellationRequestedAt
-	prepared.CancellationReason = source.CancellationReason
 	prepared.ResumeMode = model.TaskResumeModeRecover
 	if err := tx.Tasks.SupersedeTerminal(ctx, source.ID); err != nil {
 		return nil, err

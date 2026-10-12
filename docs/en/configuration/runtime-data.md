@@ -83,4 +83,4 @@ synaps3 admin task stats
 
 Do not combine a database backup with cache data from another point in time.
 
-Restore a backup only with a compatible SynapS3 version. If startup reports that the database is incompatible, leave the backup unchanged and follow [Upgrade and Recovery](../operations/upgrade-recovery.md).
+Restore a backup with its matching executable. If startup reports that the database is incompatible, leave the backup unchanged and follow [Backup and Recovery](../operations/upgrade-recovery.md).

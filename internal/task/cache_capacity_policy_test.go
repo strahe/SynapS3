@@ -272,6 +272,11 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 		t.Fatal(err)
 	}
 	runtime.registry, runtime.service, runtime.engine = registry, service, engine
+	runtime.schedules = []taskengine.ScheduleDefinition{{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}}
+	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
 	return runtime
 }
 
@@ -317,7 +322,7 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			prepareHandlerTaskFixtures(t, runtime)
+
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			settled := make(chan repository.TaskTransition, 1)
@@ -330,7 +335,7 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 						cancel()
 					}
 				},
-			}, runtime.repos, runtime.registry, nil)
+			}, runtime.repos, handlerExecutionRegistry(t, runtime), nil)
 			if err != nil {
 				t.Fatal(err)
 			}

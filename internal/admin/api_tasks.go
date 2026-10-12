@@ -189,12 +189,15 @@ func (s *Server) taskListItem(_ context.Context, row *model.Task) taskListItem {
 		ID: row.ID, Type: string(row.Type), Operation: taskOperationLabel(row.Type),
 		Status: string(row.Status), Presentation: taskPresentationStatus(row, time.Now()),
 		SubjectType: row.SubjectType, SubjectKey: row.SubjectKey,
-		RetryCount: row.RetryCount, MaxAttempts: taskMaxAttempts(row),
+		RetryCount:    row.RetryCount,
 		RetryOfTaskID: row.RetryOfTaskID, SupersededAt: formattedTime(row.SupersededAt),
 		WaitReason: row.WaitReason, FailureReason: row.FailureReason,
 		LastError: row.LastError, StatusMessage: row.StatusMessage,
 		AvailableAt: row.AvailableAt.Format(time.RFC3339),
 		CreatedAt:   row.CreatedAt.Format(time.RFC3339), UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
+	}
+	if policy, ok := s.taskPolicy(row); ok {
+		item.MaxAttempts = new(policy.MaxAttempts)
 	}
 	if s.taskService != nil {
 		item.Retryable = s.taskService.Retryable(row)
@@ -213,15 +216,11 @@ func (s *Server) taskListItem(_ context.Context, row *model.Task) taskListItem {
 	return item
 }
 
-func taskMaxAttempts(row *model.Task) *int {
-	var snapshot struct {
-		Version     int  `json:"version"`
-		MaxAttempts *int `json:"max_attempts"`
+func (s *Server) taskPolicy(row *model.Task) (taskengine.ExecutionPolicy, bool) {
+	if s.taskService == nil || row.Status != model.TaskStatusPending && row.Status != model.TaskStatusRunning {
+		return taskengine.ExecutionPolicy{}, false
 	}
-	if json.Unmarshal(row.Policy, &snapshot) != nil || snapshot.Version != 2 || snapshot.MaxAttempts == nil || *snapshot.MaxAttempts < 1 {
-		return nil
-	}
-	return snapshot.MaxAttempts
+	return s.taskService.Policy(row.Type)
 }
 
 // Unresolved storage attention blocks acknowledgement on every task view.
@@ -498,7 +497,7 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 		Task   taskListItem    `json:"task"`
 		Policy *taskPolicyView `json:"policy"`
 	}{Task: items[0]}
-	if policy, err := taskengine.DecodePolicy(row); err == nil {
+	if policy, ok := s.taskPolicy(row); ok {
 		response.Policy = &taskPolicyView{MaxAttempts: new(policy.MaxAttempts), InitialDelay: policy.Backoff.InitialDelay.String(), MaximumDelay: policy.Backoff.MaximumDelay.String(), Multiplier: policy.Backoff.Multiplier, Jitter: policy.Backoff.Jitter, InvocationTimeout: policy.InvocationTimeout.String(), ObservationWindow: policy.ObservationWindow.String()}
 	}
 	writeJSON(w, 200, response)
