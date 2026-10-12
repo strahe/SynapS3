@@ -106,7 +106,7 @@ func TestPostgresLRUPlanUsesEffectiveAccessTimeAndCursor(t *testing.T) {
 	} {
 		task := repositoryTestTask(&model.Task{
 			Type: owner.taskType, SubjectType: "storage_content", SubjectKey: strconv.FormatInt(owner.contentID, 10),
-			InputVersion: 1, InputHash: "lru-plan", Input: []byte(`{}`), Status: owner.status,
+			InputVersion: 1, Input: []byte(`{}`), Status: owner.status,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: base, CreatedAt: base, UpdatedAt: base,
 		})
 		if owner.status == model.TaskStatusFailed {

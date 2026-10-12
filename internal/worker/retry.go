@@ -1,9 +1,7 @@
 package worker
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"time"
 
@@ -26,18 +24,11 @@ func (s *Service) InspectRetry(ctx context.Context, task *model.Task) error {
 		return ErrRetryUnsupported
 	}
 	definition, _ := s.registry.Definition(task.Type)
-	if _, err := DecodePolicy(task); err != nil {
-		return repository.ErrConflict
-	}
 	if task.InputVersion != definition.InputVersion {
 		return repository.ErrConflict
 	}
-	canonical, err := canonicalizeInput(definition.Codec, task.Input)
+	_, err := canonicalizeInput(definition.Codec, task.Input)
 	if err != nil {
-		return repository.ErrConflict
-	}
-	sum := sha256.Sum256(canonical)
-	if !bytes.Equal(sum[:], decodeHash(task.InputHash)) {
 		return repository.ErrConflict
 	}
 	if task.Type.IsRecurringSystem() {
@@ -98,8 +89,6 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 	err = s.repos.WithTx(ctx, func(tx *repository.Repositories) error {
 		prepared.ID = 0
 		successor = nil
-		prepared.CancellationRequestedAt = nil
-		prepared.CancellationReason = nil
 		current, err := tx.Tasks.GetForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -115,7 +104,7 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 		if current.Status != model.TaskStatusFailed || current.SupersededAt != nil || !definition.manualRetryAllowed(current) {
 			return repository.ErrConflict
 		}
-		if current.ClaimGeneration != source.ClaimGeneration || current.InputHash != source.InputHash {
+		if current.ClaimGeneration != source.ClaimGeneration {
 			return repository.ErrConflict
 		}
 		if definition.InspectRetry != nil {
@@ -127,10 +116,6 @@ func (s *Service) Retry(ctx context.Context, id int64) (*model.Task, error) {
 			if err := preparation.Validate(ctx, tx, current); err != nil {
 				return err
 			}
-		}
-		if preparation.PreserveCancellation {
-			prepared.CancellationRequestedAt = current.CancellationRequestedAt
-			prepared.CancellationReason = current.CancellationReason
 		}
 		var schedule *model.TaskSchedule
 		if current.Type.IsRecurringSystem() {

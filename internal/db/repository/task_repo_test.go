@@ -42,15 +42,15 @@ func assertTaskClaimFiltersPreserveOrderAndRecoveryPriority(t *testing.T, db bun
 		t.Helper()
 		row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskType(taskType), SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
-			Input: []byte(`{}`), InputHash: key, AvailableAt: availableAt,
+			Input: []byte(`{}`), AvailableAt: availableAt,
 		}))
 		if err != nil || !created {
 			t.Fatalf("enqueue %s: created=%v err=%v", key, created, err)
 		}
 		if expired {
 			if _, err := db.ExecContext(t.Context(), `UPDATE tasks SET status='running',
-				claim_generation=5, claimed_at=?, lease_until=?, started_at=? WHERE id=?`,
-				availableAt.Add(-time.Minute), availableAt, availableAt.Add(-time.Minute), row.ID); err != nil {
+				claim_generation=5, lease_until=? WHERE id=?`,
+				availableAt, row.ID); err != nil {
 				t.Fatalf("expire %s: %v", key, err)
 			}
 		}
@@ -109,7 +109,7 @@ func enqueueAndClaimTask(t *testing.T, repos *repository.Repositories, key strin
 	t.Helper()
 	if _, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: "repository_test", SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "test", Status: model.TaskStatusPending,
+		Input: []byte(`{}`), Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	})); err != nil || !created {
 		t.Fatalf("enqueue task %s: created=%v err=%v", key, created, err)
@@ -131,7 +131,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	repos := repository.NewRepositories(db)
 	row, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 		Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "claim-timing", Generation: new(int64(0)), InputVersion: 1,
-		Input: []byte(`{}`), InputHash: "test", AvailableAt: time.Now(),
+		Input: []byte(`{}`), AvailableAt: time.Now(),
 		WaitReason: new("dependency"), StatusMessage: new("Old wait"), LastError: new("Old error"),
 	}))
 	if err != nil {
@@ -146,7 +146,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 		return claimed
 	}
 	first := claim()
-	if first.WorkStartedAt != nil || first.StartedAt == nil || first.LastError == nil || *first.LastError != "Old error" {
+	if first.WorkStartedAt != nil || first.LastError == nil || *first.LastError != "Old error" {
 		t.Fatalf("claim invented work start or cleared history: %#v", first)
 	}
 	actual := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
@@ -184,7 +184,7 @@ func assertTaskClaimsClearWaitDetailsAndPreserveWorkStart(t *testing.T, db *bun.
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := repositorySuccessor(t, repos, stored, false)
+	child := repositorySuccessor(t, repos, stored)
 	retried := claim()
 	if retried.ID != child.ID || retried.WorkStartedAt != nil || retried.RetryCount != 0 {
 		t.Fatalf("successor retained previous work start or budget: %#v", retried)
@@ -240,7 +240,7 @@ func TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog(t *testing.T) {
 		t.Helper()
 		row, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{
 			Type: taskType, SubjectType: "test", SubjectKey: key, Generation: new(int64(0)), InputVersion: 1,
-			Input: []byte(`{}`), InputHash: key, Status: model.TaskStatusPending,
+			Input: []byte(`{}`), Status: model.TaskStatusPending,
 			ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		}))
 		if err != nil || !created {

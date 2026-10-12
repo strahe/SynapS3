@@ -96,7 +96,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	}
 	pullTask, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStoragePull, InputVersion: 1,
-		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copies[0].ID, generation)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copies[0].ID, 10), InputHash: "zero-piece-pull", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copies[0].ID, generation)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copies[0].ID, 10), Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {
@@ -236,7 +236,7 @@ func TestMigrationCacheRestoreIsExplicitAndBlocksEviction(t *testing.T) {
 	}
 	taskRow, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageTransferPlan, InputVersion: 1,
-		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copyRow.ID)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyRow.ID, 10), InputHash: "cache-restore-plan", Status: model.TaskStatusPending,
+		Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copyRow.ID)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyRow.ID, 10), Status: model.TaskStatusPending,
 		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil || !created {

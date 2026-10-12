@@ -127,7 +127,7 @@ func TestCommittedSourceWakesPeerPullPlanWaitingForSource(t *testing.T) {
 				cancel()
 			}
 		},
-	}, repos, runtime.registry, nil)
+	}, repos, handlerExecutionRegistry(t, runtime), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

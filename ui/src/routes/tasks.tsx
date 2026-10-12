@@ -24,6 +24,7 @@ import { TaskDetailsSheet } from '@/components/tasks/TaskDetailsSheet'
 import { TaskSubject } from '@/components/tasks/TaskSubject'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -425,7 +426,19 @@ function TaskTable({
                   </StatusBadge>
                   {task.acknowledged_at && <span className="text-xs text-muted-foreground">Acknowledged</span>}
                   {task.retry_count > 0 && (
-                    <span className="whitespace-nowrap text-xs text-muted-foreground">{taskRetriesLabel(task)}</span>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <button
+                          type="button"
+                          className="whitespace-nowrap text-xs text-muted-foreground underline decoration-dotted underline-offset-4 outline-offset-4"
+                        >
+                          {taskRetriesLabel(task)}
+                        </button>
+                      </PopoverTrigger>
+                      <PopoverContent aria-label="Retry count" side="top" className="w-max max-w-72 p-3 text-sm">
+                        {task.max_attempts == null ? 'Scheduled retries' : 'Scheduled retries / current limit'}
+                      </PopoverContent>
+                    </Popover>
                   )}
                 </div>
               </TableCell>

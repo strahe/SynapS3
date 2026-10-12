@@ -71,6 +71,7 @@ type handlerTestRuntime struct {
 	service         *taskengine.Service
 	engine          *taskengine.Engine
 	testMaxAttempts *int
+	schedules       []taskengine.ScheduleDefinition
 }
 
 type handlerRuntimeOptions struct {
@@ -203,10 +204,17 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	if err != nil {
 		t.Fatalf("new task engine: %v", err)
 	}
-	return handlerTestRuntime{
+	runtime := handlerTestRuntime{
 		db: db, repos: repos, cache: cacheStore, gate: gate, tracker: tracker,
 		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, engine: engine, testMaxAttempts: options.maxAttempts,
 	}
+	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
+	}, repos, handlerExecutionRegistry(t, runtime), slog.Default())
+	if err != nil {
+		t.Fatalf("new task engine with test policies: %v", err)
+	}
+	return runtime
 }
 
 type testWalletOperator struct {
@@ -289,11 +297,11 @@ func taskTestMaxAttempts(retries *int) *int {
 	return new(*retries + 1)
 }
 
-func handlerTaskMaxAttempts(t *testing.T, row *model.Task) int {
+func handlerTaskMaxAttempts(t *testing.T, runtime handlerTestRuntime, row *model.Task) int {
 	t.Helper()
-	policy, err := taskengine.DecodePolicy(row)
-	if err != nil {
-		t.Fatal(err)
+	policy, ok := runtime.service.Policy(row.Type)
+	if !ok {
+		t.Fatalf("task type %s has no policy", row.Type)
 	}
 	return policy.MaxAttempts
 }
@@ -309,19 +317,11 @@ func handlerTaskRetryable(t *testing.T, runtime handlerTestRuntime, row *model.T
 
 func handlerTaskFixture(t *testing.T, runtime handlerTestRuntime, row *model.Task) *model.Task {
 	t.Helper()
-	definition, ok := runtime.registry.Definition(row.Type)
-	if !ok {
-		definition.Policy = taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}
-	}
+	definition, _ := runtime.registry.Definition(row.Type)
 	if definition.Identity != nil && row.SubjectType == "" {
 		if identity, err := definition.Identity(row.Input); err == nil {
 			row.SubjectType, row.SubjectKey, row.Generation = identity.SubjectType, identity.SubjectKey, identity.Generation
 		}
-	}
-	var err error
-	row.Policy, err = json.Marshal(map[string]any{"version": 2, "max_attempts": definition.Policy.MaxAttempts, "backoff": definition.Policy.Backoff, "invocation_timeout": definition.Policy.InvocationTimeout, "observation_window": definition.Policy.ObservationWindow})
-	if err != nil {
-		t.Fatal(err)
 	}
 	return row
 }
@@ -336,7 +336,7 @@ func settleHandlerTaskFixture(t *testing.T, runtime handlerTestRuntime, taskID i
 	now := time.Now()
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
 		Set("status = ?", model.TaskStatusRunning).Set("claim_generation = ?", generation).
-		Set("claimed_at = ?", now).Set("lease_until = ?", now.Add(time.Minute)).Set("started_at = ?", now).
+		Set("lease_until = ?", now.Add(time.Minute)).
 		Where("id = ?", taskID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -368,45 +368,39 @@ func ageHandlerOperation(t *testing.T, runtime handlerTestRuntime, taskID int64,
 	}
 }
 
-func prepareHandlerTaskFixtures(t *testing.T, runtime handlerTestRuntime) {
+type handlerPolicyFixture struct {
+	taskengine.Handler
+	definition taskengine.Definition
+}
+
+func (h handlerPolicyFixture) Definition() taskengine.Definition { return h.definition }
+
+func handlerExecutionRegistry(t *testing.T, runtime handlerTestRuntime) *taskengine.Registry {
 	t.Helper()
-	before := int64(0)
-	for {
-		page, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{Status: model.TaskStatusPending, BeforeID: before, Limit: 100})
-		if err != nil {
+	registry := taskengine.NewRegistry()
+	for _, taskType := range runtime.registry.Types() {
+		handler, _ := runtime.registry.Handler(taskType)
+		definition, _ := runtime.registry.Definition(taskType)
+		if runtime.testMaxAttempts != nil {
+			definition.Policy.MaxAttempts = *runtime.testMaxAttempts
+		}
+		definition.Policy.Backoff = taskengine.BackoffPolicy{
+			InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond,
+		}
+		if err := registry.Register(handlerPolicyFixture{Handler: handler, definition: definition}); err != nil {
 			t.Fatal(err)
 		}
-		for _, row := range page.Tasks {
-			var snapshot map[string]json.RawMessage
-			if err := json.Unmarshal(row.Policy, &snapshot); err != nil {
-				t.Fatal(err)
-			}
-			if runtime.testMaxAttempts != nil && row.RetryCount < *runtime.testMaxAttempts {
-				snapshot["max_attempts"] = json.RawMessage(fmt.Sprint(*runtime.testMaxAttempts))
-			}
-			backoff, err := json.Marshal(taskengine.BackoffPolicy{InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond})
-			if err != nil {
-				t.Fatal(err)
-			}
-			snapshot["backoff"] = backoff
-			raw, err := json.Marshal(snapshot)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("policy_json = ?", json.RawMessage(raw)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if page.NextBeforeID == 0 {
-			return
-		}
-		before = page.NextBeforeID
 	}
+	for _, schedule := range runtime.schedules {
+		if err := registry.RegisterSchedule(schedule); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return registry
 }
 
 func runHandlerEngine(t *testing.T, runtime handlerTestRuntime) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
-	prepareHandlerTaskFixtures(t, runtime)
 	return runEngine(t, runtime.engine)
 }
 
@@ -2174,7 +2168,7 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstPass, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, runtime.registry, slog.Default())
+	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
 	}
@@ -2715,7 +2709,7 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-			}, &limitedRepos, runtime.registry, slog.Default())
+			}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3662,7 +3656,7 @@ func testPullRequestReplay(t *testing.T, lostCheckpoint bool) {
 	limitedRepos.Tasks = limited
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, runtime.registry, slog.Default())
+	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
 	}
@@ -3910,7 +3904,7 @@ func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, runtime.registry, slog.Default())
+	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
 	}
@@ -4391,7 +4385,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, runtime.registry, slog.Default())
+	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatalf("new limited task engine: %v", err)
 	}
@@ -4558,7 +4552,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_copy_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, successor) != 6 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 6 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
@@ -4693,7 +4687,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_source_write_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, successor) != 6 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 6 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
@@ -4740,7 +4734,7 @@ func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 	// A coordinator written by a build whose input this one cannot read.
 	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, handlerTaskFixture(t, runtime, &model.Task{
 		Type:         model.TaskTypeProviderReplacementCoordinate,
-		InputVersion: 99, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)), InputHash: bucket.Name,
+		InputVersion: 99, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)),
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	}))
 	if err != nil {
@@ -6190,8 +6184,7 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 	if row.TaskID != nil {
 		return runtime.repos.Replacements.Activate(t.Context(), id, row.TaskGeneration, *row.TaskID)
 	}
-	key := fmt.Sprintf("activation-fixture/%d", id)
-	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key, SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(row.ID)}))
+	task, _, err := runtime.repos.Tasks.Enqueue(t.Context(), handlerTaskFixture(t, runtime, &model.Task{Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(row.ID)}))
 	if err != nil {
 		return err
 	}

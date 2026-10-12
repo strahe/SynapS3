@@ -211,7 +211,7 @@ func copyRetryAdmissionAndHistory(t *testing.T, db *bun.DB) *model.StorageCopy {
 	}
 	subjectType, subjectKey := "storage_copy", fmt.Sprint(copyRow.ID)
 	finishedAt := time.Now()
-	old := repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, SubjectType: subjectType, SubjectKey: subjectKey, InputVersion: 1, Input: []byte(`{}`), InputHash: "old", Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
+	old := repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, SubjectType: subjectType, SubjectKey: subjectKey, InputVersion: 1, Input: []byte(`{}`), Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now()})
 	if _, _, err := repos.Tasks.Enqueue(ctx, old); err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func ordinaryCacheRestoreProtectsCache(t *testing.T, db *bun.DB) {
 	if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	work, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, InputVersion: 1, Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copyRow.ID)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID), InputHash: "restore"}))
+	work, _, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: model.TaskTypeStoragePull, InputVersion: 1, Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":1}`, copyRow.ID)), SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID)}))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -204,7 +204,7 @@ func validateInitialSchemaTarget(ctx context.Context, db bun.IDB) (bool, error) 
 }
 
 func incompatibleDatabaseError() error {
-	return fmt.Errorf("%w; keep the existing database as a read-only backup and configure a new empty database", ErrIncompatibleDatabase)
+	return fmt.Errorf("%w; preserve the database and matching cache, verify the configured database, and follow the Backup and Recovery guide", ErrIncompatibleDatabase)
 }
 
 func newMigrator(db *bun.DB, registry *migrate.Migrations) *migrate.Migrator {

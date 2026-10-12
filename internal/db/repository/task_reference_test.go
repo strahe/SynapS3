@@ -20,7 +20,7 @@ func TestCopyTaskBindingValidatesLogicalReference(t *testing.T) {
 			if mismatch != "missing" {
 				row := repositoryTestTask(&model.Task{
 					Type: model.TaskTypeStorageStore, InputVersion: 1,
-					Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copyRow.ID, generation)), InputHash: "logical-reference",
+					Input:       []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copyRow.ID, generation)),
 					SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID),
 				})
 				switch mismatch {
@@ -65,7 +65,7 @@ func TestCopyTaskOwnerTransferRetainsUnverifiableSource(t *testing.T) {
 		t.Helper()
 		row, _, err := f.repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 			Type: model.TaskTypeStorageStore, InputVersion: 1,
-			Input: []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copyRow.ID, generation)), InputHash: key,
+			Input:       []byte(fmt.Sprintf(`{"copy_id":%d,"generation":%d}`, copyRow.ID, generation)),
 			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: fmt.Sprint(copyRow.ID),
 		}))
 		if err != nil {

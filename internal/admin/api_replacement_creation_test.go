@@ -94,7 +94,7 @@ func TestReplacementCreationPreflightAndPresentation(t *testing.T) {
 			}
 			if tc.running {
 				now := time.Now()
-				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, claimed_at = ?, lease_until = ?, claim_generation = 1, started_at = ? WHERE id = ?", model.TaskStatusRunning, now, now.Add(time.Minute), now, ensure.ID).Exec(t.Context()); err != nil {
+				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, lease_until = ?, claim_generation = 1 WHERE id = ?", model.TaskStatusRunning, now.Add(time.Minute), ensure.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -582,7 +582,7 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 				}
 				now := time.Now()
 				var generation int64
-				if err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, claimed_at = ?, lease_until = ?, claim_generation = claim_generation + 1 WHERE id = ? RETURNING claim_generation", model.TaskStatusRunning, now, now.Add(time.Minute), ensureID).Scan(t.Context(), &generation); err != nil {
+				if err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, lease_until = ?, claim_generation = claim_generation + 1 WHERE id = ? RETURNING claim_generation", model.TaskStatusRunning, now.Add(time.Minute), ensureID).Scan(t.Context(), &generation); err != nil {
 					t.Fatal(err)
 				}
 				if err := f.srv.repos.Tasks.Settle(t.Context(), ensureID, generation, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute}); err != nil {

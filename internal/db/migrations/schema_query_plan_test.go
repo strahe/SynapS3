@@ -13,17 +13,17 @@ func TestTaskIndexesServeSmallActiveSetsBesidePermanentHistory(t *testing.T) {
 		// One live round in 200 among permanent history, with rare history
 		// statuses and a rare operation.
 		for _, statement := range []string{
-			`INSERT INTO tasks (id,type,generation,input_version,input_hash,status,subject_type,subject_key,available_at,finished_at,acknowledged_at,created_at,updated_at,input_json,policy_json,runtime_json)
-			 SELECT n,type,n,1,'hash',status,'bucket',CAST(n%500 AS TEXT),CURRENT_TIMESTAMP+interval '1 hour',
+			`INSERT INTO tasks (id,type,generation,input_version,status,subject_type,subject_key,available_at,finished_at,acknowledged_at,created_at,updated_at,input_json,runtime_json)
+			 SELECT n,type,n,1,status,'bucket',CAST(n%500 AS TEXT),CURRENT_TIMESTAMP+interval '1 hour',
 			        CASE WHEN status<>'pending' THEN CURRENT_TIMESTAMP END,
 			        CASE WHEN status='failed' AND n%1000<>0 THEN CURRENT_TIMESTAMP END,
-			        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}'
+			        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{}'
 			 FROM (SELECT n,
 			         CASE WHEN n%500=7 THEN 'bucket_provision' ELSE 'observability_refresh' END AS type,
 			         CASE WHEN n%1000=0 THEN 'failed' WHEN n%200=0 THEN 'pending' WHEN n%991=2 THEN 'failed' WHEN n%997=1 THEN 'cancelled' ELSE 'completed' END AS status
 			       FROM generate_series(1,40000) AS series(n)) AS seed`,
 			`UPDATE tasks SET available_at=CURRENT_TIMESTAMP WHERE id IN (200,400,600)`,
-			`UPDATE tasks SET status='running',claim_generation=1,claimed_at=CURRENT_TIMESTAMP,lease_until=CURRENT_TIMESTAMP+(id%2000/1000)*interval '1 hour' WHERE id%1000=800`,
+			`UPDATE tasks SET status='running',claim_generation=1,lease_until=CURRENT_TIMESTAMP+(id%2000/1000)*interval '1 hour' WHERE id%1000=800`,
 			`UPDATE tasks SET retry_of_task_id=1 WHERE id=1200`,
 			// Analyze all fixture rows to keep selectivity estimates stable.
 			`ALTER TABLE tasks ALTER COLUMN status SET STATISTICS 200`,

@@ -138,14 +138,44 @@ func TestStorePreparationFailuresRetainCheckpointAndRetry(t *testing.T) {
 				if !persistent {
 					runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 				}
+				settled := make(chan repository.TaskTransition, 8)
+				runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
+					Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+					OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
+						if claimed.ID == row.ID {
+							settled <- transition
+						}
+					},
+				}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
+				if err != nil {
+					t.Fatal(err)
+				}
 				cancel, done := runHandlerEngine(t, runtime)
 				t.Cleanup(func() { stopHandlerEngine(t, cancel, done) })
-				observed := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool {
-					if persistent {
-						return task.Status == model.TaskStatusFailed
+				waitCtx, cancelWait := context.WithTimeout(t.Context(), 2*handlerTestLeaseDuration)
+				defer cancelWait()
+				for observed := false; !observed; {
+					select {
+					case transition := <-settled:
+						if persistent {
+							observed = transition.Status == model.TaskStatusFailed
+						} else {
+							observed = transition.Status == model.TaskStatusPending && transition.IncrementRetry && transition.ResumeMode == model.TaskResumeModeRecover
+						}
+						if !observed && transition.Status == model.TaskStatusPending {
+							wakeTask(t, runtime, row.ID)
+						}
+					case <-waitCtx.Done():
+						t.Fatal("Store preparation failure did not settle its retry opportunity")
 					}
-					return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.ResumeMode == model.TaskResumeModeRecover
-				})
+				}
+				observed, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+				if err != nil || observed == nil {
+					t.Fatalf("read settled Store preparation failure: %v", err)
+				}
+				if !persistent && (observed.Status != model.TaskStatusPending || observed.RetryCount != 1 || observed.ResumeMode != model.TaskResumeModeRecover) {
+					t.Fatalf("preparation failure did not schedule recovery: %#v", observed)
+				}
 				if !testutil.JSONEqual(observed.Checkpoint, before.Checkpoint) || observed.LastError == nil || stores.Load() != 0 {
 					t.Fatalf("preparation failure lost evidence or sent bytes: task=%#v stores=%d", observed, stores.Load())
 				}
@@ -488,6 +518,21 @@ func TestStoreManualRetryUsesFreshCurrentPolicyBudget(t *testing.T) {
 	if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || !runtime.service.Retryable(failed) || stores.Load() != 1 {
 		t.Fatalf("zero-retry Store = task:%#v uploads:%d", failed, stores.Load())
 	}
+	stopHandlerEngine(t, cancel, done)
+	runtime.testMaxAttempts = nil
+	settled := make(chan repository.TaskTransition, 32)
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+		OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
+			if claimed.ID == taskRow.ID {
+				settled <- transition
+			}
+		},
+	}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.engine = engine
 	{
 		var retryErr error
 		taskRow, retryErr = runtime.service.Retry(t.Context(), taskRow.ID)
@@ -495,13 +540,26 @@ func TestStoreManualRetryUsesFreshCurrentPolicyBudget(t *testing.T) {
 			t.Fatal(retryErr)
 		}
 	}
-	retrying := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		if task.Status == model.TaskStatusPending {
-			wakeTask(t, runtime, task.ID)
+	cancel, done = runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 2*handlerTestLeaseDuration)
+	defer cancelWait()
+	for finished := false; !finished; {
+		select {
+		case transition := <-settled:
+			finished = transition.Status == model.TaskStatusFailed
+			if transition.Status == model.TaskStatusPending {
+				wakeTask(t, runtime, taskRow.ID)
+			}
+		case <-waitCtx.Done():
+			t.Fatal("current-policy Store round did not exhaust its retry budget")
 		}
-		return task.Status == model.TaskStatusFailed
-	})
-	if handlerTaskMaxAttempts(t, retrying) != 6 || retrying.RetryCount != 5 || stores.Load() != 7 {
+	}
+	retrying, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID)
+	if err != nil || retrying == nil {
+		t.Fatalf("read exhausted Store round: %v", err)
+	}
+	if handlerTaskMaxAttempts(t, runtime, retrying) != 6 || retrying.RetryCount != 5 || stores.Load() != 7 {
 		t.Fatalf("new Store round budget = task:%#v uploads:%d, want current policy's six attempts", retrying, stores.Load())
 	}
 }
@@ -772,7 +830,7 @@ func TestStoreRestartBeforeRetryCheckpointRechecksOldPiece(t *testing.T) {
 	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	firstEngine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, &limitedRepos, runtime.registry, slog.Default())
+	}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,7 +906,7 @@ func TestStoreRestartAfterRetryCheckpointOnlyQueriesProvider(t *testing.T) {
 	}
 	restarted, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-	}, runtime.repos, runtime.registry, slog.Default())
+	}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -77,7 +77,7 @@ func TestUnfinishedStoreProtectsCacheAfterMinimumDurability(t *testing.T) {
 		t.Fatal(err)
 	}
 	durabilityTask, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
-		Type: model.TaskTypeCacheReconcileDurability, InputVersion: 1, InputHash: "durability",
+		Type: model.TaskTypeCacheReconcileDurability, InputVersion: 1,
 		Input:       []byte(fmt.Sprintf(`{"bucket_id":%d,"generation":%d}`, bucket.ID, durabilityGeneration)),
 		SubjectType: "bucket", SubjectKey: strconv.FormatInt(bucket.ID, 10),
 	}))

@@ -3,7 +3,6 @@ package task_test
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -425,7 +424,7 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 			} else {
 				row = bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
 			}
-			prepareHandlerTaskFixtures(t, runtime)
+
 			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
 
@@ -437,7 +436,7 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 						}
 					}
 				},
-			}, runtime.repos, runtime.registry, slog.Default())
+			}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -465,9 +464,9 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 
 func TestConfirmedPullCacheFallback(t *testing.T) {
 	for _, tt := range []struct {
-		name          string
-		evict, cancel bool
-	}{{name: "available"}, {name: "eviction pending", evict: true}, {name: "cancelled", cancel: true}} {
+		name  string
+		evict bool
+	}{{name: "available"}, {name: "eviction pending", evict: true}} {
 		t.Run(tt.name, func(t *testing.T) {
 			runtime, pipeline, row := newPullTask(t, func(_ context.Context, r storage.PullRequest) (*storage.PullResult, error) {
 				return pullStatusResult(r, storage.PullStatusFailed), nil
@@ -489,22 +488,8 @@ func TestConfirmedPullCacheFallback(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// A reserved request must keep its recovery fence during cancellation.
-			if tt.cancel {
-				sources, err := runtime.repos.Contents.ListReadableCommittedCopies(t.Context(), pipeline.upload.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				source := sources[0]
-				if err := runtime.repos.Contents.ReservePullRequest(t.Context(), repository.ReservePullRequestInput{CopyID: pipeline.target.ID, Generation: 1, TaskID: row.ID, AttemptID: "cancelled-pull", SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID, SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL, ExtraDataHex: hex.EncodeToString(testutil.CommitExtraData(7))}); err != nil {
-					t.Fatal(err)
-				}
-				if err := runtime.repos.Tasks.RequestCancellation(t.Context(), row.ID, "cancel"); err != nil {
-					t.Fatal(err)
-				}
-			}
 			want := model.TaskStatusCompleted
-			if tt.evict || tt.cancel {
+			if tt.evict {
 				want = model.TaskStatusFailed
 			}
 			result := runOneStorageTask(t, runtime, row, want)
@@ -519,10 +504,6 @@ func TestConfirmedPullCacheFallback(t *testing.T) {
 				successor, err := runtime.repos.Tasks.GetByID(t.Context(), *copyRow.ActiveTaskID)
 				if err != nil || successor.Type != model.TaskTypeStorageStore {
 					t.Fatalf("successor=%+v err=%v", successor, err)
-				}
-			} else if tt.cancel {
-				if result.FailureReason == nil || *result.FailureReason != storagepull.FailureCancelOutcomeUnknown || copyRow.ActiveTaskID == nil || copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull {
-					t.Fatalf("cancelled=%+v copy=%+v", result, copyRow)
 				}
 			} else if result.FailureReason == nil || *result.FailureReason != "pull_failed" || copyRow.ActiveTaskID != nil {
 				t.Fatalf("failed=%+v copy=%+v", result, copyRow)

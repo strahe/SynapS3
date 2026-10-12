@@ -33,8 +33,7 @@ func localReplacementSource(t *testing.T, db *bun.DB, name string) (*repository.
 
 func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int64) *model.Task {
 	t.Helper()
-	key := fmt.Sprintf("local-ensure/%d", dataSetID)
-	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"data_set_id":%d}`, dataSetID)), InputHash: key, SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(dataSetID, 10)}))
+	row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetEnsure, InputVersion: 1, Input: json.RawMessage(fmt.Sprintf(`{"data_set_id":%d}`, dataSetID)), SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(dataSetID, 10)}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,10 +45,9 @@ func localEnsureTask(t *testing.T, repos *repository.Repositories, dataSetID int
 
 func localCoordinatorTask(t *testing.T, repos *repository.Repositories, row *storagereplacement.Replacement) *model.Task {
 	t.Helper()
-	key := fmt.Sprintf("local-coordinate/%d/%d", row.ID, row.TaskGeneration)
 	coordinator, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type: model.TaskTypeProviderReplacementCoordinate, InputVersion: 1,
-		Input: json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)), InputHash: key,
+		Input:       json.RawMessage(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, row.ID, row.TaskGeneration)),
 		SubjectType: "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
 	}))
 	if err != nil {
@@ -114,7 +112,7 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 				}
 			case "running":
 				now := time.Now()
-				if _, err := db.NewRaw("UPDATE tasks SET status = ?, claim_generation = 1, claimed_at = ?, lease_until = ?, started_at = ? WHERE id = ?", model.TaskStatusRunning, now, now.Add(time.Minute), now, ensure.ID).Exec(t.Context()); err != nil {
+				if _, err := db.NewRaw("UPDATE tasks SET status = ?, claim_generation = 1, lease_until = ? WHERE id = ?", model.TaskStatusRunning, now.Add(time.Minute), ensure.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			case "transaction":
@@ -393,7 +391,7 @@ func replacementUploadWakeScope(t *testing.T, db *bun.DB) {
 		}
 		subjectType, subjectKey := string(model.TaskSubjectStorageContent), fmt.Sprint(content.ID)
 		input := json.RawMessage(fmt.Sprintf(`{"content_id":%d}`, content.ID))
-		row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, InputVersion: 1, Input: input, InputHash: c.name, SubjectType: subjectType, SubjectKey: subjectKey}))
+		row, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeUploadPlan, InputVersion: 1, Input: input, SubjectType: subjectType, SubjectKey: subjectKey}))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -31,7 +31,7 @@ func TestTaskIdentityLookupUsesIdentityIndex(t *testing.T) {
 	for id := int64(1); id <= 512; id++ {
 		history = append(history, repositoryTestTask(&model.Task{
 			ID: id, Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "identity", Generation: new(id),
-			InputVersion: 1, InputHash: "identity", Input: json.RawMessage(`{}`),
+			InputVersion: 1, Input: json.RawMessage(`{}`),
 			Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 		}))
@@ -43,7 +43,7 @@ func TestTaskIdentityLookupUsesIdentityIndex(t *testing.T) {
 	for id := int64(513); id <= 1024; id++ {
 		live = append(live, repositoryTestTask(&model.Task{
 			ID: id, Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "identity", Generation: new(id),
-			InputVersion: 1, InputHash: "identity", Input: json.RawMessage(`{}`),
+			InputVersion: 1, Input: json.RawMessage(`{}`),
 			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: now, CreatedAt: now, UpdatedAt: now,
 		}))
@@ -76,7 +76,7 @@ func TestCurrentFailedSubjectHistoryPagination(t *testing.T) {
 	for id := int64(1); id <= 512; id++ {
 		row := repositoryTestTask(&model.Task{
 			ID: id, Type: model.TaskTypeUploadPlan, SubjectType: st, SubjectKey: "other",
-			InputVersion: 1, InputHash: "subject", Input: json.RawMessage(`{}`),
+			InputVersion: 1, Input: json.RawMessage(`{}`),
 			Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})
@@ -124,7 +124,7 @@ func assertTaskHistoryPaginationAcrossLongArchivedChain(t *testing.T, db *bun.DB
 	round := func(id int64) *model.Task {
 		row := repositoryTestTask(&model.Task{
 			ID: id, Type: model.TaskTypeUploadPlan, SubjectType: "test", SubjectKey: "paged-history", Generation: new(int64(0)),
-			InputVersion: 1, InputHash: "history", Input: json.RawMessage(`{"source":"retained"}`),
+			InputVersion: 1, Input: json.RawMessage(`{"source":"retained"}`),
 			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
 			AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})

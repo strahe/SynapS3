@@ -76,9 +76,33 @@ func TestSealIntentAndCachePressureSurviveRuntimeRestart(t *testing.T) {
 				}
 				return sign(ctx, pieces)
 			}
-			cancel, done := runHandlerEngine(t, f.runtime)
+			runCtx, stopAtRetry := context.WithCancel(ctx)
+			retrySettled := make(chan struct{}, 1)
+			firstEngine, err := taskengine.NewEngine(taskengine.EngineConfig{
+				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+				OnTaskSettled: func(claimed *model.Task, transition repository.TaskTransition) {
+					if claimed.ID == taskID && transition.IncrementRetry {
+						stopAtRetry()
+						retrySettled <- struct{}{}
+					}
+				},
+			}, f.runtime.repos, handlerExecutionRegistry(t, f.runtime), slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstDone := make(chan struct{})
+			go func() {
+				defer close(firstDone)
+				_ = firstEngine.Run(runCtx)
+			}()
+			defer stopHandlerEngine(t, stopAtRetry, firstDone)
+			select {
+			case <-retrySettled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("signing failure did not settle a retry")
+			}
+			stopHandlerEngine(t, stopAtRetry, firstDone)
 			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusPending && task.RetryCount > 0 })
-			stopHandlerEngine(t, cancel, done)
 			if got := f.request(t, requestID); got.Status != storagecommit.RequestStatusCollecting || (source == "manual" && got.SealRequestedAt == nil) {
 				t.Fatalf("retry lost intent: %#v", got)
 			}
@@ -113,7 +137,7 @@ func TestSealIntentAndCachePressureSurviveRuntimeRestart(t *testing.T) {
 			if plannerID != 0 {
 				wakeTask(t, f.runtime, plannerID)
 			}
-			cancel, done = runHandlerEngine(t, f.runtime)
+			cancel, done := runHandlerEngine(t, f.runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
 			if got := f.request(t, requestID); got.Status != storagecommit.RequestStatusConfirmed || got.SealRequestedAt != nil {

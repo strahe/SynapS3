@@ -1,10 +1,7 @@
 package worker
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -183,13 +180,6 @@ func (e *Engine) executeClaimSafely(parent context.Context, claimed *model.Task)
 
 func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	logger := e.logger.With("task_id", claimed.ID, "task_type", claimed.Type, "claim_generation", claimed.ClaimGeneration)
-	policy, policyErr := DecodePolicy(claimed)
-	if policyErr != nil {
-		if err := e.commitResult(parent, claimed, Fail(policyErr, "invalid_policy", nil)); err != nil {
-			e.abandonClaim(claimed)
-		}
-		return
-	}
 	handler, ok := e.registry.Handler(claimed.Type)
 	if !ok {
 		logger.Error("claimed task has no registered handler")
@@ -206,6 +196,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 		}
 		return
 	}
+	policy := definition.Policy
 	if claimed.InputVersion != definition.InputVersion {
 		logger.Error("claimed task input version is unsupported", "input_version", claimed.InputVersion, "current_version", definition.InputVersion)
 		if e.failClaim(parent, claimed, failureInputVersionUnsupported, fmt.Errorf("task input version %d is unsupported", claimed.InputVersion)) != nil {
@@ -225,17 +216,8 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 		}
 		return
 	}
-	inputSum := sha256.Sum256(canonical)
-	if !bytes.Equal(inputSum[:], decodeHash(claimed.InputHash)) {
-		err := errors.New("stored task input hash does not match its canonical input")
-		logger.Error("claimed task input hash is invalid")
-		if e.failClaim(parent, claimed, failureInvalidInputHash, err) != nil {
-			e.abandonClaim(claimed)
-		}
-		return
-	}
 	// PostgreSQL JSONB may normalize whitespace and key order. Handler input is
-	// always the codec's canonical representation after its hash is verified.
+	// always the codec's canonical representation.
 	claimed.Input = canonical
 
 	handlerCtx, cancelHandler := context.WithCancel(parent)
@@ -263,7 +245,8 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	}
 
 	execution := Execution{
-		task: *claimed,
+		task:   *claimed,
+		policy: policy,
 		checkpoint: func(ctx context.Context, value any, settlement Settlement, startWork bool) error {
 			if !leaseSafe.Load() {
 				return repository.ErrTaskLeaseLost
@@ -397,7 +380,6 @@ const (
 	failureInputVersionUnsupported = "input_version_unsupported"
 	failureInvalidInput            = "invalid_input"
 	failureInputCodecPanic         = "input_codec_panic"
-	failureInvalidInputHash        = "invalid_input_hash"
 	failureHandlerPanic            = "handler_panic"
 	failureInvalidResult           = "invalid_result"
 )
@@ -493,7 +475,6 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 				return err
 			}
 			transition = e.transitionFor(current, result)
-			transition.CancellationObserved = claimed.CancellationRequested()
 			if result.kind == resultRetry {
 				if transition.IncrementRetry && result.onRetry != nil {
 					if err := result.onRetry(settlementCtx, txRepos, transition.AvailableAt); err != nil {
@@ -591,12 +572,9 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.ResumeMode = result.resumeMode
 		transition.AvailableAt = now.Add(result.delay)
 	case resultRetry:
-		policy, err := DecodePolicy(claimed)
-		if err != nil {
-			transition.Status = model.TaskStatusFailed
-			transition.FailureReason = textPointer("invalid_policy")
-			transition.LastError = errorPointer(err)
-		} else if claimed.RetryCount >= policy.MaxAttempts-1 {
+		definition, _ := e.registry.Definition(claimed.Type)
+		policy := definition.Policy
+		if claimed.RetryCount >= policy.MaxAttempts-1 {
 			transition.Status = model.TaskStatusFailed
 			transition.FailureReason = textPointer("attempts_exhausted")
 		} else {
@@ -811,12 +789,4 @@ func errorPointer(err error) *string {
 		message = message[:cut] + "…"
 	}
 	return &message
-}
-
-func decodeHash(value string) []byte {
-	decoded, err := hex.DecodeString(value)
-	if err != nil {
-		return nil
-	}
-	return decoded
 }

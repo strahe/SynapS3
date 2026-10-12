@@ -113,7 +113,7 @@ func (f commitFixture) request(t *testing.T, id string) *storagecommit.Request {
 func commitTask(requestID string) *model.Task {
 	return repositoryTestTask(&model.Task{
 		Type: model.TaskTypeStorageCommit, SubjectType: "test", SubjectKey: requestID, Generation: new(int64(0)), InputVersion: 1,
-		Input: fmt.Appendf(nil, `{"request_id":%q}`, requestID), InputHash: requestID,
+		Input:  fmt.Appendf(nil, `{"request_id":%q}`, requestID),
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 	})
 }
@@ -566,7 +566,7 @@ func testRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T, f commitFix
 	}
 	now := time.Now()
 	generation := row.ClaimGeneration + 1
-	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusRunning).Set("claim_generation = ?", generation).Set("claimed_at = ?", now).Set("lease_until = ?", now.Add(time.Minute)).Set("started_at = ?", now).Where("id = ?", taskID).Exec(ctx); err != nil {
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusRunning).Set("claim_generation = ?", generation).Set("lease_until = ?", now.Add(time.Minute)).Where("id = ?", taskID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.repos.Tasks.Settle(ctx, taskID, generation, repository.TaskTransition{Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute}); err != nil {

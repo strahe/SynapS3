@@ -941,7 +941,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 					"subject_type":        "object_version",
 					"subject_key":         "version-1",
 					"retry_count":         5,
-					"max_attempts":        6,
+					"max_attempts":        nil,
 					"available_at":        "2026-05-05T10:00:00Z",
 				}},
 			})
@@ -955,6 +955,9 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		if !strings.Contains(out, "object_version:version-1") {
 			t.Fatalf("task output missing subject key:\n%s", out)
 		}
+		if !strings.Contains(out, "RETRIES/CURRENT LIMIT") || strings.Contains(out, "5/5") {
+			t.Fatalf("terminal task output invents a retry limit:\n%s", out)
+		}
 	})
 
 	t.Run("task list json preserves diagnostic and lifecycle fields", func(t *testing.T) {
@@ -962,7 +965,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []map[string]any{{
 				"id": 9, "type": "storage_store", "operation": "Store content",
 				"status": "failed", "presentation_status": "failed",
-				"retry_count": 5, "max_attempts": 6, "retryable": false, "acknowledgeable": false,
+				"retry_count": 5, "max_attempts": nil, "retryable": false, "acknowledgeable": false,
 				"failure_reason": "provider_error", "last_error": "provider unavailable",
 				"available_at": "2026-05-05T10:00:00Z", "started_at": "2026-05-05T10:00:01Z",
 				"finished_at": "2026-05-05T10:00:02Z", "acknowledged_at": "2026-05-05T10:00:03Z",
@@ -980,6 +983,9 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 				t.Fatalf("task list json dropped %s: %s", field, out)
 			}
 		}
+		if !strings.Contains(out, `"max_attempts": null`) {
+			t.Fatalf("task list json dropped the nullable current limit: %s", out)
+		}
 	})
 
 	t.Run("task list shows presentation status and message", func(t *testing.T) {
@@ -996,8 +1002,8 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 					"subject_key":         "version-2",
 					"status":              "pending",
 					"presentation_status": "Waiting",
-					"retry_count":         0,
-					"max_attempts":        6,
+					"retry_count":         5,
+					"max_attempts":        3,
 					"wait_reason":         "durability_pending",
 					"status_message":      "Waiting for durable storage",
 					"available_at":        "2026-05-05T10:00:00Z",
@@ -1015,6 +1021,9 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		}
 		if !strings.Contains(out, "Waiting for durable storage") || strings.Contains(out, "durability_pending") {
 			t.Fatalf("task output missing waiting details:\n%s", out)
+		}
+		if !strings.Contains(out, "RETRIES/CURRENT LIMIT") || !strings.Contains(out, "5/2") {
+			t.Fatalf("task output changed previously scheduled retries:\n%s", out)
 		}
 	})
 }

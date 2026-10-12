@@ -20,7 +20,7 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 	st, sk := "periodic", "cache"
 	template := repositoryTestTask(&model.Task{
 		ID: 700001, Type: model.TaskTypeUploadPlan,
-		InputVersion: 1, InputHash: "history", Input: json.RawMessage(`{}`),
+		InputVersion: 1, Input: json.RawMessage(`{}`),
 		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeExecute,
 		SubjectType: st, SubjectKey: sk, AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
@@ -62,7 +62,7 @@ func TestPostgresCurrentFailedHistoryPlanWithSupersededSkew(t *testing.T) {
 	for i, id := range []int64{600001, 600002} {
 		row := repositoryTestTask(&model.Task{
 			ID: id, Type: model.TaskTypeUploadPlan, SubjectType: st, SubjectKey: "other",
-			InputVersion: 1, InputHash: "work", Input: json.RawMessage(`{}`),
+			InputVersion: 1, Input: json.RawMessage(`{}`),
 			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeExecute,
 			AvailableAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})

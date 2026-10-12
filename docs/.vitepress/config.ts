@@ -86,7 +86,7 @@ const enSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: 'Production Checklist', link: '/en/operations/production-checklist' },
       { text: 'Health and Metrics', link: '/en/operations/health-metrics' },
-      { text: 'Upgrade and Recovery', link: '/en/operations/upgrade-recovery' },
+      { text: 'Backup and Recovery', link: '/en/operations/upgrade-recovery' },
       { text: 'Troubleshooting', link: '/en/operations/troubleshooting' },
     ],
   },
@@ -132,7 +132,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: '生产环境检查清单', link: '/zh/operations/production-checklist' },
       { text: '健康检查与指标', link: '/zh/operations/health-metrics' },
-      { text: '升级与恢复', link: '/zh/operations/upgrade-recovery' },
+      { text: '备份与恢复', link: '/zh/operations/upgrade-recovery' },
       { text: '故障排查', link: '/zh/operations/troubleshooting' },
     ],
   },

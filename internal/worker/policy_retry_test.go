@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -14,35 +13,40 @@ import (
 	"github.com/uptrace/bun"
 )
 
-func TestRetryUsesCurrentPolicyWithoutChangingSourceSnapshot(t *testing.T) {
-	limit := 5
-	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result { return Fail(errors.New("stopped"), "stopped", nil) }}, nil)
-	row := enqueueTestTask(t, h, "policy")
-	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
-	registry := NewRegistry()
-	newLimit := 1
-	if err := registry.Register(scriptedHandler{definition: testDefinition(&newLimit, true)}); err != nil {
-		t.Fatal(err)
+func TestRetryUsesCurrentPolicy(t *testing.T) {
+	old := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true), execute: func(context.Context, Execution) Result {
+		return Fail(errors.New("stopped"), "stopped", nil)
+	}}, nil)
+	row := enqueueTestTask(t, old, "policy")
+	old.engine.executeClaim(t.Context(), claimTestTask(t, old))
+	limit := 1
+	definition := testDefinition(&limit, true)
+	definition.Policy.ObservationWindow = time.Minute
+	current := newTaskHarnessWithDB(t, old.db, scriptedHandler{definition: definition, recover: func(_ context.Context, execution Execution) Result {
+		if execution.Policy() != definition.Policy {
+			t.Fatalf("execution policy = %#v, want %#v", execution.Policy(), definition.Policy)
+		}
+		return RetryBackoff(errors.New("temporary"), "temporary", nil)
+	}}, nil)
+	if policy, ok := current.service.Policy(testTaskType); !ok || policy != definition.Policy {
+		t.Fatalf("service policy = %#v, available=%v", policy, ok)
 	}
-	service, err := NewService(registry, h.repos)
+	if _, ok := current.service.Policy("unregistered"); ok {
+		t.Fatal("unregistered task has an execution policy")
+	}
+	next, err := current.service.Retry(t.Context(), row.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, err := service.Retry(t.Context(), row.ID)
-	if err != nil {
-		t.Fatal(err)
+	current.engine.executeClaim(t.Context(), claimTestTask(t, current))
+	scheduled, err := current.repos.Tasks.GetByID(t.Context(), next.ID)
+	if err != nil || scheduled.Status != model.TaskStatusPending || scheduled.RetryCount != 1 {
+		t.Fatalf("retry under current policy = %#v, err=%v", scheduled, err)
 	}
-	original, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
-	oldPolicy, err := DecodePolicy(original)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newPolicy, err := DecodePolicy(next)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if oldPolicy.MaxAttempts != 6 || newPolicy.MaxAttempts != 2 {
-		t.Fatalf("policies old=%#v new=%#v", oldPolicy, newPolicy)
+	current.engine.executeClaim(t.Context(), claimTestTask(t, current))
+	exhausted, err := current.repos.Tasks.GetByID(t.Context(), next.ID)
+	if err != nil || exhausted.Status != model.TaskStatusFailed || dereference(exhausted.FailureReason) != "attempts_exhausted" || exhausted.RetryCount != 1 {
+		t.Fatalf("current budget exhaustion = %#v, err=%v", exhausted, err)
 	}
 }
 
@@ -122,17 +126,78 @@ func TestFinalOpportunityMayAdmitAndCompleteEffect(t *testing.T) {
 	}
 }
 
-func TestExhaustionSelectsOnlyExhaustedSettlement(t *testing.T) {
-	limit := 0
-	retried, exhausted := false, false
-	h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result {
-		return RetryBackoff(errors.New("unknown result"), "temporary", nil).WithRetrySettlements(func(context.Context, *repository.Repositories, time.Time) error { retried = true; return nil }, func(context.Context, *repository.Repositories) error { exhausted = true; return nil })
-	}}, nil)
-	row := enqueueTestTask(t, h, "exhaust")
-	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
-	stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
-	if retried || !exhausted || stored.RetryCount != 0 || dereference(stored.FailureReason) != "attempts_exhausted" {
-		t.Fatalf("exhaustion: %#v", stored)
+func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		oldMax, scheduled, currentMax int
+		mode                          model.TaskResumeMode
+		outcome                       string
+		wantStatus                    model.TaskStatus
+		wantRetries                   int
+		wantFailure                   string
+	}{
+		{"final retry", 1, 0, 1, model.TaskResumeModeExecute, "retry", model.TaskStatusFailed, 0, "attempts_exhausted"},
+		{"decreased complete", 6, 3, 2, model.TaskResumeModeExecute, "complete", model.TaskStatusCompleted, 3, ""},
+		{"decreased wait", 6, 3, 2, model.TaskResumeModeRecover, "wait", model.TaskStatusPending, 3, ""},
+		{"decreased retry", 6, 3, 2, model.TaskResumeModeRecover, "retry", model.TaskStatusFailed, 3, "attempts_exhausted"},
+		{"increased retry", 2, 1, 4, model.TaskResumeModeRecover, "retry", model.TaskStatusPending, 2, "temporary"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldLimit := tc.oldMax - 1
+			schedule := func(context.Context, Execution) Result {
+				return RetryBackoff(errors.New("temporary"), "temporary", nil).WithResumeMode(tc.mode)
+			}
+			old := newTaskHarness(t, scriptedHandler{definition: testDefinition(&oldLimit, true), execute: schedule, recover: schedule}, nil)
+			row := enqueueTestTask(t, old, "scheduled")
+			for range tc.scheduled {
+				old.engine.executeClaim(t.Context(), claimTestTask(t, old))
+			}
+			limit := tc.currentMax - 1
+			definition := testDefinition(&limit, true)
+			called, retried, exhausted := false, false, false
+			run := func(_ context.Context, execution Execution) Result {
+				called = true
+				if execution.Policy() != definition.Policy || execution.Mode() != tc.mode {
+					t.Fatalf("scheduled invocation = policy:%#v mode:%s", execution.Policy(), execution.Mode())
+				}
+				switch tc.outcome {
+				case "complete":
+					return Complete("Done", nil)
+				case "wait":
+					return Wait(tc.mode, time.Millisecond, "observing", "Waiting", nil)
+				default:
+					return RetryBackoff(errors.New("temporary"), "temporary", nil).WithRetrySettlements(
+						func(context.Context, *repository.Repositories, time.Time) error { retried = true; return nil },
+						func(ctx context.Context, repos *repository.Repositories) error {
+							exhausted = true
+							return repos.Tasks.AppendEvent(ctx, execution.ID(), "exhaustion_settled", nil)
+						},
+					)
+				}
+			}
+			current := newTaskHarnessWithDB(t, old.db, scriptedHandler{definition: definition, execute: run, recover: run}, nil)
+			current.engine.executeClaim(t.Context(), claimTestTask(t, current))
+			stored, err := current.repos.Tasks.GetByID(t.Context(), row.ID)
+			if err != nil || !called || stored.Status != tc.wantStatus || stored.RetryCount != tc.wantRetries || dereference(stored.FailureReason) != tc.wantFailure {
+				t.Fatalf("scheduled opportunity = %#v called=%v err=%v", stored, called, err)
+			}
+			wantExhausted := tc.wantFailure == "attempts_exhausted"
+			wantRetried := tc.outcome == "retry" && !wantExhausted
+			if exhausted != wantExhausted || retried != wantRetried {
+				t.Fatalf("settlements retry=%v exhausted=%v", retried, exhausted)
+			}
+			events, err := current.repos.Tasks.ListEvents(t.Context(), row.ID, 0, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			settled := false
+			for _, event := range events {
+				settled = settled || event.Type == "exhaustion_settled"
+			}
+			if settled != wantExhausted {
+				t.Fatalf("exhaustion evidence = %v, want %v", settled, wantExhausted)
+			}
+		})
 	}
 }
 
@@ -164,72 +229,20 @@ func TestTaskContentionPreservesFinalOpportunityAndRecovery(t *testing.T) {
 	}
 }
 
-func TestMalformedPolicyNeverDispatchesHandler(t *testing.T) {
-	// The schema already refuses policies other than version 2.
-	for _, field := range []string{"invocation_timeout", "observation_window", "backoff"} {
-		t.Run(field, func(t *testing.T) {
-			called := false
-			h := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true), execute: func(context.Context, Execution) Result { called = true; return Complete("Done", nil) }}, nil)
-			row := enqueueTestTask(t, h, "corrupt-policy")
-			var snapshot map[string]json.RawMessage
-			if err := json.Unmarshal(row.Policy, &snapshot); err != nil {
-				t.Fatal(err)
-			}
-			delete(snapshot, field)
-			raw, err := json.Marshal(snapshot)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := h.db.NewUpdate().Model((*model.Task)(nil)).Set("policy_json = ?", json.RawMessage(raw)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
-			stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
-			if called || stored.Status != model.TaskStatusFailed || dereference(stored.FailureReason) != "invalid_policy" {
-				t.Fatalf("invalid policy: %#v", stored)
-			}
-		})
-	}
-}
-
-func TestDecodePolicyRejectsUnavailableBudget(t *testing.T) {
-	raw, err := encodePolicy(ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, budget := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(`0`), json.RawMessage(`-1`)} {
-		var snapshot map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &snapshot); err != nil {
-			t.Fatal(err)
-		}
-		if budget == nil {
-			delete(snapshot, "max_attempts")
-		} else {
-			snapshot["max_attempts"] = budget
-		}
-		policy, err := json.Marshal(snapshot)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := DecodePolicy(&model.Task{Policy: policy}); !errors.Is(err, ErrInvalidPolicy) {
-			t.Fatalf("budget %s accepted: %v", budget, err)
-		}
-	}
-}
-
 func TestInvocationTimeoutAllocatesRecoveryButPreservesObservedCompletion(t *testing.T) {
 	for _, completed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "waiting", true: "completed"}[completed], func(t *testing.T) {
+			old := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true)}, nil)
+			row := enqueueTestTask(t, old, "timeout")
 			definition := testDefinition(nil, true)
 			definition.Policy.InvocationTimeout = 10 * time.Millisecond
-			h := newTaskHarness(t, scriptedHandler{definition: definition, execute: func(ctx context.Context, _ Execution) Result {
+			h := newTaskHarnessWithDB(t, old.db, scriptedHandler{definition: definition, execute: func(ctx context.Context, _ Execution) Result {
 				<-ctx.Done()
 				if completed {
 					return Complete("Done", nil)
 				}
 				return Wait(model.TaskResumeModeRecover, time.Minute, "observing", "Waiting", nil)
 			}}, nil)
-			row := enqueueTestTask(t, h, "timeout")
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 			if completed {

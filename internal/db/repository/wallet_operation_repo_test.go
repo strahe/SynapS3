@@ -176,7 +176,7 @@ func createWalletTask(t *testing.T, repos *repository.Repositories, operationID 
 	t.Helper()
 	row, created, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
 		Type:         model.TaskTypeWalletOperation,
-		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"operation_id":%d}`, operationID)), InputHash: key,
+		InputVersion: 1, Input: []byte(fmt.Sprintf(`{"operation_id":%d}`, operationID)),
 		SubjectType: "wallet_operation", SubjectKey: strconv.FormatInt(operationID, 10),
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 		AvailableAt: time.Now(),

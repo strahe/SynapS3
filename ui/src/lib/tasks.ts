@@ -88,13 +88,7 @@ export function taskRetryPolicyView(
   const retryLimit = known ? limit - 1 : undefined
   const remaining = retryLimit === undefined ? undefined : Math.max(0, retryLimit - task.retry_count)
   let status: string
-  if (task.status === 'failed') {
-    status = task.failure_reason === 'attempts_exhausted' ? 'Limit reached' : 'Stopped'
-  } else if (task.status === 'completed') {
-    status = 'Finished'
-  } else if (task.status === 'cancelled') {
-    status = 'Cancelled'
-  } else if (remaining === undefined) {
+  if (remaining === undefined) {
     status = 'Unknown'
   } else if (retryLimit === 0) {
     status = 'Disabled'

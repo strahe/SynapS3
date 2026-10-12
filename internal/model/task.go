@@ -81,7 +81,6 @@ type Task struct {
 	ID           int64    `bun:",pk,autoincrement,identity"`
 	Type         TaskType `bun:"type:text,notnull"`
 	InputVersion int      `bun:"type:integer,notnull"`
-	InputHash    string   `bun:"type:text,notnull"`
 	// The identity is (Type, SubjectType, SubjectKey, Generation). A nil
 	// Generation is never deduplicated.
 	SubjectType   string `bun:"type:text,notnull"`
@@ -91,7 +90,6 @@ type Task struct {
 
 	Input      json.RawMessage `bun:"input_json,type:jsonb,notnull"`
 	Checkpoint json.RawMessage `bun:"checkpoint_json,type:jsonb,nullzero"`
-	Policy     json.RawMessage `bun:"policy_json,type:jsonb,notnull"`
 	Runtime    json.RawMessage `bun:"runtime_json,type:jsonb,notnull"`
 
 	Status        TaskStatus     `bun:"type:text,notnull,default:'pending'"`
@@ -103,18 +101,14 @@ type Task struct {
 	LastError     *string        `bun:"type:text,nullzero"`
 	StatusMessage *string        `bun:"type:text,nullzero"`
 
-	CancellationRequestedAt *time.Time `bun:",nullzero"`
-	CancellationReason      *string    `bun:"type:text,nullzero"`
-	ClaimGeneration         int64      `bun:",notnull,default:0"`
-	ClaimedAt               *time.Time `bun:",nullzero"`
-	LeaseUntil              *time.Time `bun:",nullzero"`
-	StartedAt               *time.Time `bun:",nullzero"`
-	FinishedAt              *time.Time `bun:",nullzero"`
-	CreatedAt               time.Time  `bun:",nullzero,notnull"`
-	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
-	WorkStartedAt           *time.Time `bun:",nullzero"`
-	AcknowledgedAt          *time.Time `bun:",nullzero"`
-	SupersededAt            *time.Time `bun:",nullzero"`
+	ClaimGeneration int64      `bun:",notnull,default:0"`
+	LeaseUntil      *time.Time `bun:",nullzero"`
+	FinishedAt      *time.Time `bun:",nullzero"`
+	CreatedAt       time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt       time.Time  `bun:",nullzero,notnull"`
+	WorkStartedAt   *time.Time `bun:",nullzero"`
+	AcknowledgedAt  *time.Time `bun:",nullzero"`
+	SupersededAt    *time.Time `bun:",nullzero"`
 }
 
 // TaskRuntime is durable admission evidence, independent of diagnostic events.
@@ -142,10 +136,6 @@ type TaskSchedule struct {
 	NextRunAt     time.Time `bun:",notnull"`
 	LatestTaskID  *int64    `bun:",nullzero"`
 	Generation    int64     `bun:",notnull"`
-}
-
-func (t *Task) CancellationRequested() bool {
-	return t != nil && t.CancellationRequestedAt != nil
 }
 
 var _ bun.BeforeAppendModelHook = (*Task)(nil)

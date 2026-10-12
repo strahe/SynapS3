@@ -452,8 +452,8 @@ func insertSchemaTestTask(t *testing.T, db *bun.DB, key string) int64 {
 	t.Helper()
 	var id int64
 	if err := db.QueryRow(`INSERT INTO tasks
-		(type,subject_type,subject_key,generation,input_version,input_hash,available_at,created_at,updated_at,input_json,policy_json,runtime_json)
-		VALUES ('test','test',?,0,1,'hash',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{"version":2,"max_attempts":6}','{}') RETURNING id`, key).Scan(&id); err != nil {
+		(type,subject_type,subject_key,generation,input_version,available_at,created_at,updated_at,input_json,runtime_json)
+		VALUES ('test','test',?,0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}','{}') RETURNING id`, key).Scan(&id); err != nil {
 		t.Fatalf("insert task %q: %v", key, err)
 	}
 	return id
@@ -692,7 +692,7 @@ func TestCurrentSchemaAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
 	})
 }
 
-func TestTaskTableEnforcesStateAndBudget(t *testing.T) {
+func TestTaskTableEnforcesStateAndClaim(t *testing.T) {
 	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		id := insertSchemaTestTask(t, db, "working")
 		for _, statement := range []string{
@@ -702,24 +702,23 @@ func TestTaskTableEnforcesStateAndBudget(t *testing.T) {
 			`UPDATE tasks SET superseded_at=CURRENT_TIMESTAMP WHERE id=?`,
 			`UPDATE tasks SET retry_count=-1 WHERE id=?`,
 			`UPDATE tasks SET input_json='[]' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":0}' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"version":2}' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":null}' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":"6"}' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"version":2,"max_attempts":1.5}' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"max_attempts":6}' WHERE id=?`,
-			`UPDATE tasks SET policy_json='{"version":1,"max_attempts":6}' WHERE id=?`,
+			`UPDATE tasks SET input_version=0 WHERE id=?`,
+			`UPDATE tasks SET status='running',claim_generation=1 WHERE id=?`,
+			`UPDATE tasks SET status='running',lease_until=CURRENT_TIMESTAMP WHERE id=?`,
+			`UPDATE tasks SET lease_until=CURRENT_TIMESTAMP WHERE id=?`,
 		} {
 			mustRejectStatement(t, db, statement, id)
 		}
-		mustRejectStatement(t, db, `UPDATE tasks SET retry_count=6 WHERE id=?`, id)
-		if _, err := db.Exec(`UPDATE tasks SET status='completed',finished_at=CURRENT_TIMESTAMP,superseded_at=CURRENT_TIMESTAMP WHERE id=?`, id); err != nil {
+		if _, err := db.Exec(`UPDATE tasks SET retry_count=6,status='running',claim_generation=1,lease_until=CURRENT_TIMESTAMP WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE tasks SET status='completed',lease_until=NULL,finished_at=CURRENT_TIMESTAMP,superseded_at=CURRENT_TIMESTAMP WHERE id=?`, id); err != nil {
 			t.Fatal(err)
 		}
 		for _, statement := range []string{
 			`UPDATE tasks SET acknowledged_at=CURRENT_TIMESTAMP WHERE id=?`,
 			`UPDATE tasks SET status='pending' WHERE id=?`,
-			`UPDATE tasks SET status='running',claim_generation=1,claimed_at=CURRENT_TIMESTAMP,lease_until=CURRENT_TIMESTAMP,finished_at=NULL WHERE id=?`,
+			`UPDATE tasks SET status='running',claim_generation=1,lease_until=CURRENT_TIMESTAMP,finished_at=NULL WHERE id=?`,
 		} {
 			mustRejectStatement(t, db, statement, id)
 		}

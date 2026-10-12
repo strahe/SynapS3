@@ -92,8 +92,8 @@ func TestManualPullRetryPreservesEarliestRequestTime(t *testing.T) {
 		calls.Add(1)
 		return nil, errors.Join(pdp.ErrPullQueueFull, &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour})
 	}, nil, &limit)
-	if handlerTaskMaxAttempts(t, source) != 12 {
-		t.Fatalf("new Pull budget = %s", source.Policy)
+	if handlerTaskMaxAttempts(t, runtime, source) != 12 {
+		t.Fatalf("new Pull budget = %d", handlerTaskMaxAttempts(t, runtime, source))
 	}
 	runOneStorageTask(t, runtime, source, model.TaskStatusPending)
 	reason := "attempts_exhausted"
@@ -114,7 +114,7 @@ func TestManualPullRetryPreservesEarliestRequestTime(t *testing.T) {
 	}
 	runtime.testMaxAttempts = nil
 	waiting := runOneStorageTask(t, runtime, child, model.TaskStatusPending)
-	if calls.Load() != 1 || waiting.RetryCount != 0 || waiting.AvailableAt.Before(checkpoint.NextRequestAt) || handlerTaskMaxAttempts(t, failed) != 6 || handlerTaskMaxAttempts(t, waiting) != 12 {
+	if calls.Load() != 1 || waiting.RetryCount != 0 || waiting.AvailableAt.Before(checkpoint.NextRequestAt) || handlerTaskMaxAttempts(t, runtime, waiting) != 12 {
 		t.Fatalf("manual recovery bypassed provider delay: calls=%d task=%#v", calls.Load(), waiting)
 	}
 }
@@ -149,7 +149,7 @@ func TestManualRetryCreatesIndependentCopyRound(t *testing.T) {
 	if child.ID == source.ID || child.RetryOfTaskID == nil || *child.RetryOfTaskID != source.ID {
 		t.Fatalf("new execution relationship = %#v", child)
 	}
-	if child.RetryCount != 0 || handlerTaskMaxAttempts(t, child) != 6 || child.AcknowledgedAt != nil || child.WorkStartedAt != nil || child.FinishedAt != nil {
+	if child.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, child) != 6 || child.AcknowledgedAt != nil || child.WorkStartedAt != nil || child.FinishedAt != nil {
 		t.Fatalf("new execution budget/timing = %#v", child)
 	}
 	if !bytes.Equal(child.Checkpoint, before.Checkpoint) {
@@ -159,7 +159,7 @@ func TestManualRetryCreatesIndependentCopyRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Status != before.Status || after.RetryCount != before.RetryCount || after.AcknowledgedAt == nil || !after.AcknowledgedAt.Equal(*before.AcknowledgedAt) || !after.FinishedAt.Equal(*before.FinishedAt) || !bytes.Equal(after.Policy, before.Policy) || !bytes.Equal(after.Checkpoint, before.Checkpoint) || after.SupersededAt == nil {
+	if after.Status != before.Status || after.RetryCount != before.RetryCount || after.AcknowledgedAt == nil || !after.AcknowledgedAt.Equal(*before.AcknowledgedAt) || !after.FinishedAt.Equal(*before.FinishedAt) || !bytes.Equal(after.Checkpoint, before.Checkpoint) || after.SupersededAt == nil {
 		t.Fatalf("source execution changed: before=%#v after=%#v", before, after)
 	}
 	owned, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)

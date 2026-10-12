@@ -70,12 +70,12 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	if err != nil || !waiting.AvailableAt.Equal(due) {
 		t.Fatalf("queue-full deadline changed: %#v, %v", waiting, err)
 	}
-	if err := f.repos.Tasks.RequestCancellation(ctx, row.ID, "cancel pull"); err != nil {
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
-	if err != nil || claimed == nil || claimed.ID != row.ID || !claimed.CancellationRequested() {
-		t.Fatalf("cancel did not wake recovery: %#v, %v", claimed, err)
+	if err != nil || claimed == nil || claimed.ID != row.ID || claimed.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("due pull did not resume recovery: %#v, %v", claimed, err)
 	}
 	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: new(storagepull.FailureRecoveryBlocked),
@@ -91,26 +91,14 @@ func testPullTaskRecoveryProtection(t *testing.T, f commitFixture) {
 	}); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
 		t.Fatalf("delete unresolved pull's last reference = %v", err)
 	}
-	row = repositorySuccessor(t, f.repos, row, true)
+	row = repositorySuccessor(t, f.repos, row)
 	retried, err := f.repos.Tasks.GetByID(ctx, row.ID)
-	if err != nil || !retried.CancellationRequested() || retried.CancellationReason == nil || *retried.CancellationReason != "cancel pull" ||
-		retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
-		t.Fatalf("dependency retry lost cancellation or evidence: %#v, %v", retried, err)
+	if err != nil || retried.ResumeMode != model.TaskResumeModeRecover || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
+		t.Fatalf("dependency retry lost recovery evidence: %#v, %v", retried, err)
 	}
 	claimed, err = f.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
-	if err != nil || claimed == nil || claimed.ID != row.ID || !claimed.CancellationRequested() {
-		t.Fatalf("retry did not resume cancellation recovery: %#v, %v", claimed, err)
-	}
-	if err := f.repos.Tasks.Settle(ctx, row.ID, claimed.ClaimGeneration, repository.TaskTransition{
-		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: new(storagepull.FailureCancelOutcomeUnknown),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	row = repositorySuccessor(t, f.repos, row, false)
-	retried, err = f.repos.Tasks.GetByID(ctx, row.ID)
-	if err != nil || retried.Status != model.TaskStatusPending || retried.ResumeMode != model.TaskResumeModeRecover ||
-		retried.CancellationRequestedAt != nil || retried.CancellationReason != nil || !bytes.Equal(retried.Checkpoint, claimed.Checkpoint) {
-		t.Fatalf("manual retry lost evidence or cancellation persists: %#v, %v", retried, err)
+	if err != nil || claimed == nil || claimed.ID != row.ID || claimed.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("retry did not resume recovery: %#v, %v", claimed, err)
 	}
 	if _, err := f.repos.Contents.GetUnresolvedPullAttempt(ctx, copyRow.ContentID, copyRow.StorageDataSetID); err != nil {
 		t.Fatalf("protected retry lost its attempt: %v", err)

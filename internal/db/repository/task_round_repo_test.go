@@ -125,29 +125,6 @@ func TestTaskEventsArePagedAndTransactional(t *testing.T) {
 	}
 }
 
-func TestTaskCancellationPreservesRecoveryBackoff(t *testing.T) {
-	repos := repository.NewRepositories(testDB(t))
-	ctx := t.Context()
-	row := enqueueAndClaimTask(t, repos, "cancel-backoff", time.Minute)
-	if err := repos.Tasks.RequestCancellation(ctx, row.ID, "cancel"); err != nil {
-		t.Fatal(err)
-	}
-	due := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
-	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: due, CancellationObserved: true, IncrementRetry: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repos.Tasks.RequestCancellation(ctx, row.ID, "cancel again"); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := repos.Tasks.GetByID(ctx, row.ID)
-	if err != nil || !stored.AvailableAt.Equal(due) || stored.RetryCount != 1 {
-		t.Fatalf("cancel reset backoff=%#v,%v", stored, err)
-	}
-	if claimed, err := repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{}); err != nil || claimed != nil {
-		t.Fatalf("claimed delayed cancellation=%#v,%v", claimed, err)
-	}
-}
-
 func TestTaskRoundIdentityAndHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -159,8 +136,8 @@ func TestTaskRoundIdentityAndHistory(t *testing.T) {
 	if err := repos.Tasks.AcknowledgeFailed(ctx, source.ID); err != nil {
 		t.Fatal(err)
 	}
-	child := repositorySuccessor(t, repos, source, false)
-	duplicate, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: child.Type, SubjectType: child.SubjectType, SubjectKey: child.SubjectKey, Generation: child.Generation, InputVersion: 1, Input: json.RawMessage(`{}`), InputHash: "test"}))
+	child := repositorySuccessor(t, repos, source)
+	duplicate, created, err := repos.Tasks.Enqueue(ctx, repositoryTestTask(&model.Task{Type: child.Type, SubjectType: child.SubjectType, SubjectKey: child.SubjectKey, Generation: child.Generation, InputVersion: 1, Input: json.RawMessage(`{}`)}))
 	if err != nil || created || duplicate.ID != child.ID {
 		t.Fatalf("current identity=%#v,%v,%v", duplicate, created, err)
 	}

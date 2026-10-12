@@ -1474,7 +1474,7 @@ func writeAdminTasksTable(w io.Writer, tasks []adminTaskItem) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "ID\tOPERATION\tSTATUS\tRETRIES\tSUBJECT\tAVAILABLE\tDETAILS")
+	_, _ = fmt.Fprintln(tw, "ID\tOPERATION\tSTATUS\tRETRIES/CURRENT LIMIT\tSUBJECT\tAVAILABLE\tDETAILS")
 	for _, task := range tasks {
 		details := adminTaskDetails(task)
 		subject := ""

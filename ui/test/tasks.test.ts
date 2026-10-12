@@ -19,7 +19,7 @@ test('Retry explains a rejected recovery without exposing server diagnostics', (
   }
 })
 
-test('retry policy distinguishes stopped tasks from available automatic retries and counts scheduled retries', () => {
+test('current retry policy counts scheduled retries and available automatic retries', () => {
   const policy: TaskPolicy = {
     max_attempts: 6,
     initial_delay: '1s',
@@ -34,15 +34,12 @@ test('retry policy distinguishes stopped tasks from available automatic retries 
     retry_count: 0,
     available_at: '2026-10-11T01:00:00Z',
   }
-  for (const [status, retry_count, failure_reason, expected] of [
-    ['pending', 0, undefined, '5 remaining'],
-    ['running', 2, undefined, '3 remaining'],
-    ['failed', 0, 'provider_unavailable', 'Stopped'],
-    ['failed', 5, 'attempts_exhausted', 'Limit reached'],
-    ['completed', 2, undefined, 'Finished'],
-    ['cancelled', 1, undefined, 'Cancelled'],
+  for (const [status, retry_count, expected] of [
+    ['pending', 0, '5 remaining'],
+    ['running', 2, '3 remaining'],
+    ['running', 7, '0 remaining'],
   ] as const) {
-    const view = taskRetryPolicyView({ ...task, status, retry_count, failure_reason }, policy)
+    const view = taskRetryPolicyView({ ...task, status, retry_count }, policy)
     assert.equal(view.attemptLimit, '6')
     assert.equal(view.retriesScheduled, `${retry_count} / 5`)
     assert.equal(view.status, expected)

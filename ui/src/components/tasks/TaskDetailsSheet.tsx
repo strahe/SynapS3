@@ -234,6 +234,7 @@ export function TaskDetailsSheet({
                           ['Started', <TaskTime key="started" value={task.started_at} />],
                           ['Finished', <TaskTime key="finished" value={task.finished_at} />],
                           ['Duration', taskTook(task)],
+                          ['Scheduled retries', task.retry_count],
                         ].map(([label, value]) => (
                           <div key={String(label)} className="flex min-w-0 flex-col gap-1">
                             <dt className="text-xs text-muted-foreground">{label}</dt>
@@ -241,53 +242,53 @@ export function TaskDetailsSheet({
                           </div>
                         ))}
                       </dl>
-                      <Separator />
-                      <section className="flex flex-col gap-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <h3 className="font-medium">Execution policy</h3>
-                        </div>
-                        {policy ? (
-                          <dl className="grid gap-3 sm:grid-cols-2">
-                            {[
-                              ['Attempt limit', retryPolicy?.attemptLimit ?? 'Unknown'],
-                              ['Retries scheduled', retryPolicy?.retriesScheduled ?? 'Unknown'],
-                              ['Automatic retries', retryPolicy?.status ?? 'Unknown'],
-                              ...(policy.max_attempts == null || policy.max_attempts === 1
-                                ? []
-                                : [
-                                    [
-                                      'Retry delay',
-                                      `${policy.initial_delay} × ${policy.multiplier}, up to ${policy.maximum_delay}`,
-                                    ],
-                                    ['Delay variation', `±${Math.round(policy.jitter * 100)}%`],
-                                  ]),
-                              [
-                                'Execution timeout',
-                                policy.invocation_timeout === '0s' ? 'Not set' : policy.invocation_timeout,
-                              ],
-                              [
-                                'Result wait limit',
-                                policy.observation_window === '0s' ? 'Not set' : policy.observation_window,
-                              ],
-                            ].map(([label, value]) => (
-                              <div
-                                key={label}
-                                className="flex min-w-0 flex-col gap-1 rounded-lg bg-muted/40 px-3 py-2.5"
-                              >
-                                <dt className="text-xs text-muted-foreground">{label}</dt>
-                                <dd className="break-words tabular-nums">{value}</dd>
-                              </div>
-                            ))}
-                          </dl>
-                        ) : (
-                          <p className="text-muted-foreground">Policy is unavailable for this record.</p>
-                        )}
-                        {retryPolicy?.nextRetryAt && (
-                          <p className="text-xs text-muted-foreground">
-                            Next retry: <TaskTime value={retryPolicy.nextRetryAt} />
-                          </p>
-                        )}
-                      </section>
+                      {policy && (
+                        <>
+                          <Separator />
+                          <section className="flex flex-col gap-3">
+                            <div className="flex items-center justify-between gap-2">
+                              <h3 className="font-medium">Current execution policy</h3>
+                            </div>
+                            <dl className="grid gap-3 sm:grid-cols-2">
+                              {[
+                                ['Attempt limit', retryPolicy?.attemptLimit ?? 'Unknown'],
+                                ['Scheduled retries / current limit', retryPolicy?.retriesScheduled ?? 'Unknown'],
+                                ['Automatic retries', retryPolicy?.status ?? 'Unknown'],
+                                ...(policy.max_attempts == null || policy.max_attempts === 1
+                                  ? []
+                                  : [
+                                      [
+                                        'Retry delay',
+                                        `${policy.initial_delay} × ${policy.multiplier}, up to ${policy.maximum_delay}`,
+                                      ],
+                                      ['Delay variation', `±${Math.round(policy.jitter * 100)}%`],
+                                    ]),
+                                [
+                                  'Execution timeout',
+                                  policy.invocation_timeout === '0s' ? 'Not set' : policy.invocation_timeout,
+                                ],
+                                [
+                                  'Result wait limit',
+                                  policy.observation_window === '0s' ? 'Not set' : policy.observation_window,
+                                ],
+                              ].map(([label, value]) => (
+                                <div
+                                  key={label}
+                                  className="flex min-w-0 flex-col gap-1 rounded-lg bg-muted/40 px-3 py-2.5"
+                                >
+                                  <dt className="text-xs text-muted-foreground">{label}</dt>
+                                  <dd className="break-words tabular-nums">{value}</dd>
+                                </div>
+                              ))}
+                            </dl>
+                            {retryPolicy?.nextRetryAt && (
+                              <p className="text-xs text-muted-foreground">
+                                Next retry: <TaskTime value={retryPolicy.nextRetryAt} />
+                              </p>
+                            )}
+                          </section>
+                        </>
+                      )}
                       {message?.lastError && (
                         <details>
                           <summary className="cursor-pointer text-muted-foreground">Last error</summary>
