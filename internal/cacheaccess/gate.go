@@ -1,14 +1,19 @@
 package cacheaccess
 
 import (
+	"context"
 	"hash/fnv"
 	"io"
 	"sync"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"golang.org/x/sync/semaphore"
 )
 
-const gateShardCount = 256
+const (
+	gateShardCount       = 256
+	gateCapacity   int64 = 1<<63 - 1
+)
 
 // OpenedCacheEntry keeps a cache entry protected from deletion until Body is
 // closed.
@@ -18,8 +23,8 @@ type OpenedCacheEntry struct {
 }
 
 type gateEntry struct {
-	mu   sync.RWMutex
-	refs int
+	permits *semaphore.Weighted
+	refs    int
 }
 
 type gateShard struct {
@@ -40,10 +45,14 @@ func NewGate() *Gate {
 
 // Open protects a successful cache open until the returned body is closed.
 func (g *Gate) Open(
+	ctx context.Context,
 	cacheKey string,
 	open func() (io.ReadCloser, *cache.ObjectInfo, error),
 ) (*OpenedCacheEntry, error) {
-	release := g.HoldRead(cacheKey)
+	release, err := g.HoldRead(ctx, cacheKey)
+	if err != nil {
+		return nil, err
+	}
 
 	body, info, err := open()
 	if err != nil {
@@ -62,43 +71,49 @@ func (g *Gate) Open(
 
 // HoldRead protects a cache entry from deletion across multiple opens. The
 // returned release function is idempotent and must be called by the holder.
-func (g *Gate) HoldRead(cacheKey string) func() {
+func (g *Gate) HoldRead(ctx context.Context, cacheKey string) (func(), error) {
+	return g.hold(ctx, cacheKey, 1)
+}
+
+func (g *Gate) hold(ctx context.Context, cacheKey string, weight int64) (func(), error) {
 	shard, entry := g.acquire(cacheKey)
-	entry.mu.RLock()
+	if err := entry.permits.Acquire(ctx, weight); err != nil {
+		g.release(shard, cacheKey, entry)
+		return nil, err
+	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			entry.mu.RUnlock()
+			entry.permits.Release(weight)
 			g.release(shard, cacheKey, entry)
 		})
-	}
+	}, nil
 }
 
 // Commit serializes a local cache commit with deletion for the same cache key.
-func (g *Gate) Commit(cacheKey string, commit func() error) error {
-	shard, entry := g.acquire(cacheKey)
-	defer g.release(shard, cacheKey, entry)
-
-	entry.mu.RLock()
-	defer entry.mu.RUnlock()
-	return commit()
+func (g *Gate) Commit(ctx context.Context, cacheKey string, commit func() error) error {
+	return g.guardAccess(ctx, cacheKey, commit)
 }
 
 // GuardDeletion waits for open bodies and serializes final checks and physical
 // deletion for one cache key.
-func (g *Gate) GuardDeletion(cacheKey string, remove func()) {
-	shard, entry := g.acquire(cacheKey)
-	defer g.release(shard, cacheKey, entry)
-
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+func (g *Gate) GuardDeletion(ctx context.Context, cacheKey string, remove func()) error {
+	release, err := g.hold(ctx, cacheKey, gateCapacity)
+	if err != nil {
+		return err
+	}
+	defer release()
 	remove()
+	return nil
 }
 
-func (g *Gate) guardAccess(cacheKey string, access func()) {
-	release := g.HoldRead(cacheKey)
+func (g *Gate) guardAccess(ctx context.Context, cacheKey string, access func() error) error {
+	release, err := g.HoldRead(ctx, cacheKey)
+	if err != nil {
+		return err
+	}
 	defer release()
-	access()
+	return access()
 }
 
 func (g *Gate) acquire(cacheKey string) (*gateShard, *gateEntry) {
@@ -111,7 +126,7 @@ func (g *Gate) acquire(cacheKey string) (*gateShard, *gateEntry) {
 	}
 	entry := shard.entries[cacheKey]
 	if entry == nil {
-		entry = &gateEntry{}
+		entry = &gateEntry{permits: semaphore.NewWeighted(gateCapacity)}
 		shard.entries[cacheKey] = entry
 	}
 	entry.refs++

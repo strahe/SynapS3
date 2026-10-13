@@ -114,7 +114,7 @@ func (h *EvictHandler) runCacheEviction(
 		}
 	}
 	var result taskengine.Result
-	h.deps.CacheGate.GuardDeletion(model.ContentCacheKey(input.ContentID), func() {
+	if err := h.deps.CacheGate.GuardDeletion(ctx, model.ContentCacheKey(input.ContentID), func() {
 		if input.AccessedAt != nil {
 			if h.deps.EvictionPolicy != cache.EvictionPolicyLRU || !h.deps.CacheTracker.SafeForLRU() {
 				result = h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
@@ -126,7 +126,9 @@ func (h *EvictHandler) runCacheEviction(
 			}
 		}
 		result = h.deleteAuthorizedCacheEntry(ctx, execution, input, allowDelete)
-	})
+	}); err != nil {
+		return h.retryCacheEviction(execution, input, err, "cache_lock_failed")
+	}
 	return result
 }
 

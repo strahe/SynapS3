@@ -383,7 +383,7 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 				pulls.Add(1)
 				return pullStatusResult(request, storage.PullStatusFailed), nil
 			}
-			provider.target.StoreFunc = func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+			provider.target.UploadStoreSessionFunc = func(_ context.Context, _ string, _ string, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 				data, err := io.ReadAll(reader)
 				if err != nil {
 					return nil, err

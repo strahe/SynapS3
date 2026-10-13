@@ -76,7 +76,9 @@ func assertWriteHoldsContentGateThroughVersionInsert(
 	deletionEntered := make(chan struct{})
 	go func() {
 		close(deletionStarted)
-		tb.gate.GuardDeletion(model.ContentCacheKey(contentID), func() { close(deletionEntered) })
+		if err := tb.gate.GuardDeletion(t.Context(), model.ContentCacheKey(contentID), func() { close(deletionEntered) }); err != nil {
+			t.Errorf("deletion gate: %v", err)
+		}
 	}()
 	<-deletionStarted
 	select {

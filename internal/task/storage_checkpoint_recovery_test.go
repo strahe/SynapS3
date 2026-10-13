@@ -27,6 +27,9 @@ import (
 
 func storeRecoveryFixture(t *testing.T, retries int, payload string, parked synapse.ParkedPieceChecker, cacheStore cache.Cache, target *testutil.MockStorageTarget) (handlerTestRuntime, seededCopyPipeline, cid.Cid) {
 	t.Helper()
+	if target.FinalizeStoreSessionFunc == nil {
+		target.FinalizeStoreSessionFunc = func(context.Context, string, string, cid.Cid) error { return synapse.ErrStoreSessionIncomplete }
+	}
 	storageClient := &testutil.MockStorageClient{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		cache: cacheStore, storage: storageClient, parkedPieces: parked, maxAttempts: taskTestMaxAttempts(&retries),
@@ -69,6 +72,8 @@ func seedStoreCheckpoint(t *testing.T, runtime handlerTestRuntime, taskID, copyI
 	checkpoint, err := json.Marshal(map[string]any{
 		"attempted_at": attemptedAt.UTC(), "intended_piece_cid": pieceCID.String(),
 		"provider_service_url": providerURL, "ingress_attempt": 1,
+		"session_id": "00000000-0000-4000-8000-000000000001", "stage": "upload",
+		"observation_started_at": attemptedAt.UTC(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +116,7 @@ func TestStorePreparationFailuresRetainCheckpointAndRetry(t *testing.T) {
 					}
 					return synapse.ParkedPieceMissing, nil
 				})
-				target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+				target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 					stores.Add(1)
 					return nil, errors.New("unexpected Store call")
 				}}
@@ -176,7 +181,18 @@ func TestStorePreparationFailuresRetainCheckpointAndRetry(t *testing.T) {
 				if !persistent && (observed.Status != model.TaskStatusPending || observed.RetryCount != 1 || observed.ResumeMode != model.TaskResumeModeRecover) {
 					t.Fatalf("preparation failure did not schedule recovery: %#v", observed)
 				}
-				if !testutil.JSONEqual(observed.Checkpoint, before.Checkpoint) || observed.LastError == nil || stores.Load() != 0 {
+				var beforeEvidence, afterEvidence map[string]any
+				if err := json.Unmarshal(before.Checkpoint, &beforeEvidence); err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(observed.Checkpoint, &afterEvidence); err != nil {
+					t.Fatal(err)
+				}
+				delete(beforeEvidence, "stage")
+				delete(afterEvidence, "stage")
+				beforeJSON, _ := json.Marshal(beforeEvidence)
+				afterJSON, _ := json.Marshal(afterEvidence)
+				if !testutil.JSONEqual(afterJSON, beforeJSON) || observed.LastError == nil || stores.Load() != 0 {
 					t.Fatalf("preparation failure lost evidence or sent bytes: task=%#v stores=%d", observed, stores.Load())
 				}
 				copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -230,7 +246,7 @@ func TestStoreReadyCheckpointWriteFailureRetriesWithoutSending(t *testing.T) {
 		checks.Add(1)
 		return synapse.ParkedPieceReady, nil
 	})
-	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 		stores.Add(1)
 		return nil, errors.New("unexpected Store call")
 	}}
@@ -271,7 +287,7 @@ func TestStoreAdmissionStopsWithoutRecoveryEvidenceOrWithConflictingOperation(t 
 			parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
 				return synapse.ParkedPieceMissing, nil
 			})
-			target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+			target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 				stores.Add(1)
 				return nil, errors.New("unexpected Store call")
 			}}
@@ -329,7 +345,7 @@ func TestStoreWorkStartsAfterHashPreparation(t *testing.T) {
 	}}
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://store.example",
-		StoreFunc: func(ctx context.Context, _ io.Reader, _ *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(ctx context.Context, _ string, _ string, _ io.Reader, _ *storage.StoreOptions) (*storage.StoreResult, error) {
 			stored, err := runtime.repos.Tasks.GetByID(ctx, taskID)
 			if err != nil || stored.WorkStartedAt == nil || readyAt.IsZero() || stored.WorkStartedAt.Before(readyAt) {
 				t.Fatalf("actual upload start = %#v, ready=%v, err=%v", stored, readyAt, err)
@@ -375,7 +391,7 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 			}}
 			target := &testutil.MockStorageTarget{
 				ServiceURLValue: "https://store.example",
-				StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+				UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 					uploads.Add(1)
 					return nil, errors.New("unexpected upload")
 				},
@@ -391,7 +407,7 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 			}
 			locked, release, unlocked := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			go func() {
-				runtime.gate.GuardDeletion(model.ContentCacheKey(pipeline.upload.ID), func() {
+				_ = runtime.gate.GuardDeletion(t.Context(), model.ContentCacheKey(pipeline.upload.ID), func() {
 					close(locked)
 					<-release
 				})
@@ -416,6 +432,16 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 			}
 			if scenario == "cancelled" {
 				cancel()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("canceled Store did not stop while deletion retained the cache gate")
+				}
+				select {
+				case <-unlocked:
+					t.Fatal("deletion released the gate before cancellation completed")
+				default:
+				}
 			} else {
 				if _, err := runtime.db.NewRaw(`UPDATE tasks SET claim_generation = claim_generation + 1 WHERE id = ?`, row.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
@@ -457,7 +483,11 @@ func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) 
 			})
 			runtime, pipeline, pieceCID := storeRecoveryFixture(t, 2, payload, parked, nil, target)
 			taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
-			seedStoreCheckpoint(t, runtime, taskRow.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), time.Now().Add(-31*time.Minute))
+			started := time.Now()
+			if tt.expired {
+				started = started.Add(-31 * time.Minute)
+			}
+			seedStoreCheckpoint(t, runtime, taskRow.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), started)
 			if tt.expired {
 				runtimeJSON, err := json.Marshal(map[string]any{"operation_key": "store:" + pieceCID.String(), "operation_started_at": time.Now().Add(-31 * time.Minute)})
 				if err != nil {
@@ -506,7 +536,7 @@ func TestStoreManualRetryUsesFreshCurrentPolicyBudget(t *testing.T) {
 	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
 		return synapse.ParkedPieceMissing, nil
 	})
-	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 		stores.Add(1)
 		return nil, errors.New("connection closed after upload")
 	}}
@@ -559,8 +589,8 @@ func TestStoreManualRetryUsesFreshCurrentPolicyBudget(t *testing.T) {
 	if err != nil || retrying == nil {
 		t.Fatalf("read exhausted Store round: %v", err)
 	}
-	if handlerTaskMaxAttempts(t, runtime, retrying) != 6 || retrying.RetryCount != 5 || stores.Load() != 7 {
-		t.Fatalf("new Store round budget = task:%#v uploads:%d, want current policy's six attempts", retrying, stores.Load())
+	if handlerTaskMaxAttempts(t, runtime, retrying) != 10 || retrying.RetryCount != 9 || stores.Load() != 11 {
+		t.Fatalf("new Store round budget = task:%#v uploads:%d, want current policy's ten attempts", retrying, stores.Load())
 	}
 }
 
@@ -573,7 +603,7 @@ func TestStoreStopsAfterConfiguredAutomaticRetransmissions(t *testing.T) {
 	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
 		return synapse.ParkedPieceMissing, nil
 	})
-	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 		stores.Add(1)
 		return nil, errors.New("connection closed after upload")
 	}}
@@ -614,7 +644,7 @@ func TestNewStoreTaskAdoptsPreviousCheckpoint(t *testing.T) {
 			})
 			target := &testutil.MockStorageTarget{
 				ServiceURLValue: "https://store.example",
-				StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+				UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 					storeCalls.Add(1)
 					return nil, errors.New("unexpected upload")
 				},
@@ -705,7 +735,7 @@ func TestNewStoreTaskWithoutCheckpointChecksProviderBeforeUploading(t *testing.T
 	})
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://store.example",
-		StoreFunc: func(_ context.Context, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(_ context.Context, _ string, _ string, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 			stores.Add(1)
 			return &storage.StoreResult{PieceCID: options.PieceCID, Size: 128}, nil
 		},
@@ -787,7 +817,7 @@ func TestStoreDoesNotUseOldProviderPieceForChangedTarget(t *testing.T) {
 	})
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://current.example",
-		StoreFunc: func(_ context.Context, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(_ context.Context, _ string, _ string, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 			stores.Add(1)
 			return &storage.StoreResult{PieceCID: options.PieceCID, Size: 128}, nil
 		},
@@ -819,7 +849,7 @@ func TestStoreRestartBeforeRetryCheckpointRechecksOldPiece(t *testing.T) {
 	parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
 		return synapse.ParkedPieceMissing, nil
 	})
-	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+	target := &testutil.MockStorageTarget{ServiceURLValue: "https://store.example", UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 		stores.Add(1)
 		return nil, errors.New("transfer interrupted")
 	}}
@@ -869,7 +899,7 @@ func TestStoreRestartAfterRetryCheckpointOnlyQueriesProvider(t *testing.T) {
 	})
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://store.example",
-		StoreFunc: func(ctx context.Context, _ io.Reader, _ *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(ctx context.Context, _ string, _ string, _ io.Reader, _ *storage.StoreOptions) (*storage.StoreResult, error) {
 			if stores.Add(1) == 1 {
 				close(enteredStore)
 			}

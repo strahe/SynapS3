@@ -70,7 +70,7 @@ func (h *RetireHandler) dataSetRetireHandler() *taskengine.FuncHandler {
 			return storagereplacement.ValidateRetireInput(*input)
 		}),
 		Policy: taskengine.ExecutionPolicy{
-			MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(),
+			MaxAttempts: 10, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2},
 			ResendBackoff: &taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
 		}, AllowRetry: true,
 		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagereplacement.RetireInput) (int64, int64) {

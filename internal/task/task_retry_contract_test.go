@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,9 +14,11 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
+	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 )
 
@@ -173,6 +176,115 @@ func TestManualRetryCreatesIndependentCopyRound(t *testing.T) {
 	replay, err := runtime.service.Retry(t.Context(), source.ID)
 	if err != nil || replay.ID != child.ID {
 		t.Fatalf("replayed Retry = %#v, %v", replay, err)
+	}
+}
+
+func TestManualStoreRetryPreservesUploadSession(t *testing.T) {
+	for _, scenario := range []struct {
+		name     string
+		released bool
+		attempt  int
+		stage    string
+		session  string
+	}{
+		{name: "owned", attempt: 2, stage: "finalize", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
+		{name: "created before body", stage: "upload", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
+		{name: "create outcome unknown", stage: "create"},
+		{name: "released", released: true, attempt: 2, stage: "finalize", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
+			pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+			version := &model.ObjectVersion{
+				VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID,
+				Key: "resume.bin", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize,
+				ETag: "resume", ContentType: "application/octet-stream",
+			}
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+				t.Fatal(err)
+			}
+			progressAt := time.Now().UTC().Truncate(time.Microsecond)
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageCopy)(nil)).
+				Set("transfer_method = ?", model.StorageCopyTransferMethodCacheRestore).
+				Set("ingress_store_attempt = 2").Set("ingress_bytes_transferred = 64").Set("progress_updated_at = ?", progressAt).
+				Where("id = ?", pipeline.target.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			source := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+			pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", int(pipeline.upload.ContentSize))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := map[string]any{
+				"attempted_at": progressAt.Add(-time.Hour), "intended_piece_cid": pieceInfo.CIDv2.String(),
+				"provider_service_url": "https://provider.example", "ingress_attempt": scenario.attempt,
+				"session_id": scenario.session, "stage": scenario.stage,
+				"observation_started_at": progressAt.Add(-time.Hour),
+			}
+			encoded, err := json.Marshal(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(encoded)).Where("id = ?", source.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			reason := "store_processing_timeout"
+			settleHandlerTaskFixture(t, runtime, source.ID, model.TaskStatusFailed, &reason)
+			if scenario.released {
+				if err := runtime.repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+					StorageCopyID: pipeline.target.ID, ContentID: pipeline.upload.ID, CopyIndex: pipeline.target.CopyIndex, LastError: "upload interrupted",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := runtime.repos.Contents.CompleteCopyTask(t.Context(), pipeline.target.ID, 1, source.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			failed, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if available, err := runtime.service.RetryableContext(t.Context(), failed); err != nil || !available {
+				t.Fatalf("session recovery unavailable: %v, %v", available, err)
+			}
+			child, err := runtime.service.Retry(t.Context(), source.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(child.Checkpoint, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["session_id"] != checkpoint["session_id"] || got["stage"] != checkpoint["stage"] ||
+				got["intended_piece_cid"] != checkpoint["intended_piece_cid"] || got["ingress_attempt"] != float64(scenario.attempt) {
+				t.Fatalf("upload identity changed: %s", child.Checkpoint)
+			}
+			var clock struct {
+				ObservationStartedAt time.Time `json:"observation_started_at"`
+			}
+			if err := json.Unmarshal(child.Checkpoint, &clock); err != nil || !clock.ObservationStartedAt.IsZero() {
+				t.Fatalf("successor observation clock=%v, error=%v", clock.ObservationStartedAt, err)
+			}
+			var childInput storagepipeline.CopyGenerationInput
+			if err := json.Unmarshal(child.Input, &childInput); err != nil {
+				t.Fatal(err)
+			}
+			wantGeneration := int64(1)
+			if scenario.released {
+				wantGeneration++
+			}
+			owned, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || owned.ActiveTaskID == nil || *owned.ActiveTaskID != child.ID || owned.Status != model.StorageCopyStatusPending ||
+				owned.TransferMethod != model.StorageCopyTransferMethodCacheRestore || owned.WorkGeneration != wantGeneration ||
+				owned.IngressStoreAttempt != 2 || owned.IngressBytesTransferred != 64 || owned.ProgressUpdatedAt == nil || !owned.ProgressUpdatedAt.Equal(progressAt) ||
+				child.Type != model.TaskTypeStorageStore || child.ResumeMode != model.TaskResumeModeRecover || child.RetryCount != 0 || childInput.Generation != wantGeneration {
+				t.Fatalf("session recovery copy=%+v task=%+v, error=%v", owned, child, err)
+			}
+			old, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
+			if err != nil || !bytes.Equal(old.Checkpoint, failed.Checkpoint) {
+				t.Fatalf("source checkpoint changed: task=%+v, error=%v", old, err)
+			}
+		})
 	}
 }
 

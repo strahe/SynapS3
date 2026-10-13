@@ -200,7 +200,9 @@ type MockStorageTarget struct {
 	// ContextIdentityValue overrides DefaultContextIdentity.
 	ContextIdentityValue      storage.ContextIdentity
 	FindDataSetByClientIDFunc func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error)
-	StoreFunc                 func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
+	CreateStoreSessionFunc    func(context.Context) (string, error)
+	UploadStoreSessionFunc    func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
+	FinalizeStoreSessionFunc  func(context.Context, string, string, cid.Cid) error
 	PresignForCommitFunc      func(context.Context, []storage.PieceInput) ([]byte, error)
 	SubmitPullFunc            func(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommitFunc          func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
@@ -295,11 +297,25 @@ func (m *MockStorageTarget) FindDataSetByClientDataSetID(ctx context.Context, cl
 	return storage.DataSetRef{}, false, errors.New("MockStorageTarget.FindDataSetByClientDataSetID not configured")
 }
 
-func (m *MockStorageTarget) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
-	if m.StoreFunc != nil {
-		return m.StoreFunc(ctx, reader, opts)
+func (m *MockStorageTarget) CreateStoreSession(ctx context.Context) (string, error) {
+	if m.CreateStoreSessionFunc != nil {
+		return m.CreateStoreSessionFunc(ctx)
 	}
-	return nil, errors.New("MockStorageTarget.Store not configured")
+	return "00000000-0000-4000-8000-000000000001", nil
+}
+
+func (m *MockStorageTarget) UploadStoreSession(ctx context.Context, serviceURL, sessionID string, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
+	if m.UploadStoreSessionFunc != nil {
+		return m.UploadStoreSessionFunc(ctx, serviceURL, sessionID, reader, opts)
+	}
+	return nil, errors.New("MockStorageTarget.UploadStoreSession not configured")
+}
+
+func (m *MockStorageTarget) FinalizeStoreSession(ctx context.Context, serviceURL, sessionID string, pieceCID cid.Cid) error {
+	if m.FinalizeStoreSessionFunc != nil {
+		return m.FinalizeStoreSessionFunc(ctx, serviceURL, sessionID, pieceCID)
+	}
+	return nil
 }
 
 func (m *MockStorageTarget) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {

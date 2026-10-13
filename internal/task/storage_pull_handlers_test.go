@@ -777,7 +777,7 @@ func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 						}
 						return pullStatusResult(request, storage.PullStatusComplete), nil
 					}
-					target.StoreFunc = func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+					target.UploadStoreSessionFunc = func(_ context.Context, _ string, _ string, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 						data, err := io.ReadAll(reader)
 						if err != nil {
 							return nil, err

@@ -548,7 +548,7 @@ func TestOpenCacheMissDoesNotOverwriteConcurrentCommitPresence(t *testing.T) {
 	}()
 
 	<-firstGetStarted
-	commitErr := gate.Commit(version.CacheKey(), func() error {
+	commitErr := gate.Commit(ctx, version.CacheKey(), func() error {
 		present.Store(true)
 		return repos.Objects.RecordContentCacheCommit(ctx, *version.ContentID, time.Now())
 	})

@@ -40,7 +40,9 @@ type ProviderTarget interface {
 // DataSetTarget is an immutable existing data set used for piece operations.
 type DataSetTarget interface {
 	StorageTarget
-	Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
+	CreateStoreSession(ctx context.Context) (string, error)
+	UploadStoreSession(ctx context.Context, serviceURL, sessionID string, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error)
+	FinalizeStoreSession(ctx context.Context, serviceURL, sessionID string, pieceCID cid.Cid) error
 	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
 	SubmitPull(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommit(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)

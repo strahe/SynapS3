@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -64,7 +65,7 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.UploadPlanInput) error {
 			return storagepipeline.ValidateUploadPlanInput(*input)
 		}),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 10, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2}}, AllowRetry: true,
 		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) (int64, int64) {
 			return input.ContentID, 0
 		}),

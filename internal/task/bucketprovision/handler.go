@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -62,7 +63,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		Codec: taskengine.StrictJSONCodec(func(input *bucketlifecycle.ProvisionInput) error {
 			return bucketlifecycle.ValidateProvisionInput(*input)
 		}),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 10, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2}}, AllowRetry: true,
 	}
 	definition.Identity = taskengine.IdentityFromInput("bucket", func(input bucketlifecycle.ProvisionInput) (int64, int64) {
 		return input.BucketID, int64(input.Copies)

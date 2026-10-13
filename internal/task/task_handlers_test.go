@@ -584,7 +584,7 @@ func TestLRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess(t *testing.T) {
 	version := seedStoredCacheObject(t, runtime, 11, plannedAt)
 	// The gate protects one cache file, and that file belongs to the content.
 	cacheKey := version.CacheKey()
-	opened, err := runtime.gate.Open(cacheKey, func() (io.ReadCloser, *cache.ObjectInfo, error) {
+	opened, err := runtime.gate.Open(t.Context(), cacheKey, func() (io.ReadCloser, *cache.ObjectInfo, error) {
 		return io.NopCloser(strings.NewReader("cached")), &cache.ObjectInfo{Size: 11}, nil
 	})
 	if err != nil {
@@ -710,7 +710,7 @@ func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 	}}
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://terminal-store.example",
-		StoreFunc: func(_ context.Context, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(_ context.Context, _ string, _ string, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 			if options == nil || options.OnProgress == nil || !options.PieceCID.Defined() {
 				return nil, errors.New("store progress callback or intended piece identity is missing")
 			}
@@ -1120,7 +1120,7 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 			if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
 				t.Fatalf("timed-out cleanup details = %v", failed.LastError)
 			}
-			if !strings.Contains(*failed.LastError, "after 24 hours") {
+			if !strings.Contains(*failed.LastError, "Retry may submit another paid request") {
 				t.Fatalf("timed-out cleanup omits the elapsed operation observation: %q", *failed.LastError)
 			}
 			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
@@ -3293,7 +3293,7 @@ func TestStoreTasksReachAndRespectTypeConcurrency(t *testing.T) {
 				return &testutil.MockStorageTarget{
 					ProviderIDValue: opts.ProviderID.Copy(), DataSetIDValue: &targetDataSetID,
 					ClientDataSetIDValue: clientID, ServiceURLValue: "https://store-limit.example",
-					StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+					UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 						current := running.Add(1)
 						for {
 							observed := maximum.Load()
@@ -3368,7 +3368,7 @@ func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
 	}}
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://store-admission.example",
-		StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 			storeCalls.Add(1)
 			return nil, errors.New("unexpected Store call")
 		},
@@ -3450,8 +3450,9 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		return parkedState.Load().(synapse.ParkedPieceState), nil
 	})
 	target := &testutil.MockStorageTarget{
-		ServiceURLValue: "https://parked.example",
-		StoreFunc: func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+		ServiceURLValue:          "https://parked.example",
+		FinalizeStoreSessionFunc: func(context.Context, string, string, cid.Cid) error { return synapse.ErrStoreSessionIncomplete },
+		UploadStoreSessionFunc: func(_ context.Context, _ string, _ string, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 			storeCalls.Add(1)
 			storedBytes, readErr := io.ReadAll(reader)
 			if readErr != nil || string(storedBytes) != payload {
@@ -3503,9 +3504,13 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		t.Fatalf("interrupted store = %#v calls:%d, want checkpointed recovery after one Store", recovering, storeCalls.Load())
 	}
 	var checkpoint struct {
-		AttemptedAt        time.Time `json:"attempted_at"`
-		IntendedPieceCID   string    `json:"intended_piece_cid"`
-		ProviderServiceURL string    `json:"provider_service_url"`
+		AttemptedAt          time.Time `json:"attempted_at"`
+		IntendedPieceCID     string    `json:"intended_piece_cid"`
+		ProviderServiceURL   string    `json:"provider_service_url"`
+		IngressAttempt       int       `json:"ingress_attempt"`
+		SessionID            string    `json:"session_id"`
+		Stage                string    `json:"stage"`
+		ObservationStartedAt time.Time `json:"observation_started_at"`
 	}
 	if err := json.Unmarshal(recovering.Checkpoint, &checkpoint); err != nil {
 		t.Fatalf("decode store checkpoint: %v", err)
@@ -4506,7 +4511,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_copy_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 6 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
@@ -4641,7 +4646,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_source_write_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 6 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
