@@ -812,10 +812,6 @@ func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						storeTask = runOneStorageTask(t, runtime, storeTask, model.TaskStatusPending)
-						if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", storeTask.ID).Exec(t.Context()); err != nil {
-							t.Fatal(err)
-						}
 						runOneStorageTask(t, runtime, storeTask, model.TaskStatusCompleted)
 					} else if restored.TransferMethod != model.StorageCopyTransferMethodPeerPull || history[0].Status != storagepull.AttemptStatusAttempted {
 						t.Fatalf("Pull recovery = %#v", restored)

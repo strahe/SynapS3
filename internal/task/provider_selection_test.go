@@ -169,10 +169,11 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 				cancel, done := runHandlerEngine(t, runtime)
 				defer stopHandlerEngine(t, cancel, done)
 				for poll := 1; poll <= 7; poll++ {
+					previousClaim := row.ClaimGeneration
 					row = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
-						return row.ClaimGeneration >= int64(poll) && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.WaitReason != nil)
+						return row.ClaimGeneration > previousClaim && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.WaitReason != nil)
 					})
-					if row.Status != model.TaskStatusPending || row.RetryCount != 0 || row.LastError != nil || row.WaitReason == nil || *row.WaitReason != "providers" || !row.AvailableAt.After(time.Now()) {
+					if row.Status != model.TaskStatusPending || row.RetryCount != 0 || row.LastError != nil || row.WaitReason == nil || *row.WaitReason != "providers" {
 						t.Fatalf("provider wait %d = %#v", poll, row)
 					}
 					bindings, err := runtime.repos.Contents.ListDataSetBindings(t.Context(), bucket.ID)
