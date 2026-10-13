@@ -51,7 +51,7 @@ func TestWorkStartsAtDeclaredBoundaryAndSurvivesRecovery(t *testing.T) {
 					if !attempted || err == nil {
 						t.Fatalf("effect = %v, %v", attempted, err)
 					}
-					return Retry(err, "effect_uncertain", 0, nil)
+					return Retry(err, "effect_uncertain", nil)
 				},
 				recover: func(context.Context, Execution) Result { return Complete("recovered", nil) },
 			}
@@ -76,9 +76,9 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: func(context.Context, Execution) Result {
 		calls++
 		if calls == 1 {
-			return Wait(model.TaskResumeModeExecute, 0, "dependency", "Waiting for a dependency", nil)
+			return Wait(model.TaskResumeModeExecute, "dependency", "Waiting for a dependency", nil)
 		}
-		return CompleteCycle(time.Hour, "Done", nil)
+		return CompleteCycle("Done", nil)
 	}}, nil)
 	if err := h.service.bootstrap(t.Context()); err != nil {
 		t.Fatal(err)
@@ -88,6 +88,15 @@ func TestRecurringWorkStartBelongsToIndependentCycles(t *testing.T) {
 	waiting, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
 	if waiting.WorkStartedAt == nil {
 		t.Fatal("Wait lost work start")
+	}
+	if _, err := h.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(time.Hour)).
+		Where("id = ? AND status = ?", waiting.ID, model.TaskStatusPending).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("schedule dependency wait: %v", err)
+	}
+	if woken, err := h.repos.Tasks.WakePending(t.Context(), []int64{waiting.ID}); err != nil || woken != 1 {
+		t.Fatalf("wake dependency wait: woken=%d err=%v", woken, err)
 	}
 	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 	finished, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)

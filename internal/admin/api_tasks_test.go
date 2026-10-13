@@ -216,6 +216,7 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	}
 	f.server.WithTaskService(newAdminTestTaskService(t, f.repos, func(definition *taskengine.Definition) {
 		definition.Policy.MaxAttempts = 3
+		definition.Policy.ResendBackoff = &taskengine.BackoffPolicy{InitialDelay: time.Minute, MaximumDelay: 30 * time.Minute, Multiplier: 2}
 	}))
 
 	rr := f.request(http.MethodGet, "/api/v1/tasks/"+strconv.FormatInt(row.ID, 10), nil)
@@ -226,6 +227,12 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	decodeJSON(t, rr, &detail)
 	if rr.Code != http.StatusOK || detail.Task.RetryCount != 5 || detail.Task.MaxAttempts == nil || *detail.Task.MaxAttempts != 3 || detail.Policy == nil || detail.Policy.MaxAttempts == nil || *detail.Policy.MaxAttempts != 3 {
 		t.Fatalf("current execution policy: %d %s", rr.Code, rr.Body.String())
+	}
+	if detail.Policy.ResendBackoff == nil || detail.Policy.ResendBackoff.InitialDelay != "1m0s" || detail.Policy.ResendBackoff.MaximumDelay != "30m0s" || detail.Policy.ResendBackoff.Multiplier != 2 || detail.Policy.ResendBackoff.Jitter != 0 {
+		t.Fatalf("resend policy missing: %s", rr.Body.String())
+	}
+	if detail.Policy.ObservationInterval != "30s" {
+		t.Fatalf("observation policy missing: %s", rr.Body.String())
 	}
 	rr = f.request(http.MethodGet, "/api/v1/tasks", nil)
 	var page taskListResponse
@@ -471,7 +478,7 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	}
 }
 
-func TestAPITaskRetryCandidatesKeepDomainValidationAtDetailsAndAction(t *testing.T) {
+func TestAPITaskRetryEligibilityMatchesListDetailsAndAction(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		err          error
@@ -500,15 +507,17 @@ func TestAPITaskRetryCandidatesKeepDomainValidationAtDetailsAndAction(t *testing
 			f.transition(t, source.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
 			path := "/api/v1/tasks/" + strconv.FormatInt(source.ID, 10)
 			for _, endpoint := range []string{"/api/v1/tasks", path + "/history"} {
+				beforeInspections := inspections
 				rr := f.request(http.MethodGet, endpoint, nil)
 				var page taskListResponse
 				decodeJSON(t, rr, &page)
-				if rr.Code != http.StatusOK || len(page.Tasks) != 1 || !page.Tasks[0].Retryable || inspections != 0 {
-					t.Fatalf("candidate list %s = %d %s, inspections=%d", endpoint, rr.Code, rr.Body.String(), inspections)
+				if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].Retryable || page.Tasks[0].RetryTaskID != nil || inspections <= beforeInspections || strings.Contains(rr.Body.String(), "private database diagnostics") {
+					t.Fatalf("retry list %s = %d %s, inspections=%d", endpoint, rr.Code, rr.Body.String(), inspections)
 				}
 			}
+			beforeInspections := inspections
 			rr := f.request(http.MethodGet, path, nil)
-			if rr.Code != tc.detailStatus || inspections != 1 || strings.Contains(rr.Body.String(), "private database diagnostics") {
+			if rr.Code != tc.detailStatus || inspections <= beforeInspections || strings.Contains(rr.Body.String(), "private database diagnostics") {
 				t.Fatalf("details = %d %s, inspections=%d", rr.Code, rr.Body.String(), inspections)
 			}
 			if tc.reason != "" {

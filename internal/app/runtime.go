@@ -77,15 +77,16 @@ type FilecoinServices struct {
 // RuntimeOptions configures the application composition root. Database,
 // settings, and Filecoin services remain owned by the caller.
 type RuntimeOptions struct {
-	Config           *config.Config
-	Database         *bun.DB
-	Settings         *admin.SettingsService
-	Filecoin         FilecoinServices
-	ProviderIdentity *admin.ProviderIdentityResolver
-	UploadSpeedProbe providerbenchmark.UploadProbe
-	S3Addresses      []string
-	Logger           *slog.Logger
-	ShutdownTimeout  time.Duration
+	Config              *config.Config
+	Database            *bun.DB
+	Settings            *admin.SettingsService
+	Filecoin            FilecoinServices
+	ProviderIdentity    *admin.ProviderIdentityResolver
+	UploadSpeedProbe    providerbenchmark.UploadProbe
+	DecorateTaskHandler func(taskengine.Handler) taskengine.Handler
+	S3Addresses         []string
+	Logger              *slog.Logger
+	ShutdownTimeout     time.Duration
 }
 
 // Runtime owns all resources assembled by NewRuntime.
@@ -153,6 +154,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 	points, err := task.Register(registry, taskService, task.Dependencies{
 		Repositories:              repos,
+		DecorateTaskHandler:       opts.DecorateTaskHandler,
 		Events:                    events,
 		Cache:                     localCache,
 		CacheGate:                 cacheGate,
@@ -185,7 +187,8 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("initializing task handlers: %w", err)
 	}
 	capacityInterval := 5 * time.Second
-	if evictionPolicy == cache.EvictionPolicyNone {
+	if evictionPolicy == cache.EvictionPolicyNone ||
+		(evictionPolicy == cache.EvictionPolicyAfterUpload && !cfg.Worker.Tasks.CommitSealOnCachePressure) {
 		capacityInterval = time.Hour
 	}
 	for _, schedule := range []taskengine.ScheduleDefinition{

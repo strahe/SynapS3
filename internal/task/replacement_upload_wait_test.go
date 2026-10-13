@@ -26,7 +26,7 @@ type activateAfterUploadSelection struct {
 
 func (r *activateAfterUploadSelection) SourceEligibility(ctx context.Context, id int64) (*model.StorageDataSet, bool, error) {
 	source, local, err := r.StorageReplacementRepository.SourceEligibility(ctx, id)
-	if errors.Is(err, storagereplacement.ErrActiveReplacement) {
+	if err == nil || errors.Is(err, storagereplacement.ErrActiveReplacement) {
 		var activationErr error
 		r.once.Do(func() { activationErr = r.activate() })
 		if activationErr != nil {
@@ -43,10 +43,9 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 				return &testutil.MockStorageTarget{ProviderIDValue: sdktypes.NewBigInt(202), DataSetIDValue: &id, ClientDataSetIDValue: sdktypes.NewBigInt(909)}, nil
 			}}})
 			ctx := t.Context()
-			row, target, coordinator, observed := seedRefusedReplacement(t, runtime)
+			row, target, coordinator, observed := seedFailedInitializationReplacement(t, runtime)
 			if stage == "failed replacement" {
-				reason := storagereplacement.FailureReasonTargetRejected
-				if err := runtime.repos.Replacements.MarkFailed(ctx, row.ID, &reason, storagereplacement.ProviderRejectedMessage); err != nil {
+				if err := runtime.repos.Replacements.MarkFailed(ctx, row.ID, nil, "Storage setup stopped"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -67,14 +66,16 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 			}
 			bindReady := func() error {
 				return runtime.repos.WithTx(ctx, func(repos *repository.Repositories) error {
-					if err := repos.Replacements.BindObservedService(ctx, observed); err != nil {
+					if err := repos.Contents.MarkDataSetReady(ctx, observed); err != nil {
 						return err
 					}
-					ready, err := repos.Contents.GetDataSetBindingByID(ctx, target.ID)
-					if err != nil {
+					if target.EnsureTaskID == nil {
+						return repository.ErrConflict
+					}
+					if err := repos.Contents.CompleteDataSetEnsureTask(ctx, target.ID, *target.EnsureTaskID); err != nil {
 						return err
 					}
-					return runtime.ready.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: ready.ID})
+					return runtime.ready.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: target.ID})
 				})
 			}
 			if stage == "before suspension settlement" {
@@ -96,7 +97,7 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 			}
 			if stage == "after suspension" {
 				waiting := waitForTask(t, runtime.repos, upload.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusPending && task.WaitReason != nil })
-				if *waiting.WaitReason != "replacement" || waiting.StatusMessage == nil || *waiting.StatusMessage != "Waiting for the replacement provider to finish setup" {
+				if *waiting.WaitReason != "replacement" || waiting.StatusMessage == nil || *waiting.StatusMessage != "Storage replacement needs attention. Check it on the bucket page." {
 					t.Fatalf("wrong dependency: %#v", waiting)
 				}
 				if err := bindReady(); err != nil {
@@ -110,7 +111,7 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 				if err != nil || !stillWaiting.AvailableAt.Equal(waiting.AvailableAt) {
 					t.Fatalf("ready target woke upload before activation: %#v, %v", stillWaiting, err)
 				}
-				if _, err := runtime.repos.Tasks.WakePending(ctx, []int64{coordinator.ID}); err != nil {
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now()).Where("id = ?", coordinator.ID).Exec(ctx); err != nil {
 					t.Fatal(err)
 				}
 			}

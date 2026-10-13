@@ -15,8 +15,10 @@ func uncreatedSlotCopies(db bun.IDB, row *storagereplacement.Replacement, target
 		Join("JOIN storage_data_sets AS ended ON ended.id = storage_copy.storage_data_set_id").
 		Where("ended.bucket_id = ? AND ended.copy_index = ? AND ended.generation < ?", row.BucketID, row.CopyIndex, target.Generation).
 		Where("ended.status = ? AND ended.is_current = ? AND ended.ensure_task_id IS NULL", model.StorageDataSetStatusRetired, false).
-		Where("ended.data_set_id IS NULL AND ended.create_transaction_id IS NULL AND ended.create_status_url IS NULL").
-		Where("(ended.client_data_set_id IS NULL OR ended.creation_rejection IS NOT NULL)").
+		Where("ended.data_set_id IS NULL").
+		Where(`ended.id = ? OR EXISTS (SELECT 1 FROM storage_replacements AS prior
+			WHERE prior.source_data_set_id = ? AND prior.target_data_set_id = ended.id AND prior.status = ?)`,
+			row.SourceDataSetID, row.SourceDataSetID, storagereplacement.StatusSuperseded).
 		Where("(storage_copy.status <> ? OR storage_copy.active_task_id IS NOT NULL)", model.StorageCopyStatusFailed)
 }
 

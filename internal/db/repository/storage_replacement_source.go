@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -27,79 +28,83 @@ func replacementSourceEligibility(ctx context.Context, db bun.IDB, source *model
 	if !source.IsCurrent {
 		return false, storagereplacement.ErrSourceNotCurrent
 	}
-	active, err := db.NewSelect().Model((*storagereplacement.Replacement)(nil)).
-		Where("source_data_set_id = ?", source.ID).
-		Where("status NOT IN (?, ?, ?, ?)", storagereplacement.StatusFailed, storagereplacement.StatusCleanupAttention,
-			storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).Exists(ctx)
-	if err != nil {
+	initializing := source.Status != model.StorageDataSetStatusReady
+
+	var outgoing []storagereplacement.Replacement
+	if err := db.NewSelect().Model(&outgoing).Where("source_data_set_id = ?", source.ID).
+		Where("status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).Scan(ctx); err != nil {
 		return false, err
 	}
-	if active {
-		return false, storagereplacement.ErrActiveReplacement
-	}
-	local := source.Status != model.StorageDataSetStatusReady
-	if local {
-		if err := uncreatedDataSetEligibility(ctx, db, source); err != nil {
+	if initializing {
+		if len(outgoing) == 0 {
+			if err := failedInitializationOwner(ctx, db, source); err != nil {
+				return false, err
+			}
+		} else if _, err := replaceableEarlierTargets(ctx, db, source.ID); err != nil {
 			return false, err
+		}
+	} else {
+		for _, row := range outgoing {
+			target, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
+			if err != nil || target == nil {
+				return false, errors.Join(err, ErrNotFound)
+			}
+			if target.Status != model.StorageDataSetStatusReady && target.Status != model.StorageDataSetStatusRetired {
+				continue
+			}
+			if row.Status != storagereplacement.StatusFailed && row.Status != storagereplacement.StatusCleanupAttention {
+				return false, storagereplacement.ErrActiveReplacement
+			}
 		}
 	}
 	var incoming []storagereplacement.Replacement
-	if err := db.NewSelect().Model(&incoming).
-		Where("target_data_set_id = ?", source.ID).
-		Where("status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
-		Scan(ctx); err != nil {
+	if err := db.NewSelect().Model(&incoming).Where("target_data_set_id = ?", source.ID).
+		Where("status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).Scan(ctx); err != nil {
 		return false, err
 	}
-	for _, row := range incoming {
-		// An incoming target still depends on its original source's migration;
-		// replacing it would discard that unfinished obligation.
-		if !local || row.Status != storagereplacement.StatusFailed {
-			return false, storagereplacement.ErrActiveReplacement
-		}
-		prior, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.SourceDataSetID)
-		if err != nil {
+	if len(incoming) != 0 {
+		return false, storagereplacement.ErrActiveReplacement
+	}
+	if !initializing {
+		if _, err := replaceableEarlierTargets(ctx, db, source.ID); err != nil {
 			return false, err
 		}
-		if prior == nil || !locallyEndedDataSet(prior) {
-			return false, storagereplacement.ErrActiveReplacement
-		}
-		effects, err := dataSetHasExternalEffects(ctx, db, prior.ID)
-		if err != nil {
-			return false, err
-		}
-		if effects {
-			return false, storagereplacement.ErrActiveReplacement
-		}
 	}
-	if _, err := replaceableEarlierTargets(ctx, db, source.ID); err != nil {
-		return false, err
-	}
-	return local, nil
+	return source.DataSetID == nil, nil
 }
 
 func replaceableEarlierTargets(ctx context.Context, db bun.IDB, sourceDataSetID int64) ([]model.StorageDataSet, error) {
+	source, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, sourceDataSetID)
+	if err != nil || source == nil {
+		return nil, errors.Join(err, ErrNotFound)
+	}
+	initializing := source.Status != model.StorageDataSetStatusReady
+	if initializing {
+		ready, err := db.NewSelect().Model((*model.StorageDataSet)(nil)).
+			Where(`id IN (SELECT target_data_set_id FROM storage_replacements WHERE source_data_set_id = ? AND status NOT IN (?, ?))`,
+				sourceDataSetID, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+			Where("status = ?", model.StorageDataSetStatusReady).Exists(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ready {
+			return nil, storagereplacement.ErrActiveReplacement
+		}
+	}
 	var targets []model.StorageDataSet
-	if err := db.NewSelect().Model(&targets).
+	query := db.NewSelect().Model(&targets).
 		Where(`id IN (SELECT target_data_set_id FROM storage_replacements WHERE source_data_set_id = ? AND status NOT IN (?, ?))`,
 			sourceDataSetID, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
-		Where("data_set_id IS NULL AND status <> ?", model.StorageDataSetStatusRetired).Scan(ctx); err != nil {
+		Where("status <> ?", model.StorageDataSetStatusRetired)
+	query = query.Where("status <> ?", model.StorageDataSetStatusReady)
+	if err := query.Scan(ctx); err != nil {
 		return nil, err
 	}
-	for _, target := range targets {
-		if target.EnsureTaskID != nil {
-			live, err := db.NewSelect().Model((*model.Task)(nil)).Where("id = ?", *target.EnsureTaskID).
-				Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).Exists(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if live {
-				return nil, storagereplacement.ErrTargetCreating
-			}
-		}
-		if target.Status == model.StorageDataSetStatusFailed && target.ClientDataSetID == nil {
-			target.Status = model.StorageDataSetStatusPending
-		}
-		if err := uncreatedDataSetEligibility(ctx, db, &target); err != nil {
+	if len(targets) == 0 && initializing {
+		return nil, storagereplacement.ErrTargetCreating
+	}
+	for i := range targets {
+		if err := failedInitializationOwner(ctx, db, &targets[i]); err != nil {
 			if errors.Is(err, storagereplacement.ErrSourceRunning) || errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
 				return nil, storagereplacement.ErrTargetCreating
 			}
@@ -109,49 +114,36 @@ func replaceableEarlierTargets(ctx context.Context, db bun.IDB, sourceDataSetID 
 	return targets, nil
 }
 
-func uncreatedDataSetEligibility(ctx context.Context, db bun.IDB, source *model.StorageDataSet) error {
-	if source.EnsureTaskID != nil {
-		task, err := (&BunTaskRepo{db: db}).GetByID(ctx, *source.EnsureTaskID)
-		if err != nil {
-			return err
-		}
-		if task == nil {
-			return ErrNotFound
-		}
-		if task.Status == model.TaskStatusRunning {
-			return storagereplacement.ErrSourceRunning
-		}
-	}
-	if source.CreateTransactionID != nil || source.CreateStatusURL != nil {
-		return &storagereplacement.SourceOutcomeError{Message: "Storage setup has a submitted transaction. Wait for its confirmation before replacing the provider."}
-	}
-	if (source.Status != model.StorageDataSetStatusPending && source.Status != model.StorageDataSetStatusCreating) || source.DataSetID != nil {
+func failedInitializationOwner(ctx context.Context, db bun.IDB, binding *model.StorageDataSet) error {
+	if binding.Status == model.StorageDataSetStatusReady || binding.Status == model.StorageDataSetStatusRetired || binding.EnsureTaskID == nil {
 		return storagereplacement.ErrSourceOutcomeUnknown
 	}
-	evidence, err := source.CreationRejectionEvidence()
+	task, err := (&BunTaskRepo{db: db}).GetByID(ctx, *binding.EnsureTaskID)
 	if err != nil {
-		return &storagereplacement.SourceOutcomeError{Message: "Could not verify the recorded setup refusal. Check the setup task before replacing the provider."}
+		return err
 	}
-	if source.ClientDataSetID != nil && (source.ClientDataSetID.IsZero() || evidence == nil) {
+	if task == nil || task.Type != model.TaskTypeStorageDataSetEnsure || task.SubjectType != "storage_data_set" ||
+		task.SubjectKey != strconv.FormatInt(binding.ID, 10) || task.SupersededAt != nil {
 		return storagereplacement.ErrSourceOutcomeUnknown
 	}
-	effects, err := dataSetHasExternalEffects(ctx, db, source.ID)
+	if task.Status == model.TaskStatusPending || task.Status == model.TaskStatusRunning {
+		return storagereplacement.ErrSourceRunning
+	}
+	if task.Status != model.TaskStatusFailed {
+		return storagereplacement.ErrSourceOutcomeUnknown
+	}
+	effects, err := dataSetHasExternalEffects(ctx, db, binding.ID)
 	if err != nil {
 		return err
 	}
 	if effects {
-		return &storagereplacement.SourceOutcomeError{Message: "This provider already received storage work. Check this replica's tasks and service status before replacing it."}
+		return storagereplacement.ErrSourceOutcomeUnknown
 	}
 	return nil
 }
 
 func locallyEndedDataSet(source *model.StorageDataSet) bool {
-	if source.Status != model.StorageDataSetStatusRetired || source.IsCurrent || source.EnsureTaskID != nil ||
-		source.DataSetID != nil || source.CreateTransactionID != nil || source.CreateStatusURL != nil {
-		return false
-	}
-	evidence, err := source.CreationRejectionEvidence()
-	return err == nil && (source.ClientDataSetID == nil || evidence != nil)
+	return source.Status == model.StorageDataSetStatusRetired && !source.IsCurrent && source.EnsureTaskID == nil && source.DataSetID == nil
 }
 
 func dataSetHasExternalEffects(ctx context.Context, db bun.IDB, dataSetID int64) (bool, error) {

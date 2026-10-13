@@ -19,7 +19,7 @@ func testManualSealIsDurableAndIdempotent(t *testing.T, f commitFixture) {
 	copyRow := f.transferredCopy(t, "manual")
 	taskID := f.collecting(t, "manual", copyRow)
 	future := time.Now().Add(time.Hour)
-	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", future).Where("id = ?", taskID).Exec(ctx); err != nil {
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", future).Set("wait_reason = ?", "collecting").Where("id = ?", taskID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	first, err := f.repos.Contents.RequestCommitSeal(ctx, "manual")
@@ -126,7 +126,7 @@ func testCacheDependentCommitsAndSafeCleanupAccounting(t *testing.T, f commitFix
 		t.Fatalf("cached member = %v, %v", dependent, err)
 	}
 	future := time.Now().Add(time.Hour)
-	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", future).Where("id = ?", taskID).Exec(ctx); err != nil {
+	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", future).Set("wait_reason = ?", "collecting").Where("id = ?", taskID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.repos.Contents.WakeCacheDependentCommitTasks(ctx); err != nil {

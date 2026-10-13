@@ -61,7 +61,7 @@ func testDefinition(retryLimit *int, allowRetry bool) Definition {
 			return nil
 		}),
 		Identity:   testIdentity,
-		Policy:     ExecutionPolicy{MaxAttempts: testAttempts(retryLimit), Backoff: DefaultBackoffPolicy()},
+		Policy:     ExecutionPolicy{MaxAttempts: testAttempts(retryLimit), Backoff: BackoffPolicy{InitialDelay: time.Nanosecond, Multiplier: 1, MaximumDelay: time.Nanosecond}},
 		AllowRetry: allowRetry,
 	}
 }
@@ -121,7 +121,6 @@ func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *Eng
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
-	engine.retryDelay = func(int) time.Duration { return 0 }
 	return taskHarness{db: db, repos: repos, registry: registry, service: service, engine: engine}
 }
 
@@ -210,14 +209,16 @@ func TestServiceDerivesIdentityFromInput(t *testing.T) {
 
 func TestServiceWakeMakesFuturePendingTaskReady(t *testing.T) {
 	limit := 5
-	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
+	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result {
+		return WaitUntil(model.TaskResumeModeExecute, time.Now().Add(time.Hour), "dependency", "Waiting", nil)
+	}}, nil)
 	row, created, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
 		Type: testTaskType, Input: testInput{Value: "wake"},
-		AvailableAt: time.Now().Add(time.Hour),
 	})
 	if err != nil || !created {
 		t.Fatalf("enqueue future task = %#v created=%v err=%v", row, created, err)
 	}
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
 	if claimed, err := harness.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{}); err != nil || claimed != nil {
 		t.Fatalf("claim before wake = %#v err=%v", claimed, err)
 	}
@@ -254,22 +255,30 @@ func TestEngineConstructionFreezesRegistry(t *testing.T) {
 func TestRegistryFreezesDefinitionAtRegistration(t *testing.T) {
 	limit := 5
 	handler := &scriptedHandler{definition: testDefinition(&limit, true)}
+	handler.definition.Policy.ResendBackoff = &BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute}
 	registry := NewRegistry()
 	if err := registry.Register(handler); err != nil {
 		t.Fatalf("register handler: %v", err)
 	}
 	handler.definition.InputVersion = 2
 	handler.definition.AllowRetry = false
+	handler.definition.Policy.ResendBackoff.InitialDelay = time.Hour
 	limit = 9
 
 	definition, ok := registry.Definition(testTaskType)
-	if !ok || definition.InputVersion != 1 || !definition.AllowRetry || definition.Policy.MaxAttempts != 6 {
+	if !ok || definition.InputVersion != 1 || !definition.AllowRetry || definition.Policy.MaxAttempts != 6 || definition.Policy.ResendBackoff.InitialDelay != time.Minute {
 		t.Fatalf("registered definition changed = %#v", definition)
 	}
 	definition.Policy.MaxAttempts = 11
+	definition.Policy.ResendBackoff.InitialDelay = time.Hour
 	again, ok := registry.Definition(testTaskType)
-	if !ok || again.Policy.MaxAttempts != 6 {
+	if !ok || again.Policy.MaxAttempts != 6 || again.Policy.ResendBackoff.InitialDelay != time.Minute {
 		t.Fatalf("returned definition mutated registry = %#v", again)
+	}
+	execution := Execution{policy: again.Policy}
+	execution.Policy().ResendBackoff.InitialDelay = time.Hour
+	if execution.Policy().ResendBackoff.InitialDelay != time.Minute {
+		t.Fatal("returned execution policy mutated the claim")
 	}
 }
 
@@ -283,10 +292,10 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 		wantRetry  int
 	}{
 		{name: "completed", result: Complete("done", nil), wantStatus: model.TaskStatusCompleted, wantMode: model.TaskResumeModeRecover},
-		{name: "pending", result: Wait(model.TaskResumeModeExecute, time.Hour, "scheduled", "later", nil), wantStatus: model.TaskStatusPending, wantMode: model.TaskResumeModeExecute},
+		{name: "pending", result: Wait(model.TaskResumeModeExecute, "scheduled", "later", nil), wantStatus: model.TaskStatusPending, wantMode: model.TaskResumeModeExecute},
 		{name: "failed", result: Fail(errors.New("permanent"), "permanent_failure", nil), wantStatus: model.TaskStatusFailed, wantMode: model.TaskResumeModeRecover},
 		{name: "cancelled", result: Cancel("superseded", nil), wantStatus: model.TaskStatusCancelled, wantMode: model.TaskResumeModeRecover},
-		{name: "retry limit reached", result: Retry(errors.New("temporary"), "temporary_failure", 0, nil), wantStatus: model.TaskStatusFailed, wantMode: model.TaskResumeModeRecover},
+		{name: "retry limit reached", result: Retry(errors.New("temporary"), "temporary_failure", nil), wantStatus: model.TaskStatusFailed, wantMode: model.TaskResumeModeRecover},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -319,7 +328,7 @@ func TestEngineSettlesAllFiveStates(t *testing.T) {
 }
 
 func TestEngineRejectsWaitWithError(t *testing.T) {
-	result := Wait(model.TaskResumeModeRecover, 0, "provider_confirmation", "Checking request", nil)
+	result := Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking request", nil)
 	result.err = errors.New("query failed")
 	if !errors.Is(validateResult(result, nil), ErrInvalidResult) {
 		t.Fatal("Wait accepted an error")
@@ -349,22 +358,127 @@ func TestEngineNotifiesAfterSettlementCommits(t *testing.T) {
 
 func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 	limit := 5
-	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
-	harness.engine.retryDelay = func(retryCount int) time.Duration {
-		if retryCount != 3 {
-			t.Fatalf("retry count = %d, want 3", retryCount)
-		}
-		return 37 * time.Second
-	}
+	definition := testDefinition(&limit, true)
+	definition.Policy.Backoff = BackoffPolicy{InitialDelay: time.Second, Multiplier: 3, MaximumDelay: time.Minute}
+	harness := newTaskHarness(t, scriptedHandler{definition: definition}, nil)
 	now := time.Now()
 	row := enqueueTestTask(t, harness, "backoff")
 	row.RetryCount = 3
-	transition := harness.engine.transitionFor(row, RetryBackoff(errors.New("temporary"), "temporary_failure", nil))
+	transition := harness.engine.transitionFor(row, Retry(errors.New("temporary"), "temporary_failure", nil))
 	if transition.Status != model.TaskStatusPending || !transition.IncrementRetry {
 		t.Fatalf("transition = %#v, want pending retry", transition)
 	}
-	if transition.AvailableAt.Before(now.Add(37*time.Second)) || transition.AvailableAt.After(time.Now().Add(37*time.Second)) {
-		t.Fatalf("available at = %s, want 37 second delay", transition.AvailableAt)
+	if transition.AvailableAt.Before(now.Add(27*time.Second)) || transition.AvailableAt.After(time.Now().Add(27*time.Second)) {
+		t.Fatalf("available at = %s, want 27 second delay", transition.AvailableAt)
+	}
+}
+
+func TestResendAtRequiresDeclaredDeterministicPolicy(t *testing.T) {
+	policy := ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy(), ResendBackoff: &BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 4 * time.Minute}}
+	execution := Execution{policy: policy}
+	sentAt := time.Date(2026, time.October, 12, 1, 2, 3, 0, time.UTC)
+	for _, test := range []struct {
+		sends int
+		delay time.Duration
+	}{{1, time.Minute}, {2, 2 * time.Minute}, {20, 4 * time.Minute}} {
+		first, err := execution.ResendAt(sentAt, test.sends)
+		second, repeatedErr := execution.ResendAt(sentAt, test.sends)
+		if err != nil || repeatedErr != nil || !first.Equal(sentAt.Add(test.delay)) || !first.Equal(second) {
+			t.Fatalf("resend %d = %s, repeated=%s errors=%v,%v", test.sends, first, second, err, repeatedErr)
+		}
+	}
+	if _, err := execution.ResendAt(time.Time{}, 1); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("zero send time error = %v", err)
+	}
+	if _, err := execution.ResendAt(sentAt, 0); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("zero send count error = %v", err)
+	}
+	policy.ResendBackoff = nil
+	if err := policy.validate(); err != nil {
+		t.Fatalf("policy without resend work = %v", err)
+	}
+	if _, err := (Execution{policy: policy}).ResendAt(sentAt, 1); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("missing resend policy error = %v", err)
+	}
+	policy.ResendBackoff = &BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: time.Minute, Jitter: .1}
+	if err := policy.validate(); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("jittered resend policy error = %v", err)
+	}
+	policy.ResendBackoff = &BackoffPolicy{InitialDelay: time.Minute, Multiplier: 0, MaximumDelay: time.Minute}
+	if err := policy.validate(); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("invalid resend curve error = %v", err)
+	}
+}
+
+func TestWaitUsesPollIntervalAndAbsoluteDeadline(t *testing.T) {
+	registry := NewRegistry()
+	if err := registry.Register(scriptedHandler{definition: testDefinition(nil, true)}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{config: EngineConfig{PollInterval: 17 * time.Second}, registry: registry}
+	row := &model.Task{Type: testTaskType}
+	deadline := time.Now().Add(time.Hour)
+	for _, test := range []struct {
+		name     string
+		result   Result
+		deadline time.Time
+		delay    time.Duration
+	}{{"poll", Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil), time.Time{}, 17 * time.Second}, {"observation", WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting", nil), time.Time{}, 30 * time.Second}, {"deadline", WaitUntil(model.TaskResumeModeRecover, deadline, "protocol", "Waiting", nil), deadline, 0}} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now()
+			transition := engine.transitionFor(row, test.result)
+			if transition.IncrementRetry || transition.Status != model.TaskStatusPending || transition.WaitReason == nil {
+				t.Fatalf("wait transition = %#v", transition)
+			}
+			if !test.deadline.IsZero() {
+				if !transition.AvailableAt.Equal(test.deadline) {
+					t.Fatalf("wait deadline = %s, want %s", transition.AvailableAt, test.deadline)
+				}
+			} else if transition.AvailableAt.Before(now.Add(test.delay)) || transition.AvailableAt.After(time.Now().Add(test.delay)) {
+				t.Fatalf("%s deadline = %s", test.name, transition.AvailableAt)
+			}
+		})
+	}
+	if err := validateResult(WaitUntil(model.TaskResumeModeRecover, time.Time{}, "protocol", "Waiting", nil), nil); !errors.Is(err, ErrInvalidResult) {
+		t.Fatalf("zero wait deadline error = %v", err)
+	}
+}
+
+func TestRegistryResolvesObservationInterval(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval time.Duration
+		want     time.Duration
+		invalid  bool
+	}{
+		{name: "default", want: 30 * time.Second},
+		{name: "explicit", interval: 11 * time.Second, want: 11 * time.Second},
+		{name: "negative", interval: -time.Second, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			definition := testDefinition(nil, true)
+			definition.Policy.ObservationInterval = tc.interval
+			registry := NewRegistry()
+			err := registry.Register(scriptedHandler{definition: definition})
+			if tc.invalid {
+				if !errors.Is(err, ErrInvalidPolicy) {
+					t.Fatalf("negative interval: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			registered, ok := registry.Definition(testTaskType)
+			if !ok || registered.Policy.ObservationInterval != tc.want || definition.Policy.ObservationInterval != tc.interval {
+				t.Fatalf("registered policy=%#v input=%#v", registered.Policy, definition.Policy)
+			}
+			registered.Policy.ObservationInterval = time.Hour
+			again, _ := registry.Definition(testTaskType)
+			if again.Policy.ObservationInterval != tc.want {
+				t.Fatal("returned policy changed registry")
+			}
+		})
 	}
 }
 
@@ -636,7 +750,7 @@ func TestUnexpectedClaimPanicForcesRecoveryWithoutKillingWorker(t *testing.T) {
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(context.Context, Execution) Result {
-			return Retry(panicError{}, "formatting_failed", 0, nil)
+			return Retry(panicError{}, "formatting_failed", nil)
 		},
 	}, nil)
 	row := enqueueTestTask(t, harness, "claim-panic")
@@ -663,7 +777,7 @@ func TestEnginePanicAndInvalidResultFailClosed(t *testing.T) {
 			return Fail(nil, "", nil)
 		}, wantReason: "invalid_result"},
 		{name: "retry without reason", execute: func(context.Context, Execution) Result {
-			return Retry(errors.New("temporary"), "", 0, nil)
+			return Retry(errors.New("temporary"), "", nil)
 		}, wantReason: "invalid_result"},
 	}
 	for _, tt := range tests {

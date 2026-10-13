@@ -78,11 +78,6 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		if err != nil {
 			return err
 		}
-		if local && len(source.CreationRejection) != 0 {
-			if err := verifyCreationRejection(source, input.VerifiedCreationRejection); err != nil {
-				return err
-			}
-		}
 		if source.ProviderID.Equal(input.TargetProviderID) {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrInvalidTarget)
 		}
@@ -102,18 +97,18 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		if inUse > 0 {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrTargetInUse)
 		}
-		if err := abandonUnsentReplacementTargets(ctx, db, source.ID, input.Preflight); err != nil {
+		if err := abandonUnsentReplacementTargets(ctx, db, source.ID); err != nil {
 			return err
 		}
 
 		now := time.Now()
 		// The single-active-replacement index rejects a second live row for one
 		// source, so the predecessor must step down before the successor exists.
-		superseded, err := supersedeEarlierReplacements(ctx, db, source.ID, local, now)
+		superseded, err := supersedeEarlierReplacements(ctx, db, source.ID, local, source.Status != model.StorageDataSetStatusReady, now)
 		if err != nil {
 			return err
 		}
-		if local {
+		if source.Status != model.StorageDataSetStatusReady {
 			result, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
 				Set("ensure_task_id = NULL").Set("creation_rejection = ?", source.CreationRejection).
 				Set("updated_at = ?", now).Where("id = ? AND is_current = ?", source.ID, true).Exec(ctx)
@@ -178,13 +173,14 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 	return result, created, nil
 }
 
-// Earlier targets can be abandoned only after creation stopped without a
-// submission, with either no request or persisted provider refusal evidence.
-func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceDataSetID int64, preflight *ReplacementPreflight) error {
+func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceDataSetID int64) error {
 	var ids []int64
 	if err := db.NewSelect().Model((*storagereplacement.Replacement)(nil)).Column("target_data_set_id").
 		Where("source_data_set_id = ? AND status NOT IN (?, ?)", sourceDataSetID, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).Scan(ctx, &ids); err != nil {
 		return err
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 	if err := lockReplacementDataSets(ctx, db, ids...); err != nil {
 		return err
@@ -194,22 +190,13 @@ func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceData
 		return err
 	}
 	for _, target := range targets {
-		if len(target.CreationRejection) != 0 {
-			var checked *model.DataSetCreationRejection
-			if preflight != nil {
-				for _, entry := range preflight.Targets {
-					if entry.DataSet.ID == target.ID {
-						checked = entry.VerifiedCreationRejection
-					}
-				}
-			}
-			if err := verifyCreationRejection(&target, checked); err != nil {
-				return err
-			}
+		status := model.StorageDataSetStatusRetired
+		if target.DataSetID != nil {
+			status = model.StorageDataSetStatusDraining
 		}
 		if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
-			Set("status = ?", model.StorageDataSetStatusRetired).Set("is_current = ?", false).
-			Set("ensure_task_id = NULL").Set("creation_rejection = ?", target.CreationRejection).Set("updated_at = ?", time.Now()).Where("id = ?", target.ID).Exec(ctx); err != nil {
+			Set("status = ?", status).Set("is_current = ?", false).Set("ensure_task_id = NULL").
+			Set("creation_rejection = ?", target.CreationRejection).Set("updated_at = ?", time.Now()).Where("id = ?", target.ID).Exec(ctx); err != nil {
 			return err
 		}
 	}
@@ -247,7 +234,7 @@ func getReplacementByClientRequestID(
 
 // A later confirmation takes over from an earlier one in the same transaction,
 // which is what the single-active-replacement index relies on.
-func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSetID int64, includeIncoming bool, now time.Time) ([]int64, error) {
+func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSetID int64, includeIncoming, initializing bool, now time.Time) ([]int64, error) {
 	var ids []int64
 	if err := db.NewSelect().
 		Model((*storagereplacement.Replacement)(nil)).
@@ -265,8 +252,8 @@ func supersedeEarlierReplacements(ctx context.Context, db bun.IDB, sourceDataSet
 	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
 		Set("task_generation = task_generation + 1").Set("task_id = NULL").
 		Where("id IN (?)", bun.List(ids)).
-		Where("task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?))",
-			model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted).
+		Where("? OR task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE status IN (?, ?, ?)) OR target_data_set_id IN (SELECT id FROM storage_data_sets WHERE status <> ?)",
+			initializing, model.TaskStatusFailed, model.TaskStatusCancelled, model.TaskStatusCompleted, model.StorageDataSetStatusReady).
 		Exec(ctx); err != nil {
 		return nil, fmt.Errorf("fencing stopped superseded coordinator: %w", err)
 	}
@@ -469,9 +456,6 @@ func (r *BunStorageReplacementRepo) Activate(ctx context.Context, replacementID,
 		}
 		sourceStatus := model.StorageDataSetStatusDraining
 		if source.DataSetID == nil {
-			if err := uncreatedDataSetEligibility(ctx, db, source); err != nil {
-				return err
-			}
 			if source.EnsureTaskID != nil {
 				return ErrConflict
 			}
@@ -557,28 +541,6 @@ func (r *BunStorageReplacementRepo) MarkFailed(
 		return fmt.Errorf("marking replacement failed: unknown reason: %w", ErrInvalidInput)
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		if reason != nil && *reason == storagereplacement.FailureReasonTargetRejected {
-			// Ready binding locks this same row before changing the target. A
-			// discarded failure settlement is retried by the engine as recovery.
-			row, err := lockReplacementByID(ctx, db, replacementID)
-			if err != nil {
-				return err
-			}
-			if row == nil {
-				return ErrNotFound
-			}
-			target, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
-			if err != nil {
-				return err
-			}
-			if target == nil || target.DataSetID != nil ||
-				(target.Status != model.StorageDataSetStatusPending && target.Status != model.StorageDataSetStatusCreating) {
-				return ErrConflict
-			}
-			if evidence, err := target.CreationRejectionEvidence(); err != nil || evidence == nil {
-				return ErrConflict
-			}
-		}
 		return transitionReplacement(ctx, db, replacementID,
 			[]storagereplacement.Status{
 				storagereplacement.StatusPreparingTarget,

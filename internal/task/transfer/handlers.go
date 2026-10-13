@@ -18,12 +18,9 @@ import (
 )
 
 const (
-	storageDependencyWait     = time.Minute
-	storagePollInterval       = 5 * time.Second
-	storageSourcePollInterval = 30 * time.Second
-	storeAttentionAfter       = 30 * time.Minute
-	pullSubmitTimeout         = 30 * time.Second
-	pullStatusTimeout         = 4 * time.Second
+	storeAttentionAfter = 30 * time.Minute
+	pullSubmitTimeout   = 30 * time.Second
+	pullStatusTimeout   = 4 * time.Second
 )
 
 type ReadyDataSetResolver interface {
@@ -171,7 +168,7 @@ func (h *CopyCoordinator) wake(ctx context.Context, tx *repository.Repositories,
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

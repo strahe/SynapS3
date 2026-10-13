@@ -2,12 +2,18 @@ package task_test
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 func TestMinimumDurabilitySchedulesEvictionBeforeAllRequestedCopiesCommit(t *testing.T) {
@@ -48,5 +54,74 @@ func TestMinimumDurabilitySchedulesEvictionBeforeAllRequestedCopiesCommit(t *tes
 	waitForTask(t, f.runtime.repos, eviction.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
 	if fs.Exists(t.Context(), bucket.Name, model.ContentCacheKey(copyRow.ContentID)) {
 		t.Fatal("cache retained despite meeting the durability minimum")
+	}
+}
+
+func TestDurabilityReconciliationBatchesAndRollsBack(t *testing.T) {
+	for _, scenario := range []struct {
+		count int
+		fail  bool
+	}{{101, false}, {3, true}} {
+		t.Run(fmt.Sprintf("%d_candidates_fault_%t", scenario.count, scenario.fail), func(t *testing.T) {
+			f := newRegistrationFixture(t, scenario.count, nil, 0, func(options *handlerRuntimeOptions) { options.policy = cache.EvictionPolicyAfterUpload })
+			ctx := t.Context()
+			for _, copy := range f.copies {
+				testutil.CommitStorageCopy(t, f.runtime.db, f.runtime.repos, testutil.CommitCopyInput{StorageCopyID: copy.ID, ContentID: copy.ContentID, CopyIndex: copy.CopyIndex})
+				if err := f.runtime.repos.Objects.RecordContentCacheCommit(ctx, copy.ContentID, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			generation, err := f.runtime.repos.CacheEvictions.NextDurabilityGeneration(ctx, f.dataSet.BucketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, _, err := f.runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeCacheReconcileDurability, Input: cacheeviction.DurabilityInput{BucketID: f.dataSet.BucketID, Generation: generation}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+				return repos.CacheEvictions.BindDurabilityTask(ctx, f.dataSet.BucketID, generation, row.ID)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario.fail {
+				observer := &capacityArchiveObserver{failed: make(chan struct{})}
+				testutil.AddQueryHook(f.runtime.db, observer)
+				restore := testutil.FailWrites(t, f.runtime.db, "object_cache", "UPDATE", fmt.Sprintf("NEW.content_id = %d AND NEW.cache_active_task_id IS NOT NULL", f.copies[2].ContentID), "injected durability batch failure")
+				defer restore()
+				repos := *f.runtime.repos
+				repos.Tasks = &limitedClaimRepository{TaskRepository: f.runtime.repos.Tasks, maximum: 1}
+				engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &repos, handlerExecutionRegistry(t, f.runtime), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cancel, done := runEngine(t, engine)
+				select {
+				case <-observer.failed:
+				case <-time.After(3 * time.Second):
+					t.Fatal("batch did not reach injected fault")
+				}
+				stopHandlerEngine(t, cancel, done)
+				for _, copy := range f.copies {
+					entry, err := f.runtime.repos.CacheEvictions.GetCacheEntry(ctx, copy.ContentID)
+					if err != nil || entry.CacheActiveTaskID != nil || entry.CacheOperationGeneration != 0 {
+						t.Fatalf("rolled-back cache reservation = %#v, %v", entry, err)
+					}
+				}
+				count, err := f.runtime.db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeCacheEvict).Count(ctx)
+				if err != nil || count != 0 {
+					t.Fatalf("rolled-back eviction tasks = %d, %v", count, err)
+				}
+				return
+			}
+			row = runBatchTaskClaim(t, f.runtime, row)
+			count, err := f.runtime.db.NewSelect().Model((*model.ObjectCache)(nil)).Where("cache_active_task_id IS NOT NULL").Count(ctx)
+			if err != nil || count != 100 {
+				t.Fatalf("first durability batch = %d, %v", count, err)
+			}
+			wakeTask(t, f.runtime, row.ID)
+			runBatchTaskClaim(t, f.runtime, row)
+			count, err = f.runtime.db.NewSelect().Model((*model.ObjectCache)(nil)).Where("cache_active_task_id IS NOT NULL").Count(ctx)
+			if err != nil || count != 101 {
+				t.Fatalf("final durability batch = %d, %v", count, err)
+			}
+		})
 	}
 }

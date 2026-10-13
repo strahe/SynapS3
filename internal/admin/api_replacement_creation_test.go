@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
@@ -25,7 +24,7 @@ import (
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
-func pendingReplacementAPISource(t *testing.T, f *replacementAPIFixture) *model.Task {
+func failedReplacementAPISource(t *testing.T, f *replacementAPIFixture) *model.Task {
 	t.Helper()
 	if _, err := f.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("status = ?", model.StorageDataSetStatusPending).
 		Set("data_set_id = NULL").Where("id = ?", f.source.ID).Exec(t.Context()); err != nil {
@@ -40,6 +39,10 @@ func pendingReplacementAPISource(t *testing.T, f *replacementAPIFixture) *model.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+		Set("finished_at = ?", time.Now()).Where("id = ?", ensure.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	return ensure
 }
 
@@ -50,11 +53,15 @@ func rejectedReplacementAPISource(t *testing.T, f *replacementAPIFixture, ensure
 		t.Fatal(err)
 	}
 	identity := testutil.DefaultContextIdentity
-	evidence := model.DataSetCreationRejection{
-		Version: 1, StatusCode: 403, RejectedAt: time.Now().UTC().Add(-time.Minute), AbsenceCheckedAt: time.Now().UTC(),
-		ClientDataSetID: clientID, Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper,
+	evidence := map[string]any{
+		"version": 1, "status_code": 403, "rejected_at": time.Now().UTC().Add(-time.Minute), "absence_checked_at": time.Now().UTC(),
+		"client_data_set_id": clientID, "payer": identity.Payer, "chain_id": uint64(identity.ChainID), "record_keeper": identity.RecordKeeper,
 	}
-	if err := f.srv.repos.Contents.RecordDataSetCreationRejection(t.Context(), f.source.ID, f.source.Generation, ensure.ID, evidence); err != nil {
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("creation_rejection = ?", json.RawMessage(encoded)).Where("id = ?", f.source.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, failure_reason = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), "dataset_provider_rejected", ensure.ID).Exec(t.Context()); err != nil {
@@ -62,125 +69,11 @@ func rejectedReplacementAPISource(t *testing.T, f *replacementAPIFixture, ensure
 	}
 }
 
-func TestReplacementCreationPreflightAndPresentation(t *testing.T) {
-	for _, tc := range []struct {
-		name            string
-		refusal         bool
-		running         bool
-		unknown         bool
-		found           bool
-		lookupError     bool
-		identityChanged bool
-		wantCode        string
-	}{
-		{name: "unsent"},
-		{name: "refused", refusal: true},
-		{name: "service found", refusal: true, found: true, wantCode: storagereplacement.CodeSourceOutcomeUnknown},
-		{name: "lookup unavailable", refusal: true, lookupError: true, wantCode: storagereplacement.CodeSourceOutcomeUnknown},
-		{name: "identity changed", refusal: true, identityChanged: true, wantCode: storagereplacement.CodeSourceOutcomeUnknown},
-		{name: "unknown outcome", unknown: true, wantCode: storagereplacement.CodeSourceOutcomeUnknown},
-		{name: "running", running: true, wantCode: storagereplacement.CodeSourceRunning},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
-			ensure := pendingReplacementAPISource(t, f)
-			if tc.refusal {
-				rejectedReplacementAPISource(t, f, ensure)
-			}
-			if tc.unknown {
-				if err := f.srv.repos.Contents.RecordDataSetClientID(t.Context(), f.source.ID, ensure.ID, onChainIDValue("909")); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if tc.running {
-				now := time.Now()
-				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, lease_until = ?, claim_generation = 1 WHERE id = ?", model.TaskStatusRunning, now.Add(time.Minute), ensure.ID).Exec(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-			}
-			lookups := 0
-			f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-				identity := testutil.DefaultContextIdentity
-				if tc.identityChanged {
-					identity.ChainID++
-				}
-				return &testutil.MockStorageTarget{ProviderIDValue: f.source.ProviderID.SDK(), ContextIdentityValue: identity, FindDataSetByClientIDFunc: func(_ context.Context, clientID sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-					lookups++
-					if clientID.String() != "909" {
-						t.Fatalf("looked up another request: %s", clientID.String())
-					}
-					if tc.lookupError {
-						return storage.DataSetRef{}, false, errors.New("chain failed")
-					}
-					if tc.found {
-						ref, err := storage.NewDataSetRef(f.source.ProviderID.SDK(), sdktypes.NewBigInt(1001), clientID)
-						return ref, err == nil, err
-					}
-					return storage.DataSetRef{}, false, nil
-				}}, nil
-			}})
-			get := httptest.NewRecorder()
-			f.mux.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/v1/buckets/"+f.bucket.Name, nil))
-			var detail bucketDetailResponse
-			if get.Code != http.StatusOK {
-				t.Fatalf("detail: %d %s", get.Code, get.Body.String())
-			}
-			if err := json.Unmarshal(get.Body.Bytes(), &detail); err != nil {
-				t.Fatal(err)
-			}
-			if len(detail.DataSets) != 1 || detail.DataSets[0].Replaceable != (!tc.unknown && !tc.running) {
-				t.Fatalf("presentation = %#v", detail.DataSets)
-			}
-			if tc.refusal && detail.DataSets[0].SetupError == "" {
-				t.Fatal("provider refusal was not shown")
-			}
-			rec := f.start(t, `{"mode":"manual","provider_id":"202"}`)
-			if tc.wantCode != "" {
-				response := decodeAPIError(t, rec)
-				if rec.Code != http.StatusConflict || response["code"] != tc.wantCode {
-					t.Fatalf("blocked: %d %s", rec.Code, rec.Body.String())
-				}
-				if tc.lookupError && !strings.Contains(response["error"], "network is available") {
-					t.Fatalf("lookup failure lacks a concrete reason: %s", rec.Body.String())
-				}
-				if tc.identityChanged && (lookups != 0 || !strings.Contains(response["error"], "original wallet")) {
-					t.Fatalf("identity mismatch: lookups=%d body=%s", lookups, rec.Body.String())
-				}
-				if tc.found {
-					source, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
-					if err != nil || source.Status != model.StorageDataSetStatusReady || source.DataSetID == nil || len(source.CreationRejection) != 0 {
-						t.Fatalf("found service not bound: %#v %v", source, err)
-					}
-				}
-				return
-			}
-			if rec.Code != http.StatusCreated {
-				t.Fatalf("start: %d %s", rec.Code, rec.Body.String())
-			}
-			row := decodeReplacement(t, rec)
-			source, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.Target.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !source.IsCurrent || source.Status == model.StorageDataSetStatusRetired || source.EnsureTaskID != nil || target.IsCurrent || target.EnsureTaskID == nil {
-				t.Fatalf("preparing replacement: source=%#v target=%#v", source, target)
-			}
-			if tc.refusal && lookups != 1 {
-				t.Fatalf("preflight lookups=%d, want 1", lookups)
-			}
-		})
-	}
-}
-
 func TestUnsentReplacementConcurrentConfirmations(t *testing.T) {
 	for _, sameRequest := range []bool{true, false} {
 		t.Run(strconv.FormatBool(sameRequest), func(t *testing.T) {
 			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
-			pendingReplacementAPISource(t, f)
+			failedReplacementAPISource(t, f)
 			var wg sync.WaitGroup
 			results := make(chan *httptest.ResponseRecorder, 8)
 			for i := range 8 {
@@ -208,220 +101,6 @@ func TestUnsentReplacementConcurrentConfirmations(t *testing.T) {
 			}
 			if created != 1 {
 				t.Fatalf("created=%d, want 1", created)
-			}
-		})
-	}
-}
-
-func TestRefusedReplacementTargetIsRecheckedBeforeChangingProvider(t *testing.T) {
-	for _, outcome := range []string{"absent", "found", "lookup failed", "changed fence"} {
-		t.Run(outcome, func(t *testing.T) {
-			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
-			first := f.start(t, `{"mode":"manual","provider_id":"202"}`)
-			if first.Code != http.StatusCreated {
-				t.Fatalf("first: %d %s", first.Code, first.Body.String())
-			}
-			row := decodeReplacement(t, first)
-			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.Target.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ensure, err := f.srv.repos.Tasks.GetByID(t.Context(), *target.EnsureTaskID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			copyFixture := *f
-			copyFixture.source = target
-			rejectedReplacementAPISource(t, &copyFixture, ensure)
-			reason := storagereplacement.FailureReasonTargetRejected
-			if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, &reason, "refused"); err != nil {
-				t.Fatal(err)
-			}
-			detail := httptest.NewRecorder()
-			f.mux.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/v1/buckets/"+f.bucket.Name, nil))
-			var summary bucketDetailResponse
-			if detail.Code != http.StatusOK {
-				t.Fatalf("bucket detail: %d %s", detail.Code, detail.Body.String())
-			}
-			if err := json.Unmarshal(detail.Body.Bytes(), &summary); err != nil {
-				t.Fatal(err)
-			}
-			foundSource := false
-			for _, dataSet := range summary.DataSets {
-				if dataSet.ID == f.source.ID {
-					foundSource = true
-					if !dataSet.ReplacementHasLateServiceRisk {
-						t.Fatal("ready source did not disclose its refused target's late service risk")
-					}
-				}
-			}
-			if !foundSource {
-				t.Fatal("source summary missing")
-			}
-			lookups := 0
-			f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(_ context.Context, provider sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-				return &testutil.MockStorageTarget{ProviderIDValue: provider, FindDataSetByClientIDFunc: func(_ context.Context, id sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-					lookups++
-					if provider.String() != "202" || id.String() != "909" {
-						t.Fatalf("wrong original identity: %s/%s", provider, id)
-					}
-					switch outcome {
-					case "lookup failed":
-						return storage.DataSetRef{}, false, errors.New("unavailable")
-					case "found":
-						ref, err := storage.NewDataSetRef(provider, sdktypes.NewBigInt(2002), id)
-						return ref, err == nil, err
-					case "changed fence":
-						if err := f.srv.repos.Contents.CompleteDataSetEnsureTask(t.Context(), target.ID, ensure.ID); err != nil {
-							t.Fatal(err)
-						}
-					}
-					return storage.DataSetRef{}, false, nil
-				}}, nil
-			}})
-			second := f.start(t, `{"mode":"manual","provider_id":"303"}`)
-			if lookups != 1 {
-				t.Fatalf("original target queried %d times", lookups)
-			}
-			stored, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if outcome == "absent" {
-				if second.Code != http.StatusCreated || stored.Status != model.StorageDataSetStatusRetired || stored.DataSetID != nil {
-					t.Fatalf("absence: %d %s target=%#v", second.Code, second.Body.String(), stored)
-				}
-				return
-			}
-			if second.Code != http.StatusConflict || stored.Status == model.StorageDataSetStatusRetired {
-				t.Fatalf("unsafe abandonment: %d %s target=%#v", second.Code, second.Body.String(), stored)
-			}
-			if outcome == "found" {
-				if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", model.TaskStatusFailed, time.Now(), f.replacementTaskID(t, row.ID)).Exec(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				if stored.Status != model.StorageDataSetStatusReady || stored.DataSetID == nil || len(stored.CreationRejection) != 0 || stored.EnsureTaskID != nil {
-					t.Fatalf("service not recovered: %#v", stored)
-				}
-				retry := httptest.NewRecorder()
-				f.mux.ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(f.replacementTaskID(t, row.ID), 10)+"/retry", nil))
-				if retry.Code != http.StatusAccepted {
-					t.Fatalf("recovered target could not resume: %d %s", retry.Code, retry.Body.String())
-				}
-			}
-		})
-	}
-}
-
-func TestStoppedReplacementSourceCanBindAnObservedService(t *testing.T) {
-	f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
-	ensure := pendingReplacementAPISource(t, f)
-	rejectedReplacementAPISource(t, f, ensure)
-	copyRow := waitingReplacementAPICopy(t, f)
-	f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(_ context.Context, provider sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-		return &testutil.MockStorageTarget{ProviderIDValue: provider, FindDataSetByClientIDFunc: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-			return storage.DataSetRef{}, false, nil
-		}}, nil
-	}})
-	first := f.start(t, `{"mode":"manual","provider_id":"202"}`)
-	if first.Code != http.StatusCreated {
-		t.Fatalf("first: %d %s", first.Code, first.Body.String())
-	}
-	row := decodeReplacement(t, first)
-	if _, err := f.srv.db.NewRaw("UPDATE tasks SET status = ?, finished_at = ?, failure_reason = ? WHERE id = (SELECT ensure_task_id FROM storage_data_sets WHERE id = ?)", model.TaskStatusFailed, time.Now(), "provider_unavailable", row.Target.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(_ context.Context, provider sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-		return &testutil.MockStorageTarget{ProviderIDValue: provider, FindDataSetByClientIDFunc: func(_ context.Context, id sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-			ref, err := storage.NewDataSetRef(provider, sdktypes.NewBigInt(1001), id)
-			return ref, err == nil, err
-		}}, nil
-	}})
-	if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "replacement stopped"); err != nil {
-		t.Fatal(err)
-	}
-	second := f.start(t, `{"mode":"manual","provider_id":"303"}`)
-	if second.Code != http.StatusConflict {
-		t.Fatalf("expected new confirmation: %d %s", second.Code, second.Body.String())
-	}
-	source, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
-	if err != nil || source.EnsureTaskID != nil || source.DataSetID == nil || source.Status != model.StorageDataSetStatusReady || !source.IsCurrent || len(source.CreationRejection) != 0 {
-		t.Fatalf("stopped source could not recover: %#v %v", source, err)
-	}
-	recovered, err := f.srv.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
-	if err != nil || recovered.WorkTaskID() == nil {
-		t.Fatalf("observed service left its replica without work: %#v %v", recovered, err)
-	}
-	if _, err := f.srv.repos.Contents.AuthorizeDataSetEnsureTask(t.Context(), source.ID, ensure.ID); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("observation restored old creation permission: %v", err)
-	}
-}
-
-func waitingReplacementAPICopy(t *testing.T, f *replacementAPIFixture) *model.StorageCopy {
-	t.Helper()
-	content, err := f.srv.repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{BucketID: f.bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(t.Name()), RequestedCopies: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: f.bucket.ID, Key: "waiting.bin", ContentID: &content.ID, Size: 11, ETag: "waiting", ContentType: "application/octet-stream"}
-	if _, err := f.srv.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.srv.repos.Contents.CreateUploadCopiesForBindings(t.Context(), content.ID, []repository.UploadCopyBindingInput{{StorageDataSetID: f.source.ID, CopyIndex: 0, ProviderID: f.source.ProviderID, TransferMethod: model.StorageCopyTransferMethodIngress}}); err != nil {
-		t.Fatal(err)
-	}
-	copies, err := f.srv.repos.Contents.ListCopies(t.Context(), content.ID)
-	if err != nil || len(copies) != 1 {
-		t.Fatalf("waiting replica: %#v %v", copies, err)
-	}
-	return &copies[0]
-}
-
-func TestObservedReplacementServiceCompletionIsAtomic(t *testing.T) {
-	for _, failure := range []string{"enqueue", "dependency"} {
-		t.Run(failure, func(t *testing.T) {
-			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
-			ensure := pendingReplacementAPISource(t, f)
-			rejectedReplacementAPISource(t, f, ensure)
-			copyRow := waitingReplacementAPICopy(t, f)
-			before, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(_ context.Context, provider sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-				return &testutil.MockStorageTarget{ProviderIDValue: provider, FindDataSetByClientIDFunc: func(_ context.Context, id sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-					ref, err := storage.NewDataSetRef(provider, sdktypes.NewBigInt(1001), id)
-					return ref, err == nil, err
-				}}, nil
-			}})
-			messages := f.srv.replacementMessages
-			restoreEnqueue := func() {}
-			if failure == "dependency" {
-				f.srv.replacementMessages = nil
-			} else {
-				restoreEnqueue = testutil.FailWrites(t, f.srv.db, "tasks", "INSERT", "NEW.type = 'storage_transfer_plan'", "injected enqueue failure")
-			}
-			failed := f.start(t, `{"mode":"manual","provider_id":"202"}`)
-			if failed.Code != http.StatusInternalServerError {
-				t.Fatalf("completion failure: %d %s", failed.Code, failed.Body.String())
-			}
-			after, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
-			if err != nil || after.Status != before.Status || after.DataSetID != nil || after.EnsureTaskID == nil || *after.EnsureTaskID != ensure.ID || string(after.CreationRejection) != string(before.CreationRejection) {
-				t.Fatalf("partial observation committed: %#v %v", after, err)
-			}
-			copyRow, err = f.srv.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
-			if err != nil || copyRow.ActiveTaskID != nil || copyRow.WorkGeneration != 0 {
-				t.Fatalf("partial copy work committed: %#v %v", copyRow, err)
-			}
-			restoreEnqueue()
-			f.srv.replacementMessages = messages
-			recovered := f.start(t, `{"mode":"manual","provider_id":"202"}`)
-			if recovered.Code != http.StatusConflict {
-				t.Fatalf("completion retry: %d %s", recovered.Code, recovered.Body.String())
-			}
-			copyRow, err = f.srv.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
-			if err != nil || copyRow.ActiveTaskID == nil || copyRow.WorkGeneration != 1 {
-				t.Fatalf("completion retry did not schedule one generation: %#v %v", copyRow, err)
 			}
 		})
 	}
@@ -478,88 +157,13 @@ func TestReadyIncomingReplacementTargetRemainsUnavailable(t *testing.T) {
 	}
 }
 
-func TestConcurrentObservedReplacementServiceSchedulesOneCopyGeneration(t *testing.T) {
-	f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
-	ensure := pendingReplacementAPISource(t, f)
-	rejectedReplacementAPISource(t, f, ensure)
-	copyRow := waitingReplacementAPICopy(t, f)
-	if _, err := f.srv.db.NewUpdate().Model((*model.Bucket)(nil)).Set("status = ?", model.BucketStatusProvisioning).Where("id = ?", f.bucket.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	provision, _, err := f.srv.taskService.Enqueue(t.Context(), taskengine.EnqueueRequest{
-		Type:  model.TaskTypeBucketProvision,
-		Input: bucketlifecycle.ProvisionInput{BucketID: f.bucket.ID, Copies: f.bucket.DefaultCopies}, AvailableAt: time.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	check, err := f.srv.repos.Replacements.Preflight(t.Context(), f.source.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lookedUp, release := make(chan struct{}, 2), make(chan struct{})
-	f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(_ context.Context, provider sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-		return &testutil.MockStorageTarget{ProviderIDValue: provider, FindDataSetByClientIDFunc: func(ctx context.Context, id sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-			lookedUp <- struct{}{}
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return storage.DataSetRef{}, false, ctx.Err()
-			}
-			ref, err := storage.NewDataSetRef(provider, sdktypes.NewBigInt(1001), id)
-			return ref, err == nil, err
-		}}, nil
-	}})
-	results := make(chan error, 2)
-	for range 2 {
-		go func() {
-			_, err := f.srv.checkReplacementRefusal(t.Context(), f.bucket, check, &check.Source)
-			results <- err
-		}()
-	}
-	for range 2 {
-		select {
-		case <-lookedUp:
-		case <-time.After(3 * time.Second):
-			close(release)
-			t.Fatal("observations did not reach the remote check")
-		}
-	}
-	close(release)
-	for range 2 {
-		if err := <-results; !errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
-			t.Fatalf("concurrent observation result: %v", err)
-		}
-	}
-	copyRow, err = f.srv.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
-	if err != nil || copyRow.ActiveTaskID == nil || copyRow.WorkGeneration != 1 {
-		t.Fatalf("observation scheduled duplicate work: %#v %v", copyRow, err)
-	}
-	bucket, err := f.srv.repos.Buckets.GetByID(t.Context(), f.bucket.ID)
-	if err != nil || bucket.Status != model.BucketStatusReady {
-		t.Fatalf("observation did not advance bucket readiness: %#v %v", bucket, err)
-	}
-	provision, err = f.srv.repos.Tasks.GetByID(t.Context(), provision.ID)
-	if err != nil || provision.AvailableAt.After(time.Now()) {
-		t.Fatalf("observation did not wake provisioning: %#v %v", provision, err)
-	}
-	if err := f.srv.repos.Replacements.BindObservedService(t.Context(), repository.BindObservedReplacementServiceInput{
-		Preflight: *check, StorageDataSetID: check.Source.ID, DataSetID: onChainIDValue("1001"), ClientDataSetID: *check.Source.ClientDataSetID,
-	}); !errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
-		t.Fatalf("replayed stale observation accepted: %v", err)
-	}
-	if err := f.srv.repos.Contents.RecordDataSetClientID(t.Context(), f.source.ID, ensure.ID, onChainIDValue("999")); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("old worker regained creation permission: %v", err)
-	}
-}
-
 func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 	for _, local := range []bool{false, true} {
 		for _, phase := range []storagereplacement.Status{storagereplacement.StatusPreparingTarget, storagereplacement.StatusWaiting, storagereplacement.StatusFailed} {
 			t.Run(fmt.Sprintf("local=%v/%s", local, phase), func(t *testing.T) {
 				f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
 				if local {
-					pendingReplacementAPISource(t, f)
+					failedReplacementAPISource(t, f)
 				}
 				created := f.start(t, `{"mode":"manual","provider_id":"202"}`)
 				if created.Code != http.StatusCreated {
@@ -607,7 +211,7 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 				if get.Code != http.StatusOK || json.Unmarshal(get.Body.Bytes(), &detail) != nil {
 					t.Fatalf("detail: %d %s", get.Code, get.Body.String())
 				}
-				wantReplaceable := phase == storagereplacement.StatusFailed
+				wantReplaceable := !local && phase == storagereplacement.StatusFailed
 				found := false
 				for _, dataSet := range detail.DataSets {
 					if dataSet.ID == f.source.ID {
@@ -659,5 +263,468 @@ func TestReadyReplacementTargetKeepsSourceReserved(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestFailedInitializationReplacementDoesNotCheckProviderAbsence(t *testing.T) {
+	for _, evidence := range []string{"none", "client", "transaction", "refusal"} {
+		t.Run(evidence, func(t *testing.T) {
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+			ensure := failedReplacementAPISource(t, f)
+			if evidence == "client" || evidence == "transaction" {
+				if err := f.srv.repos.Contents.RecordDataSetClientID(t.Context(), f.source.ID, ensure.ID, onChainIDValue("909")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if evidence == "transaction" {
+				if err := f.srv.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: f.source.ID, TransactionID: "0xcreate", StatusURL: "https://provider.example/status", ClientDataSetID: new(onChainIDValue("909"))}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if evidence == "refusal" {
+				rejectedReplacementAPISource(t, f, ensure)
+			}
+			f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+				t.Fatal("replacement queried stopped provider")
+				return nil, nil
+			}})
+			response := f.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("replacement: %d %s", response.Code, response.Body.String())
+			}
+			stored, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
+			if err != nil || stored.EnsureTaskID != nil || !stored.IsCurrent {
+				t.Fatalf("source owner: %#v %v", stored, err)
+			}
+			if evidence != "none" && stored.ClientDataSetID == nil {
+				t.Fatal("creation identity was discarded")
+			}
+		})
+	}
+}
+
+func TestReplacementTargetRetryRestoresBothOwners(t *testing.T) {
+	for _, local := range []bool{false, true} {
+		t.Run(fmt.Sprintf("local=%v", local), func(t *testing.T) {
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+			if local {
+				failedReplacementAPISource(t, f)
+			}
+			created := f.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("first replacement: %d %s", created.Code, created.Body.String())
+			}
+			row, err := f.srv.repos.Replacements.GetByID(t.Context(), decodeReplacement(t, created).ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childID := *target.EnsureTaskID
+			parentID := *row.TaskID
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Where("id = ?", childID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := f.srv.repos.Replacements.SourceEligibility(t.Context(), f.source.ID); err != nil {
+				t.Fatalf("failed child waited for parent: %v", err)
+			}
+			child, err := f.srv.repos.Tasks.GetByID(t.Context(), childID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if item := f.srv.taskListItem(t.Context(), child); item.Retryable {
+				t.Fatal("running parent exposed retry")
+			}
+			if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "setup stopped"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Where("id = ?", parentID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if item := f.srv.taskListItem(t.Context(), child); !item.Retryable || item.RetryTaskID == nil || *item.RetryTaskID != parentID {
+				t.Fatalf("retry projection: %#v", item)
+			}
+			var results [2]*model.Task
+			var errs [2]error
+			var group sync.WaitGroup
+			for i, id := range []int64{childID, parentID} {
+				group.Add(1)
+				go func() { defer group.Done(); results[i], errs[i] = f.srv.retryTaskRequest(t.Context(), id) }()
+			}
+			group.Wait()
+			for _, err := range errs {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			childNext, err := f.srv.repos.Tasks.GetDirectSuccessor(t.Context(), childID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentNext, err := f.srv.repos.Tasks.GetDirectSuccessor(t.Context(), parentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if results[0].ID != childNext.ID || results[1].ID != parentNext.ID || childNext.RetryCount != 0 || parentNext.RetryCount != 0 {
+				t.Fatalf("successors: %#v %#v", results, errs)
+			}
+			stored, err := f.srv.repos.Replacements.GetByID(t.Context(), row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err = f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if *stored.TaskID != parentNext.ID || *target.EnsureTaskID != childNext.ID || stored.Status != storagereplacement.StatusPreparingTarget {
+				t.Fatalf("partial retry: %#v %#v", stored, target)
+			}
+			if _, _, err := f.srv.repos.Replacements.SourceEligibility(t.Context(), f.source.ID); !errors.Is(err, storagereplacement.ErrTargetCreating) {
+				t.Fatalf("retry allowed replacement: %v", err)
+			}
+			if replay, err := f.srv.retryTaskRequest(t.Context(), childID); err != nil || replay.ID != childNext.ID {
+				t.Fatalf("child replay: %#v %v", replay, err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(childID, 10)+"/retry", nil)
+			response := httptest.NewRecorder()
+			f.mux.ServeHTTP(response, request)
+			var replay struct {
+				TaskID int64 `json:"task_id"`
+			}
+			decodeJSON(t, response, &replay)
+			if response.Code != http.StatusAccepted || replay.TaskID != childNext.ID {
+				t.Fatalf("child HTTP replay: %d %#v", response.Code, replay)
+			}
+		})
+	}
+}
+
+func TestInitializationRetryAndReplacementAreAtomic(t *testing.T) {
+	for _, scenario := range []string{"retry rollback", "replace first", "retry first", "concurrent"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+			failedReplacementAPISource(t, f)
+			created := f.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("first replacement: %d %s", created.Code, created.Body.String())
+			}
+			row, err := f.srv.repos.Replacements.GetByID(t.Context(), decodeReplacement(t, created).ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childID, parentID := *target.EnsureTaskID, *row.TaskID
+			if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "setup stopped"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+				Set("finished_at = ?", time.Now()).Where("id IN (?, ?)", parentID, childID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "retry rollback" {
+				restore := testutil.FailWrites(t, f.srv.db, "storage_replacements", "UPDATE",
+					"NEW.task_id IS DISTINCT FROM OLD.task_id", "coordinator retry interrupted")
+				defer restore()
+				if _, err := f.srv.retryTaskRequest(t.Context(), childID); err == nil {
+					t.Fatal("retry survived failed coordinator handoff")
+				}
+				for _, id := range []int64{parentID, childID} {
+					if next, err := f.srv.repos.Tasks.GetDirectSuccessor(t.Context(), id); err != nil || next != nil {
+						t.Fatalf("partial successor: %#v %v", next, err)
+					}
+					if old, err := f.srv.repos.Tasks.GetByID(t.Context(), id); err != nil || old.SupersededAt != nil || old.Status != model.TaskStatusFailed {
+						t.Fatalf("partial task handoff: %#v %v", old, err)
+					}
+				}
+				stored, err := f.srv.repos.Replacements.GetByID(t.Context(), row.ID)
+				if err != nil || stored.TaskID == nil || *stored.TaskID != parentID || stored.Status != storagereplacement.StatusFailed {
+					t.Fatalf("partial coordinator handoff: %#v %v", stored, err)
+				}
+				target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+				if err != nil || target.EnsureTaskID == nil || *target.EnsureTaskID != childID {
+					t.Fatalf("partial child handoff: %#v %v", target, err)
+				}
+				return
+			}
+			var retried *model.Task
+			var retryErr error
+			var replaced *httptest.ResponseRecorder
+			retry := func() { retried, retryErr = f.srv.retryTaskRequest(t.Context(), childID) }
+			replace := func() { replaced = f.start(t, `{"mode":"manual","provider_id":"303"}`) }
+			switch scenario {
+			case "replace first":
+				replace()
+				retry()
+			case "retry first":
+				retry()
+				replace()
+			case "concurrent":
+				start := make(chan struct{})
+				var group sync.WaitGroup
+				for _, action := range []func(){retry, replace} {
+					group.Add(1)
+					go func() { defer group.Done(); <-start; action() }()
+				}
+				close(start)
+				group.Wait()
+			}
+			if retryErr == nil {
+				if retried == nil || replaced.Code != http.StatusConflict {
+					t.Fatalf("retry and replacement both authorized: %#v %d %s", retried, replaced.Code, replaced.Body.String())
+				}
+			} else if replaced.Code != http.StatusCreated || !errors.Is(retryErr, repository.ErrConflict) {
+				t.Fatalf("neither operation authorized: retry=%v replace=%d %s", retryErr, replaced.Code, replaced.Body.String())
+			}
+		})
+	}
+}
+
+func TestInitializationCoordinatorRetryReusesActiveChild(t *testing.T) {
+	for _, status := range []model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning} {
+		t.Run(string(status), func(t *testing.T) {
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+			failedReplacementAPISource(t, f)
+			created := f.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("first replacement: %d %s", created.Code, created.Body.String())
+			}
+			row, err := f.srv.repos.Replacements.GetByID(t.Context(), decodeReplacement(t, created).ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childID, parentID := *target.EnsureTaskID, *row.TaskID
+			if status == model.TaskStatusRunning {
+				if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", status).
+					Set("claim_generation = 1").Set("lease_until = ?", time.Now().Add(time.Minute)).Where("id = ?", childID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "coordinator stopped"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+				Set("finished_at = ?", time.Now()).Where("id = ?", parentID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			finishChild := func() error { return nil }
+			if status == model.TaskStatusRunning {
+				childTx, err := f.srv.db.BeginTx(t.Context(), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = childTx.Rollback() }()
+				childRepos := repository.NewRepositories(childTx)
+				if _, err := childRepos.Tasks.GetForUpdate(t.Context(), childID); err != nil {
+					t.Fatal(err)
+				}
+				finishChild = func() error {
+					if err := childRepos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: target.ID, DataSetID: onChainIDValue("2002")}); err != nil {
+						return err
+					}
+					return childTx.Commit()
+				}
+			}
+			retryCtx, retryCancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer retryCancel()
+			parent, err := f.srv.retryTaskRequest(retryCtx, parentID)
+			if err != nil || parent == nil || parent.ID == parentID {
+				t.Fatalf("coordinator retry: %#v %v", parent, err)
+			}
+			if next, err := f.srv.repos.Tasks.GetDirectSuccessor(t.Context(), childID); err != nil || next != nil {
+				t.Fatalf("active child got another round: %#v %v", next, err)
+			}
+			target, err = f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil || target.EnsureTaskID == nil || *target.EnsureTaskID != childID {
+				t.Fatalf("active child owner changed: %#v %v", target, err)
+			}
+			child, err := f.srv.repos.Tasks.GetByID(t.Context(), childID)
+			if err != nil || child.Status != status || child.SupersededAt != nil {
+				t.Fatalf("active child interrupted: %#v %v", child, err)
+			}
+			if err := finishChild(); err != nil {
+				t.Fatalf("active child readiness after coordinator retry: %v", err)
+			}
+			if status == model.TaskStatusRunning {
+				target, err = f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+				if err != nil || target.Status != model.StorageDataSetStatusReady || target.EnsureTaskID == nil || *target.EnsureTaskID != childID {
+					t.Fatalf("active child result lost after coordinator retry: %#v %v", target, err)
+				}
+			}
+		})
+	}
+}
+
+func TestFailedReplacementInitializationCanChangeProvider(t *testing.T) {
+	for _, scenario := range []string{"failed without receipt", "running parent with transaction", "pending parent with known service", "historical refusal"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+			first := f.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if first.Code != http.StatusCreated {
+				t.Fatalf("first: %d %s", first.Code, first.Body.String())
+			}
+			row, err := f.srv.repos.Replacements.GetByID(t.Context(), decodeReplacement(t, first).ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil || target.EnsureTaskID == nil {
+				t.Fatalf("target: %#v %v", target, err)
+			}
+			ensure, err := f.srv.repos.Tasks.GetByID(t.Context(), *target.EnsureTaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clientID := onChainIDValue("909")
+			if err := f.srv.repos.Contents.RecordDataSetClientID(t.Context(), target.ID, ensure.ID, clientID); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "historical refusal" {
+				copyFixture := *f
+				copyFixture.source = target
+				rejectedReplacementAPISource(t, &copyFixture, ensure)
+			}
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+				Set("finished_at = ?", time.Now()).Set("failure_reason = ?", "attempts_exhausted").
+				Set("last_error = ?", "provider returned HTTP 500").Where("id = ?", ensure.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			parentStatus := model.TaskStatusPending
+			switch scenario {
+			case "failed without receipt", "historical refusal":
+				parentStatus = model.TaskStatusFailed
+				if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "setup stopped"); err != nil {
+					t.Fatal(err)
+				}
+			case "running parent with transaction":
+				parentStatus = model.TaskStatusRunning
+				if _, err := f.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("create_transaction_id = ?", "transaction-evidence").
+					Set("create_status_url = ?", "https://provider.invalid/status").Where("id = ?", target.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			case "pending parent with known service":
+				if _, err := f.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("data_set_id = ?", onChainIDValue("2002")).Where("id = ?", target.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			parentUpdate := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", parentStatus).
+				Where("id = ?", *row.TaskID)
+			if parentStatus == model.TaskStatusFailed {
+				parentUpdate = parentUpdate.Set("finished_at = ?", time.Now())
+			} else {
+				parentUpdate = parentUpdate.Set("finished_at = NULL")
+			}
+			if parentStatus == model.TaskStatusRunning {
+				parentUpdate = parentUpdate.Set("claim_generation = claim_generation + 1").Set("lease_until = ?", time.Now().Add(time.Minute))
+			} else {
+				parentUpdate = parentUpdate.Set("lease_until = NULL")
+			}
+			if _, err := parentUpdate.Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			f.srv.WithObjectStorage(&testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+				t.Fatal("replacement must not depend on provider lookup")
+				return nil, errors.New("unavailable")
+			}})
+			second := f.start(t, `{"mode":"manual","provider_id":"303"}`)
+			if second.Code != http.StatusCreated {
+				t.Fatalf("replace failed initialization: %d %s", second.Code, second.Body.String())
+			}
+			stored, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := model.StorageDataSetStatusRetired
+			if scenario == "pending parent with known service" {
+				wantStatus = model.StorageDataSetStatusDraining
+			}
+			if stored.Status != wantStatus || stored.EnsureTaskID != nil || stored.IsCurrent || stored.ClientDataSetID == nil || !stored.ClientDataSetID.Equal(clientID) {
+				t.Fatalf("old target evidence/fence: %#v", stored)
+			}
+			if scenario == "running parent with transaction" && (stored.CreateTransactionID == nil || *stored.CreateTransactionID != "transaction-evidence" || stored.CreateStatusURL == nil) {
+				t.Fatalf("submission evidence lost: %#v", stored)
+			}
+			old, err := f.srv.repos.Replacements.GetByID(t.Context(), row.ID)
+			if err != nil || old.Status != storagereplacement.StatusSuperseded || old.TaskGeneration != row.TaskGeneration+1 {
+				t.Fatalf("old coordinator fence: %#v %v", old, err)
+			}
+			if scenario == "pending parent with known service" && (old.TaskID == nil || *old.TaskID == *row.TaskID) {
+				t.Fatal("known remote service has no authorized cleanup coordinator")
+			}
+			if _, err := f.srv.repos.Replacements.AuthorizeTask(t.Context(), row.ID, row.TaskGeneration, *row.TaskID); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("old coordinator authorized: %v", err)
+			}
+			source, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), f.source.ID)
+			if err != nil || !source.IsCurrent || source.Status != model.StorageDataSetStatusReady {
+				t.Fatalf("ready source changed: %#v %v", source, err)
+			}
+		})
+	}
+}
+
+func TestInitializationRetryHonorsChildEligibility(t *testing.T) {
+	for _, local := range []bool{false, true} {
+		t.Run(fmt.Sprintf("local=%v", local), func(t *testing.T) {
+			f := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+			if local {
+				failedReplacementAPISource(t, f)
+			}
+			created := f.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("start: %d %s", created.Code, created.Body.String())
+			}
+			row, err := f.srv.repos.Replacements.GetByID(t.Context(), decodeReplacement(t, created).ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := f.srv.repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+			if err != nil || target.EnsureTaskID == nil {
+				t.Fatalf("target: %#v %v", target, err)
+			}
+			for _, id := range []int64{*target.EnsureTaskID, *row.TaskID} {
+				q := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Where("id = ?", id)
+				if id == *target.EnsureTaskID {
+					q = q.Set("failure_reason = ?", "dataset_correlation_conflict")
+				}
+				if _, err := q.Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.srv.repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "setup stopped"); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []int64{*target.EnsureTaskID, *row.TaskID} {
+				task, err := f.srv.repos.Tasks.GetByID(t.Context(), id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if item := f.srv.taskListItem(t.Context(), task); item.Retryable || item.RetryTaskID != nil {
+					t.Fatalf("list offers forbidden retry: %#v", item)
+				}
+				if retryID, reason, err := f.srv.inspectManualTaskRetry(t.Context(), task); err != nil || retryID != nil || reason == "" {
+					t.Fatalf("detail eligibility: id=%v reason=%q err=%v", retryID, reason, err)
+				}
+				response := httptest.NewRecorder()
+				f.mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(id, 10)+"/retry", nil))
+				if response.Code != http.StatusConflict {
+					t.Fatalf("forbidden retry accepted: %d %s", response.Code, response.Body.String())
+				}
+				if next, err := f.srv.repos.Tasks.GetDirectSuccessor(t.Context(), id); err != nil || next != nil {
+					t.Fatalf("forbidden retry left successor: %#v %v", next, err)
+				}
+			}
+			view, err := f.srv.providerReplacementResponse(t.Context(), f.bucket.Name, row)
+			if err != nil || view.Retryable || view.RetryTaskID != nil || view.RetryUnavailableReason == "" {
+				t.Fatalf("storage offers forbidden retry: %#v %v", view, err)
+			}
+		})
 	}
 }

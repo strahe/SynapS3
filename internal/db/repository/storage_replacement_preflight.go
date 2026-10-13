@@ -3,7 +3,6 @@ package repository
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"reflect"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -83,62 +82,4 @@ func validateReplacementPreflight(ctx context.Context, db bun.IDB, expected Repl
 		}
 	}
 	return nil
-}
-
-func verifyCreationRejection(source *model.StorageDataSet, checked *model.DataSetCreationRejection) error {
-	previous, err := source.CreationRejectionEvidence()
-	if err != nil || previous == nil || checked == nil || !checked.Valid() || checked.StatusCode != previous.StatusCode ||
-		!checked.RejectedAt.Equal(previous.RejectedAt) || !checked.ClientDataSetID.Equal(previous.ClientDataSetID) ||
-		checked.Payer != previous.Payer || checked.ChainID != previous.ChainID || checked.RecordKeeper != previous.RecordKeeper ||
-		checked.AbsenceCheckedAt.Before(previous.AbsenceCheckedAt) {
-		return storagereplacement.ErrSourceOutcomeUnknown
-	}
-	encoded, err := json.Marshal(checked)
-	if err != nil {
-		return err
-	}
-	source.CreationRejection = encoded
-	return nil
-}
-
-// BindObservedService authorizes observation, without restoring creation rights.
-func (r *BunStorageReplacementRepo) BindObservedService(ctx context.Context, input BindObservedReplacementServiceInput) error {
-	if input.StorageDataSetID <= 0 || input.DataSetID.IsZero() || input.ClientDataSetID.IsZero() {
-		return ErrInvalidInput
-	}
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		if _, err := lockBucketByID(ctx, db, input.Preflight.Source.BucketID); err != nil {
-			return err
-		}
-		if err := validateReplacementPreflight(ctx, db, input.Preflight); err != nil {
-			return err
-		}
-		var observed *model.StorageDataSet
-		if input.StorageDataSetID == input.Preflight.Source.ID {
-			observed = &input.Preflight.Source
-		}
-		for _, target := range input.Preflight.Targets {
-			if target.DataSet.ID == input.StorageDataSetID {
-				value := target.DataSet
-				observed = &value
-			}
-		}
-		if observed == nil {
-			return ErrInvalidInput
-		}
-		evidence, err := observed.CreationRejectionEvidence()
-		if err != nil || evidence == nil || !evidence.ClientDataSetID.Equal(input.ClientDataSetID) {
-			return storagereplacement.ErrSourceOutcomeUnknown
-		}
-		if err := uncreatedDataSetEligibility(ctx, db, observed); err != nil {
-			return err
-		}
-		if err := markDataSetReady(ctx, db, observed.ID, input.DataSetID, &input.ClientDataSetID); err != nil {
-			return err
-		}
-		if observed.EnsureTaskID != nil {
-			return (&BunStorageContentRepo{db: db}).CompleteDataSetEnsureTask(ctx, observed.ID, *observed.EnsureTaskID)
-		}
-		return nil
-	})
 }

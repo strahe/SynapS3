@@ -778,6 +778,13 @@ export interface TaskPolicy {
   jitter: number
   invocation_timeout: string
   observation_window: string
+  observation_interval?: string
+  resend_backoff?: {
+    initial_delay: string
+    maximum_delay: string
+    multiplier: number
+    jitter: number
+  }
 }
 
 export interface TaskDetail {

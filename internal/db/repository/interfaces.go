@@ -494,17 +494,9 @@ type StorageContentRepository interface {
 	// create request before sending, under the expected ensure fence. The ID
 	// never changes later.
 	RecordDataSetClientID(ctx context.Context, id, ensureTaskID int64, clientDataSetID types.OnChainID) error
-	// RecordDataSetCreationRejection retains refusal evidence under the same
-	// generation, request identity, and ensure fence as the failed settlement.
-	RecordDataSetCreationRejection(ctx context.Context, id, generation, ensureTaskID int64, evidence model.DataSetCreationRejection) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
 	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
-	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
-	// RetireRejectedDataSet ends a failed generation whose creation the chain
-	// refused, so its provider stops being reserved. The caller must have proof
-	// that no data set was created. Reports whether it was retired.
-	RetireRejectedDataSet(ctx context.Context, storageDataSetID int64) (bool, error)
 	CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, contentID int64, copyIndex int) (*model.StorageCopy, error)
 	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageCopy, error)
@@ -605,11 +597,8 @@ type StorageReplacementRepository interface {
 	// SourceEligibility shares local admission with presentation and authorization;
 	// its boolean distinguishes a source without a ready remote service.
 	SourceEligibility(ctx context.Context, dataSetID int64) (*model.StorageDataSet, bool, error)
-	// Preflight snapshots the source and unresolved targets for remote checks.
+	// Preflight snapshots the source and unresolved targets for authorization.
 	Preflight(ctx context.Context, dataSetID int64) (*ReplacementPreflight, error)
-	// BindObservedService validates that snapshot without restoring creation
-	// permission. Its caller must continue ready work in the same transaction.
-	BindObservedService(ctx context.Context, input BindObservedReplacementServiceInput) error
 	// RetryEligibility is read-only; Retry rechecks the same target admission.
 	RetryEligibility(ctx context.Context, replacementID int64) error
 	GetReplacementSubject(ctx context.Context, id int64) (*ReplacementSubject, error)
@@ -623,6 +612,9 @@ type StorageReplacementRepository interface {
 	BindTask(ctx context.Context, replacementID, generation, taskID int64) error
 	TransferTaskOwner(ctx context.Context, replacementID, generation, oldTaskID, newTaskID int64) error
 	ResumeCoordinatorTask(ctx context.Context, replacementID, generation, oldTaskID, newTaskID int64) error
+	PrepareCoordinatorRetry(ctx context.Context, replacementID, generation, taskID int64) (*model.StorageDataSet, error)
+	MarkInitializationFailed(ctx context.Context, replacementID, generation, taskID, childID int64, message string) error
+	EnsureTaskReplacement(ctx context.Context, taskID int64) (*storagereplacement.Replacement, error)
 	AuthorizeTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
 	CompleteTask(ctx context.Context, replacementID, generation, taskID int64) error
 
@@ -645,6 +637,10 @@ type StorageReplacementRepository interface {
 	// settlement with its engine claim; row count is independent of bucket history.
 	Activate(ctx context.Context, replacementID, generation, taskID int64) error
 	SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (inserted int, done bool, err error)
+	LockCoordinatorProgress(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
+	LockCoordinatorTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
+	ListPendingReplacementItemsAfter(ctx context.Context, replacementID, afterID int64, limit int) ([]storagereplacement.Item, error)
+	AcquireItemsForCoordinator(ctx context.Context, replacementID, generation, taskID, afterID int64, limit int) (ReplacementItemBatch, error)
 	NextPendingReplacementItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error)
 	MarkReplacementItemCopied(ctx context.Context, replacementID, itemID, targetCopyID int64) error
 	MarkReplacementItemCancelled(ctx context.Context, replacementID, itemID int64) error
@@ -652,6 +648,7 @@ type StorageReplacementRepository interface {
 	ReplacementExecution(ctx context.Context, replacementID int64) (storagereplacement.ExecutionSnapshot, error)
 	ReplacementProgresses(ctx context.Context, replacementIDs []int64) (map[int64]storagereplacement.ProgressSnapshot, error)
 	AcquireItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
+	InspectItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
 	AttachTargetCopy(ctx context.Context, input AttachReplacementTargetCopyInput) (*model.StorageCopy, error)
 
 	MarkMigrating(ctx context.Context, replacementID int64) error
@@ -688,38 +685,25 @@ type StorageReplacementRepository interface {
 
 // AuthorizeReplacementInput is one operator confirmation.
 type AuthorizeReplacementInput struct {
-	BucketID                  int64
-	SourceDataSetID           int64
-	SelectionMode             storagereplacement.SelectionMode
-	TargetProviderID          types.OnChainID
-	ClientRequestID           string
-	PriceListFingerprint      string
-	VerifiedCreationRejection *model.DataSetCreationRejection
-	Preflight                 *ReplacementPreflight
+	BucketID             int64
+	SourceDataSetID      int64
+	SelectionMode        storagereplacement.SelectionMode
+	TargetProviderID     types.OnChainID
+	ClientRequestID      string
+	PriceListFingerprint string
+	Preflight            *ReplacementPreflight
 }
 
 // ReplacementPreflight freezes the local identities checked outside the transaction.
 type ReplacementPreflight struct {
-	Source                    model.StorageDataSet
-	Targets                   []ReplacementTargetCheck
-	VerifiedCreationRejection *model.DataSetCreationRejection
+	Source  model.StorageDataSet
+	Targets []ReplacementTargetCheck
 }
 
-// ReplacementTargetCheck couples the unresolved target identity with its
-// replacement fence and any freshly checked refusal evidence.
+// ReplacementTargetCheck couples the unresolved target identity with its replacement fence.
 type ReplacementTargetCheck struct {
-	Replacement               storagereplacement.Replacement
-	DataSet                   model.StorageDataSet
-	VerifiedCreationRejection *model.DataSetCreationRejection
-}
-
-// BindObservedReplacementServiceInput authorizes a service observed for one
-// exact preflight identity, including a source with no remaining ensure fence.
-type BindObservedReplacementServiceInput struct {
-	Preflight        ReplacementPreflight
-	StorageDataSetID int64
-	DataSetID        types.OnChainID
-	ClientDataSetID  types.OnChainID
+	Replacement storagereplacement.Replacement
+	DataSet     model.StorageDataSet
 }
 
 type RetryReplacementInput struct {
@@ -739,6 +723,12 @@ type ReplacementItemSnapshot struct {
 	Target      model.StorageDataSet
 	Upload      model.StorageContent
 	Version     model.ObjectVersion
+}
+
+type ReplacementItemBatch struct {
+	Items      []ReplacementItemSnapshot
+	LastItemID int64
+	Scanned    int
 }
 
 type AttachReplacementTargetCopyInput struct {

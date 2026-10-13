@@ -146,12 +146,12 @@ func TestObserveConfirmsOnlyWhatTheChainProves(t *testing.T) {
 	}
 }
 
-func TestObserveResendsAnUnknownOutcomeUnchangedOnItsPace(t *testing.T) {
+func TestObserveUnknownOutcomePreservesAuthorization(t *testing.T) {
 	ctx := t.Context()
 	c := newCommitCase(t, 1)
 	observation, err := c.advancer().Observe(ctx, c.commit())
-	if err != nil || observation.Kind != storagecommit.ObservePending || observation.RetryAfter != 4*time.Minute {
-		t.Fatalf("recent send = %#v, %v, want to wait out the first resend delay", observation, err)
+	if err != nil || observation.Kind != storagecommit.ObserveResendDue {
+		t.Fatalf("unobserved send = %#v, %v, want same-request recovery", observation, err)
 	}
 	c.sentAt(c.now.Add(-6 * time.Minute))
 	observation, err = c.advancer().Observe(ctx, c.commit())

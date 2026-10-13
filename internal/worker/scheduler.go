@@ -45,13 +45,8 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 	if !ok {
 		return nil, ErrUnknownType
 	}
-	if !definition.manualRetryAllowed(source) {
-		return nil, ErrRetryUnsupported
-	}
-	if definition.InspectRetry != nil {
-		if err := definition.InspectRetry(ctx, tx, source); err != nil {
-			return nil, err
-		}
+	if err := s.service.InspectRetryWithRepositories(ctx, tx, source); err != nil {
+		return nil, err
 	}
 	prepared, err := s.service.prepare(EnqueueRequest{Type: source.Type, Input: source.Input, AvailableAt: availableAt})
 	if err != nil {

@@ -57,11 +57,11 @@ func (h *ObservabilityHandler) newHandler() *taskengine.FuncHandler {
 		if err := h.scheduleMissingProviderSpeedTests(ctx); err != nil {
 			return retryTask(err, "provider_speed_schedule_failed")
 		}
-		return taskengine.CompleteCycle(h.deps.Observability.RefreshInterval(), "Storage health refreshed", nil)
+		return taskengine.CompleteCycle("Storage health refreshed", nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }

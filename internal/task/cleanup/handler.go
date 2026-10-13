@@ -61,9 +61,6 @@ func NewHandler(deps Dependencies) (*Handler, error) {
 }
 
 const (
-	dependencyWait        = time.Minute
-	externalPollInterval  = 5 * time.Second
-	cleanupPollInterval   = time.Minute
 	cleanupAttentionAfter = 24 * time.Hour
 )
 
@@ -142,7 +139,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		return retryTask(err, "cleanup_reference_check_failed")
 	}
 	if hasReferences {
-		return taskengine.Wait(model.TaskResumeModeRecover, dependencyWait, "references", "Waiting for stored data references", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, "references", "Waiting for stored data references", nil)
 	}
 	for i := range copies {
 		copyRow := copies[i]
@@ -162,7 +159,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		default:
 			// A status this version does not know may record a paid request it
 			// cannot judge, so the copy is left untouched.
-			return taskengine.Wait(model.TaskResumeModeRecover, dependencyWait, "cleanup_status",
+			return taskengine.Wait(model.TaskResumeModeRecover, "cleanup_status",
 				"Waiting for a newer version that supports this copy's cleanup record", nil)
 		}
 		// Zero is a legal on-chain ID; a missing data set is the only
@@ -196,7 +193,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			continue
 		}
 		if state.Queued {
-			return taskengine.Wait(model.TaskResumeModeRecover, cleanupPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
+			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
 		}
 		previousHash := ""
 		if copyRow.DeleteTxHash != nil {
@@ -237,7 +234,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			return waitForStorageCleanupOutcome(ctx, execution, copyRow, checkpoint, hasCheckpoint, "Waiting for remote cleanup")
 		}
 		if !allowDelete {
-			return taskengine.Wait(model.TaskResumeModeExecute, 0, "safe_to_execute", "Remote cleanup is ready", nil)
+			return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Remote cleanup is ready", nil)
 		}
 		providerID := copyRow.ProviderID.SDK()
 		cleanupContext, err := h.deps.Storage.OpenCleanupContext(ctx, copyRow.DataSetID.SDK(), storage.NewDataSetContextOptions{ProviderID: &providerID})
@@ -274,9 +271,9 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 					"task_id", execution.ID(), "cleanup_copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
 					"error", synapse.ErrorSummary(err))
 			}
-			return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, externalPollInterval, nil)
+			return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, nil)
 		}
-		return taskengine.Wait(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}
 	return h.finishStorageCleanup(ctx, execution, input)
 }
@@ -328,7 +325,7 @@ func waitForStorageCleanupOutcome(ctx context.Context, execution taskengine.Exec
 			return repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, message)
 		})
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, cleanupPollInterval, "provider_confirmation", waitingMessage, nil)
+	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", waitingMessage, nil)
 }
 
 // finishStorageCleanup releases the content's cached bytes and then deletes its
@@ -359,7 +356,7 @@ func (h *Handler) finishStorageCleanup(ctx context.Context, execution taskengine
 		return repos.StorageCleanup.FinalizeContent(ctx, input.ContentID, input.Generation, execution.ID())
 	})
 	if errors.Is(err, repository.ErrContentCleanupNotReady) {
-		return taskengine.Wait(model.TaskResumeModeRecover, dependencyWait, "references", "Waiting for other work on the stored data to finish", nil)
+		return taskengine.Wait(model.TaskResumeModeRecover, "references", "Waiting for other work on the stored data to finish", nil)
 	}
 	if err != nil {
 		return retryTask(err, "cleanup_finalize_failed")
@@ -368,7 +365,7 @@ func (h *Handler) finishStorageCleanup(ctx context.Context, execution taskengine
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

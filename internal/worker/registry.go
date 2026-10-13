@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 )
@@ -36,6 +37,10 @@ func (r *Registry) Register(handler Handler) error {
 		return fmt.Errorf("registering nil handler: %w", ErrUnknownType)
 	}
 	definition := handler.Definition()
+	definition.Policy = definition.Policy.clone()
+	if definition.Policy.ObservationInterval == 0 {
+		definition.Policy.ObservationInterval = 30 * time.Second
+	}
 	if err := definition.validate(); err != nil {
 		return err
 	}
@@ -92,6 +97,7 @@ func (r *Registry) Definition(taskType model.TaskType) (Definition, bool) {
 	if !ok {
 		return Definition{}, false
 	}
+	definition.Policy = definition.Policy.clone()
 	return definition, true
 }
 

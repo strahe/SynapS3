@@ -22,11 +22,12 @@ func TestRetryUsesCurrentPolicy(t *testing.T) {
 	limit := 1
 	definition := testDefinition(&limit, true)
 	definition.Policy.ObservationWindow = time.Minute
+	definition.Policy.ObservationInterval = 30 * time.Second
 	current := newTaskHarnessWithDB(t, old.db, scriptedHandler{definition: definition, recover: func(_ context.Context, execution Execution) Result {
 		if execution.Policy() != definition.Policy {
 			t.Fatalf("execution policy = %#v, want %#v", execution.Policy(), definition.Policy)
 		}
-		return RetryBackoff(errors.New("temporary"), "temporary", nil)
+		return Retry(errors.New("temporary"), "temporary", nil)
 	}}, nil)
 	if policy, ok := current.service.Policy(testTaskType); !ok || policy != definition.Policy {
 		t.Fatalf("service policy = %#v, available=%v", policy, ok)
@@ -145,7 +146,7 @@ func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			oldLimit := tc.oldMax - 1
 			schedule := func(context.Context, Execution) Result {
-				return RetryBackoff(errors.New("temporary"), "temporary", nil).WithResumeMode(tc.mode)
+				return Retry(errors.New("temporary"), "temporary", nil).WithResumeMode(tc.mode)
 			}
 			old := newTaskHarness(t, scriptedHandler{definition: testDefinition(&oldLimit, true), execute: schedule, recover: schedule}, nil)
 			row := enqueueTestTask(t, old, "scheduled")
@@ -154,6 +155,7 @@ func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
 			}
 			limit := tc.currentMax - 1
 			definition := testDefinition(&limit, true)
+			definition.Policy.ObservationInterval = 30 * time.Second
 			called, retried, exhausted := false, false, false
 			run := func(_ context.Context, execution Execution) Result {
 				called = true
@@ -164,9 +166,9 @@ func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
 				case "complete":
 					return Complete("Done", nil)
 				case "wait":
-					return Wait(tc.mode, time.Millisecond, "observing", "Waiting", nil)
+					return Wait(tc.mode, "observing", "Waiting", nil)
 				default:
-					return RetryBackoff(errors.New("temporary"), "temporary", nil).WithRetrySettlements(
+					return Retry(errors.New("temporary"), "temporary", nil).WithRetrySettlements(
 						func(context.Context, *repository.Repositories, time.Time) error { retried = true; return nil },
 						func(ctx context.Context, repos *repository.Repositories) error {
 							exhausted = true
@@ -207,7 +209,7 @@ func TestTaskContentionPreservesFinalOpportunityAndRecovery(t *testing.T) {
 			limit := 0
 			settled := false
 			h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result {
-				return RetryBackoff(cause, "temporary", func(context.Context, *repository.Repositories) error {
+				return Retry(cause, "temporary", func(context.Context, *repository.Repositories) error {
 					settled = true
 					return nil
 				})
@@ -241,7 +243,7 @@ func TestInvocationTimeoutAllocatesRecoveryButPreservesObservedCompletion(t *tes
 				if completed {
 					return Complete("Done", nil)
 				}
-				return Wait(model.TaskResumeModeRecover, time.Minute, "observing", "Waiting", nil)
+				return Wait(model.TaskResumeModeRecover, "observing", "Waiting", nil)
 			}}, nil)
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)

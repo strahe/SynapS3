@@ -1232,7 +1232,11 @@ function BucketStorageTab({
         onOpenLastError={setStorageHealthError}
         onReviewVersions={onReviewStorageRisk}
       />
-      <ProviderReplacementProgress replacements={bucket.replacements ?? []} onOpenLastError={setReplacementError} />
+      <ProviderReplacementProgress
+        replacements={bucket.replacements ?? []}
+        dataSets={bucket.data_sets ?? []}
+        onOpenLastError={setReplacementError}
+      />
       <BucketStorageDataSets
         bucketName={bucket.name}
         dataSets={bucket.data_sets ?? []}
@@ -1893,9 +1897,11 @@ function ReplaceProviderDialog({
  */
 function ProviderReplacementProgress({
   replacements,
+  dataSets,
   onOpenLastError,
 }: {
   replacements: ProviderReplacement[]
+  dataSets: StorageDataSetSummary[]
   onOpenLastError: (text: string) => void
 }) {
   const active = activeReplacements(replacements)
@@ -1910,6 +1916,7 @@ function ProviderReplacementProgress({
           <ProviderReplacementProgressCard
             key={replacement.id}
             replacement={replacement}
+            sourceReplaceable={dataSets.some((dataSet) => dataSet.id === replacement.source.id && dataSet.replaceable)}
             onOpenLastError={onOpenLastError}
           />
         ))}
@@ -1920,12 +1927,14 @@ function ProviderReplacementProgress({
 
 function ProviderReplacementProgressCard({
   replacement,
+  sourceReplaceable,
   onOpenLastError,
 }: {
   replacement: ProviderReplacement
+  sourceReplaceable: boolean
   onOpenLastError: (text: string) => void
 }) {
-  const nextStep = replacementNextStep(replacement)
+  const nextStep = replacementNextStep(replacement, sourceReplaceable)
 
   return (
     <div className="flex flex-col gap-2 rounded-md border border-border p-3">

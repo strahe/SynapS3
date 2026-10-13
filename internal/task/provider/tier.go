@@ -52,7 +52,7 @@ func newTierHandler(deps TierRefreshDependencies, taskType model.TaskType, tier 
 		if deps.Events != nil {
 			deps.Events.Publish("provider_catalog_updated", map[string]any{})
 		}
-		return taskengine.CompleteCycle(deps.Observability.RefreshInterval(), "Provider list refreshed", nil)
+		return taskengine.CompleteCycle("Provider list refreshed", nil)
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
 }

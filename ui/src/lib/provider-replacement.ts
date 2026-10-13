@@ -48,7 +48,7 @@ export function replacementInProgress(replacement: ProviderReplacement) {
 /** Only these states are resumed by the operator; the rest resume themselves. */
 export function replacementRetryable(replacement: ProviderReplacement) {
   if (replacement.retryable !== undefined) return replacement.retryable
-  if (replacement.failure_reason === 'target_in_use' || replacement.failure_reason === 'target_rejected') return false
+  if (replacement.failure_reason === 'target_in_use') return false
   return replacement.status === 'failed' || replacement.status === 'cleanup_attention'
 }
 
@@ -119,9 +119,8 @@ const replacementErrorMessages: Record<string, string> = {
   approval_check_unavailable: 'Could not check provider requirements. Try again.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',
   replacement_source_not_current: 'This replica no longer receives writes, so replacing it would change nothing.',
-  replacement_source_running: 'Storage setup is running. Try again shortly.',
-  replacement_source_outcome_unknown:
-    'Could not confirm whether storage setup succeeded. Check its task before replacing the provider.',
+  replacement_source_running: 'Storage setup is in progress. Wait for it to finish.',
+  replacement_source_outcome_unknown: 'Check the storage setup task before replacing this provider.',
   replacement_superseded: 'A newer request has taken over this replica.',
   replacement_not_retryable: 'This replacement cannot be retried in its current state.',
   replacement_task_running: 'Replacement work is still running. Try again shortly.',
@@ -131,30 +130,23 @@ const replacementErrorMessages: Record<string, string> = {
  * What the operator should do next, in their terms. The recorded error is
  * developer diagnostics and belongs behind a detail view, not on the card.
  */
-export function replacementNextStep(replacement: ProviderReplacement) {
+export function replacementNextStep(replacement: ProviderReplacement, sourceReplaceable = false) {
   if (replacement.status === 'superseded' && replacement.retirement_attention) {
     return 'The unused data set could not be shut down. Check its retirement task.'
   }
   switch (replacement.status) {
     case 'failed':
-      if (replacement.failure_reason === 'target_rejected') {
-        return 'This provider rejected setup. Choose a different provider.'
-      }
       if (replacement.failure_reason === 'target_in_use') {
         return 'This provider is already in use. Choose a different provider.'
       }
       if (replacement.retryable === false) {
+        if (sourceReplaceable) return 'Storage setup stopped. Choose a different provider.'
         if (!replacement.source.is_current && !replacement.target.is_current) {
           return 'Storage setup needs attention. Check its task.'
         }
-        return replacement.target.status === 'retired' || replacement.target.status === 'failed'
-          ? 'Storage setup has ended. Choose a different provider for the original replica.'
-          : 'Storage setup stopped. Check its task before continuing.'
+        return 'Storage setup stopped. Check its task before continuing.'
       }
-      // Choosing a different provider is only open while the old provider still
-      // holds the replica. Once the new one has taken it over, the only way
-      // forward is to finish the copy that was started.
-      return replacement.source.is_current
+      return sourceReplaceable
         ? 'The replacement has not finished. Retry, or choose a different provider.'
         : 'The replacement has not finished. Retry to continue where it stopped.'
     case 'cleanup_attention':

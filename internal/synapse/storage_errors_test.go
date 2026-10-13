@@ -118,11 +118,16 @@ func TestKnownTargetNetworkErrorsAreProviderUnavailable(t *testing.T) {
 	if got := NormalizeProviderOperationError(context.Background(), rpcFailure); !IsProviderUnavailable(got) {
 		t.Fatalf("provider endpoint error = %T %v, want ProviderUnavailableError", got, got)
 	}
-	if got := NormalizeProviderOperationError(context.Background(), &pdp.HTTPError{StatusCode: 503}); !IsProviderUnavailable(got) {
-		t.Fatalf("provider HTTP 503 = %T %v, want ProviderUnavailableError", got, got)
-	}
-	if got := NormalizeProviderOperationError(context.Background(), &pdp.HTTPError{StatusCode: 400}); IsProviderUnavailable(got) {
-		t.Fatalf("provider HTTP 400 = %T %v, must remain unclassified", got, got)
+	for _, status := range []int{400, 401, 403, 429, 500, 503} {
+		cause := &pdp.HTTPError{Method: http.MethodPost, URL: "https://provider.example/pdp/data-sets", StatusCode: status}
+		got := NormalizeProviderOperationError(context.Background(), fmt.Errorf("provider request: %w", cause))
+		if IsProviderUnavailable(got) != (status == 429 || status >= 500) {
+			t.Fatalf("provider HTTP %d classification = %T %v", status, got, got)
+		}
+		response, ok := errors.AsType[*pdp.HTTPError](got)
+		if !ok || response != cause || !errors.Is(got, cause) {
+			t.Fatalf("provider HTTP %d evidence lost: %T %v", status, got, got)
+		}
 	}
 	if got := IsProviderUnavailable(rpcFailure); got {
 		t.Fatal("raw network error must not bypass adapter classification")

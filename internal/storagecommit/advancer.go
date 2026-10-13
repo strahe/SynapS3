@@ -19,18 +19,6 @@ import (
 const (
 	DefaultRequestTimeout = 15 * time.Second
 	DefaultAttentionAfter = 15 * time.Minute
-	// ChainRetryDelay is how long a request waits after a chain read or a
-	// pre-send check could not complete.
-	ChainRetryDelay = time.Minute
-	// A provider keeps handling an add-pieces request for five minutes after
-	// the client stops waiting, so a request whose outcome is unknown is sent
-	// again only after that, doubling the wait per send up to 30 minutes.
-	firstResendDelay = 5 * time.Minute
-	maxResendDelay   = 30 * time.Minute
-	// A refused request is tried again after one minute, doubling per
-	// consecutive refusal up to 30 minutes.
-	refusedRetryBaseDelay = time.Minute
-	refusedRetryMaxDelay  = 30 * time.Minute
 	proofReadConcurrency  = 8
 )
 
@@ -166,16 +154,14 @@ const (
 	// PrepareAbandon means the data set no longer accepts writes, so the request
 	// can never land.
 	PrepareAbandon
-	// PrepareRetry means the chain could not be read; try again after
-	// RetryAfter.
+	// PrepareRetry means the chain could not be read.
 	PrepareRetry
 )
 
 type Prepared struct {
-	Outcome    PrepareOutcome
-	Proof      Proof
-	Cause      error
-	RetryAfter time.Duration
+	Outcome PrepareOutcome
+	Proof   Proof
+	Cause   error
 }
 
 // Prepare checks a ready request before it is sent. The nonce is read first:
@@ -183,7 +169,7 @@ type Prepared struct {
 func (a *Advancer) Prepare(ctx context.Context, c Commit) Prepared {
 	proof, err := a.Prove(ctx, c)
 	if err != nil {
-		return Prepared{Outcome: PrepareRetry, Cause: err, RetryAfter: ChainRetryDelay}
+		return Prepared{Outcome: PrepareRetry, Cause: err}
 	}
 	switch proof.Outcome {
 	case ProofLanded:
@@ -201,7 +187,7 @@ func (a *Advancer) Prepare(ctx context.Context, c Commit) Prepared {
 		if DataSetRefusesWrites(err) {
 			return Prepared{Outcome: PrepareAbandon, Cause: err}
 		}
-		return Prepared{Outcome: PrepareRetry, Cause: err, RetryAfter: ChainRetryDelay}
+		return Prepared{Outcome: PrepareRetry, Cause: err}
 	}
 	return Prepared{Outcome: PrepareSend}
 }
@@ -268,13 +254,12 @@ func (a *Advancer) Send(ctx context.Context, c Commit, onSubmitted func(storage.
 type ObserveKind uint8
 
 const (
-	// ObservePending means check again after RetryAfter, or the caller's poll
-	// interval when it is zero.
+	// ObservePending means the request needs another observation.
 	ObservePending ObserveKind = iota
 	// ObserveConfirmed means the chain proves the request.
 	ObserveConfirmed
-	// ObserveResendDue means nothing of the request is on chain and the latest
-	// send is old enough to send the same request again.
+	// ObserveResendDue means nothing of the request is on chain and it can be
+	// submitted under its original authorization.
 	ObserveResendDue
 	// ObserveStop means the request's nonce was consumed by other pieces.
 	// Nothing more is sent until an operator recovers it.
@@ -286,7 +271,6 @@ const (
 
 type Observation struct {
 	Kind         ObserveKind
-	RetryAfter   time.Duration
 	Confirmation *Confirmation
 	// Attention, when set, is flagged on the request with this observation.
 	Attention AttentionCode
@@ -368,7 +352,7 @@ func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
 		}
 		proof, err := a.Prove(ctx, c)
 		if err != nil {
-			return Observation{Kind: ObservePending, RetryAfter: ChainRetryDelay, Cause: err}, nil
+			return Observation{Kind: ObservePending, Cause: err}, nil
 		}
 		switch proof.Outcome {
 		case ProofLanded:
@@ -418,7 +402,7 @@ func (a *Advancer) byProof(ctx context.Context, c Commit, fallback func() (Obser
 func (a *Advancer) unobserved(ctx context.Context, c Commit, dropEvidence bool) (Observation, error) {
 	proof, err := a.Prove(ctx, c)
 	if err != nil {
-		return Observation{Kind: ObservePending, RetryAfter: ChainRetryDelay, DropEvidence: dropEvidence, Cause: err}, nil
+		return Observation{Kind: ObservePending, DropEvidence: dropEvidence, Cause: err}, nil
 	}
 	switch proof.Outcome {
 	case ProofLanded:
@@ -438,12 +422,6 @@ func (a *Advancer) unobserved(ctx context.Context, c Commit, dropEvidence bool) 
 	// attention threshold is flagged while recovery keeps sending it.
 	if req.AttentionAt == nil && a.attentionDue(req) {
 		observation.Attention = AttentionConfirmationTimeout
-	}
-	if req.LastSentAt != nil {
-		if wait := req.LastSentAt.Add(ResendDelay(req.Sends)).Sub(a.now()); wait > 0 {
-			observation.Kind = ObservePending
-			observation.RetryAfter = wait
-		}
 	}
 	return observation, nil
 }
@@ -491,26 +469,6 @@ func DataSetRefusesWrites(err error) bool {
 	return errors.Is(err, storage.ErrDataSetUnavailable) ||
 		synapse.IsDataSetServiceEnded(err) ||
 		synapse.IsDataSetWriteBlocked(err)
-}
-
-// ResendDelay is how long a request whose outcome is unknown waits after its
-// latest send before it is sent again.
-func ResendDelay(sends int) time.Duration {
-	delay := firstResendDelay
-	for i := 1; i < sends && delay < maxResendDelay; i++ {
-		delay *= 2
-	}
-	return min(delay, maxResendDelay)
-}
-
-// RefusedRetryDelay is how long a request waits after its refusals-th
-// consecutive refusal.
-func RefusedRetryDelay(refusals int) time.Duration {
-	delay := refusedRetryBaseDelay
-	for i := 1; i < refusals && delay < refusedRetryMaxDelay; i++ {
-		delay *= 2
-	}
-	return min(delay, refusedRetryMaxDelay)
 }
 
 func (a *Advancer) now() time.Time {

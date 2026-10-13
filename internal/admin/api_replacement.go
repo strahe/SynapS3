@@ -19,8 +19,6 @@ import (
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
-	"github.com/strahe/synapse-go/storage"
-	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 // providerReplacementSelector resolves the provider an automatic replacement
@@ -226,9 +224,8 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		row, created, authorizeErr = txRepos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 			BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: mode,
 			TargetProviderID: targetProvider, ClientRequestID: req.ClientRequestID,
-			PriceListFingerprint:      req.PriceListFingerprint,
-			VerifiedCreationRejection: preflight.VerifiedCreationRejection,
-			Preflight:                 preflight,
+			PriceListFingerprint: req.PriceListFingerprint,
+			Preflight:            preflight,
 		})
 		if authorizeErr != nil || !created {
 			return authorizeErr
@@ -297,71 +294,7 @@ func (s *Server) preflightReplacementSource(ctx context.Context, bucket *model.B
 	if source.BucketID != bucket.ID {
 		return nil, nil, repository.ErrNotFound
 	}
-	if source.DataSetID == nil && len(source.CreationRejection) != 0 {
-		check.VerifiedCreationRejection, err = s.checkReplacementRefusal(ctx, bucket, check, source)
-		if err != nil {
-			return source, nil, err
-		}
-	}
-	for i := range check.Targets {
-		target := &check.Targets[i]
-		if target.DataSet.DataSetID == nil && target.DataSet.Status != model.StorageDataSetStatusRetired && len(target.DataSet.CreationRejection) != 0 {
-			target.VerifiedCreationRejection, err = s.checkReplacementRefusal(ctx, bucket, check, &target.DataSet)
-			if err != nil {
-				return source, nil, err
-			}
-		}
-	}
 	return source, check, nil
-}
-
-func (s *Server) checkReplacementRefusal(ctx context.Context, bucket *model.Bucket, check *repository.ReplacementPreflight, binding *model.StorageDataSet) (*model.DataSetCreationRejection, error) {
-	evidence, err := binding.CreationRejectionEvidence()
-	if err != nil || evidence == nil || s.objectStorage == nil {
-		return nil, storagereplacement.ErrSourceOutcomeUnknown
-	}
-	provider, err := s.objectStorage.OpenProviderTarget(ctx, binding.ProviderID.SDK(), storage.NewProviderContextOptions{
-		DataSetMetadata: map[string]string{"bucket": bucket.Name},
-	})
-	if err != nil {
-		return nil, &storagereplacement.SourceOutcomeError{Message: "Could not check the original storage provider. Try again when it is available."}
-	}
-	identity := storage.ContextIdentity{Payer: evidence.Payer, ChainID: sdktypes.ChainID(evidence.ChainID), RecordKeeper: evidence.RecordKeeper}
-	if provider.ContextIdentity() != identity {
-		return nil, &storagereplacement.SourceOutcomeError{Message: "Restore the original wallet and network before replacing this provider."}
-	}
-	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, evidence.ClientDataSetID.SDK())
-	if err != nil {
-		return nil, &storagereplacement.SourceOutcomeError{Message: "Could not check the original data set. Try again when the network is available."}
-	}
-	if !found {
-		verified := *evidence
-		verified.AbsenceCheckedAt = time.Now().UTC()
-		return &verified, nil
-	}
-	dataSetID := idtypes.OnChainIDFromSDK(ref.DataSetID())
-	clientID := idtypes.OnChainIDFromSDK(ref.ClientDataSetID())
-	if dataSetID.IsZero() || !clientID.Equal(evidence.ClientDataSetID) || !idtypes.OnChainIDFromSDK(ref.ProviderID()).Equal(binding.ProviderID) {
-		return nil, storagereplacement.ErrSourceOutcomeUnknown
-	}
-	if s.replacementMessages == nil {
-		return nil, errors.New("storage setup continuation is unavailable")
-	}
-	err = s.repos.WithTx(ctx, func(repos *repository.Repositories) error {
-		if err := repos.Replacements.BindObservedService(ctx, repository.BindObservedReplacementServiceInput{
-			Preflight: *check, StorageDataSetID: binding.ID, DataSetID: dataSetID, ClientDataSetID: clientID,
-		}); err != nil {
-			return err
-		}
-		return s.replacementMessages.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: binding.ID})
-	})
-	if err != nil {
-		return nil, err
-	}
-	if binding.ID == check.Source.ID {
-		return nil, &storagereplacement.SourceOutcomeError{Message: "The original data set was found. Refresh and review the replacement again."}
-	}
-	return nil, &storagereplacement.SourceOutcomeError{Message: "The previous provider's data set was found. Retry its replacement to continue."}
 }
 
 func (s *Server) writeReplacementReplay(w http.ResponseWriter, ctx context.Context, bucket *model.Bucket, dataSetID int64, req startReplacementRequest, mode storagereplacement.SelectionMode) bool {

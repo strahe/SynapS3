@@ -34,7 +34,6 @@ type Engine struct {
 	recoveryWake          chan struct{}
 	settlementRetryDelays []time.Duration
 	renewalRetryDelays    []time.Duration
-	retryDelay            func(int) time.Duration
 	lastTick              atomic.Int64
 }
 
@@ -346,7 +345,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	}
 	if invocationCtx.Err() != nil && parent.Err() == nil && leaseSafe.Load() && (result.kind == resultWait || result.kind == resultInvalid) {
 		// Preserve observed terminal results and evidence returned by the handler.
-		result = RetryBackoff(invocationCtx.Err(), "invocation_timeout", result.settlement).WithRetrySettlements(result.onRetry, result.onExhausted)
+		result = Retry(invocationCtx.Err(), "invocation_timeout", result.settlement).WithRetrySettlements(result.onRetry, result.onExhausted)
 	}
 	if parent.Err() != nil || !leaseSafe.Load() {
 		logger.Warn("task result discarded because the lease is uncertain")
@@ -357,7 +356,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if errors.Is(result.err, repository.ErrTaskIdentityContended) || errors.Is(result.err, repository.ErrRepositoryContended) {
 		// Database contention cannot allocate another business opportunity or
 		// authorize a failed settlement of an unresolved external effect.
-		result = Wait(model.TaskResumeModeRecover, e.config.PollInterval, "database_contention", "Waiting to continue", nil)
+		result = Wait(model.TaskResumeModeRecover, "database_contention", "Waiting to continue", nil)
 	}
 	if err := validateResult(result, claimed); err != nil {
 		logger.Error("task handler returned an invalid result", "error", err)
@@ -434,12 +433,12 @@ func validateResult(result Result, _ *model.Task) error {
 	case resultCancel:
 		return nil
 	case resultWait:
-		if result.err != nil || result.delay < 0 || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
+		if result.err != nil || (result.waitUntil != nil && result.waitUntil.IsZero()) || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
 			return ErrInvalidResult
 		}
 		return nil
 	case resultRetry:
-		if result.delay < 0 || result.err == nil || result.failureReason == "" || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
+		if result.err == nil || result.failureReason == "" || (result.resumeMode != model.TaskResumeModeExecute && result.resumeMode != model.TaskResumeModeRecover) {
 			return ErrInvalidResult
 		}
 		return nil
@@ -492,7 +491,7 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 					return err
 				}
 			}
-			if err := e.settleSchedule(settlementCtx, txRepos, claimed, result, transition); err != nil {
+			if err := e.settleSchedule(settlementCtx, txRepos, claimed, transition); err != nil {
 				return err
 			}
 			return txRepos.Tasks.Settle(settlementCtx, claimed.ID, claimed.ClaimGeneration, transition)
@@ -570,7 +569,17 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 	case resultWait:
 		transition.Status = model.TaskStatusPending
 		transition.ResumeMode = result.resumeMode
-		transition.AvailableAt = now.Add(result.delay)
+		transition.AvailableAt = now.Add(e.config.PollInterval)
+		if result.observationWait {
+			definition, _ := e.registry.Definition(claimed.Type)
+			transition.AvailableAt = now.Add(definition.Policy.ObservationInterval)
+		}
+		if result.waitUntil != nil {
+			transition.AvailableAt = *result.waitUntil
+			if transition.AvailableAt.Before(now) {
+				transition.AvailableAt = now
+			}
+		}
 	case resultRetry:
 		definition, _ := e.registry.Definition(claimed.Type)
 		policy := definition.Policy
@@ -578,14 +587,7 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 			transition.Status = model.TaskStatusFailed
 			transition.FailureReason = textPointer("attempts_exhausted")
 		} else {
-			delay := result.delay
-			if result.retryBackoff {
-				backoff := policy.Backoff.delay(claimed.RetryCount)
-				if e.retryDelay != nil {
-					backoff = e.retryDelay(claimed.RetryCount)
-				}
-				delay = maxDuration(delay, backoff)
-			}
+			delay := policy.Backoff.delay(claimed.RetryCount)
 			transition.ResumeMode = result.resumeMode
 			transition.IncrementRetry = true
 			transition.Status = model.TaskStatusPending

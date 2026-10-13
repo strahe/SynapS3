@@ -967,21 +967,13 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			originalTasks := runtime.repos.Tasks
-			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: originalTasks, maximum: 8, countType: taskType}
-			cancel, done := runHandlerEngine(t, runtime)
-			defer stopHandlerEngine(t, cancel, done)
-			replanned := waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
-				return row.ClaimGeneration == 2 && (row.Status == model.TaskStatusFailed || (row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "providers"))
-			}, 15*time.Second)
-			if replanned.Status != model.TaskStatusPending || replanned.RetryCount != 0 || replanned.LastError != nil {
+			replanned := runStorageTaskClaims(t, runtime, row, model.TaskStatusPending, 2, 15*time.Second)
+			if replanned.ClaimGeneration != 2 || replanned.WaitReason == nil || *replanned.WaitReason != "providers" || replanned.RetryCount != 0 || replanned.LastError != nil {
 				t.Fatalf("task did not wait after replanning: %#v", replanned)
 			}
 			for generation := int64(3); generation <= 8; generation++ {
 				wakeTask(t, runtime, row.ID)
-				replanned = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
-					return row.ClaimGeneration == generation && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.WaitReason != nil)
-				})
+				replanned = runOneStorageTask(t, runtime, replanned, model.TaskStatusPending)
 				if replanned.Status != model.TaskStatusPending || replanned.RetryCount != 0 || replanned.LastError != nil || *replanned.WaitReason != "providers" {
 					t.Fatalf("replacement reservation wait %d = %#v", generation-1, replanned)
 				}
@@ -1004,8 +996,6 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 					t.Fatalf("rejected selection left an upload plan: copies=%#v err=%v", copies, err)
 				}
 			}
-			stopHandlerEngine(t, cancel, done)
-			runtime.repos.Tasks = originalTasks
 			replacement, err := runtime.repos.Replacements.GetByClientRequestID(ctx, bucket.ID, "selection-conflict")
 			if err != nil || replacement == nil {
 				t.Fatalf("replacement = %#v err=%v", replacement, err)
@@ -1052,7 +1042,7 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			wakeTask(t, runtime, row.ID)
-			cancel, done = runHandlerEngine(t, runtime)
+			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			row = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
 				return row.Status == model.TaskStatusCompleted || row.Status == model.TaskStatusFailed || row.RetryCount > 0

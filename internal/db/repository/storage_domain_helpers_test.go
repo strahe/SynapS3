@@ -12,7 +12,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
@@ -313,39 +312,30 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 		TargetProviderID: onChainID(t, "303"), ClientRequestID: "target-creating-successor",
 	}
-	if _, _, err := repos.Replacements.Authorize(t.Context(), successor); !errors.Is(err, storagereplacement.ErrActiveReplacement) {
-		t.Fatalf("Authorize(successor) error = %v, want ErrActiveReplacement", err)
+	if _, _, err := repos.Replacements.Authorize(t.Context(), successor); !errors.Is(err, storagereplacement.ErrTargetCreating) {
+		t.Fatalf("Authorize(successor) error = %v, want ErrTargetCreating", err)
 	}
 	if kept, err := repos.Replacements.GetByID(t.Context(), first.ID); err != nil || kept.Status == storagereplacement.StatusSuperseded {
 		t.Fatalf("first replacement = %#v err=%v, want it still in charge of its target", kept, err)
 	}
 
-	if err := repos.Contents.CompleteDataSetEnsureTask(t.Context(), first.TargetDataSetID, ensureTask.ID); err != nil {
-		t.Fatalf("release target ensure: %v", err)
-	}
-	if err := repos.Replacements.MarkFailed(t.Context(), first.ID, nil, "setup stopped"); err != nil {
-		t.Fatal(err)
-	}
+	failLocalEnsure(t, db, ensureTask)
 	if _, created, err := repos.Replacements.Authorize(t.Context(), successor); err != nil || !created {
-		t.Fatalf("Authorize(successor after creation) created=%v err=%v", created, err)
+		t.Fatalf("Authorize(successor after failed initialization) created=%v err=%v", created, err)
 	}
 	if superseded, err := repos.Replacements.GetByID(t.Context(), first.ID); err != nil || superseded.Status != storagereplacement.StatusSuperseded {
 		t.Fatalf("first replacement = %#v err=%v, want it superseded", superseded, err)
 	}
 }
 
-// TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent checks that a
-// creation fence left behind by a dead task holds the replica slot only while
-// the target row shows a request that may have reached the chain.
-func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) {
+func TestAuthorizeReplacementAllowsFailedInitializationWithRequestEvidence(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
 		bucket   string
 		recordID bool
-		blocked  bool
 	}{
-		{name: "nothing was sent", bucket: "replacement-dead-fence-unsent", recordID: false, blocked: false},
-		{name: "a request may have gone out", bucket: "replacement-dead-fence-sent", recordID: true, blocked: true},
+		{name: "nothing was sent", bucket: "replacement-dead-fence-unsent", recordID: false},
+		{name: "a request may have gone out", bucket: "replacement-dead-fence-sent", recordID: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			db := testDB(t)
@@ -397,12 +387,6 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 				TargetProviderID: onChainID(t, "303"), ClientRequestID: "dead-fence-successor",
 			}
 			_, created, err := repos.Replacements.Authorize(ctx, successor)
-			if tt.blocked {
-				if !errors.Is(err, storagereplacement.ErrTargetCreating) {
-					t.Fatalf("Authorize(successor) error = %v, want ErrTargetCreating", err)
-				}
-				return
-			}
 			if err != nil || !created {
 				t.Fatalf("Authorize(successor) created=%v err=%v, want the slot released", created, err)
 			}
@@ -411,6 +395,9 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 			abandoned, err := repos.Contents.GetDataSetBindingByID(ctx, first.TargetDataSetID)
 			if err != nil || abandoned == nil || abandoned.Status != model.StorageDataSetStatusRetired || abandoned.EnsureTaskID != nil {
 				t.Fatalf("earlier target = %#v err=%v, want it retired with its creation fence released", abandoned, err)
+			}
+			if tt.recordID && (abandoned.ClientDataSetID == nil || !abandoned.ClientDataSetID.Equal(onChainID(t, "909"))) {
+				t.Fatalf("abandoned target lost request evidence: %#v", abandoned)
 			}
 			if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, first.TargetDataSetID, ensureTask.ID); !errors.Is(err, repository.ErrConflict) {
 				t.Fatalf("authorizing the dead creation task error = %v, want ErrConflict", err)
@@ -634,51 +621,6 @@ func TestRetryReplacementRejectsUnknownFailureReason(t *testing.T) {
 // Retiring a rejected generation frees its provider without erasing anything.
 // Deleting it would have to refuse whenever a copy was bound to it, which is
 // exactly when the provider is most worth getting back.
-func TestRetireRejectedDataSetKeepsTheRowAndItsCopies(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := t.Context()
-	bucket := seedBucket(t, db, "retire-rejected-candidate")
-	upload := startCopyHealthUpload(t, repos, bucket.ID, "retire-version", 1, "retire-checksum", 1)
-	binding := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 0, "101")
-	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
-		StorageDataSetID: binding.ID, CopyIndex: 0, ProviderID: binding.ProviderID,
-		TransferMethod: model.StorageCopyTransferMethodIngress,
-	}}); err != nil {
-		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
-	}
-	if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
-		Set("status = ?", model.StorageCopyStatusFailed).
-		Where("content_id = ? AND storage_data_set_id = ?", upload.ID, binding.ID).
-		Exec(ctx); err != nil {
-		t.Fatalf("mark candidate copy failed: %v", err)
-	}
-	if err := repos.Contents.MarkDataSetFailed(ctx, binding.ID, "creation refused"); err != nil {
-		t.Fatalf("MarkDataSetFailed: %v", err)
-	}
-
-	retired, err := repos.Contents.RetireRejectedDataSet(ctx, binding.ID)
-	if err != nil || !retired {
-		t.Fatalf("RetireRejectedDataSet = %t, err=%v", retired, err)
-	}
-	kept, err := repos.Contents.GetDataSetBindingByID(ctx, binding.ID)
-	if err != nil || kept == nil || kept.Status != model.StorageDataSetStatusRetired {
-		t.Fatalf("retired generation = %#v err=%v, want the row kept as retired", kept, err)
-	}
-	// The copy is what records that ingest was attempted here.
-	copyRow, err := repos.Contents.GetUploadCopyForDataSet(ctx, upload.ID, binding.ID)
-	if err != nil || copyRow == nil {
-		t.Fatalf("retained copy = %#v err=%v", copyRow, err)
-	}
-	// And the provider is what retirement buys back.
-	reused, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: binding.ProviderID, CopyIndex: 0,
-	})
-	if err != nil || reused == nil || reused.ID == binding.ID {
-		t.Fatalf("rebinding the freed provider = %#v err=%v", reused, err)
-	}
-}
-
 func TestStorageContentBindingRejectsCrossBucketIdentity(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -989,161 +931,3 @@ func TestRecordedTerminationEpochIsVisibleToTheRetirementGate(t *testing.T) {
 // A failed generation must give up the replica slot it was holding. While it
 // kept is_current, bucket provisioning saw a current failed binding, suspended
 // on it every minute, and nothing in the system could ever clear it.
-func TestMarkDataSetFailedReleasesTheReplicaSlot(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	bucket := seedBucket(t, db, "data-set-failure-releases-slot")
-	binding, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
-	})
-	if err != nil {
-		t.Fatalf("EnsureDataSetBinding: %v", err)
-	}
-	if !binding.IsCurrent {
-		t.Fatalf("new binding = %#v, want is_current", binding)
-	}
-
-	if err := repos.Contents.MarkDataSetFailed(t.Context(), binding.ID, "creation outcome unknown"); err != nil {
-		t.Fatalf("MarkDataSetFailed: %v", err)
-	}
-	failed, err := repos.Contents.GetDataSetBindingByID(t.Context(), binding.ID)
-	if err != nil || failed == nil {
-		t.Fatalf("GetDataSetBindingByID: binding=%#v err=%v", failed, err)
-	}
-	if failed.Status != model.StorageDataSetStatusFailed || failed.IsCurrent {
-		t.Fatalf("failed binding = status:%s is_current:%t, want failed and not current", failed.Status, failed.IsCurrent)
-	}
-
-	// The slot is free, so the next generation can take it.
-	next, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 0,
-	})
-	if err != nil {
-		t.Fatalf("EnsureDataSetBinding after failure: %v", err)
-	}
-	if !next.IsCurrent || next.Generation <= failed.Generation {
-		t.Fatalf("next generation = %#v, want current and newer than %d", next, failed.Generation)
-	}
-
-	// And the database refuses to put the failed row back on the slot.
-	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
-		Set("is_current = ?", true).
-		Where("id = ?", failed.ID).
-		Exec(t.Context()); err == nil {
-		t.Fatal("restoring is_current on a failed data set was accepted")
-	}
-}
-
-// Provisioning fails before any copy exists, so reclamation has to work with
-// zero copies bound to the generation. A recorded data set identity is what
-// keeps a generation: a rejected transaction hash is not, because it names a
-// submission the chain refused rather than storage anyone is paying for.
-func TestRetireRejectedDataSetFreesTheProviderWithoutADataSetIdentity(t *testing.T) {
-	for _, tc := range []struct {
-		name          string
-		transactionID *string
-		dataSetID     *string
-		wantDiscarded bool
-	}{
-		{name: "rejected submission", transactionID: new("0xcreate"), wantDiscarded: true},
-		{name: "no submission at all", wantDiscarded: true},
-		{name: "recorded a data set identity", dataSetID: new("9001"), wantDiscarded: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db := testDB(t)
-			repos := repository.NewRepositories(db)
-			bucket := seedBucket(t, db, "discard-"+strings.ReplaceAll(tc.name, " ", "-"))
-			provider := onChainID(t, "101")
-			binding, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-				BucketID: bucket.ID, ProviderID: provider, CopyIndex: 0,
-			})
-			if err != nil {
-				t.Fatalf("EnsureDataSetBinding: %v", err)
-			}
-			update := db.NewUpdate().Model((*model.StorageDataSet)(nil)).Where("id = ?", binding.ID)
-			if tc.transactionID != nil {
-				update = update.Set("create_transaction_id = ?", *tc.transactionID)
-			}
-			if tc.dataSetID != nil {
-				update = update.Set("data_set_id = ?", *tc.dataSetID)
-			}
-			if tc.transactionID != nil || tc.dataSetID != nil {
-				if _, err := update.Exec(t.Context()); err != nil {
-					t.Fatalf("record creation evidence: %v", err)
-				}
-			}
-			if err := repos.Contents.MarkDataSetFailed(t.Context(), binding.ID, "creation refused"); err != nil {
-				t.Fatalf("MarkDataSetFailed: %v", err)
-			}
-
-			discarded, err := repos.Contents.RetireRejectedDataSet(t.Context(), binding.ID)
-			if err != nil {
-				t.Fatalf("RetireRejectedDataSet: %v", err)
-			}
-			if discarded != tc.wantDiscarded {
-				t.Fatalf("discarded = %t, want %t", discarded, tc.wantDiscarded)
-			}
-
-			// The provider is reusable exactly when the row is gone.
-			reused, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-				BucketID: bucket.ID, ProviderID: provider, CopyIndex: 0,
-			})
-			if tc.wantDiscarded {
-				if err != nil || reused == nil {
-					t.Fatalf("rebinding the freed provider = %#v err=%v", reused, err)
-				}
-				return
-			}
-			if !errors.Is(err, repository.ErrAlreadyExists) {
-				t.Fatalf("rebinding a retained provider error = %v, want ErrAlreadyExists", err)
-			}
-			kept, err := repos.Contents.GetDataSetBindingByID(t.Context(), binding.ID)
-			if err != nil || kept == nil || kept.DataSetID == nil {
-				t.Fatalf("retained generation = %#v err=%v, want its data set identity kept", kept, err)
-			}
-		})
-	}
-}
-
-// A health snapshot must not keep a rejected generation holding its provider.
-// The observability table cascades with the data set and is rebuilt on every
-// refresh, so it is a snapshot rather than evidence, and the refresh runs far
-// more often than a creation takes to fail.
-func TestRetireRejectedDataSetIgnoresObservabilitySnapshots(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := t.Context()
-	bucket := seedBucket(t, db, "discard-with-observation")
-	provider := onChainID(t, "101")
-	binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: provider, CopyIndex: 0,
-	})
-	if err != nil {
-		t.Fatalf("EnsureDataSetBinding: %v", err)
-	}
-	if err := repos.Contents.MarkDataSetFailed(ctx, binding.ID, "creation outcome unknown"); err != nil {
-		t.Fatalf("MarkDataSetFailed: %v", err)
-	}
-	// The periodic refresh snapshots every data set, including one that never
-	// reached the chain, and it runs far more often than a failure takes.
-	checkedAt := time.Now().UTC()
-	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{{
-		LocalDataSetID: binding.ID, BucketID: bucket.ID, BucketName: bucket.Name,
-		CopyIndex: binding.CopyIndex, ProviderID: binding.ProviderID,
-		Status: observability.StatusUnavailable, LocalStatus: model.StorageDataSetStatusFailed,
-		ReasonCodes:   []observability.ReasonCode{observability.ReasonChainDataSetMissing},
-		LastCheckedAt: checkedAt, Evidence: map[string]any{},
-	}}); err != nil {
-		t.Fatalf("ReplaceDataSetStates: %v", err)
-	}
-
-	discarded, err := repos.Contents.RetireRejectedDataSet(ctx, binding.ID)
-	if err != nil || !discarded {
-		t.Fatalf("RetireRejectedDataSet = %t err=%v, want the snapshot ignored", discarded, err)
-	}
-	if _, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: provider, CopyIndex: 0,
-	}); err != nil {
-		t.Fatalf("rebinding the freed provider: %v", err)
-	}
-}

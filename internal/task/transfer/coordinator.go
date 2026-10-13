@@ -172,7 +172,7 @@ func (h *CopyCoordinator) copyContextFailure(
 		return taskengine.Fail(err, "copy_owner_missing", nil)
 	}
 	if synapse.IsProviderUnavailable(err) || errors.Is(err, storage.ErrDataSetUnavailable) {
-		return taskengine.Wait(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider", "Waiting for storage provider", nil)
 	}
 	if settleSafe {
 		return h.retryCopyTask(execution, input, copyRow, err, "copy_context_failed")

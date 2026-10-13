@@ -15,11 +15,6 @@ import (
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
-const (
-	storageDependencyWait = time.Minute
-	storagePollInterval   = 5 * time.Second
-)
-
 type ReadyDataSetResolver interface {
 	OpenReadyDataSet(context.Context, *model.StorageDataSet) (synapse.DataSetTarget, error)
 }
@@ -95,7 +90,7 @@ func pressureActive(reader PressureReader) bool {
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
 
 func decodeFailure(taskType string, err error) taskengine.Result {

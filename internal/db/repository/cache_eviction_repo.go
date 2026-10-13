@@ -41,6 +41,7 @@ type CacheEvictionRepository interface {
 	// promotes any lifecycle state: pipeline position is derived from the copy
 	// rows, so there is nothing to advance, only cache to reclaim.
 	NextBucketDurabilityCandidate(ctx context.Context, bucketID, generation, taskID int64) (*model.StorageContent, error)
+	ListBucketDurabilityCandidates(ctx context.Context, bucketID, generation, taskID int64, limit int) ([]model.StorageContent, error)
 	CompleteBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error
 }
 
@@ -468,41 +469,57 @@ func (r *BunCacheEvictionRepo) BindDurabilityTask(ctx context.Context, bucketID,
 }
 
 func (r *BunCacheEvictionRepo) NextBucketDurabilityCandidate(ctx context.Context, bucketID, generation, taskID int64) (*model.StorageContent, error) {
-	var current struct {
-		Generation int64  `bun:"durability_generation"`
-		TaskID     *int64 `bun:"durability_task_id"`
+	candidates, err := r.ListBucketDurabilityCandidates(ctx, bucketID, generation, taskID, 1)
+	if err != nil || len(candidates) == 0 {
+		return nil, err
 	}
-	if err := r.db.NewSelect().
-		Model((*model.Bucket)(nil)).
-		Column("durability_generation", "durability_task_id").
-		Where("id = ?", bucketID).
-		Scan(ctx, &current); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("validating bucket durability task: %w", err)
+	return &candidates[0], nil
+}
+
+func (r *BunCacheEvictionRepo) ListBucketDurabilityCandidates(ctx context.Context, bucketID, generation, taskID int64, limit int) ([]model.StorageContent, error) {
+	if limit <= 0 {
+		return nil, ErrInvalidInput
 	}
-	if current.Generation != generation || current.TaskID == nil || *current.TaskID != taskID {
+	bucket, err := (&BunBucketRepo{db: r.db}).GetByID(ctx, bucketID)
+	if err != nil {
+		return nil, err
+	}
+	if bucket == nil {
+		return nil, ErrNotFound
+	}
+	if bucket.DurabilityGeneration != generation || bucket.DurabilityTaskID == nil || *bucket.DurabilityTaskID != taskID {
 		return nil, ErrConflict
 	}
-	return nextBucketDurabilityCandidate(ctx, r.db, bucketID)
+	return bucketDurabilityCandidates(ctx, r.db, bucketID, limit)
 }
 
 func (r *BunCacheEvictionRepo) CompleteBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error {
-	result, err := r.db.NewUpdate().
-		Model((*model.Bucket)(nil)).
-		Set("durability_task_id = NULL").
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND durability_generation = ? AND durability_task_id = ?", bucketID, generation, taskID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("completing bucket durability reconciliation: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrConflict
-	}
-	return nil
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		bucket, err := lockBucketByID(ctx, db, bucketID)
+		if err != nil {
+			return err
+		}
+		if bucket == nil || bucket.DurabilityGeneration != generation || bucket.DurabilityTaskID == nil || *bucket.DurabilityTaskID != taskID {
+			return ErrConflict
+		}
+		candidate, err := nextBucketDurabilityCandidate(ctx, db, bucketID)
+		if err != nil {
+			return err
+		}
+		if candidate != nil {
+			return ErrConflict
+		}
+		result, err := db.NewUpdate().Model((*model.Bucket)(nil)).
+			Set("durability_task_id = NULL").Set("updated_at = ?", time.Now()).
+			Where("id = ? AND durability_generation = ? AND durability_task_id = ?", bucketID, generation, taskID).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("completing bucket durability reconciliation: %w", err)
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
 }
 
 func lockCacheEntry(ctx context.Context, db bun.IDB, contentID int64) (*model.ObjectCache, error) {
@@ -536,9 +553,16 @@ func requireMinimumDurability(ctx context.Context, db bun.IDB, bucket *model.Buc
 // scan, so the predicate reads durability from the copy rows rather than from
 // any stored lifecycle value.
 func nextBucketDurabilityCandidate(ctx context.Context, db bun.IDB, bucketID int64) (*model.StorageContent, error) {
-	content := new(model.StorageContent)
-	err := db.NewSelect().
-		Model(content).
+	candidates, err := bucketDurabilityCandidates(ctx, db, bucketID, 1)
+	if err != nil || len(candidates) == 0 {
+		return nil, err
+	}
+	return &candidates[0], nil
+}
+
+func bucketDurabilityCandidates(ctx context.Context, db bun.IDB, bucketID int64, limit int) ([]model.StorageContent, error) {
+	var contents []model.StorageContent
+	err := db.NewSelect().Model(&contents).
 		Join("JOIN object_cache AS cache_entry ON cache_entry.content_id = storage_content.id").
 		Join("JOIN buckets AS durability_bucket ON durability_bucket.id = storage_content.bucket_id").
 		Where("storage_content.bucket_id = ?", bucketID).
@@ -547,20 +571,13 @@ func nextBucketDurabilityCandidate(ctx context.Context, db bun.IDB, bucketID int
 		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
 		Where(noUnfinishedStoreCacheDependencySQL("storage_content.id")).
 		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
-			storagereplacement.ItemStatusPending,
-			storagereplacement.ItemStatusAttention,
-			storagereplacement.StatusCompleted,
-			storagereplacement.StatusSuperseded).
-		OrderExpr("storage_content.updated_at, storage_content.id").
-		Limit(1).
-		Scan(ctx)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+			storagereplacement.ItemStatusPending, storagereplacement.ItemStatusAttention,
+			storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+		OrderExpr("storage_content.id").Limit(int64(limit)).Scan(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("selecting bucket durability candidate: %w", err)
+		return nil, fmt.Errorf("selecting bucket durability candidates: %w", err)
 	}
-	return content, nil
+	return contents, nil
 }
 
 func minimumDurabilityMetSQL(contentAlias, bucketAlias string) string {

@@ -564,8 +564,8 @@ func TestAPIStartDataSetReplacementRejectsSecondConfirmation(t *testing.T) {
 	}
 	// An active replacement reserves its source even before target creation.
 	rec := fixture.start(t, `{"mode":"manual","provider_id":"303"}`)
-	if rec.Code != http.StatusConflict || decodeAPIError(t, rec)["code"] != storagereplacement.CodeActive {
-		t.Fatalf("second confirmation status = %d body=%s, want active replacement conflict", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict || decodeAPIError(t, rec)["code"] != storagereplacement.CodeTargetCreating {
+		t.Fatalf("second confirmation status = %d body=%s, want target creation conflict", rec.Code, rec.Body.String())
 	}
 }
 

@@ -34,7 +34,7 @@ func TestCacheCapacityIdleChecksKeepOneRound(t *testing.T) {
 		current := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool {
 			return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "scheduled" && row.ClaimGeneration > generation
 		})
-		if current.FinishedAt != nil || current.RetryCount != 0 || current.ResumeMode != model.TaskResumeModeExecute || !current.AvailableAt.After(time.Now().Add(4*time.Second)) {
+		if current.FinishedAt != nil || current.RetryCount != 0 || current.ResumeMode != model.TaskResumeModeExecute || current.AvailableAt.Sub(current.UpdatedAt) > handlerTestPollInterval {
 			t.Fatalf("idle capacity round = %#v", current)
 		}
 		generation = current.ClaimGeneration
@@ -149,6 +149,10 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			if err != nil || completed == nil || completed.Status != model.TaskStatusCompleted || strings.Contains(string(completed.Checkpoint), "previous_cycle_failed") {
 				t.Fatalf("first healthy cycle = %#v, err=%v", completed, err)
 			}
+			archivedFailure, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
+			if err != nil || archivedFailure.SupersededAt == nil {
+				t.Fatalf("archived failure = %#v, %v", archivedFailure, err)
+			}
 			if err := runtime.repos.TaskSchedules.ScheduleNext(t.Context(), key, completed.ID, time.Now().Add(-time.Second)); err != nil {
 				t.Fatal(err)
 			}
@@ -167,14 +171,30 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			if next == nil {
 				t.Fatal("next capacity cycle was not dispatched")
 			}
-			idle := waitForTask(t, runtime.repos, next.ID, func(row *model.Task) bool {
-				return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "scheduled"
-			})
-			generation := idle.ClaimGeneration
-			wakeTask(t, runtime, idle.ID)
-			waitForTask(t, runtime.repos, idle.ID, func(row *model.Task) bool {
-				return row.Status == model.TaskStatusPending && row.ClaimGeneration > generation
-			})
+			if tc.policy == cache.EvictionPolicyNone {
+				idle := waitForTask(t, runtime.repos, next.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+				if idle.RetryCount != 0 || strings.Contains(string(idle.Checkpoint), "previous_cycle_failed") {
+					t.Fatalf("disabled healthy cycle = %#v", idle)
+				}
+				schedule, err := runtime.repos.TaskSchedules.GetForUpdate(t.Context(), key)
+				if err != nil || schedule.NextRunAt.Before(idle.FinishedAt.Add(59*time.Minute)) {
+					t.Fatalf("disabled healthy schedule = %#v, %v", schedule, err)
+				}
+				historyCount++
+			} else {
+				idle := waitForTask(t, runtime.repos, next.ID, func(row *model.Task) bool {
+					return row.Status == model.TaskStatusPending && row.WaitReason != nil && *row.WaitReason == "scheduled"
+				})
+				generation := idle.ClaimGeneration
+				wakeTask(t, runtime, idle.ID)
+				waitForTask(t, runtime.repos, idle.ID, func(row *model.Task) bool {
+					return row.Status == model.TaskStatusPending && row.ClaimGeneration > generation
+				})
+			}
+			previous, err = runtime.repos.Tasks.GetByID(t.Context(), source.ID)
+			if err != nil || previous.SupersededAt == nil || !previous.SupersededAt.Equal(*archivedFailure.SupersededAt) {
+				t.Fatalf("repeated healthy cycle changed failure history = %#v, %v", previous, err)
+			}
 			history, err := runtime.repos.Tasks.List(t.Context(), repository.TaskListFilter{Scope: repository.TaskScopeHistory, Type: model.TaskTypeCacheCapacityReconcile})
 			if err != nil || len(history.Tasks) != historyCount {
 				t.Fatalf("healthy idle cycle created extra history: %#v, err=%v", history, err)
@@ -261,10 +281,14 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, Cache: runtime.cache, CacheGate: runtime.gate, CacheTracker: runtime.tracker, Storage: runtime.storage, EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent, DefaultCopies: 1, Logger: slog.Default()}); err != nil {
+	if _, err := task.Register(registry, service, task.Dependencies{Repositories: runtime.repos, Cache: runtime.cache, CacheGate: runtime.gate, CacheTracker: runtime.tracker, Storage: runtime.storage, EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent, CommitSealOnCachePressure: options.commitSealOnCachePressure, DefaultCopies: 1, Logger: slog.Default()}); err != nil {
 		t.Fatal(err)
 	}
-	schedule := taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: 5 * time.Second}
+	interval := 5 * time.Second
+	if options.policy == cache.EvictionPolicyNone || options.policy == cache.EvictionPolicyAfterUpload && !options.commitSealOnCachePressure {
+		interval = time.Hour
+	}
+	schedule := taskengine.ScheduleDefinition{Key: "capacity-policy", Type: model.TaskTypeCacheCapacityReconcile, Interval: interval}
 	if err := registry.RegisterSchedule(schedule); err != nil {
 		t.Fatal(err)
 	}

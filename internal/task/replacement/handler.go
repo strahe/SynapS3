@@ -20,6 +20,7 @@ import (
 type (
 	TaskRetryPolicy interface {
 		RetryableContext(context.Context, *model.Task) (bool, error)
+		InspectRetryWithRepositories(context.Context, *repository.Repositories, *model.Task) error
 	}
 	Dependencies struct {
 		Repositories *repository.Repositories
@@ -30,14 +31,16 @@ type (
 )
 
 const (
-	storageDependencyWait    = time.Minute
-	storagePollInterval      = 5 * time.Second
 	replacementSeedBatchSize = 100
 )
 
 type Handler struct {
 	*taskengine.FuncHandler
 	deps Dependencies
+}
+
+type replacementProgressCheckpoint struct {
+	ScanAfterItemID int64 `json:"scan_after_item_id,omitempty"`
 }
 
 func NewHandler(deps Dependencies) (*Handler, error) {
@@ -86,10 +89,31 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			if errors.Is(err, storagereplacement.ErrNotRetryable) || errors.Is(err, storagereplacement.ErrSuperseded) || errors.Is(err, storagereplacement.ErrTargetInUse) {
 				return errors.Join(repository.ErrConflict, err)
 			}
-			return err
+			if err != nil {
+				return err
+			}
 		}
 		if row.Status == storagereplacement.StatusCompleted || row.Status == storagereplacement.StatusSuperseded || row.Status == storagereplacement.StatusRetiring || row.Status == storagereplacement.StatusCleanupAttention {
 			return repository.ErrConflict
+		}
+		target, err := repos.Contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
+		if err != nil || target == nil {
+			return errors.Join(err, repository.ErrNotFound)
+		}
+		if target.Status != model.StorageDataSetStatusReady && target.EnsureTaskID != nil {
+			child, err := repos.Tasks.GetByID(ctx, *target.EnsureTaskID)
+			if err != nil {
+				return err
+			}
+			if child == nil {
+				return repository.ErrConflict
+			}
+			if child.Status == model.TaskStatusFailed {
+				return h.deps.RetryPolicy.InspectRetryWithRepositories(ctx, repos, child)
+			}
+			if child.Status != model.TaskStatusPending && child.Status != model.TaskStatusRunning {
+				return taskengine.ErrRetryUnsupported
+			}
 		}
 		return nil
 	}
@@ -109,7 +133,40 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 	}
 
 	definition.PrepareRetry = func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
-		return taskengine.RetryPreparation{Request: taskengine.EnqueueRequest{Type: source.Type, Input: source.Input}, Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: bind}, nil
+		var input storagereplacement.CoordinateInput
+		if err := json.Unmarshal(source.Input, &input); err != nil {
+			return taskengine.RetryPreparation{}, err
+		}
+		return taskengine.RetryPreparation{
+			Request: taskengine.EnqueueRequest{Type: source.Type, Input: source.Input}, Checkpoint: source.Checkpoint,
+			ResumeMode: model.TaskResumeModeRecover,
+			Validate: func(ctx context.Context, repos *repository.Repositories, current *model.Task) error {
+				_, err := repos.Replacements.PrepareCoordinatorRetry(ctx, input.ReplacementID, input.Generation, current.ID)
+				return err
+			},
+			Bind: func(ctx context.Context, repos *repository.Repositories, old, next *model.Task) error {
+				row, err := repos.Replacements.GetByID(ctx, input.ReplacementID)
+				if err != nil || row == nil {
+					return errors.Join(err, repository.ErrNotFound)
+				}
+				target, err := repos.Contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
+				if err != nil || target == nil {
+					return errors.Join(err, repository.ErrNotFound)
+				}
+				if target.Status != model.StorageDataSetStatusReady && target.EnsureTaskID != nil {
+					child, err := repos.Tasks.GetByID(ctx, *target.EnsureTaskID)
+					if err != nil {
+						return err
+					}
+					if child != nil && child.Status == model.TaskStatusFailed {
+						if _, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, child.ID, time.Now().UTC()); err != nil {
+							return err
+						}
+					}
+				}
+				return bind(ctx, repos, old, next)
+			},
+		}, nil
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)
@@ -164,8 +221,11 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			if err != nil {
 				return h.retryReplacement(execution, row.ID, err, "replacement_target_task_load_failed")
 			}
-			if ensure != nil && (ensure.Status == model.TaskStatusFailed || ensure.Status == model.TaskStatusCancelled) && len(target.CreationRejection) == 0 {
-				return h.retryFailedDependency(ctx, execution, row.ID, ensure, "replacement_target_failed", nil)
+			if ensure != nil && (ensure.Status == model.TaskStatusFailed || ensure.Status == model.TaskStatusCancelled) {
+				return taskengine.Fail(errors.New("storage setup stopped"), "replacement_target_failed", func(ctx context.Context, repos *repository.Repositories) error {
+					return repos.Replacements.MarkInitializationFailed(ctx, row.ID, input.Generation, execution.ID(), ensure.ID,
+						"Storage setup stopped. Retry from Tasks or choose another provider.")
+				})
 			}
 		}
 		if localSource && target.IsCurrent && target.Status == model.StorageDataSetStatusReady && target.DataSetID != nil && !target.DataSetID.IsZero() {
@@ -179,29 +239,22 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 				return h.retryReplacement(execution, row.ID, err, "replacement_source_release_failed")
 			}
 			if !done {
-				return taskengine.Wait(model.TaskResumeModeRecover, 0, "source_copies", "Preparing replacement replicas", nil)
+				return taskengine.Wait(model.TaskResumeModeRecover, "source_copies", "Preparing replacement replicas", nil)
 			}
 		}
 		if target.Status != model.StorageDataSetStatusReady || target.DataSetID == nil || target.DataSetID.IsZero() {
-			if evidence, err := target.CreationRejectionEvidence(); err == nil && evidence != nil {
-				reason := storagereplacement.FailureReasonTargetRejected
-				return taskengine.Fail(errors.New("storage provider rejected setup"), "replacement_target_rejected",
-					func(ctx context.Context, repos *repository.Repositories) error {
-						return repos.Replacements.MarkFailed(ctx, row.ID, &reason, storagereplacement.ProviderRejectedMessage)
-					})
-			}
 			if target.Status == model.StorageDataSetStatusFailed {
 				return h.failReplacement(row.ID, errors.New("replacement target data set failed"), "replacement_target_failed")
 			}
 			if target.EnsureTaskID == nil {
-				return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "target", "Preparing replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
+				return taskengine.Wait(model.TaskResumeModeRecover, "target", "Preparing replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 					if err := h.enqueueDataSetEnsure(ctx, repos, target); err != nil {
 						return err
 					}
 					return repos.Replacements.MarkWaiting(ctx, row.ID, storagereplacement.WaitReasonTargetCreating)
 				})
 			}
-			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "target", "Waiting for replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
+			return taskengine.Wait(model.TaskResumeModeRecover, "target", "Waiting for replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.MarkWaiting(ctx, row.ID, storagereplacement.WaitReasonTargetCreating)
 			})
 		}
@@ -216,7 +269,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 					return h.waitForSourceWrites(ctx, execution, row, incomplete)
 				}
 			}
-			return taskengine.Wait(model.TaskResumeModeRecover, 0, "activation", "Activating replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
+			return taskengine.Wait(model.TaskResumeModeRecover, "activation", "Activating replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 				if err := repos.Replacements.Activate(ctx, row.ID, input.Generation, execution.ID()); err != nil {
 					return err
 				}
@@ -224,24 +277,39 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			})
 		}
 		if row.Status == storagereplacement.StatusWaiting || row.Status == storagereplacement.StatusPreparingTarget {
-			return taskengine.Wait(model.TaskResumeModeRecover, 0, "migration", "Preparing replacement replicas", func(ctx context.Context, repos *repository.Repositories) error {
+			return taskengine.Wait(model.TaskResumeModeRecover, "migration", "Preparing replacement replicas", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.MarkMigrating(ctx, row.ID)
 			})
 		}
 
-		inserted, seeded, err := h.deps.Repositories.Replacements.SeedMigrationBatch(ctx, row.ID, replacementSeedBatchSize)
+		if !row.SeedingComplete {
+			return taskengine.Wait(model.TaskResumeModeRecover, "seeding", "Preparing stored content for migration", func(ctx context.Context, repos *repository.Repositories) error {
+				if _, err := repos.Replacements.LockCoordinatorProgress(ctx, row.ID, input.Generation, execution.ID()); err != nil {
+					return err
+				}
+				_, _, err := repos.Replacements.SeedMigrationBatch(ctx, row.ID, replacementSeedBatchSize)
+				return err
+			})
+		}
+		checkpoint, _, err := taskengine.DecodeCheckpoint[replacementProgressCheckpoint](execution)
 		if err != nil {
-			return h.retryReplacement(execution, row.ID, err, "replacement_seed_failed")
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
 		}
-		if !seeded || inserted > 0 {
-			return taskengine.Wait(model.TaskResumeModeRecover, 0, "seeding", "Preparing stored content for migration", nil)
-		}
-		item, err := h.deps.Repositories.Replacements.NextPendingReplacementItem(ctx, row.ID)
+		items, err := h.deps.Repositories.Replacements.ListPendingReplacementItemsAfter(ctx, row.ID, checkpoint.ScanAfterItemID, replacementSeedBatchSize)
 		if err != nil {
 			return h.retryReplacement(execution, row.ID, err, "replacement_item_scan_failed")
 		}
-		if item != nil {
-			return h.coordinateReplacementItem(ctx, execution, row, item)
+		if len(items) > 0 {
+			return h.coordinateReplacementItems(ctx, execution, row, checkpoint, items)
+		}
+		if checkpoint.ScanAfterItemID != 0 {
+			return taskengine.Wait(model.TaskResumeModeRecover, "copy_work", "Continuing stored content migration", func(ctx context.Context, repos *repository.Repositories) error {
+				if _, err := repos.Replacements.LockCoordinatorProgress(ctx, row.ID, input.Generation, execution.ID()); err != nil {
+					return err
+				}
+				checkpoint.ScanAfterItemID = 0
+				return writeProgressCheckpoint(ctx, repos, execution, checkpoint)
+			})
 		}
 		snapshot, err := h.deps.Repositories.Replacements.ReplacementExecution(ctx, row.ID)
 		if err != nil {
@@ -251,7 +319,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			return h.failReplacement(row.ID, errors.New("stored content migration requires attention"), "replacement_item_attention")
 		}
 		if !snapshot.SeedingComplete || snapshot.HasPending {
-			return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "copy_work", "Waiting for stored content migration", nil)
+			return taskengine.Wait(model.TaskResumeModeRecover, "copy_work", "Waiting for stored content migration", nil)
 		}
 		if localSource {
 			return taskengine.Complete("Provider replacement completed", func(ctx context.Context, repos *repository.Repositories) error {
@@ -263,84 +331,142 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 	return taskengine.NewFuncHandler(definition, run, run)
 }
 
-func (h *Handler) coordinateReplacementItem(
-	ctx context.Context,
-	execution taskengine.Execution,
-	replacement *storagereplacement.Replacement,
-	item *storagereplacement.Item,
-) taskengine.Result {
-	snapshot, err := h.deps.Repositories.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
-		ReplacementID: replacement.ID, ItemID: item.ID,
-	})
-	if errors.Is(err, storagereplacement.ErrItemCancelled) {
-		return taskengine.Wait(model.TaskResumeModeRecover, 0, "copy_work", "Continuing stored content migration", nil)
+func (h *Handler) coordinateReplacementItems(ctx context.Context, execution taskengine.Execution, replacement *storagereplacement.Replacement, checkpoint replacementProgressCheckpoint, items []storagereplacement.Item) taskengine.Result {
+	for _, item := range items {
+		_, err := h.deps.Repositories.Replacements.InspectItem(ctx, repository.AcquireReplacementItemInput{ReplacementID: replacement.ID, ItemID: item.ID})
+		if errors.Is(err, storagereplacement.ErrItemCancelled) || errors.Is(err, storagereplacement.ErrItemDeferred) {
+			continue
+		}
+		if err != nil {
+			return h.retryReplacement(execution, replacement.ID, err, "replacement_item_load_failed")
+		}
+		copyRow, err := h.deps.Repositories.Contents.GetUploadCopyForDataSet(ctx, item.ContentID, replacement.TargetDataSetID)
+		if err != nil {
+			return h.retryReplacement(execution, replacement.ID, err, "replacement_copy_load_failed")
+		}
+		if copyRow == nil {
+			continue
+		}
+		if copyRow.Status == model.StorageCopyStatusFailed && copyRow.ActiveTaskID == nil {
+			return taskengine.Retry(errors.New("replacement copy transfer failed"), "replacement_copy_retry", nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+				current, err := requiredReplacementItemCopy(ctx, repos, execution, replacement, item.ID)
+				if err != nil {
+					return err
+				}
+				if current == nil || current.Status != model.StorageCopyStatusFailed || current.ActiveTaskID != nil {
+					return repository.ErrConflict
+				}
+				failed, err := repos.Tasks.LatestForSubject(ctx, model.TaskSubjectStorageCopy, fmt.Sprint(copyRow.ID), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+				if err != nil {
+					return err
+				}
+				var recoveryID int64
+				if failed != nil && failed.Status == model.TaskStatusFailed {
+					recoveryID = failed.ID
+				}
+				if err := repos.Contents.ReopenFailedUploadCopy(ctx, copyRow.ID); err != nil {
+					return err
+				}
+				return h.deps.Messenger.Handover(ctx, repos, storagepipeline.StartCopyTransfer{CopyID: copyRow.ID, AvailableAt: availableAt, RecoveryTaskID: recoveryID})
+			}, func(ctx context.Context, repos *repository.Repositories) error {
+				current, err := requiredReplacementItemCopy(ctx, repos, execution, replacement, item.ID)
+				if err != nil {
+					return err
+				}
+				if current.Status != model.StorageCopyStatusFailed || current.ActiveTaskID != nil {
+					return repository.ErrConflict
+				}
+				return repos.Replacements.MarkFailed(ctx, replacement.ID, nil, "Replacement copy retry budget exhausted")
+			})
+		}
+		if workID := copyRow.WorkTaskID(); workID != nil {
+			work, err := h.deps.Repositories.Tasks.GetByID(ctx, *workID)
+			if err != nil {
+				return h.retryReplacement(execution, replacement.ID, err, "replacement_copy_task_load_failed")
+			}
+			if work != nil && work.Status == model.TaskStatusFailed {
+				message := "stored content migration failed"
+				if work.LastError != nil {
+					message = *work.LastError
+				}
+				return h.retryFailedDependency(ctx, execution, replacement.ID, work, "replacement_copy_failed", func(ctx context.Context, repos *repository.Repositories) error {
+					if _, err := repos.Replacements.LockCoordinatorProgress(ctx, replacement.ID, replacement.TaskGeneration, execution.ID()); err != nil {
+						return err
+					}
+					if err := repos.Replacements.MarkReplacementItemAttention(ctx, replacement.ID, item.ID, message); err != nil {
+						return err
+					}
+					return repos.Replacements.MarkFailed(ctx, replacement.ID, nil, message)
+				}, func(ctx context.Context, repos *repository.Repositories) error {
+					current, err := requiredReplacementItemCopy(ctx, repos, execution, replacement, item.ID)
+					if err != nil {
+						return err
+					}
+					if current.WorkTaskID() == nil || *current.WorkTaskID() != work.ID {
+						return repository.ErrConflict
+					}
+					return nil
+				})
+			}
+		}
 	}
-	if errors.Is(err, storagereplacement.ErrItemDeferred) {
-		return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "source", "Waiting for readable stored content", func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Replacements.MarkWaiting(ctx, replacement.ID, storagereplacement.WaitReasonReadableSource)
-		})
-	}
-	if err != nil {
-		return h.retryReplacement(execution, replacement.ID, err, "replacement_item_load_failed")
-	}
-	if snapshot == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, 0, "copy_work", "Continuing stored content migration", nil)
-	}
-	copyRow, err := h.deps.Repositories.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{
-		ReplacementID: replacement.ID, ItemID: item.ID, ContentID: snapshot.Upload.ID,
-	})
-	if err != nil {
-		return h.retryReplacement(execution, replacement.ID, err, "replacement_copy_attach_failed")
-	}
-	if copyRow.Status == model.StorageCopyStatusCommitted {
-		return taskengine.Wait(model.TaskResumeModeRecover, 0, "copy_work", "Stored content migrated", func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Replacements.MarkReplacementItemCopied(ctx, replacement.ID, item.ID, copyRow.ID)
-		})
-	}
-	if copyRow.Status == model.StorageCopyStatusFailed && copyRow.ActiveTaskID == nil {
-		return taskengine.RetryBackoff(errors.New("replacement copy transfer failed"), "replacement_copy_retry", nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
-			failed, err := repos.Tasks.LatestForSubject(ctx, model.TaskSubjectStorageCopy, fmt.Sprint(copyRow.ID), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+	return taskengine.Wait(model.TaskResumeModeRecover, "copy_work", "Migrating stored content", func(ctx context.Context, repos *repository.Repositories) error {
+		batch, err := repos.Replacements.AcquireItemsForCoordinator(ctx, replacement.ID, replacement.TaskGeneration, execution.ID(), checkpoint.ScanAfterItemID, replacementSeedBatchSize)
+		if err != nil {
+			return err
+		}
+		for _, snapshot := range batch.Items {
+			item := snapshot.Item
+			copyRow, err := repos.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{ReplacementID: replacement.ID, ItemID: item.ID, ContentID: snapshot.Upload.ID})
 			if err != nil {
 				return err
 			}
-			var recoveryID int64
-			if failed != nil && failed.Status == model.TaskStatusFailed {
-				recoveryID = failed.ID
+			if copyRow.Status == model.StorageCopyStatusCommitted {
+				if err := repos.Replacements.MarkReplacementItemCopied(ctx, replacement.ID, item.ID, copyRow.ID); err != nil {
+					return err
+				}
+			} else if copyRow.WorkTaskID() == nil && copyRow.Status != model.StorageCopyStatusFailed {
+				if copyRow.Status == model.StorageCopyStatusPending {
+					err = h.startCopyTransfer(ctx, repos, copyRow.ID)
+				} else {
+					err = h.joinCommit(ctx, repos, copyRow.ID)
+				}
+				if err != nil {
+					return err
+				}
 			}
-			if err := repos.Contents.ReopenFailedUploadCopy(ctx, copyRow.ID); err != nil {
-				return err
-			}
-			return h.deps.Messenger.Handover(ctx, repos, storagepipeline.StartCopyTransfer{CopyID: copyRow.ID, AvailableAt: availableAt, RecoveryTaskID: recoveryID})
-		}, func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.Replacements.MarkFailed(ctx, replacement.ID, nil, "Replacement copy retry budget exhausted")
-		})
-	}
-	workTaskID := copyRow.WorkTaskID()
-	if workTaskID == nil {
-		return taskengine.Wait(model.TaskResumeModeRecover, 0, "copy_work", "Migrating stored content", func(ctx context.Context, repos *repository.Repositories) error {
-			if copyRow.Status != model.StorageCopyStatusPending {
-				return h.joinCommit(ctx, repos, copyRow.ID)
-			}
-			return h.startCopyTransfer(ctx, repos, copyRow.ID)
-		})
-	}
-	copyTask, err := h.deps.Repositories.Tasks.GetByID(ctx, *workTaskID)
-	if err != nil {
-		return h.retryReplacement(execution, replacement.ID, err, "replacement_copy_task_load_failed")
-	}
-	if copyTask != nil && copyTask.Status == model.TaskStatusFailed {
-		message := "stored content migration failed"
-		if copyTask.LastError != nil {
-			message = *copyTask.LastError
 		}
-		return h.retryFailedDependency(ctx, execution, replacement.ID, copyTask, "replacement_copy_failed", func(ctx context.Context, repos *repository.Repositories) error {
-			if err := repos.Replacements.MarkReplacementItemAttention(ctx, replacement.ID, item.ID, message); err != nil {
-				return err
-			}
-			return repos.Replacements.MarkFailed(ctx, replacement.ID, nil, message)
-		})
+		checkpoint.ScanAfterItemID = batch.LastItemID
+		if batch.Scanned < replacementSeedBatchSize {
+			checkpoint.ScanAfterItemID = 0
+		}
+		return writeProgressCheckpoint(ctx, repos, execution, checkpoint)
+	})
+}
+
+func writeProgressCheckpoint(ctx context.Context, repos *repository.Repositories, execution taskengine.Execution, checkpoint replacementProgressCheckpoint) error {
+	raw, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "copy_work", "Waiting for stored content migration", nil)
+	return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), raw)
+}
+
+func requiredReplacementItemCopy(ctx context.Context, repos *repository.Repositories, execution taskengine.Execution, replacement *storagereplacement.Replacement, itemID int64) (*model.StorageCopy, error) {
+	if _, err := repos.Replacements.LockCoordinatorProgress(ctx, replacement.ID, replacement.TaskGeneration, execution.ID()); err != nil {
+		return nil, err
+	}
+	snapshot, err := repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{ReplacementID: replacement.ID, ItemID: itemID})
+	if errors.Is(err, storagereplacement.ErrItemCancelled) || errors.Is(err, storagereplacement.ErrItemDeferred) {
+		return nil, repository.ErrConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, repository.ErrConflict
+	}
+	return repos.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{ReplacementID: replacement.ID, ItemID: itemID, ContentID: snapshot.Upload.ID})
 }
 
 func (h *Handler) waitForSourceWrites(
@@ -363,10 +489,14 @@ func (h *Handler) waitForSourceWrites(
 		}
 		return h.retryFailedDependency(ctx, execution, replacement.ID, copyTask, "replacement_source_write_failed", nil)
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, storagePollInterval, "source_writes", "Waiting for current storage writes", nil)
+	return taskengine.Wait(model.TaskResumeModeRecover, "source_writes", "Waiting for current storage writes", nil)
 }
 
-func (h *Handler) retryFailedDependency(ctx context.Context, execution taskengine.Execution, replacementID int64, source *model.Task, reason string, exhausted taskengine.Settlement) taskengine.Result {
+func (h *Handler) retryFailedDependency(ctx context.Context, execution taskengine.Execution, replacementID int64, source *model.Task, reason string, exhausted taskengine.Settlement, guards ...taskengine.Settlement) taskengine.Result {
+	input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)
+	if err != nil {
+		return decodeFailure(string(execution.Type()), err)
+	}
 	eligible, err := h.deps.RetryPolicy.RetryableContext(ctx, source)
 	if err != nil {
 		return h.retryReplacement(execution, replacementID, err, "replacement_retry_eligibility_failed")
@@ -380,10 +510,30 @@ func (h *Handler) retryFailedDependency(ctx context.Context, execution taskengin
 			return repos.Replacements.MarkFailed(ctx, replacementID, nil, message)
 		}
 	}
+	settleExhausted := exhausted
+	exhausted = func(ctx context.Context, repos *repository.Repositories) error {
+		if _, err := repos.Replacements.LockCoordinatorTask(ctx, replacementID, input.Generation, execution.ID()); err != nil {
+			return err
+		}
+		for _, guard := range guards {
+			if err := guard(ctx, repos); err != nil {
+				return err
+			}
+		}
+		return settleExhausted(ctx, repos)
+	}
 	if !eligible {
 		return taskengine.Fail(errors.New(message), reason, exhausted)
 	}
-	return taskengine.RetryBackoff(errors.New(message), reason, nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+	return taskengine.Retry(errors.New(message), reason, nil).WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, availableAt time.Time) error {
+		if _, err := repos.Replacements.LockCoordinatorTask(ctx, replacementID, input.Generation, execution.ID()); err != nil {
+			return err
+		}
+		for _, guard := range guards {
+			if err := guard(ctx, repos); err != nil {
+				return err
+			}
+		}
 		_, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, source.ID, availableAt)
 		return err
 	}, exhausted)
@@ -447,5 +597,5 @@ func decodeFailure(taskType string, err error) taskengine.Result {
 }
 
 func retryTask(err error, reason string) taskengine.Result {
-	return taskengine.RetryBackoff(err, reason, nil)
+	return taskengine.Retry(err, reason, nil)
 }
