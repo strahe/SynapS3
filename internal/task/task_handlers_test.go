@@ -3117,72 +3117,39 @@ func TestDataSetEnsureSchedulesBoundCopyWorkWhenReady(t *testing.T) {
 	}
 }
 
-func TestDataSetDiscoveryFailureNeverCreatesDataSet(t *testing.T) {
-	var createCalls atomic.Int64
+func TestDataSetCreationDoesNotRequireMetadataDiscovery(t *testing.T) {
+	var createCalls, discoveryCalls atomic.Int64
+	sequence := storedObjectSequence.Add(1)
+	providerID := testOnChainID(t, 9000+sequence)
+	dataSetID := testOnChainID(t, 10000+sequence)
 	provider := &testutil.MockStorageTarget{
-		CreateDataSetFunc: func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+		ProviderIDValue: providerID.SDK(),
+		CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 			createCalls.Add(1)
-			return nil, errors.New("unexpected data set creation")
+			ref, err := storage.NewDataSetRef(providerID.SDK(), dataSetID.SDK(), *options.ClientDataSetID)
+			return &storage.CreateDataSetResult{DataSet: ref}, err
 		},
 	}
 	storageClient := &testutil.MockStorageClient{
-		OpenProviderTargetFunc: func(_ context.Context, providerID sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
-			provider.ProviderIDValue = providerID.Copy()
+		OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 			return provider, nil
 		},
 		FindMatchingDataSetFunc: func(context.Context, sdktypes.BigInt, map[string]string, bool) (*storage.DataSetRef, error) {
+			discoveryCalls.Add(1)
 			return nil, &synapse.ProviderUnavailableError{Cause: errors.New("data set discovery unavailable")}
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: storageClient, policy: cache.EvictionPolicyNone,
 	})
-	sequence := storedObjectSequence.Add(1)
-	bucket := &model.Bucket{Name: fmt.Sprintf("ensure-task-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
-	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
-		t.Fatalf("create ensure bucket: %v", err)
+	fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("ensure-task-%d", sequence))
+	runOneStorageTask(t, runtime, fixture.ensureTask, model.TaskStatusCompleted)
+	binding, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
+	if err != nil || binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || !binding.DataSetID.Equal(dataSetID) || binding.ClientDataSetID == nil || binding.ClientDataSetID.IsZero() {
+		t.Fatalf("created data set = %#v err=%v", binding, err)
 	}
-	// Content identity comes first: a data version cannot exist without it.
-	upload, err := runtime.repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
-		BucketID: bucket.ID, ContentSize: 11,
-		Checksum: testutil.StorageChecksum(fmt.Sprintf("ensure-task-checksum-%d", sequence)), RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("start ensure upload: %v", err)
-	}
-	version := &model.ObjectVersion{
-		VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "ensure.bin", ContentID: &upload.ID, Size: 11,
-		ETag: "etag", ContentType: "application/octet-stream",
-	}
-	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-		t.Fatalf("create ensure version: %v", err)
-	}
-	binding, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: testOnChainID(t, 9000+sequence), CopyIndex: 0, CreatedByContentID: upload.ID,
-	})
-	if err != nil {
-		t.Fatalf("create pending data set: %v", err)
-	}
-	input := storagepipeline.DataSetInput{DataSetID: binding.ID}
-	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type:  model.TaskTypeStorageDataSetEnsure,
-		Input: input,
-	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
-		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
-	})
-	if err != nil {
-		t.Fatalf("enqueue data set ensure: %v", err)
-	}
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-	runtime.repos.Tasks = limited
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
-	if createCalls.Load() != 0 {
-		t.Fatalf("data set creation calls = %d, want zero while discovery is unavailable", createCalls.Load())
+	if createCalls.Load() != 1 || discoveryCalls.Load() != 0 {
+		t.Fatalf("creation calls=%d metadata discovery calls=%d", createCalls.Load(), discoveryCalls.Load())
 	}
 }
 
@@ -3200,9 +3167,6 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	storageClient := &testutil.MockStorageClient{
 		OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 			return provider, nil
-		},
-		FindMatchingDataSetFunc: func(context.Context, sdktypes.BigInt, map[string]string, bool) (*storage.DataSetRef, error) {
-			return nil, nil
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{

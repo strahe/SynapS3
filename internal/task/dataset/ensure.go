@@ -186,19 +186,6 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 		return taskengine.Fail(errors.New("data set creation checkpoint is missing"), "invalid_checkpoint", nil)
 	}
 
-	// Nothing was ever sent for this generation, so a data set the provider
-	// already holds for the bucket may be adopted.
-	matching, err := h.deps.Storage.FindMatchingDataSet(ctx, binding.ProviderID.SDK(), map[string]string{"bucket": bucket.Name}, provider.CDNEnabled())
-	if err == nil && matching != nil {
-		dataSetID, clientDataSetID, identityErr := bindings.DataSetRefIDs(binding, *matching)
-		if identityErr != nil {
-			return taskengine.Fail(identityErr, "dataset_identity_mismatch", nil)
-		}
-		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, clientDataSetID)
-	}
-	if err != nil {
-		return retryTask(err, "dataset_discovery_failed")
-	}
 	if !mayCreate {
 		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Data set is ready to create", nil)
 	}

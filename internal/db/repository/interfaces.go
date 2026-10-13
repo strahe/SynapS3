@@ -597,11 +597,8 @@ type StorageReplacementRepository interface {
 	// SourceEligibility shares local admission with presentation and authorization;
 	// its boolean distinguishes a source without a ready remote service.
 	SourceEligibility(ctx context.Context, dataSetID int64) (*model.StorageDataSet, bool, error)
-	// Preflight snapshots the source and unresolved targets for remote checks.
+	// Preflight snapshots the source and unresolved targets for authorization.
 	Preflight(ctx context.Context, dataSetID int64) (*ReplacementPreflight, error)
-	// BindObservedService validates that snapshot without restoring creation
-	// permission. Its caller must continue ready work in the same transaction.
-	BindObservedService(ctx context.Context, input BindObservedReplacementServiceInput) error
 	// RetryEligibility is read-only; Retry rechecks the same target admission.
 	RetryEligibility(ctx context.Context, replacementID int64) error
 	GetReplacementSubject(ctx context.Context, id int64) (*ReplacementSubject, error)
@@ -688,38 +685,25 @@ type StorageReplacementRepository interface {
 
 // AuthorizeReplacementInput is one operator confirmation.
 type AuthorizeReplacementInput struct {
-	BucketID                  int64
-	SourceDataSetID           int64
-	SelectionMode             storagereplacement.SelectionMode
-	TargetProviderID          types.OnChainID
-	ClientRequestID           string
-	PriceListFingerprint      string
-	VerifiedCreationRejection *model.DataSetCreationRejection
-	Preflight                 *ReplacementPreflight
+	BucketID             int64
+	SourceDataSetID      int64
+	SelectionMode        storagereplacement.SelectionMode
+	TargetProviderID     types.OnChainID
+	ClientRequestID      string
+	PriceListFingerprint string
+	Preflight            *ReplacementPreflight
 }
 
 // ReplacementPreflight freezes the local identities checked outside the transaction.
 type ReplacementPreflight struct {
-	Source                    model.StorageDataSet
-	Targets                   []ReplacementTargetCheck
-	VerifiedCreationRejection *model.DataSetCreationRejection
+	Source  model.StorageDataSet
+	Targets []ReplacementTargetCheck
 }
 
-// ReplacementTargetCheck couples the unresolved target identity with its
-// replacement fence and any freshly checked refusal evidence.
+// ReplacementTargetCheck couples the unresolved target identity with its replacement fence.
 type ReplacementTargetCheck struct {
-	Replacement               storagereplacement.Replacement
-	DataSet                   model.StorageDataSet
-	VerifiedCreationRejection *model.DataSetCreationRejection
-}
-
-// BindObservedReplacementServiceInput authorizes a service observed for one
-// exact preflight identity, including a source with no remaining ensure fence.
-type BindObservedReplacementServiceInput struct {
-	Preflight        ReplacementPreflight
-	StorageDataSetID int64
-	DataSetID        types.OnChainID
-	ClientDataSetID  types.OnChainID
+	Replacement storagereplacement.Replacement
+	DataSet     model.StorageDataSet
 }
 
 type RetryReplacementInput struct {

@@ -224,9 +224,8 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		row, created, authorizeErr = txRepos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 			BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: mode,
 			TargetProviderID: targetProvider, ClientRequestID: req.ClientRequestID,
-			PriceListFingerprint:      req.PriceListFingerprint,
-			VerifiedCreationRejection: preflight.VerifiedCreationRejection,
-			Preflight:                 preflight,
+			PriceListFingerprint: req.PriceListFingerprint,
+			Preflight:            preflight,
 		})
 		if authorizeErr != nil || !created {
 			return authorizeErr

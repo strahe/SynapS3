@@ -9,9 +9,13 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
+	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -98,6 +102,108 @@ func TestDataSetConfirmationSuccessWinsAfterWindowExpires(t *testing.T) {
 	}
 	if fixture.creates.Load() != 1 || fixture.confirmations.Load() != 2 {
 		t.Fatalf("late confirmation performed extra sends: creates=%d confirmations=%d", fixture.creates.Load(), fixture.confirmations.Load())
+	}
+}
+
+func TestDataSetGenerationCreatesOwnRequestAfterReturningToProvider(t *testing.T) {
+	sequence := storedObjectSequence.Add(1)
+	providerA, providerB := testOnChainID(t, 131000+sequence), testOnChainID(t, 132000+sequence)
+	oldDataSetID, newDataSetID := sdktypes.NewBigInt(uint64(133000+sequence)), sdktypes.NewBigInt(uint64(134000+sequence))
+	var createsA, createsB, metadataReads atomic.Int64
+	var oldRequest atomic.Value
+	var lateResultAvailable atomic.Bool
+	targetA := &testutil.MockStorageTarget{
+		ProviderIDValue: providerA.SDK(),
+		CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+			if createsA.Add(1) == 1 {
+				oldRequest.Store(options.ClientDataSetID.Copy())
+				return nil, context.DeadlineExceeded
+			}
+			ref, err := storage.NewDataSetRef(providerA.SDK(), newDataSetID, *options.ClientDataSetID)
+			return &storage.CreateDataSetResult{DataSet: ref}, err
+		},
+	}
+	targetB := &testutil.MockStorageTarget{
+		ProviderIDValue: providerB.SDK(),
+		CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+			createsB.Add(1)
+			ref, err := storage.NewDataSetRef(providerB.SDK(), sdktypes.NewBigInt(uint64(135000+sequence)), *options.ClientDataSetID)
+			return &storage.CreateDataSetResult{DataSet: ref}, err
+		},
+	}
+	budget := 1
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		policy: cache.EvictionPolicyNone, maxAttempts: &budget,
+		storage: &testutil.MockStorageClient{
+			OpenProviderTargetFunc: func(_ context.Context, providerID sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+				if providerID.Equal(providerA.SDK()) {
+					return targetA, nil
+				}
+				return targetB, nil
+			},
+			FindMatchingDataSetFunc: func(_ context.Context, providerID sdktypes.BigInt, _ map[string]string, _ bool) (*storage.DataSetRef, error) {
+				metadataReads.Add(1)
+				if !providerID.Equal(providerA.SDK()) || !lateResultAvailable.Load() {
+					return nil, nil
+				}
+				ref, err := storage.NewDataSetRef(providerA.SDK(), oldDataSetID, oldRequest.Load().(sdktypes.BigInt))
+				return &ref, err
+			},
+		},
+	})
+	ctx := t.Context()
+	bucket := &model.Bucket{Name: fmt.Sprintf("generation-request-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatal(err)
+	}
+	source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: providerA, CopyIndex: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEnsure, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: source.ID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+		return repos.Contents.BindDataSetEnsureTask(ctx, source.ID, row.ID)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOneStorageTask(t, runtime, firstEnsure, model.TaskStatusFailed)
+	first, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: providerB, ClientRequestID: "provider-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: first.ID, Generation: first.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+		return repos.Replacements.BindTask(ctx, first.ID, first.TaskGeneration, row.ID)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		cancel, done := runHandlerEngine(t, runtime)
+		defer stopHandlerEngine(t, cancel, done)
+		waitForTask(t, runtime.repos, coordinator.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+	}()
+	lateResultAvailable.Store(true)
+	second, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{BucketID: bucket.ID, SourceDataSetID: first.TargetDataSetID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: providerA, ClientRequestID: "provider-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextEnsure, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: second.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+		return repos.Contents.BindDataSetEnsureTask(ctx, second.TargetDataSetID, row.ID)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOneStorageTask(t, runtime, nextEnsure, model.TaskStatusCompleted)
+	current, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, second.TargetDataSetID)
+	if err != nil || current.Status != model.StorageDataSetStatusReady || current.DataSetID == nil || !current.DataSetID.SDK().Equal(newDataSetID) || current.ClientDataSetID == nil || current.ClientDataSetID.SDK().Equal(oldRequest.Load().(sdktypes.BigInt)) {
+		t.Fatalf("new generation adopted an abandoned creation: binding=%#v err=%v", current, err)
+	}
+	abandoned, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, source.ID)
+	if err != nil || abandoned.IsCurrent || abandoned.EnsureTaskID != nil || abandoned.DataSetID != nil || abandoned.ClientDataSetID == nil || !abandoned.ClientDataSetID.SDK().Equal(oldRequest.Load().(sdktypes.BigInt)) {
+		t.Fatalf("abandoned request evidence changed: binding=%#v err=%v", abandoned, err)
+	}
+	if createsA.Load() != 2 || createsB.Load() != 1 || metadataReads.Load() != 0 {
+		t.Fatalf("generation requests: provider A=%d provider B=%d metadata reads=%d", createsA.Load(), createsB.Load(), metadataReads.Load())
 	}
 }
 

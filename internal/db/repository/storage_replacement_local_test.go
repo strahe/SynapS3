@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -69,18 +70,18 @@ func localCoordinatorTask(t *testing.T, repos *repository.Repositories, row *sto
 	return coordinator
 }
 
-func localRefusal(t *testing.T, db *bun.DB, repos *repository.Repositories, source *model.StorageDataSet, ensure *model.Task) *model.DataSetCreationRejection {
+func localRefusal(t *testing.T, db *bun.DB, repos *repository.Repositories, source *model.StorageDataSet, ensure *model.Task) json.RawMessage {
 	t.Helper()
 	clientID := onChainID(t, fmt.Sprintf("%d", 700000+source.ID))
 	if err := repos.Contents.RecordDataSetClientID(t.Context(), source.ID, ensure.ID, clientID); err != nil {
 		t.Fatal(err)
 	}
 	identity := testutil.DefaultContextIdentity
-	evidence := &model.DataSetCreationRejection{
-		Version: 1, StatusCode: 403, RejectedAt: time.Now().UTC().Add(-time.Minute), AbsenceCheckedAt: time.Now().UTC(),
-		ClientDataSetID: clientID, Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper,
+	evidence := map[string]any{
+		"version": 1, "status_code": 403, "rejected_at": time.Now().UTC().Add(-time.Minute), "absence_checked_at": time.Now().UTC(),
+		"client_data_set_id": clientID, "payer": identity.Payer, "chain_id": uint64(identity.ChainID), "record_keeper": identity.RecordKeeper,
 	}
-	encoded, err := json.Marshal(*evidence)
+	encoded, err := json.Marshal(evidence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +91,7 @@ func localRefusal(t *testing.T, db *bun.DB, repos *repository.Repositories, sour
 	if _, err := db.NewRaw("UPDATE tasks SET status = ?, failure_reason = ?, finished_at = ? WHERE id = ?", model.TaskStatusFailed, "dataset_provider_rejected", time.Now(), ensure.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	return evidence
+	return json.RawMessage(encoded)
 }
 
 func TestUncreatedReplacementAdmissionAndFencing(t *testing.T) {
@@ -120,7 +121,7 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repos, source, ensure := localReplacementSource(t, db, "admission-"+tc.name)
-			var evidence *model.DataSetCreationRejection
+			var evidence json.RawMessage
 			if tc.refusal {
 				evidence = localRefusal(t, db, repos, source, ensure)
 			}
@@ -159,11 +160,14 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 					t.Fatal(err)
 				}
 			case "version", "identity":
-				changed := *evidence
+				var changed map[string]any
+				if err := json.Unmarshal(evidence, &changed); err != nil {
+					t.Fatal(err)
+				}
 				if tc.mutate == "version" {
-					changed.Version++
+					changed["version"] = 2
 				} else {
-					changed.ClientDataSetID = onChainID(t, "909")
+					changed["client_data_set_id"] = onChainID(t, "909")
 				}
 				encoded, err := json.Marshal(changed)
 				if err != nil {
@@ -184,7 +188,7 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 			}
 			input := repository.AuthorizeReplacementInput{
 				BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
-				TargetProviderID: onChainID(t, "202"), ClientRequestID: "replace", VerifiedCreationRejection: evidence,
+				TargetProviderID: onChainID(t, "202"), ClientRequestID: "replace",
 			}
 			row, created, err := repos.Replacements.Authorize(t.Context(), input)
 			if !errors.Is(err, tc.want) {
@@ -473,7 +477,6 @@ func rejectedLocalTargetCanBeReplacedAgain(t *testing.T, db *bun.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check.Targets[0].VerifiedCreationRejection = evidence
 	second, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "303"), ClientRequestID: "second", Preflight: check})
 	if err != nil {
 		t.Fatal(err)
@@ -510,8 +513,12 @@ func rejectedLocalTargetCanBeReplacedAgain(t *testing.T, db *bun.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if proof, err := kept.CreationRejectionEvidence(); err != nil || proof == nil {
-		t.Fatalf("retained evidence=%#v err=%v", proof, err)
+	var original, retained map[string]any
+	if err := json.Unmarshal(evidence, &original); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(kept.CreationRejection, &retained); err != nil || !reflect.DeepEqual(original, retained) {
+		t.Fatalf("retained evidence=%s err=%v", kept.CreationRejection, err)
 	}
 }
 
@@ -531,63 +538,32 @@ func activateReplacement(t *testing.T, repos *repository.Repositories, id int64)
 	return repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID)
 }
 
-func TestReplacementObservationAuthorization(t *testing.T) {
-	replacementObservationAuthorization(t, testDB(t))
+func TestReadyTargetRejectsStaleInitializationFailure(t *testing.T) {
+	readyTargetRejectsStaleInitializationFailure(t, testDB(t))
 }
 
-func TestReadyTargetRejectsStaleRefusalSettlement(t *testing.T) {
-	readyTargetRejectsStaleRefusalSettlement(t, testDB(t))
-}
-
-func readyTargetRejectsStaleRefusalSettlement(t *testing.T, db *bun.DB) {
-	for _, observed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("observed=%v", observed), func(t *testing.T) {
-			repos, source, _ := localReplacementSource(t, db, fmt.Sprintf("stale-refusal-%v", observed))
-			row, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "202"), ClientRequestID: "first"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			coordinator := localCoordinatorTask(t, repos, row)
-			target, err := repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ensure := localEnsureTask(t, repos, target.ID)
-			evidence := localRefusal(t, db, repos, target, ensure)
-			serviceID := onChainID(t, fmt.Sprintf("%d", 900000+target.ID))
-			if observed {
-				source, err = repos.Contents.GetDataSetBindingByID(t.Context(), source.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				target, err = repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				row, err = repos.Replacements.GetByID(t.Context(), row.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				check := repository.ReplacementPreflight{Source: *source, Targets: []repository.ReplacementTargetCheck{{Replacement: *row, DataSet: *target}}}
-				err = repos.Replacements.BindObservedService(t.Context(), repository.BindObservedReplacementServiceInput{Preflight: check, StorageDataSetID: target.ID, DataSetID: serviceID, ClientDataSetID: evidence.ClientDataSetID})
-			} else {
-				err = repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: target.ID, DataSetID: serviceID, ClientDataSetID: &evidence.ClientDataSetID})
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			reason := storagereplacement.FailureReasonTargetRejected
-			if err := repos.Replacements.MarkFailed(t.Context(), row.ID, &reason, "obsolete refusal"); !errors.Is(err, repository.ErrConflict) {
-				t.Fatalf("ready target accepted refusal settlement: %v", err)
-			}
-			if err := repos.Replacements.MarkInitializationFailed(t.Context(), row.ID, row.TaskGeneration, coordinator.ID, ensure.ID, "obsolete initialization failure"); !errors.Is(err, repository.ErrConflict) {
-				t.Fatalf("ready target accepted initialization failure settlement: %v", err)
-			}
-			current, err := repos.Replacements.GetByID(t.Context(), row.ID)
-			if err != nil || current.Status != storagereplacement.StatusPreparingTarget || current.FailureReason != nil {
-				t.Fatalf("stale refusal changed replacement: %#v %v", current, err)
-			}
-		})
+func readyTargetRejectsStaleInitializationFailure(t *testing.T, db *bun.DB) {
+	repos, source, _ := localReplacementSource(t, db, "stale-initialization-failure")
+	row, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "202"), ClientRequestID: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := localCoordinatorTask(t, repos, row)
+	target, err := repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensure := localEnsureTask(t, repos, target.ID)
+	failLocalEnsure(t, db, ensure)
+	if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: target.ID, DataSetID: onChainID(t, fmt.Sprintf("%d", 900000+target.ID))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Replacements.MarkInitializationFailed(t.Context(), row.ID, row.TaskGeneration, coordinator.ID, ensure.ID, "obsolete initialization failure"); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("ready target accepted initialization failure settlement: %v", err)
+	}
+	current, err := repos.Replacements.GetByID(t.Context(), row.ID)
+	if err != nil || current.Status != storagereplacement.StatusPreparingTarget || current.FailureReason != nil {
+		t.Fatalf("stale initialization failure changed replacement: %#v %v", current, err)
 	}
 }
 
@@ -616,112 +592,5 @@ func remoteSourceCannotCompleteLocally(t *testing.T, db *bun.DB) {
 	current, err := repos.Replacements.GetByID(t.Context(), row.ID)
 	if err != nil || current.Status != storagereplacement.StatusMigrating {
 		t.Fatalf("local completion changed remote replacement: %#v %v", current, err)
-	}
-}
-
-func replacementObservationAuthorization(t *testing.T, db *bun.DB) {
-	for _, role := range []string{"source", "target"} {
-		for _, operation := range []string{"fresh", "stale", "concurrent"} {
-			t.Run(fmt.Sprintf("%s/%s", role, operation), func(t *testing.T) {
-				repos, source, ensure := localReplacementSource(t, db, fmt.Sprintf("observation-%s-%s", role, operation))
-				var sourceEvidence *model.DataSetCreationRejection
-				if role == "source" {
-					sourceEvidence = localRefusal(t, db, repos, source, ensure)
-				}
-				row, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "202"), ClientRequestID: "observation", VerifiedCreationRejection: sourceEvidence})
-				if err != nil {
-					t.Fatal(err)
-				}
-				observedID := source.ID
-				if role == "target" {
-					observedID = row.TargetDataSetID
-					target, err := repos.Contents.GetDataSetBindingByID(t.Context(), observedID)
-					if err != nil {
-						t.Fatal(err)
-					}
-					localRefusal(t, db, repos, target, localEnsureTask(t, repos, observedID))
-					reason := storagereplacement.FailureReasonTargetRejected
-					if err := repos.Replacements.MarkFailed(t.Context(), row.ID, &reason, "refused"); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if role == "source" {
-					target, err := repos.Contents.GetDataSetBindingByID(t.Context(), row.TargetDataSetID)
-					if err != nil {
-						t.Fatal(err)
-					}
-					failed := localEnsureTask(t, repos, target.ID)
-					failLocalEnsure(t, db, failed)
-					if err := repos.Replacements.MarkFailed(t.Context(), row.ID, nil, "replacement stopped"); err != nil {
-						t.Fatal(err)
-					}
-				}
-				check, err := repos.Replacements.Preflight(t.Context(), source.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				binding, err := repos.Contents.GetDataSetBindingByID(t.Context(), observedID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if operation == "stale" {
-					if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).Set("task_generation = task_generation + 1").Where("id = ?", row.ID).Exec(t.Context()); err != nil {
-						t.Fatal(err)
-					}
-				}
-				input := repository.BindObservedReplacementServiceInput{Preflight: *check, StorageDataSetID: observedID, DataSetID: onChainID(t, fmt.Sprintf("%d", 800000+observedID)), ClientDataSetID: *binding.ClientDataSetID}
-				if operation == "concurrent" {
-					results := make(chan error, 2)
-					for range 2 {
-						go func() { results <- repos.Replacements.BindObservedService(t.Context(), input) }()
-					}
-					bound := 0
-					for range 2 {
-						if result := <-results; result == nil {
-							bound++
-						} else if !errors.Is(result, storagereplacement.ErrSourceOutcomeUnknown) {
-							t.Fatalf("concurrent observation: %v", result)
-						}
-					}
-					wantBound := 1
-					if role == "source" {
-						wantBound = 0
-					}
-					if bound != wantBound {
-						t.Fatalf("observation accepted %d concurrent bindings", bound)
-					}
-					if role == "source" {
-						return
-					}
-				} else {
-					err = repos.Replacements.BindObservedService(t.Context(), input)
-				}
-				if operation == "stale" || role == "source" {
-					if !errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
-						t.Fatalf("changed ownership accepted: %v", err)
-					}
-					return
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := repos.Replacements.BindObservedService(t.Context(), input); !errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown) {
-					t.Fatalf("replayed observation accepted: %v", err)
-				}
-				binding, err = repos.Contents.GetDataSetBindingByID(t.Context(), observedID)
-				if err != nil || binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.EnsureTaskID != nil || len(binding.CreationRejection) != 0 {
-					t.Fatalf("observed service=%#v %v", binding, err)
-				}
-				if err := repos.Contents.RecordDataSetClientID(t.Context(), observedID, ensure.ID, onChainID(t, "999")); !errors.Is(err, repository.ErrConflict) {
-					t.Fatalf("observation restored creation permission: %v", err)
-				}
-				if role == "target" {
-					resumed, err := repos.Replacements.Retry(t.Context(), repository.RetryReplacementInput{ReplacementID: row.ID})
-					if err != nil || resumed.Status != storagereplacement.StatusPreparingTarget || resumed.FailureReason != nil {
-						t.Fatalf("recovered target did not resume: %#v %v", resumed, err)
-					}
-				}
-			})
-		}
 	}
 }

@@ -22,32 +22,34 @@ type observeTargetAfterCoordinatorRead struct {
 	repository.StorageContentRepository
 	repos    *repository.Repositories
 	ready    *taskengine.Messenger
-	input    repository.BindObservedReplacementServiceInput
+	input    repository.MarkDataSetReadyInput
 	observed atomic.Bool
 	result   chan error
 }
 
 func (r *observeTargetAfterCoordinatorRead) GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error) {
 	stale, err := r.StorageContentRepository.GetDataSetBindingByID(ctx, id)
-	if err == nil && id == r.input.StorageDataSetID && r.observed.CompareAndSwap(false, true) {
+	if err == nil && id == r.input.ID && r.observed.CompareAndSwap(false, true) {
 		err = r.repos.WithTx(ctx, func(repos *repository.Repositories) error {
-			if err := repos.Replacements.BindObservedService(ctx, r.input); err != nil {
+			if err := repos.Contents.MarkDataSetReady(ctx, r.input); err != nil {
 				return err
 			}
-			ready, err := repos.Contents.GetDataSetBindingByID(ctx, id)
-			if err != nil {
+			if stale.EnsureTaskID == nil {
+				return repository.ErrConflict
+			}
+			if err := repos.Contents.CompleteDataSetEnsureTask(ctx, id, *stale.EnsureTaskID); err != nil {
 				return err
 			}
-			return r.ready.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: ready.ID})
+			return r.ready.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: id})
 		})
 		r.result <- err
 	}
 	return stale, err
 }
 
-func TestCoordinatorDiscardsRefusalAfterObservedService(t *testing.T) {
+func TestCoordinatorDiscardsStaleFailureAfterDataSetReady(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	row, target, coordinator, input := seedRefusedReplacement(t, runtime)
+	row, target, coordinator, input := seedFailedInitializationReplacement(t, runtime)
 	wrapper := &observeTargetAfterCoordinatorRead{
 		StorageContentRepository: runtime.repos.Contents, repos: runtime.repos, ready: runtime.ready,
 		input: input, result: make(chan error, 1),
@@ -88,7 +90,7 @@ func TestCoordinatorDiscardsRefusalAfterObservedService(t *testing.T) {
 	}
 }
 
-func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime, readySource ...bool) (*storagereplacement.Replacement, *model.StorageDataSet, *model.Task, repository.BindObservedReplacementServiceInput) {
+func seedFailedInitializationReplacement(t *testing.T, runtime handlerTestRuntime, readySource ...bool) (*storagereplacement.Replacement, *model.StorageDataSet, *model.Task, repository.MarkDataSetReadyInput) {
 	t.Helper()
 	bucket := &model.Bucket{Name: "review-stale-rejection", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
@@ -135,7 +137,7 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime, readySourc
 		t.Fatal(err)
 	}
 	identity := testutil.DefaultContextIdentity
-	evidence := model.DataSetCreationRejection{Version: 1, StatusCode: 403, RejectedAt: time.Now().Add(-time.Minute), AbsenceCheckedAt: time.Now(), ClientDataSetID: clientID, Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper}
+	evidence := map[string]any{"version": 1, "status_code": 403, "rejected_at": time.Now().Add(-time.Minute), "absence_checked_at": time.Now(), "client_data_set_id": clientID, "payer": identity.Payer, "chain_id": uint64(identity.ChainID), "record_keeper": identity.RecordKeeper}
 	encoded, err := json.Marshal(evidence)
 	if err != nil {
 		t.Fatal(err)
@@ -152,44 +154,33 @@ func seedRefusedReplacement(t *testing.T, runtime handlerTestRuntime, readySourc
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), source.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	target, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row, err = runtime.repos.Replacements.GetByID(t.Context(), row.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	check := &repository.ReplacementPreflight{Source: *source, Targets: []repository.ReplacementTargetCheck{{Replacement: *row, DataSet: *target}}}
-	return row, target, coordinator, repository.BindObservedReplacementServiceInput{Preflight: *check, StorageDataSetID: target.ID, DataSetID: testOnChainID(t, 2002), ClientDataSetID: clientID}
+	return row, target, coordinator, repository.MarkDataSetReadyInput{ID: target.ID, DataSetID: testOnChainID(t, 2002), ClientDataSetID: &clientID}
 }
 
-func TestObservedServiceAfterRefusalSettlementKeepsReplacementReserved(t *testing.T) {
+func TestReadyTargetAfterInitializationFailureKeepsReplacementReserved(t *testing.T) {
 	for _, action := range []string{"retry", "another provider"} {
 		t.Run(action, func(t *testing.T) {
 			terminator := &testServiceTerminator{}
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator})
-			row, target, coordinator, _ := seedRefusedReplacement(t, runtime)
+			row, target, coordinator, _ := seedFailedInitializationReplacement(t, runtime)
 			cancel, done := runHandlerEngine(t, runtime)
 			waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
 			stopHandlerEngine(t, cancel, done)
-			check, err := runtime.repos.Replacements.Preflight(t.Context(), row.SourceDataSetID)
-			if err != nil {
-				t.Fatal(err)
-			}
 			if err := runtime.repos.WithTx(t.Context(), func(repos *repository.Repositories) error {
-				if err := repos.Replacements.BindObservedService(t.Context(), repository.BindObservedReplacementServiceInput{Preflight: *check, StorageDataSetID: target.ID, DataSetID: testOnChainID(t, 2002), ClientDataSetID: *target.ClientDataSetID}); err != nil {
+				if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: target.ID, DataSetID: testOnChainID(t, 2002), ClientDataSetID: target.ClientDataSetID}); err != nil {
 					return err
 				}
-				ready, err := repos.Contents.GetDataSetBindingByID(t.Context(), target.ID)
-				if err != nil {
+				if target.EnsureTaskID == nil {
+					return repository.ErrConflict
+				}
+				if err := repos.Contents.CompleteDataSetEnsureTask(t.Context(), target.ID, *target.EnsureTaskID); err != nil {
 					return err
 				}
-				return runtime.ready.Notify(t.Context(), repos, storagepipeline.DataSetReady{BindingID: ready.ID})
+				return runtime.ready.Notify(t.Context(), repos, storagepipeline.DataSetReady{BindingID: target.ID})
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -204,7 +195,7 @@ func TestObservedServiceAfterRefusalSettlementKeepsReplacementReserved(t *testin
 				}
 				return
 			}
-			coordinator, err = runtime.service.Retry(t.Context(), coordinator.ID)
+			coordinator, err := runtime.service.Retry(t.Context(), coordinator.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -224,7 +215,7 @@ func TestInitializationCoordinatorStopsOnFailedChild(t *testing.T) {
 	for _, readySource := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ready_source=%v", readySource), func(t *testing.T) {
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-			row, target, coordinator, _ := seedRefusedReplacement(t, runtime, readySource)
+			row, target, coordinator, _ := seedFailedInitializationReplacement(t, runtime, readySource)
 			if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("creation_rejection = NULL").Where("id = ?", target.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}

@@ -216,11 +216,11 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 `client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式、手动存储提供方和价格指纹使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。重放会在读取当前价格以及自动选择的批准状态前命中原记录，因此清单后续变化不会改选存储提供方。
 
-替换进行中时，原副本不能再次替换。前次替换失败或关闭旧服务需要处理时，若目标创建结果已明确，可从原副本重新选择提供方。放弃被拒绝的目标前，会按原钱包和网络重新查询，即使原副本已就绪也不会跳过。若查到服务，新确认返回冲突，应重试已有替换。被取代请求中已知的闲置服务沿用正常关闭流程。`replacement_active` 表示该副本正参与进行中的替换，或是未完成替换的目标，需要先继续那一次替换。
+未完成的替换会保留来源、目标和副本槽位。目标尚未就绪且当前创建任务为 Failed 时，可从原来源副本确认另一提供方，取代该次替换。其他未完成替换继续保留槽位。被取代请求中已知的闲置服务沿用正常关闭流程。`replacement_active` 表示请求的副本仍属于未完成替换，应按返回的提示处理。
 
-当前副本满足以下任一情况即可替换：服务已就绪；尚未发送创建请求；初始创建 POST 返回 400、401 或 403，且按原钱包和网络查询未发现服务。此前发生过超时也可适用最后一种情况。创建任务正在执行时返回 `409 Conflict` 和 `replacement_source_running`；结果未确认、存在已提交交易、查询失败或身份变化时返回 `replacement_source_outcome_unknown`。存储桶响应提供 `replaceable`、可选的 `replacement_blocked_reason` 和 `setup_error`；提交时会重新核验。可选的 `replacement_has_late_service_risk` 也包含改选时将放弃的拒绝目标的迟到计费风险。
+当前副本在服务已就绪，或服务尚未就绪且当前创建任务为 Failed 时可替换。创建任务处于 Pending 或 Running 时不能执行此初始化恢复，包括 Retry 启动的新任务。任务失败后，已保存的请求 ID、已提交交易或无法回查的结果不会阻止替换，也不要求查询提供方。存储桶响应提供 `replaceable`、可选的 `replacement_blocked_reason` 和 `setup_error`；提交时会重新核验。可选的 `replacement_has_late_service_risk` 表示被取代的创建请求仍可能成功创建服务。
 
-尚无服务的副本在确认后停止原来的创建，并准备所选提供方。新服务就绪前，原副本保留槽位；若创建失败，应从原副本改选提供方。需要该副本的新上传会等待新服务设置完成，交接后继续执行。交接后从其他副本或缓存恢复所需内容，两者都没有的内容需要处理。不终止旧服务。查询未发现服务不能排除此前请求迟到成功；SynapS3 不会自动接管或清理这类迟到服务。
+尚无已知服务的副本在确认后停止为被替换提供方继续创建，并准备所选提供方。新服务就绪前，原副本保留槽位。需要该副本的新上传会等待设置完成，交接后继续执行。所需内容从其他副本或缓存恢复，两者都没有的内容需要处理。被取代的请求迟到成功时，可能留下未使用的数据集并产生创建费用。SynapS3 不会自动接管或清理这类迟到服务。
 
 首次确认成功返回 `201 Created` 和替换记录；精确重放返回 `200 OK`。`GET /api/v1/buckets/{name}` 在 `replacements` 中返回该存储桶最近的替换记录，最新的在前，最多 50 条。
 
@@ -237,7 +237,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `completed` | 所需内容可从新提供方读取，存在的旧服务也已终止。 |
 | `superseded` | 更晚的一次确认取代了本次请求。 |
 
-退役停止时还会返回 `retirement_attention` 和错误；恢复安全时，还会提供当前绑定的 `retry_task_id`，包括已被替代但仍需退役未使用目标的替换记录。其他情况下，`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 和 `target_rejected` 都要求改选提供方，重试接口会返回冲突并说明该操作。`retryable` 表示已有替换是否可以恢复。交接前应从原副本改选提供方。可恢复的创建失败会在替换的预算内重试；替换停止后，查看错误并使用 **Retry**。已结束的创建不会因重试替换而重新执行。
+退役停止时还会返回 `retirement_attention` 和错误；恢复安全时，还会提供当前绑定的 `retry_task_id`，包括已被替代但仍需退役未使用目标的替换记录。其他情况下，`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 要求改选提供方。`target_rejected` 本身不决定重试资格，应按 `retryable` 和返回的提示处理。目标创建任务 Failed 后不会自动重新启动。交接前，可从 **Tasks** 使用可用的 **Retry** 继续使用所选提供方，或从原来源副本改选提供方。
 
 `items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
 
@@ -289,7 +289,7 @@ Provenance 副本和替换详情提供 `retryable`、`retry_task_id`，使用该
 
 `POST /api/v1/tasks/{id}/retry` 无需请求体，返回 `202 {"task_id":456}`。自动重试留在原轮次；手动 Retry 创建后继，获得新的策略和独立预算。重复请求返回同一后继。任务不存在返回 404，来源已过时或恢复不安全返回 409，并说明原因。临时事务竞争返回 503，可重试请求。
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表按已保存的结果计算重试资格；详情检查当前恢复条件，并可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。批次需要处理的 Submit batch 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表和详情均检查当前恢复条件；详情还可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。批次需要处理的 Submit batch 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
 列表和统计默认使用 `scope=work`：Pending、Running 和未确认失败。`scope=history` 包含完成、取消、已确认和已被替代的执行轮次，也包含周期任务。`work` 的状态筛选支持 `pending`、`running`、`failed`；`history` 支持 `completed`、`cancelled`、`failed`。无效范围或不属于该范围的状态返回 400。确认将失败移入 `history`，保留 Failed 结果和 Retry 资格；历史永久保存。Tasks 页面把 `work` 显示为 Open，把 `history` 显示为 Closed。
 

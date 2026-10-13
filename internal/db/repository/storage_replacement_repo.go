@@ -541,28 +541,6 @@ func (r *BunStorageReplacementRepo) MarkFailed(
 		return fmt.Errorf("marking replacement failed: unknown reason: %w", ErrInvalidInput)
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		if reason != nil && *reason == storagereplacement.FailureReasonTargetRejected {
-			// Ready binding locks this same row before changing the target. A
-			// discarded failure settlement is retried by the engine as recovery.
-			row, err := lockReplacementByID(ctx, db, replacementID)
-			if err != nil {
-				return err
-			}
-			if row == nil {
-				return ErrNotFound
-			}
-			target, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
-			if err != nil {
-				return err
-			}
-			if target == nil || target.DataSetID != nil ||
-				(target.Status != model.StorageDataSetStatusPending && target.Status != model.StorageDataSetStatusCreating) {
-				return ErrConflict
-			}
-			if evidence, err := target.CreationRejectionEvidence(); err != nil || evidence == nil {
-				return ErrConflict
-			}
-		}
 		return transitionReplacement(ctx, db, replacementID,
 			[]storagereplacement.Status{
 				storagereplacement.StatusPreparingTarget,

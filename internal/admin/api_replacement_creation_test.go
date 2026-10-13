@@ -53,9 +53,9 @@ func rejectedReplacementAPISource(t *testing.T, f *replacementAPIFixture, ensure
 		t.Fatal(err)
 	}
 	identity := testutil.DefaultContextIdentity
-	evidence := model.DataSetCreationRejection{
-		Version: 1, StatusCode: 403, RejectedAt: time.Now().UTC().Add(-time.Minute), AbsenceCheckedAt: time.Now().UTC(),
-		ClientDataSetID: clientID, Payer: identity.Payer, ChainID: uint64(identity.ChainID), RecordKeeper: identity.RecordKeeper,
+	evidence := map[string]any{
+		"version": 1, "status_code": 403, "rejected_at": time.Now().UTC().Add(-time.Minute), "absence_checked_at": time.Now().UTC(),
+		"client_data_set_id": clientID, "payer": identity.Payer, "chain_id": uint64(identity.ChainID), "record_keeper": identity.RecordKeeper,
 	}
 	encoded, err := json.Marshal(evidence)
 	if err != nil {

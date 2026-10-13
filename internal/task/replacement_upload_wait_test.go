@@ -43,10 +43,9 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 				return &testutil.MockStorageTarget{ProviderIDValue: sdktypes.NewBigInt(202), DataSetIDValue: &id, ClientDataSetIDValue: sdktypes.NewBigInt(909)}, nil
 			}}})
 			ctx := t.Context()
-			row, target, coordinator, observed := seedRefusedReplacement(t, runtime)
+			row, target, coordinator, observed := seedFailedInitializationReplacement(t, runtime)
 			if stage == "failed replacement" {
-				reason := storagereplacement.FailureReasonTargetRejected
-				if err := runtime.repos.Replacements.MarkFailed(ctx, row.ID, &reason, storagereplacement.ProviderRejectedMessage); err != nil {
+				if err := runtime.repos.Replacements.MarkFailed(ctx, row.ID, nil, "Storage setup stopped"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -67,14 +66,16 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 			}
 			bindReady := func() error {
 				return runtime.repos.WithTx(ctx, func(repos *repository.Repositories) error {
-					if err := repos.Replacements.BindObservedService(ctx, observed); err != nil {
+					if err := repos.Contents.MarkDataSetReady(ctx, observed); err != nil {
 						return err
 					}
-					ready, err := repos.Contents.GetDataSetBindingByID(ctx, target.ID)
-					if err != nil {
+					if target.EnsureTaskID == nil {
+						return repository.ErrConflict
+					}
+					if err := repos.Contents.CompleteDataSetEnsureTask(ctx, target.ID, *target.EnsureTaskID); err != nil {
 						return err
 					}
-					return runtime.ready.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: ready.ID})
+					return runtime.ready.Notify(ctx, repos, storagepipeline.DataSetReady{BindingID: target.ID})
 				})
 			}
 			if stage == "before suspension settlement" {

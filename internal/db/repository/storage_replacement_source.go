@@ -114,46 +114,6 @@ func replaceableEarlierTargets(ctx context.Context, db bun.IDB, sourceDataSetID 
 	return targets, nil
 }
 
-func remoteReplacementTargetEligibility(ctx context.Context, db bun.IDB, binding *model.StorageDataSet) error {
-	if binding.EnsureTaskID != nil {
-		task, err := (&BunTaskRepo{db: db}).GetByID(ctx, *binding.EnsureTaskID)
-		if err != nil {
-			return err
-		}
-		if task == nil {
-			return ErrNotFound
-		}
-		if task.Status == model.TaskStatusPending || task.Status == model.TaskStatusRunning {
-			return storagereplacement.ErrSourceRunning
-		}
-	}
-	if binding.CreateTransactionID != nil || binding.CreateStatusURL != nil {
-		return &storagereplacement.SourceOutcomeError{Message: "Storage setup has a submitted transaction. Wait for its confirmation before replacing the provider."}
-	}
-	status := binding.Status
-	if status == model.StorageDataSetStatusFailed && binding.ClientDataSetID == nil {
-		status = model.StorageDataSetStatusPending
-	}
-	if (status != model.StorageDataSetStatusPending && status != model.StorageDataSetStatusCreating) || binding.DataSetID != nil {
-		return storagereplacement.ErrSourceOutcomeUnknown
-	}
-	evidence, err := binding.CreationRejectionEvidence()
-	if err != nil {
-		return &storagereplacement.SourceOutcomeError{Message: "Could not verify the recorded setup refusal. Check the setup task before replacing the provider."}
-	}
-	if binding.ClientDataSetID != nil && (binding.ClientDataSetID.IsZero() || evidence == nil) {
-		return storagereplacement.ErrSourceOutcomeUnknown
-	}
-	effects, err := dataSetHasExternalEffects(ctx, db, binding.ID)
-	if err != nil {
-		return err
-	}
-	if effects {
-		return &storagereplacement.SourceOutcomeError{Message: "This provider already received storage work. Check this replica's tasks and service status before replacing it."}
-	}
-	return nil
-}
-
 func failedInitializationOwner(ctx context.Context, db bun.IDB, binding *model.StorageDataSet) error {
 	if binding.Status == model.StorageDataSetStatusReady || binding.Status == model.StorageDataSetStatusRetired || binding.EnsureTaskID == nil {
 		return storagereplacement.ErrSourceOutcomeUnknown
@@ -180,10 +140,6 @@ func failedInitializationOwner(ctx context.Context, db bun.IDB, binding *model.S
 		return storagereplacement.ErrSourceOutcomeUnknown
 	}
 	return nil
-}
-
-func uncreatedDataSetEligibility(ctx context.Context, db bun.IDB, source *model.StorageDataSet) error {
-	return failedInitializationOwner(ctx, db, source)
 }
 
 func locallyEndedDataSet(source *model.StorageDataSet) bool {
