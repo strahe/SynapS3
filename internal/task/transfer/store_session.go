@@ -153,14 +153,19 @@ func (h *StoreHandler) storeBodyFailure(ctx context.Context, execution taskengin
 	return h.storeCacheFailure(execution, hasCheckpoint, err)
 }
 
-func (h *StoreHandler) executeStoreSession(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, target synapse.DataSetTarget, content *model.StorageContent, bucket *model.Bucket, checkpoint storeCheckpoint, prepared *storeBody) taskengine.Result {
+func (h *StoreHandler) executeStoreSession(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, target synapse.DataSetTarget, content *model.StorageContent, bucket *model.Bucket, checkpoint storeCheckpoint, hasCheckpoint bool, prepared *storeBody) taskengine.Result {
 	pieceCID, err := cid.Parse(checkpoint.IntendedPieceCID)
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
 	var progress *uploadProgressReporter
 	defer func() { progress.Close() }()
-	attempted, err := execution.WithCheckpointedEffect(ctx, "store:"+checkpoint.IntendedPieceCID, checkpoint, nil, func(ctx context.Context) error {
+	previousObservationStartedAt := checkpoint.ObservationStartedAt
+	candidate := checkpoint
+	candidate.ObservationStartedAt = time.Time{}
+	requestStarted := false
+	attempted, err := execution.WithCheckpointedEffect(ctx, "store:"+checkpoint.IntendedPieceCID, candidate, nil, func(ctx context.Context) error {
+		checkpoint = candidate
 		if checkpoint.Stage == storeStageExpired {
 			checkpoint.SessionID, checkpoint.Stage = "", storeStageCreate
 			checkpoint.ProviderServiceURL = target.ServiceURL()
@@ -170,6 +175,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 				return err
 			}
+			requestStarted = true
 			id, err := target.CreateStoreSession(ctx)
 			if err != nil {
 				return err
@@ -186,6 +192,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 				return err
 			}
+			requestStarted = true
 			err := target.FinalizeStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, pieceCID)
 			if err == nil {
 				return h.storePublished(ctx, execution, &checkpoint)
@@ -225,6 +232,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 			progress = h.newIngressProgressReporter(ctx, execution.ID(), input.Generation, copyRow.ID, checkpoint.IngressAttempt, content, bucket)
 			options.OnProgress = progress.OnProgress
 		}
+		requestStarted = true
 		stored, err := target.UploadStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, body.storeContextReader, options)
 		if errors.Is(err, synapse.ErrStoreSessionMissing) {
 			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID)
@@ -243,6 +251,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 			return err
 		}
+		requestStarted = true
 		err = target.FinalizeStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, pieceCID)
 		if errors.Is(err, synapse.ErrStoreSessionMissing) {
 			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID)
@@ -262,40 +271,68 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 		if errors.Is(err, repository.ErrTaskOperationUnresolved) || errors.Is(err, taskengine.ErrEffectForbidden) {
 			return taskengine.Fail(err, "store_checkpoint_conflict", nil)
 		}
-		if copyRow.IngressStoreAttempt > 0 && checkpoint.SessionID == "" {
+		if !hasCheckpoint && copyRow.IngressStoreAttempt > 0 {
 			return taskengine.Fail(err, "store_checkpoint_write_failed", nil)
 		}
 		return retryTask(err, "store_checkpoint_write_failed")
 	}
+	if !requestStarted {
+		checkpoint.ObservationStartedAt = previousObservationStartedAt
+	}
 	if errors.Is(err, errStoreReady) {
 		return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
 	}
-	if err == nil || errors.Is(err, errStoreBusy) {
+	if err == nil {
+		return h.recoverStore(ctx, execution, input, copyRow, target, checkpoint)
+	}
+	if errors.Is(err, errStoreBusy) {
 		return h.waitForStoreStatus(ctx, execution, checkpoint, synapse.ParkedPieceProcessing, nil)
 	}
+	settlement, encodeErr := storeCheckpointSettlement(execution, checkpoint)
+	if encodeErr != nil {
+		return taskengine.Fail(encodeErr, "invalid_checkpoint", nil)
+	}
 	if errors.Is(err, errStoreIdentity) {
-		return taskengine.Fail(err, "store_identity_mismatch", nil)
+		return taskengine.Fail(err, "store_identity_mismatch", settlement)
 	}
 	if errors.Is(err, errStoreResult) {
-		return taskengine.Fail(err, "store_result_invalid", nil)
+		return taskengine.Fail(err, "store_result_invalid", settlement)
 	}
 	if os.IsNotExist(err) {
 		return h.storeBodyFailure(ctx, execution, input, copyRow, true, err)
 	}
 	var httpErr *pdp.HTTPError
 	if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusBadRequest || httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden || httpErr.StatusCode == http.StatusRequestEntityTooLarge || httpErr.StatusCode == http.StatusUnprocessableEntity) {
-		return taskengine.Fail(synapse.SummarizedError(err), "store_request_rejected", nil)
+		return taskengine.Fail(synapse.SummarizedError(err), "store_request_rejected", settlement)
 	}
-	if checkpoint.ObservationStartedAt.IsZero() {
+	if !requestStarted {
+		return retryStoreCheckpoint(execution, checkpoint, err, "store_checkpoint_write_failed")
+	}
+	if checkpoint.Stage != storeStageExpired && checkpoint.ObservationStartedAt.IsZero() {
 		checkpoint.ObservationStartedAt = time.Now().UTC()
 	}
+	return retryStoreCheckpoint(execution, checkpoint, err, "provider_confirmation")
+}
+
+func storeCheckpointSettlement(execution taskengine.Execution, checkpoint storeCheckpoint) (taskengine.Settlement, error) {
 	encoded, encodeErr := json.Marshal(checkpoint)
+	if encodeErr != nil {
+		return nil, encodeErr
+	}
+	return func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), encoded)
+	}, nil
+}
+
+func retryStoreCheckpoint(execution taskengine.Execution, checkpoint storeCheckpoint, err error, reason string) taskengine.Result {
+	settlement, encodeErr := storeCheckpointSettlement(execution, checkpoint)
 	if encodeErr != nil {
 		return taskengine.Fail(encodeErr, "invalid_checkpoint", nil)
 	}
-	return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), encoded)
-	})
+	if errors.Is(err, repository.ErrTaskIdentityContended) || errors.Is(err, repository.ErrRepositoryContended) {
+		return taskengine.Wait(model.TaskResumeModeRecover, "database_contention", "Waiting to continue", settlement)
+	}
+	return taskengine.RetryInMode(synapse.SummarizedError(err), reason, model.TaskResumeModeRecover, settlement)
 }
 
 func (h *StoreHandler) storePublished(ctx context.Context, execution taskengine.Execution, checkpoint *storeCheckpoint) error {

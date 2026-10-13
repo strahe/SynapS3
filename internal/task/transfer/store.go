@@ -22,7 +22,7 @@ func (h *StoreHandler) storeHandler() *taskengine.FuncHandler {
 	definition.Policy = taskengine.ExecutionPolicy{
 		MaxAttempts:       10,
 		Backoff:           taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2},
-		InvocationTimeout: time.Hour, ObservationWindow: storeAttentionAfter,
+		InvocationTimeout: 3 * time.Hour, ObservationWindow: storeAttentionAfter,
 	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.runStore(ctx, execution, true)
@@ -78,7 +78,7 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 		if state == synapse.ParkedPieceReady {
 			return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
 		}
-		return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, nil)
+		return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, true, nil)
 	}
 	if !hasCheckpoint && copyRow.IngressStoreAttempt > 0 {
 		previous, err := h.CopyCoordinator.deps.Repositories.Tasks.PreviousStoreCheckpoints(ctx, copyRow.ID, execution.ID())
@@ -174,7 +174,7 @@ func (h *StoreHandler) storePiece(
 			return h.retryStoreNotStarted(execution, errors.New("storage provider is still processing the piece"))
 		}
 	}
-	return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, body)
+	return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, false, body)
 }
 
 func (h *StoreHandler) recoverStore(
@@ -199,7 +199,7 @@ func (h *StoreHandler) recoverStore(
 		return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
 	}
 	if findErr == nil && state == synapse.ParkedPieceMissing {
-		if !checkpoint.ObservationStartedAt.IsZero() && time.Since(checkpoint.ObservationStartedAt) >= execution.Policy().ObservationWindow {
+		if checkpoint.Stage != storeStageExpired && !checkpoint.ObservationStartedAt.IsZero() && time.Since(checkpoint.ObservationStartedAt) >= execution.Policy().ObservationWindow {
 			return taskengine.Fail(errors.New("upload session recovery remains unconfirmed"), "store_processing_timeout", nil)
 		}
 		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Storage transfer is ready to resume", nil)
@@ -241,14 +241,17 @@ func (h *StoreHandler) storePieceState(ctx context.Context, target synapse.DataS
 }
 
 func (h *StoreHandler) waitForStoreStatus(ctx context.Context, execution taskengine.Execution, checkpoint storeCheckpoint, state synapse.ParkedPieceState, checkErr error) taskengine.Result {
+	if checkpoint.Stage == storeStageExpired && checkErr != nil {
+		return retryStoreCheckpoint(execution, checkpoint, checkErr, "store_check_failed")
+	}
 	if checkpoint.ObservationStartedAt.IsZero() {
 		checkpoint.ObservationStartedAt = time.Now().UTC()
 		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-			return retryTask(err, "store_observation_failed")
+			return retryStoreCheckpoint(execution, checkpoint, err, "store_observation_failed")
 		}
 	}
 	if checkErr != nil {
-		return retryTask(checkErr, "store_check_failed")
+		return retryStoreCheckpoint(execution, checkpoint, checkErr, "store_check_failed")
 	}
 	window := execution.Policy().ObservationWindow
 	if window > 0 && time.Since(checkpoint.ObservationStartedAt) >= window {
