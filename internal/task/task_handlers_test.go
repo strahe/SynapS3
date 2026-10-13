@@ -1117,11 +1117,8 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 				!handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 0 {
 				t.Fatalf("timed-out cleanup = %#v, delete calls = %d", failed, deleteCalls.Load())
 			}
-			if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
+			if failed.LastError == nil || *failed.LastError != "Could not confirm remote removal. Retry may submit another paid request." {
 				t.Fatalf("timed-out cleanup details = %v", failed.LastError)
-			}
-			if !strings.Contains(*failed.LastError, "Retry may submit another paid request") {
-				t.Fatalf("timed-out cleanup omits the elapsed operation observation: %q", *failed.LastError)
 			}
 			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
 				t.Fatalf("reload cleanup copy: %v", err)
@@ -4368,6 +4365,10 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 
 // Reopening failed child work spends the coordinator budget and preserves its source history.
 func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T) {
+	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", 128)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name              string
 		reason            string
@@ -4375,7 +4376,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 		wantFailed        bool
 		wantFenceReleased bool
 	}{
-		{name: "retryable", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
+		{name: "retryable", reason: "store_outcome_unknown", checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://target.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, pieceInfo.CIDv2.String())},
 		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
 	}
 	for _, tt := range tests {
@@ -4392,7 +4393,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				t.Fatalf("create bucket: %v", err)
 			}
 			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-				BucketID: bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
+				BucketID: bucket.ID, ContentSize: int64(pieceInfo.RawSize), Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
 			})
 			if err != nil {
 				t.Fatalf("ensure content: %v", err)
@@ -4423,7 +4424,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 			}
 			pieceID := id(4)
 			testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
-				ContentID: content.ID, CopyIndex: 0, PieceCID: testPieceCID(t, bucket.Name).String(),
+				ContentID: content.ID, CopyIndex: 0, PieceCID: pieceInfo.CIDv2.String(),
 				PieceID: &pieceID, RetrievalURL: "https://source.example/piece",
 			})
 			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
@@ -4529,13 +4530,17 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 
 // Activation recovers failed source writes through a separately budgeted child round.
 func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
+	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", 128)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name       string
 		reason     string
 		checkpoint string
 		wantFailed bool
 	}{
-		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
+		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://source.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, pieceInfo.CIDv2.String())},
 		{name: "engine failure", reason: "handler_panic"},
 		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
 	}
@@ -4553,7 +4558,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				t.Fatalf("create bucket: %v", err)
 			}
 			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-				BucketID: bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
+				BucketID: bucket.ID, ContentSize: int64(pieceInfo.RawSize), Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
 			})
 			if err != nil {
 				t.Fatalf("ensure content: %v", err)

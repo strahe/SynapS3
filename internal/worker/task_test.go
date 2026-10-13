@@ -747,14 +747,47 @@ func TestCodecInvalidCanonicalJSONFailsClosed(t *testing.T) {
 
 func TestUnexpectedClaimPanicForcesRecoveryWithoutKillingWorker(t *testing.T) {
 	limit := 5
+	config := EngineConfig{Concurrency: 1, PollInterval: 100 * time.Millisecond, LeaseDuration: 5 * time.Second}
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
 		execute: func(context.Context, Execution) Result {
 			return Retry(panicError{}, "formatting_failed", nil)
 		},
-	}, nil)
+	}, &config)
+	shortener := &delayedShortenRepository{TaskRepository: harness.repos.Tasks}
+	controlled := &controlledShortenRepository{TaskRepository: shortener}
+	controlled.fail.Store(true)
+	harness.repos.Tasks = controlled
 	row := enqueueTestTask(t, harness, "claim-panic")
 	harness.engine.executeClaimSafely(t.Context(), claimTestTask(t, harness))
+	controlled.fail.Store(false)
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	done := make(chan struct{})
+	go func() {
+		harness.engine.runRecoveryQueue(ctx)
+		close(done)
+	}()
+	stopRecovery := func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("panic recovery queue did not stop")
+		}
+	}
+	t.Cleanup(stopRecovery)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !shortener.shortened.Load() {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("panic recovery did not shorten the task lease")
+		}
+	}
+	stopRecovery()
+
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
 	if err != nil || stored.Status != model.TaskStatusRunning || stored.ResumeMode != model.TaskResumeModeRecover || stored.LeaseUntil == nil {
 		t.Fatalf("task after unexpected panic = %#v, err=%v", stored, err)
