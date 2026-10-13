@@ -1500,7 +1500,7 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending
+		return limited.claims.Load() == 1 && task.ClaimGeneration == 1 && task.Status == model.TaskStatusPending
 	})
 	if deleteCalls.Load() != 0 {
 		t.Fatalf("old unrecorded retry sent %d duplicate requests", deleteCalls.Load())
