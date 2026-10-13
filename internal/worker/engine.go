@@ -569,11 +569,14 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 	case resultWait:
 		transition.Status = model.TaskStatusPending
 		transition.ResumeMode = result.resumeMode
-		transition.AvailableAt = now.Add(e.config.PollInterval)
+		definition, _ := e.registry.Definition(claimed.Type)
+		interval := e.config.PollInterval
 		if result.observationWait {
-			definition, _ := e.registry.Definition(claimed.Type)
-			transition.AvailableAt = now.Add(definition.Policy.ObservationInterval)
+			interval = definition.Policy.ObservationInterval
+		} else if definition.Policy.WaitInterval > 0 {
+			interval = definition.Policy.WaitInterval
 		}
+		transition.AvailableAt = now.Add(interval)
 		if result.waitUntil != nil {
 			transition.AvailableAt = *result.waitUntil
 			if transition.AvailableAt.Before(now) {

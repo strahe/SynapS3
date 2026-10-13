@@ -87,50 +87,66 @@ func waitAdmissionTask(t *testing.T, harness taskHarness, id int64, predicate fu
 }
 
 func TestEngineTypeConcurrencyPreservesQueueAndFairness(t *testing.T) {
-	definition := testDefinition(nil, true)
-	definition.MaxConcurrency = 1
-	other := testDefinition(nil, true)
-	other.Type = "other_operation"
-	entered := make(chan Execution, 8)
-	advance := make(chan struct{})
-	run := func(ctx context.Context, execution Execution) Result {
-		entered <- execution
-		select {
-		case <-advance:
-		case <-ctx.Done():
-		}
-		return Complete("Done", nil)
+	for _, limit := range []int{1, 2} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			definition := testDefinition(nil, true)
+			definition.MaxConcurrency = limit
+			other := testDefinition(nil, true)
+			other.Type = "other_operation"
+			entered := make(chan Execution, 8)
+			advance := make(chan struct{})
+			run := func(ctx context.Context, execution Execution) Result {
+				entered <- execution
+				select {
+				case <-advance:
+				case <-ctx.Done():
+				}
+				return Complete("Done", nil)
+			}
+			h := newTaskHarness(t, scriptedHandler{definition: definition, execute: run, recover: run},
+				&EngineConfig{Concurrency: limit + 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second},
+				scriptedHandler{definition: other})
+			expected := make(map[int64]model.TaskResumeMode, limit)
+			for i := range limit {
+				holder := enqueueTestTask(t, h, fmt.Sprintf("holder-%d", i))
+				mode := model.TaskResumeModeExecute
+				if i == 0 {
+					mode = model.TaskResumeModeRecover
+					if _, err := h.db.ExecContext(t.Context(), `UPDATE tasks SET resume_mode = 'recover' WHERE id = ?`, holder.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				expected[holder.ID] = mode
+			}
+			old := enqueueTestTask(t, h, "old")
+			startAdmissionEngine(t, h)
+			for range limit {
+				first := receiveAdmission(t, entered)
+				mode, exists := expected[first.ID()]
+				if !exists || first.Mode() != mode {
+					t.Fatalf("initial invocation = id:%d mode:%s, expected=%v", first.ID(), first.Mode(), expected)
+				}
+				delete(expected, first.ID())
+			}
+			for i := range 4 {
+				enqueueTestTask(t, h, fmt.Sprintf("new-%d", i))
+				plain := enqueueAdmissionTask(t, h, other.Type, fmt.Sprintf("plain-%d", i))
+				waitAdmissionTask(t, h, plain.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+				waiting, err := h.repos.Tasks.GetByID(t.Context(), old.ID)
+				if err != nil || waiting.Status != model.TaskStatusPending || waiting.ClaimGeneration != 0 ||
+					!waiting.AvailableAt.Equal(old.AvailableAt) || waiting.WaitReason != nil || waiting.RetryCount != 0 {
+					t.Fatalf("type limit changed the queued task: %#v err=%v", waiting, err)
+				}
+			}
+			advance <- struct{}{}
+			next := receiveAdmission(t, entered)
+			if next.ID() != old.ID || next.Mode() != model.TaskResumeModeExecute {
+				t.Fatalf("new work overtook old task: id:%d mode:%s, want %d", next.ID(), next.Mode(), old.ID)
+			}
+			close(advance)
+			waitAdmissionTask(t, h, old.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
+		})
 	}
-	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: run, recover: run},
-		&EngineConfig{Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second},
-		scriptedHandler{definition: other})
-	holder := enqueueTestTask(t, h, "holder")
-	old := enqueueTestTask(t, h, "old")
-	if _, err := h.db.ExecContext(t.Context(), `UPDATE tasks SET resume_mode = 'recover' WHERE id = ?`, holder.ID); err != nil {
-		t.Fatal(err)
-	}
-	startAdmissionEngine(t, h)
-	first := receiveAdmission(t, entered)
-	if first.ID() != holder.ID || first.Mode() != model.TaskResumeModeRecover {
-		t.Fatalf("first invocation = id:%d mode:%s", first.ID(), first.Mode())
-	}
-	for i := range 4 {
-		enqueueTestTask(t, h, fmt.Sprintf("new-%d", i))
-		plain := enqueueAdmissionTask(t, h, other.Type, fmt.Sprintf("plain-%d", i))
-		waitAdmissionTask(t, h, plain.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
-		waiting, err := h.repos.Tasks.GetByID(t.Context(), old.ID)
-		if err != nil || waiting.Status != model.TaskStatusPending || waiting.ClaimGeneration != 0 ||
-			!waiting.AvailableAt.Equal(old.AvailableAt) || waiting.WaitReason != nil || waiting.RetryCount != 0 {
-			t.Fatalf("type limit changed the queued task: %#v err=%v", waiting, err)
-		}
-	}
-	advance <- struct{}{}
-	next := receiveAdmission(t, entered)
-	if next.ID() != old.ID || next.Mode() != model.TaskResumeModeExecute {
-		t.Fatalf("new work overtook old task: id:%d mode:%s, want %d", next.ID(), next.Mode(), old.ID)
-	}
-	advance <- struct{}{}
-	waitAdmissionTask(t, h, old.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
 }
 
 type observedClaimRepository struct {

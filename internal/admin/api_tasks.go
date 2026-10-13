@@ -524,6 +524,9 @@ func toTaskPolicyView(policy taskengine.ExecutionPolicy) *taskPolicyView {
 	if policy.ObservationInterval > 0 {
 		view.ObservationInterval = policy.ObservationInterval.String()
 	}
+	if policy.WaitInterval > 0 {
+		view.WaitInterval = policy.WaitInterval.String()
+	}
 	if policy.ResendBackoff != nil {
 		b := policy.ResendBackoff
 		view.ResendBackoff = &taskBackoffView{InitialDelay: b.InitialDelay.String(), MaximumDelay: b.MaximumDelay.String(), Multiplier: b.Multiplier, Jitter: b.Jitter}
@@ -541,6 +544,7 @@ type taskPolicyView struct {
 	InvocationTimeout   string           `json:"invocation_timeout"`
 	ObservationWindow   string           `json:"observation_window"`
 	ObservationInterval string           `json:"observation_interval,omitempty"`
+	WaitInterval        string           `json:"wait_interval,omitempty"`
 }
 
 func taskPageParameters(w http.ResponseWriter, r *http.Request) (int64, int, bool) {

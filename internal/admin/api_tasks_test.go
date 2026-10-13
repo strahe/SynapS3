@@ -216,6 +216,7 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	}
 	f.server.WithTaskService(newAdminTestTaskService(t, f.repos, func(definition *taskengine.Definition) {
 		definition.Policy.MaxAttempts = 3
+		definition.Policy.WaitInterval = 30 * time.Second
 		definition.Policy.ResendBackoff = &taskengine.BackoffPolicy{InitialDelay: time.Minute, MaximumDelay: 30 * time.Minute, Multiplier: 2}
 	}))
 
@@ -234,11 +235,28 @@ func TestAPITasksShowCurrentPolicyOnlyForActiveRounds(t *testing.T) {
 	if detail.Policy.ObservationInterval != "30s" {
 		t.Fatalf("observation policy missing: %s", rr.Body.String())
 	}
+	if detail.Policy.WaitInterval != "30s" {
+		t.Fatalf("ordinary wait policy missing: %s", rr.Body.String())
+	}
 	rr = f.request(http.MethodGet, "/api/v1/tasks", nil)
 	var page taskListResponse
 	decodeJSON(t, rr, &page)
 	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].RetryCount != 5 || page.Tasks[0].MaxAttempts == nil || *page.Tasks[0].MaxAttempts != 3 {
 		t.Fatalf("current list policy: %d %s", rr.Code, rr.Body.String())
+	}
+	f.server.WithTaskService(newAdminTestTaskService(t, f.repos, func(definition *taskengine.Definition) {
+		definition.Policy.MaxAttempts = 3
+	}))
+	rr = f.request(http.MethodGet, "/api/v1/tasks/"+strconv.FormatInt(row.ID, 10), nil)
+	var defaultPolicy struct {
+		Policy map[string]json.RawMessage `json:"policy"`
+	}
+	decodeJSON(t, rr, &defaultPolicy)
+	if rr.Code != http.StatusOK || defaultPolicy.Policy == nil {
+		t.Fatalf("default execution policy: %d %s", rr.Code, rr.Body.String())
+	}
+	if _, exists := defaultPolicy.Policy["wait_interval"]; exists {
+		t.Fatalf("inherited wait interval is exposed: %s", rr.Body.String())
 	}
 
 	for _, test := range []struct {
