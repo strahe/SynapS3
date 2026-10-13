@@ -584,7 +584,7 @@ func TestLRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess(t *testing.T) {
 	version := seedStoredCacheObject(t, runtime, 11, plannedAt)
 	// The gate protects one cache file, and that file belongs to the content.
 	cacheKey := version.CacheKey()
-	opened, err := runtime.gate.Open(cacheKey, func() (io.ReadCloser, *cache.ObjectInfo, error) {
+	opened, err := runtime.gate.Open(t.Context(), cacheKey, func() (io.ReadCloser, *cache.ObjectInfo, error) {
 		return io.NopCloser(strings.NewReader("cached")), &cache.ObjectInfo{Size: 11}, nil
 	})
 	if err != nil {
@@ -710,7 +710,7 @@ func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 	}}
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://terminal-store.example",
-		StoreFunc: func(_ context.Context, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(_ context.Context, _ string, _ string, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 			if options == nil || options.OnProgress == nil || !options.PieceCID.Defined() {
 				return nil, errors.New("store progress callback or intended piece identity is missing")
 			}
@@ -1117,11 +1117,8 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 				!handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 0 {
 				t.Fatalf("timed-out cleanup = %#v, delete calls = %d", failed, deleteCalls.Load())
 			}
-			if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
+			if failed.LastError == nil || *failed.LastError != "Could not confirm remote removal. Retry may submit another paid request." {
 				t.Fatalf("timed-out cleanup details = %v", failed.LastError)
-			}
-			if !strings.Contains(*failed.LastError, "after 24 hours") {
-				t.Fatalf("timed-out cleanup omits the elapsed operation observation: %q", *failed.LastError)
 			}
 			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
 				t.Fatalf("reload cleanup copy: %v", err)
@@ -1503,7 +1500,7 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending
+		return limited.claims.Load() == 1 && task.ClaimGeneration == 1 && task.Status == model.TaskStatusPending
 	})
 	if deleteCalls.Load() != 0 {
 		t.Fatalf("old unrecorded retry sent %d duplicate requests", deleteCalls.Load())
@@ -3293,7 +3290,7 @@ func TestStoreTasksReachAndRespectTypeConcurrency(t *testing.T) {
 				return &testutil.MockStorageTarget{
 					ProviderIDValue: opts.ProviderID.Copy(), DataSetIDValue: &targetDataSetID,
 					ClientDataSetIDValue: clientID, ServiceURLValue: "https://store-limit.example",
-					StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+					UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 						current := running.Add(1)
 						for {
 							observed := maximum.Load()
@@ -3368,7 +3365,7 @@ func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
 	}}
 	target := &testutil.MockStorageTarget{
 		ServiceURLValue: "https://store-admission.example",
-		StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+		UploadStoreSessionFunc: func(context.Context, string, string, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 			storeCalls.Add(1)
 			return nil, errors.New("unexpected Store call")
 		},
@@ -3450,8 +3447,9 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		return parkedState.Load().(synapse.ParkedPieceState), nil
 	})
 	target := &testutil.MockStorageTarget{
-		ServiceURLValue: "https://parked.example",
-		StoreFunc: func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+		ServiceURLValue:          "https://parked.example",
+		FinalizeStoreSessionFunc: func(context.Context, string, string, cid.Cid) error { return synapse.ErrStoreSessionIncomplete },
+		UploadStoreSessionFunc: func(_ context.Context, _ string, _ string, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 			storeCalls.Add(1)
 			storedBytes, readErr := io.ReadAll(reader)
 			if readErr != nil || string(storedBytes) != payload {
@@ -3503,9 +3501,13 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		t.Fatalf("interrupted store = %#v calls:%d, want checkpointed recovery after one Store", recovering, storeCalls.Load())
 	}
 	var checkpoint struct {
-		AttemptedAt        time.Time `json:"attempted_at"`
-		IntendedPieceCID   string    `json:"intended_piece_cid"`
-		ProviderServiceURL string    `json:"provider_service_url"`
+		AttemptedAt          time.Time `json:"attempted_at"`
+		IntendedPieceCID     string    `json:"intended_piece_cid"`
+		ProviderServiceURL   string    `json:"provider_service_url"`
+		IngressAttempt       int       `json:"ingress_attempt"`
+		SessionID            string    `json:"session_id"`
+		Stage                string    `json:"stage"`
+		ObservationStartedAt time.Time `json:"observation_started_at"`
 	}
 	if err := json.Unmarshal(recovering.Checkpoint, &checkpoint); err != nil {
 		t.Fatalf("decode store checkpoint: %v", err)
@@ -4363,6 +4365,10 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 
 // Reopening failed child work spends the coordinator budget and preserves its source history.
 func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T) {
+	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", 128)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name              string
 		reason            string
@@ -4370,7 +4376,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 		wantFailed        bool
 		wantFenceReleased bool
 	}{
-		{name: "retryable", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
+		{name: "retryable", reason: "store_outcome_unknown", checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://target.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, pieceInfo.CIDv2.String())},
 		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
 	}
 	for _, tt := range tests {
@@ -4387,7 +4393,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				t.Fatalf("create bucket: %v", err)
 			}
 			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-				BucketID: bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
+				BucketID: bucket.ID, ContentSize: int64(pieceInfo.RawSize), Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
 			})
 			if err != nil {
 				t.Fatalf("ensure content: %v", err)
@@ -4418,7 +4424,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 			}
 			pieceID := id(4)
 			testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
-				ContentID: content.ID, CopyIndex: 0, PieceCID: testPieceCID(t, bucket.Name).String(),
+				ContentID: content.ID, CopyIndex: 0, PieceCID: pieceInfo.CIDv2.String(),
 				PieceID: &pieceID, RetrievalURL: "https://source.example/piece",
 			})
 			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
@@ -4506,7 +4512,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_copy_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 6 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
@@ -4524,13 +4530,17 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 
 // Activation recovers failed source writes through a separately budgeted child round.
 func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
+	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", 128)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name       string
 		reason     string
 		checkpoint string
 		wantFailed bool
 	}{
-		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
+		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://source.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, pieceInfo.CIDv2.String())},
 		{name: "engine failure", reason: "handler_panic"},
 		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
 	}
@@ -4548,7 +4558,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				t.Fatalf("create bucket: %v", err)
 			}
 			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-				BucketID: bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
+				BucketID: bucket.ID, ContentSize: int64(pieceInfo.RawSize), Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
 			})
 			if err != nil {
 				t.Fatalf("ensure content: %v", err)
@@ -4641,7 +4651,7 @@ func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
 				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_source_write_failed"
 			})
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 6 {
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 {
 				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
 			}
 			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)

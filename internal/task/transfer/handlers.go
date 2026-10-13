@@ -140,11 +140,24 @@ func NewPullHandler(deps PullDependencies) (*PullHandler, error) {
 	return h, nil
 }
 
+type storeStage string
+
+const (
+	storeStageCreate   storeStage = "create"
+	storeStageUpload   storeStage = "upload"
+	storeStageFinalize storeStage = "finalize"
+	storeStageObserve  storeStage = "observe"
+	storeStageExpired  storeStage = "expired"
+)
+
 type storeCheckpoint struct {
-	AttemptedAt        time.Time `json:"attempted_at"`
-	IntendedPieceCID   string    `json:"intended_piece_cid"`
-	ProviderServiceURL string    `json:"provider_service_url"`
-	IngressAttempt     int       `json:"ingress_attempt,omitempty"`
+	AttemptedAt          time.Time  `json:"attempted_at"`
+	IntendedPieceCID     string     `json:"intended_piece_cid"`
+	ProviderServiceURL   string     `json:"provider_service_url"`
+	IngressAttempt       int        `json:"ingress_attempt,omitempty"`
+	SessionID            string     `json:"session_id,omitempty"`
+	Stage                storeStage `json:"stage"`
+	ObservationStartedAt time.Time  `json:"observation_started_at,omitempty"`
 }
 
 type pullCheckpoint struct {

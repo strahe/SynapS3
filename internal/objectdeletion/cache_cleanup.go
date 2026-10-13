@@ -51,7 +51,7 @@ func ReleaseContentCache(
 	cacheKey := model.ContentCacheKey(contentID)
 	outcome := CacheReleaseRetained
 	var releaseErr error
-	gate.GuardDeletion(cacheKey, func() {
+	if err := gate.GuardDeletion(ctx, cacheKey, func() {
 		var released bool
 		released, releaseErr = repository.ReleaseContentCacheIfUnreferenced(ctx, contentID, func() error {
 			if beforeDelete != nil {
@@ -63,7 +63,9 @@ func ReleaseContentCache(
 			tracker.Forget(contentID)
 			outcome = CacheReleaseReleased
 		}
-	})
+	}); err != nil {
+		return outcome, err
+	}
 	return outcome, releaseErr
 }
 
@@ -94,13 +96,15 @@ func DiscardOrphanedContent(
 	cacheKey := model.ContentCacheKey(contentID)
 	var discarded bool
 	var discardErr error
-	gate.GuardDeletion(cacheKey, func() {
+	if err := gate.GuardDeletion(ctx, cacheKey, func() {
 		discarded, discardErr = repository.DiscardOrphanedContent(ctx, contentID, func() error {
 			return c.Delete(ctx, bucketName, cacheKey)
 		})
 		if discardErr == nil && discarded {
 			tracker.Forget(contentID)
 		}
-	})
+	}); err != nil {
+		return false, err
+	}
 	return discarded, discardErr
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -55,6 +57,19 @@ func validateStoreCheckpoint(checkpoint storeCheckpoint, contentSize int64) erro
 	}
 	if contentSize < 0 || pieceInfo.RawSize != uint64(contentSize) {
 		return fmt.Errorf("checkpointed storage identity has size %d, expected %d", pieceInfo.RawSize, contentSize)
+	}
+	switch checkpoint.Stage {
+	case storeStageCreate:
+		if checkpoint.SessionID != "" {
+			return errors.New("uncreated upload session has an identity")
+		}
+	case storeStageUpload, storeStageFinalize, storeStageObserve, storeStageExpired:
+		id, err := uuid.Parse(checkpoint.SessionID)
+		if err != nil || id.String() != strings.ToLower(checkpoint.SessionID) {
+			return errors.New("invalid upload session identity")
+		}
+	default:
+		return errors.New("invalid upload session stage")
 	}
 	return nil
 }

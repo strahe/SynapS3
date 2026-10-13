@@ -45,9 +45,12 @@ func TestPostgresCopyRetrySerializesReplacement(t *testing.T) {
 			defer hold.Release()
 			gate := cacheaccess.NewGate()
 			runRetry := func() error {
-				release := gate.HoldRead(model.ContentCacheKey(copyRow.ContentID))
+				release, err := gate.HoldRead(t.Context(), model.ContentCacheKey(copyRow.ContentID))
+				if err != nil {
+					return err
+				}
 				defer release()
-				_, err := repos.Contents.RetryFailedCopy(postgresRaceContext(t.Context(), "retry"), copyRow.ID)
+				_, err = repos.Contents.RetryFailedCopy(postgresRaceContext(t.Context(), "retry"), copyRow.ID)
 				return err
 			}
 			runReplacement := func() error {
@@ -172,14 +175,16 @@ func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
 	evictionDone := make(chan error, 1)
 	go func() {
 		var evictionErr error
-		gate.GuardDeletion(key, func() {
+		if err := gate.GuardDeletion(ctx, key, func() {
 			evictionErr = repos.WithTx(postgresRaceContext(ctx, "eviction"), func(tx *repository.Repositories) error {
 				if _, err := tx.CacheEvictions.AuthorizeDeletion(postgresRaceContext(ctx, "eviction"), copyRow.ContentID, reservation.Generation, evict.ID, nil); err != nil {
 					return err
 				}
 				return tx.CacheEvictions.RecordDeletion(ctx, copyRow.ContentID, reservation.Generation, evict.ID)
 			})
-		})
+		}); err != nil {
+			evictionErr = err
+		}
 		evictionDone <- evictionErr
 	}()
 	select {
@@ -191,7 +196,11 @@ func TestPostgresCopyRetryWaitsForCacheEviction(t *testing.T) {
 	}
 	retryDone := make(chan error, 1)
 	go func() {
-		release := gate.HoldRead(key)
+		release, err := gate.HoldRead(ctx, key)
+		if err != nil {
+			retryDone <- err
+			return
+		}
 		defer release()
 		reopened, err := repos.Contents.RetryFailedCopy(ctx, copyRow.ID)
 		if err == nil && reopened.TransferMethod != model.StorageCopyTransferMethodPeerPull {

@@ -88,7 +88,10 @@ func copyRetryFailedIngressWithSuccessor(t *testing.T, db *bun.DB) {
 			if err != nil || !states[failed.ID].Available || states[failed.ID].NextMethod != method {
 				t.Fatalf("states=%+v err=%v", states, err)
 			}
-			release := cacheaccess.NewGate().HoldRead(model.ContentCacheKey(content.ID))
+			release, err := cacheaccess.NewGate().HoldRead(ctx, model.ContentCacheKey(content.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
 			defer release()
 			reopened, err := repos.Contents.RetryFailedCopy(ctx, failed.ID)
 			if err != nil {

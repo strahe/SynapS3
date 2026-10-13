@@ -518,6 +518,7 @@ type StorageContentRepository interface {
 	GetUnresolvedPullAttempt(ctx context.Context, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
 	CopyRetryStates(ctx context.Context, copyIDs []int64) (map[int64]CopyRetryState, error)
 	RetryFailedCopy(ctx context.Context, copyID int64) (*model.StorageCopy, error)
+	ResumeFailedStoreCopy(ctx context.Context, input ResumeFailedStoreCopyInput) error
 	GetLastAbandonedPullAttempt(ctx context.Context, contentID, storageDataSetID int64) (*storagepull.Attempt, error)
 	SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID, lastError string) error
 	AbandonMigrationPull(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error

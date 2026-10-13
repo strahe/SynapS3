@@ -308,6 +308,7 @@ func (r *Reader) streamAndRehydrate(
 			skipRehydration bool
 		)
 		err := r.cacheGate.Commit(
+			ctx,
 			cacheKey,
 			func() error {
 				persistedVersion, err := r.repos.Objects.GetVersionByID(ctx, versionID)
@@ -365,7 +366,7 @@ func (r *Reader) reconcileCacheMiss(ctx context.Context, bucketName string, vers
 		return
 	}
 	cacheKey := version.CacheKey()
-	r.cacheGate.GuardDeletion(cacheKey, func() {
+	_ = r.cacheGate.GuardDeletion(ctx, cacheKey, func() {
 		body, _, err := r.cache.Get(ctx, bucketName, cacheKey)
 		switch {
 		case err == nil && body != nil:
@@ -390,6 +391,7 @@ func (r *Reader) openCached(
 	version *model.ObjectVersion,
 ) (io.ReadCloser, error) {
 	opened, err := r.cacheGate.Open(
+		ctx,
 		version.CacheKey(),
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
 			return r.cache.Get(ctx, bucketName, version.CacheKey())

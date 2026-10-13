@@ -80,7 +80,7 @@ func (h *EnsureHandler) dataSetEnsureHandler() *taskengine.FuncHandler {
 		}),
 		Identity: taskengine.IdentityFromInput("storage_data_set", func(input storagepipeline.DataSetInput) (int64, int64) { return input.DataSetID, 0 }),
 		Policy: taskengine.ExecutionPolicy{
-			MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(),
+			MaxAttempts: 10, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2},
 			ObservationWindow: 30 * time.Minute,
 			ResendBackoff:     &taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 30 * time.Minute},
 		}, AllowRetry: true,

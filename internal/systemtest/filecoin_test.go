@@ -13,6 +13,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -47,9 +48,29 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	}
 
 	content := bytes.Repeat([]byte("synaps3-system-test"), 128)
-	stored, err := contexts[0].Store(ctx, bytes.NewReader(content), nil)
+	identity, err := piece.CalculateFromBytes(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID, err := contexts[0].CreateStoreSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := contexts[0].FinalizeStoreSession(ctx, contexts[0].ServiceURL(), sessionID, identity.CIDv2); !errors.Is(err, synapse.ErrStoreSessionIncomplete) {
+		t.Fatalf("FinalizeStoreSession before upload = %v", err)
+	}
+	stored, err := contexts[0].UploadStoreSession(ctx, contexts[0].ServiceURL(), sessionID, bytes.NewReader(content), &storage.StoreOptions{PieceCID: identity.CIDv2})
 	if err != nil {
 		t.Fatalf("Store: %v", err)
+	}
+	if state, err := filecoin.FindParkedPiece(ctx, contexts[0].ServiceURL(), stored.PieceCID); err != nil || state != synapse.ParkedPieceMissing {
+		t.Fatalf("piece before finalization = %s, %v", state, err)
+	}
+	if err := contexts[0].FinalizeStoreSession(ctx, contexts[0].ServiceURL(), sessionID, stored.PieceCID); err != nil {
+		t.Fatal(err)
+	}
+	if err := contexts[0].FinalizeStoreSession(ctx, contexts[0].ServiceURL(), sessionID, stored.PieceCID); !errors.Is(err, synapse.ErrStoreSessionMissing) {
+		t.Fatalf("FinalizeStoreSession after publication = %v", err)
 	}
 	for i, target := range contexts {
 		state, err := filecoin.FindParkedPiece(ctx, target.ServiceURL(), stored.PieceCID)
@@ -226,8 +247,20 @@ func TestMemoryFilecoinAuthorizationBindsTargetAndOrderedPieces(t *testing.T) {
 	}
 	var inputs []storage.PieceInput
 	for _, data := range []string{"first piece", "second piece"} {
-		stored, err := targets[0].Store(ctx, bytes.NewReader(bytes.Repeat([]byte(data), 128)), nil)
+		payload := bytes.Repeat([]byte(data), 128)
+		identity, err := piece.CalculateFromBytes(payload)
 		if err != nil {
+			t.Fatal(err)
+		}
+		sessionID, err := targets[0].CreateStoreSession(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := targets[0].UploadStoreSession(ctx, targets[0].ServiceURL(), sessionID, bytes.NewReader(payload), &storage.StoreOptions{PieceCID: identity.CIDv2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := targets[0].FinalizeStoreSession(ctx, targets[0].ServiceURL(), sessionID, stored.PieceCID); err != nil {
 			t.Fatal(err)
 		}
 		inputs = append(inputs, storage.PieceInput{PieceCID: stored.PieceCID})

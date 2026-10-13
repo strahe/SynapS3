@@ -335,7 +335,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	}
 	cacheKey := model.ContentCacheKey(content.ID)
 	cacheCommitted := false
-	err = b.cacheGate.Commit(cacheKey, func() error {
+	err = b.cacheGate.Commit(ctx, cacheKey, func() error {
 		if err := staged.CommitAs(bucketName, cacheKey); err != nil {
 			return fmt.Errorf("committing assembled cache file: %w", err)
 		}

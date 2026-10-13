@@ -92,7 +92,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	// The content gate stays held from the physical commit through the database
 	// transaction. A deletion therefore observes either the old state or the
 	// new file and its committed version/presence together.
-	err = b.cacheGate.Commit(cacheKey, func() error {
+	err = b.cacheGate.Commit(ctx, cacheKey, func() error {
 		if err := staged.CommitAs(bucketName, cacheKey); err != nil {
 			return fmt.Errorf("committing cache file: %w", err)
 		}
@@ -790,7 +790,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 	cacheKey := model.ContentCacheKey(content.ID)
 	var objectID int64
 	cacheCommitted := false
-	err = b.cacheGate.Commit(cacheKey, func() error {
+	err = b.cacheGate.Commit(ctx, cacheKey, func() error {
 		if err := staged.CommitAs(input.DestinationBucket.Name, cacheKey); err != nil {
 			return fmt.Errorf("committing copy cache: %w", err)
 		}

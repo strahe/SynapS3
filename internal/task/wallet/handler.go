@@ -58,7 +58,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		MaxConcurrency: 1,
 		Codec:          taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
 		Identity:       taskengine.IdentityFromInput("wallet_operation", func(input walletoperation.Input) (int64, int64) { return input.OperationID, 0 }),
-		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 10, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2}}, AllowRetry: true,
 		CanManualRetry: func(source *model.Task) bool {
 			return source != nil && (source.FailureReason == nil || (*source.FailureReason != "invalid_checkpoint" && *source.FailureReason != "wallet_broadcast_unknown" && *source.FailureReason != "wallet_transaction_reverted"))
 		},

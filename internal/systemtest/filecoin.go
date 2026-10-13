@@ -68,10 +68,12 @@ type MemoryFilecoin struct {
 	commitsByAuthorization map[string]storage.CommitSubmission
 	// clientNonces records, by add-pieces nonce, what FWSS would: the data set
 	// the pieces joined and the piece ID it assigns next.
-	clientNonces map[string]synapse.ClientNonceState
-	pieces       map[string]*memoryPiece
-	nextDataSet  map[string]uint64
-	nextPiece    uint64
+	clientNonces     map[string]synapse.ClientNonceState
+	pieces           map[string]*memoryPiece
+	storeSessions    map[string]*memoryStoreSession
+	nextStoreSession uint64
+	nextDataSet      map[string]uint64
+	nextPiece        uint64
 	// terminated records the epoch at which each data set's service ends, and
 	// epoch is the observed chain head. Tests advance the head to prove that
 	// retirement waits for the chain rather than for the call returning.
@@ -107,6 +109,8 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 		commitsByAuthorization: make(map[string]storage.CommitSubmission),
 		clientNonces:           make(map[string]synapse.ClientNonceState),
 		pieces:                 make(map[string]*memoryPiece),
+		storeSessions:          make(map[string]*memoryStoreSession),
+		nextStoreSession:       1,
 		nextDataSet:            make(map[string]uint64),
 		nextPiece:              1,
 		terminated:             make(map[string]int64),
@@ -368,6 +372,14 @@ type memoryDataSetTarget struct {
 	ref storage.DataSetRef
 }
 
+type memoryStoreSession struct {
+	provider string
+	claimed  bool
+	complete bool
+	pieceCID cid.Cid
+	content  []byte
+}
+
 func (c *memoryDataSetTarget) DataSetRef() (storage.DataSetRef, bool) { return c.ref, true }
 
 func (c *memoryDataSetTarget) DataSetID() *sdktypes.BigInt {
@@ -464,13 +476,48 @@ func (c *memoryProviderTarget) WaitForDataSetCreated(ctx context.Context, status
 	return &storage.CreateDataSetResult{TransactionID: txID, DataSet: ref}, nil
 }
 
-func (c *memoryDataSetTarget) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
+func (c *memoryDataSetTarget) CreateStoreSession(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if c.DataSetID() == nil {
+		return "", fmt.Errorf("%w: store requires a dataset", errInvalidFilecoinSequence)
+	}
+	c.filecoin.mu.Lock()
+	defer c.filecoin.mu.Unlock()
+	id := fmt.Sprintf("00000000-0000-4000-8000-%012x", c.filecoin.nextStoreSession)
+	c.filecoin.nextStoreSession++
+	c.filecoin.storeSessions[id] = &memoryStoreSession{provider: c.provider.String()}
+	return id, nil
+}
+
+func (c *memoryDataSetTarget) UploadStoreSession(ctx context.Context, serviceURL, sessionID string, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if c.DataSetID() == nil {
-		return nil, fmt.Errorf("%w: store requires a dataset", errInvalidFilecoinSequence)
+	if opts == nil || !opts.PieceCID.Defined() {
+		return nil, errors.New("memory filecoin: upload requires a piece identity")
 	}
+	c.filecoin.mu.Lock()
+	session := c.filecoin.storeSessions[sessionID]
+	if session == nil || session.provider != c.provider.String() || serviceURL != c.ServiceURL() {
+		c.filecoin.mu.Unlock()
+		return nil, synapse.ErrStoreSessionMissing
+	}
+	if session.claimed {
+		c.filecoin.mu.Unlock()
+		return nil, synapse.ErrStoreSessionClaimed
+	}
+	session.claimed = true
+	c.filecoin.mu.Unlock()
+	complete := false
+	defer func() {
+		if !complete {
+			c.filecoin.mu.Lock()
+			session.claimed = false
+			c.filecoin.mu.Unlock()
+		}
+	}()
 	content, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
@@ -480,28 +527,49 @@ func (c *memoryDataSetTarget) Store(ctx context.Context, reader io.Reader, opts 
 		return nil, fmt.Errorf("memory filecoin: calculating piece identity: %w", err)
 	}
 	pieceCID := pieceInfo.CIDv2
-	if opts != nil && opts.PieceCID.Defined() && !opts.PieceCID.Equals(pieceCID) {
+	if !opts.PieceCID.Equals(pieceCID) {
 		return nil, fmt.Errorf("memory filecoin: supplied CID does not match content")
 	}
-	if opts != nil && opts.OnProgress != nil {
+	if opts.OnProgress != nil {
 		opts.OnProgress(int64(len(content)))
 	}
 	c.filecoin.mu.Lock()
-	piece := c.filecoin.pieces[pieceCID.String()]
-	if piece == nil {
-		piece = &memoryPiece{
-			content:           bytes.Clone(content),
+	session.pieceCID, session.content, session.complete = pieceCID, bytes.Clone(content), true
+	c.filecoin.mu.Unlock()
+	complete = true
+	return &storage.StoreResult{PieceCID: pieceCID, Size: int64(len(content))}, nil
+}
+
+func (c *memoryDataSetTarget) FinalizeStoreSession(ctx context.Context, serviceURL, sessionID string, pieceCID cid.Cid) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.filecoin.mu.Lock()
+	defer c.filecoin.mu.Unlock()
+	session := c.filecoin.storeSessions[sessionID]
+	if session == nil || session.provider != c.provider.String() || serviceURL != c.ServiceURL() {
+		return synapse.ErrStoreSessionMissing
+	}
+	if !session.complete {
+		return synapse.ErrStoreSessionIncomplete
+	}
+	if !session.pieceCID.Equals(pieceCID) {
+		return errors.New("memory filecoin: finalized CID does not match uploaded content")
+	}
+	stored := c.filecoin.pieces[pieceCID.String()]
+	if stored == nil {
+		stored = &memoryPiece{
+			content:           bytes.Clone(session.content),
 			storedProviders:   make(map[string]struct{}),
 			committedDataSets: make(map[string]struct{}),
 		}
-		c.filecoin.pieces[pieceCID.String()] = piece
-	} else if !bytes.Equal(piece.content, content) {
-		c.filecoin.mu.Unlock()
-		return nil, fmt.Errorf("memory filecoin: CID content mismatch")
+		c.filecoin.pieces[pieceCID.String()] = stored
+	} else if !bytes.Equal(stored.content, session.content) {
+		return errors.New("memory filecoin: CID content mismatch")
 	}
-	piece.storedProviders[c.provider.String()] = struct{}{}
-	c.filecoin.mu.Unlock()
-	return &storage.StoreResult{PieceCID: pieceCID, Size: int64(len(content))}, nil
+	stored.storedProviders[c.provider.String()] = struct{}{}
+	delete(c.filecoin.storeSessions, sessionID)
+	return nil
 }
 
 func (c *memoryDataSetTarget) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {

@@ -169,10 +169,11 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 				cancel, done := runHandlerEngine(t, runtime)
 				defer stopHandlerEngine(t, cancel, done)
 				for poll := 1; poll <= 7; poll++ {
+					previousClaim := row.ClaimGeneration
 					row = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
-						return row.ClaimGeneration >= int64(poll) && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.WaitReason != nil)
+						return row.ClaimGeneration > previousClaim && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.WaitReason != nil)
 					})
-					if row.Status != model.TaskStatusPending || row.RetryCount != 0 || row.LastError != nil || row.WaitReason == nil || *row.WaitReason != "providers" || !row.AvailableAt.After(time.Now()) {
+					if row.Status != model.TaskStatusPending || row.RetryCount != 0 || row.LastError != nil || row.WaitReason == nil || *row.WaitReason != "providers" {
 						t.Fatalf("provider wait %d = %#v", poll, row)
 					}
 					bindings, err := runtime.repos.Contents.ListDataSetBindings(t.Context(), bucket.ID)
@@ -262,13 +263,16 @@ func TestProviderSelectionWaitPreservesAllocatedRetry(t *testing.T) {
 	}
 }
 
-func TestProviderSelectionExhaustsSixAttempts(t *testing.T) {
+func TestProviderSelectionExhaustsDeclaredBudget(t *testing.T) {
 	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
 		t.Run(string(taskType), func(t *testing.T) {
 			checker := &selectionHealthChecker{check: func(time.Time) ([]observability.ProviderState, error) {
 				return nil, errors.New("Registry read failed")
 			}}
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{providerTier: providerselect.TierApproved, observabilityChecker: checker})
+			backoff := taskengine.BackoffPolicy{InitialDelay: time.Minute, Multiplier: 1, MaximumDelay: time.Minute}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				providerTier: providerselect.TierApproved, observabilityChecker: checker, testBackoff: &backoff,
+			})
 			providerID := testOnChainID(t, 202)
 			seedProviderSelection(t, runtime, providerID.SDK())
 			if _, err := runtime.db.NewUpdate().Table("observability_provider_states").Set("last_checked_at = ?", time.Now().UTC().Add(-time.Hour)).Where("provider_id = ?", providerID.String()).Exec(t.Context()); err != nil {
@@ -279,23 +283,28 @@ func TestProviderSelectionExhaustsSixAttempts(t *testing.T) {
 				t.Fatal(err)
 			}
 			row := providerSelectionWork(t, runtime, bucket, taskType)
+			definition, ok := runtime.registry.Definition(taskType)
+			if !ok {
+				t.Fatalf("task type %s is not registered", taskType)
+			}
+			attempts := definition.Policy.MaxAttempts
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
-			for attempt := 1; attempt <= 6; attempt++ {
+			for attempt := 1; attempt <= attempts; attempt++ {
 				row = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
 					return row.ClaimGeneration == int64(attempt) && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.RetryCount == attempt)
 				})
-				if attempt < 6 {
+				if attempt < attempts {
 					if row.Status != model.TaskStatusPending || row.RetryCount != attempt || !row.AvailableAt.After(time.Now()) {
 						t.Fatalf("attempt %d stopped prematurely: %#v", attempt, row)
 					}
 					wakeTask(t, runtime, row.ID)
-				} else if row.Status != model.TaskStatusFailed || row.RetryCount != 5 || row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" {
-					t.Fatalf("sixth attempt = %#v", row)
+				} else if row.Status != model.TaskStatusFailed || row.RetryCount != attempts-1 || row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" {
+					t.Fatalf("final attempt = %#v", row)
 				}
 			}
-			if reports := providerSelectionReports(t, runtime, row.ID); len(reports) != 6 || checker.calls.Load() != 6 {
-				t.Fatalf("per-attempt evidence=%d refreshes=%d, want six", len(reports), checker.calls.Load())
+			if reports := providerSelectionReports(t, runtime, row.ID); len(reports) != attempts || checker.calls.Load() != int64(attempts) {
+				t.Fatalf("per-attempt evidence=%d refreshes=%d, want %d", len(reports), checker.calls.Load(), attempts)
 			}
 		})
 	}

@@ -132,11 +132,13 @@ func TestTrackerSweepDoesNotPersistForgottenCommitAfterDeletion(t *testing.T) {
 	releaseDelete := make(chan struct{})
 	deleteDone := make(chan struct{})
 	go func() {
-		gate.GuardDeletion(model.ContentCacheKey(3), func() {
+		if err := gate.GuardDeletion(t.Context(), model.ContentCacheKey(3), func() {
 			close(deleteStarted)
 			<-releaseDelete
 			tracker.Forget(3)
-		})
+		}); err != nil {
+			t.Errorf("GuardDeletion: %v", err)
+		}
 		close(deleteDone)
 	}()
 	waitForGateSignal(t, deleteStarted, time.Second, "deletion start")

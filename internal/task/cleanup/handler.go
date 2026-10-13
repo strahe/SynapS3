@@ -78,7 +78,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		Type: model.TaskTypeStorageCleanup, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
 		MaxConcurrency: 2,
 		Codec:          taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
-		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(), ObservationWindow: cleanupAttentionAfter}, AllowRetry: true,
+		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 10, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2}, ObservationWindow: cleanupAttentionAfter}, AllowRetry: true,
 		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) (int64, int64) {
 			return input.ContentID, input.Generation
 		}),
@@ -317,11 +317,8 @@ func waitForStorageCleanupOutcome(ctx context.Context, execution taskengine.Exec
 	}
 	window := execution.Policy().ObservationWindow
 	if window > 0 && time.Since(attemptedAt) >= window {
-		message := "removal unconfirmed after 24 hours. Recover may submit another paid request"
-		if attemptedAt.IsZero() {
-			message = "removal outcome cannot be confirmed. Recover may submit another paid request"
-		}
-		return taskengine.Fail(errors.New(message), "cleanup_outcome_unknown", func(ctx context.Context, repos *repository.Repositories) error {
+		message := "Could not confirm remote removal. Retry may submit another paid request."
+		return taskengine.Fail(fmt.Errorf("%s", message), "cleanup_outcome_unknown", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, message)
 		})
 	}

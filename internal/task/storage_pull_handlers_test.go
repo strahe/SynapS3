@@ -777,7 +777,7 @@ func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 						}
 						return pullStatusResult(request, storage.PullStatusComplete), nil
 					}
-					target.StoreFunc = func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+					target.UploadStoreSessionFunc = func(_ context.Context, _ string, _ string, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
 						data, err := io.ReadAll(reader)
 						if err != nil {
 							return nil, err
@@ -810,10 +810,6 @@ func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 						}
 						storeTask, err := runtime.repos.Tasks.GetByID(t.Context(), *restored.ActiveTaskID)
 						if err != nil {
-							t.Fatal(err)
-						}
-						storeTask = runOneStorageTask(t, runtime, storeTask, model.TaskStatusPending)
-						if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", storeTask.ID).Exec(t.Context()); err != nil {
 							t.Fatal(err)
 						}
 						runOneStorageTask(t, runtime, storeTask, model.TaskStatusCompleted)

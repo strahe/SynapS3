@@ -9,7 +9,6 @@ import (
 	"net/http"
 
 	"github.com/strahe/synapse-go/pdp"
-	"github.com/strahe/synapse-go/piece"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
@@ -329,32 +328,6 @@ func newDataSetTargetAdapter(dataSet *storage.DataSetContext, writable dataSetWr
 		return nil
 	}
 	return &dataSetTargetAdapter{storageTargetAdapter: storageTargetAdapter{inner: dataSet}, dataSet: dataSet, writable: writable}
-}
-
-func (c *dataSetTargetAdapter) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
-	if opts == nil || !opts.PieceCID.Defined() {
-		return nil, errors.New("upload submission requires a piece identity")
-	}
-	info, err := piece.ParseV2(opts.PieceCID)
-	if err != nil {
-		return nil, err
-	}
-	client := c.providerHTTP
-	if client == nil {
-		client = NewProviderHTTPClient(0, false)
-	}
-	provider, err := pdp.New(c.ServiceURL(), pdp.WithHTTPClient(client))
-	if err != nil {
-		return nil, err
-	}
-	result, err := provider.UploadPieceStreaming(ctx, reader, pdp.UploadPieceStreamingOptions{Size: int64(info.RawSize), PieceCID: opts.PieceCID, OnProgress: opts.OnProgress})
-	if err != nil {
-		return nil, NormalizeProviderOperationError(ctx, err)
-	}
-	if result == nil || !result.PieceCID.Equals(opts.PieceCID) || result.Size != int64(info.RawSize) {
-		return nil, errors.New("upload submission returned a mismatched piece")
-	}
-	return &storage.StoreResult{PieceCID: result.PieceCID, Size: result.Size}, nil
 }
 
 func (c *dataSetTargetAdapter) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {
