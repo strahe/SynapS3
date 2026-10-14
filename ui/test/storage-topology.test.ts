@@ -19,6 +19,7 @@ import {
   findDataSetTopologyNodeByChainID,
   findDataSetTopologyNodeByLocalID,
   findProviderTopologyNode,
+  findStorageTopologyDataSetObservation,
   findStorageTopologySelection,
   formatOptionalTopologyID,
   formatOptionalTopologyText,
@@ -39,8 +40,10 @@ import {
   topologySummaryLabel,
 } from '../src/lib/storage-topology.ts'
 import {
+  cleanStorageTopologySearch,
   clearStorageTopologySelectionSearch,
   nonNegativeStorageTopologySearchInteger,
+  storageTopologySearchBoolean,
 } from '../src/lib/storage-topology-search.ts'
 
 const allEntityFilterValue = storageTopologyAllFilterValue
@@ -356,6 +359,20 @@ test('storage topology detects partial loaded snapshots from page boundaries', (
   assert.equal(snapshotPageIsPartial({ items: [provider101], total: 2, offset: 0 }), true)
   assert.equal(snapshotPageIsPartial({ items: [provider101], total: 1, offset: 0 }), false)
   assert.equal(snapshotPageIsPartial({ items: [provider101], total: 2, offset: 1 }), false)
+  const page = {
+    items: [{ ...mediaDataSet, facts: { ...mediaDataSet.facts, local_status: 'retired' } }],
+    total: 1,
+    offset: 0,
+  }
+  const graph = buildStorageTopologyGraph([provider101], page.items, {
+    status: 'all',
+    provider: allEntityFilterValue,
+    bucket: allEntityFilterValue,
+    showRetired: false,
+  })
+  assert.equal(graph.dataSets.length, 0)
+  assert.equal(snapshotPageIsPartial(page), false)
+  assert.equal(snapshotPageIsPartial({ ...page, total: 2 }), true)
 })
 
 test('storage topology merges scoped data sets only when scoped snapshot is enabled', () => {
@@ -413,6 +430,19 @@ test('storage topology data set selection search keeps chain, local fallback, an
     selection_provider: '101',
     selection_bucket: 'research-data',
   })
+  assert.deepEqual(
+    storageTopologyDataSetSelectionSearch({
+      ...mediaDataSet,
+      facts: { ...mediaDataSet.facts, local_status: 'retired' },
+    }),
+    {
+      show_retired: true,
+      chain_data_set_id: '51001',
+      local_data_set_id: 11,
+      selection_provider: '101',
+      selection_bucket: 'media-prod',
+    }
+  )
 })
 
 test('storage topology bucket data set links keep local fallback and raw chain copy values', () => {
@@ -421,6 +451,7 @@ test('storage topology bucket data set links keep local fallback and raw chain c
       id: 11,
       provider_id: '101',
       data_set_id: '51001',
+      status: 'ready',
     }),
     {
       label: '51001',
@@ -433,6 +464,24 @@ test('storage topology bucket data set links keep local fallback and raw chain c
         selection_provider: '101',
         selection_bucket: 'media-prod',
       },
+    }
+  )
+
+  assert.deepEqual(
+    bucketStorageDataSetTopologyLinkModel('media-prod', {
+      id: 11,
+      provider_id: '101',
+      data_set_id: '51001',
+      status: 'retired',
+    }).search,
+    {
+      show_retired: true,
+      bucket: 'media-prod',
+      provider: '101',
+      chain_data_set_id: '51001',
+      local_data_set_id: 11,
+      selection_provider: '101',
+      selection_bucket: 'media-prod',
     }
   )
 
@@ -483,6 +532,7 @@ test('storage topology clears selection search without changing visible filters'
       status: 'degraded',
       provider: '101',
       bucket: 'media-prod',
+      show_retired: true,
       chain_data_set_id: '51001',
       local_data_set_id: 11,
       selection_provider: '101',
@@ -493,12 +543,28 @@ test('storage topology clears selection search without changing visible filters'
       status: 'degraded',
       provider: '101',
       bucket: 'media-prod',
+      show_retired: true,
       chain_data_set_id: undefined,
       local_data_set_id: undefined,
       selection_provider: undefined,
       selection_bucket: undefined,
     }
   )
+})
+
+test('storage topology parses and preserves explicit retired visibility in search', () => {
+  for (const value of [true, 'true']) {
+    assert.equal(storageTopologySearchBoolean(value), true)
+  }
+  for (const value of [false, 'false']) {
+    assert.equal(storageTopologySearchBoolean(value), false)
+  }
+  for (const value of [undefined, null, '', '1', 1, 'yes', {}, []]) {
+    assert.equal(storageTopologySearchBoolean(value), undefined)
+  }
+  assert.equal(cleanStorageTopologySearch({ show_retired: true }).show_retired, true)
+  assert.equal(cleanStorageTopologySearch({ show_retired: false }).show_retired, undefined)
+  assert.equal(cleanStorageTopologySearch({}).show_retired, undefined)
 })
 
 test('storage topology parses local data set search ids without treating blanks as zero', () => {
@@ -699,12 +765,67 @@ test('storage topology graph filters bucket and provider while retaining connect
   )
 })
 
-test('storage topology finds detail nodes by chain id first and local id fallback', () => {
-  const graph = buildStorageTopologyGraph(
-    [provider101, provider202, provider606],
-    [mediaDataSet, mediaReplicaDataSet, logsDataSet],
-    { status: 'all', provider: allEntityFilterValue, bucket: allEntityFilterValue }
+test('storage topology can hide retired relationships while retaining active and unfinished data sets', () => {
+  const dataSets = [
+    mediaDataSet,
+    { ...mediaReplicaDataSet, facts: { ...mediaReplicaDataSet.facts, local_status: 'draining' } },
+    { ...logsDataSet, facts: { ...logsDataSet.facts, local_status: 'failed' } },
+    {
+      ...mediaReplicaDataSet,
+      facts: {
+        ...mediaReplicaDataSet.facts,
+        local_data_set_id: 41,
+        provider_id: '606',
+        local_status: 'retired',
+      },
+    },
+    {
+      ...missingChainDataSet,
+      facts: {
+        ...missingChainDataSet.facts,
+        local_data_set_id: 42,
+        provider_id: '606',
+        local_status: 'retired',
+      },
+    },
+  ]
+  const providers = [provider101, provider202, provider606]
+  const filters = { status: 'all' as const, provider: allEntityFilterValue, bucket: allEntityFilterValue }
+  const fullGraph = buildStorageTopologyGraph(providers, dataSets, filters)
+  assert.equal(topologySummaryLabel(fullGraph), '3 buckets · 5 data sets · 3 providers')
+  assert.equal(fullGraph.buckets.find((node) => node.id === 'bucket:1')?.data.issueCount, 2)
+  assert.deepEqual(buildStorageTopologyGraph(providers, dataSets, { ...filters, showRetired: true }), fullGraph)
+
+  const graph = buildStorageTopologyGraph(providers, dataSets, { ...filters, showRetired: false })
+  assert.deepEqual(sortedIDs(graph.nodes), [
+    'bucket:1',
+    'bucket:2',
+    'data-set:11',
+    'data-set:12',
+    'data-set:21',
+    'provider:101',
+    'provider:202',
+  ])
+  assert.equal(graph.edges.length, 6)
+  assert.equal(
+    graph.edges.every(
+      (edge) =>
+        graph.nodes.some((node) => node.id === edge.source) && graph.nodes.some((node) => node.id === edge.target)
+    ),
+    true
   )
+  assert.equal(topologySummaryLabel(graph), '2 buckets · 3 data sets · 2 providers')
+  assert.equal(graph.buckets.find((node) => node.id === 'bucket:1')?.data.replicaCount, 2)
+  assert.equal(graph.buckets.find((node) => node.id === 'bucket:1')?.data.issueCount, 1)
+})
+
+test('storage topology finds detail nodes by chain id first and local id fallback', () => {
+  const dataSets = [mediaDataSet, mediaReplicaDataSet, logsDataSet]
+  const graph = buildStorageTopologyGraph([provider101, provider202, provider606], dataSets, {
+    status: 'all',
+    provider: allEntityFilterValue,
+    bucket: allEntityFilterValue,
+  })
 
   assert.equal(findProviderTopologyNode(graph, '202')?.id, 'provider:202')
   assert.equal(findProviderTopologyNode(graph, 'missing'), undefined)
@@ -728,6 +849,15 @@ test('storage topology finds detail nodes by chain id first and local id fallbac
     kind: 'provider',
   })
   assert.equal(findStorageTopologySelection(graph, { localDataSetID: 999 }), null)
+  assert.equal(
+    findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: '51002', localDataSetID: 11 }),
+    mediaReplicaDataSet
+  )
+  assert.equal(
+    findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: 'missing', localDataSetID: 11 }),
+    mediaDataSet
+  )
+  assert.equal(findStorageTopologyDataSetObservation(dataSets, { localDataSetID: 999 }), undefined)
 })
 
 test('storage topology selection lookup keeps local data set id zero as a valid fallback', () => {
@@ -750,6 +880,7 @@ test('storage topology selection lookup keeps local data set id zero as a valid 
     id: 'data-set:0',
     kind: 'data-set',
   })
+  assert.equal(findStorageTopologyDataSetObservation([zeroDataSet], { localDataSetID: 0 }), zeroDataSet)
 })
 
 test('storage topology chain data set lookup requires disambiguation when providers share a chain id', () => {
@@ -782,6 +913,35 @@ test('storage topology chain data set lookup requires disambiguation when provid
     id: 'data-set:12',
     kind: 'data-set',
   })
+  const dataSets = [mediaDataSet, duplicateChainDataSet]
+  assert.equal(findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: '51001' }), undefined)
+  assert.equal(
+    findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: '51001', providerID: '101' }),
+    mediaDataSet
+  )
+  assert.equal(
+    findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: '51001', providerID: '202' }),
+    duplicateChainDataSet
+  )
+  assert.equal(
+    findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: '51001', bucketName: 'missing-bucket' }),
+    undefined
+  )
+  const otherBucketDataSet = {
+    ...duplicateChainDataSet,
+    facts: { ...duplicateChainDataSet.facts, bucket_name: 'other-bucket' },
+  }
+  assert.equal(
+    findStorageTopologyDataSetObservation([mediaDataSet, otherBucketDataSet], {
+      chainDataSetID: '51001',
+      bucketName: 'other-bucket',
+    }),
+    otherBucketDataSet
+  )
+  assert.equal(
+    findStorageTopologyDataSetObservation(dataSets, { chainDataSetID: '51001', localDataSetID: 12 }),
+    duplicateChainDataSet
+  )
 })
 
 test('storage topology resolves stable selections against current observations', () => {

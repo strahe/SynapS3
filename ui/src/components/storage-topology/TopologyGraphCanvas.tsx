@@ -5,7 +5,7 @@ import {
   type ColorMode,
   Controls,
   type Edge,
-  type FitViewOptions,
+  getViewportForBounds,
   Handle,
   MarkerType,
   type Node,
@@ -14,7 +14,8 @@ import {
   PanOnScrollMode,
   Position,
   ReactFlow,
-  type ReactFlowInstance,
+  useReactFlow,
+  useStore,
 } from '@xyflow/react'
 import { Database, Gauge } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
@@ -49,6 +50,7 @@ type FlowNode = TopologyFlowNode | LaneFlowNode
 type FlowEdge = Edge<FlowEdgeData, 'smoothstep'>
 type TopologyFlowNodeProps = NodeProps<TopologyFlowNode>
 type LaneFlowNodeProps = NodeProps<LaneFlowNode>
+type TopologyFocusRequest = { key: string; nodeID: string }
 
 const graphNodeTypes = {
   bucket: BucketGraphNode,
@@ -57,24 +59,26 @@ const graphNodeTypes = {
   lane: LaneHeaderGraphNode,
 } as NodeTypes
 
-const fitViewOptions: FitViewOptions<FlowNode> = { padding: 0.04, minZoom: 0.12, maxZoom: 1.25 }
+const viewportPadding = 24
+const laneNodeIDs = ['lane:buckets', 'lane:data-sets', 'lane:providers']
 
 export default function TopologyGraphCanvas({
   graph,
   selection,
   onSelectionChange,
+  viewResetKey,
+  focusRequest,
+  onFocusHandled,
 }: {
   graph: StorageTopologyGraph
   selection: StorageTopologySelection | null
   onSelectionChange: (selection: StorageTopologySelection | null) => void
+  viewResetKey: string
+  focusRequest?: TopologyFocusRequest | null
+  onFocusHandled?: (key: string) => void
 }) {
   const colorMode = useReactFlowColorMode()
-  const containerRef = useRef<HTMLDivElement>(null)
-  const flowRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null)
   const hasNodes = graph.nodes.length > 0
-  // A different set of nodes, such as after a filter change, starts from a fresh fit;
-  // a refresh that keeps the same nodes keeps the operator's pan and zoom.
-  const layoutKey = useMemo(() => graph.nodes.map((node) => node.id).join('|'), [graph.nodes])
   const topologyNodes = useMemo<TopologyFlowNode[]>(
     () =>
       graph.nodes.map((node) => ({
@@ -124,23 +128,6 @@ export default function TopologyGraphCanvas({
     [graph.edges, selection]
   )
 
-  useEffect(() => {
-    const container = containerRef.current
-    if (!hasNodes || !container) return
-    let frame = 0
-    const observer = new ResizeObserver(() => {
-      cancelAnimationFrame(frame)
-      frame = requestAnimationFrame(() => {
-        void flowRef.current?.fitView(fitViewOptions)
-      })
-    })
-    observer.observe(container)
-    return () => {
-      cancelAnimationFrame(frame)
-      observer.disconnect()
-    }
-  }, [hasNodes])
-
   if (!hasNodes) {
     return (
       <div className="flex h-full min-h-0 items-center justify-center p-6">
@@ -151,17 +138,12 @@ export default function TopologyGraphCanvas({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div ref={containerRef} className="min-h-0 flex-1">
+      <div className="min-h-0 flex-1">
         <ReactFlow<FlowNode, FlowEdge>
-          key={layoutKey}
+          key={viewResetKey}
           nodes={flowNodes}
           edges={flowEdges}
           nodeTypes={graphNodeTypes}
-          onInit={(instance) => {
-            flowRef.current = instance
-          }}
-          fitView
-          fitViewOptions={fitViewOptions}
           minZoom={0.12}
           maxZoom={1.8}
           colorMode={colorMode}
@@ -194,12 +176,114 @@ export default function TopologyGraphCanvas({
           proOptions={{ hideAttribution: true }}
           className="bg-muted/10"
         >
+          <TopologyViewport focusRequest={focusRequest} onFocusHandled={onFocusHandled} />
           <Background color="var(--border)" gap={20} />
           <Controls showInteractive={false} />
         </ReactFlow>
       </div>
     </div>
   )
+}
+
+function TopologyViewport({
+  focusRequest,
+  onFocusHandled,
+}: {
+  focusRequest?: TopologyFocusRequest | null
+  onFocusHandled?: (key: string) => void
+}) {
+  const { getInternalNode, getNodesBounds, getViewport, setViewport, viewportInitialized } = useReactFlow<
+    FlowNode,
+    FlowEdge
+  >()
+  const nodesMeasured = useStore((state) => {
+    for (const node of state.nodeLookup.values()) {
+      if (!node.hidden && (!node.measured.width || !node.measured.height)) return false
+    }
+    return state.nodeLookup.size > 0
+  })
+  const width = useStore((state) => state.width)
+  const height = useStore((state) => state.height)
+  const initialization = useRef<Promise<boolean> | null>(null)
+  const handledFocusKey = useRef<string | null>(null)
+  const focusKey = focusRequest?.key
+  const focusNodeID = focusRequest?.nodeID
+
+  useEffect(() => {
+    if (!focusKey) handledFocusKey.current = null
+    if (!nodesMeasured || !viewportInitialized || width <= 0 || height <= 0) return
+
+    if (!initialization.current) {
+      const bounds = getNodesBounds(laneNodeIDs)
+      if (bounds.width <= 0) return
+      // A zero-height strip makes the initial scale depend only on the column widths.
+      const viewport = getViewportForBounds({ ...bounds, height: 0 }, width, height, 0.8, 1.25, {
+        x: `${viewportPadding}px`,
+        y: 0,
+      })
+      initialization.current = setViewport({
+        ...viewport,
+        x:
+          bounds.width * viewport.zoom > width - viewportPadding * 2
+            ? viewportPadding - bounds.x * viewport.zoom
+            : viewport.x,
+        y: viewportPadding - bounds.y * viewport.zoom,
+      })
+    }
+
+    let cancelled = false
+    const focusTarget = async () => {
+      const initialized = await initialization.current
+      if (!initialized || cancelled || !focusKey || !focusNodeID || handledFocusKey.current === focusKey) return
+      const node = getInternalNode(focusNodeID)
+      if (!node?.measured.width || !node.measured.height) return
+
+      const bounds = getNodesBounds([focusNodeID])
+      const viewport = getViewport()
+      const left = bounds.x * viewport.zoom + viewport.x
+      const top = bounds.y * viewport.zoom + viewport.y
+      const targetWidth = bounds.width * viewport.zoom
+      const targetHeight = bounds.height * viewport.zoom
+      let x = viewport.x
+      let y = viewport.y
+
+      if (targetWidth > width - viewportPadding * 2 || left < viewportPadding) {
+        x += viewportPadding - left
+      } else if (left + targetWidth > width - viewportPadding) {
+        x += width - viewportPadding - left - targetWidth
+      }
+      if (targetHeight > height - viewportPadding * 2 || top < viewportPadding) {
+        y += viewportPadding - top
+      } else if (top + targetHeight > height - viewportPadding) {
+        y += height - viewportPadding - top - targetHeight
+      }
+
+      if (x !== viewport.x || y !== viewport.y) {
+        const focused = await setViewport({ x, y, zoom: viewport.zoom })
+        if (!focused || cancelled) return
+      }
+      handledFocusKey.current = focusKey
+      onFocusHandled?.(focusKey)
+    }
+    void focusTarget()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    nodesMeasured,
+    viewportInitialized,
+    width,
+    height,
+    focusKey,
+    focusNodeID,
+    getInternalNode,
+    getNodesBounds,
+    getViewport,
+    setViewport,
+    onFocusHandled,
+  ])
+
+  return null
 }
 
 function BucketGraphNode({ data, selected }: TopologyFlowNodeProps) {
