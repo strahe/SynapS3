@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -404,6 +405,11 @@ func (s *Server) resolveReplacementProvider(ctx context.Context, bucket *model.B
 	}
 	selected, err := providerselect.Select(in, bucket.ProviderSelectionStrategy, 1, excluded, hasTrusted)
 	if err != nil {
+		if errors.Is(err, providerselect.ErrNoTrustedProvider) && slices.ContainsFunc(candidates, func(candidate replacementProviderCandidate) bool {
+			return candidate.Eligible && candidate.PreviouslyUsed && admission.Satisfied(hasTrusted, candidate.ProviderID)
+		}) {
+			err = errors.Join(err, errReplacementManualProviderAvailable)
+		}
 		return idtypes.OnChainID{}, admission, err
 	}
 	if len(selected) == 0 {
@@ -480,8 +486,9 @@ func (s *Server) replacementProviderCandidatesFor(
 }
 
 var (
-	errReplacementUnavailable   = errors.New("filecoin storage is unavailable")
-	errApprovalCheckUnavailable = errors.New("provider requirement check is unavailable")
+	errReplacementUnavailable             = errors.New("filecoin storage is unavailable")
+	errApprovalCheckUnavailable           = errors.New("provider requirement check is unavailable")
+	errReplacementManualProviderAvailable = errors.New("eligible replacement provider requires manual selection")
 )
 
 func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketName string) {
@@ -496,7 +503,11 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 		}
 		writeJSON(w, http.StatusConflict, map[string]string{"error": message, "code": code})
 	case errors.Is(err, providerselect.ErrNoTrustedProvider):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "Replacement must retain a provider that meets the configured requirement", "code": "required_provider_unavailable"})
+		message := "Replacement must retain a provider that meets the configured requirement"
+		if errors.Is(err, errReplacementManualProviderAvailable) {
+			message = "Could not choose an unused provider that meets the configured requirement. Choose a provider manually."
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": message, "code": "required_provider_unavailable"})
 	case errors.Is(err, providerselect.ErrCandidatesTemporarilyUnavailable):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "No provider is currently available for this replica. Refresh providers and try again.", "code": "no_eligible_provider"})
 	case errors.Is(err, errApprovalCheckUnavailable):

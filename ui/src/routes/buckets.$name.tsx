@@ -80,7 +80,7 @@ import {
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb'
 import { Button } from '@/components/ui/button'
-import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -2059,6 +2059,7 @@ function BucketStorageDataSets({
   const visibleDataSets = showRetired
     ? dataSets
     : dataSets.filter((dataSet) => dataSet.is_current || dataSet.status !== 'retired')
+  const hiddenRetiredCount = dataSets.length - visibleDataSets.length
 
   if (dataSets.length === 0) {
     return (
@@ -2102,6 +2103,12 @@ function BucketStorageDataSets({
             Check now
           </Button>
         </CardAction>
+        {hiddenRetiredCount > 0 && (
+          <CardDescription className="basis-full">
+            Storage health includes {formatNumber(hiddenRetiredCount)} hidden retired data{' '}
+            {hiddenRetiredCount === 1 ? 'set' : 'sets'}.
+          </CardDescription>
+        )}
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {refreshError && (

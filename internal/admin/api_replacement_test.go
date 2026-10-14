@@ -273,23 +273,27 @@ func TestReplacementAutomaticSkipsRevokedApproval(t *testing.T) {
 
 func TestReplacementSelectionRespectsBucketHistory(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		mode           string
-		copyIndex      int
-		otherBucket    bool
-		onlyHistory    bool
-		unretired      bool
-		missingHistory bool
-		tier           providerselect.Tier
-		wantProvider   string
-		wantCode       string
+		name             string
+		mode             string
+		copyIndex        int
+		otherBucket      bool
+		onlyHistory      bool
+		unretired        bool
+		missingHistory   bool
+		unhealthyHistory bool
+		wantManualHint   bool
+		tier             providerselect.Tier
+		wantProvider     string
+		wantCode         string
 	}{
 		{name: "automatic skips same replica history", mode: "automatic", tier: providerselect.TierApproved, wantProvider: "303"},
-		{name: "automatic skips failed other replica history", mode: "automatic", copyIndex: 2, tier: providerselect.TierApproved, wantProvider: "303"},
+		{name: "automatic skips retired history on another replica slot", mode: "automatic", copyIndex: 2, tier: providerselect.TierApproved, wantProvider: "303"},
 		{name: "automatic accepts another bucket provider", mode: "automatic", otherBucket: true, onlyHistory: true, tier: providerselect.TierApproved, wantProvider: "202"},
 		{name: "automatic history exhausted", mode: "automatic", onlyHistory: true, tier: providerselect.TierNone, wantCode: storagereplacement.CodeNoEligibleProvider},
-		{name: "automatic required tier exhausted", mode: "automatic", onlyHistory: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "automatic required tier exhausted", mode: "automatic", onlyHistory: true, wantManualHint: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
 		{name: "automatic required history without observation", mode: "automatic", missingHistory: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "automatic required history unhealthy", mode: "automatic", onlyHistory: true, unhealthyHistory: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "automatic required history still in use", mode: "automatic", onlyHistory: true, unretired: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
 		{name: "manual permits retired history", mode: "manual", onlyHistory: true, tier: providerselect.TierApproved, wantProvider: "202"},
 		{name: "manual rejects unretired history", mode: "manual", onlyHistory: true, unretired: true, tier: providerselect.TierApproved, wantCode: storagereplacement.CodeTargetInUse},
 	} {
@@ -303,6 +307,13 @@ func TestReplacementSelectionRespectsBucketHistory(t *testing.T) {
 			}
 			fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: providers})
 			fixture.srv.WithProviderTier(tc.tier)
+			if tc.unhealthyHistory {
+				if err := fixture.srv.repos.Observability.UpsertProviderObservation(t.Context(), time.Now().UTC(), observability.ProviderState{
+					ProviderID: onChainIDValue("202"), Status: observability.StatusUnavailable,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if tc.missingHistory {
 				if _, err := fixture.srv.repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), []idtypes.OnChainID{onChainIDValue("202")}); err != nil {
 					t.Fatal(err)
@@ -356,6 +367,15 @@ func TestReplacementSelectionRespectsBucketHistory(t *testing.T) {
 			}
 			if tc.wantCode == storagereplacement.CodeNoEligibleProvider && apiError["error"] != "Could not choose an unused provider. Choose a provider manually." {
 				t.Fatalf("error = %q", apiError["error"])
+			}
+			if tc.wantCode == "required_provider_unavailable" {
+				wantMessage := "Replacement must retain a provider that meets the configured requirement"
+				if tc.wantManualHint {
+					wantMessage = "Could not choose an unused provider that meets the configured requirement. Choose a provider manually."
+				}
+				if apiError["error"] != wantMessage {
+					t.Fatalf("error = %q, want %q", apiError["error"], wantMessage)
+				}
 			}
 			bindings, err := fixture.srv.repos.Contents.ListDataSetBindings(t.Context(), fixture.bucket.ID)
 			if err != nil || len(bindings) != 2 {
