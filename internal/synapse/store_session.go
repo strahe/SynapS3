@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/piece"
@@ -62,7 +63,7 @@ func (c *dataSetTargetAdapter) UploadStoreSession(ctx context.Context, serviceUR
 	}
 	counted := &storeUploadReader{reader: reader, maximum: int64(info.RawSize), progress: opts.OnProgress}
 	// An opaque body prevents net/http from replaying the upload.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint.String(), counted)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint.String(), c.transferCounters.WrapReadCloser(observability.StorageUpload, counted))
 	if err != nil {
 		return nil, err
 	}

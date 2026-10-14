@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -98,7 +99,7 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		return nil, objectSizeAPIError(&objectlimits.SizeError{Size: *input.ContentLength, Err: objectlimits.ErrTooLarge})
 	}
 
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(input.Body), declaredWriteSize(input.ContentLength))
+	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(b.transferCounters.WrapReader(observability.ClientUpload, input.Body)), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {
 			return nil, objectSizeAPIError(err)

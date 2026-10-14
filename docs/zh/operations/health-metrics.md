@@ -51,6 +51,14 @@ synaps3 admin task stats
 
 status 应显示后台任务处理正常。已确认失败仍计为 failed；pending 工作显示为 queued、scheduled 或 waiting。
 
+## Overview 监控
+
+**Process resources** 显示 SynapS3 进程的 CPU 使用核数和 RSS 内存。**Application traffic** 显示上传、下载速率：**Client** 统计 S3 和 Admin 对象传输，**Storage** 统计 SynapS3 与存储提供方之间的传输。点击信息按钮可查看采样时间和启动以来的累计字节数。
+
+图表每 15 秒采样，展示最近一小时。关闭或刷新页面后仍可查看已有历史；重启 SynapS3 会清空历史和累计量。长期历史请使用 Prometheus。
+
+流量统计对象正文，包括部分失败和重试产生的字节。两个视角分别统计，不包含本地文件操作、测速和提供方之间的直接传输。
+
 ## Prometheus Metrics
 
 指标暴露在 Admin 端口：
@@ -73,6 +81,7 @@ scrape_configs:
 | Metric | 含义 |
 | --- | --- |
 | `synaps3_backend_object_operations_total` | 按类型和状态统计的 S3 操作。 |
+| `synaps3_transfer_bytes_total` | 按 `scope`（`client` 或 `storage`）和 `direction`（`upload` 或 `download`）统计的对象正文字节数，重启后重新累计。 |
 | `synaps3_cache_used_bytes` | 当前缓存磁盘使用量。 |
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | 缓存读取行为。 |
 | `synaps3_cache_lru_eviction_paused` | 因近期缓存访问记录无法安全保留而暂停 LRU 淘汰时为 `1`；请先排除持久化错误，再重启 SynapS3。 |

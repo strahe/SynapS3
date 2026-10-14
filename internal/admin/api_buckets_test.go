@@ -5010,6 +5010,8 @@ func TestAPIBucketObjectUpload_AppearsInObjectList(t *testing.T) {
 
 func TestAPIBucketObjectDownload_FromCache(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
+	counters := observability.NewTransferCounters()
+	srv.WithMonitoring(nil, counters)
 	info := seedCachedDownloadObject(t, srv, repos, "download-bucket", "folder/report.txt", "hello admin")
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -5027,6 +5029,9 @@ func TestAPIBucketObjectDownload_FromCache(t *testing.T) {
 	body := readBody(t, resp.Body)
 	if body != "hello admin" {
 		t.Fatalf("body = %q, want %q", body, "hello admin")
+	}
+	if got := counters.Totals(); got.Client.DownloadBytes != uint64(len(body)) || got.Client.UploadBytes != 0 || got.Storage.DownloadBytes != 0 {
+		t.Fatalf("cached admin download counters = %+v", got)
 	}
 	if got := resp.Header.Get("Content-Type"); got != "text/plain" {
 		t.Fatalf("Content-Type = %q, want text/plain", got)

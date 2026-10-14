@@ -97,6 +97,7 @@ type Runtime struct {
 	backend       *backend.SynapseBackend
 	cacheGate     *cacheaccess.Gate
 	accessTracker *cacheaccess.Tracker
+	monitoring    *observability.RuntimeMonitor
 	iam           auth.IAMService
 	workers       *taskengine.Manager
 	s3Addresses   []string
@@ -133,6 +134,8 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	events := admin.NewEventHub()
 	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability, opts.Filecoin.ApprovedProviders, opts.Filecoin.Endorsements)
+	transferCounters := observability.NewTransferCounters()
+	monitoring := observability.NewRuntimeMonitor(transferCounters)
 	uploadSpeedProbe := opts.UploadSpeedProbe
 	if uploadSpeedProbe == nil {
 		uploadSpeedProbe = synapse.NewPDPBatchUploadProbe(cfg.Filecoin.AllowPrivateNetworks)
@@ -146,6 +149,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 	if adapter, ok := opts.Filecoin.Storage.(*synapse.StorageServiceAdapter); ok {
 		adapter.ConfigureProviderHTTPClient(cfg.Filecoin.AllowPrivateNetworks)
+		adapter.SetTransferCounters(transferCounters)
 	}
 	registry := taskengine.NewRegistry()
 	taskService, err := taskengine.NewService(registry, repos)
@@ -213,6 +217,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("initializing task engine: %w", err)
 	}
 	appBackend := backend.New(repos, localCache, opts.Filecoin.Storage, cacheGate, accessTracker, logger,
+		backend.WithTransferCounters(transferCounters),
 		backend.WithTaskService(taskService),
 		backend.WithCacheEvictionMessages(points.BackendCacheEviction),
 		backend.WithEvictionPolicy(evictionPolicy),
@@ -264,6 +269,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithCommitPolicy(cfg.Worker.Tasks, synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network)).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
 		WithObservability(observabilityService).
+		WithMonitoring(monitoring, transferCounters).
 		WithProviderTier(providerselect.Tier(cfg.Filecoin.AnchorProviderTier)).
 		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).
 		WithTaskService(taskService).
@@ -304,6 +310,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		backend:       appBackend,
 		cacheGate:     cacheGate,
 		accessTracker: accessTracker,
+		monitoring:    monitoring,
 		iam:           iamService,
 		workers:       manager,
 		s3Addresses:   s3Addresses,
@@ -465,8 +472,13 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.mu.Unlock()
 
 	r.releaseInterruptedMultipartCompletions(ctx)
+	r.monitoring.Capture()
 	runCtx, cancel := context.WithCancel(ctx)
 	group, groupCtx := errgroup.WithContext(runCtx)
+	group.Go(func() error {
+		r.monitoring.Run(groupCtx)
+		return nil
+	})
 	group.Go(func() error {
 		r.workers.Start(groupCtx)
 		if groupCtx.Err() == nil {

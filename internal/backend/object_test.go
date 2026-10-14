@@ -28,6 +28,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
@@ -491,7 +492,8 @@ func counterValue(t *testing.T, name string) float64 {
 // ---------- PutObject ----------
 
 func TestPutObject_HappyPath(t *testing.T) {
-	tb := newTestBackend(t)
+	counters := observability.NewTransferCounters()
+	tb := newTestBackendWithOptions(t, backend.WithTransferCounters(counters))
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "put-bucket")
 
@@ -536,6 +538,9 @@ func TestPutObject_HappyPath(t *testing.T) {
 	if !tb.cache.Exists(ctx, "put-bucket", obj.CacheKey()) {
 		t.Error("cache file does not exist")
 	}
+	if got := counters.Totals().Client.UploadBytes; got != uint64(len(body)) {
+		t.Errorf("client upload bytes = %d, want %d", got, len(body))
+	}
 }
 
 func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
@@ -544,11 +549,13 @@ func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
 		body          string
 		contentLength *int64
 		wantCode      s3err.ErrorCode
+		wantBytes     uint64
 	}{
 		{
-			name:     "below minimum",
-			body:     strings.Repeat("a", chain.MinUploadSize-1),
-			wantCode: s3err.ErrEntityTooSmall,
+			name:      "below minimum",
+			body:      strings.Repeat("a", chain.MinUploadSize-1),
+			wantCode:  s3err.ErrEntityTooSmall,
+			wantBytes: chain.MinUploadSize - 1,
 		},
 		{
 			name:          "known length above maximum",
@@ -561,12 +568,14 @@ func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
 			body:          validTestObjectBody("body") + "x",
 			contentLength: ptrInt64(chain.MinUploadSize),
 			wantCode:      s3err.ErrContentLengthMismatch,
+			wantBytes:     chain.MinUploadSize + 1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tb := newTestBackend(t)
+			counters := observability.NewTransferCounters()
+			tb := newTestBackendWithOptions(t, backend.WithTransferCounters(counters))
 			ctx := context.Background()
 			seedActiveBucket(t, tb, "put-size-limit-bucket")
 
@@ -588,6 +597,9 @@ func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
 			}
 			if used := tb.cache.UsedBytes(); used != 0 {
 				t.Fatalf("rejected body left %d bytes in the cache", used)
+			}
+			if got := counters.Totals().Client.UploadBytes; got != tt.wantBytes {
+				t.Errorf("rejected upload bytes = %d, want %d", got, tt.wantBytes)
 			}
 		})
 	}
@@ -1318,7 +1330,8 @@ func TestGetObject_FromCache(t *testing.T) {
 }
 
 func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
-	tb := newTestBackend(t)
+	counters := observability.NewTransferCounters()
+	tb := newTestBackendWithOptions(t, backend.WithTransferCounters(counters))
 	ctx := t.Context()
 	seedActiveBucket(t, tb, "range-bucket")
 	body := validTestObjectBody("range-body")
@@ -1344,6 +1357,7 @@ func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
 		get.LastModified == nil || get.Metadata["custom"] != "first" {
 		t.Fatalf("range output = %#v body=%q readErr=%v", get, data, readErr)
 	}
+	wantBytes := uint64(len(data))
 	head, err := tb.backend.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), VersionId: &put.VersionID,
 	})
@@ -1368,6 +1382,7 @@ func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
 			if readErr != nil || string(got) != tc.expected || out.ContentRange == nil || *out.ContentLength != int64(len(tc.expected)) {
 				t.Fatalf("range %q = %q, %#v, %v", tc.request, got, out, readErr)
 			}
+			wantBytes += uint64(len(got))
 		})
 	}
 	_, err = tb.backend.GetObject(ctx, &s3.GetObjectInput{
@@ -1375,6 +1390,9 @@ func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("out-of-range GetObject succeeded")
+	}
+	if got := counters.Totals().Client.DownloadBytes; got != wantBytes {
+		t.Errorf("client range download bytes = %d, want %d", got, wantBytes)
 	}
 }
 
@@ -2959,11 +2977,13 @@ func TestDeleteObjects_DeleteMarkerVersionRestoresObject(t *testing.T) {
 }
 
 func TestCopyObject_HappyPath(t *testing.T) {
-	tb := newTestBackend(t)
+	counters := observability.NewTransferCounters()
+	tb := newTestBackendWithOptions(t, backend.WithTransferCounters(counters))
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "src-bucket")
 	seedActiveBucket(t, tb, "dst-bucket")
 	putValidTestObject(t, tb, "src-bucket", "original.txt", "copy me")
+	before := counters.Totals()
 
 	out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket:     aws.String("dst-bucket"),
@@ -2988,6 +3008,9 @@ func TestCopyObject_HappyPath(t *testing.T) {
 	}
 	if dstObj.State != model.ObjectStateCached {
 		t.Errorf("dst state = %q, want %q", dstObj.State, model.ObjectStateCached)
+	}
+	if got := counters.Totals(); got != before {
+		t.Errorf("copy transfer totals = %#v, want %#v", got, before)
 	}
 }
 

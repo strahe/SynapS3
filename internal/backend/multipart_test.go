@@ -12,9 +12,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
@@ -204,12 +206,14 @@ func TestUploadPartCopyMissingCopySourceUsesHeaderArgumentName(t *testing.T) {
 }
 
 func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) {
-	tb := newTestBackend(t)
+	counters := observability.NewTransferCounters()
+	tb := newTestBackendWithOptions(t, backend.WithTransferCounters(counters))
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "up-copy-version-bucket")
 
 	firstOut := putValidTestObjectOutput(t, tb, "up-copy-version-bucket", "source.txt", "old")
 	putValidTestObject(t, tb, "up-copy-version-bucket", "source.txt", "new")
+	before := counters.Totals()
 
 	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
 		Bucket: aws.String("up-copy-version-bucket"),
@@ -258,6 +262,9 @@ func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) 
 	if versionID == "" {
 		t.Fatal("expected complete multipart version ID")
 	}
+	if got := counters.Totals(); got != before {
+		t.Errorf("copy part transfer totals = %#v, want %#v", got, before)
+	}
 
 	out, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("up-copy-version-bucket"),
@@ -279,7 +286,8 @@ func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) 
 // ---------- CompleteMultipartUpload ----------
 
 func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
-	tb := newTestBackend(t)
+	counters := observability.NewTransferCounters()
+	tb := newTestBackendWithOptions(t, backend.WithTransferCounters(counters))
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "cmp-bucket")
 
@@ -296,6 +304,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 
 	// Upload 2 parts.
 	var partETags [2]string
+	var uploadedBytes uint64
 	for i := int32(1); i <= 2; i++ {
 		partBody := fmt.Sprintf("part-%d-data", i)
 		if i == 1 {
@@ -312,6 +321,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 			t.Fatalf("UploadPart %d: %v", i, err)
 		}
 		partETags[i-1] = *partOut.ETag
+		uploadedBytes += uint64(len(partBody))
 	}
 
 	// Complete.
@@ -361,6 +371,9 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 	if task.Type != model.TaskTypeUploadPlan {
 		t.Fatalf("task type = %s, want upload_plan", task.Type)
+	}
+	if got := counters.Totals().Client.UploadBytes; got != uploadedBytes {
+		t.Errorf("multipart upload bytes = %d, want %d", got, uploadedBytes)
 	}
 }
 

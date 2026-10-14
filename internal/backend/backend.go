@@ -8,6 +8,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/versity/versitygw/backend"
@@ -25,6 +26,7 @@ type SynapseBackend struct {
 	cacheAccessTracker    *cacheaccess.Tracker
 	bucketLifecycle       *bucketlifecycle.Service
 	storage               synapse.StorageClient
+	transferCounters      *observability.TransferCounters
 	taskService           *taskengine.Service
 	cacheEvictionMessages *taskengine.Messenger
 	evictionPolicy        cache.EvictionPolicy
@@ -34,6 +36,12 @@ type SynapseBackend struct {
 
 // Option configures SynapseBackend runtime behavior.
 type Option func(*SynapseBackend)
+
+func WithTransferCounters(counters *observability.TransferCounters) Option {
+	return func(b *SynapseBackend) {
+		b.transferCounters = counters
+	}
+}
 
 // WithTaskService configures the sole task creation boundary.
 func WithTaskService(service *taskengine.Service) Option {

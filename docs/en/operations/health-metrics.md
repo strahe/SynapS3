@@ -51,6 +51,14 @@ synaps3 admin task stats
 
 Status should show background task processing as healthy. Acknowledged failures remain failed; pending work is shown as queued, scheduled, or waiting.
 
+## Overview Monitoring
+
+**Process resources** shows SynapS3 process CPU usage in cores and RSS memory. **Application traffic** shows upload and download rates: **Client** covers S3 and Admin object transfers; **Storage** covers transfers between SynapS3 and storage providers. Open the information button for sample times and cumulative bytes since startup.
+
+Charts sample every 15 seconds and show the last hour. History remains available when you close or refresh the page; restarting SynapS3 resets history and totals. Use Prometheus for longer-term history.
+
+Traffic measures object payload bytes, including partial failures and retries. The two scopes are reported separately; local file operations, speed tests, and transfers directly between providers are excluded.
+
 ## Prometheus Metrics
 
 Metrics are exposed on the admin port:
@@ -73,6 +81,7 @@ Key metrics:
 | Metric | Meaning |
 | --- | --- |
 | `synaps3_backend_object_operations_total` | S3 operations by type and status. |
+| `synaps3_transfer_bytes_total` | Object payload bytes by `scope` (`client` or `storage`) and `direction` (`upload` or `download`), reset on restart. |
 | `synaps3_cache_used_bytes` | Current cache disk usage. |
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | Cache read behavior. |
 | `synaps3_cache_lru_eviction_paused` | `1` when LRU eviction is paused because recent cache access could not be retained safely. Resolve the persistence error and restart SynapS3. |
