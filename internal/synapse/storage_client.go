@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/observability"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -28,14 +29,15 @@ type dataSetWriteReader interface {
 // StorageServiceAdapter adapts synapse-go's concrete immutable storage
 // contexts to SynapS3's testable staged storage interface.
 type StorageServiceAdapter struct {
-	service      *storage.Service
-	terminator   storageServiceTerminator
-	dataSets     dataSetStateReader
-	writable     dataSetWriteReader
-	identity     storage.ContextIdentity
-	verifier     common.Address
-	cleanup      *cleanupPieceReader
-	providerHTTP *http.Client
+	service          *storage.Service
+	terminator       storageServiceTerminator
+	dataSets         dataSetStateReader
+	writable         dataSetWriteReader
+	identity         storage.ContextIdentity
+	verifier         common.Address
+	cleanup          *cleanupPieceReader
+	providerHTTP     *http.Client
+	transferCounters *observability.TransferCounters
 }
 
 // AdaptStorageService wraps the SDK storage service. dataSets reads the FWSS
@@ -77,7 +79,12 @@ func (s *StorageServiceAdapter) ContextIdentity() storage.ContextIdentity {
 }
 
 func (s *StorageServiceAdapter) Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
-	return s.service.Download(ctx, pieceCID, opts)
+	body, err := s.service.Download(ctx, pieceCID, opts)
+	return s.transferCounters.WrapReadCloser(observability.StorageDownload, body), err
+}
+
+func (s *StorageServiceAdapter) SetTransferCounters(counters *observability.TransferCounters) {
+	s.transferCounters = counters
 }
 
 func (s *StorageServiceAdapter) PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*sdkcosts.MultiContextCosts, error) {
@@ -119,6 +126,7 @@ func (s *StorageServiceAdapter) SelectUploadTargets(ctx context.Context, opts st
 		}
 		if dataSet, ok := target.(*dataSetTargetAdapter); ok {
 			dataSet.providerHTTP = s.providerHTTP
+			dataSet.transferCounters = s.transferCounters
 		}
 		out = append(out, target)
 	}
@@ -148,6 +156,7 @@ func (s *StorageServiceAdapter) OpenDataSetTarget(ctx context.Context, dataSetID
 	}
 	target := newDataSetTargetAdapter(storageCtx, s.writable)
 	target.providerHTTP = s.providerHTTP
+	target.transferCounters = s.transferCounters
 	return target, nil
 }
 
@@ -318,9 +327,10 @@ func (c *providerTargetAdapter) FindDataSetByClientDataSetID(
 
 type dataSetTargetAdapter struct {
 	storageTargetAdapter
-	dataSet      *storage.DataSetContext
-	writable     dataSetWriteReader
-	providerHTTP *http.Client
+	dataSet          *storage.DataSetContext
+	writable         dataSetWriteReader
+	providerHTTP     *http.Client
+	transferCounters *observability.TransferCounters
 }
 
 func newDataSetTargetAdapter(dataSet *storage.DataSetContext, writable dataSetWriteReader) *dataSetTargetAdapter {

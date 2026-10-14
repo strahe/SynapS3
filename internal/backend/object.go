@@ -24,6 +24,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -58,7 +59,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 
 	// Stage beside the content directory: the destination is content-addressed
 	// and only nameable once the staged checksum resolves a content row.
-	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(input.Body), declaredWriteSize(input.ContentLength))
+	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(b.transferCounters.WrapReader(observability.ClientUpload, input.Body)), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		if errors.Is(err, objectlimits.ErrTooLarge) {
@@ -224,7 +225,7 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 	}
 	admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 	return &s3.GetObjectOutput{
-		Body:          out.Body,
+		Body:          b.transferCounters.WrapReadCloser(observability.ClientDownload, out.Body),
 		ContentLength: &length,
 		ContentRange:  contentRange,
 		AcceptRanges:  &acceptRanges,

@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
@@ -144,12 +145,17 @@ func TestMetrics_Endpoint(t *testing.T) {
 	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
 
 	// Increment metrics so we can verify their presence.
+	counters := observability.NewTransferCounters()
+	if _, err := io.Copy(io.Discard, counters.WrapReader(observability.ClientUpload, strings.NewReader("payload"))); err != nil {
+		t.Fatal(err)
+	}
+	srv.WithMonitoring(nil, counters)
 	ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
 	TaskQueueDepth.WithLabelValues("upload_plan", "pending").Set(1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
-	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.Handle("GET /metrics", srv.metricsHandler())
 
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -176,10 +182,14 @@ func TestMetrics_Endpoint(t *testing.T) {
 		"synaps3_cache_hits_total",
 		"synaps3_cache_misses_total",
 		"synaps3_task_queue_depth",
+		"synaps3_transfer_bytes_total",
 	} {
 		if !strings.Contains(text, prefix) {
 			t.Errorf("metrics output missing %q", prefix)
 		}
+	}
+	if !strings.Contains(text, `synaps3_transfer_bytes_total{direction="upload",scope="client"} 7`) {
+		t.Errorf("metrics output missing client upload bytes")
 	}
 
 	// Verify Content-Type is Prometheus text format.

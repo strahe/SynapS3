@@ -1,18 +1,174 @@
 package synapse
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/strahe/synaps3/internal/observability"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/payments"
+	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/strahe/synapse-go/warmstorage"
 )
+
+func TestStorageServiceAdapterDownloadCountsConsumedPayload(t *testing.T) {
+	t.Parallel()
+	payload := bytes.Repeat([]byte{0xab}, 512)
+	info, err := piece.CalculateFromBytes(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongInfo, err := piece.CalculateFromBytes(bytes.Repeat([]byte{0xcd}, len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		corrupt     bool
+		truncated   bool
+		chunked     bool
+		maximum     int64
+		readBytes   int64
+		wantBytes   uint64
+		wantReadErr bool
+		wantOpenErr bool
+	}{
+		{name: "complete", wantBytes: 512},
+		{name: "CID mismatch", corrupt: true, wantBytes: 512, wantReadErr: true},
+		{name: "truncated", truncated: true, wantBytes: 512, wantReadErr: true},
+		{name: "streamed limit", chunked: true, maximum: 256, wantBytes: 256, wantReadErr: true},
+		{name: "declared limit", maximum: 256, wantOpenErr: true},
+		{name: "early close", readBytes: 64, wantBytes: 64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.chunked {
+					w.(http.Flusher).Flush()
+				} else {
+					length := len(payload)
+					if tc.truncated {
+						length++
+					}
+					w.Header().Set("Content-Length", strconv.Itoa(length))
+				}
+				_, _ = w.Write(payload)
+			}))
+			defer server.Close()
+			service, err := storage.New(storage.Options{HTTPClient: server.Client(), DownloadMaxBytes: tc.maximum})
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter := AdaptStorageService(service, nil, storage.ContextIdentity{})
+			counters := observability.NewTransferCounters()
+			adapter.SetTransferCounters(counters)
+			expected := info.CIDv2
+			if tc.corrupt {
+				expected = wrongInfo.CIDv2
+			}
+			body, err := adapter.Download(t.Context(), expected, &storage.DownloadOptions{URL: server.URL})
+			if (err != nil) != tc.wantOpenErr {
+				t.Fatalf("Download error = %v, want error %t", err, tc.wantOpenErr)
+			}
+			if body != nil {
+				if got := counters.Totals().Storage.DownloadBytes; got != 0 {
+					t.Fatalf("unread download bytes = %d, want 0", got)
+				}
+				if tc.readBytes > 0 {
+					_, err = io.CopyN(io.Discard, body, tc.readBytes)
+				} else {
+					_, err = io.Copy(io.Discard, body)
+				}
+				_ = body.Close()
+				if (err != nil) != tc.wantReadErr {
+					t.Errorf("download read error = %v, want error %t", err, tc.wantReadErr)
+				}
+			}
+			if got := counters.Totals().Storage.DownloadBytes; got != tc.wantBytes {
+				t.Errorf("storage download bytes = %d, want %d", got, tc.wantBytes)
+			}
+		})
+	}
+}
+
+func TestStorageServiceAdapterSharesTransferCountersWithDataSetTargets(t *testing.T) {
+	t.Parallel()
+	payload := bytes.Repeat([]byte{0xab}, 512)
+	info, err := piece.CalculateFromBytes(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	payer := common.HexToAddress("0x1001")
+	recordKeeper := common.HexToAddress("0x2002")
+	chainID := sdktypes.ChainID(314159)
+	ref, err := storage.NewDataSetRef(sdktypes.NewBigInt(101), sdktypes.NewBigInt(202), sdktypes.NewBigInt(303))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSet, err := storage.NewDataSetContext(storage.Provider{ID: ref.ProviderID(), ServiceURL: server.URL}, &inertPDPProviderClient{}, nil, ref,
+		storage.WithPayer(payer), storage.WithChainID(chainID), storage.WithRecordKeeper(recordKeeper))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := &recordingContextSelector{selectUpload: func(opts storage.SelectUploadContextsOptions) (*storage.UploadContextSelection, error) {
+		return &storage.UploadContextSelection{Contexts: []storage.StorageContext{dataSet}, RequestedCopies: 1, Complete: true}, nil
+	}}
+	service, err := storage.New(storage.Options{
+		ContextSelector: selector,
+		ContextResolver: &staticDataSetContextResolver{dataSet: dataSet},
+		PayerAddress:    payer,
+		ChainID:         chainID,
+		RecordKeeper:    recordKeeper,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := AdaptStorageService(service, nil, storage.ContextIdentity{})
+	adapter.providerHTTP = server.Client()
+	counters := observability.NewTransferCounters()
+	adapter.SetTransferCounters(counters)
+	selected, err := adapter.SelectUploadTargets(t.Context(), storage.SelectUploadContextsOptions{Copies: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := adapter.OpenDataSetTarget(t.Context(), ref.DataSetID(), storage.NewDataSetContextOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []DataSetTarget{selected[0].(DataSetTarget), opened} {
+		if _, err := target.UploadStoreSession(t.Context(), server.URL, "12345678-1234-4234-8234-123456789abc", bytes.NewReader(payload), &storage.StoreOptions{PieceCID: info.CIDv2}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := counters.Totals().Storage.UploadBytes; got != uint64(2*len(payload)) {
+		t.Errorf("storage upload bytes = %d, want %d", got, 2*len(payload))
+	}
+}
+
+type staticDataSetContextResolver struct {
+	storage.ContextResolver
+	dataSet *storage.DataSetContext
+}
+
+func (r *staticDataSetContextResolver) ResolveDataSetContext(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (*storage.DataSetContext, error) {
+	return r.dataSet, nil
+}
 
 func TestStorageServiceAdapterSelectUploadTargetsPreservesPartialSelection(t *testing.T) {
 	t.Parallel()

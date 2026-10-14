@@ -119,6 +119,36 @@ export interface OverviewData {
   filecoin_storage_health: OverviewFilecoinStorageHealth
 }
 
+export type MonitoringStatus = 'ready' | 'collecting' | 'unavailable'
+
+export interface MonitoringPoint {
+  at: string
+  cpu_cores: number | null
+  rss_bytes: number | null
+  client_upload_bytes_per_second: number | null
+  client_download_bytes_per_second: number | null
+  storage_upload_bytes_per_second: number | null
+  storage_download_bytes_per_second: number | null
+  gap_before: boolean
+}
+
+export interface MonitoringData {
+  instance_id: string
+  started_at: string
+  window_start: string
+  window_end: string
+  snapshot_at: string
+  sampled_at: string | null
+  interval_seconds: number
+  retention_seconds: number
+  status: { cpu: MonitoringStatus; rss: MonitoringStatus; traffic: MonitoringStatus }
+  totals: {
+    client: { upload_bytes: string; download_bytes: string }
+    storage: { upload_bytes: string; download_bytes: string }
+  }
+  points: MonitoringPoint[]
+}
+
 export type ObservabilitySignalLevel = 'ok' | 'warning' | 'blocking'
 export type ObservabilityStatus = 'available' | 'degraded' | 'unavailable' | 'unknown'
 
@@ -1164,6 +1194,7 @@ export const api = {
       setAdminCSRFToken('')
     }),
   getOverview: () => fetchJSON<OverviewData>('/overview'),
+  getMonitoring: (signal?: AbortSignal) => fetchJSON<MonitoringData>('/monitoring', { signal }),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
   getBucket: (name: string) => fetchJSON<BucketDetail>(`/buckets/${encodeURIComponent(name)}`),
   createBucket: (payload: {

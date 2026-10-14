@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
@@ -97,6 +98,8 @@ func TestTaskStoreSessionStages(t *testing.T) {
 	defer server.Close()
 	serviceURL := server.URL + "/provider/api"
 	target := storeSessionTestTarget(t, serviceURL, server.Client())
+	counters := observability.NewTransferCounters()
+	target.transferCounters = counters
 	id, err := target.CreateStoreSession(t.Context())
 	if err != nil || id != sessionID {
 		t.Fatalf("CreateStoreSession = %q, %v", id, err)
@@ -110,6 +113,9 @@ func TestTaskStoreSessionStages(t *testing.T) {
 	}
 	if err := target.FinalizeStoreSession(t.Context(), serviceURL, id, info.CIDv2); err != nil {
 		t.Fatal(err)
+	}
+	if got := counters.Totals().Storage.UploadBytes; got != uint64(len(payload)) {
+		t.Errorf("storage upload bytes = %d, want %d", got, len(payload))
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -194,6 +200,8 @@ func TestTaskStoreSessionCancellation(t *testing.T) {
 			defer server.Close()
 			defer close(release)
 			target := storeSessionTestTarget(t, server.URL, server.Client())
+			counters := observability.NewTransferCounters()
+			target.transferCounters = counters
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			done := make(chan error, 1)
@@ -222,6 +230,13 @@ func TestTaskStoreSessionCancellation(t *testing.T) {
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("session request did not stop after cancellation")
+			}
+			var wantBytes uint64
+			if stage == "upload" {
+				wantBytes = uint64(len(payload))
+			}
+			if got := counters.Totals().Storage.UploadBytes; got != wantBytes {
+				t.Errorf("cancelled %s upload bytes = %d, want %d", stage, got, wantBytes)
 			}
 		})
 	}
@@ -336,9 +351,14 @@ func TestTaskStoreSessionProgressPanicReturnsToCaller(t *testing.T) {
 	}))
 	defer server.Close()
 	target := storeSessionTestTarget(t, server.URL, server.Client())
+	counters := observability.NewTransferCounters()
+	target.transferCounters = counters
 	defer func() {
 		if got := recover(); got != "progress callback failed" {
 			t.Errorf("progress panic = %v", got)
+		}
+		if got := counters.Totals().Storage.UploadBytes; got != 0 {
+			t.Errorf("storage upload bytes = %d, want 0 for withheld body", got)
 		}
 	}()
 	_, _ = target.UploadStoreSession(t.Context(), server.URL, "12345678-1234-4234-8234-123456789abc", bytes.NewReader(payload), &storage.StoreOptions{

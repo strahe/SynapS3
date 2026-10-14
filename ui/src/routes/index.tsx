@@ -1,14 +1,14 @@
-import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { CheckCircle2, ChevronRight, Database, FileBox, HardDrive, MemoryStick } from 'lucide-react'
 import type { ElementType } from 'react'
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import type { OverviewData } from '@/api/client'
+import { MonitoringCards } from '@/components/app/MonitoringCards'
 import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
 import { PageError, PageLoading } from '@/components/app/PageState'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { useOverview } from '@/hooks/queries'
+import { useMonitoring, useOverview } from '@/hooks/queries'
 import {
   attentionDisplayRows,
   filecoinStorageHealthCheckedLabel,
@@ -29,12 +29,25 @@ export const Route = createFileRoute('/')({
 
 function OverviewPage() {
   const { data, isLoading, error, refetch, isFetching } = useOverview()
-  const qc = useQueryClient()
+  const monitoring = useMonitoring()
+  const monitoringCards = (
+    <MonitoringCards
+      data={monitoring.data}
+      loading={monitoring.isLoading}
+      error={monitoring.isError}
+      refreshing={monitoring.isFetching}
+      updatedAt={monitoring.dataUpdatedAt}
+      onRetry={() => void monitoring.refetch()}
+    />
+  )
   const header = (
     <PageHeader
       title="Overview"
       actions={
-        <RefreshButton onClick={() => qc.invalidateQueries({ queryKey: ['overview'] })} refreshing={isFetching} />
+        <RefreshButton
+          onClick={() => void Promise.allSettled([refetch(), monitoring.refetch()])}
+          refreshing={isFetching || monitoring.isFetching}
+        />
       }
     />
   )
@@ -53,6 +66,7 @@ function OverviewPage() {
             retrying={isFetching}
           />
         )}
+        {monitoringCards}
       </div>
     )
   }
@@ -127,6 +141,8 @@ function OverviewPage() {
           </CardContent>
         </Card>
       </div>
+
+      {monitoringCards}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>

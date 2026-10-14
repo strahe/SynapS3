@@ -17,6 +17,16 @@ export function useOverview() {
   })
 }
 
+export function useMonitoring() {
+  return useQuery({
+    queryKey: ['monitoring'],
+    queryFn: ({ signal }) => api.getMonitoring(signal),
+    staleTime: 15_000,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+  })
+}
+
 export function useCommitBatches(status: CommitBatchStatus | undefined, cursor: string | undefined) {
   return useQuery({
     queryKey: ['commitBatches', status, cursor],

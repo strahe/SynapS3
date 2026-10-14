@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
@@ -58,6 +59,8 @@ type Server struct {
 	wallet                  synapse.WalletQuerier
 	filecoinReadiness       filecoinReadinessProbe
 	observability           *observability.Service
+	monitoring              *observability.RuntimeMonitor
+	transferCounters        *observability.TransferCounters
 	warmStorageMarket       WarmStorageMarket
 	marketChainID           uint64
 	usdfcAddress            string
@@ -230,6 +233,23 @@ func (s *Server) WithObservability(service *observability.Service) *Server {
 	return s
 }
 
+// WithMonitoring connects the runtime's resource history and transfer counters.
+func (s *Server) WithMonitoring(monitor *observability.RuntimeMonitor, counters *observability.TransferCounters) *Server {
+	s.monitoring = monitor
+	s.transferCounters = counters
+	return s
+}
+
+func (s *Server) metricsHandler() http.Handler {
+	if s.transferCounters == nil {
+		return promhttp.Handler()
+	}
+	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, promhttp.HandlerFor(prometheus.Gatherers{
+		prometheus.DefaultGatherer,
+		s.transferCounters.Gatherer(),
+	}, promhttp.HandlerOpts{}))
+}
+
 // WithS3IAM enables S3 user management API routes.
 func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	s.s3IAM = iam
@@ -264,9 +284,10 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /healthz", s.handleSetupHealthz)
 	} else {
 		mux.HandleFunc("GET /healthz", s.handleHealthz)
-		mux.Handle("GET /metrics", promhttp.Handler())
+		mux.Handle("GET /metrics", s.metricsHandler())
 		// Dashboard API
 		mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
+		mux.HandleFunc("GET /api/v1/monitoring", s.handleAPIMonitoring)
 		mux.HandleFunc("GET /api/v1/events", s.handleAPIEvents)
 		mux.HandleFunc("GET /api/v1/buckets", s.handleAPIListBuckets)
 		mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)

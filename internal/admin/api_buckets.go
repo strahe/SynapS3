@@ -2098,7 +2098,7 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("ETag", `"`+out.ETag+`"`)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, out.Body); err != nil {
+	if _, err := io.Copy(s.transferCounters.WrapWriter(observability.ClientDownload, w), out.Body); err != nil {
 		s.logger.Warn("api: object download stream failed", "error", err, "bucket", bucketName, "key", key)
 	}
 }
