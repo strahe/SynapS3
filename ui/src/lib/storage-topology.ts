@@ -26,6 +26,7 @@ export interface StorageTopologyFilters {
   status: ObservabilityStatusFilter
   provider: string
   bucket: string
+  showRetired?: boolean
 }
 
 export interface PaginationState {
@@ -150,6 +151,7 @@ export interface StorageTopologySelectionLookup {
 }
 
 export interface StorageTopologyDataSetSelectionSearch {
+  show_retired?: boolean
   chain_data_set_id?: string
   local_data_set_id?: number
   selection_provider?: string
@@ -266,7 +268,8 @@ export function dataSetTopologyPath(dataSet: ObservabilityDataSetObservation) {
 
 export function bucketStorageDataSetTopologyLinkModel(
   bucketName: string,
-  dataSet: Pick<StorageDataSetSummary, 'id' | 'bucket_name' | 'provider_id' | 'data_set_id'>
+  dataSet: Pick<StorageDataSetSummary, 'id' | 'bucket_name' | 'provider_id' | 'data_set_id'> &
+    Partial<Pick<StorageDataSetSummary, 'status'>>
 ): BucketStorageDataSetTopologyLinkModel {
   const chainDataSetID = nonEmptyTopologyText(dataSet.data_set_id)
 
@@ -274,6 +277,7 @@ export function bucketStorageDataSetTopologyLinkModel(
     label: chainDataSetID ?? 'No chain data set',
     copyValue: chainDataSetID,
     search: {
+      ...(dataSet.status === 'retired' ? { show_retired: true } : {}),
       bucket: bucketName,
       provider: dataSet.provider_id,
       chain_data_set_id: chainDataSetID,
@@ -442,6 +446,7 @@ export function storageTopologyDataSetSelectionSearch(
   dataSet: ObservabilityDataSetObservation
 ): StorageTopologyDataSetSelectionSearch {
   return {
+    ...(dataSet.facts.local_status === 'retired' ? { show_retired: true } : {}),
     chain_data_set_id: dataSet.facts.chain_data_set_id,
     local_data_set_id: dataSet.facts.local_data_set_id,
     selection_provider: dataSet.facts.provider_id,
@@ -653,6 +658,25 @@ export function storageTopologyDataSetSelection(
   return node ? { type: 'node', id: node.id, kind: node.kind } : { type: 'data-set', localDataSetID }
 }
 
+export function findStorageTopologyDataSetObservation(
+  dataSets: ObservabilityDataSetObservation[],
+  lookup: StorageTopologySelectionLookup
+) {
+  if (lookup.chainDataSetID) {
+    const candidates = dataSets.filter((dataSet) => {
+      if (dataSet.facts.chain_data_set_id !== lookup.chainDataSetID) return false
+      if (lookup.providerID && dataSet.facts.provider_id !== lookup.providerID) return false
+      if (lookup.bucketName && dataSet.facts.bucket_name !== lookup.bucketName) return false
+      return true
+    })
+    if (candidates.length === 1) return candidates[0]
+  }
+  if (lookup.localDataSetID != null) {
+    return dataSets.find((dataSet) => dataSet.facts.local_data_set_id === lookup.localDataSetID)
+  }
+  return undefined
+}
+
 export function findStorageTopologySelection(
   graph: StorageTopologyGraph,
   lookup: StorageTopologySelectionLookup
@@ -812,6 +836,7 @@ export function summaryFromStatuses(statuses: ObservabilityStatus[]): Observabil
 }
 
 function dataSetMatchesFilters(dataSet: ObservabilityDataSetObservation, filters: StorageTopologyFilters) {
+  if (filters.showRetired === false && dataSet.facts.local_status === 'retired') return false
   if (filters.status !== 'all' && dataSet.signal.status !== filters.status) return false
   if (!isAllEntityFilter(filters.provider) && dataSet.facts.provider_id !== filters.provider) return false
   if (!isAllEntityFilter(filters.bucket) && dataSet.facts.bucket_name !== filters.bucket) return false

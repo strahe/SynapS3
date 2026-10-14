@@ -1,7 +1,7 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { TriangleAlert } from 'lucide-react'
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
 import { Banner } from '@/components/app/Banner'
@@ -18,6 +18,7 @@ import {
   buildStorageTopologyGraph,
   buildTopologyProviderOptions,
   clampPageForLoadedTotal,
+  findStorageTopologyDataSetObservation,
   findStorageTopologySelection,
   mergeTopologyDataSetSnapshots,
   mergeTopologyStorageConfirmationCounts,
@@ -48,6 +49,7 @@ import {
   hasStorageTopologySelectionSearch,
   nonEmptyStorageTopologySearchString,
   nonNegativeStorageTopologySearchInteger,
+  storageTopologySearchBoolean,
 } from '@/lib/storage-topology-search'
 
 const TopologyGraphCanvas = lazy(() => import('@/components/storage-topology/TopologyGraphCanvas'))
@@ -55,11 +57,13 @@ const TopologyGraphCanvas = lazy(() => import('@/components/storage-topology/Top
 type TopologyTab = StorageTopologyTab
 type TopologySelectionState = SourcedStorageTopologySelection
 type PinnedTopologyContext = StorageTopologyPinnedContext & { source: 'route' | 'local' }
+type TopologyFocusRequest = { key: string; nodeID: string }
 type StorageTopologySearch = {
   tab?: TopologyTab
   status?: Exclude<ObservabilityStatusFilter, 'all'>
   provider?: string
   bucket?: string
+  show_retired?: boolean
   chain_data_set_id?: string
   local_data_set_id?: number
   selection_provider?: string
@@ -83,6 +87,7 @@ export const Route = createFileRoute('/storage-topology')({
       typeof search.status === 'string' && topologyStatusSearchValues.has(search.status) ? search.status : undefined
     const provider = nonEmptyStorageTopologySearchString(search.provider)
     const bucket = nonEmptyStorageTopologySearchString(search.bucket)
+    const showRetired = storageTopologySearchBoolean(search.show_retired)
     const chainDataSetID = nonEmptyStorageTopologySearchString(search.chain_data_set_id)
     const localDataSetID = nonNegativeStorageTopologySearchInteger(search.local_data_set_id)
     const selectionProvider = nonEmptyStorageTopologySearchString(search.selection_provider)
@@ -93,6 +98,7 @@ export const Route = createFileRoute('/storage-topology')({
       status: status as Exclude<ObservabilityStatusFilter, 'all'> | undefined,
       provider,
       bucket,
+      show_retired: showRetired,
       chain_data_set_id: chainDataSetID,
       local_data_set_id: localDataSetID,
       selection_provider: selectionProvider,
@@ -112,14 +118,18 @@ function StorageTopologyPage() {
       status: search.status ?? allStatusFilterValue,
       provider: search.provider ?? allEntityFilterValue,
       bucket: search.bucket ?? allEntityFilterValue,
+      showRetired: search.show_retired ?? false,
     }),
-    [search.bucket, search.provider, search.status]
+    [search.bucket, search.provider, search.show_retired, search.status]
   )
+  const viewResetKey = JSON.stringify([filters.status, filters.provider, filters.bucket, filters.showRetired])
   const hasSearchSelection = hasStorageTopologySelectionSearch(search)
   const [providerPage, setProviderPage] = useState(1)
   const [dataSetPage, setDataSetPage] = useState(1)
   const [selection, setSelection] = useState<TopologySelectionState | null>(null)
   const [pinnedContext, setPinnedContext] = useState<PinnedTopologyContext | null>(null)
+  const [handledFocusKey, setHandledFocusKey] = useState<string | null>(null)
+  const handleFocusRequest = useCallback((key: string) => setHandledFocusKey(key), [])
   const testProviderUploadSpeed = useTestProviderUploadSpeed()
   const selectionProviderID = search.selection_provider ?? observabilityProviderParam(filters.provider)
   const selectionBucketName = search.selection_bucket ?? observabilityBucketParam(filters.bucket)
@@ -219,11 +229,15 @@ function StorageTopologyPage() {
     [dataSets]
   )
   const graph = useMemo(
-    () => buildStorageTopologyGraph(graphProviders, dataSets, filters),
-    [dataSets, filters, graphProviders]
+    () =>
+      buildStorageTopologyGraph(graphProviders, dataSets, {
+        ...filters,
+        showRetired: tab !== 'topology' || filters.showRetired,
+      }),
+    [dataSets, filters, graphProviders, tab]
   )
   const providerContextFilters = useMemo<StorageTopologyFilters>(
-    () => ({ ...filters, status: allStatusFilterValue }),
+    () => ({ ...filters, status: allStatusFilterValue, showRetired: true }),
     [filters]
   )
   const providerContextGraph = useMemo(
@@ -300,6 +314,41 @@ function StorageTopologyPage() {
     (scopedDeepLinkSnapshotEnabled && scopedDeepLinkDataSetSnapshot.data
       ? snapshotPageIsPartial(scopedDeepLinkDataSetSnapshot.data)
       : false)
+  const routeGraphSelection = useMemo(
+    () =>
+      hasSearchSelection
+        ? findStorageTopologySelection(graph, {
+            chainDataSetID: search.chain_data_set_id,
+            providerID: selectionProviderID,
+            bucketName: selectionBucketName,
+            localDataSetID: search.local_data_set_id,
+          })
+        : null,
+    [
+      graph,
+      hasSearchSelection,
+      search.chain_data_set_id,
+      search.local_data_set_id,
+      selectionBucketName,
+      selectionProviderID,
+    ]
+  )
+  const routeFocusKey = hasSearchSelection
+    ? JSON.stringify([search.chain_data_set_id, search.local_data_set_id, selectionProviderID, selectionBucketName])
+    : null
+  const focusRequest = useMemo<TopologyFocusRequest | null>(
+    () =>
+      tab === 'topology' &&
+      !snapshotLoading &&
+      selection?.source === 'route' &&
+      routeFocusKey !== null &&
+      handledFocusKey !== routeFocusKey &&
+      routeGraphSelection?.type === 'node' &&
+      routeGraphSelection.kind === 'data-set'
+        ? { key: routeFocusKey, nodeID: routeGraphSelection.id }
+        : null,
+    [handledFocusKey, routeFocusKey, routeGraphSelection, selection?.source, snapshotLoading, tab]
+  )
   const resolvedSelection = useMemo(
     () => resolveStorageTopologySelection(selection?.selection ?? null, graph, detailProviders, detailDataSets),
     [selection, graph, detailProviders, detailDataSets]
@@ -328,21 +377,30 @@ function StorageTopologyPage() {
     if (hasSearchSelection) return
     setSelection((current) => reconcileStorageTopologySelectionSearch(current, false))
     setPinnedContext((current) => (current?.source === 'route' ? null : current))
+    setHandledFocusKey(null)
   }, [hasSearchSelection])
 
   useEffect(() => {
     if (snapshotLoading || !hasSearchSelection) return
-    const topologySelection = findStorageTopologySelection(graph, {
+    const dataSet = findStorageTopologyDataSetObservation(unpinnedDetailDataSets, {
       chainDataSetID: search.chain_data_set_id,
       providerID: selectionProviderID,
       bucketName: selectionBucketName,
       localDataSetID: search.local_data_set_id,
     })
+    if (tab === 'topology' && search.show_retired === undefined && handledFocusKey !== routeFocusKey) {
+      if (dataSet?.facts.local_status === 'retired') {
+        void navigate({
+          to: '/storage-topology',
+          replace: true,
+          search: cleanStorageTopologySearch({ ...search, show_retired: true }) as StorageTopologySearch,
+        })
+        return
+      }
+    }
     const nextSelection =
-      topologySelection ??
-      (search.local_data_set_id != null
-        ? { type: 'data-set' as const, localDataSetID: search.local_data_set_id }
-        : null)
+      routeGraphSelection ??
+      (dataSet ? { type: 'data-set' as const, localDataSetID: dataSet.facts.local_data_set_id } : null)
     const nextState = nextSelection ? { source: 'route' as const, selection: nextSelection } : null
     setSelection((current) => (sameStorageTopologySelectionState(current, nextState) ? current : nextState))
     const nextPinnedContext = nextSelection
@@ -359,12 +417,18 @@ function StorageTopologyPage() {
     setPinnedContext((current) => (samePinnedTopologyContext(current, nextPinnedContext) ? current : nextPinnedContext))
   }, [
     graph,
+    handledFocusKey,
     hasSearchSelection,
+    navigate,
+    routeGraphSelection,
+    routeFocusKey,
+    search,
     search.chain_data_set_id,
     search.local_data_set_id,
     selectionBucketName,
     selectionProviderID,
     snapshotLoading,
+    tab,
     unpinnedDetailDataSets,
     unpinnedDetailProviders,
   ])
@@ -404,6 +468,7 @@ function StorageTopologyPage() {
         status: next.status === undefined ? search.status : searchStatusValue(next.status),
         provider: next.provider === undefined ? search.provider : searchFilterValue(next.provider),
         bucket: next.bucket === undefined ? search.bucket : searchFilterValue(next.bucket),
+        show_retired: next.showRetired === undefined ? search.show_retired : next.showRetired,
       }) as StorageTopologySearch
     )
   }
@@ -506,6 +571,9 @@ function StorageTopologyPage() {
         <div className="min-h-0 flex-1">
           <TopologyWorkbench
             graph={graph}
+            viewResetKey={viewResetKey}
+            focusRequest={focusRequest}
+            onFocusHandled={handleFocusRequest}
             selection={selection?.selection ?? null}
             onSelectionChange={selectTopologySelection}
           />
@@ -575,17 +643,30 @@ function TopologyPartialAlert() {
 
 function TopologyWorkbench({
   graph,
+  viewResetKey,
+  focusRequest,
+  onFocusHandled,
   selection,
   onSelectionChange,
 }: {
   graph: StorageTopologyGraph
+  viewResetKey: string
+  focusRequest: TopologyFocusRequest | null
+  onFocusHandled: (key: string) => void
   selection: StorageTopologySelection | null
   onSelectionChange: (selection: StorageTopologySelection | null) => void
 }) {
   return (
     <div className="h-full min-h-0 overflow-hidden rounded-md border bg-card">
       <Suspense fallback={<TopologyGraphFallback />}>
-        <TopologyGraphCanvas graph={graph} selection={selection} onSelectionChange={onSelectionChange} />
+        <TopologyGraphCanvas
+          graph={graph}
+          viewResetKey={viewResetKey}
+          focusRequest={focusRequest}
+          onFocusHandled={onFocusHandled}
+          selection={selection}
+          onSelectionChange={onSelectionChange}
+        />
       </Suspense>
     </div>
   )

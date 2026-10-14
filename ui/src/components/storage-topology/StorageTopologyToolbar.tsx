@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react'
+import { Field, FieldLabel } from '@/components/ui/field'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { providerRegistryLabel } from '@/lib/provider-display'
 import {
@@ -53,6 +55,17 @@ export function StorageTopologyToolbar({
       </Tabs>
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        {tab === 'topology' && (
+          <Field orientation="horizontal" className="w-auto">
+            <Switch
+              id="topology-show-retired"
+              size="sm"
+              checked={filters.showRetired ?? false}
+              onCheckedChange={(showRetired) => onChange({ showRetired })}
+            />
+            <FieldLabel htmlFor="topology-show-retired">Show retired</FieldLabel>
+          </Field>
+        )}
         <ToolbarFilter id="topology-status-filter" label="Status">
           <Select
             value={filters.status}

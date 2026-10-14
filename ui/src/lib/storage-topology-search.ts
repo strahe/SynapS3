@@ -3,6 +3,7 @@ export interface StorageTopologySearchParams {
   status?: string
   provider?: string
   bucket?: string
+  show_retired?: boolean
   chain_data_set_id?: string
   local_data_set_id?: number
   selection_provider?: string
@@ -25,6 +26,13 @@ export function nonNegativeStorageTopologySearchInteger(value: unknown) {
   return parsed
 }
 
+export function storageTopologySearchBoolean(value: unknown) {
+  if (typeof value === 'boolean') return value
+  if (value === 'true') return true
+  if (value === 'false') return false
+  return undefined
+}
+
 export function cleanStorageTopologySearch(search: StorageTopologySearchParams): StorageTopologySearchParams {
   const chainDataSetID = nonEmptyStorageTopologySearchString(search.chain_data_set_id)
   const localDataSetID = nonNegativeStorageTopologySearchInteger(search.local_data_set_id)
@@ -34,6 +42,7 @@ export function cleanStorageTopologySearch(search: StorageTopologySearchParams):
     status: nonEmptyStorageTopologySearchString(search.status),
     provider: nonEmptyStorageTopologySearchString(search.provider),
     bucket: nonEmptyStorageTopologySearchString(search.bucket),
+    show_retired: search.show_retired === true ? true : undefined,
     chain_data_set_id: chainDataSetID,
     local_data_set_id: localDataSetID,
     selection_provider: hasSelection ? nonEmptyStorageTopologySearchString(search.selection_provider) : undefined,
