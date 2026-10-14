@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -13,6 +14,8 @@ import (
 
 func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 	definition := h.copyDefinition(model.TaskTypeStorageTransferPlan)
+	definition.MaxConcurrency = 2
+	definition.Policy.WaitInterval = 30 * time.Second
 	definition.WorkStart = taskengine.WorkStartOnHandler
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)

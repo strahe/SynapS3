@@ -2551,12 +2551,17 @@ func TestInitialPeerPullWaitsForCommittedSourceEvenWithCache(t *testing.T) {
 				return target, nil
 			}
 			plan := bindCopyTask(t, runtime, pipeline.target, taskType)
+			before := time.Now()
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			waiting := waitForTask(t, runtime.repos, plan.ID, func(task *model.Task) bool {
 				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "source"
 			})
-			if delay := waiting.AvailableAt.Sub(waiting.UpdatedAt); delay > handlerTestPollInterval || waiting.RetryCount != 0 {
+			interval := handlerTestPollInterval
+			if taskType == model.TaskTypeStorageTransferPlan {
+				interval = 30 * time.Second
+			}
+			if waiting.AvailableAt.Before(before.Add(interval)) || waiting.AvailableAt.After(time.Now().Add(interval)) || waiting.RetryCount != 0 {
 				t.Fatalf("source dependency wait = %#v", waiting)
 			}
 			copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -3042,75 +3047,90 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 }
 
 func TestDataSetEnsureSchedulesBoundCopyWorkWhenReady(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		policy: cache.EvictionPolicyNone,
-	})
-	sequence := storedObjectSequence.Add(1)
-	bucket := &model.Bucket{Name: fmt.Sprintf("ensure-ready-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
-	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
-		t.Fatalf("create ensure bucket: %v", err)
-	}
-	// Content identity comes first: a data version cannot exist without it.
-	upload, err := runtime.repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
-		BucketID: bucket.ID, ContentSize: 11,
-		Checksum: testutil.StorageChecksum(fmt.Sprintf("ensure-checksum-%d", sequence)), RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("start ensure upload: %v", err)
-	}
-	version := &model.ObjectVersion{
-		VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "ensure-ready.bin", ContentID: &upload.ID, Size: 11,
-		ETag: "etag", ContentType: "application/octet-stream",
-	}
-	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
-		t.Fatalf("create ensure version: %v", err)
-	}
-	providerID := testOnChainID(t, 9000+sequence)
-	binding, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: providerID, CopyIndex: 0, CreatedByContentID: upload.ID,
-	})
-	if err != nil {
-		t.Fatalf("create pending data set: %v", err)
-	}
-	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(t.Context(), upload.ID, []repository.UploadCopyBindingInput{{
-		StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: providerID,
-	}}); err != nil {
-		t.Fatalf("create bound copy: %v", err)
-	}
-	copyRow, err := runtime.repos.Contents.GetUploadCopyForDataSet(t.Context(), upload.ID, binding.ID)
-	if err != nil || copyRow == nil || copyRow.ActiveTaskID != nil {
-		t.Fatalf("bound copy = %#v err=%v", copyRow, err)
-	}
-	ensureTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-		Type:  model.TaskTypeStorageDataSetEnsure,
-		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
-	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
-		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
-	})
-	if err != nil {
-		t.Fatalf("enqueue data set ensure: %v", err)
-	}
-	dataSetID := testOnChainID(t, 10000+sequence)
-	clientDataSetID := testOnChainID(t, 11000+sequence)
-	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
-	}); err != nil {
-		t.Fatalf("mark data set ready: %v", err)
-	}
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-	runtime.repos.Tasks = limited
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, ensureTask.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusCompleted
-	})
-	copyRow, err = runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
-	if err != nil || copyRow == nil || copyRow.ActiveTaskID == nil {
-		t.Fatalf("scheduled copy = %#v err=%v", copyRow, err)
-	}
-	transferTask, err := runtime.repos.Tasks.GetByID(t.Context(), *copyRow.ActiveTaskID)
-	if err != nil || transferTask == nil || transferTask.Type != model.TaskTypeStorageTransferPlan || transferTask.Status != model.TaskStatusPending {
-		t.Fatalf("scheduled transfer task = %#v err=%v", transferTask, err)
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing_task_%t", existing), func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
+			sequence := storedObjectSequence.Add(1)
+			bucket := &model.Bucket{Name: fmt.Sprintf("ensure-ready-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
+			if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
+				t.Fatalf("create ensure bucket: %v", err)
+			}
+			// Content identity comes first: a data version cannot exist without it.
+			upload, err := runtime.repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
+				BucketID: bucket.ID, ContentSize: 11,
+				Checksum: testutil.StorageChecksum(fmt.Sprintf("ensure-checksum-%d", sequence)), RequestedCopies: 1,
+			})
+			if err != nil {
+				t.Fatalf("start ensure upload: %v", err)
+			}
+			version := &model.ObjectVersion{
+				VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "ensure-ready.bin", ContentID: &upload.ID, Size: 11,
+				ETag: "etag", ContentType: "application/octet-stream",
+			}
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+				t.Fatalf("create ensure version: %v", err)
+			}
+			providerID := testOnChainID(t, 9000+sequence)
+			binding, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+				BucketID: bucket.ID, ProviderID: providerID, CopyIndex: 0, CreatedByContentID: upload.ID,
+			})
+			if err != nil {
+				t.Fatalf("create pending data set: %v", err)
+			}
+			if err := runtime.repos.Contents.CreateUploadCopiesForBindings(t.Context(), upload.ID, []repository.UploadCopyBindingInput{{
+				StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: providerID,
+			}}); err != nil {
+				t.Fatalf("create bound copy: %v", err)
+			}
+			copyRow, err := runtime.repos.Contents.GetUploadCopyForDataSet(t.Context(), upload.ID, binding.ID)
+			if err != nil || copyRow == nil || copyRow.ActiveTaskID != nil {
+				t.Fatalf("bound copy = %#v err=%v", copyRow, err)
+			}
+			future := time.Now().Add(time.Hour)
+			var waiting *model.Task
+			if existing {
+				waiting = bindCopyTask(t, runtime, copyRow, model.TaskTypeStorageTransferPlan)
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+					Set("available_at = ?", future).Set("wait_reason = ?", "dataset").
+					Where("id = ?", waiting.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ensureTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+				Type:  model.TaskTypeStorageDataSetEnsure,
+				Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
+			}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+				return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
+			})
+			if err != nil {
+				t.Fatalf("enqueue data set ensure: %v", err)
+			}
+			dataSetID := testOnChainID(t, 10000+sequence)
+			clientDataSetID := testOnChainID(t, 11000+sequence)
+			if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+				ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+			}); err != nil {
+				t.Fatalf("mark data set ready: %v", err)
+			}
+			limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
+			runtime.repos.Tasks = limited
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForTask(t, runtime.repos, ensureTask.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusCompleted
+			})
+			copyRow, err = runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
+			if err != nil || copyRow == nil || copyRow.ActiveTaskID == nil {
+				t.Fatalf("scheduled copy = %#v err=%v", copyRow, err)
+			}
+			transferTask, err := runtime.repos.Tasks.GetByID(t.Context(), *copyRow.ActiveTaskID)
+			if err != nil || transferTask == nil || transferTask.Type != model.TaskTypeStorageTransferPlan || transferTask.Status != model.TaskStatusPending {
+				t.Fatalf("scheduled transfer task = %#v err=%v", transferTask, err)
+			}
+			if existing && (transferTask.ID != waiting.ID || transferTask.AvailableAt.After(time.Now()) || transferTask.RetryCount != waiting.RetryCount) {
+				t.Fatalf("waiting transfer was not woken: %#v", transferTask)
+			}
+		})
 	}
 }
 

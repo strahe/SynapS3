@@ -779,6 +779,7 @@ export interface TaskPolicy {
   invocation_timeout: string
   observation_window: string
   observation_interval?: string
+  wait_interval?: string
   resend_backoff?: {
     initial_delay: string
     maximum_delay: string

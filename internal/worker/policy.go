@@ -23,6 +23,8 @@ type ExecutionPolicy struct {
 	InvocationTimeout   time.Duration  `json:"invocation_timeout"`
 	ObservationWindow   time.Duration  `json:"observation_window"`
 	ObservationInterval time.Duration  `json:"observation_interval,omitempty"`
+	// WaitInterval controls ordinary waits; zero uses the engine poll interval.
+	WaitInterval time.Duration `json:"wait_interval,omitempty"`
 }
 
 func DefaultBackoffPolicy() BackoffPolicy {
@@ -30,7 +32,7 @@ func DefaultBackoffPolicy() BackoffPolicy {
 }
 
 func (p ExecutionPolicy) validate() error {
-	if p.MaxAttempts < 1 || p.InvocationTimeout < 0 || p.ObservationWindow < 0 || p.ObservationInterval < 0 || !p.Backoff.valid() || (p.ResendBackoff != nil && (!p.ResendBackoff.valid() || p.ResendBackoff.Jitter != 0)) {
+	if p.MaxAttempts < 1 || p.InvocationTimeout < 0 || p.WaitInterval < 0 || p.ObservationWindow < 0 || p.ObservationInterval < 0 || !p.Backoff.valid() || (p.ResendBackoff != nil && (!p.ResendBackoff.valid() || p.ResendBackoff.Jitter != 0)) {
 		return ErrInvalidPolicy
 	}
 	return nil

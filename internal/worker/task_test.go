@@ -410,21 +410,30 @@ func TestResendAtRequiresDeclaredDeterministicPolicy(t *testing.T) {
 	}
 }
 
-func TestWaitUsesPollIntervalAndAbsoluteDeadline(t *testing.T) {
-	registry := NewRegistry()
-	if err := registry.Register(scriptedHandler{definition: testDefinition(nil, true)}); err != nil {
-		t.Fatal(err)
-	}
-	engine := &Engine{config: EngineConfig{PollInterval: 17 * time.Second}, registry: registry}
+func TestWaitUsesPolicyIntervalsAndAbsoluteDeadline(t *testing.T) {
 	row := &model.Task{Type: testTaskType}
 	deadline := time.Now().Add(time.Hour)
 	for _, test := range []struct {
-		name     string
-		result   Result
-		deadline time.Time
-		delay    time.Duration
-	}{{"poll", Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil), time.Time{}, 17 * time.Second}, {"observation", WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting", nil), time.Time{}, 30 * time.Second}, {"deadline", WaitUntil(model.TaskResumeModeRecover, deadline, "protocol", "Waiting", nil), deadline, 0}} {
+		name         string
+		result       Result
+		waitInterval time.Duration
+		deadline     time.Time
+		delay        time.Duration
+	}{
+		{name: "poll", result: Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil), delay: 17 * time.Second},
+		{name: "type interval", result: Wait(model.TaskResumeModeExecute, "dependency", "Waiting", nil), waitInterval: 41 * time.Second, delay: 41 * time.Second},
+		{name: "observation", result: WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting", nil), waitInterval: 41 * time.Second, delay: 30 * time.Second},
+		{name: "deadline", result: WaitUntil(model.TaskResumeModeRecover, deadline, "protocol", "Waiting", nil), waitInterval: 41 * time.Second, deadline: deadline},
+		{name: "past deadline", result: WaitUntil(model.TaskResumeModeRecover, time.Now().Add(-time.Hour), "protocol", "Waiting", nil), waitInterval: 41 * time.Second},
+	} {
 		t.Run(test.name, func(t *testing.T) {
+			definition := testDefinition(nil, true)
+			definition.Policy.WaitInterval = test.waitInterval
+			registry := NewRegistry()
+			if err := registry.Register(scriptedHandler{definition: definition}); err != nil {
+				t.Fatal(err)
+			}
+			engine := &Engine{config: EngineConfig{PollInterval: 17 * time.Second}, registry: registry}
 			now := time.Now()
 			transition := engine.transitionFor(row, test.result)
 			if transition.IncrementRetry || transition.Status != model.TaskStatusPending || transition.WaitReason == nil {
@@ -444,19 +453,23 @@ func TestWaitUsesPollIntervalAndAbsoluteDeadline(t *testing.T) {
 	}
 }
 
-func TestRegistryResolvesObservationInterval(t *testing.T) {
+func TestRegistryValidatesWaitIntervals(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		interval time.Duration
-		want     time.Duration
-		invalid  bool
+		name         string
+		waitInterval time.Duration
+		interval     time.Duration
+		want         time.Duration
+		invalid      bool
 	}{
 		{name: "default", want: 30 * time.Second},
-		{name: "explicit", interval: 11 * time.Second, want: 11 * time.Second},
-		{name: "negative", interval: -time.Second, invalid: true},
+		{name: "observation", interval: 11 * time.Second, want: 11 * time.Second},
+		{name: "ordinary", waitInterval: 41 * time.Second, want: 30 * time.Second},
+		{name: "negative observation", interval: -time.Second, invalid: true},
+		{name: "negative ordinary", waitInterval: -time.Second, invalid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			definition := testDefinition(nil, true)
+			definition.Policy.WaitInterval = tc.waitInterval
 			definition.Policy.ObservationInterval = tc.interval
 			registry := NewRegistry()
 			err := registry.Register(scriptedHandler{definition: definition})
@@ -470,12 +483,13 @@ func TestRegistryResolvesObservationInterval(t *testing.T) {
 				t.Fatal(err)
 			}
 			registered, ok := registry.Definition(testTaskType)
-			if !ok || registered.Policy.ObservationInterval != tc.want || definition.Policy.ObservationInterval != tc.interval {
+			if !ok || registered.Policy.ObservationInterval != tc.want || registered.Policy.WaitInterval != tc.waitInterval || definition.Policy.ObservationInterval != tc.interval || definition.Policy.WaitInterval != tc.waitInterval {
 				t.Fatalf("registered policy=%#v input=%#v", registered.Policy, definition.Policy)
 			}
 			registered.Policy.ObservationInterval = time.Hour
+			registered.Policy.WaitInterval = time.Hour
 			again, _ := registry.Definition(testTaskType)
-			if again.Policy.ObservationInterval != tc.want {
+			if again.Policy.ObservationInterval != tc.want || again.Policy.WaitInterval != tc.waitInterval {
 				t.Fatal("returned policy changed registry")
 			}
 		})
