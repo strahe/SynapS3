@@ -434,7 +434,7 @@ func (heldAcknowledgeTaskRepo) AcknowledgeFailed(context.Context, int64) error {
 	return repository.ErrConflict
 }
 
-// A stopped Submit batch task carries the confirmation it holds and offers
+// A stopped Commit batch task carries the confirmation it holds and offers
 // Retry instead of a dismissal, which is refused.
 func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	fixture := newAdminTaskFixture(t)

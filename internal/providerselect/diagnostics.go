@@ -12,6 +12,7 @@ type ExclusionReason string
 
 const (
 	ExclusionBucketInUse       ExclusionReason = "bucket_in_use"
+	ExclusionPreviouslyUsed    ExclusionReason = "previously_used"
 	ExclusionContextOpenFailed ExclusionReason = "context_open_failed"
 	ExclusionSelected          ExclusionReason = "selected_this_round"
 )
@@ -19,7 +20,7 @@ const (
 func (r ExclusionReason) Valid() bool {
 	//exhaustive:enforce
 	switch r {
-	case ExclusionBucketInUse, ExclusionContextOpenFailed, ExclusionSelected:
+	case ExclusionBucketInUse, ExclusionPreviouslyUsed, ExclusionContextOpenFailed, ExclusionSelected:
 		return true
 	default:
 		return false
@@ -149,7 +150,7 @@ func exclusionReason(reason ExclusionReason) string {
 	switch reason {
 	case "", ExclusionSelected:
 		return ""
-	case ExclusionBucketInUse, ExclusionContextOpenFailed:
+	case ExclusionBucketInUse, ExclusionPreviouslyUsed, ExclusionContextOpenFailed:
 		return string(reason)
 	default:
 		return "provider_unavailable"
@@ -179,7 +180,8 @@ func candidateRejectionReason(c Candidate) string {
 
 func allTrustedInUse(admission Admission, excluded map[string]ExclusionReason) bool {
 	return len(admission.TrustedIDs) > 0 && !slices.ContainsFunc(admission.TrustedIDs, func(id types.OnChainID) bool {
-		return excluded[id.String()] != ExclusionBucketInUse
+		reason := excluded[id.String()]
+		return reason != ExclusionBucketInUse && reason != ExclusionPreviouslyUsed
 	})
 }
 
@@ -238,7 +240,9 @@ func inspectSelection(in Inventory, count int, excluded map[string]ExclusionReas
 }
 
 func hasTemporaryRejection(rejections []ProviderRejection) bool {
-	return slices.ContainsFunc(rejections, func(r ProviderRejection) bool { return r.Reason != string(ExclusionBucketInUse) })
+	return slices.ContainsFunc(rejections, func(r ProviderRejection) bool {
+		return r.Reason != string(ExclusionBucketInUse) && r.Reason != string(ExclusionPreviouslyUsed)
+	})
 }
 
 func refreshNeeded(rejections []ProviderRejection, relevant func(types.OnChainID) bool) bool {

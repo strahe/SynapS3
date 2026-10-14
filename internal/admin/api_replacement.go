@@ -383,6 +383,16 @@ func (s *Server) resolveReplacementProvider(ctx context.Context, bucket *model.B
 		}
 		return *requestedID, admission, nil
 	}
+	bindings, err := s.repos.Contents.ListDataSetBindings(ctx, bucket.ID)
+	if err != nil {
+		return idtypes.OnChainID{}, admission, err
+	}
+	for _, binding := range bindings {
+		key := binding.ProviderID.String()
+		if excluded[key] != providerselect.ExclusionBucketInUse {
+			excluded[key] = providerselect.ExclusionPreviouslyUsed
+		}
+	}
 	in := providerselect.Inventory{Admission: admission}
 	for _, candidate := range candidates {
 		if candidate.Eligible && candidate.Profile != nil {
@@ -520,7 +530,7 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 		})
 	case errors.Is(err, storagereplacement.ErrNoEligibleProvider):
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "no provider is currently eligible for automatic replacement",
+			"error": "Could not choose an unused provider. Choose a provider manually.",
 			"code":  code,
 		})
 	case errors.Is(err, storagereplacement.ErrTargetUnavailable):

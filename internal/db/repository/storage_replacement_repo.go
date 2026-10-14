@@ -81,21 +81,21 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		if source.ProviderID.Equal(input.TargetProviderID) {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrInvalidTarget)
 		}
-		// Any generation that has not been retired still holds this provider's
-		// data set for the bucket. Preparing a second one would make the SDK
-		// hand back the same data set and collide on the provider/data set
-		// uniqueness, so the choice is refused up front with a typed error
-		// rather than failing later inside the worker.
-		inUse, err := db.NewSelect().
+		// Unretired generations reserve the provider across all replica slots.
+		var total, inUse int
+		err = db.NewSelect().
 			Model((*model.StorageDataSet)(nil)).
+			ColumnExpr("COUNT(*), COUNT(*) FILTER (WHERE status <> ?)", model.StorageDataSetStatusRetired).
 			Where("bucket_id = ? AND provider_id = ?", input.BucketID, input.TargetProviderID).
-			Where("status <> ?", model.StorageDataSetStatusRetired).
-			Count(ctx)
+			Scan(ctx, &total, &inUse)
 		if err != nil {
 			return fmt.Errorf("checking replacement target provider: %w", err)
 		}
 		if inUse > 0 {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrTargetInUse)
+		}
+		if input.SelectionMode == storagereplacement.SelectionModeAutomatic && total > 0 {
+			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrNoEligibleProvider)
 		}
 		if err := abandonUnsentReplacementTargets(ctx, db, source.ID); err != nil {
 			return err

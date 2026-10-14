@@ -113,8 +113,7 @@ const replacementErrorMessages: Record<string, string> = {
     'The earlier replacement of this replica is still setting up its new data set. Wait for it to finish, or retry that setup from Tasks if it stopped.',
   replacement_target_in_use: 'That provider already stores a replica of this bucket. Choose a different one.',
   replacement_target_invalid: 'Choose a provider other than the one being replaced.',
-  replacement_no_eligible_provider:
-    'No unused storage provider is available right now. Try again later or choose an available provider.',
+  replacement_no_eligible_provider: 'Could not choose an unused provider. Choose a provider manually.',
   replacement_target_unavailable: 'That provider is not available for replacement right now. Choose another provider.',
   approval_check_unavailable: 'Could not check provider requirements. Try again.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',

@@ -266,7 +266,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 一个批次用一个签名请求把写入同一数据集的一个或多个 piece 提交上链。存储提供方拒绝该批次、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对这些 piece 是否已添加。未添加时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方报告该请求仍在处理时，SynapS3 会继续等待。存储提供方拒绝该请求时会稍后再试；批次确认前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他数据集时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。自动恢复受当前执行轮次的有限预算限制；预算耗尽后保留批次证据，供人工 Retry。
 
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的批次，也包括超过 15 分钟仍未确认、SynapS3 仍在继续尝试的批次：批次（`request_id`）、所属任务（`task_id`）、存储提供方和数据集、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Submit batch 任务上显示同样的批次。对已停止的批次，使用 `POST /api/v1/tasks/{id}/retry` 重试；新一轮执行基于已保存的批次证据继续恢复。
+`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的批次，也包括超过 15 分钟仍未确认、SynapS3 仍在继续尝试的批次：批次（`request_id`）、所属任务（`task_id`）、存储提供方和数据集、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Commit batch 任务上显示同样的批次。对已停止的批次，使用 `POST /api/v1/tasks/{id}/retry` 重试；新一轮执行基于已保存的批次证据继续恢复。
 
 ### 失败副本恢复
 
@@ -289,7 +289,7 @@ Provenance 副本和替换详情提供 `retryable`、`retry_task_id`，使用该
 
 `POST /api/v1/tasks/{id}/retry` 无需请求体，返回 `202 {"task_id":456}`。自动重试留在原轮次；手动 Retry 创建后继，获得新的策略和独立预算。重复请求返回同一后继。任务不存在返回 404，来源已过时或恢复不安全返回 409，并说明原因。临时事务竞争返回 503，可重试请求。
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表和详情均检查当前恢复条件；详情还可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。批次需要处理的 Submit batch 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表和详情均检查当前恢复条件；详情还可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。批次需要处理的 Commit batch 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
 
 列表和统计默认使用 `scope=work`：Pending、Running 和未确认失败。`scope=history` 包含完成、取消、已确认和已被替代的执行轮次，也包含周期任务。`work` 的状态筛选支持 `pending`、`running`、`failed`；`history` 支持 `completed`、`cancelled`、`failed`。无效范围或不属于该范围的状态返回 400。确认将失败移入 `history`，保留 Failed 结果和 Retry 资格；历史永久保存。Tasks 页面把 `work` 显示为 Open，把 `history` 显示为 Closed。
 
