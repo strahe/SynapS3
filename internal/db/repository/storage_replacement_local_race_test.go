@@ -42,6 +42,58 @@ func TestPostgresRemoteSourceCannotCompleteLocally(t *testing.T) {
 	remoteSourceCannotCompleteLocally(t, testDB(t))
 }
 
+func TestPostgresAutomaticReplacementsReserveTargetAcrossReplicas(t *testing.T) {
+	db := testDB(t)
+	repos, firstSource, _ := localReplacementSource(t, db, "automatic-target-race")
+	testutil.OpenBucketReplicaSlots(t, db, firstSource.BucketID, 2)
+	secondSource, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: firstSource.BucketID, ProviderID: onChainID(t, "303"), CopyIndex: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	markSourceReady(t, repos, secondSource.ID)
+	hold := newPostgresRaceHold("first", func(query string) bool {
+		return strings.Contains(query, "buckets") && strings.Contains(query, "for no key update")
+	})
+	testutil.AddQueryHook(db, hold)
+	defer hold.Release()
+	firstInput := repository.AuthorizeReplacementInput{
+		BucketID: firstSource.BucketID, SourceDataSetID: firstSource.ID,
+		SelectionMode: storagereplacement.SelectionModeAutomatic, TargetProviderID: onChainID(t, "202"), ClientRequestID: "first",
+	}
+	secondInput := firstInput
+	secondInput.SourceDataSetID, secondInput.ClientRequestID = secondSource.ID, "second"
+	firstResult, secondResult := make(chan error, 1), make(chan error, 1)
+	var first *storagereplacement.Replacement
+	go func() {
+		var err error
+		first, _, err = repos.Replacements.Authorize(postgresRaceContext(t.Context(), "first"), firstInput)
+		firstResult <- err
+	}()
+	waitPostgresSignal(t, hold.reached, "first authorization acquired the bucket lock")
+	go func() {
+		_, _, err := repos.Replacements.Authorize(t.Context(), secondInput)
+		secondResult <- err
+	}()
+	waitForPostgresLockWait(t, db, "buckets")
+	hold.Release()
+	if err := waitPostgresResult(t, firstResult, "first authorization"); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitPostgresResult(t, secondResult, "second authorization"); !errors.Is(err, storagereplacement.ErrTargetInUse) {
+		t.Fatalf("second authorization = %v, want target in use", err)
+	}
+	replacements, err := repos.Replacements.ListForBucket(t.Context(), firstSource.BucketID, 0)
+	if err != nil || len(replacements) != 1 || replacements[0].ID != first.ID {
+		t.Fatalf("authorized replacements = %#v, err=%v", replacements, err)
+	}
+	replayed, created, err := repos.Replacements.Authorize(t.Context(), firstInput)
+	if err != nil || created || replayed.ID != first.ID || replayed.TargetDataSetID != first.TargetDataSetID {
+		t.Fatalf("automatic replay = %#v, created=%v, err=%v", replayed, created, err)
+	}
+}
+
 func TestPostgresUncreatedReplacementSerializesWithCreatePermission(t *testing.T) {
 	for _, first := range []string{"replacement", "creation"} {
 		t.Run(first, func(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
+	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
@@ -270,26 +271,175 @@ func TestReplacementAutomaticSkipsRevokedApproval(t *testing.T) {
 	}
 }
 
-func TestReplacementAutomaticReusesRetiredProvider(t *testing.T) {
-	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
-	if _, err := fixture.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
-		Set("generation = 2").Where("id = ?", fixture.source.ID).Exec(t.Context()); err != nil {
-		t.Fatalf("advance current generation: %v", err)
+func TestReplacementSelectionRespectsBucketHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		mode             string
+		copyIndex        int
+		otherBucket      bool
+		onlyHistory      bool
+		unretired        bool
+		missingHistory   bool
+		unhealthyHistory bool
+		wantManualHint   bool
+		tier             providerselect.Tier
+		wantProvider     string
+		wantCode         string
+	}{
+		{name: "automatic skips same replica history", mode: "automatic", tier: providerselect.TierApproved, wantProvider: "303"},
+		{name: "automatic skips retired history on another replica slot", mode: "automatic", copyIndex: 2, tier: providerselect.TierApproved, wantProvider: "303"},
+		{name: "automatic accepts another bucket provider", mode: "automatic", otherBucket: true, onlyHistory: true, tier: providerselect.TierApproved, wantProvider: "202"},
+		{name: "automatic history exhausted", mode: "automatic", onlyHistory: true, tier: providerselect.TierNone, wantCode: storagereplacement.CodeNoEligibleProvider},
+		{name: "automatic required tier exhausted", mode: "automatic", onlyHistory: true, wantManualHint: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "automatic required history without observation", mode: "automatic", missingHistory: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "automatic required history unhealthy", mode: "automatic", onlyHistory: true, unhealthyHistory: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "automatic required history still in use", mode: "automatic", onlyHistory: true, unretired: true, tier: providerselect.TierApproved, wantCode: "required_provider_unavailable"},
+		{name: "manual permits retired history", mode: "manual", onlyHistory: true, tier: providerselect.TierApproved, wantProvider: "202"},
+		{name: "manual rejects unretired history", mode: "manual", onlyHistory: true, unretired: true, tier: providerselect.TierApproved, wantCode: storagereplacement.CodeTargetInUse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			providers := []string{"202", "303"}
+			if tc.onlyHistory {
+				providers = providers[:1]
+			}
+			if tc.missingHistory {
+				providers = []string{"303"}
+			}
+			fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: providers})
+			fixture.srv.WithProviderTier(tc.tier)
+			if tc.unhealthyHistory {
+				if err := fixture.srv.repos.Observability.UpsertProviderObservation(t.Context(), time.Now().UTC(), observability.ProviderState{
+					ProviderID: onChainIDValue("202"), Status: observability.StatusUnavailable,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.missingHistory {
+				if _, err := fixture.srv.repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), []idtypes.OnChainID{onChainIDValue("202")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := fixture.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+				Set("generation = 2").Where("id = ?", fixture.source.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			bucketID := fixture.bucket.ID
+			if tc.otherBucket {
+				other := &model.Bucket{Name: "other-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+				if err := fixture.srv.repos.Buckets.Create(t.Context(), other); err != nil {
+					t.Fatal(err)
+				}
+				bucketID = other.ID
+			}
+			status := model.StorageDataSetStatusRetired
+			if tc.unretired {
+				status = model.StorageDataSetStatusFailed
+			}
+			previous := &model.StorageDataSet{
+				BucketID: bucketID, ProviderID: onChainIDValue("202"), CopyIndex: tc.copyIndex,
+				Generation: 1, IsCurrent: false, Status: status,
+			}
+			testutil.OpenBucketReplicaSlots(t, fixture.srv.db, bucketID, tc.copyIndex+1)
+			if _, err := fixture.srv.db.NewInsert().Model(previous).Exec(t.Context()); err != nil {
+				t.Fatalf("seed provider history: %v", err)
+			}
+
+			body := `{"mode":"` + tc.mode + `"}`
+			if tc.mode == "manual" {
+				body = `{"mode":"manual","provider_id":"202"}`
+			}
+			rec := fixture.start(t, body)
+			if tc.wantCode == "" {
+				if rec.Code != http.StatusCreated {
+					t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+				}
+				if got := decodeReplacement(t, rec).Target.ProviderID; got != tc.wantProvider {
+					t.Fatalf("provider = %s, want %s", got, tc.wantProvider)
+				}
+				return
+			}
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d body=%s, want 409", rec.Code, rec.Body.String())
+			}
+			apiError := decodeAPIError(t, rec)
+			if apiError["code"] != tc.wantCode {
+				t.Fatalf("code = %q, want %q", apiError["code"], tc.wantCode)
+			}
+			if tc.wantCode == storagereplacement.CodeNoEligibleProvider && apiError["error"] != "Could not choose an unused provider. Choose a provider manually." {
+				t.Fatalf("error = %q", apiError["error"])
+			}
+			if tc.wantCode == "required_provider_unavailable" {
+				wantMessage := "Replacement must retain a provider that meets the configured requirement"
+				if tc.wantManualHint {
+					wantMessage = "Could not choose an unused provider that meets the configured requirement. Choose a provider manually."
+				}
+				if apiError["error"] != wantMessage {
+					t.Fatalf("error = %q, want %q", apiError["error"], wantMessage)
+				}
+			}
+			bindings, err := fixture.srv.repos.Contents.ListDataSetBindings(t.Context(), fixture.bucket.ID)
+			if err != nil || len(bindings) != 2 {
+				t.Fatalf("data sets after rejection = %#v, err=%v", bindings, err)
+			}
+			replacements, err := fixture.srv.repos.Replacements.ListForBucket(t.Context(), fixture.bucket.ID, 0)
+			if err != nil || len(replacements) != 0 {
+				t.Fatalf("replacements after rejection = %#v, err=%v", replacements, err)
+			}
+			tasks, err := fixture.srv.db.NewSelect().Model((*model.Task)(nil)).Count(t.Context())
+			if err != nil || tasks != 0 {
+				t.Fatalf("tasks after rejection = %d, err=%v", tasks, err)
+			}
+		})
 	}
-	previous := &model.StorageDataSet{
-		BucketID: fixture.bucket.ID, ProviderID: onChainIDValue("202"), CopyIndex: 0,
-		Generation: 1, IsCurrent: false, Status: model.StorageDataSetStatusRetired,
-	}
-	if _, err := fixture.srv.db.NewInsert().Model(previous).Exec(t.Context()); err != nil {
-		t.Fatalf("seed retired provider: %v", err)
-	}
-	candidates, err := fixture.srv.replacementProviderCandidates(t.Context(), fixture.bucket, fixture.source)
-	if err != nil || len(candidates) != 1 || !candidates[0].Eligible || !candidates[0].PreviouslyUsed || !candidates[0].ApprovedFresh || candidates[0].Profile == nil || !candidates[0].Profile.Approved {
-		t.Fatalf("retired candidate = %#v, err=%v", candidates, err)
-	}
-	rec := fixture.start(t, `{"mode":"automatic"}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d body=%s, want provider reuse", rec.Code, rec.Body.String())
+}
+
+func TestReplacementAuthorizationRechecksHistoryAfterSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status model.StorageDataSetStatus
+		want   error
+	}{
+		{name: "retired target", status: model.StorageDataSetStatusRetired, want: storagereplacement.ErrNoEligibleProvider},
+		{name: "unretired target", status: model.StorageDataSetStatusFailed, want: storagereplacement.ErrTargetInUse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+			ctx := t.Context()
+			selected, admission, err := fixture.srv.resolveReplacementProvider(ctx, fixture.bucket, fixture.source, storagereplacement.SelectionModeAutomatic, "")
+			if err != nil || selected.String() != "202" {
+				t.Fatalf("selection = %s, err=%v", selected, err)
+			}
+			history := &model.StorageDataSet{
+				BucketID: fixture.bucket.ID, ProviderID: selected, CopyIndex: 2,
+				Generation: 1, Status: tc.status,
+			}
+			testutil.OpenBucketReplicaSlots(t, fixture.srv.db, fixture.bucket.ID, 3)
+			if _, err := fixture.srv.db.NewInsert().Model(history).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			err = fixture.srv.repos.WithTx(ctx, func(repos *repository.Repositories) error {
+				if err := repos.ValidateProviderSelection(ctx, fixture.bucket.ID, fixture.source.ID, admission, []idtypes.OnChainID{selected}); err != nil {
+					return err
+				}
+				_, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+					BucketID: fixture.bucket.ID, SourceDataSetID: fixture.source.ID,
+					SelectionMode: storagereplacement.SelectionModeAutomatic, TargetProviderID: selected,
+					ClientRequestID: "history-after-selection",
+				})
+				return err
+			})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("authorization = %v, want %v", err, tc.want)
+			}
+			replacements, err := fixture.srv.repos.Replacements.ListForBucket(ctx, fixture.bucket.ID, 0)
+			if err != nil || len(replacements) != 0 {
+				t.Fatalf("replacements after rejection = %#v, err=%v", replacements, err)
+			}
+			bindings, err := fixture.srv.repos.Contents.ListDataSetBindings(ctx, fixture.bucket.ID)
+			if err != nil || len(bindings) != 2 {
+				t.Fatalf("data sets after rejection = %#v, err=%v", bindings, err)
+			}
+		})
 	}
 }
 
@@ -320,7 +470,7 @@ func TestReplacementManualAllowsNegativeApprovalWithoutTierRequirement(t *testin
 func TestReplacementConcurrentIdempotentReplay(t *testing.T) {
 	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
 	fixture.srv.WithProviderReplacement(NewStorageProviderSelector(fixture.srv.observability))
-	body := `{"mode":"manual","provider_id":"202","client_request_id":"concurrent-replay","price_list_fingerprint":"` + fixture.priceFingerprint + `"}`
+	body := `{"mode":"automatic","client_request_id":"concurrent-replay","price_list_fingerprint":"` + fixture.priceFingerprint + `"}`
 	path := "/api/v1/buckets/" + fixture.bucket.Name + "/data-sets/" + strconv.FormatInt(fixture.source.ID, 10) + "/replacement"
 	start := make(chan struct{})
 	results := make([]*httptest.ResponseRecorder, 2)
@@ -570,9 +720,10 @@ func TestAPIStartDataSetReplacementRejectsSecondConfirmation(t *testing.T) {
 }
 
 func TestAPIRetryStorageReplacementStates(t *testing.T) {
-	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	selector := &stubProviderSelector{providers: []string{"202"}}
+	fixture := newReplacementAPIFixture(t, selector)
 	ctx := context.Background()
-	rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
+	rec := fixture.start(t, `{"mode":"automatic"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("confirmation status = %d", rec.Code)
 	}
@@ -601,6 +752,7 @@ func TestAPIRetryStorageReplacementStates(t *testing.T) {
 	if _, err := fixture.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("failure_reason = ?", "replacement_failed").Where("id = ?", sourceID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
+	selector.providers = []string{"303"}
 	out = retry()
 	if out.Code != http.StatusAccepted {
 		t.Fatalf("retry after failure = %d %s", out.Code, out.Body.String())
@@ -611,6 +763,10 @@ func TestAPIRetryStorageReplacementStates(t *testing.T) {
 	decodeJSON(t, out, &started)
 	if started.TaskID == sourceID || started.TaskID == 0 {
 		t.Fatalf("retry did not create new round: %#v", started)
+	}
+	resumed, err := fixture.srv.repos.Replacements.GetByID(ctx, created.ID)
+	if err != nil || resumed.TargetDataSetID != created.Target.ID || selector.calls != 1 {
+		t.Fatalf("retry changed target: replacement=%#v inventory calls=%d err=%v", resumed, selector.calls, err)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/999999/retry", nil)

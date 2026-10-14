@@ -24,18 +24,13 @@ type replacementProviderCandidate struct {
 	ApprovedFresh    bool
 	Eligible         bool
 	IneligibleReason string
-	// PreviouslyUsed marks a provider used by this bucket before; once all its
-	// data sets retire, it can be selected again without a ranking penalty.
+	// PreviouslyUsed excludes a provider from automatic replacement; manual
+	// selection permits reuse when all of its data sets in the bucket are retired.
 	PreviouslyUsed bool
 }
 
-// replacementProviderCandidates applies the bucket and source rules shared by
-// manual and automatic selection.
-//
-// The rules follow StorageReplacementRepository.Authorize: the generation being
-// replaced cannot replace itself, and a provider still holding an unretired
-// generation of this bucket would collide with it. A provider whose earlier
-// generations are all retired is choosable again.
+// replacementProviderCandidates lists manual choices and bucket usage for
+// automatic selection. Unretired generations reserve their provider for the bucket.
 func replacementProviderCandidates(
 	providers []idtypes.OnChainID,
 	bindings []model.StorageDataSet,

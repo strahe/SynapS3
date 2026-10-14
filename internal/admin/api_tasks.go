@@ -305,25 +305,25 @@ func taskOperationLabel(taskType model.TaskType) string {
 	case model.TaskTypeStorageStore:
 		return "Upload data"
 	case model.TaskTypeStoragePull:
-		return "Copy data"
+		return "Replicate data"
 	case model.TaskTypeStorageCommit:
-		return "Submit batch"
+		return "Commit batch"
 	case model.TaskTypeProviderReplacementCoordinate:
 		return "Replace provider"
 	case model.TaskTypeCacheCapacityReconcile:
-		return "Manage cache"
+		return "Manage cache capacity"
 	case model.TaskTypeCacheEvict:
-		return "Clear cache"
+		return "Release cache"
 	case model.TaskTypeCacheReconcileDurability:
-		return "Apply cache policy"
+		return "Recheck cache release"
 	case model.TaskTypeStorageCleanup:
-		return "Delete remote replicas"
+		return "Clean up deleted data"
 	case model.TaskTypeStorageDataSetRetire:
-		return "Close data set"
+		return "Terminate data set"
 	case model.TaskTypeWalletOperation:
 		return "Wallet operation"
 	case model.TaskTypeObservabilityRefresh:
-		return "Refresh health"
+		return "Refresh storage health"
 	case model.TaskTypeApprovedProviderRefresh:
 		return "Refresh approved providers"
 	case model.TaskTypeEndorsedProviderRefresh:

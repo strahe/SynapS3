@@ -20,7 +20,7 @@ import {
   Upload,
   UserRound,
 } from 'lucide-react'
-import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ChangeEvent, Fragment, type ReactNode, useEffect, useId, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   APIError,
@@ -80,7 +80,7 @@ import {
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb'
 import { Button } from '@/components/ui/button'
-import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -95,6 +95,7 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -1238,6 +1239,7 @@ function BucketStorageTab({
         onOpenLastError={setReplacementError}
       />
       <BucketStorageDataSets
+        key={bucket.name}
         bucketName={bucket.name}
         dataSets={bucket.data_sets ?? []}
         onReviewStorageRisk={onReviewStorageDataSetRisk}
@@ -2052,6 +2054,12 @@ function BucketStorageDataSets({
 }) {
   const refreshStorageHealth = useRefreshDataSetStorageHealth()
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [showRetired, setShowRetired] = useState(false)
+  const showRetiredID = useId()
+  const visibleDataSets = showRetired
+    ? dataSets
+    : dataSets.filter((dataSet) => dataSet.is_current || dataSet.status !== 'retired')
+  const hiddenRetiredCount = dataSets.length - visibleDataSets.length
 
   if (dataSets.length === 0) {
     return (
@@ -2065,9 +2073,13 @@ function BucketStorageDataSets({
 
   return (
     <Card size="sm">
-      <CardHeader>
+      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-3">
         <CardTitle>Data sets</CardTitle>
-        <CardAction>
+        <CardAction className="flex flex-wrap items-center gap-3">
+          <Field orientation="horizontal" className="w-auto">
+            <Switch id={showRetiredID} size="sm" checked={showRetired} onCheckedChange={setShowRetired} />
+            <FieldLabel htmlFor={showRetiredID}>Show retired</FieldLabel>
+          </Field>
           <Button
             type="button"
             variant="outline"
@@ -2091,6 +2103,12 @@ function BucketStorageDataSets({
             Check now
           </Button>
         </CardAction>
+        {hiddenRetiredCount > 0 && (
+          <CardDescription className="basis-full">
+            Storage health includes {formatNumber(hiddenRetiredCount)} hidden retired data{' '}
+            {hiddenRetiredCount === 1 ? 'set' : 'sets'}.
+          </CardDescription>
+        )}
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {refreshError && (
@@ -2099,125 +2117,129 @@ function BucketStorageDataSets({
             <span>{refreshError}</span>
           </div>
         )}
-        <DataTableFrame>
-          <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
-            <Table className="min-w-[860px] table-fixed">
-              <TableHeader>
-                <TableRow className={tableHeaderRowClassName}>
-                  <TableHead className="w-[10%] px-4">Replica</TableHead>
-                  <TableHead className="w-[18%] px-4">Provider</TableHead>
-                  <TableHead className="w-[12%] px-4">Data set</TableHead>
-                  <TableHead className="w-[19%] px-4">Storage health</TableHead>
-                  <TableHead className="w-[17%] px-4">Impact</TableHead>
-                  <TableHead
-                    className="w-[8%] px-2 text-right"
-                    aria-label="Current object versions referencing this data set"
-                  >
-                    Current
-                  </TableHead>
-                  <TableHead
-                    className="w-[9%] px-2 text-right"
-                    aria-label="Total non-delete-marker versions referencing this data set"
-                  >
-                    Total
-                  </TableHead>
-                  <TableHead className="w-[6%] px-4 text-right">
-                    <span className="sr-only">Actions</span>
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {dataSets.map((dataSet) => {
-                  const topologyLink = bucketStorageDataSetTopologyLinkModel(bucketName, dataSet)
-                  const link = (
-                    <Link
-                      to="/storage-topology"
-                      search={topologyLink.search}
-                      className="block min-w-0 max-w-full truncate font-mono text-xs hover:text-foreground hover:underline"
+        {visibleDataSets.length === 0 ? (
+          <EmptyState icon={<Database />} title="All data sets are retired" />
+        ) : (
+          <DataTableFrame>
+            <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
+              <Table className="min-w-[860px] table-fixed">
+                <TableHeader>
+                  <TableRow className={tableHeaderRowClassName}>
+                    <TableHead className="w-[10%] px-4">Replica</TableHead>
+                    <TableHead className="w-[18%] px-4">Provider</TableHead>
+                    <TableHead className="w-[12%] px-4">Data set</TableHead>
+                    <TableHead className="w-[19%] px-4">Storage health</TableHead>
+                    <TableHead className="w-[17%] px-4">Impact</TableHead>
+                    <TableHead
+                      className="w-[8%] px-2 text-right"
+                      aria-label="Current object versions referencing this data set"
                     >
-                      {topologyLink.label}
-                    </Link>
-                  )
+                      Current
+                    </TableHead>
+                    <TableHead
+                      className="w-[9%] px-2 text-right"
+                      aria-label="Total non-delete-marker versions referencing this data set"
+                    >
+                      Total
+                    </TableHead>
+                    <TableHead className="w-[6%] px-4 text-right">
+                      <span className="sr-only">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {visibleDataSets.map((dataSet) => {
+                    const topologyLink = bucketStorageDataSetTopologyLinkModel(bucketName, dataSet)
+                    const link = (
+                      <Link
+                        to="/storage-topology"
+                        search={topologyLink.search}
+                        className="block min-w-0 max-w-full truncate font-mono text-xs hover:text-foreground hover:underline"
+                      >
+                        {topologyLink.label}
+                      </Link>
+                    )
 
-                  return (
-                    <TableRow key={dataSet.id}>
-                      <TableCell className="overflow-hidden px-4">
-                        <span className="block max-w-full truncate font-medium">
-                          {replicaLabel(dataSet.copy_index)}
-                        </span>
-                        <StatusBadge
-                          tone={dataSetGenerationTone(dataSet)}
-                          className="mt-1 max-w-full truncate"
-                          title={dataSetGenerationLabel(dataSet)}
-                        >
-                          {dataSetGenerationLabel(dataSet)}
-                        </StatusBadge>
-                      </TableCell>
-                      <TableCell className="overflow-hidden px-4">
-                        <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
-                      </TableCell>
-                      <TableCell className="overflow-hidden px-4 text-muted-foreground">
-                        {topologyLink.copyValue ? (
-                          <CopyableValue label="Data set ID" value={topologyLink.copyValue} monospace maxLength={24}>
-                            {link}
-                          </CopyableValue>
-                        ) : (
-                          link
-                        )}
-                      </TableCell>
-                      <TableCell className="overflow-hidden px-4">
-                        <DataSetStorageHealthCell dataSet={dataSet} />
-                        {dataSetSetupMessage(dataSet) && (
-                          <p
-                            className="mt-1 truncate text-xs text-muted-foreground"
-                            title={dataSetSetupMessage(dataSet) ?? undefined}
+                    return (
+                      <TableRow key={dataSet.id}>
+                        <TableCell className="overflow-hidden px-4">
+                          <span className="block max-w-full truncate font-medium">
+                            {replicaLabel(dataSet.copy_index)}
+                          </span>
+                          <StatusBadge
+                            tone={dataSetGenerationTone(dataSet)}
+                            className="mt-1 max-w-full truncate"
+                            title={dataSetGenerationLabel(dataSet)}
                           >
-                            {dataSetSetupMessage(dataSet)}
-                          </p>
-                        )}
-                      </TableCell>
-                      <TableCell className="overflow-hidden px-4">
-                        <DataSetImpactCell dataSet={dataSet} />
-                      </TableCell>
-                      <TableCell
-                        className="px-2 text-right text-muted-foreground"
-                        aria-label={`Current object versions referencing this data set: ${formatNumber(dataSet.current_version_count)}`}
-                        title="Current object versions referencing this data set"
-                      >
-                        {formatNumber(dataSet.current_version_count)}
-                      </TableCell>
-                      <TableCell
-                        className="px-2 text-right text-muted-foreground"
-                        aria-label={`Total non-delete-marker versions referencing this data set: ${formatNumber(dataSet.referenced_version_count)}`}
-                        title="Total non-delete-marker versions referencing this data set"
-                      >
-                        {formatNumber(dataSet.referenced_version_count)}
-                      </TableCell>
-                      <TableCell className="px-4 text-right">
-                        {(dataSetNeedsStorageRiskReview(dataSet) || dataSet.replaceable) && (
-                          <RowActionsMenu label={replicaLabel(dataSet.copy_index)}>
-                            {dataSetNeedsStorageRiskReview(dataSet) && (
-                              <RowActionItem onSelect={() => onReviewStorageRisk(dataSet.id)}>
-                                <TriangleAlert data-icon="inline-start" />
-                                Review affected versions
-                              </RowActionItem>
-                            )}
-                            {dataSet.replaceable && (
-                              <RowActionItem onSelect={() => onReplaceProvider(dataSet)}>
-                                <Repeat2 data-icon="inline-start" />
-                                Replace provider
-                              </RowActionItem>
-                            )}
-                          </RowActionsMenu>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-        </DataTableFrame>
+                            {dataSetGenerationLabel(dataSet)}
+                          </StatusBadge>
+                        </TableCell>
+                        <TableCell className="overflow-hidden px-4">
+                          <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
+                        </TableCell>
+                        <TableCell className="overflow-hidden px-4 text-muted-foreground">
+                          {topologyLink.copyValue ? (
+                            <CopyableValue label="Data set ID" value={topologyLink.copyValue} monospace maxLength={24}>
+                              {link}
+                            </CopyableValue>
+                          ) : (
+                            link
+                          )}
+                        </TableCell>
+                        <TableCell className="overflow-hidden px-4">
+                          <DataSetStorageHealthCell dataSet={dataSet} />
+                          {dataSetSetupMessage(dataSet) && (
+                            <p
+                              className="mt-1 truncate text-xs text-muted-foreground"
+                              title={dataSetSetupMessage(dataSet) ?? undefined}
+                            >
+                              {dataSetSetupMessage(dataSet)}
+                            </p>
+                          )}
+                        </TableCell>
+                        <TableCell className="overflow-hidden px-4">
+                          <DataSetImpactCell dataSet={dataSet} />
+                        </TableCell>
+                        <TableCell
+                          className="px-2 text-right text-muted-foreground"
+                          aria-label={`Current object versions referencing this data set: ${formatNumber(dataSet.current_version_count)}`}
+                          title="Current object versions referencing this data set"
+                        >
+                          {formatNumber(dataSet.current_version_count)}
+                        </TableCell>
+                        <TableCell
+                          className="px-2 text-right text-muted-foreground"
+                          aria-label={`Total non-delete-marker versions referencing this data set: ${formatNumber(dataSet.referenced_version_count)}`}
+                          title="Total non-delete-marker versions referencing this data set"
+                        >
+                          {formatNumber(dataSet.referenced_version_count)}
+                        </TableCell>
+                        <TableCell className="px-4 text-right">
+                          {(dataSetNeedsStorageRiskReview(dataSet) || dataSet.replaceable) && (
+                            <RowActionsMenu label={replicaLabel(dataSet.copy_index)}>
+                              {dataSetNeedsStorageRiskReview(dataSet) && (
+                                <RowActionItem onSelect={() => onReviewStorageRisk(dataSet.id)}>
+                                  <TriangleAlert data-icon="inline-start" />
+                                  Review affected versions
+                                </RowActionItem>
+                              )}
+                              {dataSet.replaceable && (
+                                <RowActionItem onSelect={() => onReplaceProvider(dataSet)}>
+                                  <Repeat2 data-icon="inline-start" />
+                                  Replace provider
+                                </RowActionItem>
+                              )}
+                            </RowActionsMenu>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          </DataTableFrame>
+        )}
       </CardContent>
     </Card>
   )

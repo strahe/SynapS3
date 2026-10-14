@@ -72,11 +72,11 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 			return retryTask(err, "durability_scan_failed")
 		}
 		if len(candidates) == 0 {
-			return taskengine.Complete("Bucket storage policy applied", func(ctx context.Context, repos *repository.Repositories) error {
+			return taskengine.Complete("Cache release checked", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.CacheEvictions.CompleteBucketDurability(ctx, input.BucketID, input.Generation, execution.ID())
 			})
 		}
-		return taskengine.Wait(model.TaskResumeModeExecute, "more_work", "Applying bucket storage policy", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Wait(model.TaskResumeModeExecute, "more_work", "Rechecking cache release", func(ctx context.Context, repos *repository.Repositories) error {
 			if err := repos.Buckets.LockByID(ctx, input.BucketID); err != nil {
 				return err
 			}

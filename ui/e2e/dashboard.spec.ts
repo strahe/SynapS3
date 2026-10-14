@@ -15,7 +15,7 @@ test('a stopped batch shows its identity and offers Retry instead of a release',
   const task: TaskItem = {
     id: 9001,
     type: 'storage_commit',
-    operation: 'Submit batch',
+    operation: 'Commit batch',
     status: 'failed',
     presentation_status: 'failed',
     retryable: true,

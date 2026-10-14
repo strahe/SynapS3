@@ -104,6 +104,8 @@ func TestSelectDistinguishesShortageFromTemporaryObstacles(t *testing.T) {
 	}{
 		{"empty required tier", []Candidate{healthy}, Admission{Tier: TierApproved}, nil, false, 1, 0, SelectionRequiredTierEmpty, false},
 		{"trusted bucket binding", []Candidate{unhealthy}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{unhealthy.ID}}, map[string]ExclusionReason{"2": ExclusionBucketInUse}, false, 1, 0, SelectionRequiredTierInUse, false},
+		{"trusted historical provider", []Candidate{unhealthy}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{unhealthy.ID}}, map[string]ExclusionReason{"2": ExclusionPreviouslyUsed}, false, 1, 0, SelectionRequiredTierInUse, false},
+		{"trusted history without observation", []Candidate{healthy}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{unhealthy.ID}}, map[string]ExclusionReason{"2": ExclusionPreviouslyUsed}, false, 1, 0, SelectionRequiredTierInUse, false},
 		{"trusted context failed", []Candidate{healthy}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{healthy.ID}}, map[string]ExclusionReason{"1": ExclusionContextOpenFailed}, false, 1, 0, SelectionTemporary, false},
 		{"missing trusted observation", []Candidate{healthy}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{unhealthy.ID}}, nil, false, 1, 0, SelectionTemporary, true},
 		{"unhealthy trusted and unrelated stale", []Candidate{unhealthy, stale}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{unhealthy.ID}}, nil, false, 1, 0, SelectionTemporary, false},
@@ -112,6 +114,9 @@ func TestSelectDistinguishesShortageFromTemporaryObstacles(t *testing.T) {
 		{"no tier unhealthy shortage", []Candidate{healthy, unhealthy}, Admission{Tier: TierNone}, nil, false, 2, 0, SelectionTemporary, false},
 		{"existing trusted stale shortage", []Candidate{healthy, stale}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{healthy.ID}}, nil, true, 2, 0, SelectionTemporary, true},
 		{"bucket occupied shortage", []Candidate{healthy, stale}, Admission{Tier: TierNone}, map[string]ExclusionReason{"3": ExclusionBucketInUse}, false, 2, 1, "", false},
+		{"historical provider shortage", []Candidate{healthy, stale}, Admission{Tier: TierNone}, map[string]ExclusionReason{"3": ExclusionPreviouslyUsed}, false, 2, 1, "", false},
+		{"trusted satisfied historical shortage", []Candidate{stale}, Admission{Tier: TierApproved, TrustedIDs: []types.OnChainID{healthy.ID}}, map[string]ExclusionReason{"3": ExclusionPreviouslyUsed, "1": ExclusionBucketInUse}, true, 1, 0, "", false},
+		{"historical and temporary shortage", []Candidate{healthy, stale}, Admission{Tier: TierNone}, map[string]ExclusionReason{"1": ExclusionPreviouslyUsed}, false, 1, 0, SelectionTemporary, true},
 		{"selected provider is not an obstacle", []Candidate{healthy}, Admission{Tier: TierNone}, map[string]ExclusionReason{"1": ExclusionSelected}, true, 1, 0, "", false},
 		{"unknown exclusion is conservative", []Candidate{healthy}, Admission{Tier: TierNone}, map[string]ExclusionReason{"1": "unknown"}, false, 1, 0, SelectionTemporary, false},
 		{"zero demand", []Candidate{stale}, Admission{Tier: TierApproved}, nil, false, 0, 0, "", false},
