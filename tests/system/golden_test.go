@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +58,17 @@ func TestSystemGoldenPath(t *testing.T) {
 		t.Fatalf("PutObject: %v", err)
 	}
 	e2e.AssertS3Object(t, t.Context(), s3Client, bucket, key, content, checksum)
+
+	adminBody, err := admin.GetJSON(t.Context(), "/api/v1/buckets/"+bucket+"/objects/download?key="+url.QueryEscape(key), nil)
+	if err != nil || adminBody != string(content) {
+		t.Fatalf("Admin download: bytes=%d, error=%v", len(adminBody), err)
+	}
+	e2e.Eventually(t, t.Context(), time.Second, "client transfer metrics", func(ctx context.Context) (string, bool, error) {
+		metrics, err := admin.GetJSON(ctx, "/metrics", nil)
+		upload := fmt.Sprintf("synaps3_transfer_bytes_total{direction=\"upload\",scope=\"client\"} %d\n", len(content))
+		download := fmt.Sprintf("synaps3_transfer_bytes_total{direction=\"download\",scope=\"client\"} %d\n", 2*len(content))
+		return metrics, strings.Contains(metrics, upload) && strings.Contains(metrics, download), err
+	})
 
 	object := e2e.Eventually(t, t.Context(), 30*time.Second, "object to complete three-copy upload", func(ctx context.Context) (struct {
 		VersionID string

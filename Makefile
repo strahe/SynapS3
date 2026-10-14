@@ -5,6 +5,7 @@ MODULE   := github.com/strahe/synaps3
 PKG      := ./cmd/synaps3
 GOFLAGS  := -trimpath
 GO_TEST_PACKAGE_PARALLELISM ?=
+GO_TEST_P := $(if $(GO_TEST_PACKAGE_PARALLELISM),-p $(GO_TEST_PACKAGE_PARALLELISM))
 CGO_ENABLED := 1
 CGO      := CGO_ENABLED=$(CGO_ENABLED)
 
@@ -55,15 +56,15 @@ build-integration-server:
 test: test-fast
 
 test-fast:
-	$(CGO) go test $(GOFLAGS) $(if $(GO_TEST_PACKAGE_PARALLELISM),-p $(GO_TEST_PACKAGE_PARALLELISM)) -count=1 ./cmd/... ./internal/...
+	$(CGO) go test $(GOFLAGS) $(GO_TEST_P) -count=1 ./cmd/... ./internal/...
 
 test-race:
-	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 $(RACE_PACKAGES)
+	$(CGO) go test $(GOFLAGS) $(GO_TEST_P) -race -tags dev -count=1 $(RACE_PACKAGES)
 
 # Keep PR race checks focused on shared-memory contracts; run test-race for
 # the complete package suites when investigating concurrency changes.
 test-race-ci:
-	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/s3access ./internal/task/transfer
+	$(CGO) go test $(GOFLAGS) $(GO_TEST_P) -race -tags dev -count=1 ./internal/cache ./internal/cacheaccess ./internal/objectreader ./internal/s3access ./internal/task/transfer
 	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^Test(AdminEventHub.*|CachedWalletQuerier_(CoalescesConcurrentMisses|WaiterContextCanCancel))$$' ./internal/admin
 	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^Test((PutObject|CopyObject|CompleteMultipart)HoldsContentGateThroughVersionTransaction|RequestContext.*)$$' ./internal/backend
 	$(CGO) go test $(GOFLAGS) -race -tags dev -count=1 -run '^Test(CacheCapacity(CompletionPreservesDemandUntilArchiveCommits|MergesRefusalBeforeCompletingAfterUpload|TaskEvictsLRUItemsOnlyToCleanupTarget)|LRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess)$$' ./internal/task

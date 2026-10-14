@@ -23,6 +23,7 @@ import (
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/s3iam"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -59,6 +60,7 @@ type Harness struct {
 
 type HarnessOptions struct {
 	CommitMaxWait *time.Duration
+	Storage       synapse.StorageClient
 }
 
 // NewHarness creates and starts an isolated production runtime.
@@ -125,7 +127,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	// A private schema and a pool with several connections, as production uses.
 	cfg.Database = config.DatabaseConfig{Driver: "postgres", DSN: schemaDSN, MaxOpenConns: 8, MaxIdleConns: 2}
 	cfg.Filecoin.DefaultCopies = config.DefaultFilecoinCopies
-	// MemoryFilecoin is injected directly; this only satisfies production settings validation.
+	// Settings validation requires a key even with offline chain services.
 	cfg.Filecoin.PrivateKey = offlinePrivateKeyPlaceholder
 	cfg.Filecoin.Observability.Interval = 2 * time.Second
 	cfg.Filecoin.Observability.Timeout = time.Second
@@ -185,6 +187,10 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 
 	filecoin := NewMemoryFilecoin()
 	market := memoryWarmStorageMarket{filecoin: filecoin}
+	var storageClient synapse.StorageClient = filecoin
+	if len(options) > 0 && options[0].Storage != nil {
+		storageClient = options[0].Storage
+	}
 	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
 		Config: cfg, Database: database, Settings: settings, Logger: logger,
 		DecorateTaskHandler: func(handler taskengine.Handler) taskengine.Handler {
@@ -195,7 +201,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 		UploadSpeedProbe: filecoin,
 		Filecoin: app.FilecoinServices{
 			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314, USDFCAddress: memoryUSDFCAddress.Hex(),
-			Storage: filecoin, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
+			Storage: storageClient, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,
 			Terminator: filecoin, Epochs: filecoin, CommitNonces: filecoin, ParkedPieces: filecoin,
 		},
