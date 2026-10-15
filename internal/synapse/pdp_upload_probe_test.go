@@ -43,9 +43,9 @@ func TestPDPBatchUploadProbeUploadsSampleWithoutFinalizing(t *testing.T) {
 	}))
 	defer server.Close()
 	probe := NewPDPBatchUploadProbe(true)
-	duration, err := probe.Probe(t.Context(), server.URL+"/proxy")
-	if err != nil || duration <= 0 {
-		t.Fatalf("Probe = %v, %v", duration, err)
+	measurement, err := probe.Probe(t.Context(), server.URL+"/proxy")
+	if err != nil || measurement.Duration <= 0 || measurement.Bytes != providerbenchmark.SampleBytes {
+		t.Fatalf("Probe = %v, %v", measurement, err)
 	}
 	if got := strings.Join(requests, ","); got != "POST /proxy/pdp/piece/uploads,PUT /proxy/pdp/piece/uploads/123e4567-e89b-12d3-a456-426614174000" {
 		t.Fatalf("requests = %s", got)
@@ -94,26 +94,75 @@ func TestPDPBatchUploadProbeRejectsFailedPutWithoutFollowingRedirect(t *testing.
 	}
 }
 
-func TestPDPBatchUploadProbeTimesOutDuringPut(t *testing.T) {
-	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			w.Header().Set("Location", "/pdp/piece/uploads/123e4567-e89b-12d3-a456-426614174000")
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-		_, _ = io.Copy(io.Discard, r.Body)
-		select {
-		case <-r.Context().Done():
-		case <-release:
-		}
-	}))
-	defer server.Close()
-	defer close(release)
-	probe := NewPDPBatchUploadProbe(true)
-	probe.timeout = 20 * time.Millisecond
-	if _, err := probe.Probe(t.Context(), server.URL); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("timed out PUT = %v", err)
+type uploadProbeTransport func(*http.Request) (*http.Response, error)
+
+func (f uploadProbeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestPDPBatchUploadProbeMeasurementWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		bytes             int64
+		createTimeout     bool
+		cancelParent      bool
+		cancelAfterWindow bool
+		transportFailure  bool
+		wantError         error
+	}{
+		{name: "partial sample", bytes: providerbenchmark.MinimumSampleBytes},
+		{name: "below minimum", bytes: providerbenchmark.MinimumSampleBytes - 1, wantError: context.DeadlineExceeded},
+		{name: "session timeout", createTimeout: true, wantError: context.DeadlineExceeded},
+		{name: "parent cancellation", bytes: providerbenchmark.MinimumSampleBytes, cancelParent: true, wantError: context.Canceled},
+		{name: "parent canceled at window", bytes: providerbenchmark.MinimumSampleBytes, cancelAfterWindow: true, wantError: context.DeadlineExceeded},
+		{name: "transport failure", bytes: providerbenchmark.MinimumSampleBytes, transportFailure: true, wantError: io.ErrUnexpectedEOF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			probe := NewPDPBatchUploadProbe(true)
+			probe.measurementWindow = 20 * time.Millisecond
+			probe.sessionCreateTimeout = 20 * time.Millisecond
+			probe.client.Transport = uploadProbeTransport(func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodPost {
+					if tc.createTimeout {
+						<-r.Context().Done()
+						return nil, r.Context().Err()
+					}
+					return &http.Response{
+						StatusCode: http.StatusCreated,
+						Header:     http.Header{"Location": []string{"/pdp/piece/uploads/123e4567-e89b-12d3-a456-426614174000"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				}
+				defer func() { _ = r.Body.Close() }()
+				if r.GetBody != nil {
+					t.Error("upload sample body is replayable")
+				}
+				if _, err := io.CopyN(io.Discard, r.Body, tc.bytes); err != nil {
+					return nil, err
+				}
+				if tc.transportFailure {
+					return nil, io.ErrUnexpectedEOF
+				}
+				if tc.cancelParent {
+					cancel()
+				}
+				<-r.Context().Done()
+				if tc.cancelAfterWindow {
+					cancel()
+				}
+				return nil, r.Context().Err()
+			})
+			measurement, err := probe.Probe(ctx, "https://provider.example")
+			if tc.wantError != nil {
+				if !errors.Is(err, tc.wantError) || measurement.Bytes != 0 {
+					t.Fatalf("Probe = %#v, %v; want %v", measurement, err, tc.wantError)
+				}
+				return
+			}
+			if err != nil || measurement.Bytes != tc.bytes || measurement.Duration < probe.measurementWindow {
+				t.Fatalf("Probe = %#v, %v", measurement, err)
+			}
+		})
 	}
 }
 

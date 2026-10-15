@@ -82,6 +82,9 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			"speed test succeeded without throughput": `INSERT INTO provider_upload_speed_tests
 				(provider_id, state, service_url_hash, sample_bytes, duration_ms, tested_at, created_at, updated_at)
 				VALUES ('speed-no-throughput', 'succeeded', '` + strings.Repeat("a", 64) + `', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"speed test testing with incomplete result": `INSERT INTO provider_upload_speed_tests
+				(provider_id, state, service_url_hash, sample_bytes, active_task_id, duration_ms, created_at, updated_at)
+				VALUES ('speed-partial-result', 'testing', '` + strings.Repeat("a", 64) + `', 1, ` + strconv.FormatInt(walletTaskID, 10) + `, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 		} {
 			t.Run(name, func(t *testing.T) { mustRejectStatement(t, db, statement) })
 		}

@@ -71,6 +71,7 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `s3` | Region reported to S3 clients. |
 | `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and replica policy. |
 | `filecoin.observability` | Provider and local data set health checks. |
+| `filecoin.upload_speed_test` | Automatic upload speed tests and periodic remeasurement. |
 | `database` | PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
 | `worker.tasks` | Global background task and upload concurrency limits. |
@@ -88,6 +89,8 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
 | `filecoin.anchor_provider_tier` | `approved` |
+| `filecoin.upload_speed_test.auto_scope` | `trusted` |
+| `filecoin.upload_speed_test.retest_interval` | `0s` |
 | `database.driver` | `postgres` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
@@ -121,9 +124,13 @@ Open **Batches** to see collected data. **Submit next batch** requests one submi
 
 ## Provider Selection
 
-`filecoin.anchor_provider_tier` requires newly selected provider sets to retain at least one Approved or Endorsed provider. Endorsed membership is independent of Approved; `none` removes the list requirement. All candidates still need fresh healthy observations for their current service URL. Changes require restart and do not reselect accepted targets. Bucket preparation and uploads wait for suitable providers without using retries; bucket preparation stops if the required Approved or Endorsed list is confirmed empty. Recoverable errors while checking providers or preparing storage retry within the attempt limit. Open a waiting or stopped task to inspect the recorded provider exclusions; use Retry after resolving a stopped task's cause.
+Selecting a provider for a replica requires fresh healthy observations and a successful upload speed test for the current service URL. `filecoin.anchor_provider_tier` also requires the selected set to retain at least one member of the configured Approved or Endorsed list. Endorsed membership is independent of Approved; `none` removes the membership requirement. Changing this setting requires restart. Providers assigned to replicas stay assigned when membership or speed results change.
 
-At bucket creation, **Provider preference** chooses `distribution` (default) or `speed`. Distribution first prefers providers with fewer non-retired data sets, then faster measured uploads. Speed first prefers successful measurements for the current service URL; unmeasured providers follow by load. Exact ties are randomized. The saved preference applies to additional replicas and automatic replacements; manual replacements bypass ranking. S3-created and existing buckets use distribution. The creation API accepts `provider_selection_strategy`, and bucket queries return the saved value. The preference cannot be changed after creation. Additional replicas and manual replacements may reuse an eligible provider once all its data sets for that bucket are retired. Automatic replacements exclude every provider the bucket has used.
+Bucket creation accepts the request while storage is prepared. Selecting new providers waits for eligible Approved and Endorsed providers to finish a test for their current URL, then requires enough successful providers for the replica target and configured anchor tier. These waits do not consume retries. Bucket preparation stops if the required tier list is confirmed empty. Open the bucket's preparation message or the task to see the cause; use **Retry** after resolving a stopped task's cause. Uploads to assigned providers do not wait for speed tests.
+
+At bucket creation, **Provider preference** chooses `distribution` (default) or `speed`. Distribution first prefers eligible providers with fewer non-retired data sets, then faster measured uploads. Speed first prefers faster measured uploads, then lower load. Exact ties are randomized. The saved preference applies to additional replicas and automatic replacements; manual replacements bypass ranking. S3-created buckets use distribution. The creation API accepts `provider_selection_strategy`, and bucket queries return the saved value. The preference cannot be changed after creation. Additional replicas and manual replacements may reuse an eligible provider once all its data sets for that bucket are retired. Automatic replacements exclude every provider the bucket has used.
+
+Approved, Endorsed, and bound providers are automatically tested when first eligible and after a service URL change. `filecoin.upload_speed_test.auto_scope = "all"` also tests other eligible providers. Under the default `trusted` scope, the selection pool consists of trusted, bound, and manually tested providers, all requiring healthy observations and a successful test for their current service URL. Use **Test remaining providers** or individual tests in **Storage** to test other providers. Setting `anchor_provider_tier = "none"` does not expand this selection pool. Set `retest_interval` to a positive duration to repeat automatic measurements; `0s` disables periodic remeasurement. Upload failures and timeouts need **Retry** unless periodic remeasurement is enabled. Interrupted or incomplete measurements are automatically scheduled again. These settings require restart.
 
 ## Admin Session Lifetime
 
@@ -136,6 +143,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 - `filecoin.network`: `calibration`, `mainnet`.
 - `filecoin.default_copies`: `1` through `8`.
 - `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
+- `filecoin.upload_speed_test.auto_scope`: `trusted`, `all`; `retest_interval` must be nonnegative.
 - `database.driver`: `postgres`.
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`.
 - `logging.level`: `debug`, `info`, `warn`, `error`.

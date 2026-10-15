@@ -61,6 +61,12 @@ test('upload speed actions follow server eligibility and explain unavailable or 
 })
 
 test('upload speed labels distinguish results from failed or outdated tests', () => {
+  for (const label of [providerUploadSpeedLabel, providerUploadSpeedShortLabel]) {
+    assert.equal(
+      label({ state: 'testing', sample_bytes: 32 << 20, bytes_per_second: 10 << 20 }),
+      'Testing · last 10.0 MiB/s'
+    )
+  }
   assert.equal(
     providerUploadSpeedLabel({ state: 'succeeded', sample_bytes: 32 << 20, bytes_per_second: 10 << 20 }),
     '10.0 MiB/s'

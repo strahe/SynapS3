@@ -101,6 +101,18 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_FILECOIN_DEFAULT_COPIES",
 		Editable:    true,
 	},
+	"filecoin.upload_speed_test.auto_scope": {
+		Label:       "Automatic speed tests",
+		Description: "Tests trusted providers and providers used by buckets, or all available providers. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_AUTO_SCOPE",
+		Editable:    true,
+	},
+	"filecoin.upload_speed_test.retest_interval": {
+		Label:       "Speed test interval",
+		Description: "Interval between automatic speed tests. 0 disables periodic tests. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_RETEST_INTERVAL",
+		Editable:    true,
+	},
 	"filecoin.observability.interval": {
 		Label:       "Observability interval",
 		Description: "Interval between background provider and local data set health checks. Restart required.",

@@ -157,35 +157,37 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("initializing task service: %w", err)
 	}
 	points, err := task.Register(registry, taskService, task.Dependencies{
-		Repositories:              repos,
-		DecorateTaskHandler:       opts.DecorateTaskHandler,
-		Events:                    events,
-		Cache:                     localCache,
-		CacheGate:                 cacheGate,
-		CacheTracker:              accessTracker,
-		Storage:                   opts.Filecoin.Storage,
-		Wallet:                    opts.Filecoin.Wallet,
-		Receipts:                  opts.Filecoin.Receipts,
-		Terminator:                opts.Filecoin.Terminator,
-		Epochs:                    opts.Filecoin.Epochs,
-		Observability:             observabilityService,
-		UploadSpeedProbe:          uploadSpeedProbe,
-		ParkedPieces:              parkedPieces,
-		CommitNonces:              opts.Filecoin.CommitNonces,
-		EvictionPolicy:            evictionPolicy,
-		MaxCacheBytes:             maxCacheBytes,
-		MaxWriteBytes:             objectlimits.MaxFOCUploadSize,
-		LRUHighPercent:            cfg.Cache.LRUHighWatermarkPercent,
-		LRULowPercent:             cfg.Cache.LRULowWatermarkPercent,
-		DefaultCopies:             cfg.Filecoin.DefaultCopies,
-		UploadConcurrency:         cfg.Worker.Tasks.UploadConcurrency,
-		AnchorProviderTier:        providerselect.Tier(cfg.Filecoin.AnchorProviderTier),
-		CommitMaxPieces:           cfg.Worker.Tasks.CommitMaxPieces,
-		CommitMaxWait:             cfg.Worker.Tasks.CommitMaxWait,
-		CommitMaxBacklog:          cfg.Worker.Tasks.CommitMaxBacklog,
-		CommitSealOnCachePressure: cfg.Worker.Tasks.CommitSealOnCachePressure,
-		LegacyPieceStorageIDLimit: synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network),
-		Logger:                    logger,
+		Repositories:                  repos,
+		DecorateTaskHandler:           opts.DecorateTaskHandler,
+		Events:                        events,
+		Cache:                         localCache,
+		CacheGate:                     cacheGate,
+		CacheTracker:                  accessTracker,
+		Storage:                       opts.Filecoin.Storage,
+		Wallet:                        opts.Filecoin.Wallet,
+		Receipts:                      opts.Filecoin.Receipts,
+		Terminator:                    opts.Filecoin.Terminator,
+		Epochs:                        opts.Filecoin.Epochs,
+		Observability:                 observabilityService,
+		UploadSpeedProbe:              uploadSpeedProbe,
+		UploadSpeedTestAutoScope:      cfg.Filecoin.UploadSpeedTest.AutoScope,
+		UploadSpeedTestRetestInterval: cfg.Filecoin.UploadSpeedTest.RetestInterval,
+		ParkedPieces:                  parkedPieces,
+		CommitNonces:                  opts.Filecoin.CommitNonces,
+		EvictionPolicy:                evictionPolicy,
+		MaxCacheBytes:                 maxCacheBytes,
+		MaxWriteBytes:                 objectlimits.MaxFOCUploadSize,
+		LRUHighPercent:                cfg.Cache.LRUHighWatermarkPercent,
+		LRULowPercent:                 cfg.Cache.LRULowWatermarkPercent,
+		DefaultCopies:                 cfg.Filecoin.DefaultCopies,
+		UploadConcurrency:             cfg.Worker.Tasks.UploadConcurrency,
+		AnchorProviderTier:            providerselect.Tier(cfg.Filecoin.AnchorProviderTier),
+		CommitMaxPieces:               cfg.Worker.Tasks.CommitMaxPieces,
+		CommitMaxWait:                 cfg.Worker.Tasks.CommitMaxWait,
+		CommitMaxBacklog:              cfg.Worker.Tasks.CommitMaxBacklog,
+		CommitSealOnCachePressure:     cfg.Worker.Tasks.CommitSealOnCachePressure,
+		LegacyPieceStorageIDLimit:     synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network),
+		Logger:                        logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initializing task handlers: %w", err)
@@ -271,6 +273,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithObservability(observabilityService).
 		WithMonitoring(monitoring, transferCounters).
 		WithProviderTier(providerselect.Tier(cfg.Filecoin.AnchorProviderTier)).
+		WithUploadSpeedTest(cfg.Filecoin.UploadSpeedTest).
 		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).
 		WithTaskService(taskService).
 		WithTaskMessages(points.AdminReplacement, points.AdminCopyRetry).

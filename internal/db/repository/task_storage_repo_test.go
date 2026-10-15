@@ -12,6 +12,40 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
+func TestLatestTasksForSubjectsFiltersAndKeepsCurrentRounds(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	enqueue := func(subjectType, subjectKey string, taskType model.TaskType) *model.Task {
+		t.Helper()
+		task, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{
+			Type: taskType, SubjectType: subjectType, SubjectKey: subjectKey, InputVersion: 1, Input: json.RawMessage(`{}`),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+	enqueue("bucket", "1", model.TaskTypeBucketProvision)
+	wantFirst := enqueue("bucket", "1", model.TaskTypeBucketProvision)
+	wantSecond := enqueue("bucket", "2", model.TaskTypeBucketProvision)
+	superseded := enqueue("bucket", "1", model.TaskTypeBucketProvision)
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("superseded_at = ?", time.Now()).
+		Where("id = ?", superseded.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	enqueue("bucket", "1", model.TaskTypeCacheEvict)
+	enqueue("other", "1", model.TaskTypeBucketProvision)
+	enqueue("bucket", "4", model.TaskTypeBucketProvision)
+	latest, err := repos.Tasks.LatestForSubjects(t.Context(), "bucket", []string{"1", "2", "3"}, model.TaskTypeBucketProvision)
+	if err != nil || len(latest) != 2 || latest["1"].ID != wantFirst.ID || latest["2"].ID != wantSecond.ID {
+		t.Fatalf("latest tasks=%#v, err=%v", latest, err)
+	}
+	if empty, err := repos.Tasks.LatestForSubjects(t.Context(), "bucket", nil, model.TaskTypeBucketProvision); err != nil || len(empty) != 0 {
+		t.Fatalf("empty subject selection=%#v, err=%v", empty, err)
+	}
+}
+
 func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

@@ -47,6 +47,7 @@ func TestReplacementCandidatesAndSubmitRejectStaleHealth(t *testing.T) {
 	if _, err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), now, []idtypes.OnChainID{onChainIDValue("202")}); err != nil {
 		t.Fatal(err)
 	}
+	seedReplacementProviderSpeed(t, fixture.srv, "202", url)
 	rec := fixture.listProviders(t)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("candidate status = %d body=%s", rec.Code, rec.Body.String())

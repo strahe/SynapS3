@@ -55,6 +55,8 @@ type Candidate struct {
 	ProfileURL           string
 	Load                 int
 	BytesPerSecond       int64
+	TierListed           bool
+	UploadSpeedSettled   bool
 	TieBreak             uint64
 	ObservationCheckedAt *time.Time
 }
@@ -92,14 +94,16 @@ func (a Admission) Satisfied(remainingTrusted bool, targets ...types.OnChainID) 
 }
 
 type Inventory struct {
-	Candidates []Candidate
-	Admission  Admission
+	Candidates          []Candidate
+	Admission           Admission
+	UploadSpeedRequired bool
 }
 
 var (
 	ErrNoTrustedProvider                = errors.New("no eligible provider meets the required provider tier")
 	ErrInventoryUnavailable             = errors.New("provider selection inventory unavailable")
 	ErrCandidatesTemporarilyUnavailable = errors.New("storage providers are temporarily unavailable")
+	ErrUploadSpeedTestsPending          = errors.New("provider upload speed tests are pending")
 )
 
 // Select reserves a trusted candidate first when the remaining set needs one.

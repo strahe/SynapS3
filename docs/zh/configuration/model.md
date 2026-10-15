@@ -71,6 +71,7 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `s3` | 返回给 S3 客户端的 region。 |
 | `filecoin` | 网络、RPC、钱包、存储提供方 URL 策略、CDN hints 和副本策略。 |
 | `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
+| `filecoin.upload_speed_test` | 自动上传测速和定期重测。 |
 | `database` | PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
 | `worker.tasks` | 后台任务全局并发和上传并发限制。 |
@@ -88,6 +89,8 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
 | `filecoin.anchor_provider_tier` | `approved` |
+| `filecoin.upload_speed_test.auto_scope` | `trusted` |
+| `filecoin.upload_speed_test.retest_interval` | `0s` |
 | `database.driver` | `postgres` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
@@ -121,9 +124,13 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 
 ## 节点选择
 
-`filecoin.anchor_provider_tier` 要求新选择后的节点集合至少保留一个 Approved 或 Endorsed 节点。Endorsed 不要求同时属于 Approved；`none` 取消名单要求。所有候选仍须有当前服务地址的有效健康观测。修改后需重启，已接受的目标不会重新选择。准备存储桶和上传时会等待合适的节点，不消耗重试次数；所需 Approved 或 Endorsed 名单确认为空时，存储桶准备会停止。检查节点或准备存储遇到可恢复错误时，会在尝试上限内自动重试。打开等待中或已停止的任务查看记录的节点排除原因；解决停止原因后再使用 Retry。
+为副本选择新节点时，该节点必须有未过期的健康观测，并且在当前服务 URL 下上传测速成功。`filecoin.anchor_provider_tier` 还要求选出的集合至少保留一个所配置层级中的节点（Approved 或 Endorsed）。Endorsed 不要求同时属于 Approved；`none` 取消名单要求，修改此设置后需重启。名单或测速结果变化时，已分配的节点保持不变。
 
-创建存储桶时，**Provider preference** 可选分布优先（`distribution`，默认）或速度优先（`speed`）。分布优先先比较未退役数据集数量，再比较上传测速；速度优先先选择当前服务地址下测速成功的节点，未测速节点按负载补足。条件相同则随机选择。保存的偏好用于补副本和自动替换，手动替换跳过排序。S3 创建和现有存储桶默认分布优先，创建 API 接受 `provider_selection_strategy`，查询返回保存值；创建后不能修改偏好。补副本和手动替换可复用符合上述选择条件的节点，前提是其在该桶的数据集已全部退役。自动替换排除该桶用过的所有节点。
+创建存储桶会接受请求，并在后台准备存储。选择新节点前，会等待可选的 Approved 和 Endorsed 节点完成当前 URL 下的测速，再按副本目标和配置的锚定层级检查成功节点是否足够。等待不消耗重试次数；所需名单确认为空时，存储桶准备会停止。查看存储桶的准备说明或任务了解原因，解决停止原因后再使用 **Retry**。使用已分配节点的上传不等待测速。
+
+创建存储桶时，**Provider preference** 可选分布优先（`distribution`，默认）或速度优先（`speed`）。分布优先先比较合格节点的未退役数据集数量，再比较上传速度；速度优先先比较上传速度，再比较负载。条件相同则随机选择。保存的偏好用于补副本和自动替换，手动替换跳过排序。S3 创建的存储桶默认分布优先，创建 API 接受 `provider_selection_strategy`，查询返回保存值；创建后不能修改偏好。补副本和手动替换可复用符合上述选择条件的节点，前提是其在该桶的数据集已全部退役。自动替换排除该桶用过的所有节点。
+
+Approved、Endorsed 和已绑定的节点在首次满足测速条件及服务 URL 变化后会自动测速。`filecoin.upload_speed_test.auto_scope = "all"` 还会测试其他符合条件的节点。默认 `trusted` 范围下，可选节点来自可信、已绑定和手动测过的节点，且均须有健康观测并在当前服务 URL 下测速成功。其他节点可通过 **Test remaining providers** 或 **Storage** 中的单节点测速来测试。仅把 `anchor_provider_tier` 设为 `none` 不会扩大这个可选节点池。将 `retest_interval` 设为正时长可定期重测，`0s` 表示关闭定期重测。上传失败和超时需要使用 **Retry**，除非启用了定期重测；中断或未完成的测量会自动重新排队。以上设置修改后需重启。
 
 ## Admin 会话时长
 
@@ -136,6 +143,7 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 - `filecoin.network`: `calibration`, `mainnet`。
 - `filecoin.default_copies`: `1` 到 `8`。
 - `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
+- `filecoin.upload_speed_test.auto_scope`：`trusted`、`all`；`retest_interval` 不得为负数。
 - `database.driver`: `postgres`。
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`。
 - `logging.level`: `debug`, `info`, `warn`, `error`。

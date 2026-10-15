@@ -143,6 +143,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 - `default_copies`：该存储桶的目标副本数；
 - `minimum_durable_copies`：释放缓存前必须完成的副本数，不会超过目标副本数。
 
+存储桶准备期间，列表和详情响应包含 `setup_message`，说明正在等待测速、节点、资金还是存储服务；准备任务需要重试时会提示到 Tasks 处理。
+
 `PUT /api/v1/buckets/{name}/copy-policy` 可以独立接收 `default_copies` 和 `minimum_durable_copies`。字段缺省时保持不变。传 `null` 表示重置该字段：`default_copies: null` 恢复为配置的默认值，`minimum_durable_copies: null` 将门槛设为与目标副本数相同。显式值必须在 `1` 到 `8` 之间，且门槛不能超过同一请求产生的最终目标副本数。空请求或无效的最终组合返回 `400 Bad Request`。
 
 **不支持调低 `default_copies`，调低会返回 `400 Bad Request`。** 超出新目标的那些副本仍会继续运行、继续计费，而且没有任何机制会退役它们，所以目标副本数只能调高。如果 `null` 重置后的值低于存储桶当前的目标副本数，同样会被拒绝。
@@ -210,7 +212,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 { "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<从价格清单接口取得的指纹>" }
 ```
 
-指定的存储提供方必须有针对当前服务 URL 的未过期、可用、活跃且支持 PDP 的健康观测。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的存储提供方，以及任何仍持有该存储桶活跃代的存储提供方，都会被拒绝。候选接口也返回不可选的已观测节点及原因，供查看详情。自动选择要求 FWSS approved 成员资格仍新鲜。endorsed 状态单独展示，不影响更换资格。
+指定的存储提供方必须有针对当前服务 URL 的未过期、可用、活跃且支持 PDP 的健康观测，并且上传测速成功。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的存储提供方，以及任何仍持有该存储桶活跃代的存储提供方，都会被拒绝。两种选择方式都必须保留[配置要求的锚定层级](../configuration/model.md#节点选择)。可选可信节点尚未完成测速时，自动选择返回 `409 Conflict` 和 `provider_speed_tests`。
 
 确认前读取 `GET /api/v1/filecoin/warm-storage/price-list`。接口返回当前币种地址、全部费率、费用、锁定额、读取时间及指纹；金额均为十进制整数字符串。新请求会重新读取合约价格；`price_list_unavailable`、`price_list_changed` 或 `unsupported_price_token` 都会阻止授权。价格变化后应审阅新清单并使用新的请求 ID。指纹记录授权时审阅的价格，链上价格此后仍可能变化。
 
@@ -258,9 +260,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；Filecoin 存储不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
-`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing` 和 `profile_url_changed`。手动选择不受 FWSS 批准名单限制，但仍须满足健康、最新资料处于启用状态和存储桶约束。自动选择还会排除该存储桶用过的所有存储提供方，并按 ID 顺序链上核对新鲜获批的候选。
+`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing`、`profile_url_changed`、`upload_speed_untested` 和 `upload_speed_failed`。确认目标前，先测试尚未测量的节点，或 Retry 其失败的测速。
 
-手动确认不核对 FWSS 批准名单，也不检查存储提供方是否仍在链上为该存储桶保留数据集。后者会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移。此前已正常退休的存储提供方可以再次选择。
+手动确认不检查存储提供方是否仍在链上为该存储桶保留数据集。这会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移。此前已正常退休的存储提供方可以再次选择。
 
 ### 需要处理的批次
 
@@ -340,10 +342,16 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | 刷新单个节点的 Registry 资料和健康状态；同 ID 并发刷新会冲突。 |
 | `POST` | `/api/v1/observability/provider-tiers/refresh` | 并行刷新 approved 和 endorsed 名单；分别返回成功状态、尝试时间及成功采集时间或错误。单路失败时保留该路之前的资料状态和采集时间。 |
 | `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 对可用的存储提供方发起一次 32 MiB 上传测速。返回 `202 Accepted` 和 `task_id`；存储提供方不存在时返回 `404 Not Found`；已有测速进行中或存储提供方不满足测速条件时返回 `409 Conflict`。 |
+| `GET` | `/api/v1/observability/providers/upload-speed-summary` | 读取已存储的测速进度和节点选择就绪状态，不刷新网络数据。 |
+| `POST` | `/api/v1/observability/providers/upload-speed-tests` | 为当前 URL 下尚无已完成结果的合格节点排队测速。返回 `202 Accepted` 和 `queued`；跳过测速中和已有完成结果的节点。 |
 | `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的批次数量。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
-存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。最新失败测速可通过统一任务 Retry 接口创建新的测速轮次。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
+存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`。每次在 30 秒窗口内最多上传 32 MiB；窗口到期时，已传输至少 8 MiB 则按实际字节和耗时估算速度，否则算失败。单次样本不保证实际对象上传速度。[自动测速范围与重测](../configuration/model.md#节点选择)可配置。
+
+同一 URL 重测时会保留上次完成的结果；API 在 `state: "testing"` 时一并返回这些字段，保留的成功速度仍可用于选择。当前服务 URL 缺失或变化时，结果显示为 `stale`。失败测速提供 `retry_task_id`，通过任务 Retry 接口发起新测量；批量端点跳过失败结果。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
+
+汇总响应包含 `auto_scope`，分别列出 `trusted` 和 `other` 的 `total`、`succeeded`、`failed`、`testing`、`untested` 数量，以及 `selectable_providers` 和 `required_copies`。`ready` 表示可选可信节点都有已完成结果；`can_provision_default` 还会检查默认副本数和锚定层级。`can_test_remaining` 表示能否继续为未测节点排队。重测中的节点计入 `testing`，其保留结果仍可让 `ready` 保持为真。Filecoin readiness 单独检查节点网络可用性，不包含这些测速要求。
 
 存储提供方健康检查失败时，该提供方的 `signal.last_error` 会说明原因：检查超时、无法连接、被重定向、返回 HTTP 错误状态，或收到的不是 PDP 服务的应答。
 

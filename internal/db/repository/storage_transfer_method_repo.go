@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 )
 
@@ -141,17 +143,38 @@ func (r *BunStorageContentRepo) PromotePendingIngress(ctx context.Context, conte
 				WHERE attempt.content_id = storage_copy.content_id AND attempt.storage_data_set_id = storage_copy.storage_data_set_id)`).
 			Where(`NOT EXISTS (SELECT 1 FROM storage_replacement_items AS item
 				WHERE item.content_id = storage_copy.content_id AND item.target_data_set_id = storage_copy.storage_data_set_id)`).
-			OrderExpr("copy_index ASC").Limit(1).Scan(ctx)
+			OrderExpr("id ASC").Scan(ctx)
 		if err != nil {
 			return err
 		}
 		if len(candidates) == 0 {
 			return nil
 		}
+		ids := make([]types.OnChainID, len(candidates))
+		for i, candidate := range candidates {
+			ids[i] = candidate.ProviderID
+		}
+		speeds, err := providerRankingSpeeds(ctx, db, ids)
+		if err != nil {
+			return err
+		}
+		entries := make([]providerselect.IngressEntry, len(candidates))
+		for i, candidate := range candidates {
+			entries[i] = providerselect.IngressEntry{CopyIndex: candidate.CopyIndex, BytesPerSecond: speeds[candidate.ProviderID.String()]}
+		}
+		best := providerselect.RankIngress(entries)[0]
+		selected := &candidates[0]
+		for i := range candidates {
+			candidate := &candidates[i]
+			if candidate.CopyIndex == best.CopyIndex && speeds[candidate.ProviderID.String()] == best.BytesPerSecond {
+				selected = candidate
+				break
+			}
+		}
 		result, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
 			Set("transfer_method = ?", model.StorageCopyTransferMethodIngress).
 			Set("updated_at = ?", time.Now()).
-			Where("id = ? AND status = ? AND transfer_method = ?", candidates[0].ID, model.StorageCopyStatusPending, model.StorageCopyTransferMethodPeerPull).
+			Where("id = ? AND status = ? AND transfer_method = ?", selected.ID, model.StorageCopyStatusPending, model.StorageCopyTransferMethodPeerPull).
 			Exec(ctx)
 		if err != nil {
 			return err
@@ -164,7 +187,7 @@ func (r *BunStorageContentRepo) PromotePendingIngress(ctx context.Context, conte
 		if err != nil {
 			return err
 		}
-		promoted = &candidates[0]
+		promoted = selected
 		promoted.TransferMethod = model.StorageCopyTransferMethodIngress
 		return nil
 	})

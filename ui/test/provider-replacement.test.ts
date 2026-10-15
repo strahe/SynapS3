@@ -208,6 +208,16 @@ test('errors explain what to do next', () => {
     'That provider already stores a replica of this bucket. Choose a different one.'
   )
   assert.equal(
+    replacementErrorMessage(
+      new APIError('A successful upload speed test is required.', 400, 'replacement_target_unavailable')
+    ),
+    'A successful upload speed test is required.'
+  )
+  assert.equal(
+    replacementErrorMessage(new APIError('pending', 409, 'provider_speed_tests')),
+    'Could not choose a provider until upload speed tests finish. Try again shortly.'
+  )
+  assert.equal(
     replacementErrorMessage(new APIError('unavailable', 503)),
     'Filecoin storage is unavailable right now. Try again once it recovers.'
   )
@@ -348,6 +358,9 @@ test('recorded selection exclusions explain each known obstacle', () => {
     provider_missing_pdp: 'Provider does not offer PDP storage.',
     provider_unhealthy: 'Provider health check failed.',
     service_url_missing: 'Provider has no service URL.',
+    upload_speed_untested: 'Run an upload speed test before selecting this provider.',
+    upload_speed_failed: 'The upload speed test failed. Retry it before selecting this provider.',
+    previously_used: 'This provider has already been used by the bucket. Choose it manually to reuse it.',
   }
   for (const [reason, message] of Object.entries(reasons)) assert.equal(providerSelectionBlockedReason(reason), message)
   assert.equal(providerSelectionBlockedReason('unknown'), 'Provider unavailable')

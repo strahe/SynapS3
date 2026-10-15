@@ -667,7 +667,7 @@ func safeProviderSelection(report *providerselect.SelectionDiagnostics) *provide
 	view.Rejections = make([]providerselect.ProviderRejection, 0, min(len(report.Rejections), 100))
 	for _, rejection := range report.Rejections[:min(len(report.Rejections), 100)] {
 		switch rejection.Reason {
-		case "observation_missing", "observation_stale", "profile_missing", "profile_url_changed", "provider_inactive", "provider_missing_pdp", "provider_unhealthy", "service_url_missing", "provider_unavailable", "bucket_in_use", "context_open_failed":
+		case "observation_missing", "observation_stale", "profile_missing", "profile_url_changed", "provider_inactive", "provider_missing_pdp", "provider_unhealthy", "service_url_missing", "provider_unavailable", "bucket_in_use", "previously_used", "context_open_failed", "upload_speed_untested", "upload_speed_failed":
 		default:
 			rejection.Reason = "provider_unavailable"
 		}

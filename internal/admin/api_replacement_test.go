@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -159,6 +160,7 @@ func newReplacementAPIFixtureWithHealth(t *testing.T, selector providerReplaceme
 				}); err != nil {
 					t.Fatalf("Seed provider health: %v", err)
 				}
+				seedReplacementProviderSpeed(t, srv, value, url)
 			}
 			if _, err := srv.repos.Observability.RecordApprovedProviders(ctx, time.Now().UTC(), ids); err != nil {
 				t.Fatalf("Seed approval: %v", err)
@@ -188,6 +190,20 @@ func newReplacementAPIFixtureWithHealth(t *testing.T, selector providerReplaceme
 		t.Fatalf("GetDataSetBindingByID: %#v err=%v", source, err)
 	}
 	return &replacementAPIFixture{srv: srv, mux: newBucketAPIMux(srv), bucket: bucket, source: source, priceFingerprint: price.Fingerprint, market: market}
+}
+
+func seedReplacementProviderSpeed(t *testing.T, srv *Server, providerID, serviceURL string) {
+	t.Helper()
+	now := time.Now().UTC()
+	durationMS, bytesPerSecond := int64(1000), providerbenchmark.SampleBytes
+	row := &providerbenchmark.Result{
+		ProviderID: providerID, State: providerbenchmark.StateSucceeded, ServiceURLHash: providerbenchmark.URLHash(serviceURL),
+		SampleBytes: providerbenchmark.SampleBytes, DurationMS: &durationMS, BytesPerSecond: &bytesPerSecond, TestedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := srv.db.NewInsert().Model(row).Exec(t.Context()); err != nil {
+		t.Fatalf("Seed provider upload speed: %v", err)
+	}
 }
 
 func (f *replacementAPIFixture) start(t *testing.T, body string) *httptest.ResponseRecorder {
@@ -976,6 +992,69 @@ func TestAPIListDataSetReplacementProviders(t *testing.T) {
 	}
 	if !source.UploadSpeedTestable || !replacement.UploadSpeedTestable || source.UploadSpeedUnavailableReason != "" || replacement.UploadSpeedUnavailableReason != "" {
 		t.Fatalf("speed test eligibility depended on replacement eligibility: source=%#v replacement=%#v", source, replacement)
+	}
+}
+
+func TestReplacementRequiresSuccessfulCurrentURLUploadSpeed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+	}{
+		{name: "not tested", reason: "upload_speed_untested"},
+		{name: "failed", reason: "upload_speed_failed"},
+		{name: "previous URL", reason: "upload_speed_untested"},
+		{name: "retesting success"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+			ctx := t.Context()
+			query := fixture.srv.db.NewUpdate().Model((*providerbenchmark.Result)(nil)).Where("provider_id = ?", "202")
+			switch tc.name {
+			case "not tested":
+				if _, err := fixture.srv.db.NewDelete().Model((*providerbenchmark.Result)(nil)).Where("provider_id = ?", "202").Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "failed":
+				if _, err := query.Set("state = ?", providerbenchmark.StateFailed).Set("duration_ms = NULL").Set("bytes_per_second = NULL").Set("failure_code = ?", "upload_failed").Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "previous URL":
+				if _, err := query.Set("service_url_hash = ?", providerbenchmark.URLHash("https://old.example")).Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "retesting success":
+				input := providerbenchmark.Input{ProviderID: "202", ServiceURLHash: providerbenchmark.URLHash("https://provider.example")}
+				if _, _, err := fixture.srv.taskService.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeProviderUploadSpeedTest, Input: input}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+					return repos.ProviderUploadSpeed.Begin(ctx, input.ProviderID, input.ServiceURLHash, task.ID)
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			listed := fixture.listProviders(t)
+			var body struct {
+				Providers []replacementProviderResponse `json:"providers"`
+			}
+			if listed.Code != http.StatusOK {
+				t.Fatalf("list: %d %s", listed.Code, listed.Body.String())
+			}
+			if err := json.Unmarshal(listed.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Providers) != 1 || body.Providers[0].ManualSelectable != (tc.reason == "") || body.Providers[0].ManualBlockReason != tc.reason {
+				t.Fatalf("provider speed eligibility = %+v, want %q", body.Providers, tc.reason)
+			}
+			rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if tc.reason == "" {
+				if rec.Code != http.StatusCreated {
+					t.Fatalf("retesting target: %d %s", rec.Code, rec.Body.String())
+				}
+			} else {
+				apiError := decodeAPIError(t, rec)
+				if rec.Code != http.StatusBadRequest || apiError["code"] != storagereplacement.CodeTargetUnavailable || !strings.Contains(apiError["error"], "successful upload speed test") {
+					t.Fatalf("unmeasured target: %d %+v", rec.Code, apiError)
+				}
+			}
+		})
 	}
 }
 

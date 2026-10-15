@@ -35,6 +35,8 @@ flowchart TD
 
 Cache presence is tracked separately from storage state. A `stored` object may remain in the local cache or be available only from remote storage.
 
+Local uploads use the assigned provider with the fastest valid speed measurement. Providers without a valid measurement follow in replica order. If that upload fails before a readable replica is committed, the next eligible assigned replica uses the same ranking. Other replicas pull from a readable committed source. Speed tests do not delay uploads to assigned providers.
+
 ## Retries and Recovery
 
 If SynapS3 is interrupted, unfinished tasks become eligible to continue after the service restarts.

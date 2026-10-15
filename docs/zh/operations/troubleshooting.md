@@ -149,6 +149,10 @@ curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 
 在 curl 的无回显提示中输入 Admin 密码。
 
+Filecoin readiness 检查存储提供方的网络可用性。仪表盘顶部的测速提示单独说明节点是否可以参与选择。可信节点测速期间可以创建存储桶，但存储准备会等待这些测速完成，并确认成功节点足以满足副本策略。查看存储桶的准备说明了解原因。
+
+在顶部提示中使用 **Test remaining providers**，测试尚无结果且符合测速条件的节点。失败的测速可在 **Tasks** 或 **Storage** 的节点详情中使用 **Retry**。自动测速范围和定期重测见[节点选择](../configuration/model.md#节点选择)。
+
 恢复方式：
 
 - 恢复配置中的 `filecoin.rpc_url`。

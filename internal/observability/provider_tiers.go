@@ -28,6 +28,37 @@ func (s *Service) ProviderTiersAvailable() bool {
 	return ok
 }
 
+func (s *Service) RefreshMissingProviderTiers(ctx context.Context) error {
+	store, ok := s.store.(interface {
+		GetProviderTierSnapshot(context.Context, string) (*ProviderTierSnapshot, error)
+	})
+	if !ok {
+		return nil
+	}
+	for _, tier := range []struct {
+		name       string
+		configured bool
+		refresh    func(context.Context) (time.Time, time.Time, error)
+	}{
+		{"approved", s.approvedProviders != nil, s.RefreshApprovedProviders},
+		{"endorsed", s.endorsedProviders != nil, s.RefreshEndorsedProviders},
+	} {
+		if !tier.configured {
+			continue
+		}
+		snapshot, err := store.GetProviderTierSnapshot(ctx, tier.name)
+		if err != nil {
+			return err
+		}
+		if snapshot == nil {
+			if _, _, err := tier.refresh(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // RefreshApprovedProviders reads the approved tier and returns when the read
 // started and the collection time of the snapshot stored afterwards. The two
 // differ when a newer read committed first; the newer snapshot is kept.

@@ -30,16 +30,17 @@ func (r ExclusionReason) Valid() bool {
 type SelectionFailureKind string
 
 const (
-	SelectionRequiredTierEmpty SelectionFailureKind = "required_tier_empty"
-	SelectionRequiredTierInUse SelectionFailureKind = "required_tier_in_use"
-	SelectionTemporary         SelectionFailureKind = "temporarily_unavailable"
-	SelectionProviderContext   SelectionFailureKind = "provider_context_unavailable"
+	SelectionRequiredTierEmpty  SelectionFailureKind = "required_tier_empty"
+	SelectionRequiredTierInUse  SelectionFailureKind = "required_tier_in_use"
+	SelectionTemporary          SelectionFailureKind = "temporarily_unavailable"
+	SelectionProviderContext    SelectionFailureKind = "provider_context_unavailable"
+	SelectionUploadSpeedPending SelectionFailureKind = "upload_speed_tests_pending"
 )
 
 func (k SelectionFailureKind) Valid() bool {
 	//exhaustive:enforce
 	switch k {
-	case SelectionRequiredTierEmpty, SelectionRequiredTierInUse, SelectionTemporary, SelectionProviderContext:
+	case SelectionRequiredTierEmpty, SelectionRequiredTierInUse, SelectionTemporary, SelectionProviderContext, SelectionUploadSpeedPending:
 		return true
 	default:
 		return false
@@ -83,6 +84,8 @@ func (e *SelectionError) Error() string {
 		return ErrNoTrustedProvider.Error()
 	case SelectionTemporary, SelectionProviderContext:
 		return ErrCandidatesTemporarilyUnavailable.Error()
+	case SelectionUploadSpeedPending:
+		return ErrUploadSpeedTestsPending.Error()
 	default:
 		return ErrInventoryUnavailable.Error()
 	}
@@ -101,6 +104,8 @@ func (e *SelectionError) Unwrap() []error {
 		causes = append(causes, ErrCandidatesTemporarilyUnavailable)
 	case SelectionProviderContext:
 		// Provider errors retain their original retry and terminal classification.
+	case SelectionUploadSpeedPending:
+		causes = append(causes, ErrUploadSpeedTestsPending)
 	default:
 		causes = append(causes, ErrInventoryUnavailable)
 	}
@@ -123,6 +128,12 @@ func selectionCandidates(in Inventory, excluded map[string]ExclusionReason) ([]C
 		}
 		if reason == "" {
 			reason = candidateRejectionReason(c)
+		}
+		if reason == "" && in.UploadSpeedRequired && (!c.UploadSpeedSettled || c.BytesPerSecond <= 0) {
+			reason = "upload_speed_untested"
+			if c.UploadSpeedSettled {
+				reason = "upload_speed_failed"
+			}
 		}
 		if reason == "" {
 			eligible = append(eligible, c)
@@ -219,6 +230,11 @@ func inspectSelection(in Inventory, count int, excluded map[string]ExclusionReas
 	diagnostics := selectionDiagnostics(in, count, hasTrusted, len(eligible), rejections)
 	if count <= 0 {
 		return eligible, diagnostics, ""
+	}
+	if in.UploadSpeedRequired && slices.ContainsFunc(in.Candidates, func(c Candidate) bool {
+		return c.TierListed && !c.UploadSpeedSettled && excluded[c.ID.String()] == "" && c.IneligibleReason() == ""
+	}) {
+		return eligible, diagnostics, SelectionUploadSpeedPending
 	}
 	if !in.Admission.Satisfied(hasTrusted) {
 		if len(in.Admission.TrustedIDs) == 0 {

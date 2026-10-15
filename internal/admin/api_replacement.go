@@ -352,6 +352,13 @@ func (s *Server) resolveReplacementProvider(ctx context.Context, bucket *model.B
 	} else if mode != storagereplacement.SelectionModeAutomatic || requested != "" {
 		return idtypes.OnChainID{}, admission, storagereplacement.ErrInvalidTarget
 	}
+	if s.replacementSelector == nil || s.observability == nil {
+		return idtypes.OnChainID{}, admission, errReplacementUnavailable
+	}
+	admission, err := s.observability.SelectionAdmission(ctx, s.anchorProviderTier)
+	if err != nil {
+		return idtypes.OnChainID{}, admission, fmt.Errorf("%w: %v", errApprovalCheckUnavailable, err)
+	}
 	candidates, err := s.replacementProviderCandidatesFor(ctx, bucket, source, requestedID)
 	if err != nil {
 		return idtypes.OnChainID{}, admission, err
@@ -363,16 +370,15 @@ func (s *Server) resolveReplacementProvider(ctx context.Context, bucket *model.B
 				if candidate.IneligibleReason == providerIneligibleServesBucket {
 					return idtypes.OnChainID{}, admission, storagereplacement.ErrTargetInUse
 				}
+				if candidate.IneligibleReason == "upload_speed_untested" || candidate.IneligibleReason == "upload_speed_failed" {
+					return idtypes.OnChainID{}, admission, errors.Join(storagereplacement.ErrTargetUnavailable, errReplacementUploadSpeedUnavailable)
+				}
 				valid = candidate.Eligible
 			}
 		}
 		if !valid {
 			return idtypes.OnChainID{}, admission, storagereplacement.ErrTargetUnavailable
 		}
-	}
-	admission, err = s.observability.SelectionAdmission(ctx, s.anchorProviderTier)
-	if err != nil {
-		return idtypes.OnChainID{}, admission, fmt.Errorf("%w: %v", errApprovalCheckUnavailable, err)
 	}
 	excluded, hasTrusted, err := s.repos.ProviderSelectionState(ctx, bucket.ID, source.ID, admission)
 	if err != nil {
@@ -394,14 +400,9 @@ func (s *Server) resolveReplacementProvider(ctx context.Context, bucket *model.B
 			excluded[key] = providerselect.ExclusionPreviouslyUsed
 		}
 	}
-	in := providerselect.Inventory{Admission: admission}
+	in := providerselect.Inventory{Admission: admission, UploadSpeedRequired: true}
 	for _, candidate := range candidates {
-		if candidate.Eligible && candidate.Profile != nil {
-			in.Candidates = append(in.Candidates, providerselect.Candidate{ID: candidate.ProviderID, Active: true, HasPDP: true, HasProfile: true, Fresh: true, Healthy: true, ServiceURL: candidate.Profile.ServiceURL, ProfileURL: candidate.Profile.ServiceURL, TieBreak: rand.Uint64()})
-		}
-	}
-	if err := s.repos.EnrichProviderCandidates(ctx, &in); err != nil {
-		return idtypes.OnChainID{}, admission, err
+		in.Candidates = append(in.Candidates, candidate.Selection)
 	}
 	selected, err := providerselect.Select(in, bucket.ProviderSelectionStrategy, 1, excluded, hasTrusted)
 	if err != nil {
@@ -458,6 +459,7 @@ func (s *Server) replacementProviderCandidatesFor(
 	for _, item := range observations {
 		observed[item.Facts.ProviderID.String()] = item
 	}
+	in := providerselect.Inventory{Candidates: make([]providerselect.Candidate, len(candidates))}
 	now := time.Now().UTC()
 	for i := range candidates {
 		item := observed[candidates[i].ProviderID.String()]
@@ -469,18 +471,30 @@ func (s *Server) replacementProviderCandidatesFor(
 			candidates[i].ApprovedFresh = profile.ApprovedCheckedAt != nil &&
 				!profile.ApprovedCheckedAt.IsZero() && now.Sub(*profile.ApprovedCheckedAt) <= 2*s.observability.RefreshInterval()
 		}
-		if !candidates[i].Eligible {
-			continue
-		}
-		c := providerselect.Candidate{ID: candidates[i].ProviderID, Active: hasProfile && profile.Active && item.Facts.Active != nil && *item.Facts.Active, HasPDP: item.Facts.HasPDP != nil && *item.Facts.HasPDP, HasProfile: hasProfile, Healthy: item.Signal.Status == observability.StatusAvailable, Fresh: !item.Signal.Freshness.Stale, ProfileURL: profile.ServiceURL}
+		c := providerselect.Candidate{ID: candidates[i].ProviderID, Active: hasProfile && profile.Active && item.Facts.Active != nil && *item.Facts.Active, HasPDP: item.Facts.HasPDP != nil && *item.Facts.HasPDP, HasProfile: hasProfile, Healthy: item.Signal.Status == observability.StatusAvailable, Fresh: !item.Signal.Freshness.Stale, ProfileURL: profile.ServiceURL, TierListed: profile.Approved || profile.Endorsed, TieBreak: rand.Uint64(), ObservationCheckedAt: item.Signal.Freshness.LastCheckedAt}
 		if item.Facts.ServiceURL != nil {
 			c.ServiceURL = *item.Facts.ServiceURL
+		}
+		in.Candidates[i] = c
+	}
+	if err := s.repos.EnrichProviderCandidates(ctx, &in); err != nil {
+		return nil, err
+	}
+	for i, c := range in.Candidates {
+		candidates[i].Selection = c
+		if !candidates[i].Eligible {
+			continue
 		}
 		if reason := c.IneligibleReason(); reason != "" {
 			candidates[i].Eligible = false
 			candidates[i].IneligibleReason = reason
+			continue
 		}
-
+		diagnostics := providerselect.Diagnose(providerselect.Inventory{Candidates: []providerselect.Candidate{c}, UploadSpeedRequired: true}, 1, nil, true)
+		if len(diagnostics.Rejections) > 0 {
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = diagnostics.Rejections[0].Reason
+		}
 	}
 	return candidates, nil
 }
@@ -489,11 +503,16 @@ var (
 	errReplacementUnavailable             = errors.New("filecoin storage is unavailable")
 	errApprovalCheckUnavailable           = errors.New("provider requirement check is unavailable")
 	errReplacementManualProviderAvailable = errors.New("eligible replacement provider requires manual selection")
+	errReplacementUploadSpeedUnavailable  = errors.New("provider needs a successful upload speed test")
 )
 
 func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketName string) {
 	code := storagereplacement.Code(err)
 	switch {
+	case errors.Is(err, providerselect.ErrUploadSpeedTestsPending):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Could not choose a provider until upload speed tests finish. Try again shortly.", "code": "provider_speed_tests"})
+	case errors.Is(err, errReplacementUploadSpeedUnavailable):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Could not select this provider. A successful upload speed test is required.", "code": code})
 	case errors.Is(err, storagereplacement.ErrSourceRunning):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Storage setup is running. Try again shortly.", "code": code})
 	case errors.Is(err, storagereplacement.ErrSourceOutcomeUnknown):

@@ -211,6 +211,27 @@ func (r *BunTaskRepo) LatestForSubject(ctx context.Context, subjectType, subject
 	return row, nil
 }
 
+func (r *BunTaskRepo) LatestForSubjects(ctx context.Context, subjectType string, subjectKeys []string, types ...model.TaskType) (map[string]model.Task, error) {
+	latest := make(map[string]model.Task, len(subjectKeys))
+	if len(subjectKeys) == 0 {
+		return latest, nil
+	}
+	var rows []model.Task
+	query := r.db.NewSelect().Model(&rows).DistinctOn("task.subject_key").
+		Where("task.subject_type = ? AND task.subject_key IN (?) AND task.superseded_at IS NULL", subjectType, bun.List(subjectKeys)).
+		OrderExpr("task.subject_key, task.id DESC")
+	if len(types) > 0 {
+		query = query.Where("task.type IN (?)", bun.List(types))
+	}
+	if err := query.Scan(ctx); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		latest[row.SubjectKey] = row
+	}
+	return latest, nil
+}
+
 func (r *BunTaskRepo) ListCurrentFailedForSubject(ctx context.Context, subjectType, subjectKey string, beforeID int64, limit int, types ...model.TaskType) (TaskPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 100

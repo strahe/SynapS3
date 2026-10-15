@@ -150,8 +150,10 @@ export function useRetryTask() {
         'objectProvenance',
         'objects',
         'bucket',
+        'buckets',
         'observabilityProviders',
-        'replacementProviders',
+        'replacement-providers',
+        'uploadSpeedSummary',
         'commitBatch',
         'commitBatches',
         'task',
@@ -482,6 +484,32 @@ export function useTestProviderUploadSpeed() {
   return useMutation({
     mutationFn: api.testProviderUploadSpeed,
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
+      qc.invalidateQueries({ queryKey: ['uploadSpeedSummary'] })
+      qc.invalidateQueries({ queryKey: ['replacement-providers'] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
+export function useUploadSpeedSummary(enabled = true) {
+  return useQuery({
+    queryKey: ['uploadSpeedSummary'],
+    queryFn: api.getUploadSpeedSummary,
+    enabled,
+    refetchInterval: (query) => {
+      const summary = query.state.data
+      return summary && summary.trusted.testing + summary.other.testing > 0 ? 3_000 : 30_000
+    },
+  })
+}
+
+export function useStartAllUploadSpeedTests() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.startAllUploadSpeedTests,
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['uploadSpeedSummary'] })
       qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
       qc.invalidateQueries({ queryKey: ['replacement-providers'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })

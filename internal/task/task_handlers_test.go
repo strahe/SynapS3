@@ -31,6 +31,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagecommit"
@@ -93,22 +94,20 @@ type handlerRuntimeOptions struct {
 	epochs                    synapse.ChainEpochReader
 	parkedPieces              synapse.ParkedPieceChecker
 	commitNonces              synapse.CommitNonceReader
-	uploadSpeedProbe          interface {
-		Probe(context.Context, string) (time.Duration, error)
-	}
-	policy               cache.EvictionPolicy
-	maxBytes             int64
-	maxWriteBytes        int64
-	highPercent          int
-	lowPercent           int
-	concurrency          int
-	uploadConcurrency    int
-	maxAttempts          *int
-	testBackoff          *taskengine.BackoffPolicy
-	leaseDuration        time.Duration
-	observabilityChecker observability.RefreshChecker
-	retireOnly           bool
-	extraHandlers        []taskengine.Handler
+	uploadSpeedProbe          providerbenchmark.UploadProbe
+	policy                    cache.EvictionPolicy
+	maxBytes                  int64
+	maxWriteBytes             int64
+	highPercent               int
+	lowPercent                int
+	concurrency               int
+	uploadConcurrency         int
+	maxAttempts               *int
+	testBackoff               *taskengine.BackoffPolicy
+	leaseDuration             time.Duration
+	observabilityChecker      observability.RefreshChecker
+	retireOnly                bool
+	extraHandlers             []taskengine.Handler
 }
 
 func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerTestRuntime {
@@ -6131,9 +6130,26 @@ func seedProviderSelection(t *testing.T, runtime handlerTestRuntime, providers .
 		if err != nil {
 			t.Fatal(err)
 		}
+		seedProviderSelectionSpeed(t, runtime, id)
 	}
 	if _, err := runtime.repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), ids); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func seedProviderSelectionSpeed(t *testing.T, runtime handlerTestRuntime, providers ...idtypes.OnChainID) {
+	t.Helper()
+	for _, id := range providers {
+		now := time.Now().UTC()
+		row := &providerbenchmark.Result{
+			ProviderID: id.String(), State: providerbenchmark.StateSucceeded,
+			ServiceURLHash: providerbenchmark.URLHash("https://provider.example"), SampleBytes: providerbenchmark.SampleBytes,
+			DurationMS: new(int64(1000)), BytesPerSecond: new(int64(providerbenchmark.SampleBytes)), TestedAt: &now,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if _, err := runtime.db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

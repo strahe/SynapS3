@@ -1117,6 +1117,81 @@ func TestAPIBucketDetail(t *testing.T) {
 	}
 }
 
+func TestAPIBucketSetupMessagesUseProvisioningTaskReasons(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	mux := newBucketAPIMux(srv)
+	cases := []struct {
+		name   string
+		reason string
+		failed bool
+		ready  bool
+		want   string
+	}{
+		{"speed", "provider_speed_tests", false, false, "Waiting for provider speed tests"},
+		{"providers", "providers", false, false, "Waiting for available storage providers"},
+		{"funding", "funding", false, false, "Waiting for Filecoin funding"},
+		{"storage", "storage_service", false, false, "Preparing bucket storage"},
+		{"unknown", "private_internal_reason", false, false, "Preparing bucket storage"},
+		{"failed", "providers", true, false, "Bucket setup failed. Use Retry in Tasks."},
+		{"ready", "provider_speed_tests", false, true, ""},
+	}
+	for _, tc := range cases {
+		bucket := &model.Bucket{Name: "setup-" + tc.name, Status: model.BucketStatusProvisioning, DefaultCopies: 1, MinimumDurableCopies: 1}
+		if tc.ready {
+			bucket.Status = model.BucketStatusReady
+		}
+		if err := repos.Buckets.Create(t.Context(), bucket); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		raw := "private task error and message"
+		task := &model.Task{
+			Type: model.TaskTypeBucketProvision, InputVersion: 1, SubjectType: "bucket", SubjectKey: strconv.FormatInt(bucket.ID, 10),
+			Input: json.RawMessage(`{}`), Runtime: json.RawMessage(`{}`), Status: model.TaskStatusPending,
+			ResumeMode: model.TaskResumeModeExecute, AvailableAt: now, WaitReason: &tc.reason, LastError: &raw, StatusMessage: &raw,
+		}
+		if tc.failed {
+			task.Status, task.FinishedAt = model.TaskStatusFailed, &now
+		}
+		if _, err := srv.db.NewInsert().Model(task).Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list := httptest.NewRecorder()
+	mux.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/buckets", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d, body=%s", list.Code, list.Body.String())
+	}
+	var items []bucketListItem
+	if err := json.Unmarshal(list.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		i := slices.IndexFunc(items, func(item bucketListItem) bool { return item.Name == "setup-"+tc.name })
+		if i < 0 || items[i].SetupMessage != tc.want {
+			t.Fatalf("list bucket %s setup message, want %q: %#v", tc.name, tc.want, items)
+		}
+		detail := httptest.NewRecorder()
+		mux.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/v1/buckets/setup-"+tc.name, nil))
+		if detail.Code != http.StatusOK {
+			t.Fatalf("detail status=%d, body=%s", detail.Code, detail.Body.String())
+		}
+		var body bucketDetailResponse
+		if err := json.Unmarshal(detail.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.SetupMessage != tc.want {
+			t.Fatalf("detail bucket %s setup message=%q, want %q", tc.name, body.SetupMessage, tc.want)
+		}
+		if tc.ready && bytes.Contains(detail.Body.Bytes(), []byte(`"setup_message"`)) {
+			t.Fatal("ready bucket exposed a setup message")
+		}
+	}
+	if strings.Contains(list.Body.String(), "private") {
+		t.Fatalf("bucket list exposed task internals: %s", list.Body.String())
+	}
+}
+
 func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	identityResolver := &fakeAPIProviderIdentityResolver{

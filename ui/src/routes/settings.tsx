@@ -83,6 +83,8 @@ const tabFields = {
     'filecoin.allow_private_networks',
     'filecoin.default_copies',
     'filecoin.anchor_provider_tier',
+    'filecoin.upload_speed_test.auto_scope',
+    'filecoin.upload_speed_test.retest_interval',
     'filecoin.observability.interval',
     'filecoin.observability.timeout',
     'filecoin.observability.concurrency',
@@ -495,6 +497,41 @@ function SettingsPage() {
                 errors={fieldErrors}
                 onChange={(checked) =>
                   setForm({ ...form, filecoin: { ...form.filecoin, allow_private_networks: checked } })
+                }
+              />
+              <SelectField
+                label="Automatic speed tests"
+                field="filecoin.upload_speed_test.auto_scope"
+                value={form.filecoin.upload_speed_test.auto_scope}
+                options={settingsOptions('filecoin.upload_speed_test.auto_scope', ['trusted', 'all'])}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => {
+                  if (value === 'trusted' || value === 'all') {
+                    setForm({
+                      ...form,
+                      filecoin: {
+                        ...form.filecoin,
+                        upload_speed_test: { ...form.filecoin.upload_speed_test, auto_scope: value },
+                      },
+                    })
+                  }
+                }}
+              />
+              <TextField
+                label="Speed retest interval"
+                field="filecoin.upload_speed_test.retest_interval"
+                value={form.filecoin.upload_speed_test.retest_interval}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({
+                    ...form,
+                    filecoin: {
+                      ...form.filecoin,
+                      upload_speed_test: { ...form.filecoin.upload_speed_test, retest_interval: value },
+                    },
+                  })
                 }
               />
               <TextField

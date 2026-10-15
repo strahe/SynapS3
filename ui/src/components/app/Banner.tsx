@@ -3,9 +3,13 @@ import type { ReactNode } from 'react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { cn } from '@/lib/utils'
 
-export type BannerTone = 'warning' | 'danger' | 'success'
+export type BannerTone = 'info' | 'warning' | 'danger' | 'success'
 
 const bannerToneClasses: Record<BannerTone, { alert?: string; description?: string }> = {
+  info: {
+    alert: 'border-[color:var(--status-info-border)] bg-[var(--status-info-bg)] text-[color:var(--status-info)]',
+    description: 'text-[color:var(--status-info)]',
+  },
   warning: {
     alert:
       'border-[color:var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[color:var(--status-warning)]',

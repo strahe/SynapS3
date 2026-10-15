@@ -211,6 +211,25 @@ export interface ProviderUploadSpeedTest {
   failure_code?: string
 }
 
+export interface UploadSpeedCounts {
+  total: number
+  succeeded: number
+  failed: number
+  testing: number
+  untested: number
+}
+
+export interface UploadSpeedSummary {
+  auto_scope: UploadSpeedAutoScope
+  trusted: UploadSpeedCounts
+  other: UploadSpeedCounts
+  selectable_providers: number
+  required_copies: number
+  ready: boolean
+  can_provision_default: boolean
+  can_test_remaining: boolean
+}
+
 export interface ObservabilityDataSetFacts {
   local_data_set_id: number
   bucket_id: number
@@ -251,6 +270,7 @@ export interface BucketItem {
   minimum_durable_copies: number
   provider_selection_strategy: ProviderSelectionStrategy
   status: BucketStatus
+  setup_message?: string
   object_count: number
   total_size_bytes: number
   storage_health: BucketStorageHealthSummary
@@ -1065,7 +1085,15 @@ export interface SettingsFilecoinConfig {
   allow_private_networks: boolean
   default_copies: number
   anchor_provider_tier: AnchorProviderTier
+  upload_speed_test: SettingsUploadSpeedTestConfig
   observability: SettingsObservabilityConfig
+}
+
+export type UploadSpeedAutoScope = 'trusted' | 'all'
+
+export interface SettingsUploadSpeedTestConfig {
+  auto_scope: UploadSpeedAutoScope
+  retest_interval: string
 }
 
 export interface SettingsObservabilityConfig {
@@ -1159,8 +1187,9 @@ export type SettingsUpdatePayload = Partial<{
     max_requests: number
   }>
   s3: Partial<SettingsS3Config>
-  filecoin: Partial<Omit<SettingsFilecoinConfig, 'observability'>> & {
+  filecoin: Partial<Omit<SettingsFilecoinConfig, 'observability' | 'upload_speed_test'>> & {
     observability?: Partial<SettingsObservabilityConfig>
+    upload_speed_test?: Partial<SettingsUploadSpeedTestConfig>
   }
   cache: Partial<SettingsCacheConfig>
   worker: Partial<{
@@ -1172,7 +1201,7 @@ export type SettingsUpdatePayload = Partial<{
 }>
 
 export interface FilecoinReadinessPreflightPayload {
-  filecoin: Partial<Omit<SettingsFilecoinConfig, 'observability'>> & {
+  filecoin: Partial<Omit<SettingsFilecoinConfig, 'observability' | 'upload_speed_test'>> & {
     observability?: Partial<SettingsObservabilityConfig>
   }
 }
@@ -1445,6 +1474,9 @@ export const api = {
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
   getFilecoinReadiness: () => fetchJSON<FilecoinReadinessData>('/filecoin/readiness'),
+  getUploadSpeedSummary: () => fetchJSON<UploadSpeedSummary>('/observability/providers/upload-speed-summary'),
+  startAllUploadSpeedTests: () =>
+    fetchJSON<{ queued: number }>('/observability/providers/upload-speed-tests', { method: 'POST' }),
   getObservabilityProviders: (
     params: Pick<ObservabilityListParams, 'status' | 'provider_id' | 'limit' | 'offset'> = {}
   ) =>

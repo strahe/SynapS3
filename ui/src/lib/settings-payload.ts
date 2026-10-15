@@ -27,6 +27,11 @@ export function buildSettingsPayload(
   if (include('filecoin.with_cdn')) payload.filecoin.with_cdn = form.filecoin.with_cdn
   if (include('filecoin.allow_private_networks'))
     payload.filecoin.allow_private_networks = form.filecoin.allow_private_networks
+  payload.filecoin.upload_speed_test = {}
+  if (include('filecoin.upload_speed_test.auto_scope'))
+    payload.filecoin.upload_speed_test.auto_scope = form.filecoin.upload_speed_test.auto_scope
+  if (include('filecoin.upload_speed_test.retest_interval'))
+    payload.filecoin.upload_speed_test.retest_interval = form.filecoin.upload_speed_test.retest_interval
   payload.filecoin.observability = {}
   if (include('filecoin.observability.interval'))
     payload.filecoin.observability.interval = form.filecoin.observability.interval

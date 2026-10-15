@@ -11,78 +11,106 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 )
 
-const uploadProbeTimeout = 180 * time.Second
-
 var uploadSessionPath = regexp.MustCompile(`(?:^|/)pdp/piece/uploads/([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})$`)
 
+var errUploadMeasurementWindow = errors.New("upload measurement window ended")
+
 type PDPBatchUploadProbe struct {
-	client  *http.Client
-	timeout time.Duration
+	client               *http.Client
+	measurementWindow    time.Duration
+	sessionCreateTimeout time.Duration
+	minimumSampleBytes   int64
 }
 
 func NewPDPBatchUploadProbe(allowPrivate bool) *PDPBatchUploadProbe {
-	return &PDPBatchUploadProbe{client: NewProviderHTTPClient(0, allowPrivate), timeout: uploadProbeTimeout}
+	return &PDPBatchUploadProbe{
+		client:               NewProviderHTTPClient(0, allowPrivate),
+		measurementWindow:    providerbenchmark.MeasurementWindow,
+		sessionCreateTimeout: providerbenchmark.SessionCreateTimeout,
+		minimumSampleBytes:   providerbenchmark.MinimumSampleBytes,
+	}
 }
 
 // Probe measures only the PUT phase; the upload session is intentionally not finalized.
-func (p *PDPBatchUploadProbe) Probe(ctx context.Context, serviceURL string) (time.Duration, error) {
+func (p *PDPBatchUploadProbe) Probe(ctx context.Context, serviceURL string) (providerbenchmark.Measurement, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return providerbenchmark.Measurement{}, err
 	}
 	base, err := parsePDPHTTPURL(serviceURL, "provider service URL")
 	if err != nil || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
-		return 0, errors.New("invalid provider service URL")
+		return providerbenchmark.Measurement{}, errors.New("invalid provider service URL")
 	}
 	base = cloneUploadBaseURL(base)
 	createURL := base.ResolveReference(&url.URL{Path: "pdp/piece/uploads"})
 	payload := make([]byte, providerbenchmark.SampleBytes)
 	if _, err := rand.Read(payload); err != nil {
-		return 0, fmt.Errorf("preparing upload sample: %w", err)
+		return providerbenchmark.Measurement{}, fmt.Errorf("preparing upload sample: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL.String(), nil)
+	createCtx, cancelCreate := context.WithTimeout(ctx, p.sessionCreateTimeout)
+	defer cancelCreate()
+	createReq, err := http.NewRequestWithContext(createCtx, http.MethodPost, createURL.String(), nil)
 	if err != nil {
-		return 0, err
+		return providerbenchmark.Measurement{}, err
 	}
 	createResp, err := p.client.Do(createReq)
 	if err != nil {
-		return 0, err
+		return providerbenchmark.Measurement{}, err
 	}
-	defer func() { _ = createResp.Body.Close() }()
 	_, _ = io.CopyN(io.Discard, createResp.Body, 1024)
+	_ = createResp.Body.Close()
+	cancelCreate()
 	if createResp.StatusCode != http.StatusCreated {
-		return 0, fmt.Errorf("upload session creation returned HTTP %d", createResp.StatusCode)
+		return providerbenchmark.Measurement{}, fmt.Errorf("upload session creation returned HTTP %d", createResp.StatusCode)
 	}
 	uuid, err := checkedUploadSessionID(createResp.Header.Get("Location"), createURL)
 	if err != nil {
-		return 0, err
+		return providerbenchmark.Measurement{}, err
 	}
 	putURL := base.ResolveReference(&url.URL{Path: "pdp/piece/uploads/" + uuid})
+	putCtx, cancelPut := context.WithTimeoutCause(ctx, p.measurementWindow, errUploadMeasurementWindow)
+	defer cancelPut()
+	body := &uploadCountingReader{reader: bytes.NewReader(payload)}
 	// An opaque ReadCloser prevents net/http from constructing a replayable body.
-	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL.String(), io.NopCloser(bytes.NewReader(payload)))
+	putReq, err := http.NewRequestWithContext(putCtx, http.MethodPut, putURL.String(), io.NopCloser(body))
 	if err != nil {
-		return 0, err
+		return providerbenchmark.Measurement{}, err
 	}
 	putReq.ContentLength = providerbenchmark.SampleBytes
 	putReq.Header.Set("Content-Type", "application/octet-stream")
 	started := time.Now()
 	putResp, err := p.client.Do(putReq)
-	if err != nil {
-		return 0, err
-	}
 	duration := time.Since(started)
+	if err != nil {
+		if context.Cause(putCtx) == errUploadMeasurementWindow && ctx.Err() == nil {
+			if count := body.bytes.Load(); count >= p.minimumSampleBytes {
+				return providerbenchmark.Measurement{Bytes: count, Duration: duration}, nil
+			}
+		}
+		return providerbenchmark.Measurement{}, err
+	}
 	defer func() { _ = putResp.Body.Close() }()
 	_, _ = io.CopyN(io.Discard, putResp.Body, 1024)
 	if putResp.StatusCode != http.StatusNoContent {
-		return 0, fmt.Errorf("upload sample returned HTTP %d", putResp.StatusCode)
+		return providerbenchmark.Measurement{}, fmt.Errorf("upload sample returned HTTP %d", putResp.StatusCode)
 	}
-	return duration, nil
+	return providerbenchmark.Measurement{Bytes: providerbenchmark.SampleBytes, Duration: duration}, nil
+}
+
+type uploadCountingReader struct {
+	reader io.Reader
+	bytes  atomic.Int64
+}
+
+func (r *uploadCountingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytes.Add(int64(n))
+	return n, err
 }
 
 func cloneUploadBaseURL(base *url.URL) *url.URL {

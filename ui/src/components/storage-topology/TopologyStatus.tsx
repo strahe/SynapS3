@@ -35,7 +35,8 @@ export function UploadSpeedText({
   hideUntested?: boolean
 }) {
   if (!test && !testing && hideUntested) return null
-  const label = testing ? 'Testing…' : providerUploadSpeedShortLabel(test)
+  const currentTest = testing ? { ...test, state: 'testing' as const, sample_bytes: test?.sample_bytes ?? 0 } : test
+  const label = providerUploadSpeedShortLabel(currentTest)
   const details = testing ? [] : uploadSpeedDetails(test)
   const text = <span className="min-w-0 truncate tabular-nums">{label}</span>
   if (details.length === 0) return text

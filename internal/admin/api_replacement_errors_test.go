@@ -13,6 +13,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 )
 
@@ -52,5 +53,20 @@ func TestBucketReplacementEligibilityLogsUnexpectedFailures(t *testing.T) {
 				t.Fatal("database failure must be logged without being exposed to the client")
 			}
 		})
+	}
+}
+
+func TestAutomaticReplacementWaitsForTrustedProviderSpeedTests(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+	if _, err := fixture.srv.db.NewDelete().Model((*providerbenchmark.Result)(nil)).Where("provider_id = ?", "303").Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	rec := fixture.start(t, `{"mode":"automatic"}`)
+	if rec.Code != http.StatusConflict || decodeAPIError(t, rec)["code"] != "provider_speed_tests" {
+		t.Fatalf("automatic replacement before trusted tests finish: %d %s", rec.Code, rec.Body.String())
+	}
+	replacements, err := fixture.srv.repos.Replacements.ListForBucket(t.Context(), fixture.bucket.ID, 0)
+	if err != nil || len(replacements) != 0 {
+		t.Fatalf("replacements after pending test rejection = %+v, %v", replacements, err)
 	}
 }

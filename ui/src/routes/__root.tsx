@@ -25,6 +25,7 @@ import { type AuthSession, addAuthInvalidationListener, api } from '@/api/client
 import { AdminLogin } from '@/components/app/AdminLogin'
 import { Banner } from '@/components/app/Banner'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
+import { ProviderSpeedNotice } from '@/components/app/ProviderSpeedNotice'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -247,6 +248,7 @@ function AuthenticatedRootLayout({
         ) : (
           <>
             <GlobalFilecoinReadinessAlert enabled={filecoinRuntimeReadinessEnabled(settings, settingsLoading)} />
+            <ProviderSpeedNotice enabled={filecoinRuntimeReadinessEnabled(settings, settingsLoading)} />
             <Outlet />
           </>
         )}
@@ -363,6 +365,7 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
     const refreshCatalog = () => {
       lastCatalogRefresh = Date.now()
       queryClient.invalidateQueries({ queryKey: ['observabilityProviders'] })
+      queryClient.invalidateQueries({ queryKey: ['uploadSpeedSummary'] })
       queryClient.invalidateQueries({ queryKey: ['replacement-providers'] })
       queryClient.invalidateQueries({ queryKey: ['bucket'] })
       queryClient.invalidateQueries({ queryKey: ['objectProvenance'] })

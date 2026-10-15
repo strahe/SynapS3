@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -14,11 +15,13 @@ import (
 type (
 	EventPublisher            interface{ Publish(string, map[string]any) }
 	ObservabilityDependencies struct {
-		Repositories     *repository.Repositories
-		Observability    *observability.Service
-		UploadSpeedProbe providerbenchmark.UploadProbe
-		Events           EventPublisher
-		Scheduler        *taskengine.Scheduler
+		Repositories                  *repository.Repositories
+		Observability                 *observability.Service
+		UploadSpeedProbe              providerbenchmark.UploadProbe
+		Events                        EventPublisher
+		Scheduler                     *taskengine.Scheduler
+		UploadSpeedTestAutoScope      string
+		UploadSpeedTestRetestInterval time.Duration
 	}
 )
 
@@ -51,11 +54,12 @@ func (h *ObservabilityHandler) newHandler() *taskengine.FuncHandler {
 			h.deps.Events.Publish("provider_catalog_updated", map[string]any{})
 		}
 		dataSetErr := h.deps.Observability.RefreshDataSetStates(ctx)
+		speedErr := h.scheduleMissingProviderSpeedTests(ctx)
 		if err := errors.Join(providerErr, dataSetErr); err != nil {
-			return retryTask(err, "observability_refresh_failed")
+			return retryTask(errors.Join(err, speedErr), "observability_refresh_failed")
 		}
-		if err := h.scheduleMissingProviderSpeedTests(ctx); err != nil {
-			return retryTask(err, "provider_speed_schedule_failed")
+		if speedErr != nil {
+			return retryTask(speedErr, "provider_speed_schedule_failed")
 		}
 		return taskengine.CompleteCycle("Storage health refreshed", nil)
 	}

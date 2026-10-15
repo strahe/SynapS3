@@ -20,11 +20,11 @@ import (
 )
 
 func TestAPIObservabilityRefreshRunsThroughAdminHandler(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	service := observability.NewService(observability.ServiceOptions{
 		Checker: &observabilityAPIRefreshChecker{
 			providers: func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error) {
-				atomic.AddInt32(&calls, 1)
+				calls.Add(1)
 				return []observability.ProviderState{
 					{ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable, LastCheckedAt: time.Now().UTC()},
 				}, nil
@@ -47,7 +47,7 @@ func TestAPIObservabilityRefreshRunsThroughAdminHandler(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			atomic.StoreInt32(&calls, 0)
+			calls.Store(0)
 			srv := &Server{addr: tt.addr, observability: service, logger: testLogger()}
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/observability/providers/refresh", nil)
 			rr := httptest.NewRecorder()
@@ -57,8 +57,8 @@ func TestAPIObservabilityRefreshRunsThroughAdminHandler(t *testing.T) {
 			if rr.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
 			}
-			if atomic.LoadInt32(&calls) != tt.wantCalls {
-				t.Fatalf("refresh calls = %d, want %d", calls, tt.wantCalls)
+			if gotCalls := calls.Load(); gotCalls != tt.wantCalls {
+				t.Fatalf("refresh calls = %d, want %d", gotCalls, tt.wantCalls)
 			}
 			if tt.wantStatus == http.StatusOK {
 				var body observability.ProviderObservationPage
@@ -405,7 +405,7 @@ func TestAPIProviderUploadSpeedTestAdmitsOneTaskAndListsResult(t *testing.T) {
 		t.Fatalf("active speed test row = %+v, %v", row, err)
 	}
 	if err := repos.ProviderUploadSpeed.Finish(t.Context(), "101", *row.ActiveTaskID, providerbenchmark.StateSucceeded,
-		1000, providerbenchmark.SampleBytes, ""); err != nil {
+		providerbenchmark.SampleBytes, 1000, providerbenchmark.SampleBytes, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := getSpeed(); got.State != string(providerbenchmark.StateSucceeded) || got.BytesPerSecond == nil {
@@ -428,11 +428,11 @@ func TestAPIProviderUploadSpeedTestAdmitsOneTaskAndListsResult(t *testing.T) {
 }
 
 func TestAPIObservabilityRefreshDataSets(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	service := observability.NewService(observability.ServiceOptions{
 		Checker: &observabilityAPIRefreshChecker{
 			dataSets: func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error) {
-				atomic.AddInt32(&calls, 1)
+				calls.Add(1)
 				return []observability.DataSetState{
 					{
 						LocalDataSetID: 101,
@@ -457,7 +457,7 @@ func TestAPIObservabilityRefreshDataSets(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
 	}
-	if gotCalls := atomic.LoadInt32(&calls); gotCalls != 1 {
+	if gotCalls := calls.Load(); gotCalls != 1 {
 		t.Fatalf("refresh calls = %d, want 1", gotCalls)
 	}
 

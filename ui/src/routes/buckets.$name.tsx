@@ -1045,6 +1045,7 @@ function ObjectBrowserPage() {
           }
           actions={<RefreshButton onClick={handleRefresh} refreshing={bucket.isFetching} />}
         />
+        {data?.setup_message && <p className="text-sm text-muted-foreground">{data.setup_message}</p>}
       </div>
 
       {bucket.error && (

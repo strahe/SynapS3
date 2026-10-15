@@ -67,14 +67,20 @@ type S3Config struct {
 }
 
 type FilecoinConfig struct {
-	Network              string                      `koanf:"network"` // calibration | mainnet
-	RPCURL               string                      `koanf:"rpc_url"`
-	PrivateKey           string                      `koanf:"private_key"`
-	WithCDN              bool                        `koanf:"with_cdn"`
-	AllowPrivateNetworks bool                        `koanf:"allow_private_networks"`
-	DefaultCopies        int                         `koanf:"default_copies"`
-	AnchorProviderTier   string                      `koanf:"anchor_provider_tier"`
-	Observability        FilecoinObservabilityConfig `koanf:"observability"`
+	Network              string                        `koanf:"network"` // calibration | mainnet
+	RPCURL               string                        `koanf:"rpc_url"`
+	PrivateKey           string                        `koanf:"private_key"`
+	WithCDN              bool                          `koanf:"with_cdn"`
+	AllowPrivateNetworks bool                          `koanf:"allow_private_networks"`
+	DefaultCopies        int                           `koanf:"default_copies"`
+	AnchorProviderTier   string                        `koanf:"anchor_provider_tier"`
+	UploadSpeedTest      FilecoinUploadSpeedTestConfig `koanf:"upload_speed_test"`
+	Observability        FilecoinObservabilityConfig   `koanf:"observability"`
+}
+
+type FilecoinUploadSpeedTestConfig struct {
+	AutoScope      string        `koanf:"auto_scope"`
+	RetestInterval time.Duration `koanf:"retest_interval"`
 }
 
 type FilecoinObservabilityConfig struct {
@@ -183,6 +189,7 @@ func defaultConfig() *Config {
 			RPCURL:             defaultFilecoinRPCURLs["calibration"],
 			DefaultCopies:      DefaultFilecoinCopies,
 			AnchorProviderTier: string(providerselect.TierApproved),
+			UploadSpeedTest:    FilecoinUploadSpeedTestConfig{AutoScope: "trusted"},
 			Observability: FilecoinObservabilityConfig{
 				Interval:    5 * time.Minute,
 				Timeout:     5 * time.Second,
@@ -475,6 +482,12 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if !providerselect.Tier(c.Filecoin.AnchorProviderTier).Valid() {
 		add("filecoin.anchor_provider_tier", "must be approved, endorsed, or none")
+	}
+	if c.Filecoin.UploadSpeedTest.AutoScope != "trusted" && c.Filecoin.UploadSpeedTest.AutoScope != "all" {
+		add("filecoin.upload_speed_test.auto_scope", "must be trusted or all")
+	}
+	if c.Filecoin.UploadSpeedTest.RetestInterval < 0 {
+		add("filecoin.upload_speed_test.retest_interval", "must be >= 0")
 	}
 	if !model.ValidStorageCopies(c.Filecoin.DefaultCopies) {
 		if c.Filecoin.DefaultCopies < model.StorageCopiesMin {

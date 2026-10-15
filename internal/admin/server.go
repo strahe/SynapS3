@@ -40,42 +40,43 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr                    string
-	db                      *bun.DB
-	cache                   cache.Cache
-	objectReader            *objectreader.Reader
-	objectStorage           synapse.StorageClient
-	cacheGate               *cacheaccess.Gate
-	cacheAccessTracker      *cacheaccess.Tracker
-	objectUploader          objectUploader
-	objectVersionRestorer   objectVersionRestorer
-	cacheMaxBytes           int64
-	repos                   *repository.Repositories
-	taskService             *taskengine.Service
-	replacementMessages     *taskengine.Messenger
-	copyRetryMessages       *taskengine.Messenger
-	bucketLifecycle         *bucketlifecycle.Service
-	workerHealth            WorkerHealthChecker
-	wallet                  synapse.WalletQuerier
-	filecoinReadiness       filecoinReadinessProbe
-	observability           *observability.Service
-	monitoring              *observability.RuntimeMonitor
-	transferCounters        *observability.TransferCounters
-	warmStorageMarket       WarmStorageMarket
-	marketChainID           uint64
-	usdfcAddress            string
-	providerIdentity        providerIdentityLookup
-	events                  *EventHub
-	settings                *SettingsService
-	auth                    *authService
-	trustedProxies          []netip.Prefix
-	s3IAM                   auth.IAMService
-	s3RootAccess            string
-	anchorProviderTier      providerselect.Tier
-	filecoinDefaultCopies   int
-	commitMaxPieces         int
-	commitMaxWait           time.Duration
-	legacyPieceStorageLimit uint64
+	addr                     string
+	db                       *bun.DB
+	cache                    cache.Cache
+	objectReader             *objectreader.Reader
+	objectStorage            synapse.StorageClient
+	cacheGate                *cacheaccess.Gate
+	cacheAccessTracker       *cacheaccess.Tracker
+	objectUploader           objectUploader
+	objectVersionRestorer    objectVersionRestorer
+	cacheMaxBytes            int64
+	repos                    *repository.Repositories
+	taskService              *taskengine.Service
+	replacementMessages      *taskengine.Messenger
+	copyRetryMessages        *taskengine.Messenger
+	bucketLifecycle          *bucketlifecycle.Service
+	workerHealth             WorkerHealthChecker
+	wallet                   synapse.WalletQuerier
+	filecoinReadiness        filecoinReadinessProbe
+	observability            *observability.Service
+	monitoring               *observability.RuntimeMonitor
+	transferCounters         *observability.TransferCounters
+	warmStorageMarket        WarmStorageMarket
+	marketChainID            uint64
+	usdfcAddress             string
+	providerIdentity         providerIdentityLookup
+	events                   *EventHub
+	settings                 *SettingsService
+	auth                     *authService
+	trustedProxies           []netip.Prefix
+	s3IAM                    auth.IAMService
+	s3RootAccess             string
+	anchorProviderTier       providerselect.Tier
+	uploadSpeedTestAutoScope string
+	filecoinDefaultCopies    int
+	commitMaxPieces          int
+	commitMaxWait            time.Duration
+	legacyPieceStorageLimit  uint64
 	// replacementSelector resolves an automatic replacement provider. Nil means
 	// only an explicit Provider ID can be confirmed.
 	replacementSelector providerReplacementSelector
@@ -91,6 +92,12 @@ type Server struct {
 func (s *Server) WithTaskService(service *taskengine.Service) *Server {
 	s.taskService = service
 	s.bucketLifecycle.SetTaskService(service)
+	return s
+}
+
+// WithUploadSpeedTest supplies the running provider test policy.
+func (s *Server) WithUploadSpeedTest(cfg config.FilecoinUploadSpeedTestConfig) *Server {
+	s.uploadSpeedTestAutoScope = cfg.AutoScope
 	return s
 }
 
@@ -121,24 +128,25 @@ func New(
 		panic("admin server requires a cache access tracker")
 	}
 	s := &Server{
-		anchorProviderTier:    providerselect.TierApproved,
-		addr:                  addr,
-		db:                    db,
-		cache:                 c,
-		cacheGate:             cacheGate,
-		cacheAccessTracker:    cacheAccessTracker,
-		objectReader:          objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
-		cacheMaxBytes:         cacheMaxBytes,
-		repos:                 repos,
-		bucketLifecycle:       bucketlifecycle.New(repos, c, boundedBucketCopies(filecoinDefaultCopies), logger),
-		workerHealth:          wh,
-		wallet:                newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
-		events:                newAdminEventHub(),
-		filecoinDefaultCopies: boundedBucketCopies(filecoinDefaultCopies),
-		commitMaxPieces:       config.DefaultCommitMaxPieces,
-		commitMaxWait:         config.DefaultCommitMaxWait,
-		logger:                logger,
-		startedAt:             time.Now(),
+		anchorProviderTier:       providerselect.TierApproved,
+		uploadSpeedTestAutoScope: "trusted",
+		addr:                     addr,
+		db:                       db,
+		cache:                    c,
+		cacheGate:                cacheGate,
+		cacheAccessTracker:       cacheAccessTracker,
+		objectReader:             objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
+		cacheMaxBytes:            cacheMaxBytes,
+		repos:                    repos,
+		bucketLifecycle:          bucketlifecycle.New(repos, c, boundedBucketCopies(filecoinDefaultCopies), logger),
+		workerHealth:             wh,
+		wallet:                   newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
+		events:                   newAdminEventHub(),
+		filecoinDefaultCopies:    boundedBucketCopies(filecoinDefaultCopies),
+		commitMaxPieces:          config.DefaultCommitMaxPieces,
+		commitMaxWait:            config.DefaultCommitMaxWait,
+		logger:                   logger,
+		startedAt:                time.Now(),
 	}
 	s.watchWalletOperationEvents()
 	return s
@@ -336,6 +344,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
 		mux.HandleFunc("GET /api/v1/filecoin/warm-storage/price-list", s.handleAPIWarmStoragePrice)
 		mux.HandleFunc("GET /api/v1/observability/providers", s.handleAPIObservabilityProviders)
+		mux.HandleFunc("GET /api/v1/observability/providers/upload-speed-summary", s.handleAPIUploadSpeedSummary)
+		mux.HandleFunc("POST /api/v1/observability/providers/upload-speed-tests", s.handleAPIStartAllUploadSpeedTests)
 		mux.HandleFunc("POST /api/v1/observability/provider-tiers/refresh", s.handleAPIRefreshProviderTiers)
 		mux.HandleFunc("POST /api/v1/observability/providers/refresh", s.handleAPIRefreshObservabilityProviders)
 		mux.HandleFunc("POST /api/v1/observability/providers/{provider_id}/upload-speed-test", s.handleAPIProviderUploadSpeedTest)

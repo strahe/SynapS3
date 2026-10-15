@@ -36,6 +36,9 @@ func TestValidate_DefaultConfig(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got: %v", err)
 	}
+	if cfg.Filecoin.UploadSpeedTest.AutoScope != "trusted" || cfg.Filecoin.UploadSpeedTest.RetestInterval != 0 {
+		t.Fatalf("default speed test config = %#v, want trusted with periodic tests disabled", cfg.Filecoin.UploadSpeedTest)
+	}
 }
 
 func TestLoadAdminTrustedProxiesFromConfigAndEnv(t *testing.T) {
@@ -277,6 +280,14 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 		{
 			name: "provider requirement", field: "filecoin.anchor_provider_tier",
 			mutate: func(cfg *Config) { cfg.Filecoin.AnchorProviderTier = "any" },
+		},
+		{
+			name: "speed test scope", field: "filecoin.upload_speed_test.auto_scope",
+			mutate: func(cfg *Config) { cfg.Filecoin.UploadSpeedTest.AutoScope = "none" },
+		},
+		{
+			name: "negative speed test interval", field: "filecoin.upload_speed_test.retest_interval",
+			mutate: func(cfg *Config) { cfg.Filecoin.UploadSpeedTest.RetestInterval = -time.Second },
 		},
 		{
 			name:  "server port",
