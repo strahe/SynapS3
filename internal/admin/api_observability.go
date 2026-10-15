@@ -125,13 +125,18 @@ func uploadSpeedView(row providerbenchmark.Result, profile *observability.Provid
 	} else if observedServiceURL != nil {
 		serviceURL = *observedServiceURL
 	}
-	if row.State != providerbenchmark.StateTesting && (serviceURL == "" || providerbenchmark.URLHash(serviceURL) != row.ServiceURLHash) {
+	_, settled := row.Outcome(serviceURL)
+	if !settled && (row.State != providerbenchmark.StateTesting || serviceURL == "" || providerbenchmark.URLHash(serviceURL) != row.ServiceURLHash) {
 		return &providerUploadSpeedView{State: "stale", SampleBytes: row.SampleBytes, TestedAt: row.TestedAt}
 	}
-	return &providerUploadSpeedView{
-		State: string(row.State), SampleBytes: row.SampleBytes,
-		DurationMS: row.DurationMS, BytesPerSecond: row.BytesPerSecond, TestedAt: row.TestedAt, FailureCode: row.FailureCode,
+	view := &providerUploadSpeedView{State: string(row.State), SampleBytes: row.SampleBytes}
+	if settled {
+		view.DurationMS = row.DurationMS
+		view.BytesPerSecond = row.BytesPerSecond
+		view.TestedAt = row.TestedAt
+		view.FailureCode = row.FailureCode
 	}
+	return view
 }
 
 type providerObservationWithSpeed struct {

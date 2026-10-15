@@ -18,7 +18,9 @@ export function providerUploadSpeedLabel(test?: ProviderUploadSpeedTest): string
   if (!test) return 'Not tested'
   switch (test.state) {
     case 'testing':
-      return 'Testing upload speed…'
+      return test.bytes_per_second && test.bytes_per_second > 0
+        ? `Testing · last ${formatUploadSpeed(test.bytes_per_second)}`
+        : 'Testing upload speed…'
     case 'stale':
       return 'Outdated — Service URL no longer matches'
     case 'failed':
@@ -46,7 +48,9 @@ export function providerUploadSpeedShortLabel(test?: ProviderUploadSpeedTest): s
   if (!test) return 'Not tested'
   switch (test.state) {
     case 'testing':
-      return 'Testing…'
+      return test.bytes_per_second && test.bytes_per_second > 0
+        ? `Testing · last ${formatUploadSpeed(test.bytes_per_second)}`
+        : 'Testing…'
     case 'stale':
       return 'Outdated'
     case 'failed':

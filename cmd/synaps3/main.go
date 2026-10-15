@@ -454,6 +454,8 @@ func setupModeAllowedField(field string) bool {
 		"filecoin.rpc_url",
 		"filecoin.private_key",
 		"filecoin.default_copies",
+		"filecoin.upload_speed_test.auto_scope",
+		"filecoin.upload_speed_test.retest_interval",
 		"filecoin.observability.interval",
 		"filecoin.observability.timeout",
 		"filecoin.observability.concurrency",

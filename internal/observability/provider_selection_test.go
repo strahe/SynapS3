@@ -25,11 +25,55 @@ func (s *selectionTierStore) ProviderProfiles(_ context.Context, ids []types.OnC
 	for _, id := range ids {
 		for _, state := range s.providers {
 			if state.Profile != nil && state.ProviderID.Equal(id) {
-				profiles[id.String()] = *state.Profile
+				profile := *state.Profile
+				profile.Approved, profile.Endorsed = false, false
+				for tier, snapshot := range s.snapshots {
+					if snapshot == nil {
+						continue
+					}
+					var members []string
+					if err := json.Unmarshal(snapshot.ProviderIDs, &members); err != nil {
+						return nil, err
+					}
+					for _, member := range members {
+						if member == id.String() {
+							profile.Approved = profile.Approved || tier == "approved"
+							profile.Endorsed = profile.Endorsed || tier == "endorsed"
+						}
+					}
+				}
+				profiles[id.String()] = profile
 			}
 		}
 	}
 	return profiles, nil
+}
+
+func TestProviderCandidatesReadStoredMembershipAfterAdmissionRefresh(t *testing.T) {
+	now := time.Now().UTC()
+	id := types.NewOnChainID(202)
+	url := "https://provider.test"
+	store := &selectionTierStore{
+		tierTestStore: &tierTestStore{fakeStateStore: &fakeStateStore{providers: []ProviderState{{
+			ProviderID: id, Status: StatusAvailable, Active: new(true), HasPDP: new(true), ServiceURL: &url, LastCheckedAt: now,
+			Profile: &ProviderProfile{ProviderID: id, Active: true, ServiceURL: url},
+		}}}},
+		snapshots: map[string]*ProviderTierSnapshot{"endorsed": {CheckedAt: now.Add(-time.Hour), ProviderIDs: json.RawMessage(`["101"]`)}},
+	}
+	service := NewService(ServiceOptions{Store: store, EndorsedProviders: tierEndorsedSource{ids: []sdktypes.BigInt{id.SDK()}}, RefreshInterval: time.Minute, Now: func() time.Time { return now }})
+	in, err := service.ProviderCandidates(t.Context())
+	if err != nil || len(in.Candidates) != 1 || in.Candidates[0].TierListed || store.endorsedCalls != 0 {
+		t.Fatalf("stored candidates = %#v err=%v refreshes=%d", in, err, store.endorsedCalls)
+	}
+	in, err = service.SelectionInventory(t.Context(), providerselect.TierEndorsed)
+	if err != nil || len(in.Candidates) != 1 || !in.Candidates[0].TierListed || !in.Admission.Trusted(id) {
+		t.Fatalf("refreshed candidates = %#v err=%v", in, err)
+	}
+	delete(store.snapshots, "endorsed")
+	in, err = service.ProviderCandidates(t.Context())
+	if err != nil || len(in.Candidates) != 1 || in.Candidates[0].TierListed || store.endorsedCalls != 1 {
+		t.Fatalf("missing tier candidates = %#v err=%v refreshes=%d", in, err, store.endorsedCalls)
+	}
 }
 
 func (s *selectionTierStore) ListProviderStates(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {

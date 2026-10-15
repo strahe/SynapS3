@@ -188,14 +188,14 @@ function ProviderHealthCell({
       <div>
         <TopologySignalBadge status={row.status} signal={row.provider?.signal} />
       </div>
-      <div>
+      <div className={cn(test?.retryable && 'col-span-2')}>
         {test?.retryable ? (
           <RetryButton taskID={test.retry_task_id} />
         ) : (
           <ProviderUploadSpeedButton provider={row.provider} name={name} starting={starting} compact onTest={onTest} />
         )}
       </div>
-      <UploadSpeedText test={test} testing={testing} hideUntested />
+      {!test?.retryable && <UploadSpeedText test={test} testing={testing} hideUntested />}
     </div>
   )
 }

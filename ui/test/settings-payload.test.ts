@@ -19,6 +19,8 @@ function baseConfig(): SettingsEditableConfig {
       with_cdn: false,
       allow_private_networks: false,
       default_copies: 2,
+      anchor_provider_tier: 'approved',
+      upload_speed_test: { auto_scope: 'trusted', retest_interval: '0s' },
       observability: { interval: '5m0s', timeout: '5s', concurrency: 8 },
     },
     cache: {
@@ -87,6 +89,33 @@ test('settings payload includes editable filecoin observability fields', () => {
     timeout: '10s',
     concurrency: 4,
   })
+})
+
+test('settings payload preserves environment ownership of automatic speed test settings', () => {
+  const initial = baseConfig()
+  const form = baseConfig()
+  form.filecoin.upload_speed_test = { auto_scope: 'all', retest_interval: '1h0m0s' }
+
+  for (const [envManaged, expected] of [
+    [{}, { auto_scope: 'all', retest_interval: '1h0m0s' }],
+    [
+      { 'filecoin.upload_speed_test.auto_scope': 'SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_AUTO_SCOPE' },
+      { retest_interval: '1h0m0s' },
+    ],
+    [
+      { 'filecoin.upload_speed_test.retest_interval': 'SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_RETEST_INTERVAL' },
+      { auto_scope: 'all' },
+    ],
+    [
+      {
+        'filecoin.upload_speed_test.auto_scope': 'SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_AUTO_SCOPE',
+        'filecoin.upload_speed_test.retest_interval': 'SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_RETEST_INTERVAL',
+      },
+      {},
+    ],
+  ] as const) {
+    assert.deepEqual(buildSettingsPayload(form, initial, envManaged).filecoin?.upload_speed_test, expected)
+  }
 })
 
 test('settings payload omits env-managed filecoin observability fields', () => {

@@ -160,6 +160,10 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.Filecoin.AllowPrivateNetworks)
 		setString("filecoin.anchor_provider_tier", &next.Filecoin.AnchorProviderTier, req.Filecoin.AnchorProviderTier)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.Filecoin.DefaultCopies)
+		if req.Filecoin.UploadSpeedTest != nil {
+			setString("filecoin.upload_speed_test.auto_scope", &next.Filecoin.UploadSpeedTest.AutoScope, req.Filecoin.UploadSpeedTest.AutoScope)
+			setDuration("filecoin.upload_speed_test.retest_interval", &next.Filecoin.UploadSpeedTest.RetestInterval, req.Filecoin.UploadSpeedTest.RetestInterval)
+		}
 		if req.Filecoin.Observability != nil {
 			setDuration("filecoin.observability.interval", &next.Filecoin.Observability.Interval, req.Filecoin.Observability.Interval)
 			setDuration("filecoin.observability.timeout", &next.Filecoin.Observability.Timeout, req.Filecoin.Observability.Timeout)
@@ -252,6 +256,10 @@ func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*con
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.AllowPrivateNetworks)
 		setString("filecoin.anchor_provider_tier", &next.Filecoin.AnchorProviderTier, req.AnchorProviderTier)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.DefaultCopies)
+		if req.UploadSpeedTest != nil {
+			setString("filecoin.upload_speed_test.auto_scope", &next.Filecoin.UploadSpeedTest.AutoScope, req.UploadSpeedTest.AutoScope)
+			setDuration("filecoin.upload_speed_test.retest_interval", &next.Filecoin.UploadSpeedTest.RetestInterval, req.UploadSpeedTest.RetestInterval)
+		}
 		if req.Observability != nil {
 			setDuration("filecoin.observability.interval", &next.Filecoin.Observability.Interval, req.Observability.Interval)
 			setDuration("filecoin.observability.timeout", &next.Filecoin.Observability.Timeout, req.Observability.Timeout)
@@ -383,13 +391,19 @@ type settingsS3Config struct {
 }
 
 type settingsFilecoinConfig struct {
-	Network              string                      `json:"network"`
-	RPCURL               string                      `json:"rpc_url"`
-	WithCDN              bool                        `json:"with_cdn"`
-	AllowPrivateNetworks bool                        `json:"allow_private_networks"`
-	DefaultCopies        int                         `json:"default_copies"`
-	AnchorProviderTier   string                      `json:"anchor_provider_tier"`
-	Observability        settingsObservabilityConfig `json:"observability"`
+	Network              string                        `json:"network"`
+	RPCURL               string                        `json:"rpc_url"`
+	WithCDN              bool                          `json:"with_cdn"`
+	AllowPrivateNetworks bool                          `json:"allow_private_networks"`
+	DefaultCopies        int                           `json:"default_copies"`
+	AnchorProviderTier   string                        `json:"anchor_provider_tier"`
+	UploadSpeedTest      settingsUploadSpeedTestConfig `json:"upload_speed_test"`
+	Observability        settingsObservabilityConfig   `json:"observability"`
+}
+
+type settingsUploadSpeedTestConfig struct {
+	AutoScope      string `json:"auto_scope"`
+	RetestInterval string `json:"retest_interval"`
 }
 
 type settingsObservabilityConfig struct {
@@ -493,13 +507,19 @@ type settingsS3Update struct {
 }
 
 type settingsFilecoinUpdate struct {
-	Network              *string                      `json:"network,omitempty"`
-	RPCURL               *string                      `json:"rpc_url,omitempty"`
-	WithCDN              *bool                        `json:"with_cdn,omitempty"`
-	AllowPrivateNetworks *bool                        `json:"allow_private_networks,omitempty"`
-	DefaultCopies        *int                         `json:"default_copies,omitempty"`
-	AnchorProviderTier   *string                      `json:"anchor_provider_tier,omitempty"`
-	Observability        *settingsObservabilityUpdate `json:"observability,omitempty"`
+	Network              *string                        `json:"network,omitempty"`
+	RPCURL               *string                        `json:"rpc_url,omitempty"`
+	WithCDN              *bool                          `json:"with_cdn,omitempty"`
+	AllowPrivateNetworks *bool                          `json:"allow_private_networks,omitempty"`
+	DefaultCopies        *int                           `json:"default_copies,omitempty"`
+	AnchorProviderTier   *string                        `json:"anchor_provider_tier,omitempty"`
+	UploadSpeedTest      *settingsUploadSpeedTestUpdate `json:"upload_speed_test,omitempty"`
+	Observability        *settingsObservabilityUpdate   `json:"observability,omitempty"`
+}
+
+type settingsUploadSpeedTestUpdate struct {
+	AutoScope      *string `json:"auto_scope,omitempty"`
+	RetestInterval *string `json:"retest_interval,omitempty"`
 }
 
 type settingsObservabilityUpdate struct {
@@ -564,6 +584,10 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 			DefaultCopies:        cfg.Filecoin.DefaultCopies,
 			AnchorProviderTier:   cfg.Filecoin.AnchorProviderTier,
+			UploadSpeedTest: settingsUploadSpeedTestConfig{
+				AutoScope:      cfg.Filecoin.UploadSpeedTest.AutoScope,
+				RetestInterval: cfg.Filecoin.UploadSpeedTest.RetestInterval.String(),
+			},
 			Observability: settingsObservabilityConfig{
 				Interval:    cfg.Filecoin.Observability.Interval.String(),
 				Timeout:     cfg.Filecoin.Observability.Timeout.String(),
@@ -647,6 +671,8 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"filecoin.rpc_url":                           {},
 		"filecoin.default_copies":                    {},
 		"filecoin.anchor_provider_tier":              {},
+		"filecoin.upload_speed_test.auto_scope":      {},
+		"filecoin.upload_speed_test.retest_interval": {},
 		"filecoin.observability.interval":            {},
 		"filecoin.observability.timeout":             {},
 		"filecoin.observability.concurrency":         {},
@@ -675,13 +701,15 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 
 func filecoinEditableValidationErrors(cfg *config.Config) []config.FieldError {
 	editable := map[string]struct{}{
-		"filecoin.network":                   {},
-		"filecoin.rpc_url":                   {},
-		"filecoin.default_copies":            {},
-		"filecoin.anchor_provider_tier":      {},
-		"filecoin.observability.interval":    {},
-		"filecoin.observability.timeout":     {},
-		"filecoin.observability.concurrency": {},
+		"filecoin.network":                           {},
+		"filecoin.rpc_url":                           {},
+		"filecoin.default_copies":                    {},
+		"filecoin.anchor_provider_tier":              {},
+		"filecoin.upload_speed_test.auto_scope":      {},
+		"filecoin.upload_speed_test.retest_interval": {},
+		"filecoin.observability.interval":            {},
+		"filecoin.observability.timeout":             {},
+		"filecoin.observability.concurrency":         {},
 	}
 
 	var out []config.FieldError

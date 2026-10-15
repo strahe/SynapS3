@@ -141,7 +141,8 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		selected, err := h.deps.Selector.SelectBucketBindings(ctx, bucket, required)
 		if err != nil {
 			if bindingtask.SelectionNeedsWait(err) {
-				return taskengine.WaitForObservation(model.TaskResumeModeExecute, "providers", "Waiting for storage providers", bindingtask.SelectionWaitSettlement(execution.ID(), err))
+				reason, message := bindingtask.SelectionWait(err)
+				return taskengine.WaitForObservation(model.TaskResumeModeExecute, reason, message, bindingtask.SelectionWaitSettlement(execution.ID(), err))
 			}
 			settlement := bindingtask.SelectionSettlement(execution.ID(), err)
 			if errors.Is(err, providerselect.ErrCandidatesTemporarilyUnavailable) {

@@ -3,6 +3,7 @@ package task_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,12 +12,13 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
+	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
-type uploadSpeedProbeFunc func(context.Context, string) (time.Duration, error)
+type uploadSpeedProbeFunc func(context.Context, string) (providerbenchmark.Measurement, error)
 
-func (f uploadSpeedProbeFunc) Probe(ctx context.Context, url string) (time.Duration, error) {
+func (f uploadSpeedProbeFunc) Probe(ctx context.Context, url string) (providerbenchmark.Measurement, error) {
 	return f(ctx, url)
 }
 
@@ -44,19 +46,20 @@ func seedSpeedTest(t *testing.T, runtime handlerTestRuntime) *model.Task {
 
 func TestProviderUploadSpeedTaskRecordsSuccessfulMeasurement(t *testing.T) {
 	var calls atomic.Int32
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(_ context.Context, url string) (time.Duration, error) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(_ context.Context, url string) (providerbenchmark.Measurement, error) {
 		calls.Add(1)
 		if url != "https://provider.example" {
 			t.Errorf("probe URL = %q", url)
 		}
-		return 2 * time.Second, nil
+		return providerbenchmark.Measurement{Bytes: providerbenchmark.MinimumSampleBytes, Duration: 2 * time.Second}, nil
 	})})
 	taskRow := seedSpeedTest(t, runtime)
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
 	row, err := runtime.repos.ProviderUploadSpeed.Get(t.Context(), "101")
-	if err != nil || row == nil || row.State != providerbenchmark.StateSucceeded || row.DurationMS == nil || *row.DurationMS != 2000 || row.ActiveTaskID != nil {
+	if err != nil || row == nil || row.State != providerbenchmark.StateSucceeded || row.DurationMS == nil || *row.DurationMS != 2000 ||
+		row.SampleBytes != providerbenchmark.MinimumSampleBytes || row.BytesPerSecond == nil || *row.BytesPerSecond != providerbenchmark.MinimumSampleBytes/2 || row.ActiveTaskID != nil {
 		t.Fatalf("speed result = %#v, %v", row, err)
 	}
 	if calls.Load() != 1 {
@@ -64,9 +67,55 @@ func TestProviderUploadSpeedTaskRecordsSuccessfulMeasurement(t *testing.T) {
 	}
 }
 
+func TestProviderUploadSpeedFailuresPreserveAutomaticRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		admissionFailure bool
+		probeError       error
+		wantCode         string
+	}{
+		{name: "checkpoint admission", admissionFailure: true, wantCode: "record_failed"},
+		{name: "upload failure", probeError: errors.New("upload rejected"), wantCode: "upload_failed"},
+		{name: "upload timeout", probeError: context.DeadlineExceeded, wantCode: "timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (providerbenchmark.Measurement, error) {
+				calls.Add(1)
+				return providerbenchmark.Measurement{}, tc.probeError
+			})})
+			taskRow := seedSpeedTest(t, runtime)
+			if tc.admissionFailure {
+				restore := testutil.FailWrites(t, runtime.db, "tasks", "UPDATE OF checkpoint_json", fmt.Sprintf("NEW.id = %d", taskRow.ID), "checkpoint admission failed")
+				defer restore()
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
+			row, err := runtime.repos.ProviderUploadSpeed.Get(t.Context(), "101")
+			if err != nil || row == nil || row.State != providerbenchmark.StateFailed || row.ActiveTaskID != nil || row.FailureCode == nil || *row.FailureCode != tc.wantCode {
+				t.Fatalf("speed result = %#v, err=%v; want %s", row, err, tc.wantCode)
+			}
+			wantCalls := int32(1)
+			if tc.admissionFailure {
+				wantCalls = 0
+				if failed.WorkStartedAt != nil {
+					t.Fatalf("failed admission started work at %v", failed.WorkStartedAt)
+				}
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("probe calls=%d, want %d", calls.Load(), wantCalls)
+			}
+			if due := providerbenchmark.Due(row, providerbenchmark.URLHash("https://provider.example"), 0, time.Now()); due != tc.admissionFailure {
+				t.Fatalf("automatic retry due=%t, want %t", due, tc.admissionFailure)
+			}
+		})
+	}
+}
+
 func TestProviderUploadSpeedEngineFailureReleasesActiveTest(t *testing.T) {
 	var calls atomic.Int32
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (time.Duration, error) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (providerbenchmark.Measurement, error) {
 		calls.Add(1)
 		panic("probe failed unexpectedly")
 	})})
@@ -86,9 +135,9 @@ func TestProviderUploadSpeedEngineFailureReleasesActiveTest(t *testing.T) {
 
 func TestProviderUploadSpeedRecoveryNeverReuploads(t *testing.T) {
 	var calls atomic.Int32
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (time.Duration, error) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (providerbenchmark.Measurement, error) {
 		calls.Add(1)
-		return 0, errors.New("should not upload")
+		return providerbenchmark.Measurement{}, errors.New("should not upload")
 	})})
 	taskRow := seedSpeedTest(t, runtime)
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("resume_mode = ?", model.TaskResumeModeRecover).
@@ -112,29 +161,42 @@ func TestProviderUploadSpeedRecoveryNeverReuploads(t *testing.T) {
 }
 
 func TestProviderUploadSpeedRecoverySettlesCompletedPutWithoutReupload(t *testing.T) {
-	var calls atomic.Int32
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (time.Duration, error) {
-		calls.Add(1)
-		return 0, errors.New("should not upload")
-	})})
-	taskRow := seedSpeedTest(t, runtime)
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("resume_mode = ?", model.TaskResumeModeRecover).
-		Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.db.NewUpdate().TableExpr("tasks").
-		Set("checkpoint_json = ?", `{"attempted":true,"duration_ms":2000,"bytes_per_second":16777216}`).
-		Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
-	row, err := runtime.repos.ProviderUploadSpeed.Get(t.Context(), "101")
-	if err != nil || row == nil || row.State != providerbenchmark.StateSucceeded || row.BytesPerSecond == nil || *row.BytesPerSecond != 16777216 || row.ActiveTaskID != nil {
-		t.Fatalf("recovered result = %#v, %v", row, err)
-	}
-	if calls.Load() != 0 {
-		t.Fatalf("probe calls during recovery = %d", calls.Load())
+	for _, tc := range []struct {
+		name       string
+		checkpoint string
+		bytes      int64
+		speed      int64
+	}{
+		{"implicit sample size", `{"attempted":true,"duration_ms":2000,"bytes_per_second":16777216}`, providerbenchmark.SampleBytes, 16777216},
+		{"partial sample", `{"attempted":true,"sample_bytes":8388608,"duration_ms":2000,"bytes_per_second":4194304}`, providerbenchmark.MinimumSampleBytes, 4194304},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (providerbenchmark.Measurement, error) {
+				calls.Add(1)
+				return providerbenchmark.Measurement{}, errors.New("should not upload")
+			})})
+			taskRow := seedSpeedTest(t, runtime)
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("resume_mode = ?", model.TaskResumeModeRecover).
+				Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().TableExpr("tasks").
+				Set("checkpoint_json = ?", tc.checkpoint).
+				Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+			row, err := runtime.repos.ProviderUploadSpeed.Get(t.Context(), "101")
+			if err != nil || row == nil || row.State != providerbenchmark.StateSucceeded || row.SampleBytes != tc.bytes ||
+				row.BytesPerSecond == nil || *row.BytesPerSecond != tc.speed || row.ActiveTaskID != nil {
+				t.Fatalf("recovered result = %#v, %v", row, err)
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("probe calls during recovery = %d", calls.Load())
+			}
+		})
 	}
 }

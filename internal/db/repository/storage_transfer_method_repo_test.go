@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
 )
@@ -20,12 +23,12 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	bucket := seedBucket(t, db, "failed-ingress-successor")
 	content, err := repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
 		BucketID: bucket.ID, ContentSize: 1,
-		Checksum: testutil.StorageChecksum("failed-ingress-successor"), RequestedCopies: 2,
+		Checksum: testutil.StorageChecksum("failed-ingress-successor"), RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var bindings [2]*model.StorageDataSet
+	var bindings [3]*model.StorageDataSet
 	for index := range bindings {
 		providerID := onChainID(t, fmt.Sprint(101+index))
 		binding, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
@@ -42,15 +45,34 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 			t.Fatal(err)
 		}
 		bindings[index] = binding
+		url := fmt.Sprintf("https://provider-%s.example", providerID)
+		if err := repos.Observability.UpsertProviderObservation(t.Context(), time.Now().UTC(), observability.ProviderState{
+			ProviderID: providerID, Status: observability.StatusAvailable,
+			Active: new(true), HasPDP: new(true), ServiceURL: &url,
+			Profile: &observability.ProviderProfile{ProviderID: providerID, Active: true, ServiceURL: url, RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if index == 2 {
+			task := enqueueProviderSpeedTask(t, repos, providerID.String(), providerbenchmark.URLHash(url), "successor-speed")
+			if err := repos.ProviderUploadSpeed.Begin(t.Context(), providerID.String(), providerbenchmark.URLHash(url), task.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := repos.ProviderUploadSpeed.Finish(t.Context(), providerID.String(), task.ID, providerbenchmark.StateSucceeded,
+				providerbenchmark.SampleBytes, 1000, providerbenchmark.SampleBytes, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if err := repos.Contents.CreateUploadCopiesForBindings(t.Context(), content.ID, []repository.UploadCopyBindingInput{
 		{StorageDataSetID: bindings[0].ID, CopyIndex: 0, ProviderID: bindings[0].ProviderID, TransferMethod: model.StorageCopyTransferMethodIngress},
 		{StorageDataSetID: bindings[1].ID, CopyIndex: 1, ProviderID: bindings[1].ProviderID, TransferMethod: model.StorageCopyTransferMethodPeerPull},
+		{StorageDataSetID: bindings[2].ID, CopyIndex: 2, ProviderID: bindings[2].ProviderID, TransferMethod: model.StorageCopyTransferMethodPeerPull},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	copies, err := repos.Contents.ListCopies(t.Context(), content.ID)
-	if err != nil || len(copies) != 2 {
+	if err != nil || len(copies) != 3 {
 		t.Fatalf("copies = %#v, err=%v", copies, err)
 	}
 	if err := repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
@@ -59,11 +81,11 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 		t.Fatal(err)
 	}
 	promoted, err := repos.Contents.PromotePendingIngress(t.Context(), content.ID)
-	if err != nil || promoted == nil || promoted.ID != copies[1].ID {
+	if err != nil || promoted == nil || promoted.ID != copies[2].ID {
 		t.Fatalf("promoted = %#v, err=%v", promoted, err)
 	}
 	ingress, err := repos.Contents.GetIngressCopy(t.Context(), content.ID)
-	if err != nil || ingress == nil || ingress.ID != copies[1].ID {
+	if err != nil || ingress == nil || ingress.ID != copies[2].ID {
 		t.Fatalf("active ingress = %#v, err=%v", ingress, err)
 	}
 	// Zero is a legal on-chain piece ID: the first piece of a data set is piece
@@ -71,7 +93,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	// presence check that treats zero as unset would reject a usable source.
 	pieceID := onChainID(t, "0")
 	testutil.CommitStorageCopy(t, db, repos, testutil.CommitCopyInput{
-		StorageCopyID: copies[1].ID, ContentID: content.ID, CopyIndex: 1,
+		StorageCopyID: copies[2].ID, ContentID: content.ID, CopyIndex: 2,
 		PieceCID: "bafk2bzacecpiecerestore", PieceID: &pieceID, RetrievalURL: "https://provider.example/piece",
 	})
 	reopened, err := repos.Contents.ReopenFailedIngressForPull(t.Context(), content.ID)
@@ -83,7 +105,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 		t.Fatalf("old ingress = %#v, err=%v", old, err)
 	}
 	sources, err := repos.Contents.ListReadableCommittedCopies(t.Context(), content.ID)
-	if err != nil || len(sources) != 1 || sources[0].CopyIndex != 1 {
+	if err != nil || len(sources) != 1 || sources[0].CopyIndex != 2 {
 		t.Fatalf("pull sources = %#v, err=%v", sources, err)
 	}
 	source := sources[0]

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/config"
 )
@@ -92,6 +93,8 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		{field: "filecoin.private_key", env: "SYNAPS3_FILECOIN_PRIVATE_KEY", secret: true},
 		{field: "filecoin.default_copies", env: "SYNAPS3_FILECOIN_DEFAULT_COPIES"},
 		{field: "filecoin.anchor_provider_tier", env: "SYNAPS3_FILECOIN_ANCHOR_PROVIDER_TIER"},
+		{field: "filecoin.upload_speed_test.auto_scope", env: "SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_AUTO_SCOPE"},
+		{field: "filecoin.upload_speed_test.retest_interval", env: "SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_RETEST_INTERVAL"},
 		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
 		{field: "worker.tasks.upload_concurrency", env: "SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY"},
 	}
@@ -348,6 +351,21 @@ func TestSettingsValidateReportsDraftValidationRules(t *testing.T) {
 			field:   "worker.tasks.poll_interval",
 		},
 		{
+			name:    "speed test scope",
+			payload: `{"filecoin":{"upload_speed_test":{"auto_scope":"none"}}}`,
+			field:   "filecoin.upload_speed_test.auto_scope",
+		},
+		{
+			name:    "negative speed test interval",
+			payload: `{"filecoin":{"upload_speed_test":{"retest_interval":"-1s"}}}`,
+			field:   "filecoin.upload_speed_test.retest_interval",
+		},
+		{
+			name:    "speed test interval parse",
+			payload: `{"filecoin":{"upload_speed_test":{"retest_interval":"bad"}}}`,
+			field:   "filecoin.upload_speed_test.retest_interval",
+		},
+		{
 			name:    "env managed field",
 			payload: `{"server":{"port":":8088"}}`,
 			field:   "server.port",
@@ -443,7 +461,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":":8088"},
-		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3,"anchor_provider_tier":"endorsed"},
+		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3,"anchor_provider_tier":"endorsed","upload_speed_test":{"auto_scope":"all","retest_interval":"2h"}},
 		"cache":{
 			"max_size_gb":8,
 			"eviction_policy":"After_Upload",
@@ -497,6 +515,9 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Filecoin.AnchorProviderTier != "endorsed" || resp.Config.Filecoin.AnchorProviderTier != "endorsed" {
 		t.Fatalf("saved provider requirement = %q, response=%q", loaded.Filecoin.AnchorProviderTier, resp.Config.Filecoin.AnchorProviderTier)
+	}
+	if loaded.Filecoin.UploadSpeedTest.AutoScope != "all" || loaded.Filecoin.UploadSpeedTest.RetestInterval != 2*time.Hour || resp.Config.Filecoin.UploadSpeedTest.AutoScope != "all" || resp.Config.Filecoin.UploadSpeedTest.RetestInterval != "2h0m0s" {
+		t.Fatalf("saved speed test config=%#v response=%#v", loaded.Filecoin.UploadSpeedTest, resp.Config.Filecoin.UploadSpeedTest)
 	}
 	if loaded.Cache.EvictionPolicy != "after_upload" ||
 		loaded.Cache.LRUHighWatermarkPercent != 86 ||
@@ -877,7 +898,7 @@ func hasFieldError(errs []config.FieldError, field string) bool {
 
 func containsEnabledTOMLKey(text, key string) bool {
 	prefix := key + " ="
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
 			return true
 		}

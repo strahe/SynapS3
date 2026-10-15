@@ -23,6 +23,7 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	appTypes "github.com/strahe/synaps3/internal/types"
@@ -119,16 +120,16 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 }
 
 // Probe returns stable relative upload durations without leaving the in-memory boundary.
-func (m *MemoryFilecoin) Probe(ctx context.Context, serviceURL string) (time.Duration, error) {
+func (m *MemoryFilecoin) Probe(ctx context.Context, serviceURL string) (providerbenchmark.Measurement, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return providerbenchmark.Measurement{}, err
 	}
 	for index, providerID := range m.providers {
 		if serviceURL == fmt.Sprintf("https://provider-%s.system.invalid", providerID.String()) {
-			return time.Duration(len(m.providers)-index) * time.Millisecond, nil
+			return providerbenchmark.Measurement{Bytes: providerbenchmark.SampleBytes, Duration: time.Duration(len(m.providers)-index) * time.Millisecond}, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: unknown provider service URL", errInvalidFilecoinSequence)
+	return providerbenchmark.Measurement{}, fmt.Errorf("%w: unknown provider service URL", errInvalidFilecoinSequence)
 }
 
 func (m *MemoryFilecoin) PrepareUpload(ctx context.Context, _ uint64, targets []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error) {

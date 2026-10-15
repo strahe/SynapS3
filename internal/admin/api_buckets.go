@@ -55,6 +55,7 @@ type bucketListItem struct {
 	MinimumDurableCopies      int                                `json:"minimum_durable_copies"`
 	ProviderSelectionStrategy providerselect.Strategy            `json:"provider_selection_strategy"`
 	Status                    string                             `json:"status"`
+	SetupMessage              string                             `json:"setup_message,omitempty"`
 	ObjectCount               int64                              `json:"object_count"`
 	TotalSizeBytes            int64                              `json:"total_size_bytes"`
 	StorageHealth             bucketStorageHealthSummaryResponse `json:"storage_health"`
@@ -87,6 +88,7 @@ type bucketDetailResponse struct {
 	MinimumDurableCopies      int                                `json:"minimum_durable_copies"`
 	ProviderSelectionStrategy providerselect.Strategy            `json:"provider_selection_strategy"`
 	Status                    string                             `json:"status"`
+	SetupMessage              string                             `json:"setup_message,omitempty"`
 	ObjectCount               int64                              `json:"object_count"`
 	TotalSizeBytes            int64                              `json:"total_size_bytes"`
 	StorageHealth             bucketStorageHealthSummaryResponse `json:"storage_health"`
@@ -203,6 +205,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		statsMap = make(map[int64]repository.BucketObjectStats)
 	}
 	storageHealthMap, storageHealthFailed := s.bucketStorageHealthSummaries(ctx, 0)
+	setupMessages := s.bucketSetupMessages(ctx, buckets)
 
 	items := make([]bucketListItem, 0, len(buckets))
 	for _, b := range buckets {
@@ -218,6 +221,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 			MinimumDurableCopies:      b.MinimumDurableCopies,
 			ProviderSelectionStrategy: b.ProviderSelectionStrategy,
 			Status:                    string(b.Status),
+			SetupMessage:              setupMessages[b.ID],
 			ObjectCount:               stats.Count,
 			TotalSizeBytes:            stats.TotalSize,
 			StorageHealth:             bucketStorageHealthSummaryForBucket(storageHealthMap, b.ID, storageHealthFailed),
@@ -226,6 +230,52 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) bucketSetupMessages(ctx context.Context, buckets []model.Bucket) map[int64]string {
+	messages := make(map[int64]string)
+	var keys []string
+	for _, bucket := range buckets {
+		if bucket.Status == model.BucketStatusProvisioning {
+			keys = append(keys, strconv.FormatInt(bucket.ID, 10))
+			messages[bucket.ID] = "Preparing bucket storage"
+		}
+	}
+	if len(keys) == 0 || s.repos.Tasks == nil {
+		return messages
+	}
+	latest, err := s.repos.Tasks.LatestForSubjects(ctx, "bucket", keys, model.TaskTypeBucketProvision)
+	if err != nil {
+		s.logger.Warn("api: failed to load bucket setup status", "error", err)
+		for id := range messages {
+			messages[id] = "Bucket setup status unavailable"
+		}
+		return messages
+	}
+	for id := range messages {
+		task, ok := latest[strconv.FormatInt(id, 10)]
+		if !ok {
+			continue
+		}
+		if task.Status == model.TaskStatusFailed {
+			messages[id] = "Bucket setup failed. Use Retry in Tasks."
+			continue
+		}
+		if task.WaitReason == nil {
+			continue
+		}
+		switch *task.WaitReason {
+		case "provider_speed_tests":
+			messages[id] = "Waiting for provider speed tests"
+		case "providers":
+			messages[id] = "Waiting for available storage providers"
+		case "funding":
+			messages[id] = "Waiting for Filecoin funding"
+		case "storage_service":
+			messages[id] = "Preparing bucket storage"
+		}
+	}
+	return messages
 }
 
 // bucketNameRe matches valid S3-compatible bucket names (3-63 chars, lowercase
@@ -347,6 +397,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		dataSets = s.storageDataSetSummaryResponses(ctx, summaries)
 	}
 	storageHealthMap, storageHealthFailed := s.bucketStorageHealthSummaries(ctx, bucket.ID)
+	setupMessages := s.bucketSetupMessages(ctx, []model.Bucket{*bucket})
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
 		ID:                        bucket.ID,
@@ -356,6 +407,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		MinimumDurableCopies:      bucket.MinimumDurableCopies,
 		ProviderSelectionStrategy: bucket.ProviderSelectionStrategy,
 		Status:                    string(bucket.Status),
+		SetupMessage:              setupMessages[bucket.ID],
 		ObjectCount:               stats.Count,
 		TotalSizeBytes:            stats.TotalSize,
 		StorageHealth:             bucketStorageHealthSummaryForBucket(storageHealthMap, bucket.ID, storageHealthFailed),

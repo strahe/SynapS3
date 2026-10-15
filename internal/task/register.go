@@ -37,31 +37,33 @@ type EventPublisher interface {
 }
 
 type Dependencies struct {
-	Repositories           *repository.Repositories
-	DecorateTaskHandler    func(taskengine.Handler) taskengine.Handler
-	Events                 EventPublisher
-	Cache                  cache.Cache
-	CacheGate              *cacheaccess.Gate
-	CacheTracker           *cacheaccess.Tracker
-	Storage                synapse.StorageClient
-	Wallet                 synapse.WalletOperator
-	Receipts               wallet.WalletReceiptChecker
-	WalletBroadcastTimeout time.Duration
-	WalletReceiptTimeout   time.Duration
-	Terminator             synapse.ServiceTerminator
-	Epochs                 synapse.ChainEpochReader
-	Observability          *observability.Service
-	UploadSpeedProbe       providerbenchmark.UploadProbe
-	UploadConcurrency      int
-	ParkedPieces           synapse.ParkedPieceChecker
-	CommitNonces           synapse.CommitNonceReader
-	EvictionPolicy         cache.EvictionPolicy
-	MaxCacheBytes          int64
-	MaxWriteBytes          int64 // largest single cache write; 0 means no room is kept for it
-	LRUHighPercent         int
-	LRULowPercent          int
-	AnchorProviderTier     providerselect.Tier
-	DefaultCopies          int
+	Repositories                  *repository.Repositories
+	DecorateTaskHandler           func(taskengine.Handler) taskengine.Handler
+	Events                        EventPublisher
+	Cache                         cache.Cache
+	CacheGate                     *cacheaccess.Gate
+	CacheTracker                  *cacheaccess.Tracker
+	Storage                       synapse.StorageClient
+	Wallet                        synapse.WalletOperator
+	Receipts                      wallet.WalletReceiptChecker
+	WalletBroadcastTimeout        time.Duration
+	WalletReceiptTimeout          time.Duration
+	Terminator                    synapse.ServiceTerminator
+	Epochs                        synapse.ChainEpochReader
+	Observability                 *observability.Service
+	UploadSpeedProbe              providerbenchmark.UploadProbe
+	UploadSpeedTestAutoScope      string
+	UploadSpeedTestRetestInterval time.Duration
+	UploadConcurrency             int
+	ParkedPieces                  synapse.ParkedPieceChecker
+	CommitNonces                  synapse.CommitNonceReader
+	EvictionPolicy                cache.EvictionPolicy
+	MaxCacheBytes                 int64
+	MaxWriteBytes                 int64 // largest single cache write; 0 means no room is kept for it
+	LRUHighPercent                int
+	LRULowPercent                 int
+	AnchorProviderTier            providerselect.Tier
+	DefaultCopies                 int
 
 	// CommitMaxPieces, CommitMaxWait and CommitMaxBacklog shape how transferred
 	// copies of one data set are registered together.
@@ -248,7 +250,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing bucketHandler: %w", err)
 	}
-	uploadHandler, err := uploadplan.NewHandler(uploadplan.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Observability: deps.Observability, Logger: deps.Logger, Selector: selector, Messenger: uploadMessages})
+	uploadHandler, err := uploadplan.NewHandler(uploadplan.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Logger: deps.Logger, Selector: selector, Messenger: uploadMessages})
 	if err != nil {
 		return points, fmt.Errorf("constructing uploadHandler: %w", err)
 	}
@@ -264,7 +266,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing walletHandler: %w", err)
 	}
-	observabilityHandler, err := providertask.NewObservabilityHandler(providertask.ObservabilityDependencies{Repositories: deps.Repositories, Observability: deps.Observability, UploadSpeedProbe: deps.UploadSpeedProbe, Events: deps.Events, Scheduler: providerScheduler})
+	observabilityHandler, err := providertask.NewObservabilityHandler(providertask.ObservabilityDependencies{Repositories: deps.Repositories, Observability: deps.Observability, UploadSpeedProbe: deps.UploadSpeedProbe, UploadSpeedTestAutoScope: deps.UploadSpeedTestAutoScope, UploadSpeedTestRetestInterval: deps.UploadSpeedTestRetestInterval, Events: deps.Events, Scheduler: providerScheduler})
 	if err != nil {
 		return points, fmt.Errorf("constructing observabilityHandler: %w", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -101,7 +102,7 @@ func selectionProviderState(id idtypes.OnChainID, checkedAt time.Time) observabi
 
 func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
-		for _, scenario := range []string{"approved", "endorsed", "none", "existing trusted", "inactive", "missing PDP", "ordinary shortage"} {
+		for _, scenario := range []string{"approved", "endorsed", "none", "existing trusted", "inactive", "missing PDP", "ordinary shortage", "speed tests"} {
 			t.Run(string(taskType)+"/"+scenario, func(t *testing.T) {
 				tier := providerselect.TierApproved
 				switch scenario {
@@ -135,6 +136,12 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 				case "ordinary shortage":
 					state.Status = observability.StatusAvailable
 					wantReason = ""
+				case "speed tests":
+					state.Status = observability.StatusAvailable
+					wantReason = "upload_speed_untested"
+					if _, err := runtime.db.NewDelete().Model((*providerbenchmark.Result)(nil)).Where("provider_id = ?", providerID.String()).Exec(t.Context()); err != nil {
+						t.Fatal(err)
+					}
 				}
 				if err := runtime.repos.Observability.UpsertProviderObservation(t.Context(), time.Now().UTC(), state); err != nil {
 					t.Fatal(err)
@@ -166,6 +173,10 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 					}
 				}
 				row := providerSelectionWork(t, runtime, bucket, taskType)
+				waitReason := "providers"
+				if scenario == "speed tests" {
+					waitReason = "provider_speed_tests"
+				}
 				cancel, done := runHandlerEngine(t, runtime)
 				defer stopHandlerEngine(t, cancel, done)
 				for poll := 1; poll <= 7; poll++ {
@@ -173,7 +184,7 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 					row = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool {
 						return row.ClaimGeneration > previousClaim && (row.Status == model.TaskStatusFailed || row.Status == model.TaskStatusPending && row.WaitReason != nil)
 					})
-					if row.Status != model.TaskStatusPending || row.RetryCount != 0 || row.LastError != nil || row.WaitReason == nil || *row.WaitReason != "providers" {
+					if row.Status != model.TaskStatusPending || row.RetryCount != 0 || row.LastError != nil || row.WaitReason == nil || *row.WaitReason != waitReason {
 						t.Fatalf("provider wait %d = %#v", poll, row)
 					}
 					bindings, err := runtime.repos.Contents.ListDataSetBindings(t.Context(), bucket.ID)
@@ -208,6 +219,8 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 				}
 				if scenario == "ordinary shortage" {
 					seedProviderSelection(t, runtime, providerID.SDK(), sdktypes.NewBigInt(303))
+				} else if scenario == "speed tests" {
+					seedProviderSelectionSpeed(t, runtime, providerID)
 				} else if err := runtime.repos.Observability.UpsertProviderObservation(t.Context(), time.Now().UTC(), selectionProviderState(providerID, time.Now().UTC())); err != nil {
 					t.Fatal(err)
 				}
@@ -395,6 +408,7 @@ func TestProviderSelectionRefreshesEmptyInventoryOnce(t *testing.T) {
 						return &testutil.MockStorageTarget{ProviderIDValue: id, DataSetIDValue: &dataSetID, ClientDataSetIDValue: sdktypes.NewBigInt(2)}, nil
 					},
 				}})
+				seedProviderSelectionSpeed(t, runtime, providerID)
 				bucket := &model.Bucket{Name: "empty-inventory", Status: model.BucketStatusProvisioning, DefaultCopies: 1, MinimumDurableCopies: 1}
 				if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
 					t.Fatal(err)

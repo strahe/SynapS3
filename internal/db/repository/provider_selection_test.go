@@ -31,7 +31,7 @@ func TestProviderSelectionIgnoresRetiredLoadAndOldURLSpeed(t *testing.T) {
 	if err := repos.ProviderUploadSpeed.Begin(ctx, "101", providerbenchmark.URLHash("https://old.example"), row.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.ProviderUploadSpeed.Finish(ctx, "101", row.ID, providerbenchmark.StateSucceeded, 1000, providerbenchmark.SampleBytes, ""); err != nil {
+	if err := repos.ProviderUploadSpeed.Finish(ctx, "101", row.ID, providerbenchmark.StateSucceeded, providerbenchmark.SampleBytes, 1000, providerbenchmark.SampleBytes, ""); err != nil {
 		t.Fatal(err)
 	}
 	in := providerselect.Inventory{Admission: providerselect.Admission{Tier: providerselect.TierNone}, Candidates: []providerselect.Candidate{
@@ -54,5 +54,15 @@ func TestProviderSelectionIgnoresRetiredLoadAndOldURLSpeed(t *testing.T) {
 	}
 	if in.Candidates[0].BytesPerSecond <= 0 {
 		t.Fatal("matching completed speed test was ignored")
+	}
+	retest := enqueueProviderSpeedTask(t, repos, "101", providerbenchmark.URLHash("https://old.example"), "selection-speed-retest")
+	if err := repos.ProviderUploadSpeed.Begin(ctx, "101", providerbenchmark.URLHash("https://old.example"), retest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.EnrichProviderCandidates(ctx, &in); err != nil {
+		t.Fatal(err)
+	}
+	if in.Candidates[0].BytesPerSecond != providerbenchmark.SampleBytes {
+		t.Fatalf("speed during retest = %d, want %d", in.Candidates[0].BytesPerSecond, providerbenchmark.SampleBytes)
 	}
 }

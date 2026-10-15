@@ -134,7 +134,7 @@ alias 会把凭据保存在 `~/.mc/config.json`。无回显提示可以避免 se
 | --- | --- |
 | `AccessDenied` | 确认 access key 和 secret key 来自 `synaps3 admin s3-user create`。 |
 | 客户端使用 virtual-hosted 存储桶访问 | 开启 path-style addressing 或客户端中的等价设置。 |
-| 创建存储桶后的首次上传返回 `SlowDown` | 存储提供方可能仍在准备该存储桶。短暂等待后重试上传，再使用读取命令确认结果。 |
+| 创建存储桶后的首次上传返回 `SlowDown` | 查看存储桶的准备说明和仪表盘顶部的测速提示。准备过程会等待可选可信节点完成测速，并确认成功节点足以满足副本策略。按提示处理后重试上传。 |
 | 用 `versionId` 删除某份数据的最后一个版本后，立即上传相同内容返回 `SlowDown` | SynapS3 仍在清理这份数据的旧副本。等待几分钟后再重试上传。 |
 | 大量早先上传仍在等待 Filecoin 存储时，上传返回 `SlowDown` | 本地缓存已满。稍后重试；持续出现时参考[缓存已满](../operations/troubleshooting.md#缓存已满)。 |
 | 上传成功但 Filecoin 存储仍在等待 | 查看仪表盘任务页，或运行 `synaps3 admin task list --status pending`。 |

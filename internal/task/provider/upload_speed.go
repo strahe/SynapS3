@@ -128,26 +128,28 @@ func (h *UploadSpeedTestHandler) executeProviderUploadSpeed(ctx context.Context,
 	if !eligible || providerbenchmark.URLHash(serviceURL) != input.ServiceURLHash {
 		return h.failProviderUploadSpeed(execution, input, errors.New("provider is no longer available at the tested address"), "provider_changed")
 	}
-	var duration time.Duration
-	_, err = execution.WithCheckpointedEffect(ctx, "speed:"+input.ProviderID,
+	var measurement providerbenchmark.Measurement
+	attempted, err := execution.WithCheckpointedEffect(ctx, "speed:"+input.ProviderID,
 		providerbenchmark.Checkpoint{Attempted: true}, nil, func(ctx context.Context) error {
 			var probeErr error
-			duration, probeErr = h.deps.UploadSpeedProbe.Probe(ctx, serviceURL)
+			measurement, probeErr = h.deps.UploadSpeedProbe.Probe(ctx, serviceURL)
 			return probeErr
 		})
 	if err != nil {
 		code := "upload_failed"
-		if errors.Is(err, context.DeadlineExceeded) {
+		if !attempted {
+			code = "record_failed"
+		} else if errors.Is(err, context.DeadlineExceeded) {
 			code = "timeout"
 		}
 		return h.failProviderUploadSpeed(execution, input, err, code)
 	}
-	if duration < time.Millisecond {
-		duration = time.Millisecond
+	if measurement.Duration < time.Millisecond {
+		measurement.Duration = time.Millisecond
 	}
 	checkpoint := providerbenchmark.Checkpoint{
-		Attempted: true, DurationMS: duration.Milliseconds(),
-		BytesPerSecond: int64(float64(providerbenchmark.SampleBytes) / duration.Seconds()),
+		Attempted: true, SampleBytes: measurement.Bytes, DurationMS: measurement.Duration.Milliseconds(),
+		BytesPerSecond: measurement.Bytes * 1000 / measurement.Duration.Milliseconds(),
 	}
 	if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 		return h.failProviderUploadSpeed(execution, input, err, "record_failed")
@@ -171,9 +173,12 @@ func (h *UploadSpeedTestHandler) recoverProviderUploadSpeed(ctx context.Context,
 }
 
 func (h *UploadSpeedTestHandler) completeProviderUploadSpeed(execution taskengine.Execution, input providerbenchmark.Input, checkpoint providerbenchmark.Checkpoint) taskengine.Result {
+	if checkpoint.SampleBytes == 0 {
+		checkpoint.SampleBytes = providerbenchmark.SampleBytes
+	}
 	return taskengine.Complete("Provider upload speed tested", func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.ProviderUploadSpeed.Finish(ctx, input.ProviderID, execution.ID(), providerbenchmark.StateSucceeded,
-			checkpoint.DurationMS, checkpoint.BytesPerSecond, "")
+			checkpoint.SampleBytes, checkpoint.DurationMS, checkpoint.BytesPerSecond, "")
 	})
 }
 
@@ -187,7 +192,7 @@ func (h *UploadSpeedTestHandler) failProviderUploadSpeed(execution taskengine.Ex
 		message = "Provider is no longer ready for this test"
 	}
 	return taskengine.Fail(errors.New(message), code, func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.ProviderUploadSpeed.Finish(ctx, input.ProviderID, execution.ID(), providerbenchmark.StateFailed, 0, 0, code)
+		return repos.ProviderUploadSpeed.Finish(ctx, input.ProviderID, execution.ID(), providerbenchmark.StateFailed, providerbenchmark.SampleBytes, 0, 0, code)
 	})
 }
 

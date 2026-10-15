@@ -35,6 +35,7 @@ export function walletOperationStatusLabel(status: WalletOperationStatus) {
 const settingsOptionLabels: Record<string, Record<string, string>> = {
   'filecoin.network': { calibration: 'Calibration', mainnet: 'Mainnet' },
   'filecoin.anchor_provider_tier': { approved: 'Approved', endorsed: 'Endorsed', none: 'None' },
+  'filecoin.upload_speed_test.auto_scope': { trusted: 'Trusted providers', all: 'All providers' },
   'logging.level': { debug: 'Debug', info: 'Info', warn: 'Warning', error: 'Error' },
   'logging.s3_access.level': { debug: 'Debug', info: 'Info', warn: 'Warning', error: 'Error' },
   'logging.format': { json: 'JSON', text: 'Text' },

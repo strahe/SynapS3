@@ -15,34 +15,15 @@ import (
 
 type BunProviderUploadSpeedRepo struct{ db bun.IDB }
 
-func (r *BunProviderUploadSpeedRepo) BeginIfAbsent(ctx context.Context, providerID, hash string, taskID int64) error {
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		task, err := taskForBinding(ctx, db, taskID, "provider", providerID, model.TaskTypeProviderUploadSpeedTest)
-		if err != nil {
-			return err
-		}
-		var input providerbenchmark.Input
-		if json.Unmarshal(task.Input, &input) != nil || input.ProviderID != providerID || input.ServiceURLHash != hash {
-			return ErrConflict
-		}
-
-		now := time.Now().UTC()
-		row := &providerbenchmark.Result{
-			ProviderID: providerID, State: providerbenchmark.StateTesting, ServiceURLHash: hash,
-			SampleBytes: providerbenchmark.SampleBytes, ActiveTaskID: &taskID, CreatedAt: now, UpdatedAt: now,
-		}
-		result, err := db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(ctx)
-		if err != nil {
-			return err
-		}
-		if count, _ := result.RowsAffected(); count != 1 {
-			return ErrConflict
-		}
-		return nil
-	})
+func (r *BunProviderUploadSpeedRepo) BeginIfDue(ctx context.Context, providerID, hash string, taskID int64, testedBefore time.Time, nonMeasuredCodes []string) error {
+	return r.begin(ctx, providerID, hash, taskID, &testedBefore, nonMeasuredCodes)
 }
 
 func (r *BunProviderUploadSpeedRepo) Begin(ctx context.Context, providerID, hash string, taskID int64) error {
+	return r.begin(ctx, providerID, hash, taskID, nil, nil)
+}
+
+func (r *BunProviderUploadSpeedRepo) begin(ctx context.Context, providerID, hash string, taskID int64, testedBefore *time.Time, nonMeasuredCodes []string) error {
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		task, err := taskForBinding(ctx, db, taskID, "provider", providerID, model.TaskTypeProviderUploadSpeedTest)
 		if err != nil {
@@ -65,13 +46,30 @@ func (r *BunProviderUploadSpeedRepo) Begin(ctx context.Context, providerID, hash
 		if count, _ := result.RowsAffected(); count == 1 {
 			return nil
 		}
-		result, err = db.NewUpdate().Model((*providerbenchmark.Result)(nil)).
+		query := db.NewUpdate().Model((*providerbenchmark.Result)(nil)).
 			Set("state = ?", providerbenchmark.StateTesting).
 			Set("service_url_hash = ?", hash).
-			Set("sample_bytes = ?", providerbenchmark.SampleBytes).
-			Set("duration_ms = NULL").Set("bytes_per_second = NULL").Set("tested_at = NULL").Set("failure_code = NULL").
+			Set("sample_bytes = CASE WHEN service_url_hash = ? THEN sample_bytes ELSE ? END", hash, providerbenchmark.SampleBytes).
+			Set("duration_ms = CASE WHEN service_url_hash = ? THEN duration_ms ELSE NULL END", hash).
+			Set("bytes_per_second = CASE WHEN service_url_hash = ? THEN bytes_per_second ELSE NULL END", hash).
+			Set("tested_at = CASE WHEN service_url_hash = ? THEN tested_at ELSE NULL END", hash).
+			Set("failure_code = CASE WHEN service_url_hash = ? THEN failure_code ELSE NULL END", hash).
 			Set("active_task_id = ?", taskID).Set("updated_at = ?", now).
-			Where("provider_id = ? AND state <> ?", providerID, providerbenchmark.StateTesting).Exec(ctx)
+			Where("provider_id = ? AND state <> ?", providerID, providerbenchmark.StateTesting)
+		if testedBefore != nil {
+			query = query.Where("state IN (?)", bun.List([]providerbenchmark.State{providerbenchmark.StateSucceeded, providerbenchmark.StateFailed})).
+				WhereGroup(" AND ", func(q *bun.UpdateQuery) *bun.UpdateQuery {
+					q = q.Where("service_url_hash <> ? OR tested_at IS NULL", hash)
+					if len(nonMeasuredCodes) > 0 {
+						q = q.WhereOr("failure_code IN (?)", bun.List(nonMeasuredCodes))
+					}
+					if !testedBefore.IsZero() {
+						q = q.WhereOr("tested_at <= ?", *testedBefore)
+					}
+					return q
+				})
+		}
+		result, err = query.Exec(ctx)
 		if err != nil {
 			return err
 		}
@@ -82,7 +80,7 @@ func (r *BunProviderUploadSpeedRepo) Begin(ctx context.Context, providerID, hash
 	})
 }
 
-func (r *BunProviderUploadSpeedRepo) Finish(ctx context.Context, providerID string, taskID int64, state providerbenchmark.State, durationMS, bytesPerSecond int64, failureCode string) error {
+func (r *BunProviderUploadSpeedRepo) Finish(ctx context.Context, providerID string, taskID int64, state providerbenchmark.State, sampleBytes, durationMS, bytesPerSecond int64, failureCode string) error {
 	if state != providerbenchmark.StateSucceeded && state != providerbenchmark.StateFailed {
 		return ErrInvalidInput
 	}
@@ -91,10 +89,10 @@ func (r *BunProviderUploadSpeedRepo) Finish(ctx context.Context, providerID stri
 		Set("state = ?", state).Set("active_task_id = NULL").Set("tested_at = ?", now).Set("updated_at = ?", now).
 		Where("provider_id = ? AND active_task_id = ? AND state = ?", providerID, taskID, providerbenchmark.StateTesting)
 	if state == providerbenchmark.StateSucceeded {
-		if durationMS < 1 || bytesPerSecond < 1 {
+		if sampleBytes < 1 || durationMS < 1 || bytesPerSecond < 1 {
 			return ErrInvalidInput
 		}
-		query = query.Set("duration_ms = ?", durationMS).Set("bytes_per_second = ?", bytesPerSecond).Set("failure_code = NULL")
+		query = query.Set("sample_bytes = ?", sampleBytes).Set("duration_ms = ?", durationMS).Set("bytes_per_second = ?", bytesPerSecond).Set("failure_code = NULL")
 	} else {
 		if failureCode == "" {
 			return ErrInvalidInput

@@ -4,13 +4,13 @@ import (
 	"context"
 
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 )
 
 func (r *Repositories) EnrichProviderCandidates(ctx context.Context, in *providerselect.Inventory) error {
+	in.UploadSpeedRequired = true
 	ids := make([]types.OnChainID, len(in.Candidates))
 	raw := make([]string, len(ids))
 	for i, c := range in.Candidates {
@@ -28,9 +28,10 @@ func (r *Repositories) EnrichProviderCandidates(ctx context.Context, in *provide
 		c := &in.Candidates[i]
 		c.Load = loads[c.ID.String()]
 		c.BytesPerSecond = 0
+		c.UploadSpeedSettled = false
 		row, ok := speeds[c.ID.String()]
-		if ok && row.State == providerbenchmark.StateSucceeded && row.BytesPerSecond != nil && *row.BytesPerSecond > 0 && row.ServiceURLHash == providerbenchmark.URLHash(c.ServiceURL) {
-			c.BytesPerSecond = *row.BytesPerSecond
+		if ok {
+			c.BytesPerSecond, c.UploadSpeedSettled = row.Outcome(c.ServiceURL)
 		}
 	}
 	return nil

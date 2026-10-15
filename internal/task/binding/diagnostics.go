@@ -13,7 +13,14 @@ import (
 func SelectionNeedsWait(err error) bool {
 	var selectionErr *providerselect.SelectionError
 	return errors.As(err, &selectionErr) && selectionErr.Cause == nil &&
-		(selectionErr.Kind == providerselect.SelectionTemporary || selectionErr.Kind == providerselect.SelectionRequiredTierInUse)
+		(selectionErr.Kind == providerselect.SelectionTemporary || selectionErr.Kind == providerselect.SelectionRequiredTierInUse || selectionErr.Kind == providerselect.SelectionUploadSpeedPending)
+}
+
+func SelectionWait(err error) (reason, message string) {
+	if errors.Is(err, providerselect.ErrUploadSpeedTestsPending) {
+		return "provider_speed_tests", "Waiting for provider speed tests to finish"
+	}
+	return "providers", "Waiting for storage providers"
 }
 
 func SelectionFailed(err error) bool {

@@ -148,6 +148,10 @@ curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 
 Enter the Admin password at curl's no-echo prompt.
 
+Filecoin readiness checks provider network availability; the dashboard's speed-test notice shows selection readiness. If bucket preparation waits for tests, check its preparation message.
+
+Use **Test remaining providers** to test eligible providers without a result. For failed tests, use **Retry** in **Tasks** or the provider details in **Storage**. See [Provider Selection](../configuration/model.md#provider-selection) for selection requirements and automatic remeasurement.
+
 Recovery:
 
 - Restore the configured `filecoin.rpc_url`.

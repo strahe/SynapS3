@@ -255,6 +255,13 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
+			Name: "filecoin.upload_speed_test",
+			Fields: []initFieldDescriptor{
+				{Field: "filecoin.upload_speed_test.auto_scope", Key: "auto_scope", Value: quoteTOMLString(cfg.Filecoin.UploadSpeedTest.AutoScope), Enabled: saveMode, Notes: []string{"trusted | all. Restart required."}},
+				{Field: "filecoin.upload_speed_test.retest_interval", Key: "retest_interval", Value: quoteTOMLString(cfg.Filecoin.UploadSpeedTest.RetestInterval.String()), Enabled: saveMode},
+			},
+		},
+		{
 			Name: "filecoin.observability",
 			Fields: []initFieldDescriptor{
 				{Field: "filecoin.observability.interval", Key: "interval", Value: quoteTOMLString(cfg.Filecoin.Observability.Interval.String()), Enabled: saveMode},

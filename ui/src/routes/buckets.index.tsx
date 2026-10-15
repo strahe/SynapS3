@@ -1,10 +1,11 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Database, FolderOpen, HardDrive, Loader2, Plus, Settings } from 'lucide-react'
+import { Database, FolderOpen, HardDrive, Info, Loader2, Plus, Settings } from 'lucide-react'
 import { type FormEvent, useState } from 'react'
 import { toast } from 'sonner'
 import type { ProviderSelectionStrategy } from '@/api/client'
 import { type BucketItem, internalRootOwnerAccessKey, type S3User } from '@/api/client'
+import { Banner } from '@/components/app/Banner'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { clickableRowProps, DataTableFrame, TableSkeleton, tableHeaderRowClassName } from '@/components/app/DataTable'
@@ -134,7 +135,7 @@ function CreateBucketDialog({ open, onOpenChange }: { open: boolean; onOpenChang
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent>
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create bucket</DialogTitle>
           <DialogDescription>
@@ -249,6 +250,9 @@ function CreateBucketDialog({ open, onOpenChange }: { open: boolean; onOpenChang
               </FieldDescription>
             </Field>
           </FieldGroup>
+          <Banner tone="info" icon={Info} title="Storage preparation">
+            You can create this bucket while provider tests run; uploads become available when storage is ready.
+          </Banner>
           {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
             <Alert>
               <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
@@ -364,7 +368,12 @@ function BucketsPage() {
                     <BucketStorageHealthCell bucket={bucket} />
                   </TableCell>
                   <TableCell className="px-4">
-                    <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucketStatusLabel(bucket.status)}</StatusBadge>
+                    <div className="flex max-w-64 flex-col items-start gap-1">
+                      <StatusBadge tone={bucketStatusTone(bucket.status)}>
+                        {bucketStatusLabel(bucket.status)}
+                      </StatusBadge>
+                      {bucket.setup_message && <p className="text-xs text-muted-foreground">{bucket.setup_message}</p>}
+                    </div>
                   </TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{formatNumber(bucket.object_count)}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{formatBytes(bucket.total_size_bytes)}</TableCell>

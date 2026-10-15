@@ -12,8 +12,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/observability"
-	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -30,11 +28,10 @@ import (
 )
 
 type Dependencies struct {
-	Repositories  *repository.Repositories
-	Storage       synapse.StorageClient
-	Observability *observability.Service
-	Selector      *bindingtask.Selector
-	Messenger     *taskengine.Messenger
+	Repositories *repository.Repositories
+	Storage      synapse.StorageClient
+	Selector     *bindingtask.Selector
+	Messenger    *taskengine.Messenger
 
 	Logger *slog.Logger
 }
@@ -129,7 +126,8 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 		plan, err := h.deps.Selector.SelectBucketBindings(ctx, bucket, model.ClampStorageCopies(upload.RequestedCopies))
 		if err != nil {
 			if bindingtask.SelectionNeedsWait(err) {
-				return taskengine.WaitForObservation(model.TaskResumeModeExecute, "providers", "Waiting for storage providers", bindingtask.SelectionWaitSettlement(execution.ID(), err))
+				reason, message := bindingtask.SelectionWait(err)
+				return taskengine.WaitForObservation(model.TaskResumeModeExecute, reason, message, bindingtask.SelectionWaitSettlement(execution.ID(), err))
 			}
 			if errors.Is(err, providerselect.ErrCandidatesTemporarilyUnavailable) {
 				return taskengine.Retry(h.logStorageDependencyFailure(ctx, execution, "providers", err), "provider_selection_unavailable", bindingtask.SelectionSettlement(execution.ID(), err)).WithResumeMode(model.TaskResumeModeExecute)
@@ -199,8 +197,10 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 			bindingPlan = append(bindingPlan, frozen)
 		}
 		sort.Slice(bindingPlan, func(i, j int) bool { return bindingPlan[i].CopyIndex < bindingPlan[j].CopyIndex })
-		ingressIndex := h.fastestIngressIndex(ctx, bindingPlan)
-		ingressProviderID := bindingPlan[ingressIndex].Provider
+		ingressProviderID, err := h.ingressProviderID(ctx, bindingPlan)
+		if err != nil {
+			return retryTask(err, "ingress_selection_failed")
+		}
 
 		return taskengine.Complete("Storage work scheduled", func(ctx context.Context, repos *repository.Repositories) error {
 			if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
@@ -345,33 +345,29 @@ func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {
 	return "Waiting for Filecoin payment funding: " + strings.Join(parts, "; ")
 }
 
-func (h *Handler) fastestIngressIndex(ctx context.Context, plan []bindingtask.Plan) int {
-	if len(plan) < 2 || h.deps.Observability == nil || h.deps.Repositories.ProviderUploadSpeed == nil {
-		return 0
+func (h *Handler) ingressProviderID(ctx context.Context, plan []bindingtask.Plan) (idtypes.OnChainID, error) {
+	if len(plan) == 0 {
+		return idtypes.OnChainID{}, repository.ErrInvalidInput
 	}
-	ids := make([]string, len(plan))
+	ids := make([]idtypes.OnChainID, len(plan))
 	for i := range plan {
-		ids[i] = plan[i].Provider.String()
+		ids[i] = plan[i].Provider
 	}
-	results, err := h.deps.Repositories.ProviderUploadSpeed.ListByProviderIDs(ctx, ids)
+	speeds, err := h.deps.Repositories.ProviderRankingSpeeds(ctx, ids)
 	if err != nil {
-		return 0
+		return idtypes.OnChainID{}, err
 	}
-	bestIndex, bestSpeed := 0, int64(0)
+	entries := make([]providerselect.IngressEntry, len(plan))
 	for i := range plan {
-		row, ok := results[ids[i]]
-		if !ok || row.State != providerbenchmark.StateSucceeded || row.BytesPerSecond == nil || *row.BytesPerSecond <= 0 {
-			return 0
-		}
-		url, eligible, err := providerbenchmark.CurrentServiceURL(ctx, h.deps.Observability, plan[i].Provider)
-		if err != nil || !eligible || providerbenchmark.URLHash(url) != row.ServiceURLHash {
-			return 0
-		}
-		if *row.BytesPerSecond > bestSpeed {
-			bestIndex, bestSpeed = i, *row.BytesPerSecond
+		entries[i] = providerselect.IngressEntry{CopyIndex: plan[i].CopyIndex, BytesPerSecond: speeds[plan[i].Provider.String()]}
+	}
+	best := providerselect.RankIngress(entries)[0]
+	for _, entry := range plan {
+		if entry.CopyIndex == best.CopyIndex {
+			return entry.Provider, nil
 		}
 	}
-	return bestIndex
+	return idtypes.OnChainID{}, repository.ErrNotFound
 }
 
 func (h *Handler) enqueueDataSetEnsure(ctx context.Context, tx *repository.Repositories, row *model.StorageDataSet) error {

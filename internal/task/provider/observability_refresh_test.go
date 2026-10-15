@@ -8,6 +8,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -26,9 +27,8 @@ type partialCatalogChecker struct {
 	dataSetAttempt bool
 }
 
-func (c *partialCatalogChecker) CheckProviders(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error) {
-	id, _ := idtypes.ParseOnChainID("provider_id", "101")
-	return []observability.ProviderState{{ProviderID: id, Status: observability.StatusAvailable}}, nil
+func (c *partialCatalogChecker) CheckProviders(_ context.Context, checkedAt time.Time, _ []observability.LocalDataSet) ([]observability.ProviderState, error) {
+	return []observability.ProviderState{speedScheduleState(101, checkedAt)}, nil
 }
 
 func (c *partialCatalogChecker) CheckDataSets(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error) {
@@ -47,16 +47,20 @@ func TestObservabilityRefreshPublishesCommittedProvidersBeforeDataSetFailure(t *
 		Store: repos.Observability, Checker: checker,
 		LocalDataSets: observability.LocalDataSetSourceFunc(func(context.Context) ([]observability.LocalDataSet, error) { return nil, nil }),
 	})
-	handler, err := NewObservabilityHandler(ObservabilityDependencies{Repositories: repos, Observability: service, Events: events})
-	if err != nil {
+	if _, err := repos.Observability.RecordApprovedProviders(t.Context(), time.Now().UTC(), []idtypes.OnChainID{idtypes.NewOnChainID(101)}); err != nil {
 		t.Fatal(err)
 	}
-	handler.Execute(context.Background(), taskengine.Execution{})
+	handler := newSpeedScheduleHandler(t, repos, service)
+	handler.deps.Events = events
+	handler.Execute(t.Context(), taskengine.Execution{})
 	if !checker.dataSetAttempt || !events.published {
 		t.Fatalf("data set attempted=%t, provider event published=%t", checker.dataSetAttempt, events.published)
 	}
 	page, err := repos.Observability.ListProviderStates(context.Background(), observability.ListOptions{})
 	if err != nil || len(page.Items) != 1 || page.Items[0].ProviderID.String() != "101" {
 		t.Fatalf("committed providers = %#v, error=%v", page.Items, err)
+	}
+	if row, err := repos.ProviderUploadSpeed.Get(t.Context(), "101"); err != nil || row == nil || row.State != providerbenchmark.StateTesting {
+		t.Fatalf("measurement after data set refresh failure=%#v, err=%v", row, err)
 	}
 }

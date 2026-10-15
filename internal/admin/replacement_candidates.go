@@ -3,6 +3,7 @@ package admin
 import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerselect"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
@@ -24,6 +25,7 @@ type replacementProviderCandidate struct {
 	ApprovedFresh    bool
 	Eligible         bool
 	IneligibleReason string
+	Selection        providerselect.Candidate
 	// PreviouslyUsed excludes a provider from automatic replacement; manual
 	// selection permits reuse when all of its data sets in the bucket are retired.
 	PreviouslyUsed bool

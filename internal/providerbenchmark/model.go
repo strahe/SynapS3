@@ -11,11 +11,21 @@ import (
 	"github.com/uptrace/bun"
 )
 
-const SampleBytes int64 = 32 << 20
+const (
+	SampleBytes          int64 = 32 << 20
+	MinimumSampleBytes   int64 = 8 << 20
+	MeasurementWindow          = 30 * time.Second
+	SessionCreateTimeout       = 15 * time.Second
+)
+
+type Measurement struct {
+	Bytes    int64
+	Duration time.Duration
+}
 
 // UploadProbe measures one upload sample against a provider service URL.
 type UploadProbe interface {
-	Probe(context.Context, string) (time.Duration, error)
+	Probe(context.Context, string) (Measurement, error)
 }
 
 type State string
@@ -42,6 +52,103 @@ type Result struct {
 	UpdatedAt      time.Time  `bun:"updated_at,notnull" json:"-"`
 }
 
+// Outcome reads the last settled result, including while a new test is running.
+func (r Result) Outcome(serviceURL string) (bytesPerSecond int64, settled bool) {
+	if serviceURL == "" || r.ServiceURLHash != URLHash(serviceURL) || r.TestedAt == nil {
+		return 0, false
+	}
+	if r.FailureCode != nil && *r.FailureCode != "" && r.DurationMS == nil && r.BytesPerSecond == nil {
+		return 0, true
+	}
+	if r.FailureCode == nil && r.SampleBytes > 0 && r.DurationMS != nil && *r.DurationMS > 0 && r.BytesPerSecond != nil && *r.BytesPerSecond > 0 {
+		return *r.BytesPerSecond, true
+	}
+	return 0, false
+}
+
+type failureCode string
+
+const (
+	failureUploadFailed            failureCode = "upload_failed"
+	failureTimeout                 failureCode = "timeout"
+	failureUnavailable             failureCode = "unavailable"
+	failureInvalidInput            failureCode = "invalid_input"
+	failureProviderChanged         failureCode = "provider_changed"
+	failureRecordFailed            failureCode = "record_failed"
+	failureInvalidCheckpoint       failureCode = "invalid_checkpoint"
+	failureInterrupted             failureCode = "interrupted"
+	failureHandlerUnavailable      failureCode = "handler_unavailable"
+	failureInputVersionUnsupported failureCode = "input_version_unsupported"
+	failureInputCodecPanic         failureCode = "input_codec_panic"
+	failureHandlerPanic            failureCode = "handler_panic"
+	failureInvalidResult           failureCode = "invalid_result"
+)
+
+// MeasuredFailure treats unknown failures as completed measurements.
+func MeasuredFailure(code string) bool {
+	//exhaustive:enforce
+	switch failureCode(code) {
+	case failureUnavailable, failureInvalidInput, failureProviderChanged, failureRecordFailed, failureInvalidCheckpoint, failureInterrupted,
+		failureHandlerUnavailable, failureInputVersionUnsupported, failureInputCodecPanic, failureHandlerPanic, failureInvalidResult:
+		return false
+	case failureUploadFailed, failureTimeout:
+		return true
+	default:
+		return true
+	}
+}
+
+// NonMeasuredFailureCodes identifies failures eligible for automatic remeasurement.
+func NonMeasuredFailureCodes() []string {
+	var codes []string
+	for _, code := range []failureCode{
+		failureUploadFailed, failureTimeout, failureUnavailable, failureInvalidInput, failureProviderChanged, failureRecordFailed,
+		failureInvalidCheckpoint, failureInterrupted, failureHandlerUnavailable, failureInputVersionUnsupported,
+		failureInputCodecPanic, failureHandlerPanic, failureInvalidResult,
+	} {
+		if !MeasuredFailure(string(code)) {
+			codes = append(codes, string(code))
+		}
+	}
+	return codes
+}
+
+// Priority orders measurements by provider membership and accepted bindings.
+func Priority(endorsed, approved, bound bool) int {
+	switch {
+	case endorsed:
+		return 0
+	case approved:
+		return 1
+	case bound:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// Due reports whether a provider can start another automatic measurement.
+func Due(row *Result, currentHash string, retestInterval time.Duration, now time.Time) bool {
+	if row == nil {
+		return true
+	}
+	//exhaustive:enforce
+	switch row.State {
+	case StateTesting:
+		return false
+	case StateSucceeded, StateFailed:
+	default:
+		return false
+	}
+	if row.ServiceURLHash != currentHash || row.TestedAt == nil {
+		return true
+	}
+	if row.FailureCode != nil && !MeasuredFailure(*row.FailureCode) {
+		return true
+	}
+	return retestInterval > 0 && !row.TestedAt.After(now.Add(-retestInterval))
+}
+
 type Input struct {
 	ProviderID     string `json:"provider_id"`
 	ServiceURLHash string `json:"service_url_hash"`
@@ -49,6 +156,7 @@ type Input struct {
 
 type Checkpoint struct {
 	Attempted      bool  `json:"attempted"`
+	SampleBytes    int64 `json:"sample_bytes,omitempty"`
 	DurationMS     int64 `json:"duration_ms,omitempty"`
 	BytesPerSecond int64 `json:"bytes_per_second,omitempty"`
 }

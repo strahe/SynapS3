@@ -15,10 +15,10 @@ type providerSelectionStore interface {
 	GetProviderTierSnapshot(context.Context, string) (*ProviderTierSnapshot, error)
 }
 
-// SelectionInventory reads health and a fresh, independent tier snapshot.
-func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Tier) (providerselect.Inventory, error) {
-	in := providerselect.Inventory{Admission: providerselect.Admission{Tier: tier}}
-	if s == nil || !tier.Valid() {
+// ProviderCandidates reads stored provider health, profiles, and tier membership.
+func (s *Service) ProviderCandidates(ctx context.Context) (providerselect.Inventory, error) {
+	in := providerselect.Inventory{Admission: providerselect.Admission{Tier: providerselect.TierNone}}
+	if s == nil {
 		return in, providerselect.ErrInventoryUnavailable
 	}
 	store, ok := s.store.(providerSelectionStore)
@@ -45,11 +45,6 @@ func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Ti
 	if err != nil {
 		return in, err
 	}
-	in.Admission, err = s.SelectionAdmission(ctx, tier)
-	if err != nil {
-		return in, err
-	}
-
 	for _, o := range observations {
 		p, exists := profiles[o.Facts.ProviderID.String()]
 		c := providerselect.Candidate{
@@ -57,6 +52,7 @@ func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Ti
 			Active: exists && p.Active && o.Facts.Active != nil && *o.Facts.Active,
 			HasPDP: o.Facts.HasPDP != nil && *o.Facts.HasPDP, Healthy: o.Signal.Status == StatusAvailable,
 			Fresh: !o.Signal.Freshness.Stale, TieBreak: rand.Uint64(), ObservationCheckedAt: o.Signal.Freshness.LastCheckedAt,
+			TierListed: p.Approved || p.Endorsed,
 		}
 		if o.Facts.ServiceURL != nil {
 			c.ServiceURL = *o.Facts.ServiceURL
@@ -64,6 +60,17 @@ func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Ti
 		in.Candidates = append(in.Candidates, c)
 	}
 	return in, nil
+}
+
+// SelectionInventory reads health and a fresh, independent tier snapshot.
+func (s *Service) SelectionInventory(ctx context.Context, tier providerselect.Tier) (providerselect.Inventory, error) {
+	admission, err := s.SelectionAdmission(ctx, tier)
+	if err != nil {
+		return providerselect.Inventory{Admission: admission}, err
+	}
+	in, err := s.ProviderCandidates(ctx)
+	in.Admission = admission
+	return in, err
 }
 
 func (s *Service) SelectionAdmission(ctx context.Context, tier providerselect.Tier) (providerselect.Admission, error) {

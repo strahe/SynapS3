@@ -327,6 +327,8 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Filecoin.RPCURL = "https://example.invalid/rpc"
 	cfg.Filecoin.WithCDN = true
 	cfg.Filecoin.AllowPrivateNetworks = true
+	cfg.Filecoin.UploadSpeedTest.AutoScope = "all"
+	cfg.Filecoin.UploadSpeedTest.RetestInterval = 2 * time.Hour
 	cfg.Cache.MaxSizeGB = 42
 	cfg.Cache.EvictionPolicy = "NONE"
 	cfg.Cache.LRUHighWatermarkPercent = 87
@@ -364,6 +366,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"network = \"mainnet\"",
 		"with_cdn = true",
 		"allow_private_networks = true",
+		"[filecoin.upload_speed_test]",
+		"auto_scope = \"all\"",
+		"retest_interval = \"2h0m0s\"",
 		"[filecoin.observability]",
 		"interval = \"5m0s\"",
 		"timeout = \"5s\"",
@@ -396,6 +401,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	}
 	if loaded.Server.Port != cfg.Server.Port {
 		t.Fatalf("Server.Port = %q, want %q", loaded.Server.Port, cfg.Server.Port)
+	}
+	if loaded.Filecoin.UploadSpeedTest != cfg.Filecoin.UploadSpeedTest {
+		t.Fatalf("speed test config = %#v, want %#v", loaded.Filecoin.UploadSpeedTest, cfg.Filecoin.UploadSpeedTest)
 	}
 	if loaded.Worker.Tasks.PollInterval != cfg.Worker.Tasks.PollInterval {
 		t.Fatalf("Task poll interval = %s, want %s", loaded.Worker.Tasks.PollInterval, cfg.Worker.Tasks.PollInterval)
@@ -539,6 +547,8 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		{env: "SYNAPS3_SERVER_PORT", field: "server.port"},
 		{env: "SYNAPS3_S3_REGION", field: "s3.region"},
 		{env: "SYNAPS3_FILECOIN_PRIVATE_KEY", field: "filecoin.private_key"},
+		{env: "SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_AUTO_SCOPE", field: "filecoin.upload_speed_test.auto_scope"},
+		{env: "SYNAPS3_FILECOIN_UPLOAD_SPEED_TEST_RETEST_INTERVAL", field: "filecoin.upload_speed_test.retest_interval"},
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL", field: "filecoin.observability.interval"},
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", field: "filecoin.observability.timeout"},
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", field: "filecoin.observability.concurrency"},

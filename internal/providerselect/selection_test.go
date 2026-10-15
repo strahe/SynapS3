@@ -3,6 +3,7 @@ package providerselect
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +11,30 @@ import (
 
 	"github.com/strahe/synaps3/internal/types"
 )
+
+func TestRankIngress(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entries []IngressEntry
+		want    []int
+	}{
+		{name: "empty"},
+		{name: "valid before unknown", entries: []IngressEntry{{CopyIndex: 0}, {CopyIndex: 1, BytesPerSecond: 20}, {CopyIndex: 2, BytesPerSecond: 100}}, want: []int{2, 1, 0}},
+		{name: "equal speed uses replica slot", entries: []IngressEntry{{CopyIndex: 2, BytesPerSecond: 10}, {CopyIndex: 0, BytesPerSecond: 10}}, want: []int{0, 2}},
+		{name: "unknown uses replica slot", entries: []IngressEntry{{CopyIndex: 2}, {CopyIndex: 0}, {CopyIndex: 1, BytesPerSecond: -1}}, want: []int{0, 1, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ranked := RankIngress(tc.entries)
+			var got []int
+			for _, entry := range ranked {
+				got = append(got, entry.CopyIndex)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ranked slots = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 func selectionCandidate(t *testing.T, id string, load int, speed int64) Candidate {
 	t.Helper()
@@ -80,6 +105,60 @@ func TestSelectRejectsIneligibleProviders(t *testing.T) {
 			}
 			if len(failure.Diagnostics.Rejections) != 1 || failure.Diagnostics.Rejections[0].Reason != change.reason || failure.Diagnostics.NeedsRefresh() != change.refresh {
 				t.Fatalf("diagnostics = %#v, refresh=%v", failure.Diagnostics, failure.Diagnostics.NeedsRefresh())
+			}
+		})
+	}
+	for _, settled := range []bool{false, true} {
+		t.Run("upload speed settled="+strconv.FormatBool(settled), func(t *testing.T) {
+			c := selectionCandidate(t, "1", 0, 0)
+			c.UploadSpeedSettled = settled
+			got, err := Select(Inventory{Candidates: []Candidate{c}, Admission: Admission{Tier: TierNone}, UploadSpeedRequired: true}, StrategySpeed, 1, nil, false)
+			var failure *SelectionError
+			if !errors.As(err, &failure) || !errors.Is(err, ErrCandidatesTemporarilyUnavailable) || len(got) != 0 {
+				t.Fatalf("untested selection=%#v err=%v", got, err)
+			}
+			want := "upload_speed_untested"
+			if settled {
+				want = "upload_speed_failed"
+			}
+			if len(failure.Diagnostics.Rejections) != 1 || failure.Diagnostics.Rejections[0].Reason != want || failure.Diagnostics.NeedsRefresh() {
+				t.Fatalf("speed rejection = %#v", failure.Diagnostics)
+			}
+		})
+	}
+}
+
+func TestSelectWaitsForTrustedUploadSpeed(t *testing.T) {
+	for _, scenario := range []string{"pending trusted", "ordinary", "settled failure", "unhealthy", "excluded", "speed optional"} {
+		t.Run(scenario, func(t *testing.T) {
+			measured := selectionCandidate(t, "1", 0, 100)
+			measured.UploadSpeedSettled = true
+			pending := selectionCandidate(t, "2", 0, 0)
+			pending.TierListed = true
+			in := Inventory{Candidates: []Candidate{measured, pending}, Admission: Admission{Tier: TierNone}, UploadSpeedRequired: true}
+			var excluded map[string]ExclusionReason
+			switch scenario {
+			case "ordinary":
+				in.Candidates[1].TierListed = false
+			case "settled failure":
+				in.Candidates[1].UploadSpeedSettled = true
+			case "unhealthy":
+				in.Candidates[1].Healthy = false
+			case "excluded":
+				excluded = map[string]ExclusionReason{"2": ExclusionBucketInUse}
+			case "speed optional":
+				in.UploadSpeedRequired = false
+			}
+			selected, err := Select(in, StrategySpeed, 1, excluded, false)
+			if scenario == "pending trusted" {
+				var failure *SelectionError
+				if !errors.As(err, &failure) || failure.Kind != SelectionUploadSpeedPending || !errors.Is(err, ErrUploadSpeedTestsPending) || len(selected) != 0 {
+					t.Fatalf("trusted speed wait = %#v, err=%v", selected, err)
+				}
+				return
+			}
+			if err != nil || len(selected) != 1 || !selected[0].ID.Equal(measured.ID) {
+				t.Fatalf("selection = %#v, err=%v", selected, err)
 			}
 		})
 	}

@@ -745,7 +745,15 @@ CREATE TABLE provider_upload_speed_tests (
   updated_at timestamptz NOT NULL,
   CONSTRAINT chk_provider_upload_speed_tests_state CHECK (state IN ('testing', 'succeeded', 'failed')),
   CONSTRAINT chk_provider_upload_speed_tests_identity CHECK (provider_id <> '' AND length(service_url_hash) = 64 AND sample_bytes > 0),
-  CONSTRAINT chk_provider_upload_speed_tests_result CHECK ((state = 'testing' AND active_task_id IS NOT NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NULL AND failure_code IS NULL) OR (state = 'succeeded' AND active_task_id IS NULL AND duration_ms IS NOT NULL AND duration_ms > 0 AND bytes_per_second IS NOT NULL AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL) OR (state = 'failed' AND active_task_id IS NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL)),
+  CONSTRAINT chk_provider_upload_speed_tests_result CHECK (
+    (state = 'testing' AND active_task_id IS NOT NULL AND (
+      (duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NULL AND failure_code IS NULL)
+      OR (duration_ms IS NOT NULL AND duration_ms > 0 AND bytes_per_second IS NOT NULL AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL)
+      OR (duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL)
+    ))
+    OR (state = 'succeeded' AND active_task_id IS NULL AND duration_ms IS NOT NULL AND duration_ms > 0 AND bytes_per_second IS NOT NULL AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL)
+    OR (state = 'failed' AND active_task_id IS NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL)
+  ),
   PRIMARY KEY (provider_id),
   FOREIGN KEY (active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );

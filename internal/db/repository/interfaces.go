@@ -775,6 +775,7 @@ type TaskRepository interface {
 	GetDirectSuccessor(ctx context.Context, id int64) (*model.Task, error)
 	SupersedeTerminal(ctx context.Context, id int64) error
 	LatestForSubject(ctx context.Context, subjectType, subjectKey string, types ...model.TaskType) (*model.Task, error)
+	LatestForSubjects(ctx context.Context, subjectType string, subjectKeys []string, types ...model.TaskType) (map[string]model.Task, error)
 	ListCurrentFailedForSubject(ctx context.Context, subjectType, subjectKey string, beforeID int64, limit int, types ...model.TaskType) (TaskPage, error)
 	ListHistory(ctx context.Context, anchorID, beforeID int64, limit int) (TaskPage, error)
 	AppendEvent(ctx context.Context, taskID int64, eventType string, details json.RawMessage) error
@@ -902,8 +903,8 @@ type ObservabilityRepository interface {
 type ProviderUploadSpeedRepository interface {
 	Begin(context.Context, string, string, int64) error
 	TransferTaskOwner(context.Context, int64, int64) error
-	BeginIfAbsent(context.Context, string, string, int64) error
-	Finish(context.Context, string, int64, providerbenchmark.State, int64, int64, string) error
+	BeginIfDue(context.Context, string, string, int64, time.Time, []string) error
+	Finish(context.Context, string, int64, providerbenchmark.State, int64, int64, int64, string) error
 	FailActiveTask(context.Context, int64, string) error
 	Get(context.Context, string) (*providerbenchmark.Result, error)
 	ListByProviderIDs(context.Context, []string) (map[string]providerbenchmark.Result, error)

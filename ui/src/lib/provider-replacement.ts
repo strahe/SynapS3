@@ -116,6 +116,7 @@ const replacementErrorMessages: Record<string, string> = {
   replacement_no_eligible_provider: 'Could not choose an unused provider. Choose a provider manually.',
   replacement_target_unavailable: 'That provider is not available for replacement right now. Choose another provider.',
   approval_check_unavailable: 'Could not check provider requirements. Try again.',
+  provider_speed_tests: 'Could not choose a provider until upload speed tests finish. Try again shortly.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',
   replacement_source_not_current: 'This replica no longer receives writes, so replacing it would change nothing.',
   replacement_source_running: 'Storage setup is in progress. Wait for it to finish.',
@@ -166,7 +167,9 @@ export function dataSetSetupMessage(dataSet: StorageDataSetSummary) {
 export function replacementErrorMessage(error: unknown) {
   if (error instanceof APIError) {
     if (
-      (error.code === 'replacement_source_outcome_unknown' || error.code === 'replacement_not_retryable') &&
+      (error.code === 'replacement_source_outcome_unknown' ||
+        error.code === 'replacement_not_retryable' ||
+        error.code === 'replacement_target_unavailable') &&
       error.message
     )
       return error.message
@@ -200,6 +203,9 @@ const providerIneligibleReasons: Record<string, string> = {
   observation_stale: 'Health information is out of date. Refresh this provider.',
   profile_missing: 'Provider details are unavailable. Refresh this provider.',
   profile_url_changed: 'The provider service URL changed. Refresh this provider to check its health.',
+  upload_speed_untested: 'Run an upload speed test before selecting this provider.',
+  upload_speed_failed: 'The upload speed test failed. Retry it before selecting this provider.',
+  previously_used: 'This provider has already been used by the bucket. Choose it manually to reuse it.',
   required_provider_unavailable: 'This choice would leave the bucket without a required provider.',
 }
 
