@@ -121,6 +121,9 @@ func (s *Server) handleAPIUploadSpeedSummary(w http.ResponseWriter, r *http.Requ
 		scope = "trusted"
 	}
 	summary := summarizeUploadSpeed(in, rows, scope, s.filecoinDefaultCopies)
+	if s.anchorProviderTier != providerselect.TierNone && (in.Admission.CheckedAt == nil || in.Admission.CheckedAt.IsZero() || time.Since(*in.Admission.CheckedAt) > 2*s.observability.RefreshInterval()) {
+		summary.CanProvisionDefault = false
+	}
 	summary.CanTestRemaining = summary.CanTestRemaining && s.taskService != nil
 	writeJSON(w, http.StatusOK, summary)
 }

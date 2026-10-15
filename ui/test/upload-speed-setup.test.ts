@@ -24,6 +24,12 @@ test('provider notice follows trusted tests through shortage and optional testin
     trusted: { total: 3, succeeded: 1, failed: 0, testing: 2, untested: 0 },
   })
   const shortage = summary({ can_provision_default: false, selectable_providers: 1 })
+  const failedTests = summary({
+    can_provision_default: false,
+    selectable_providers: 2,
+    can_test_remaining: false,
+    trusted: { total: 3, succeeded: 2, failed: 1, testing: 0, untested: 0 },
+  })
   const otherTesting = summary({
     can_test_remaining: false,
     other: { total: 2, succeeded: 0, failed: 1, testing: 1, untested: 0 },
@@ -33,6 +39,7 @@ test('provider notice follows trusted tests through shortage and optional testin
     [summary({ ready: false }), 'trusted_testing', false],
     [summary({ trusted: { total: 3, succeeded: 2, failed: 0, testing: 1, untested: 0 } }), 'trusted_testing', false],
     [shortage, 'shortage', false],
+    [failedTests, 'shortage', false],
     [summary(), 'remaining', true],
     [otherTesting, 'other_testing', true],
   ] as const) {
@@ -45,6 +52,10 @@ test('provider notice follows trusted tests through shortage and optional testin
       dismissible ? 'hidden' : kind
     )
   }
+  const failureNotice = providerSpeedNoticeState({ enabled: true, summary: failedTests, dismissed: true })
+  assert.notEqual(failureNotice.kind, 'hidden')
+  if (failureNotice.kind === 'hidden') assert.fail('failed tests require attention')
+  assert.match(failureNotice.message, /Retry.*Storage or Tasks/)
   assert.equal(
     providerSpeedNoticeState({ enabled: true, summary: summary({ can_test_remaining: false }) }).kind,
     'hidden'

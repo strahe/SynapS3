@@ -161,30 +161,23 @@ func TestCompleteBaselineWithoutMetadataIsRefusedUnchanged(t *testing.T) {
 }
 
 func TestBaselineRollbackIsRefusedUnchanged(t *testing.T) {
-	db := newPostgresMigrationDB(t)
-	ctx := t.Context()
-	registry := migrate.NewMigrations()
-	registry.Add(Migrations.Sorted()[0])
-	migrator := newMigrator(db, registry)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	id := insertSchemaTestTask(t, db, "rollback-survivor")
-	before := appliedSchemaState(t, db)
-	if _, err := migrator.Rollback(ctx); err == nil {
-		t.Fatal("baseline rollback succeeded")
-	}
-	assertAppliedMigrationCount(t, ctx, migrator, 1)
-	var key string
-	if err := db.NewRaw("SELECT subject_key FROM tasks WHERE id = ?", id).Scan(ctx, &key); err != nil || key != "rollback-survivor" {
-		t.Fatalf("task after rollback=%q err=%v", key, err)
-	}
-	if after := appliedSchemaState(t, db); !slices.Equal(before, after) {
-		t.Fatal("refused rollback changed the application schema")
-	}
+	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		id := insertSchemaTestTask(t, db, "rollback-survivor")
+		before := appliedSchemaState(t, db)
+		migrator := NewMigrator(db)
+		if _, err := migrator.Rollback(ctx); err == nil {
+			t.Fatal("baseline rollback succeeded")
+		}
+		assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))
+		var key string
+		if err := db.NewRaw("SELECT subject_key FROM tasks WHERE id = ?", id).Scan(ctx, &key); err != nil || key != "rollback-survivor" {
+			t.Fatalf("task after rollback=%q err=%v", key, err)
+		}
+		if after := appliedSchemaState(t, db); !slices.Equal(before, after) {
+			t.Fatal("refused rollback changed the application schema")
+		}
+	})
 }
 
 func assertAppliedMigrationCount(t *testing.T, ctx context.Context, migrator *migrate.Migrator, want int) {

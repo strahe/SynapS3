@@ -33,7 +33,10 @@ export function providerSpeedNoticeState({
     return {
       kind: 'shortage',
       title: 'Providers need attention',
-      message: 'The available providers do not meet the default replica requirements.',
+      message:
+        summary.trusted.failed + summary.other.failed > 0
+          ? 'Retry failed speed tests in Storage or Tasks.'
+          : 'The default replica requirements could not be confirmed.',
       tone: 'warning',
       dismissible: false,
     }

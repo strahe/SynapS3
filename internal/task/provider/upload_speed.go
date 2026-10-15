@@ -129,7 +129,7 @@ func (h *UploadSpeedTestHandler) executeProviderUploadSpeed(ctx context.Context,
 		return h.failProviderUploadSpeed(execution, input, errors.New("provider is no longer available at the tested address"), "provider_changed")
 	}
 	var measurement providerbenchmark.Measurement
-	_, err = execution.WithCheckpointedEffect(ctx, "speed:"+input.ProviderID,
+	attempted, err := execution.WithCheckpointedEffect(ctx, "speed:"+input.ProviderID,
 		providerbenchmark.Checkpoint{Attempted: true}, nil, func(ctx context.Context) error {
 			var probeErr error
 			measurement, probeErr = h.deps.UploadSpeedProbe.Probe(ctx, serviceURL)
@@ -137,7 +137,9 @@ func (h *UploadSpeedTestHandler) executeProviderUploadSpeed(ctx context.Context,
 		})
 	if err != nil {
 		code := "upload_failed"
-		if errors.Is(err, context.DeadlineExceeded) {
+		if !attempted {
+			code = "record_failed"
+		} else if errors.Is(err, context.DeadlineExceeded) {
 			code = "timeout"
 		}
 		return h.failProviderUploadSpeed(execution, input, err, code)

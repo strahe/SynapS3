@@ -148,9 +148,9 @@ curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 
 Enter the Admin password at curl's no-echo prompt.
 
-Filecoin readiness checks provider network availability. The dashboard's speed-test notice separately shows whether providers are ready for selection. A bucket can be created while trusted providers are testing, but its storage waits until those tests finish and enough successful providers satisfy its replica policy. Check the bucket's preparation message for the cause.
+Filecoin readiness checks provider network availability; the dashboard's speed-test notice shows selection readiness. If bucket preparation waits for tests, check its preparation message.
 
-Use **Test remaining providers** in the notice to test eligible providers without a result. For a failed test, use **Retry** in **Tasks** or the provider details in **Storage**. Automatic scope and periodic remeasurement are described in [Provider Selection](../configuration/model.md#provider-selection).
+Use **Test remaining providers** to test eligible providers without a result. For failed tests, use **Retry** in **Tasks** or the provider details in **Storage**. See [Provider Selection](../configuration/model.md#provider-selection) for selection requirements and automatic remeasurement.
 
 Recovery:
 

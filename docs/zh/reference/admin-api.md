@@ -258,7 +258,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；Filecoin 存储不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
+这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running`、`replacement_idempotency_conflict` 和 `provider_speed_tests`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；Filecoin 存储不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing`、`profile_url_changed`、`upload_speed_untested` 和 `upload_speed_failed`。确认目标前，先测试尚未测量的节点，或 Retry 其失败的测速。
 
@@ -347,11 +347,11 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的批次数量。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
-存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`。每次在 30 秒窗口内最多上传 32 MiB；窗口到期时，已传输至少 8 MiB 则按实际字节和耗时估算速度，否则算失败。单次样本不保证实际对象上传速度。[自动测速范围与重测](../configuration/model.md#节点选择)可配置。
+存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`。每次在 30 秒内最多上传 32 MiB；窗口到期时，至少传输 8 MiB 才能估算速度。单次样本不保证实际对象上传速度。自动测速和重测见[节点选择](../configuration/model.md#节点选择)。
 
-同一 URL 重测时会保留上次完成的结果；API 在 `state: "testing"` 时一并返回这些字段，保留的成功速度仍可用于选择。当前服务 URL 缺失或变化时，结果显示为 `stale`。失败测速提供 `retry_task_id`，通过任务 Retry 接口发起新测量；批量端点跳过失败结果。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
+同一 URL 重测时，`state: "testing"` 一并返回上次完成的结果；保留的成功速度仍可用于选择。当前服务 URL 缺失或变化时，结果为 `stale`。失败测速提供 `retry_task_id`，用于任务 Retry 接口。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
 
-汇总响应包含 `auto_scope`，分别列出 `trusted` 和 `other` 的 `total`、`succeeded`、`failed`、`testing`、`untested` 数量，以及 `selectable_providers` 和 `required_copies`。`ready` 表示可选可信节点都有已完成结果；`can_provision_default` 还会检查默认副本数和锚定层级。`can_test_remaining` 表示能否继续为未测节点排队。重测中的节点计入 `testing`，其保留结果仍可让 `ready` 保持为真。Filecoin readiness 单独检查节点网络可用性，不包含这些测速要求。
+汇总响应包含 `auto_scope`，分别列出 `trusted` 和 `other` 的 `total`、`succeeded`、`failed`、`testing`、`untested` 数量，以及 `selectable_providers` 和 `required_copies`。`ready` 表示可选可信节点都有已完成结果。`can_provision_default` 还会检查默认副本数，以及配置要求的锚定层级名单是否在有效期内。`can_test_remaining` 表示能否继续为未测节点排队。
 
 存储提供方健康检查失败时，该提供方的 `signal.last_error` 会说明原因：检查超时、无法连接、被重定向、返回 HTTP 错误状态，或收到的不是 PDP 服务的应答。
 

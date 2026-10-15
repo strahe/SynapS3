@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 type unusedSpeedProbe struct{}
@@ -239,30 +241,75 @@ func TestProviderSpeedSchedulingPrioritizesTrustedAndBoundsOtherQueue(t *testing
 	}
 }
 
-type speedApprovedSource struct{ calls int }
+type speedApprovedSource struct {
+	calls int
+	err   error
+}
 
 func (s *speedApprovedSource) ReadApprovedProviderIDs(context.Context) ([]types.OnChainID, error) {
 	s.calls++
-	return []types.OnChainID{types.NewOnChainID(101)}, nil
+	return []types.OnChainID{types.NewOnChainID(101)}, s.err
+}
+
+type speedEndorsedSource struct {
+	calls int
+	err   error
+}
+
+func (s *speedEndorsedSource) GetEndorsedProviderIDs(context.Context) ([]sdktypes.BigInt, error) {
+	s.calls++
+	return []sdktypes.BigInt{types.NewOnChainID(101).SDK()}, s.err
 }
 
 func TestProviderSpeedSchedulingRefreshesMissingConfiguredTier(t *testing.T) {
-	repos := repository.NewRepositories(testutil.NewTestDB(t))
-	now := time.Now().UTC()
-	if err := repos.Observability.ReplaceProviderStates(t.Context(), now, []observability.ProviderState{speedScheduleState(101, now)}); err != nil {
-		t.Fatal(err)
-	}
-	source := &speedApprovedSource{}
-	h := newSpeedScheduleHandler(t, repos, observability.NewService(observability.ServiceOptions{Store: repos.Observability, ApprovedProviders: source}))
-	for range 2 {
-		if err := h.scheduleMissingProviderSpeedTests(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if source.calls != 1 {
-		t.Fatalf("approved source reads=%d, want 1", source.calls)
-	}
-	if row, err := repos.ProviderUploadSpeed.Get(t.Context(), "101"); err != nil || row == nil || row.State != providerbenchmark.StateTesting {
-		t.Fatalf("newly approved provider measurement=%#v, err=%v", row, err)
+	approvedErr := errors.New("approved source unavailable")
+	endorsedErr := errors.New("endorsed source unavailable")
+	for _, tc := range []struct {
+		name                           string
+		approvedErr, endorsedErr       error
+		wantErr                        error
+		storedApproved, storedEndorsed bool
+		approvedCalls, endorsedCalls   int
+	}{
+		{name: "missing tiers", approvedCalls: 1, endorsedCalls: 1},
+		{name: "approved failure with stored endorsed", approvedErr: approvedErr, wantErr: approvedErr, storedEndorsed: true, approvedCalls: 2},
+		{name: "approved failure before endorsed refresh", approvedErr: approvedErr, wantErr: approvedErr, approvedCalls: 2, endorsedCalls: 1},
+		{name: "endorsed failure after approved refresh", endorsedErr: endorsedErr, wantErr: endorsedErr, approvedCalls: 1, endorsedCalls: 2},
+		{name: "stored tiers with unavailable sources", approvedErr: approvedErr, endorsedErr: endorsedErr, storedApproved: true, storedEndorsed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repos := repository.NewRepositories(testutil.NewTestDB(t))
+			now := time.Now().UTC()
+			if err := repos.Observability.ReplaceProviderStates(t.Context(), now, []observability.ProviderState{speedScheduleState(101, now)}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.storedApproved {
+				if _, err := repos.Observability.RecordApprovedProviders(t.Context(), now, []types.OnChainID{types.NewOnChainID(101)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.storedEndorsed {
+				if _, err := repos.Observability.RecordEndorsedProviders(t.Context(), now, []types.OnChainID{types.NewOnChainID(101)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			approved := &speedApprovedSource{err: tc.approvedErr}
+			endorsed := &speedEndorsedSource{err: tc.endorsedErr}
+			h := newSpeedScheduleHandler(t, repos, observability.NewService(observability.ServiceOptions{
+				Store: repos.Observability, ApprovedProviders: approved, EndorsedProviders: endorsed,
+			}))
+			for range 2 {
+				err := h.scheduleMissingProviderSpeedTests(t.Context())
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("scheduling error=%v, want %v", err, tc.wantErr)
+				}
+			}
+			if approved.calls != tc.approvedCalls || endorsed.calls != tc.endorsedCalls {
+				t.Fatalf("source reads approved=%d endorsed=%d, want %d and %d", approved.calls, endorsed.calls, tc.approvedCalls, tc.endorsedCalls)
+			}
+			if row, err := repos.ProviderUploadSpeed.Get(t.Context(), "101"); err != nil || row == nil || row.State != providerbenchmark.StateTesting {
+				t.Fatalf("provider measurement=%#v, err=%v", row, err)
+			}
+		})
 	}
 }

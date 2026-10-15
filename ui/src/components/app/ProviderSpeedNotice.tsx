@@ -57,7 +57,9 @@ export function ProviderSpeedNotice({ enabled }: { enabled: boolean }) {
               </Button>
             )}
             <Button variant="outline" size="sm" asChild>
-              <Link to="/storage-topology">Storage</Link>
+              <Link to="/storage-topology" search={{ tab: 'providers' }}>
+                Storage
+              </Link>
             </Button>
             {notice.dismissible && (
               <Button variant="outline" size="sm" onClick={dismiss}>

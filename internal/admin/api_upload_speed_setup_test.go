@@ -110,8 +110,19 @@ func TestAPIUploadSpeedSummaryUsesStoredTiersAndRetainedResults(t *testing.T) {
 	startSetupSpeedTest(t, srv, "101")
 	srv.filecoinDefaultCopies = 1
 	retesting := getSummary()
-	if !retesting.Ready || !retesting.CanProvisionDefault || retesting.SelectableProviders != 1 || retesting.Trusted.Testing != 1 || retesting.Trusted.Failed != 1 {
+	if !retesting.Ready || retesting.CanProvisionDefault || retesting.SelectableProviders != 1 || retesting.Trusted.Testing != 1 || retesting.Trusted.Failed != 1 {
 		t.Fatalf("retained result summary=%+v", retesting)
+	}
+	srv.anchorProviderTier = providerselect.TierNone
+	if unrestricted := getSummary(); !unrestricted.Ready || !unrestricted.CanProvisionDefault {
+		t.Fatalf("unrestricted summary=%+v", unrestricted)
+	}
+	srv.anchorProviderTier = providerselect.TierApproved
+	if _, err := repos.Observability.RecordApprovedProviders(t.Context(), time.Now(), []types.OnChainID{states[0].ProviderID, states[1].ProviderID}); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed := getSummary(); !refreshed.Ready || !refreshed.CanProvisionDefault {
+		t.Fatalf("fresh tier summary=%+v", refreshed)
 	}
 	if calls := source.calls.Load(); calls != 0 {
 		t.Fatalf("summary refreshed expired tier %d times", calls)

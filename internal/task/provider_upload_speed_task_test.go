@@ -3,6 +3,7 @@ package task_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
+	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
@@ -62,6 +64,52 @@ func TestProviderUploadSpeedTaskRecordsSuccessfulMeasurement(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("probe calls = %d", calls.Load())
+	}
+}
+
+func TestProviderUploadSpeedFailuresPreserveAutomaticRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		admissionFailure bool
+		probeError       error
+		wantCode         string
+	}{
+		{name: "checkpoint admission", admissionFailure: true, wantCode: "record_failed"},
+		{name: "upload failure", probeError: errors.New("upload rejected"), wantCode: "upload_failed"},
+		{name: "upload timeout", probeError: context.DeadlineExceeded, wantCode: "timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (providerbenchmark.Measurement, error) {
+				calls.Add(1)
+				return providerbenchmark.Measurement{}, tc.probeError
+			})})
+			taskRow := seedSpeedTest(t, runtime)
+			if tc.admissionFailure {
+				restore := testutil.FailWrites(t, runtime.db, "tasks", "UPDATE OF checkpoint_json", fmt.Sprintf("NEW.id = %d", taskRow.ID), "checkpoint admission failed")
+				defer restore()
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
+			row, err := runtime.repos.ProviderUploadSpeed.Get(t.Context(), "101")
+			if err != nil || row == nil || row.State != providerbenchmark.StateFailed || row.ActiveTaskID != nil || row.FailureCode == nil || *row.FailureCode != tc.wantCode {
+				t.Fatalf("speed result = %#v, err=%v; want %s", row, err, tc.wantCode)
+			}
+			wantCalls := int32(1)
+			if tc.admissionFailure {
+				wantCalls = 0
+				if failed.WorkStartedAt != nil {
+					t.Fatalf("failed admission started work at %v", failed.WorkStartedAt)
+				}
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("probe calls=%d, want %d", calls.Load(), wantCalls)
+			}
+			if due := providerbenchmark.Due(row, providerbenchmark.URLHash("https://provider.example"), 0, time.Now()); due != tc.admissionFailure {
+				t.Fatalf("automatic retry due=%t, want %t", due, tc.admissionFailure)
+			}
+		})
 	}
 }
 

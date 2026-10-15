@@ -35,6 +35,7 @@ func (s *Service) RefreshMissingProviderTiers(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
+	var refreshErr error
 	for _, tier := range []struct {
 		name       string
 		configured bool
@@ -48,15 +49,15 @@ func (s *Service) RefreshMissingProviderTiers(ctx context.Context) error {
 		}
 		snapshot, err := store.GetProviderTierSnapshot(ctx, tier.name)
 		if err != nil {
-			return err
+			return errors.Join(refreshErr, err)
 		}
 		if snapshot == nil {
 			if _, _, err := tier.refresh(ctx); err != nil {
-				return err
+				refreshErr = errors.Join(refreshErr, err)
 			}
 		}
 	}
-	return nil
+	return refreshErr
 }
 
 // RefreshApprovedProviders reads the approved tier and returns when the read

@@ -124,13 +124,15 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 
 ## 节点选择
 
-为副本选择新节点时，该节点必须有未过期的健康观测，并且在当前服务 URL 下上传测速成功。`filecoin.anchor_provider_tier` 还要求选出的集合至少保留一个所配置层级中的节点（Approved 或 Endorsed）。Endorsed 不要求同时属于 Approved；`none` 取消名单要求，修改此设置后需重启。名单或测速结果变化时，已分配的节点保持不变。
+副本的新节点必须有未过期的健康观测，并在当前服务 URL 下上传测速成功。`filecoin.anchor_provider_tier` 要求至少选中一个所配置名单（Approved 或 Endorsed）中的节点；`none` 取消此要求。Endorsed 不要求同时属于 Approved。名单或测速结果变化时，已分配的节点保持不变。
 
-创建存储桶会接受请求，并在后台准备存储。选择新节点前，会等待可选的 Approved 和 Endorsed 节点完成当前 URL 下的测速，再按副本目标和配置的锚定层级检查成功节点是否足够。等待不消耗重试次数；所需名单确认为空时，存储桶准备会停止。查看存储桶的准备说明或任务了解原因，解决停止原因后再使用 **Retry**。使用已分配节点的上传不等待测速。
+创建存储桶的请求成功后，存储继续准备。自动选择节点会等待可选的 Approved 和 Endorsed 节点完成当前 URL 下的测速，再检查副本目标和锚定层级。等待不消耗重试次数。所需名单确认为空时，准备会停止；解决存储桶或任务提示的原因后，使用 **Retry**。使用已分配节点的上传不等待测速。
 
-创建存储桶时，**Provider preference** 可选分布优先（`distribution`，默认）或速度优先（`speed`）。分布优先先比较合格节点的未退役数据集数量，再比较上传速度；速度优先先比较上传速度，再比较负载。条件相同则随机选择。保存的偏好用于补副本和自动替换，手动替换跳过排序。S3 创建的存储桶默认分布优先，创建 API 接受 `provider_selection_strategy`，查询返回保存值；创建后不能修改偏好。补副本和手动替换可复用符合上述选择条件的节点，前提是其在该桶的数据集已全部退役。自动替换排除该桶用过的所有节点。
+创建存储桶时，**Provider preference** 可选分布优先（`distribution`，默认）或速度优先（`speed`）。分布优先按未退役数据集更少、上传更快排序；速度优先调换两者顺序。条件相同则随机选择。偏好在创建后固定，用于补副本和自动替换；手动替换跳过排序。S3 创建的存储桶使用分布优先。API 通过 `provider_selection_strategy` 接受和返回偏好。补副本和手动替换可复用合格节点，前提是其在该桶的数据集已全部退役；自动替换排除该桶用过的节点。
 
-Approved、Endorsed 和已绑定的节点在首次满足测速条件及服务 URL 变化后会自动测速。`filecoin.upload_speed_test.auto_scope = "all"` 还会测试其他符合条件的节点。默认 `trusted` 范围下，可选节点来自可信、已绑定和手动测过的节点，且均须有健康观测并在当前服务 URL 下测速成功。其他节点可通过 **Test remaining providers** 或 **Storage** 中的单节点测速来测试。仅把 `anchor_provider_tier` 设为 `none` 不会扩大这个可选节点池。将 `retest_interval` 设为正时长可定期重测，`0s` 表示关闭定期重测。上传失败和超时需要使用 **Retry**，除非启用了定期重测；中断或未完成的测量会自动重新排队。以上设置修改后需重启。
+Approved、Endorsed 和已绑定的节点在首次满足测速条件及服务 URL 变化后会自动测速。`filecoin.upload_speed_test.auto_scope = "all"` 还会测试其他符合条件的节点。默认 `trusted` 可选节点池由可信、已绑定和手动测过的节点组成。仅把 `anchor_provider_tier` 设为 `none` 不会扩大该池。通过 **Test remaining providers** 或 **Storage** 中的单节点测速可测试其他节点。
+
+将 `retest_interval` 设为正时长可定期重测；`0s` 表示关闭。上传失败和超时需要使用 **Retry**，除非启用了定期重测。中断的测速会自动重试。修改 `anchor_provider_tier` 和 `upload_speed_test` 后需重启。
 
 ## Admin 会话时长
 

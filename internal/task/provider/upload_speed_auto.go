@@ -20,12 +20,10 @@ func (h *ObservabilityHandler) scheduleMissingProviderSpeedTests(ctx context.Con
 	if h.deps.Observability == nil || h.deps.UploadSpeedProbe == nil || h.deps.Scheduler == nil || h.deps.Repositories.ProviderUploadSpeed == nil {
 		return nil
 	}
-	if err := h.deps.Observability.RefreshMissingProviderTiers(ctx); err != nil {
-		return err
-	}
+	refreshErr := h.deps.Observability.RefreshMissingProviderTiers(ctx)
 	in, err := h.deps.Observability.ProviderCandidates(ctx)
 	if err != nil || len(in.Candidates) == 0 {
-		return err
+		return errors.Join(refreshErr, err)
 	}
 	ids := make([]string, len(in.Candidates))
 	providerIDs := make([]types.OnChainID, len(in.Candidates))
@@ -125,5 +123,5 @@ func (h *ObservabilityHandler) scheduleMissingProviderSpeedTests(ctx context.Con
 			otherQueued++
 		}
 	}
-	return nil
+	return refreshErr
 }
