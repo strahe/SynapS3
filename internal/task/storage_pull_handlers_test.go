@@ -751,6 +751,85 @@ func runStorageTaskClaims(t *testing.T, runtime handlerTestRuntime, row *model.T
 	}, timeout...)
 }
 
+func TestTransferPlanOnDrainingDataSet(t *testing.T) {
+	for _, phase := range []storagecommit.RequestStatus{"", storagecommit.RequestStatusReady, storagecommit.RequestStatusSubmitted} {
+		name := string(phase)
+		if name == "" {
+			name = "unsigned"
+		}
+		t.Run(name, func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
+			initialStatus := model.StorageCopyStatusPending
+			if phase != "" {
+				initialStatus = model.StorageCopyStatusPieceReady
+			}
+			pipeline := seedCopyPipeline(t, runtime, initialStatus)
+			var original *storagecommit.Request
+			if phase != "" {
+				fixture := registrationFixture{runtime: runtime, dataSet: pipeline.targetSet, copies: []*model.StorageCopy{pipeline.target}}
+				requestID, taskID := fixture.collect(t)
+				if _, err := runtime.repos.Contents.SealCommitRequest(t.Context(), repository.SealCommitRequestInput{
+					RequestID: requestID, TaskID: taskID, ExtraDataHex: hex.EncodeToString(testutil.CommitExtraData(90)),
+					Members: []repository.SealMember{{CopyID: pipeline.target.ID, ContentID: pipeline.target.ContentID, PieceCID: pipeline.pieceCID.String()}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if phase == storagecommit.RequestStatusSubmitted {
+					if err := runtime.repos.Contents.BeginCommitSubmission(t.Context(), repository.BeginCommitSubmissionInput{RequestID: requestID, TaskID: taskID}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := runtime.repos.Contents.ReturnCommitMembersToTransfer(t.Context(), requestID, taskID, []int64{pipeline.target.ID}, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				original, err = runtime.repos.Contents.GetCommitRequest(t.Context(), requestID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			replacement, _, err := runtime.repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
+				BucketID: pipeline.upload.BucketID, SourceDataSetID: pipeline.target.StorageDataSetID,
+				SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: testOnChainID(t, 990001), ClientRequestID: "draining-transfer",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 990002)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := activateReplacement(t, runtime, replacement.ID); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), pipeline.target.StorageDataSetID)
+			if err != nil || binding.Status != model.StorageDataSetStatusDraining {
+				t.Fatalf("source binding = %#v, %v, want draining", binding, err)
+			}
+			plan := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageTransferPlan)
+			if original == nil {
+				waiting := runOneStorageTask(t, runtime, plan, model.TaskStatusPending)
+				if waiting.WaitReason == nil || *waiting.WaitReason != "dataset" {
+					t.Fatalf("unsigned transfer = %#v, want data set wait", waiting)
+				}
+				return
+			}
+			runOneStorageTask(t, runtime, plan, model.TaskStatusCompleted)
+			restored, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+			if err != nil || restored.ActiveTaskID == nil || restored.CommitRequestID == nil || *restored.CommitRequestID != original.RequestID || restored.CommitPosition == nil || *restored.CommitPosition != 0 {
+				t.Fatalf("planned signed member = %#v, %v", restored, err)
+			}
+			pullTask, err := runtime.repos.Tasks.GetByID(t.Context(), *restored.ActiveTaskID)
+			if err != nil || pullTask.Type != model.TaskTypeStoragePull {
+				t.Fatalf("transfer task = %#v, %v, want Pull", pullTask, err)
+			}
+			current, err := runtime.repos.Contents.GetCommitRequest(t.Context(), original.RequestID)
+			if err != nil || current.Status != phase || current.ExtraDataHex == nil || *current.ExtraDataHex != *original.ExtraDataHex {
+				t.Fatalf("Commit after transfer plan = %#v, %v", current, err)
+			}
+		})
+	}
+}
+
 func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 	for _, members := range []int{1, 2} {
 		for _, phase := range []storagecommit.RequestStatus{storagecommit.RequestStatusReady, storagecommit.RequestStatusSubmitted} {
@@ -787,7 +866,16 @@ func TestSealedReplacementTransferKeepsOriginalBatch(t *testing.T) {
 					client.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
 						return target, nil
 					}
-					pullTask := bindCopyTask(t, runtime, copyRow, model.TaskTypeStoragePull)
+					planTask := bindCopyTask(t, runtime, copyRow, model.TaskTypeStorageTransferPlan)
+					runOneStorageTask(t, runtime, planTask, model.TaskStatusCompleted)
+					planned, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
+					if err != nil || planned.ActiveTaskID == nil {
+						t.Fatalf("planned transfer = %#v, %v", planned, err)
+					}
+					pullTask, err := runtime.repos.Tasks.GetByID(t.Context(), *planned.ActiveTaskID)
+					if err != nil || pullTask.Type != model.TaskTypeStoragePull {
+						t.Fatalf("transfer task = %#v, %v, want Pull", pullTask, err)
+					}
 					runOneStorageTask(t, runtime, pullTask, model.TaskStatusCompleted)
 					restored, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
 					if err != nil || restored.CommitRequestID == nil || *restored.CommitRequestID != original.RequestID || restored.CommitPosition == nil || *restored.CommitPosition != 0 {

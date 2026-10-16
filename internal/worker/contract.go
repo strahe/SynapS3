@@ -108,7 +108,11 @@ type Definition struct {
 	PrepareRetry func(context.Context, *repository.Repositories, *model.Task) (RetryPreparation, error)
 	// BindSuccessor moves domain ownership from a superseded round to its
 	// successor in the same transaction, unless PrepareRetry overrides it.
-	BindSuccessor       func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	BindSuccessor func(context.Context, *repository.Repositories, *model.Task, *model.Task) error
+	// RetryCheckpoint derives the successor evidence of a coordinator's budgeted
+	// retry inside its transaction, so it must not call the network or wait on a
+	// process lock. Nil inherits the failed round's checkpoint.
+	RetryCheckpoint     func(context.Context, *repository.Repositories, *model.Task) (json.RawMessage, error)
 	NextCycleCheckpoint func(context.Context, *repository.Repositories, *model.Task) (json.RawMessage, error)
 }
 

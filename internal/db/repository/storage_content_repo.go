@@ -1052,6 +1052,21 @@ func selectLiveObjectVersionForStorageContent(
 	return version, nil
 }
 
+// ListInFlightCopiesForDataSet lists every copy that may still write to the
+// data set, including copies whose content no live version needs.
+func (r *BunStorageContentRepo) ListInFlightCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error) {
+	if storageDataSetID < 1 {
+		return nil, ErrInvalidInput
+	}
+	var copies []model.StorageCopy
+	q := r.db.NewSelect().Model(&copies)
+	projectCommitRequest(q, "storage_copy")
+	if err := inFlightDataSetCopies(q, storageDataSetID).OrderExpr("storage_copy.id ASC").Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing in-flight data set copies: %w", err)
+	}
+	return copies, nil
+}
+
 func (r *BunStorageContentRepo) ListIncompleteCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error) {
 	if storageDataSetID < 1 {
 		return nil, ErrInvalidInput

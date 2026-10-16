@@ -102,6 +102,22 @@ func copyRetryCheckpoint(source *model.Task, row *model.StorageCopy) (json.RawMe
 	return encoded, checkpoint.SessionID != "", err
 }
 
+func loadCopyRetryCheckpoint(ctx context.Context, repos *repository.Repositories, source *model.Task) (json.RawMessage, error) {
+	var input storagepipeline.CopyGenerationInput
+	if err := json.Unmarshal(source.Input, &input); err != nil {
+		return nil, err
+	}
+	row, err := repos.Contents.GetUploadCopyByID(ctx, input.CopyID)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil {
+		return nil, repository.ErrNotFound
+	}
+	checkpoint, _, err := copyRetryCheckpoint(source, row)
+	return checkpoint, err
+}
+
 func (h *CopyCoordinator) prepareCopyRetry(ctx context.Context, repos *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
 	var input storagepipeline.CopyGenerationInput
 	if err := json.Unmarshal(source.Input, &input); err != nil {

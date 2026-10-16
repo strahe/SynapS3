@@ -98,7 +98,7 @@ func (r *BunStorageReplacementRepo) AcquireItemsForCoordinator(ctx context.Conte
 	}
 	for _, item := range items {
 		snapshot, err := acquireReplacementItemLocked(ctx, r.db, row, item.ID)
-		if err != nil && !errors.Is(err, storagereplacement.ErrItemCancelled) && !errors.Is(err, storagereplacement.ErrItemDeferred) {
+		if err != nil && !errors.Is(err, storagereplacement.ErrItemCancelled) {
 			return batch, err
 		}
 		if snapshot != nil {
@@ -195,19 +195,9 @@ func (r *BunStorageReplacementRepo) scanMigrationCandidates(
 		return nil, row.SeedCursorContentID, 0, nil
 	}
 	cursor = candidates[len(candidates)-1]
-	source, err := (&BunStorageContentRepo{db: r.db}).GetDataSetBindingByID(ctx, row.SourceDataSetID)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	if source == nil {
-		return nil, 0, 0, ErrNotFound
-	}
-	query := r.db.NewSelect().TableExpr("storage_contents AS candidate").ColumnExpr("candidate.id").Where("candidate.id IN (?)", bun.List(candidates)).OrderExpr("candidate.id")
-	if source.DataSetID == nil {
-		query = query.Where(localSlotObligationSQL("candidate", "live_version"), row.CopyIndex)
-	} else {
-		query = query.Where(fmt.Sprintf(`EXISTS (SELECT 1 FROM object_versions AS live_version WHERE %s AND live_version.is_delete_marker = FALSE)`, objectVersionReferencesStorageContentSQL("live_version", "candidate")))
-	}
+	query := r.db.NewSelect().TableExpr("storage_contents AS candidate").ColumnExpr("candidate.id").
+		Where("candidate.id IN (?)", bun.List(candidates)).Where(slotObligationSQL("candidate", "live_version"), row.CopyIndex).
+		OrderExpr("candidate.id")
 	if err := query.Scan(ctx, &eligible); err != nil {
 		return nil, 0, 0, fmt.Errorf("selecting replacement candidates: %w", err)
 	}
@@ -271,7 +261,7 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 			return err
 		}
 		snapshot, terminalErr = acquireReplacementItemLocked(ctx, db, replacement, input.ItemID)
-		if errors.Is(terminalErr, storagereplacement.ErrItemCancelled) || errors.Is(terminalErr, storagereplacement.ErrItemDeferred) {
+		if errors.Is(terminalErr, storagereplacement.ErrItemCancelled) {
 			return nil
 		}
 		return terminalErr
@@ -295,14 +285,6 @@ func acquireReplacementItemLocked(ctx context.Context, db bun.IDB, replacement *
 			}
 		}
 		return nil, terminalErr
-	}
-	if errors.Is(terminalErr, storagereplacement.ErrItemDeferred) {
-		_, err := db.NewUpdate().Model((*storagereplacement.Item)(nil)).
-			Set("last_error = ?", "the retiring provider has not finished storing this content").
-			Set("updated_at = ?", time.Now()).Where("id = ? AND status = ?", item.ID, storagereplacement.ItemStatusPending).Exec(ctx)
-		if err != nil {
-			return nil, err
-		}
 	}
 	return snapshot, terminalErr
 }
@@ -340,18 +322,7 @@ func inspectReplacementItem(ctx context.Context, db bun.IDB, replacement *storag
 	if version == nil {
 		return nil, storagereplacement.ItemStatusCancelled, storagereplacement.ErrItemCancelled
 	}
-	owed, inFlight, err := sourceCopyState(ctx, db, content.ID, source.ID)
-	if err != nil {
-		return nil, "", err
-	}
-	if source.DataSetID == nil {
-		owed = localSlotObligation(content, version, replacement.CopyIndex)
-		inFlight = false
-	}
-	if !owed {
-		if inFlight {
-			return nil, storagereplacement.ItemStatusPending, storagereplacement.ErrItemDeferred
-		}
+	if !slotObligation(content, version, replacement.CopyIndex) {
 		return nil, storagereplacement.ItemStatusCancelled, storagereplacement.ErrItemCancelled
 	}
 	covered, err := targetHoldsReadableCopy(ctx, db, content.ID, target.ID)
@@ -492,25 +463,6 @@ func clearUnattemptedReplacementReservation(
 		}
 	}
 	return nil
-}
-
-func sourceCopyState(ctx context.Context, db bun.IDB, contentID, sourceDataSetID int64) (bool, bool, error) {
-	var copies []model.StorageCopy
-	if err := db.NewSelect().Model(&copies).
-		Where("content_id = ? AND storage_data_set_id = ?", contentID, sourceDataSetID).
-		Scan(ctx); err != nil {
-		return false, false, err
-	}
-	inFlight := false
-	for i := range copies {
-		switch copies[i].Status {
-		case model.StorageCopyStatusCommitted:
-			return true, false, nil
-		case model.StorageCopyStatusPending, model.StorageCopyStatusPieceReady, model.StorageCopyStatusCommitting:
-			inFlight = true
-		}
-	}
-	return false, inFlight, nil
 }
 
 func targetHoldsReadableCopy(ctx context.Context, db bun.IDB, contentID, targetDataSetID int64) (bool, error) {

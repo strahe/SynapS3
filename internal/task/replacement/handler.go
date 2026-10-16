@@ -242,6 +242,41 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 				return taskengine.Wait(model.TaskResumeModeRecover, "source_copies", "Preparing replacement replicas", nil)
 			}
 		}
+		remoteSource := source.DataSetID != nil && !source.IsCurrent && source.Status == model.StorageDataSetStatusDraining
+		if remoteSource && target.IsCurrent && target.Status == model.StorageDataSetStatusReady && target.DataSetID != nil && !target.DataSetID.IsZero() {
+			writes, err := h.deps.Repositories.Replacements.HasUnsignedSourceWrites(ctx, row.SourceDataSetID)
+			if err != nil {
+				return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
+			}
+			if writes {
+				progress, _, err := taskengine.DecodeCheckpoint[replacementProgressCheckpoint](execution)
+				if err != nil {
+					return taskengine.Fail(err, "invalid_checkpoint", nil)
+				}
+				var done bool
+				err = execution.WriteCheckpointWith(ctx, progress, func(ctx context.Context, repos *repository.Repositories) error {
+					copies, complete, err := repos.Replacements.HandOverSourceWritesBatch(ctx, row.ID, input.Generation, execution.ID(), replacementSeedBatchSize)
+					if err != nil {
+						return err
+					}
+					for _, copyRow := range copies {
+						if copyRow.Status == model.StorageCopyStatusPending && copyRow.WorkTaskID() == nil {
+							if err := h.startCopyTransfer(ctx, repos, copyRow.ID); err != nil {
+								return err
+							}
+						}
+					}
+					done = complete
+					return nil
+				})
+				if err != nil {
+					return h.retryReplacement(execution, row.ID, err, "replacement_source_handover_failed")
+				}
+				if !done {
+					return taskengine.Wait(model.TaskResumeModeRecover, "source_copies", "Preparing replacement replicas", nil)
+				}
+			}
+		}
 		if target.Status != model.StorageDataSetStatusReady || target.DataSetID == nil || target.DataSetID.IsZero() {
 			if target.Status == model.StorageDataSetStatusFailed {
 				return h.failReplacement(row.ID, errors.New("replacement target data set failed"), "replacement_target_failed")
@@ -260,15 +295,6 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 		}
 
 		if !target.IsCurrent {
-			if source.DataSetID != nil {
-				incomplete, err := h.deps.Repositories.Contents.ListIncompleteCopiesForDataSet(ctx, row.SourceDataSetID)
-				if err != nil {
-					return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
-				}
-				if len(incomplete) > 0 {
-					return h.waitForSourceWrites(ctx, execution, row, incomplete)
-				}
-			}
 			return taskengine.Wait(model.TaskResumeModeRecover, "activation", "Activating replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 				if err := repos.Replacements.Activate(ctx, row.ID, input.Generation, execution.ID()); err != nil {
 					return err
@@ -326,6 +352,13 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 				return repos.Replacements.CompleteWithoutRemoteSource(ctx, row.ID, input.Generation, execution.ID())
 			})
 		}
+		writes, err := h.deps.Repositories.Contents.ListInFlightCopiesForDataSet(ctx, row.SourceDataSetID)
+		if err != nil {
+			return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
+		}
+		if len(writes) > 0 {
+			return h.waitForSourceWrites(ctx, execution, row, writes)
+		}
 		return h.scheduleReplacementRetirement(input, execution.ID(), row, row.SourceDataSetID, "Old data set retirement scheduled")
 	}
 	return taskengine.NewFuncHandler(definition, run, run)
@@ -334,7 +367,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 func (h *Handler) coordinateReplacementItems(ctx context.Context, execution taskengine.Execution, replacement *storagereplacement.Replacement, checkpoint replacementProgressCheckpoint, items []storagereplacement.Item) taskengine.Result {
 	for _, item := range items {
 		_, err := h.deps.Repositories.Replacements.InspectItem(ctx, repository.AcquireReplacementItemInput{ReplacementID: replacement.ID, ItemID: item.ID})
-		if errors.Is(err, storagereplacement.ErrItemCancelled) || errors.Is(err, storagereplacement.ErrItemDeferred) {
+		if errors.Is(err, storagereplacement.ErrItemCancelled) {
 			continue
 		}
 		if err != nil {
@@ -389,7 +422,7 @@ func (h *Handler) coordinateReplacementItems(ctx context.Context, execution task
 				if work.LastError != nil {
 					message = *work.LastError
 				}
-				return h.retryFailedDependency(ctx, execution, replacement.ID, work, "replacement_copy_failed", func(ctx context.Context, repos *repository.Repositories) error {
+				return h.retryFailedDependency(ctx, execution, replacement.ID, work, message, "replacement_copy_failed", func(ctx context.Context, repos *repository.Repositories) error {
 					if _, err := repos.Replacements.LockCoordinatorProgress(ctx, replacement.ID, replacement.TaskGeneration, execution.ID()); err != nil {
 						return err
 					}
@@ -457,7 +490,7 @@ func requiredReplacementItemCopy(ctx context.Context, repos *repository.Reposito
 		return nil, err
 	}
 	snapshot, err := repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{ReplacementID: replacement.ID, ItemID: itemID})
-	if errors.Is(err, storagereplacement.ErrItemCancelled) || errors.Is(err, storagereplacement.ErrItemDeferred) {
+	if errors.Is(err, storagereplacement.ErrItemCancelled) {
 		return nil, repository.ErrConflict
 	}
 	if err != nil {
@@ -469,14 +502,17 @@ func requiredReplacementItemCopy(ctx context.Context, repos *repository.Reposito
 	return repos.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{ReplacementID: replacement.ID, ItemID: itemID, ContentID: snapshot.Upload.ID})
 }
 
+// waitForSourceWrites holds retirement while writes remain on the source. Once
+// unsigned writes are handed over, only writes the old provider holds a signed
+// authorization for are left, and they settle only through their own tasks.
 func (h *Handler) waitForSourceWrites(
 	ctx context.Context,
 	execution taskengine.Execution,
 	replacement *storagereplacement.Replacement,
-	incomplete []model.StorageCopy,
+	writes []model.StorageCopy,
 ) taskengine.Result {
-	for i := range incomplete {
-		taskID := incomplete[i].WorkTaskID()
+	for i := range writes {
+		taskID := writes[i].WorkTaskID()
 		if taskID == nil {
 			continue
 		}
@@ -487,12 +523,14 @@ func (h *Handler) waitForSourceWrites(
 		if copyTask == nil || copyTask.Status != model.TaskStatusFailed {
 			continue
 		}
-		return h.retryFailedDependency(ctx, execution, replacement.ID, copyTask, "replacement_source_write_failed", nil)
+		return h.retryFailedDependency(ctx, execution, replacement.ID, copyTask,
+			"The old provider did not finish writes it had already accepted, so it cannot be shut down yet. Retry the replacement after the old provider recovers.",
+			"replacement_source_write_failed", nil)
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, "source_writes", "Waiting for current storage writes", nil)
+	return taskengine.Wait(model.TaskResumeModeRecover, "source_writes", "Waiting for writes on the old provider to finish", nil)
 }
 
-func (h *Handler) retryFailedDependency(ctx context.Context, execution taskengine.Execution, replacementID int64, source *model.Task, reason string, exhausted taskengine.Settlement, guards ...taskengine.Settlement) taskengine.Result {
+func (h *Handler) retryFailedDependency(ctx context.Context, execution taskengine.Execution, replacementID int64, source *model.Task, message, reason string, exhausted taskengine.Settlement, guards ...taskengine.Settlement) taskengine.Result {
 	input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)
 	if err != nil {
 		return decodeFailure(string(execution.Type()), err)
@@ -500,10 +538,6 @@ func (h *Handler) retryFailedDependency(ctx context.Context, execution taskengin
 	eligible, err := h.deps.RetryPolicy.RetryableContext(ctx, source)
 	if err != nil {
 		return h.retryReplacement(execution, replacementID, err, "replacement_retry_eligibility_failed")
-	}
-	message := "Replacement storage work failed"
-	if source.LastError != nil {
-		message = *source.LastError
 	}
 	if exhausted == nil {
 		exhausted = func(ctx context.Context, repos *repository.Repositories) error {

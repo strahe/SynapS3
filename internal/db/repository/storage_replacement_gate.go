@@ -158,19 +158,22 @@ func retirementCoverageGapsSQL() string {
 // effect. Therefore the copy lifecycle is the complete source-write fence; the
 // retirement gate never needs to inspect task input.
 func countRetirementSourceWrites(ctx context.Context, db bun.IDB, _ int64, sourceDataSetID int64) (int, error) {
-	inFlight, err := db.NewSelect().
-		Model((*model.StorageCopy)(nil)).
-		Where("storage_data_set_id = ?", sourceDataSetID).
-		Where("status IN (?, ?, ?)",
-			model.StorageCopyStatusPending,
-			model.StorageCopyStatusPieceReady,
-			model.StorageCopyStatusCommitting).
-		Count(ctx)
+	inFlight, err := inFlightDataSetCopies(db.NewSelect().Model((*model.StorageCopy)(nil)), sourceDataSetID).Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting in-flight source copies: %w", err)
 	}
 
 	return int(inFlight), nil
+}
+
+// inFlightDataSetCopies narrows a storage_copy query to the copies that may
+// still write to the data set.
+func inFlightDataSetCopies(q *bun.SelectQuery, dataSetID int64) *bun.SelectQuery {
+	return q.Where("storage_copy.storage_data_set_id = ?", dataSetID).
+		Where("storage_copy.status IN (?, ?, ?)",
+			model.StorageCopyStatusPending,
+			model.StorageCopyStatusPieceReady,
+			model.StorageCopyStatusCommitting)
 }
 
 // CountAbandonedTargetSoleCopies reports how many uploads would lose their only

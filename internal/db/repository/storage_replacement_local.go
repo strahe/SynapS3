@@ -40,7 +40,7 @@ func (r *BunStorageReplacementRepo) AbandonUncreatedCopiesBatch(ctx context.Cont
 		if _, err := lockBucketByID(ctx, db, row.BucketID); err != nil {
 			return err
 		}
-		locked, source, target, err := lockLocalReplacement(ctx, db, replacementID, generation, taskID)
+		locked, source, target, err := lockFencedReplacement(ctx, db, replacementID, generation, taskID)
 		if err != nil {
 			return err
 		}
@@ -75,31 +75,7 @@ func (r *BunStorageReplacementRepo) AbandonUncreatedCopiesBatch(ctx context.Cont
 			if err := lockStorageContentForCopyMutation(ctx, db, copyRow.ContentID); err != nil {
 				return err
 			}
-			content, err := contents.GetByID(ctx, copyRow.ContentID)
-			if err != nil {
-				return err
-			}
-			version, err := contents.GetLiveVersionForUpload(ctx, copyRow.ContentID)
-			if err != nil {
-				return err
-			}
-			if localSlotObligation(content, version, locked.CopyIndex) {
-				if err := contents.CreateUploadCopiesForBindings(ctx, content.ID, []UploadCopyBindingInput{{
-					StorageDataSetID: target.ID, CopyIndex: target.CopyIndex, ProviderID: target.ProviderID,
-					TransferMethod: model.StorageCopyTransferMethodPeerPull,
-				}}); err != nil {
-					return err
-				}
-			}
-			if err := contents.MarkUploadCopyFailed(ctx, MarkUploadCopyFailedInput{
-				StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex,
-				LastError: "Replaced before data set setup completed",
-			}); err != nil {
-				return err
-			}
-			if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
-				Set("active_task_id = NULL").Set("work_generation = work_generation + 1").Set("updated_at = ?", time.Now()).
-				Where("id = ? AND status = ?", copyRow.ID, model.StorageCopyStatusFailed).Exec(ctx); err != nil {
+			if _, err := releaseReplacedCopy(ctx, db, locked, target, copyRow, "Replaced before data set setup completed"); err != nil {
 				return err
 			}
 		}
@@ -109,17 +85,58 @@ func (r *BunStorageReplacementRepo) AbandonUncreatedCopiesBatch(ctx context.Cont
 	return done, err
 }
 
-func localSlotObligation(content *model.StorageContent, version *model.ObjectVersion, copyIndex int) bool {
+// releaseReplacedCopy gives a source copy's slot obligation to the target and
+// fences the copy's work in the same transaction, so the content never loses
+// its last viable copy. The caller holds the content lock and the coordinator
+// fence.
+func releaseReplacedCopy(ctx context.Context, db bun.IDB, replacement *storagereplacement.Replacement, target *model.StorageDataSet, copyRow model.StorageCopy, lastError string) (*model.StorageCopy, error) {
+	contents := &BunStorageContentRepo{db: db}
+	content, err := contents.GetByID(ctx, copyRow.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	version, err := contents.GetLiveVersionForUpload(ctx, copyRow.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	var targetCopy *model.StorageCopy
+	if slotObligation(content, version, replacement.CopyIndex) {
+		if err := contents.CreateUploadCopiesForBindings(ctx, content.ID, []UploadCopyBindingInput{{
+			StorageDataSetID: target.ID, CopyIndex: target.CopyIndex, ProviderID: target.ProviderID,
+			TransferMethod: model.StorageCopyTransferMethodPeerPull,
+		}}); err != nil {
+			return nil, err
+		}
+		targetCopy, err = contents.GetUploadCopyForDataSet(ctx, content.ID, target.ID)
+		if err != nil {
+			return nil, err
+		}
+		if targetCopy == nil {
+			return nil, ErrNotFound
+		}
+	}
+	if err := contents.MarkUploadCopyFailed(ctx, MarkUploadCopyFailedInput{
+		StorageCopyID: copyRow.ID, ContentID: copyRow.ContentID, CopyIndex: copyRow.CopyIndex, LastError: lastError,
+	}); err != nil {
+		return nil, err
+	}
+	_, err = db.NewUpdate().Model((*model.StorageCopy)(nil)).
+		Set("active_task_id = NULL").Set("work_generation = work_generation + 1").Set("updated_at = ?", time.Now()).
+		Where("id = ? AND status = ?", copyRow.ID, model.StorageCopyStatusFailed).Exec(ctx)
+	return targetCopy, err
+}
+
+func slotObligation(content *model.StorageContent, version *model.ObjectVersion, copyIndex int) bool {
 	return content != nil && version != nil && content.RequestedCopies > copyIndex
 }
 
-func localSlotObligationSQL(contentAlias, versionAlias string) string {
+func slotObligationSQL(contentAlias, versionAlias string) string {
 	return fmt.Sprintf(`%s.requested_copies > ? AND EXISTS (
 		SELECT 1 FROM object_versions AS %s WHERE %s AND %s.is_delete_marker = FALSE)`,
 		contentAlias, versionAlias, objectVersionReferencesStorageContentSQL(versionAlias, contentAlias), versionAlias)
 }
 
-func lockLocalReplacement(ctx context.Context, db bun.IDB, id, generation, taskID int64) (*storagereplacement.Replacement, *model.StorageDataSet, *model.StorageDataSet, error) {
+func lockFencedReplacement(ctx context.Context, db bun.IDB, id, generation, taskID int64) (*storagereplacement.Replacement, *model.StorageDataSet, *model.StorageDataSet, error) {
 	row, err := lockReplacementByID(ctx, db, id)
 	if err != nil {
 		return nil, nil, nil, err
@@ -156,7 +173,7 @@ func (r *BunStorageReplacementRepo) CompleteWithoutRemoteSource(ctx context.Cont
 		if _, err := lockBucketByID(ctx, db, row.BucketID); err != nil {
 			return err
 		}
-		locked, source, target, err := lockLocalReplacement(ctx, db, replacementID, generation, taskID)
+		locked, source, target, err := lockFencedReplacement(ctx, db, replacementID, generation, taskID)
 		if err != nil {
 			return err
 		}
@@ -182,7 +199,7 @@ func (r *BunStorageReplacementRepo) CompleteWithoutRemoteSource(ctx context.Cont
 			AND NOT EXISTS (SELECT 1 FROM storage_copies AS target_copy
 				JOIN storage_data_sets AS target_data_set ON target_data_set.id = target_copy.storage_data_set_id
 				WHERE target_copy.content_id = content.id AND target_copy.storage_data_set_id = ? AND %s)`,
-			localSlotObligationSQL("content", "live"), readableCommittedCopyPredicateSQL("target_copy", "target_data_set"))
+			slotObligationSQL("content", "live"), readableCommittedCopyPredicateSQL("target_copy", "target_data_set"))
 		if err := db.NewRaw(coverage, locked.BucketID, locked.SeedCursorContentID, locked.CopyIndex, target.ID).Scan(ctx, &gaps); err != nil {
 			return err
 		}
