@@ -59,10 +59,6 @@ var (
 	// ErrItemCancelled means this migration item no longer has executable work.
 	ErrItemCancelled = errors.New("replacement item is no longer executable")
 
-	// ErrItemDeferred means the item cannot run yet but must be revisited. The
-	// coordinator moves on to other content rather than blocking on it.
-	ErrItemDeferred = errors.New("replacement item is waiting for its source")
-
 	// ErrPrematureComplete means a retirement safety gate still reports a
 	// blocker. Repositories return it even when called outside the worker.
 	ErrPrematureComplete = errors.New("replacement cannot complete while a safety gate blocks it")

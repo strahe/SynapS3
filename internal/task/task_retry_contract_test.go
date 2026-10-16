@@ -179,18 +179,22 @@ func TestManualRetryCreatesIndependentCopyRound(t *testing.T) {
 	}
 }
 
-func TestManualStoreRetryPreservesUploadSession(t *testing.T) {
+func TestStoreRetryPreservesUploadSession(t *testing.T) {
 	for _, scenario := range []struct {
-		name     string
-		released bool
-		attempt  int
-		stage    string
-		session  string
+		name        string
+		released    bool
+		coordinator bool
+		attempt     int
+		stage       string
+		session     string
 	}{
 		{name: "owned", attempt: 2, stage: "finalize", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
 		{name: "created before body", stage: "upload", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
 		{name: "create outcome unknown", stage: "create"},
 		{name: "released", released: true, attempt: 2, stage: "finalize", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
+		// A coordinator retries only a write that still owns its copy.
+		{name: "owned by coordinator", coordinator: true, attempt: 2, stage: "finalize", session: "7cd9c1bb-7e18-4006-a8f6-a3b6dc75bfa3"},
+		{name: "create outcome unknown by coordinator", coordinator: true, stage: "create"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyNone})
@@ -247,7 +251,16 @@ func TestManualStoreRetryPreservesUploadSession(t *testing.T) {
 			if available, err := runtime.service.RetryableContext(t.Context(), failed); err != nil || !available {
 				t.Fatalf("session recovery unavailable: %v, %v", available, err)
 			}
-			child, err := runtime.service.Retry(t.Context(), source.ID)
+			var child *model.Task
+			if scenario.coordinator {
+				err = runtime.repos.WithTx(t.Context(), func(tx *repository.Repositories) error {
+					var retryErr error
+					child, retryErr = runtime.retries.RetryInTransaction(t.Context(), tx, source.ID, time.Now().UTC())
+					return retryErr
+				})
+			} else {
+				child, err = runtime.service.Retry(t.Context(), source.ID)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

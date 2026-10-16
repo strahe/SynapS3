@@ -70,6 +70,7 @@ type handlerTestRuntime struct {
 	entryPoints     task.EntryPoints
 	registry        *taskengine.Registry
 	service         *taskengine.Service
+	retries         *taskengine.Scheduler
 	engine          *taskengine.Engine
 	testMaxAttempts *int
 	testBackoff     *taskengine.BackoffPolicy
@@ -152,6 +153,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	var ready *taskengine.Messenger
 	var entryPoints task.EntryPoints
+	var retries *taskengine.Scheduler
 	if options.retireOnly {
 		handler, err := dataset.NewRetireHandler(dataset.RetireDependencies{
 			Repositories: repos, Terminator: options.terminator, Epochs: options.epochs,
@@ -188,6 +190,10 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		if err != nil {
 			t.Fatalf("register handlers: %v", err)
 		}
+		retries, err = service.Scheduler("test.coordinator", model.TaskTypeStorageStore)
+		if err != nil {
+			t.Fatalf("coordinator scheduler: %v", err)
+		}
 	}
 	for _, handler := range options.extraHandlers {
 		if err := registry.Register(handler); err != nil {
@@ -207,7 +213,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	runtime := handlerTestRuntime{
 		db: db, repos: repos, cache: cacheStore, gate: gate, tracker: tracker,
-		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, engine: engine, testMaxAttempts: options.maxAttempts,
+		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, retries: retries, engine: engine, testMaxAttempts: options.maxAttempts,
 		testBackoff: options.testBackoff,
 	}
 	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
@@ -4547,140 +4553,287 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 	}
 }
 
-// Activation recovers failed source writes through a separately budgeted child round.
-func TestReplacementRecoversSourceWritesWithinCoordinatorBudget(t *testing.T) {
+// replacementSourceFixture replaces the only replica of a bucket while the old
+// provider still holds unfinished writes.
+type replacementSourceFixture struct {
+	runtime handlerTestRuntime
+	bucket  *model.Bucket
+	source  *model.StorageDataSet
+	id      func(int64) idtypes.OnChainID
+}
+
+func newReplacementSourceFixture(t *testing.T, options handlerRuntimeOptions) replacementSourceFixture {
+	t.Helper()
+	runtime := newHandlerTestRuntime(t, options)
+	sequence := storedObjectSequence.Add(1)
+	id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 37000+sequence*10+offset) }
+	bucket := &model.Bucket{
+		Name: fmt.Sprintf("replacement-source-write-%d", sequence), Status: model.BucketStatusActive,
+		DefaultCopies: 1, MinimumDurableCopies: 1,
+	}
+	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	source, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
+		t.Fatalf("mark source ready: %v", err)
+	}
+	return replacementSourceFixture{runtime: runtime, bucket: bucket, source: source, id: id}
+}
+
+// write creates content whose only copy is still being written to the old
+// provider; live gives the content a live version.
+func (f replacementSourceFixture) write(t *testing.T, key string, live bool) *model.StorageCopy {
+	t.Helper()
+	ctx := t.Context()
+	content, err := f.runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: f.bucket.ID, ContentSize: 128, Checksum: testutil.StorageChecksum(f.bucket.Name + key), RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("ensure content: %v", err)
+	}
+	if live {
+		version := &model.ObjectVersion{
+			VersionID: model.NewVersionID(), BucketID: f.bucket.ID, Key: key, Size: content.ContentSize,
+			ETag: key, ContentType: "application/octet-stream", ContentID: &content.ID,
+		}
+		if _, err := f.runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+			t.Fatalf("create object version: %v", err)
+		}
+	}
+	if err := f.runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: f.source.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: f.id(1),
+	}}); err != nil {
+		t.Fatalf("create source copy: %v", err)
+	}
+	copyRow, err := f.runtime.repos.Contents.GetUploadCopyForDataSet(ctx, content.ID, f.source.ID)
+	if err != nil || copyRow == nil {
+		t.Fatalf("load source copy = %#v, err=%v", copyRow, err)
+	}
+	return copyRow
+}
+
+// stop claims the task and settles it as the old provider left it.
+func (f replacementSourceFixture) stop(t *testing.T, task *model.Task, checkpoint string, transition repository.TaskTransition) {
+	t.Helper()
+	claimed, err := f.runtime.repos.Tasks.ClaimNext(t.Context(), time.Minute, repository.TaskClaimFilter{})
+	if err != nil || claimed == nil || claimed.ID != task.ID {
+		t.Fatalf("claim old write = %#v, err=%v", claimed, err)
+	}
+	if checkpoint != "" {
+		if err := f.runtime.repos.Tasks.WriteCheckpoint(t.Context(), claimed.ID, claimed.ClaimGeneration, json.RawMessage(checkpoint)); err != nil {
+			t.Fatalf("write old checkpoint: %v", err)
+		}
+	}
+	if err := f.runtime.repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, transition); err != nil {
+		t.Fatalf("settle old write: %v", err)
+	}
+}
+
+func (f replacementSourceFixture) replace(t *testing.T) (*storagereplacement.Replacement, *model.Task) {
+	t.Helper()
+	ctx := t.Context()
+	replacement, _, err := f.runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID: f.bucket.ID, SourceDataSetID: f.source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: f.id(5), ClientRequestID: f.bucket.Name,
+	})
+	if err != nil {
+		t.Fatalf("authorize replacement: %v", err)
+	}
+	if err := f.runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: f.id(6)}); err != nil {
+		t.Fatalf("mark target ready: %v", err)
+	}
+	coordinateTask, _, err := f.runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
+		Type:  model.TaskTypeProviderReplacementCoordinate,
+		Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue replacement coordinator: %v", err)
+	}
+	return replacement, coordinateTask
+}
+
+func TestReplacementHandsOverUnsignedSourceWrites(t *testing.T) {
 	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", 128)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tests := []struct {
-		name       string
-		reason     string
-		checkpoint string
-		wantFailed bool
-	}{
-		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://source.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, pieceInfo.CIDv2.String())},
-		{name: "engine failure", reason: "handler_panic"},
-		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
+	stale := time.Now().UTC().Add(-21 * time.Hour).Format(time.RFC3339Nano)
+	failed := func(reason string) repository.TaskTransition {
+		message := "write stopped"
+		return repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason, LastError: &message}
 	}
-	for _, tt := range tests {
+	waiting := "provider"
+	for _, tt := range []struct {
+		name       string
+		checkpoint string
+		transition repository.TaskTransition
+		history    int
+	}{
+		{
+			name: "stopped with an expired confirmation window",
+			checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://source.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":10,"observation_started_at":%q}`,
+				pieceInfo.CIDv2.String(), stale),
+			transition: failed("store_processing_timeout"),
+		},
+		{name: "engine failure", transition: failed("handler_panic")},
+		{name: "invalid checkpoint", transition: failed("invalid_checkpoint")},
+		{name: "waiting for the provider", history: 128, transition: repository.TaskTransition{
+			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now().Add(time.Hour), WaitReason: &waiting,
+		}},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
+			f := newReplacementSourceFixture(t, handlerRuntimeOptions{})
 			ctx := t.Context()
-			sequence := storedObjectSequence.Add(1)
-			id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 37000+sequence*10+offset) }
-			bucket := &model.Bucket{
-				Name: fmt.Sprintf("replacement-source-write-%d", sequence), Status: model.BucketStatusActive,
-				DefaultCopies: 1, MinimumDurableCopies: 1,
-			}
-			if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
-				t.Fatalf("create bucket: %v", err)
-			}
-			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-				BucketID: bucket.ID, ContentSize: int64(pieceInfo.RawSize), Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
-			})
-			if err != nil {
-				t.Fatalf("ensure content: %v", err)
-			}
-			version := &model.ObjectVersion{
-				VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "writing.bin", Size: content.ContentSize,
-				ETag: bucket.Name, ContentType: "application/octet-stream", ContentID: &content.ID,
-			}
-			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
-				t.Fatalf("create object version: %v", err)
-			}
-			source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-				BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0, CreatedByContentID: content.ID,
-			})
-			if err != nil {
-				t.Fatalf("create source: %v", err)
-			}
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID: source.ID, DataSetID: id(2),
-			}); err != nil {
-				t.Fatalf("mark source ready: %v", err)
-			}
-			if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
-				StorageDataSetID: source.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: id(1),
-			}}); err != nil {
-				t.Fatalf("create source copy: %v", err)
-			}
-			sourceCopy, err := runtime.repos.Contents.GetUploadCopyForDataSet(ctx, content.ID, source.ID)
-			if err != nil || sourceCopy == nil {
-				t.Fatalf("load source copy = %#v, err=%v", sourceCopy, err)
-			}
-			// The write to the source has stopped before the replacement starts.
-			storeTask := bindCopyTask(t, runtime, sourceCopy, model.TaskTypeStorageStore)
-			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
-			if err != nil || claimed == nil || claimed.ID != storeTask.ID {
-				t.Fatalf("claim source write = %#v, err=%v", claimed, err)
-			}
-			if tt.checkpoint != "" {
-				if err := runtime.repos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, json.RawMessage(tt.checkpoint)); err != nil {
-					t.Fatalf("write source checkpoint: %v", err)
+			for i := range tt.history {
+				if _, err := f.runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+					BucketID: f.bucket.ID, ContentSize: 128, RequestedCopies: 1,
+					Checksum: testutil.StorageChecksum(fmt.Sprintf("%s-history-%d", f.bucket.Name, i)),
+				}); err != nil {
+					t.Fatal(err)
 				}
 			}
-			reason, message := tt.reason, "write stopped"
-			if err := runtime.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-				Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason, LastError: &message,
-			}); err != nil {
-				t.Fatalf("fail source write: %v", err)
-			}
-			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
-				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
-				TargetProviderID: id(5), ClientRequestID: bucket.Name,
-			})
-			if err != nil {
-				t.Fatalf("authorize replacement: %v", err)
-			}
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID: replacement.TargetDataSetID, DataSetID: id(6),
-			}); err != nil {
-				t.Fatalf("mark target ready: %v", err)
-			}
-			coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-				Type:  model.TaskTypeProviderReplacementCoordinate,
-				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
-			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
-				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
-			})
-			if err != nil {
-				t.Fatalf("enqueue replacement coordinator: %v", err)
-			}
+			write := f.write(t, "writing.bin", true)
+			storeTask := bindCopyTask(t, f.runtime, write, model.TaskTypeStorageStore)
+			f.stop(t, storeTask, tt.checkpoint, tt.transition)
+			replacement, coordinateTask := f.replace(t)
 
-			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1, countType: model.TaskTypeProviderReplacementCoordinate}
-			cancel, done := runHandlerEngine(t, runtime)
-			defer stopHandlerEngine(t, cancel, done)
-			if tt.wantFailed {
-				failed := waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
-					return task.Status == model.TaskStatusFailed
-				})
-				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
-				if failed.FailureReason == nil || *failed.FailureReason != "replacement_source_write_failed" || err != nil ||
-					stored.Status != storagereplacement.StatusFailed {
-					t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement failed", failed, stored, err)
-				}
-				current, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, source.ID)
-				if err != nil || current == nil || !current.IsCurrent {
-					t.Fatalf("source after failure = %#v, err=%v, want it still receiving writes", current, err)
-				}
+			runStorageTaskClaims(t, f.runtime, coordinateTask, model.TaskStatusPending, 2)
+			stored, err := f.runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil || stored.Status != storagereplacement.StatusMigrating {
+				t.Fatalf("replacement = %#v err=%v, want migrating", stored, err)
+			}
+			if tt.history > 0 && stored.SeedingComplete {
+				t.Fatal("expected the history scan to remain incomplete")
+			}
+			target, err := f.runtime.repos.Contents.GetDataSetBindingByID(ctx, replacement.TargetDataSetID)
+			if err != nil || !target.IsCurrent {
+				t.Fatalf("target = %#v err=%v, want it receiving new writes", target, err)
+			}
+			old, err := f.runtime.repos.Contents.GetUploadCopyByID(ctx, write.ID)
+			if err != nil || old.Status != model.StorageCopyStatusFailed || old.ActiveTaskID != nil {
+				t.Fatalf("old copy = %#v err=%v, want it handed over", old, err)
+			}
+			moved, err := f.runtime.repos.Contents.GetUploadCopyForDataSet(ctx, write.ContentID, replacement.TargetDataSetID)
+			if err != nil || moved == nil || moved.Status != model.StorageCopyStatusPending || moved.ActiveTaskID == nil {
+				t.Fatalf("replacement copy = %#v err=%v, want transfer scheduled", moved, err)
+			}
+			if migration, err := f.runtime.repos.Contents.IsPendingReplacementCopy(ctx, moved.ID); err != nil || !migration {
+				t.Fatalf("replacement copy migration = %v, err=%v, want cache recovery available", migration, err)
+			}
+			if successor, err := f.runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID); err != nil || successor != nil {
+				t.Fatalf("old write successor = %#v err=%v, want no retry on the old provider", successor, err)
+			}
+			current, err := f.runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Status != model.TaskStatusPending {
 				return
 			}
-			waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_source_write_failed"
-			})
-			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 {
-				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
+			if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now()).Where("id = ?", current.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
 			}
-			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
-			if err != nil || sourceHistory.Status != model.TaskStatusFailed || sourceHistory.SupersededAt == nil || !testutil.JSONEqual(sourceHistory.Checkpoint, []byte(tt.checkpoint)) {
-				t.Fatalf("failed source history = %#v, err=%v", sourceHistory, err)
-			}
+			runOneStorageTask(t, f.runtime, current, model.TaskStatusCancelled)
+		})
+	}
+}
 
-			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
-			if err != nil || stored.Status == storagereplacement.StatusFailed {
-				t.Fatalf("replacement = %#v err=%v, want it waiting for the write retry", stored, err)
+// Writes the old provider holds a signed authorization for are never handed
+// over. Activation and migration go on, but retirement waits for them, and a
+// write that stopped is retried within the coordinator's budget with its
+// evidence.
+func TestReplacementHoldsRetirementForSignedSourceWrites(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		stopped  bool
+		attempts int
+		want     model.TaskStatus
+	}{
+		{name: "waiting", attempts: 1, want: model.TaskStatusPending},
+		{name: "recovered", stopped: true, attempts: 2, want: model.TaskStatusPending},
+		{name: "exhausted", stopped: true, attempts: 1, want: model.TaskStatusFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newReplacementSourceFixture(t, handlerRuntimeOptions{maxAttempts: &tt.attempts})
+			ctx := t.Context()
+			// The content has no live version, so the whole migration is this one
+			// signed write.
+			member := f.write(t, "signed.bin", false)
+			if err := f.runtime.repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+				StorageCopyID: member.ID, ContentID: member.ContentID, CopyIndex: 0, PieceCID: "piece-signed",
+			}); err != nil {
+				t.Fatalf("mark piece ready: %v", err)
+			}
+			requestID := f.bucket.Name
+			commitTask, _, err := f.runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
+				Type: model.TaskTypeStorageCommit, Input: storagepipeline.CommitRequestInput{RequestID: requestID},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.runtime.repos.Contents.CreateCollectingCommitRequest(ctx, repository.CreateCommitRequestInput{
+				RequestID: requestID, TaskID: commitTask.ID, StorageDataSetID: f.source.ID, CopyIDs: []int64{member.ID},
+			}); err != nil {
+				t.Fatalf("collect: %v", err)
+			}
+			if _, err := f.runtime.repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
+				RequestID: requestID, TaskID: commitTask.ID, ExtraDataHex: "abcd",
+				Members: []repository.SealMember{{CopyID: member.ID, ContentID: member.ContentID, PieceCID: "piece-signed"}},
+			}); err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			checkpoint := `{"request_id":"` + requestID + `","sends":1}`
+			if tt.stopped {
+				reason := "attempts_exhausted"
+				f.stop(t, commitTask, checkpoint, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason})
+			}
+			replacement, coordinateTask := f.replace(t)
+
+			// Activation, hand-over with seeding, then the retirement check.
+			coordinator := runStorageTaskClaims(t, f.runtime, coordinateTask, tt.want, 3)
+			stored, err := f.runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := f.runtime.repos.Contents.GetDataSetBindingByID(ctx, f.source.ID)
+			if err != nil || source.IsCurrent || source.Status != model.StorageDataSetStatusDraining {
+				t.Fatalf("source = %#v err=%v, want it draining, not retiring", source, err)
+			}
+			if held, err := f.runtime.repos.Contents.GetUploadCopyByID(ctx, member.ID); err != nil || held.Status != model.StorageCopyStatusCommitting {
+				t.Fatalf("signed write = %#v err=%v, want it left to its batch", held, err)
+			}
+			successor, err := f.runtime.repos.Tasks.GetDirectSuccessor(ctx, commitTask.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := f.runtime.repos.Contents.GetCommitRequest(ctx, requestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch tt.name {
+			case "waiting":
+				if coordinator.WaitReason == nil || *coordinator.WaitReason != "source_writes" || stored.Status != storagereplacement.StatusMigrating || successor != nil {
+					t.Fatalf("coordinator = %#v replacement = %#v, want both waiting for the signed write", coordinator, stored)
+				}
+			case "recovered":
+				if successor == nil || successor.Type != model.TaskTypeStorageCommit || successor.ResumeMode != model.TaskResumeModeRecover ||
+					successor.RetryCount != 0 || !testutil.JSONEqual(successor.Checkpoint, []byte(checkpoint)) ||
+					request.TaskID == nil || *request.TaskID != successor.ID || coordinator.RetryCount != 1 || stored.Status != storagereplacement.StatusMigrating {
+					t.Fatalf("batch recovery lost its evidence or budget: coordinator=%#v request=%#v successor=%#v", coordinator, request, successor)
+				}
+			case "exhausted":
+				if successor != nil || request.TaskID == nil || *request.TaskID != commitTask.ID || stored.Status != storagereplacement.StatusFailed || stored.LastError == nil ||
+					*stored.LastError != "The old provider did not finish writes it had already accepted, so it cannot be shut down yet. Retry the replacement after the old provider recovers." {
+					t.Fatalf("replacement = %#v request=%#v successor=%#v, want it stopped with the old provider named", stored, request, successor)
+				}
 			}
 		})
 	}

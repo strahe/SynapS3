@@ -18,7 +18,8 @@ type Scheduler struct {
 }
 
 // RetryInTransaction is reserved for a coordinator's budgeted retry settlement.
-// It performs no network preparation and preserves an unresolved operation.
+// It performs no network preparation; the type's RetryCheckpoint decides the
+// successor evidence.
 func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repositories, sourceID int64, availableAt time.Time) (*model.Task, error) {
 	if err := requireTransaction(tx); err != nil {
 		return nil, err
@@ -48,12 +49,18 @@ func (s *Scheduler) RetryInTransaction(ctx context.Context, tx *repository.Repos
 	if err := s.service.InspectRetryWithRepositories(ctx, tx, source); err != nil {
 		return nil, err
 	}
+	checkpoint := source.Checkpoint
+	if definition.RetryCheckpoint != nil {
+		if checkpoint, err = definition.RetryCheckpoint(ctx, tx, source); err != nil {
+			return nil, err
+		}
+	}
 	prepared, err := s.service.prepare(EnqueueRequest{Type: source.Type, Input: source.Input, AvailableAt: availableAt})
 	if err != nil {
 		return nil, err
 	}
 	prepared.RetryOfTaskID = &source.ID
-	prepared.Checkpoint = source.Checkpoint
+	prepared.Checkpoint = checkpoint
 	prepared.ResumeMode = model.TaskResumeModeRecover
 	if err := tx.Tasks.SupersedeTerminal(ctx, source.ID); err != nil {
 		return nil, err

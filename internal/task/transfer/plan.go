@@ -35,7 +35,9 @@ func (h *PlanHandler) transferPlanHandler() *taskengine.FuncHandler {
 		if binding == nil {
 			return h.failCopyTask(execution, input, copyRow, repository.ErrNotFound, "dataset_missing")
 		}
-		if binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.IsZero() {
+		canTransfer := binding.Status == model.StorageDataSetStatusReady ||
+			(binding.Status == model.StorageDataSetStatusDraining && copyRow.CommitPinned())
+		if !canTransfer || binding.DataSetID == nil || binding.DataSetID.IsZero() {
 			return taskengine.Wait(model.TaskResumeModeExecute, "dataset", "Waiting for data set", nil)
 		}
 		unreferenced, err := h.CopyCoordinator.deps.Repositories.Objects.ContentIsUnreferenced(ctx, copyRow.ContentID)

@@ -99,6 +99,18 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
+		var contentID int64
+		if err := db.NewSelect().Model((*model.StorageCopy)(nil)).Column("content_id").Where("id = ?", input.CopyID).Scan(ctx, &contentID); err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("reserving storage pull request: %w", ErrConflict)
+			}
+			return fmt.Errorf("reserving storage pull request: %w", err)
+		}
+		// A replacement hands a copy over under its content lock, so the owner
+		// checked below holds until this attempt commits.
+		if err := lockStorageContentForCopyMutation(ctx, db, contentID); err != nil {
+			return err
+		}
 		copyRow := new(model.StorageCopy)
 		if err := db.NewSelect().
 			Model(copyRow).

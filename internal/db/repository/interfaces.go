@@ -502,6 +502,7 @@ type StorageContentRepository interface {
 	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageCopy, error)
 	GetLiveVersionForUpload(ctx context.Context, contentID int64) (*model.ObjectVersion, error)
 	ListIncompleteCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error)
+	ListInFlightCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error)
 	BindDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
 	TransferEnsureTaskOwner(ctx context.Context, dataSetID, generation, oldTaskID, newTaskID int64) error
 	// DataSetCreationStopped includes local sources whose replacement revoked
@@ -673,6 +674,12 @@ type StorageReplacementRepository interface {
 	// after activation and under the coordinator fence. The caller must protect
 	// the transaction with its current engine claim.
 	AbandonUncreatedCopiesBatch(ctx context.Context, replacementID, generation, taskID int64, limit int) (bool, error)
+	// HandOverSourceWritesBatch moves unsigned writes still bound to an
+	// activated remote source to the target under the coordinator fence and
+	// returns target copies for scheduling. The caller must protect the
+	// transaction with its current engine claim.
+	HandOverSourceWritesBatch(ctx context.Context, replacementID, generation, taskID int64, limit int) ([]model.StorageCopy, bool, error)
+	HasUnsignedSourceWrites(ctx context.Context, sourceDataSetID int64) (bool, error)
 	// CompleteWithoutRemoteSource rechecks readable coverage and settled old
 	// work under the coordinator fence; the caller protects its engine claim.
 	// No remote termination evidence is required.

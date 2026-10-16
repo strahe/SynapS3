@@ -29,9 +29,10 @@ func (h *CopyCoordinator) copyDefinition(taskType model.TaskType) taskengine.Def
 		CanManualRetry: func(source *model.Task) bool {
 			return source != nil && (source.FailureReason == nil || *source.FailureReason != "invalid_checkpoint")
 		},
-		InspectRetry:  h.inspectCopyRetry,
-		PrepareRetry:  h.prepareCopyRetry,
-		BindSuccessor: transferCopyOwner,
+		InspectRetry:    h.inspectCopyRetry,
+		PrepareRetry:    h.prepareCopyRetry,
+		BindSuccessor:   transferCopyOwner,
+		RetryCheckpoint: loadCopyRetryCheckpoint,
 		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) (int64, int64) {
 			return input.CopyID, input.Generation
 		}),
