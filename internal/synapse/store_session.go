@@ -26,6 +26,7 @@ var (
 	ErrStoreSessionMissing    = errors.New("upload session is unavailable")
 	ErrStoreSessionClaimed    = errors.New("upload session is already claimed")
 	ErrStoreSessionIncomplete = errors.New("upload session is incomplete")
+	ErrStoreUploadTruncated   = errors.New("upload ended before all bytes were sent")
 )
 
 func (c *dataSetTargetAdapter) CreateStoreSession(ctx context.Context) (string, error) {
@@ -75,6 +76,9 @@ func (c *dataSetTargetAdapter) UploadStoreSession(ctx context.Context, serviceUR
 		panic(panicValue)
 	}
 	if err != nil {
+		if uploaded < int64(info.RawSize) {
+			return nil, errors.Join(NormalizeProviderOperationError(ctx, err), ErrStoreUploadTruncated)
+		}
 		return nil, NormalizeProviderOperationError(ctx, err)
 	}
 	if uploaded != int64(info.RawSize) {

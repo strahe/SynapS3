@@ -1005,7 +1005,7 @@ func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 	f := newAdminTaskFixture(t)
 	row := f.enqueue(t, model.TaskTypeUploadPlan, "task-events", time.Now(), "bucket", "1")
-	for _, details := range []string{`{"attempt":1,"operation_key":"private-effect","checkpoint":{"secret":"private-payload"}}`, `{"next_attempt":2,"failure_reason":"attempts_exhausted"}`} {
+	for _, details := range []string{`{"attempt":1,"operation_key":"private-effect","checkpoint":{"secret":"private-payload"},"error":"private-round-error"}`, `{"next_attempt":2,"failure_reason":"attempts_exhausted","error":"private-retry-error"}`} {
 		if err := f.repos.Tasks.AppendEvent(t.Context(), row.ID, "retry", json.RawMessage(details)); err != nil {
 			t.Fatal(err)
 		}
@@ -1017,12 +1017,12 @@ func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 		NextCursor *int64          `json:"next_cursor"`
 	}
 	decodeJSON(t, rr, &page)
-	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].NextAttempt == nil || *page.Events[0].NextAttempt != 2 || page.NextCursor == nil {
+	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].NextAttempt == nil || *page.Events[0].NextAttempt != 2 || page.NextCursor == nil || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), `"error"`) {
 		t.Fatalf("event page: %d %s", rr.Code, rr.Body.String())
 	}
 	rr = f.request(http.MethodGet, path+"&cursor="+strconv.FormatInt(*page.NextCursor, 10), nil)
 	decodeJSON(t, rr, &page)
-	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].Attempt == nil || *page.Events[0].Attempt != 1 || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), "checkpoint") {
+	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].Attempt == nil || *page.Events[0].Attempt != 1 || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), "checkpoint") || strings.Contains(rr.Body.String(), `"error"`) {
 		t.Fatalf("unsafe event page: %d %s", rr.Code, rr.Body.String())
 	}
 	selection := json.RawMessage(`{"provider_selection":{"tier":"approved","has_trusted":false,"requested_count":3,"eligible_count":1,"rejected_total":2,"rejected_omitted":0,"service_url":"private-url","rejections":[{"provider_id":"2","reason":"observation_stale","observation_checked_at":"2026-10-11T09:00:00Z","error":"private-provider-error"},{"provider_id":"4","reason":"private-reason"}]},"checkpoint":{"secret":"private-payload"}}`)

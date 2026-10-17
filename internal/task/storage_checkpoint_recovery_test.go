@@ -204,8 +204,8 @@ func TestStorePreparationFailuresRetainCheckpointAndRetry(t *testing.T) {
 					if !afterClock.Started.Equal(beforeClock.Started) {
 						t.Fatalf("pre-request failure refreshed observation: before=%v after=%v", beforeClock.Started, afterClock.Started)
 					}
-				} else if !afterClock.Started.After(beforeClock.Started) || afterClock.Started.After(time.Now().UTC()) {
-					t.Fatalf("unconfirmed finalize did not open a fresh observation window: before=%v after=%v requests=%d", beforeClock.Started, afterClock.Started, finalizes.Load())
+				} else if !afterClock.Started.IsZero() {
+					t.Fatalf("request result began observation before provider confirmation: before=%v after=%v requests=%d", beforeClock.Started, afterClock.Started, finalizes.Load())
 				}
 				delete(beforeEvidence, "stage")
 				delete(afterEvidence, "stage")
@@ -529,14 +529,16 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 
 func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) {
 	for _, tt := range []struct {
-		name    string
-		state   synapse.ParkedPieceState
-		err     error
-		expired bool
+		name      string
+		state     synapse.ParkedPieceState
+		err       error
+		expired   bool
+		zeroStart bool
 	}{
 		{name: "processing", state: synapse.ParkedPieceProcessing},
 		{name: "processing window expired", state: synapse.ParkedPieceProcessing, expired: true},
 		{name: "query failure", err: errors.New("provider unavailable")},
+		{name: "query failure before observation", err: errors.New("provider unavailable"), zeroStart: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			payload := strings.Repeat("k", 128)
@@ -551,6 +553,11 @@ func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) 
 				started = started.Add(-31 * time.Minute)
 			}
 			seedStoreCheckpoint(t, runtime, taskRow.ID, pipeline.target.ID, pieceCID, target.ServiceURL(), started)
+			if tt.zeroStart {
+				if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = checkpoint_json - 'observation_started_at' WHERE id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if tt.expired {
 				runtimeJSON, err := json.Marshal(map[string]any{"operation_key": "store:" + pieceCID.String(), "operation_started_at": time.Now().Add(-31 * time.Minute)})
 				if err != nil {
@@ -570,6 +577,14 @@ func TestStoreProcessingWaitAndQueryFailureRetainRecoveryEvidence(t *testing.T) 
 			})
 			if len(observed.Checkpoint) == 0 {
 				t.Fatal("Store recovery evidence was lost")
+			}
+			if tt.zeroStart {
+				var evidence struct {
+					Started time.Time `json:"observation_started_at"`
+				}
+				if err := json.Unmarshal(observed.Checkpoint, &evidence); err != nil || !evidence.Started.IsZero() {
+					t.Fatalf("failed provider queries began observation: checkpoint=%+v err=%v", evidence, err)
+				}
 			}
 			if tt.expired {
 				if observed.FailureReason == nil || *observed.FailureReason != "store_processing_timeout" || observed.RetryCount != 0 {
@@ -754,13 +769,13 @@ func TestStoreStopsAfterConfiguredAutomaticRetransmissions(t *testing.T) {
 			break
 		}
 		first, second := <-observations, <-observations
-		if first.IngressAttempt != attempt || second.IngressAttempt != attempt || first.RetryCount != attempt || second.RetryCount != attempt || first.ObservationStartedAt.IsZero() || !second.ObservationStartedAt.Equal(first.ObservationStartedAt) || !first.ObservationStartedAt.After(previousStart) {
+		if first.IngressAttempt != attempt || second.IngressAttempt != attempt || first.RetryCount != attempt || second.RetryCount != attempt || !first.ObservationStartedAt.IsZero() || !second.ObservationStartedAt.After(previousStart) {
 			t.Fatalf("Store observation %d changed clock or budget: first=%+v second=%+v previous=%s", attempt, first, second, previousStart)
 		}
-		previousStart = first.ObservationStartedAt
+		previousStart = second.ObservationStartedAt
 	}
 	var finalEvidence checkpointEvidence
-	if err := json.Unmarshal(failed.Checkpoint, &finalEvidence); err != nil || finalEvidence.IngressAttempt != 10 || !finalEvidence.ObservationStartedAt.After(previousStart) {
+	if err := json.Unmarshal(failed.Checkpoint, &finalEvidence); err != nil || finalEvidence.IngressAttempt != 10 || !finalEvidence.ObservationStartedAt.IsZero() {
 		t.Fatalf("exhausted Store checkpoint = %+v, err:%v", finalEvidence, err)
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
@@ -832,6 +847,12 @@ func TestNewStoreTaskAdoptsPreviousCheckpoint(t *testing.T) {
 			}
 			if len(completed.Checkpoint) == 0 {
 				t.Fatal("new Store task did not retain the previous checkpoint")
+			}
+			var evidence struct {
+				Started time.Time `json:"observation_started_at"`
+			}
+			if err := json.Unmarshal(completed.Checkpoint, &evidence); err != nil || !evidence.Started.IsZero() {
+				t.Fatalf("adopted Store checkpoint retained the previous observation clock: checkpoint=%+v err=%v", evidence, err)
 			}
 			if completed.WorkStartedAt == nil || completed.WorkStartedAt.Before(newTask.CreatedAt) {
 				t.Fatalf("new Store recovery start = %v, before creation %v", completed.WorkStartedAt, newTask.CreatedAt)

@@ -56,7 +56,11 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		if eventType == "" {
 			return nil
 		}
-		details, err := json.Marshal(map[string]any{"attempt": row.RetryCount + 1, "failure_reason": transition.FailureReason})
+		eventDetails := map[string]any{"attempt": row.RetryCount + 1, "failure_reason": transition.FailureReason}
+		if transition.LastError != nil {
+			eventDetails["error"] = *transition.LastError
+		}
+		details, err := json.Marshal(eventDetails)
 		if err != nil {
 			return err
 		}

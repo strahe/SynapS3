@@ -181,6 +181,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 				return err
 			}
 			checkpoint.SessionID, checkpoint.Stage = id, storeStageUpload
+			checkpoint.UploadsIncomplete = true
 			if err := validateStoreCheckpoint(checkpoint, content.ContentSize); err != nil {
 				return err
 			}
@@ -198,7 +199,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 				return h.storePublished(ctx, execution, &checkpoint)
 			}
 			if errors.Is(err, synapse.ErrStoreSessionMissing) {
-				return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID)
+				return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, synapse.ErrStoreSessionMissing)
 			}
 			if !errors.Is(err, synapse.ErrStoreSessionIncomplete) {
 				return err
@@ -213,8 +214,10 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 			}
 			defer func() { _ = body.Close() }()
 		}
+		claimable := checkpoint.UploadsIncomplete
 		uploadCheckpoint := checkpoint
 		uploadCheckpoint.Stage = storeStageUpload
+		uploadCheckpoint.UploadsIncomplete = false
 		var progressSettlement taskengine.Settlement
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 			uploadCheckpoint.IngressAttempt = copyRow.IngressStoreAttempt + 1
@@ -235,12 +238,17 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 		requestStarted = true
 		stored, err := target.UploadStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, body.storeContextReader, options)
 		if errors.Is(err, synapse.ErrStoreSessionMissing) {
-			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID)
+			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, synapse.ErrStoreSessionMissing)
 		}
 		if errors.Is(err, synapse.ErrStoreSessionClaimed) {
-			return errStoreBusy
+			checkpoint.UploadsIncomplete = claimable
+			if claimable {
+				return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, err)
+			}
+			return err
 		}
 		if err != nil {
+			checkpoint.UploadsIncomplete = claimable && errors.Is(err, synapse.ErrStoreUploadTruncated)
 			return err
 		}
 		if stored == nil || !stored.PieceCID.Equals(pieceCID) || stored.Size != content.ContentSize {
@@ -254,7 +262,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 		requestStarted = true
 		err = target.FinalizeStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, pieceCID)
 		if errors.Is(err, synapse.ErrStoreSessionMissing) {
-			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID)
+			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, synapse.ErrStoreSessionMissing)
 		}
 		if errors.Is(err, synapse.ErrStoreSessionIncomplete) {
 			return errStoreBusy
@@ -285,6 +293,9 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 	if err == nil {
 		return h.recoverStore(ctx, execution, input, copyRow, target, checkpoint)
 	}
+	if errors.Is(err, synapse.ErrStoreSessionClaimed) && checkpoint.Stage != storeStageExpired {
+		return retryStoreCheckpoint(execution, checkpoint, err, "store_resend_required")
+	}
 	if errors.Is(err, errStoreBusy) {
 		return h.waitForStoreStatus(ctx, execution, checkpoint, synapse.ParkedPieceProcessing, nil)
 	}
@@ -307,9 +318,6 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 	}
 	if !requestStarted {
 		return retryStoreCheckpoint(execution, checkpoint, err, "store_checkpoint_write_failed")
-	}
-	if checkpoint.Stage != storeStageExpired && checkpoint.ObservationStartedAt.IsZero() {
-		checkpoint.ObservationStartedAt = time.Now().UTC()
 	}
 	return retryStoreCheckpoint(execution, checkpoint, err, "provider_confirmation")
 }
@@ -337,13 +345,10 @@ func retryStoreCheckpoint(execution taskengine.Execution, checkpoint storeCheckp
 
 func (h *StoreHandler) storePublished(ctx context.Context, execution taskengine.Execution, checkpoint *storeCheckpoint) error {
 	checkpoint.Stage = storeStageObserve
-	if checkpoint.ObservationStartedAt.IsZero() {
-		checkpoint.ObservationStartedAt = time.Now().UTC()
-	}
 	return execution.WriteCheckpoint(ctx, *checkpoint)
 }
 
-func (h *StoreHandler) storeSessionMissing(ctx context.Context, execution taskengine.Execution, target synapse.DataSetTarget, checkpoint *storeCheckpoint, pieceCID cid.Cid) error {
+func (h *StoreHandler) storeSessionMissing(ctx context.Context, execution taskengine.Execution, target synapse.DataSetTarget, checkpoint *storeCheckpoint, pieceCID cid.Cid, cause error) error {
 	state, err := h.storePieceState(ctx, target, *checkpoint, pieceCID)
 	if err != nil {
 		return err
@@ -356,7 +361,7 @@ func (h *StoreHandler) storeSessionMissing(ctx context.Context, execution tasken
 		if err := execution.WriteCheckpoint(ctx, *checkpoint); err != nil {
 			return err
 		}
-		return synapse.ErrStoreSessionMissing
+		return cause
 	case synapse.ParkedPieceProcessing:
 		return errStoreBusy
 	default:

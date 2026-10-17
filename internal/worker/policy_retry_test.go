@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -195,6 +196,17 @@ func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
 			settled := false
 			for _, event := range events {
 				settled = settled || event.Type == "exhaustion_settled"
+				if event.Type == "retry_scheduled" || event.Type == "failed" {
+					var details struct {
+						Error string `json:"error"`
+					}
+					if err := json.Unmarshal(event.Details, &details); err != nil {
+						t.Fatal(err)
+					}
+					if details.Error != "temporary" {
+						t.Fatalf("%s event error = %q, want temporary", event.Type, details.Error)
+					}
+				}
 			}
 			if settled != wantExhausted {
 				t.Fatalf("exhaustion evidence = %v, want %v", settled, wantExhausted)
