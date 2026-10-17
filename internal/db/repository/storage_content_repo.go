@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagepipeline"
@@ -742,7 +743,7 @@ func (r *BunStorageContentRepo) RecordDataSetCreationError(ctx context.Context, 
 	}
 	_, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
-		Set("last_error = ?", message).
+		Set("last_error = ?", errtext.Redact(message)).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ? AND ensure_task_id = ?", id, taskID).
 		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
@@ -857,7 +858,7 @@ func (r *BunStorageContentRepo) MarkDataSetDraining(ctx context.Context, id int6
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = ?", model.StorageDataSetStatusDraining).
 		Set("is_current = ?", false).
-		Set("last_error = ?", lastError).
+		Set("last_error = ?", errtext.Redact(lastError)).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", id).
 		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
@@ -1307,7 +1308,7 @@ func abandonCopyPullAttempt(ctx context.Context, db bun.IDB, attemptID string, c
 	result, err := db.NewUpdate().
 		Model((*storagepull.Attempt)(nil)).
 		Set("status = ?", storagepull.AttemptStatusAbandoned).
-		Set("last_error = ?", lastError).
+		Set("last_error = ?", errtext.Redact(lastError)).
 		Set("resolved_at = ?", now).
 		Set("updated_at = ?", now).
 		Where("attempt_id = ?", attemptID).
@@ -1362,7 +1363,7 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 			Model((*model.StorageCopy)(nil)).
 			Set("status = ?", model.StorageCopyStatusFailed).
 			Set("commit_ready_at = NULL").
-			Set("last_error = ?", lastError).
+			Set("last_error = ?", errtext.Redact(lastError)).
 			Set("updated_at = ?", now).
 			Where("id = ?", copyID).
 			Where("status <> ?", model.StorageCopyStatusCommitted).

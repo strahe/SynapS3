@@ -160,8 +160,8 @@ func TestCheckProvidersMarksLookupFailureUnknownWithSanitizedError(t *testing.T)
 	if state.Active != nil || state.HasPDP != nil || state.ServiceURL != nil || state.HealthStatus != nil {
 		t.Fatalf("lookup failure facts = active:%v has_pdp:%v service_url:%v health:%v, want all nil", state.Active, state.HasPDP, state.ServiceURL, state.HealthStatus)
 	}
-	if state.LastError == nil || *state.LastError != "RPC call failed" {
-		t.Fatalf("LastError = %#v, want sanitized RPC call failed", state.LastError)
+	if state.LastError == nil || *state.LastError != "lookup unavailable https://rpc.example.test" {
+		t.Fatalf("LastError = %v, want redacted lookup error", state.LastError)
 	}
 }
 
@@ -430,8 +430,8 @@ func TestCheckDataSetsMergesWalletScanFailureWithLocalStatus(t *testing.T) {
 	assertDataSetState(t, byLocal[2], StatusUnknown, []ReasonCode{ReasonChainLookupFailed, ReasonLocalStatusNotReady}, nil)
 	assertDataSetState(t, byLocal[3], StatusUnavailable, []ReasonCode{ReasonChainLookupFailed, ReasonLocalStatusNotReady}, nil)
 	for _, id := range []int64{1, 2, 3} {
-		if byLocal[id].LastError == nil || *byLocal[id].LastError != "RPC call failed" {
-			t.Fatalf("local data set %d LastError = %#v, want sanitized RPC call failed", id, byLocal[id].LastError)
+		if byLocal[id].LastError == nil || *byLocal[id].LastError != "rpc unavailable https://rpc.example.test" {
+			t.Fatalf("local data set %d LastError = %v, want redacted scan error", id, byLocal[id].LastError)
 		}
 	}
 }

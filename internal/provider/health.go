@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synapse-go/pdp"
 )
 
@@ -79,9 +80,12 @@ func (h *HealthChecker) Probe(ctx context.Context, serviceURL string, timeout ti
 	return HealthResult{Status: "reachable"}
 }
 
-// pingFailureDetail classifies a failed PDP ping without exposing the URL,
-// response body, or raw network error text.
+// pingFailureDetail classifies a failed PDP ping and keeps the redacted error.
 func pingFailureDetail(err error) string {
+	return pingFailureSummary(err) + ": " + errtext.Redact(err.Error())
+}
+
+func pingFailureSummary(err error) string {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return "Health check was interrupted"

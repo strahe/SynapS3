@@ -2,12 +2,12 @@ package observability
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/types"
 )
@@ -490,16 +490,10 @@ func clampDuration(value, min, max time.Duration) time.Duration {
 }
 
 func safeObservabilityError(err error) string {
-	switch {
-	case err == nil:
+	if err == nil {
 		return ""
-	case errors.Is(err, context.Canceled):
-		return "request cancelled"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "request timed out"
-	default:
-		return "RPC call failed"
 	}
+	return errtext.Redact(err.Error())
 }
 
 func lessOnChainID(a, b types.OnChainID) bool {

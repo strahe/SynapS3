@@ -18,11 +18,12 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	taskengine "github.com/strahe/synaps3/internal/worker"
+	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
 )
 
 func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
-	for _, scenario := range []string{"lost PUT response", "busy upload", "missing session", "missing session with published piece", "unreachable original URL"} {
+	for _, scenario := range []string{"lost PUT response", "busy upload", "incomplete upload claim", "complete upload claim", "missing session", "missing session with published piece", "unreachable original URL"} {
 		t.Run(scenario, func(t *testing.T) {
 			payload := strings.Repeat("s", 128)
 			originalURL := "https://store.example"
@@ -50,15 +51,27 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 			target := &testutil.MockStorageTarget{ServiceURLValue: originalURL}
 			target.CreateStoreSessionFunc = func(context.Context) (string, error) { creates.Add(1); return fresh, nil }
 			target.UploadStoreSessionFunc = func(_ context.Context, url, session string, body io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
-				uploads.Add(1)
+				upload := uploads.Add(1)
 				if url != originalURL {
 					t.Errorf("session moved to %q", url)
 				}
-				if scenario == "busy upload" {
+				if scenario == "busy upload" || (scenario == "incomplete upload claim" || scenario == "complete upload claim") && upload == 2 {
 					if session != original {
 						t.Errorf("busy upload changed session to %q", session)
 					}
-					return nil, synapse.ErrStoreSessionClaimed
+					return nil, errors.Join(synapse.ErrStoreSessionClaimed, &pdp.HTTPError{StatusCode: 409, Body: "Data has already been uploaded"})
+				}
+				if (scenario == "incomplete upload claim" || scenario == "complete upload claim") && upload == 1 {
+					if session != original {
+						t.Errorf("first upload changed session to %q", session)
+					}
+					if scenario == "incomplete upload claim" {
+						return nil, errors.Join(errors.New("upload response lost"), synapse.ErrStoreUploadTruncated)
+					}
+					if _, err := io.Copy(io.Discard, body); err != nil {
+						return nil, err
+					}
+					return nil, errors.New("upload response lost")
 				}
 				if session != fresh {
 					t.Errorf("replacement upload used %q", session)
@@ -71,7 +84,7 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 				if url != originalURL {
 					t.Errorf("finalize moved to %q", url)
 				}
-				if scenario == "busy upload" {
+				if scenario == "busy upload" || (scenario == "incomplete upload claim" || scenario == "complete upload claim") && session == original {
 					return synapse.ErrStoreSessionIncomplete
 				}
 				if scenario == "missing session" && session == original {
@@ -91,6 +104,11 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 			runtime, pipeline, pieceCID := storeRecoveryFixture(t, retries, payload, parked, cacheStore, target)
 			row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
 			seedStoreCheckpoint(t, runtime, row.ID, pipeline.target.ID, pieceCID, originalURL, time.Now())
+			if scenario == "incomplete upload claim" || scenario == "complete upload claim" {
+				if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = jsonb_set(checkpoint_json, '{uploads_incomplete}', 'true') WHERE id = ?", row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if scenario == "busy upload" || scenario == "unreachable original URL" {
 				target.ServiceURLValue = "https://changed-store.example"
 			}
@@ -137,25 +155,18 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 			switch scenario {
 			case "busy upload":
-				var evidence map[string]any
-				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil {
-					t.Fatal(err)
-				}
-				clock := evidence["observation_started_at"]
-				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 				if row.RetryCount != 1 || creates.Load() != 0 || uploads.Load() != 1 || finalizes.Load() != 1 {
 					t.Fatal("busy session bypassed effect admission or opened a new session")
 				}
-				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil {
-					t.Fatal(err)
+				var evidence struct {
+					Session string    `json:"session_id"`
+					URL     string    `json:"provider_service_url"`
+					Started time.Time `json:"observation_started_at"`
 				}
-				if evidence["session_id"] != original || evidence["provider_service_url"] != originalURL || evidence["observation_started_at"] != clock {
-					t.Fatal("busy recovery changed identity or observation clock")
+				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.URL != originalURL || !evidence.Started.IsZero() || row.FailureReason == nil || *row.FailureReason != "store_resend_required" || row.LastError == nil || *row.LastError != "provider returned HTTP 409: Data has already been uploaded" {
+					t.Fatalf("busy recovery lost session or HTTP evidence: checkpoint=%+v task=%+v err=%v", evidence, row, err)
 				}
 				for retry := 1; retry <= 3; retry++ {
-					row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-					row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 					row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 					status := model.TaskStatusPending
 					if retry == 3 {
@@ -165,6 +176,35 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 				}
 				if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" || row.RetryCount != 3 || creates.Load() != 0 || uploads.Load() != 4 || finalizes.Load() != 4 {
 					t.Fatalf("busy upload budget: task=%+v requests=%d/%d/%d", row, creates.Load(), uploads.Load(), finalizes.Load())
+				}
+				return
+			case "incomplete upload claim", "complete upload claim":
+				var evidence struct {
+					Session    string    `json:"session_id"`
+					Stage      string    `json:"stage"`
+					Incomplete bool      `json:"uploads_incomplete"`
+					Started    time.Time `json:"observation_started_at"`
+				}
+				incomplete := scenario == "incomplete upload claim"
+				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.Incomplete != incomplete || !evidence.Started.IsZero() || row.RetryCount != 1 || row.FailureReason == nil || *row.FailureReason != "provider_confirmation" {
+					t.Fatalf("upload result lost completion evidence: checkpoint=%+v task=%+v err=%v", evidence, row, err)
+				}
+				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+				stage, reason := "upload", "store_resend_required"
+				if incomplete {
+					stage, reason = "expired", "provider_confirmation"
+				}
+				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.Stage != stage || evidence.Incomplete != incomplete || !evidence.Started.IsZero() || row.RetryCount != 2 || row.FailureReason == nil || *row.FailureReason != reason || row.LastError == nil || *row.LastError != "provider returned HTTP 409: Data has already been uploaded" || creates.Load() != 0 || uploads.Load() != 2 {
+					t.Fatalf("claimed upload ignored completion evidence: checkpoint=%+v task=%+v create=%d uploads=%d err=%v", evidence, row, creates.Load(), uploads.Load(), err)
+				}
+				if !incomplete {
+					return
+				}
+				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+				runOneStorageTask(t, runtime, row, model.TaskStatusCompleted)
+				if creates.Load() != 1 || uploads.Load() != 3 || finalizes.Load() != 3 {
+					t.Fatalf("incomplete session recovery requests: create=%d uploads=%d finalize=%d", creates.Load(), uploads.Load(), finalizes.Load())
 				}
 				return
 			case "missing session":
@@ -300,8 +340,8 @@ func TestStoreSessionCheckpointFailureStopsNextRequest(t *testing.T) {
 				if !evidence.ObservationStartedAt.Equal(oldClock) {
 					t.Fatalf("request preparation failure changed the observation window: old=%v checkpoint=%v", oldClock, evidence.ObservationStartedAt)
 				}
-			} else if evidence.ObservationStartedAt.IsZero() || time.Since(evidence.ObservationStartedAt) >= 30*time.Minute {
-				t.Fatalf("unknown request result did not preserve a fresh observation window: %v", evidence.ObservationStartedAt)
+			} else if !evidence.ObservationStartedAt.IsZero() {
+				t.Fatalf("request result began observation before provider confirmation: %v", evidence.ObservationStartedAt)
 			}
 			if scenario.exhausted {
 				if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" {
@@ -358,12 +398,22 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 				t.Fatal(err)
 			}
 			started := evidence.ObservationStartedAt
-			if started.Before(before) || started.After(time.Now().UTC()) || !evidence.AttemptedAt.Equal(old) {
-				t.Fatalf("upload admission consumed observation window: %+v", evidence)
+			if !evidence.AttemptedAt.Equal(old) {
+				t.Fatalf("provider query changed upload admission: %+v", evidence)
+			}
+			if unknown {
+				if !started.IsZero() || row.RetryCount != 1 || row.FailureReason == nil || *row.FailureReason != "store_check_failed" {
+					t.Fatalf("failed provider query began observation or lost retry: checkpoint=%+v task=%+v", evidence, row)
+				}
+			} else if started.Before(before) || started.After(time.Now().UTC()) || row.RetryCount != 0 {
+				t.Fatalf("provider processing did not begin observation without retry: checkpoint=%+v task=%+v", evidence, row)
 			}
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 			if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || !evidence.ObservationStartedAt.Equal(started) {
 				t.Fatalf("automatic recovery reset observation start: %+v, err=%v", evidence, err)
+			}
+			if unknown && (row.RetryCount != 2 || row.FailureReason == nil || *row.FailureReason != "store_check_failed") {
+				t.Fatalf("provider query failures did not consume retries: %+v", row)
 			}
 		})
 	}
@@ -520,8 +570,12 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 			var clock struct {
 				Started time.Time `json:"observation_started_at"`
 			}
-			if err := json.Unmarshal(row.Checkpoint, &clock); err != nil || clock.Started.Before(finished) || clock.Started.After(time.Now().UTC()) {
-				t.Fatalf("upload result did not persist a fresh observation window: %v, err=%v", clock.Started, err)
+			if err := json.Unmarshal(row.Checkpoint, &clock); err != nil {
+				t.Fatal(err)
+			}
+			observed := outcome == "processing" || outcome == "canceled settlement rollback"
+			if observed && (clock.Started.Before(finished) || clock.Started.After(time.Now().UTC())) || !observed && !clock.Started.IsZero() {
+				t.Fatalf("upload result observation clock: outcome=%s started=%v finished=%v", outcome, clock.Started, finished)
 			}
 			wantUploads := int64(1)
 			if outcome == "contention" {
@@ -537,6 +591,12 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 				copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 				if err != nil || copyRow.IngressStoreAttempt != 1 || row.WaitReason == nil || *row.WaitReason != "database_contention" {
 					t.Fatalf("contended upload checkpoint changed progress or wait semantics: copy=%+v task=%+v err=%v", copyRow, row, err)
+				}
+			}
+			if !observed {
+				row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+				if err := json.Unmarshal(row.Checkpoint, &clock); err != nil || clock.Started.Before(finished) || clock.Started.After(time.Now().UTC()) || uploads.Load() != wantUploads {
+					t.Fatalf("provider confirmation did not start observation after request completion: clock=%v uploads=%d err=%v", clock.Started, uploads.Load(), err)
 				}
 			}
 			started := clock.Started

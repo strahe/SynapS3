@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -157,7 +158,7 @@ func (r *BunStorageCleanupRepo) MarkCopyFailed(ctx context.Context, id int64, me
 	res, err := r.db.NewUpdate().
 		Model((*model.StorageCleanupCopy)(nil)).
 		Set("status = ?", model.StorageCleanupCopyStatusFailed).
-		Set("last_error = ?", message).
+		Set("last_error = ?", errtext.Redact(message)).
 		Set("updated_at = ?", now).
 		Where("id = ?", id).
 		Exec(ctx)
@@ -169,7 +170,7 @@ func (r *BunStorageCleanupRepo) MarkCopyUnsupported(ctx context.Context, id int6
 	res, err := r.db.NewUpdate().
 		Model((*model.StorageCleanupCopy)(nil)).
 		Set("status = ?", model.StorageCleanupCopyStatusUnsupported).
-		Set("last_error = ?", message).
+		Set("last_error = ?", errtext.Redact(message)).
 		Set("updated_at = ?", now).
 		Where("id = ?", id).
 		Exec(ctx)

@@ -224,6 +224,7 @@ func TestStoreRetryPreservesUploadSession(t *testing.T) {
 				"provider_service_url": "https://provider.example", "ingress_attempt": scenario.attempt,
 				"session_id": scenario.session, "stage": scenario.stage,
 				"observation_started_at": progressAt.Add(-time.Hour),
+				"uploads_incomplete":     true,
 			}
 			encoded, err := json.Marshal(checkpoint)
 			if err != nil {
@@ -269,7 +270,7 @@ func TestStoreRetryPreservesUploadSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got["session_id"] != checkpoint["session_id"] || got["stage"] != checkpoint["stage"] ||
-				got["intended_piece_cid"] != checkpoint["intended_piece_cid"] || got["ingress_attempt"] != float64(scenario.attempt) {
+				got["intended_piece_cid"] != checkpoint["intended_piece_cid"] || got["ingress_attempt"] != float64(scenario.attempt) || got["uploads_incomplete"] != true {
 				t.Fatalf("upload identity changed: %s", child.Checkpoint)
 			}
 			var clock struct {

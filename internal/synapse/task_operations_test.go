@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -165,6 +166,9 @@ func TestTaskStoreSessionErrorsPreserveHTTPStatus(t *testing.T) {
 			if tc.want != nil && !errors.Is(got, tc.want) {
 				t.Fatalf("session error = %v, want %v", got, tc.want)
 			}
+			if errors.Is(got, ErrStoreUploadTruncated) {
+				t.Fatalf("fully read request was reported as truncated: %v", got)
+			}
 			httpErr, ok := errors.AsType[*pdp.HTTPError](got)
 			if !ok || httpErr.StatusCode != tc.status {
 				t.Fatalf("HTTP classification = %#v, %v", httpErr, got)
@@ -175,6 +179,26 @@ func TestTaskStoreSessionErrorsPreserveHTTPStatus(t *testing.T) {
 				t.Fatalf("provider request count = %d, want 1", requests)
 			}
 		})
+	}
+}
+
+func TestTaskStoreSessionTruncatedUploadPreservesReadError(t *testing.T) {
+	t.Parallel()
+	payload := bytes.Repeat([]byte{0xab}, 512)
+	info, err := piece.CalculateFromBytes(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	target := storeSessionTestTarget(t, server.URL, server.Client())
+	body := io.MultiReader(bytes.NewReader(payload[:len(payload)/2]), iotest.ErrReader(io.ErrUnexpectedEOF))
+	result, err := target.UploadStoreSession(t.Context(), server.URL, "12345678-1234-4234-8234-123456789abc", body, &storage.StoreOptions{PieceCID: info.CIDv2})
+	if result != nil || !errors.Is(err, ErrStoreUploadTruncated) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated upload = %#v, %v", result, err)
 	}
 }
 

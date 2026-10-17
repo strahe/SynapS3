@@ -83,3 +83,31 @@ func TestTaskArchiveRollsBackAndPreservesLatestEvidence(t *testing.T) {
 		t.Fatalf("repeated settlement = %v", err)
 	}
 }
+
+func TestTaskSettlementRedactsErrorText(t *testing.T) {
+	repos := repository.NewRepositories(testDB(t))
+	ctx := t.Context()
+	row := enqueueAndClaimTask(t, repos, "redacted-error", time.Minute)
+	raw := `could not pull the piece: Post "https://user:pass@sp.example/pdp/piece/pull?token=secret": HTTP 409: dataset is terminated`
+	want := `could not pull the piece: Post "https://sp.example/pdp/piece/pull": HTTP 409: dataset is terminated`
+	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("pull_failed"), LastError: &raw,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := repos.Tasks.GetByID(ctx, row.ID)
+	if err != nil || failed == nil || failed.LastError == nil || *failed.LastError != want {
+		t.Fatalf("settled task = %#v, err=%v", failed, err)
+	}
+	events, err := repos.Tasks.ListEvents(ctx, row.ID, 0, 128)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("events = %#v, err=%v", events, err)
+	}
+	var details struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(events[0].Details, &details); err != nil || details.Error != want {
+		t.Fatalf("event error = %q, err=%v", details.Error, err)
+	}
+}

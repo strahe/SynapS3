@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 )
@@ -24,7 +25,8 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 			return ErrTaskLeaseLost
 		}
 		row.Status, row.WaitReason, row.FailureReason = transition.Status, transition.WaitReason, transition.FailureReason
-		row.LastError, row.StatusMessage, row.UpdatedAt = transition.LastError, transition.StatusMessage, now
+		lastError := errtext.RedactPtr(transition.LastError)
+		row.LastError, row.StatusMessage, row.UpdatedAt = lastError, transition.StatusMessage, now
 		row.LeaseUntil = nil
 		if transition.ClearWorkStartedAt {
 			row.WorkStartedAt = nil
@@ -56,7 +58,11 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		if eventType == "" {
 			return nil
 		}
-		details, err := json.Marshal(map[string]any{"attempt": row.RetryCount + 1, "failure_reason": transition.FailureReason})
+		eventDetails := map[string]any{"attempt": row.RetryCount + 1, "failure_reason": transition.FailureReason}
+		if lastError != nil {
+			eventDetails["error"] = *lastError
+		}
+		details, err := json.Marshal(eventDetails)
 		if err != nil {
 			return err
 		}

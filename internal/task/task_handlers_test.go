@@ -1348,19 +1348,20 @@ func TestStorageCleanupUnknownRequestOutcomeDoesNotResend(t *testing.T) {
 		},
 	})
 	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
-	runtime.repos.Tasks = limited
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
+	taskRow = runOneStorageTask(t, runtime, taskRow, model.TaskStatusPending)
+	if taskRow.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("unknown deletion resume mode = %s, want recover", taskRow.ResumeMode)
+	}
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("unknown deletion sent %d requests, want one", deleteCalls.Load())
+	}
 	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("advance cleanup poll: %v", err)
 	}
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
+	taskRow = runOneStorageTask(t, runtime, taskRow, model.TaskStatusPending)
+	if taskRow.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("unknown deletion recovery resume mode = %s, want recover", taskRow.ResumeMode)
+	}
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("unknown deletion sent %d requests, want one", deleteCalls.Load())
 	}

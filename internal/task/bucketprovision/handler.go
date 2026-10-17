@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 
 	"github.com/strahe/synaps3/internal/providerselect"
@@ -275,7 +276,7 @@ func (h *Handler) waitForStorageDependency(ctx context.Context, execution tasken
 func (h *Handler) logStorageDependencyFailure(ctx context.Context, execution taskengine.Execution, reason string, err error) error {
 	summary := synapse.SummarizedError(err)
 	level := slog.LevelWarn
-	if execution.LastError() == summary.Error() {
+	if execution.LastError() == errtext.Redact(summary.Error()) {
 		level = slog.LevelDebug
 	}
 	h.deps.Logger.Log(ctx, level, "storage task waiting for dependency",

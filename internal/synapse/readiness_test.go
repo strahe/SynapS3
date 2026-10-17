@@ -169,7 +169,7 @@ func TestReadinessCheckerChecksPaymentRunway(t *testing.T) {
 	}
 }
 
-func TestReadinessCheckerStorageErrorsAreUnknownAndSanitized(t *testing.T) {
+func TestReadinessCheckerStorageErrorsAreUnknownAndRedacted(t *testing.T) {
 	cfg := readyReadinessConfig()
 	client := readyReadinessClient(1)
 	client.storage.info = nil
@@ -186,13 +186,11 @@ func TestReadinessCheckerStorageErrorsAreUnknownAndSanitized(t *testing.T) {
 	requireResultStatus(t, got, ReadinessStatusUnknown)
 	requireCheckStatus(t, got.Checks, "providers", ReadinessStatusUnknown)
 	body := fmt.Sprintf("%#v", got)
-	for _, leaked := range []string{"secret-token", "example.invalid", "boom"} {
-		if strings.Contains(body, leaked) {
-			t.Fatalf("readiness response leaked %q: %s", leaked, body)
-		}
+	if strings.Contains(body, "secret-token") {
+		t.Fatalf("readiness response leaked URL credentials: %s", body)
 	}
-	if got.PartialErrors["provider_inventory"] != "RPC call failed" {
-		t.Fatalf("partial storage error = %#v, want sanitized RPC failure", got.PartialErrors)
+	if got.PartialErrors["provider_inventory"] != "dial https://example.invalid/rpc: boom" {
+		t.Fatalf("partial storage error = %#v, want redacted RPC error", got.PartialErrors)
 	}
 	if strings.Contains(logs.String(), "level=WARN") {
 		t.Fatalf("readiness partial error should not log warning: %s", logs.String())

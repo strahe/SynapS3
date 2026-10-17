@@ -50,7 +50,7 @@ func TestProbeHTTPResponses(t *testing.T) {
 			defer srv.Close()
 
 			got := NewHealthChecker(nil).Probe(context.Background(), srv.URL, 2*time.Second)
-			if got.Status != tt.wantStatus || got.Detail != tt.wantDetail {
+			if got.Status != tt.wantStatus || !detailMatches(got.Detail, tt.wantDetail) {
 				t.Errorf("probe = %+v, want status %q detail %q", got, tt.wantStatus, tt.wantDetail)
 			}
 		})
@@ -74,7 +74,7 @@ func TestProbeTLSVerificationFailures(t *testing.T) {
 			}}
 			checker := NewHealthChecker(&http.Client{Transport: transport})
 			got := checker.Probe(t.Context(), "https://provider.example", time.Second)
-			if got.Status != "unreachable" || got.Detail != "Provider TLS certificate could not be verified" {
+			if got.Status != "unreachable" || !detailMatches(got.Detail, "Provider TLS certificate could not be verified") {
 				t.Errorf("probe = %+v, want unreachable with TLS verification failure detail", got)
 			}
 		})
@@ -83,7 +83,7 @@ func TestProbeTLSVerificationFailures(t *testing.T) {
 
 func TestProbeConnectionRefused(t *testing.T) {
 	got := NewHealthChecker(nil).Probe(context.Background(), "http://127.0.0.1:1", time.Second)
-	if got.Status != "unreachable" || got.Detail != "Provider refused the connection" {
+	if got.Status != "unreachable" || !detailMatches(got.Detail, "Provider refused the connection") {
 		t.Errorf("probe = %+v, want unreachable with refused connection detail", got)
 	}
 }
@@ -100,7 +100,7 @@ func TestProbeConnectionClosedBeforeReply(t *testing.T) {
 	defer srv.Close()
 
 	got := NewHealthChecker(nil).Probe(context.Background(), srv.URL, 2*time.Second)
-	if got.Status != "unreachable" || got.Detail != "Provider closed the connection before replying" {
+	if got.Status != "unreachable" || !detailMatches(got.Detail, "Provider closed the connection before replying") {
 		t.Errorf("probe = %+v, want unreachable with closed connection detail", got)
 	}
 }
@@ -138,7 +138,7 @@ func TestCheckHealth_Timeout(t *testing.T) {
 	defer srv.Close()
 
 	got := NewHealthChecker(nil).Probe(context.Background(), srv.URL, 100*time.Millisecond)
-	if got.Status != "unreachable" || got.Detail != "Health check timed out" {
+	if got.Status != "unreachable" || !detailMatches(got.Detail, "Health check timed out") {
 		t.Errorf("probe = %+v, want unreachable with timeout detail", got)
 	}
 }
@@ -212,4 +212,13 @@ func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 		Body:       io.NopCloser(strings.NewReader("curio-pdp")),
 		Request:    req,
 	}, nil
+}
+
+// detailMatches checks the classified prefix of a probe detail; the redacted
+// error after it varies with the test server address.
+func detailMatches(detail, summary string) bool {
+	if summary == "" {
+		return detail == ""
+	}
+	return strings.HasPrefix(detail, summary+": ")
 }

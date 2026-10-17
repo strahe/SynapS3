@@ -97,6 +97,7 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 			if err := validateStoreCheckpoint(candidate, copyRow.ContentSize); err != nil {
 				return taskengine.Fail(err, "invalid_checkpoint", nil)
 			}
+			candidate.ObservationStartedAt = time.Time{}
 			if hasCheckpoint && checkpoint != candidate {
 				return taskengine.Fail(errors.New("previous Store checkpoints disagree"), "store_checkpoint_conflict", nil)
 			}
@@ -241,7 +242,7 @@ func (h *StoreHandler) storePieceState(ctx context.Context, target synapse.DataS
 }
 
 func (h *StoreHandler) waitForStoreStatus(ctx context.Context, execution taskengine.Execution, checkpoint storeCheckpoint, state synapse.ParkedPieceState, checkErr error) taskengine.Result {
-	if checkpoint.Stage == storeStageExpired && checkErr != nil {
+	if checkErr != nil {
 		return retryStoreCheckpoint(execution, checkpoint, checkErr, "store_check_failed")
 	}
 	if checkpoint.ObservationStartedAt.IsZero() {
@@ -249,9 +250,6 @@ func (h *StoreHandler) waitForStoreStatus(ctx context.Context, execution taskeng
 		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 			return retryStoreCheckpoint(execution, checkpoint, err, "store_observation_failed")
 		}
-	}
-	if checkErr != nil {
-		return retryStoreCheckpoint(execution, checkpoint, checkErr, "store_check_failed")
 	}
 	window := execution.Policy().ObservationWindow
 	if window > 0 && time.Since(checkpoint.ObservationStartedAt) >= window {

@@ -158,6 +158,8 @@ type storeCheckpoint struct {
 	SessionID            string     `json:"session_id,omitempty"`
 	Stage                storeStage `json:"stage"`
 	ObservationStartedAt time.Time  `json:"observation_started_at,omitempty"`
+	// UploadsIncomplete proves every PUT that may hold this session's claim ended before reading the complete body.
+	UploadsIncomplete bool `json:"uploads_incomplete,omitempty"`
 }
 
 type pullCheckpoint struct {

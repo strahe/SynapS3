@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -191,14 +192,14 @@ func (h *UploadSpeedTestHandler) failProviderUploadSpeed(execution taskengine.Ex
 	if code == "provider_changed" {
 		message = "Provider is no longer ready for this test"
 	}
-	return taskengine.Fail(errors.New(message), code, func(ctx context.Context, repos *repository.Repositories) error {
+	return taskengine.Fail(fmt.Errorf("%s: %w", message, err), code, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.ProviderUploadSpeed.Finish(ctx, input.ProviderID, execution.ID(), providerbenchmark.StateFailed, providerbenchmark.SampleBytes, 0, 0, code)
 	})
 }
 
 func (h *UploadSpeedTestHandler) failInvalidProviderUploadSpeedInput(execution taskengine.Execution, err error) taskengine.Result {
 	h.deps.Logger.Warn("provider upload speed task input is invalid", "task_id", execution.ID(), "error", err)
-	return taskengine.Fail(errors.New("upload speed test could not complete"), "invalid_input", func(ctx context.Context, repos *repository.Repositories) error {
+	return taskengine.Fail(fmt.Errorf("upload speed test could not complete: %w", err), "invalid_input", func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.ProviderUploadSpeed.FailActiveTask(ctx, execution.ID(), "invalid_input")
 	})
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/providerselect"
@@ -530,7 +531,7 @@ func (r *ReadinessResult) addPartialError(field string, err error) {
 	if r.PartialErrors == nil {
 		r.PartialErrors = make(map[string]string)
 	}
-	r.PartialErrors[field] = sanitizeRPCError(err)
+	r.PartialErrors[field] = errtext.Redact(err.Error())
 }
 
 func (c *ReadinessChecker) addPartialError(result *ReadinessResult, field string, err error) {
@@ -538,7 +539,7 @@ func (c *ReadinessChecker) addPartialError(result *ReadinessResult, field string
 		c.logger.Debug(
 			"filecoin readiness probe failed",
 			"check", field,
-			"error", sanitizeRPCError(err),
+			"error", errtext.Redact(err.Error()),
 			"error_type", fmt.Sprintf("%T", err),
 		)
 	}
