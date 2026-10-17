@@ -60,21 +60,22 @@ const (
 )
 
 type handlerTestRuntime struct {
-	db              *bun.DB
-	repos           *repository.Repositories
-	cache           cache.Cache
-	gate            *cacheaccess.Gate
-	tracker         *cacheaccess.Tracker
-	storage         *testutil.MockStorageClient
-	ready           *taskengine.Messenger
-	entryPoints     task.EntryPoints
-	registry        *taskengine.Registry
-	service         *taskengine.Service
-	retries         *taskengine.Scheduler
-	engine          *taskengine.Engine
-	testMaxAttempts *int
-	testBackoff     *taskengine.BackoffPolicy
-	schedules       []taskengine.ScheduleDefinition
+	db                    *bun.DB
+	repos                 *repository.Repositories
+	cache                 cache.Cache
+	gate                  *cacheaccess.Gate
+	tracker               *cacheaccess.Tracker
+	storage               *testutil.MockStorageClient
+	ready                 *taskengine.Messenger
+	entryPoints           task.EntryPoints
+	registry              *taskengine.Registry
+	service               *taskengine.Service
+	retries               *taskengine.Scheduler
+	engine                *taskengine.Engine
+	testMaxAttempts       *int
+	testDependencyRetries *int
+	testBackoff           *taskengine.BackoffPolicy
+	schedules             []taskengine.ScheduleDefinition
 }
 
 type handlerRuntimeOptions struct {
@@ -104,6 +105,7 @@ type handlerRuntimeOptions struct {
 	concurrency               int
 	uploadConcurrency         int
 	maxAttempts               *int
+	dependencyRetries         *int
 	testBackoff               *taskengine.BackoffPolicy
 	leaseDuration             time.Duration
 	observabilityChecker      observability.RefreshChecker
@@ -214,7 +216,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	runtime := handlerTestRuntime{
 		db: db, repos: repos, cache: cacheStore, gate: gate, tracker: tracker,
 		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, retries: retries, engine: engine, testMaxAttempts: options.maxAttempts,
-		testBackoff: options.testBackoff,
+		testBackoff: options.testBackoff, testDependencyRetries: options.dependencyRetries,
 	}
 	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
@@ -392,6 +394,9 @@ func handlerExecutionRegistry(t *testing.T, runtime handlerTestRuntime) *taskeng
 		definition.Policy.ObservationInterval = handlerTestPollInterval
 		if runtime.testMaxAttempts != nil {
 			definition.Policy.MaxAttempts = *runtime.testMaxAttempts
+		}
+		if runtime.testDependencyRetries != nil {
+			definition.Policy.DependencyRetries = *runtime.testDependencyRetries
 		}
 		definition.Policy.Backoff = taskengine.BackoffPolicy{
 			InitialDelay: 50 * time.Millisecond, Multiplier: 2, MaximumDelay: 50 * time.Millisecond,
@@ -4480,166 +4485,303 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	}
 }
 
-// Reopening failed child work spends the coordinator budget and preserves its source history.
 func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T) {
-	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("r", 128)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
+	dependencyLimit := 1
+	for _, tt := range []struct {
 		name              string
-		reason            string
-		checkpoint        string
-		wantFailed        bool
-		wantFenceReleased bool
+		contents          int
+		invalidCheckpoint bool
+		exhaustedFirst    bool
+		dependencyRetries *int
 	}{
-		{name: "retryable", reason: "store_outcome_unknown", checkpoint: fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://target.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, pieceInfo.CIDv2.String())},
-		{name: "invalid checkpoint", reason: "invalid_checkpoint", wantFailed: true},
-	}
-	for _, tt := range tests {
+		{name: "retryable", contents: 1},
+		{name: "retryable batch", contents: 7},
+		{name: "exhausted dependency leaves others running", contents: 2, exhaustedFirst: true},
+		{name: "invalid checkpoint", contents: 1, invalidCheckpoint: true},
+		{name: "dependency limit and manual reset", contents: 1, dependencyRetries: &dependencyLimit},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
+			runtime, replacement, coordinator := replacementBatchFixture(t, tt.contents, true, 128)
+			runtime.testDependencyRetries = tt.dependencyRetries
 			ctx := t.Context()
-			sequence := storedObjectSequence.Add(1)
-			id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 36000+sequence*10+offset) }
-			bucket := &model.Bucket{
-				Name: fmt.Sprintf("replacement-copy-retry-%d", sequence), Status: model.BucketStatusActive,
-				DefaultCopies: 1, MinimumDurableCopies: 1,
+			var contents []model.StorageContent
+			if err := runtime.db.NewSelect().Model(&contents).Where("bucket_id = ?", replacement.BucketID).OrderExpr("id ASC").Scan(ctx); err != nil {
+				t.Fatal(err)
 			}
-			if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
-				t.Fatalf("create bucket: %v", err)
-			}
-			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-				BucketID: bucket.ID, ContentSize: int64(pieceInfo.RawSize), Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
-			})
+			source, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, replacement.SourceDataSetID)
 			if err != nil {
-				t.Fatalf("ensure content: %v", err)
+				t.Fatal(err)
 			}
-			version := &model.ObjectVersion{
-				VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "migrating.bin", Size: content.ContentSize,
-				ETag: bucket.Name, ContentType: "application/octet-stream", ContentID: &content.ID,
-			}
-			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
-				t.Fatalf("create object version: %v", err)
-			}
-			source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-				BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0, CreatedByContentID: content.ID,
-			})
+			target, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, replacement.TargetDataSetID)
 			if err != nil {
-				t.Fatalf("create source: %v", err)
+				t.Fatal(err)
 			}
-			sourceClientID := id(3)
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID: source.ID, DataSetID: id(2), ClientDataSetID: &sourceClientID,
-			}); err != nil {
-				t.Fatalf("mark source ready: %v", err)
-			}
-			if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
-				StorageDataSetID: source.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: id(1),
-			}}); err != nil {
-				t.Fatalf("create source copy: %v", err)
-			}
-			pieceID := id(4)
-			testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
-				ContentID: content.ID, CopyIndex: 0, PieceCID: pieceInfo.CIDv2.String(),
-				PieceID: &pieceID, RetrievalURL: "https://source.example/piece",
-			})
-			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
-				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
-				TargetProviderID: id(5), ClientRequestID: bucket.Name,
-			})
-			if err != nil {
-				t.Fatalf("authorize replacement: %v", err)
-			}
-			targetClientID := id(7)
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID: replacement.TargetDataSetID, DataSetID: id(6), ClientDataSetID: &targetClientID,
-			}); err != nil {
-				t.Fatalf("mark target ready: %v", err)
-			}
-			if err := activateReplacement(t, runtime, replacement.ID); err != nil {
-				t.Fatalf("activate replacement: %v", err)
-			}
-			if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
-				StorageDataSetID: replacement.TargetDataSetID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: id(5),
-			}}); err != nil {
-				t.Fatalf("create target copy: %v", err)
-			}
-			targetCopy, err := runtime.repos.Contents.GetUploadCopyForDataSet(ctx, content.ID, replacement.TargetDataSetID)
-			if err != nil || targetCopy == nil {
-				t.Fatalf("load target copy = %#v, err=%v", targetCopy, err)
-			}
-			item := &storagereplacement.Item{
-				ReplacementID: replacement.ID, ContentID: content.ID, TargetDataSetID: replacement.TargetDataSetID,
-				Status: storagereplacement.ItemStatusPending,
-			}
-			if _, err := runtime.db.NewInsert().Model(item).Exec(ctx); err != nil {
-				t.Fatalf("insert replacement item: %v", err)
-			}
-			if _, err := runtime.db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
-				Set("seeding_complete = ?", true).
-				Where("id = ?", replacement.ID).Exec(ctx); err != nil {
-				t.Fatalf("complete replacement seeding: %v", err)
-			}
-			// The migration task for the target copy has stopped.
-			storeTask := bindCopyTask(t, runtime, targetCopy, model.TaskTypeStorageStore)
-			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
-			if err != nil || claimed == nil || claimed.ID != storeTask.ID {
-				t.Fatalf("claim migration task = %#v, err=%v", claimed, err)
-			}
-			if tt.checkpoint != "" {
-				if err := runtime.repos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, json.RawMessage(tt.checkpoint)); err != nil {
-					t.Fatalf("write migration checkpoint: %v", err)
+			var copies []*model.StorageCopy
+			var stopped []*model.Task
+			var checkpoints []json.RawMessage
+			for i, content := range contents {
+				identity, err := piece.Calculate(bytes.NewReader(bytes.Repeat([]byte{byte(i + 1)}, int(content.ContentSize))))
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-			reason, message := tt.reason, "migration stopped"
-			if err := runtime.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
-				Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason, LastError: &message,
-			}); err != nil {
-				t.Fatalf("fail migration task: %v", err)
-			}
-			coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
-				Type:  model.TaskTypeProviderReplacementCoordinate,
-				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
-			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
-				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
-			})
-			if err != nil {
-				t.Fatalf("enqueue replacement coordinator: %v", err)
-			}
-
-			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1, countType: model.TaskTypeProviderReplacementCoordinate}
-			cancel, done := runHandlerEngine(t, runtime)
-			defer stopHandlerEngine(t, cancel, done)
-			if tt.wantFailed {
-				failed := waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
-					return task.Status == model.TaskStatusFailed
+				if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+					StorageDataSetID: source.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: source.ProviderID,
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				pieceID := testOnChainID(t, int64(90000+i))
+				testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
+					ContentID: content.ID, CopyIndex: 0, PieceCID: identity.CIDv2.String(), PieceID: &pieceID, RetrievalURL: "https://source.example/piece",
 				})
-				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
-				if failed.FailureReason == nil || *failed.FailureReason != "replacement_copy_failed" || err != nil || stored.Status != storagereplacement.StatusFailed {
-					t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement failed", failed, stored, err)
+				if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+					StorageDataSetID: target.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: target.ProviderID,
+				}}); err != nil {
+					t.Fatal(err)
 				}
-				copyAfterFailure, err := runtime.repos.Contents.GetUploadCopyByID(ctx, targetCopy.ID)
-				if err != nil || (copyAfterFailure.ActiveTaskID == nil) != tt.wantFenceReleased {
-					t.Fatalf("copy fence after attention = %#v, err=%v, want released=%v", copyAfterFailure, err, tt.wantFenceReleased)
+				copyRow, err := runtime.repos.Contents.GetUploadCopyForDataSet(ctx, content.ID, target.ID)
+				if err != nil || copyRow == nil {
+					t.Fatalf("target copy = %#v, %v", copyRow, err)
+				}
+				item := &storagereplacement.Item{ReplacementID: replacement.ID, ContentID: content.ID, TargetDataSetID: target.ID, Status: storagereplacement.ItemStatusPending}
+				if _, err := runtime.db.NewInsert().Model(item).Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+				storeTask := bindCopyTask(t, runtime, copyRow, model.TaskTypeStorageStore)
+				claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{ExcludedTaskIDs: []int64{coordinator.ID}})
+				if err != nil || claimed == nil || claimed.ID != storeTask.ID {
+					t.Fatalf("claim migration task = %#v, %v", claimed, err)
+				}
+				reason := "store_outcome_unknown"
+				var checkpoint json.RawMessage
+				if tt.invalidCheckpoint {
+					reason = "invalid_checkpoint"
+				} else {
+					checkpoint = json.RawMessage(fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://target.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, identity.CIDv2.String()))
+					if err := runtime.repos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, checkpoint); err != nil {
+						t.Fatal(err)
+					}
+				}
+				message := "migration stopped"
+				if err := runtime.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason, LastError: &message}); err != nil {
+					t.Fatal(err)
+				}
+				copies = append(copies, copyRow)
+				stopped = append(stopped, storeTask)
+				checkpoints = append(checkpoints, checkpoint)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).Set("seeding_complete = ?", true).Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if tt.exhaustedFirst {
+				checkpoint, err := json.Marshal(map[string]any{"dependency_retries": map[string]int{fmt.Sprintf("storage_copy:%d", copies[0].ID): 5}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?::jsonb", string(checkpoint)).Where("id = ?", coordinator.ID).Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.invalidCheckpoint {
+				coordinator = runStorageTaskClaims(t, runtime, coordinator, model.TaskStatusFailed, 2)
+				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+				copyAfter, copyErr := runtime.repos.Contents.GetUploadCopyByID(ctx, copies[0].ID)
+				var item storagereplacement.Item
+				if err := runtime.db.NewSelect().Model(&item).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err != nil || stored.Status != storagereplacement.StatusFailed || stored.LastError == nil || *stored.LastError != "Some stored content could not be copied to the new provider. Retry the replacement to try it again." ||
+					coordinator.FailureReason == nil || *coordinator.FailureReason != "replacement_item_attention" || item.Status != storagereplacement.ItemStatusAttention || copyErr != nil || copyAfter.ActiveTaskID == nil {
+					t.Fatalf("attention = task %#v, replacement %#v, item %#v, copy %#v, errors %v %v", coordinator, stored, item, copyAfter, err, copyErr)
 				}
 				return
 			}
-			waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
-				return task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.FailureReason != nil && *task.FailureReason == "replacement_copy_failed"
-			})
-			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, storeTask.ID)
-			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != storeTask.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 {
-				t.Fatalf("dependent recovery successor = %#v, err=%v", successor, err)
+			coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
+			if coordinator.WaitReason != nil {
+				t.Logf("coordinator wait=%s", *coordinator.WaitReason)
 			}
-			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, storeTask.ID)
-			if err != nil || sourceHistory.Status != model.TaskStatusFailed || sourceHistory.SupersededAt == nil || !testutil.JSONEqual(sourceHistory.Checkpoint, []byte(tt.checkpoint)) {
-				t.Fatalf("failed source history = %#v, err=%v", sourceHistory, err)
+			if coordinator.RetryCount != 0 || coordinator.FailureReason != nil {
+				t.Fatalf("dependency recovery consumed coordinator budget: %#v", coordinator)
 			}
-
+			var progress struct {
+				DependencyRetries map[string]int `json:"dependency_retries"`
+			}
+			if err := json.Unmarshal(coordinator.Checkpoint, &progress); err != nil {
+				t.Fatal(err)
+			}
+			var successor *model.Task
+			for i, taskRow := range stopped {
+				successor, err = runtime.repos.Tasks.GetDirectSuccessor(ctx, taskRow.ID)
+				if tt.exhaustedFirst && i == 0 {
+					var item storagereplacement.Item
+					if queryErr := runtime.db.NewSelect().Model(&item).Where("replacement_id = ? AND content_id = ?", replacement.ID, copies[0].ContentID).Scan(ctx); queryErr != nil {
+						t.Fatal(queryErr)
+					}
+					if err != nil || successor != nil || item.Status != storagereplacement.ItemStatusAttention {
+						t.Fatalf("exhausted dependency = successor %#v, item %#v, %v", successor, item, err)
+					}
+					continue
+				}
+				if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != taskRow.ID || successor.RetryCount != 0 || handlerTaskMaxAttempts(t, runtime, successor) != 10 ||
+					progress.DependencyRetries[fmt.Sprintf("storage_copy:%d", copies[i].ID)] != 1 {
+					t.Fatalf("dependent recovery = successor %#v, checkpoint %s, wait=%s, %v", successor, coordinator.Checkpoint, taskField(coordinator, func(row *model.Task) *string { return row.WaitReason }), err)
+				}
+				history, err := runtime.repos.Tasks.GetByID(ctx, taskRow.ID)
+				if err != nil || history.Status != model.TaskStatusFailed || history.SupersededAt == nil || !testutil.JSONEqual(history.Checkpoint, checkpoints[i]) {
+					t.Fatalf("failed source history = %#v, %v", history, err)
+				}
+			}
 			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
-			if err != nil || stored.Status == storagereplacement.StatusFailed {
-				t.Fatalf("replacement = %#v err=%v, want it waiting for the migration retry", stored, err)
+			if err != nil || stored.Status != storagereplacement.StatusMigrating {
+				t.Fatalf("replacement = %#v, %v", stored, err)
+			}
+			if tt.dependencyRetries == nil {
+				return
+			}
+			var claimed *model.Task
+			deadline := time.After(handlerTestLeaseDuration)
+			for claimed == nil {
+				claimed, err = runtime.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{ExcludedTaskIDs: []int64{coordinator.ID}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if claimed == nil {
+					select {
+					case <-deadline:
+						t.Fatal("dependent retry did not become available")
+					case <-time.After(handlerTestPollInterval):
+					}
+				}
+			}
+			if claimed.ID != successor.ID {
+				t.Fatalf("claimed retry = %#v, want %d", claimed, successor.ID)
+			}
+			reason := "store_outcome_unknown"
+			if err := runtime.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason}); err != nil {
+				t.Fatal(err)
+			}
+			coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
+			if next, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, successor.ID); err != nil || next != nil {
+				t.Fatalf("exhausted dependency successor = %#v, %v", next, err)
+			}
+			var item storagereplacement.Item
+			if err := runtime.db.NewSelect().Model(&item).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil || item.Status != storagereplacement.ItemStatusAttention {
+				t.Fatalf("exhausted item = %#v, %v", item, err)
+			}
+			coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusFailed)
+			stored, err = runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil || stored.Status != storagereplacement.StatusFailed || coordinator.FailureReason == nil || *coordinator.FailureReason != "replacement_item_attention" || stored.LastError == nil || *stored.LastError != "Some stored content could not be copied to the new provider. Retry the replacement to try it again." {
+				t.Fatalf("exhausted replacement = %#v, coordinator %#v, %v", stored, coordinator, err)
+			}
+			coordinator, err = runtime.service.Retry(ctx, coordinator.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
+			if next, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, successor.ID); err != nil || next == nil {
+				t.Fatalf("manual coordinator retry did not restore the dependency budget: %#v, %v", next, err)
+			}
+			if err := json.Unmarshal(coordinator.Checkpoint, &progress); err != nil || progress.DependencyRetries[fmt.Sprintf("storage_copy:%d", copies[0].ID)] != 1 || coordinator.RetryCount != 0 {
+				t.Fatalf("manual retry checkpoint = %s, %v", coordinator.Checkpoint, err)
+			}
+		})
+	}
+	for _, manualFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shared commit manual first %t", manualFirst), func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
+			ctx := t.Context()
+			copyRow, _, request := seedSealedReplacementBatch(t, runtime, 2, storagecommit.RequestStatusReady)
+			replacement, err := runtime.repos.Replacements.GetByClientRequestID(ctx, copyRow.BucketID, "migration-pull-test")
+			if err != nil || replacement == nil {
+				t.Fatalf("replacement = %#v, %v", replacement, err)
+			}
+			var copies []model.StorageCopy
+			if err := runtime.db.NewSelect().Model(&copies).Where("commit_request_id = ?", request.RequestID).OrderExpr("id ASC").Scan(ctx); err != nil || len(copies) != 2 {
+				t.Fatalf("shared batch copies = %#v, %v", copies, err)
+			}
+			for _, row := range copies {
+				item := &storagereplacement.Item{ReplacementID: replacement.ID, ContentID: row.ContentID, TargetDataSetID: row.StorageDataSetID, Status: storagereplacement.ItemStatusPending}
+				if _, err := runtime.db.NewInsert().Model(item).On("CONFLICT DO NOTHING").Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := runtime.db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).Set("seeding_complete = ?", true).Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			commitTask, err := runtime.repos.Tasks.GetByID(ctx, *request.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reason := "attempts_exhausted"
+			settleHandlerTaskFixture(t, runtime, commitTask.ID, model.TaskStatusFailed, &reason)
+			coordinator, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
+				Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
+			}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, row.ID)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manualSuccessor *model.Task
+			if manualFirst {
+				registry := taskengine.NewRegistry()
+				for _, taskType := range runtime.registry.Types() {
+					handler, _ := runtime.registry.Handler(taskType)
+					if taskType == coordinator.Type {
+						handler = revokeAfterReplacementPlan{Handler: handler, revoke: func() {
+							var retryErr error
+							manualSuccessor, retryErr = runtime.service.Retry(ctx, commitTask.ID)
+							if retryErr != nil {
+								t.Errorf("manual commit retry: %v", retryErr)
+							}
+						}}
+					}
+					if err := registry.Register(handler); err != nil {
+						t.Fatal(err)
+					}
+				}
+				runtime.registry = registry
+			}
+			coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
+			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, commitTask.ID)
+			if err != nil || successor == nil || (manualFirst && (manualSuccessor == nil || manualSuccessor.ID != successor.ID)) {
+				t.Fatalf("shared commit successor = %#v, manual %#v, %v", successor, manualSuccessor, err)
+			}
+			assertProgress := func() {
+				t.Helper()
+				var progress struct {
+					DependencyRetries map[string]int `json:"dependency_retries"`
+				}
+				if err := json.Unmarshal(coordinator.Checkpoint, &progress); err != nil {
+					t.Fatal(err)
+				}
+				wantRetries := 1
+				if manualFirst {
+					wantRetries = 0
+					if _, counted := progress.DependencyRetries["storage_commit_request:"+request.RequestID]; counted {
+						t.Fatalf("manual commit retry was counted as automatic: %s", coordinator.Checkpoint)
+					}
+				}
+				if coordinator.RetryCount != 0 || coordinator.FailureReason != nil || progress.DependencyRetries["storage_commit_request:"+request.RequestID] != wantRetries {
+					t.Fatalf("shared commit budget = task %#v, counts %#v", coordinator, progress.DependencyRetries)
+				}
+				var items []storagereplacement.Item
+				if err := runtime.db.NewSelect().Model(&items).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil || len(items) != 2 {
+					t.Fatalf("shared items = %#v, %v", items, err)
+				}
+				for _, item := range items {
+					if item.Status != storagereplacement.ItemStatusPending {
+						t.Fatalf("shared item = %#v", item)
+					}
+				}
+				count, err := runtime.db.NewSelect().Model((*model.Task)(nil)).Where("retry_of_task_id = ?", commitTask.ID).Count(ctx)
+				if err != nil || count != 1 {
+					t.Fatalf("shared successors = %d, %v", count, err)
+				}
+			}
+			assertProgress()
+			if !manualFirst {
+				coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
+				assertProgress()
 			}
 		})
 	}
@@ -4661,8 +4803,8 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				}),
 			}
 			if scenario.exhausted {
-				limit := 1
-				options.maxAttempts = &limit
+				limit := 0
+				options.dependencyRetries = &limit
 			}
 			runtime := newHandlerTestRuntime(t, options)
 			ctx := t.Context()
@@ -4735,12 +4877,12 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				}
 				return item.Status
 			}
-			wantRetries := 1
+			wantRetries := 0
 			if scenario.exhausted {
-				coordinateTask = runOneStorageTask(t, runtime, coordinateTask, model.TaskStatusFailed)
+				coordinateTask = runStorageTaskClaims(t, runtime, coordinateTask, model.TaskStatusFailed, 2)
 				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
 				if err != nil || stored.Status != storagereplacement.StatusFailed || itemStatus() != storagereplacement.ItemStatusAttention ||
-					coordinateTask.FailureReason == nil || *coordinateTask.FailureReason != "attempts_exhausted" {
+					coordinateTask.FailureReason == nil || *coordinateTask.FailureReason != "replacement_item_attention" {
 					t.Fatalf("exhausted replacement = %#v, task=%#v, err=%v", stored, coordinateTask, err)
 				}
 				if _, err := runtime.service.Retry(ctx, pullTask.ID); !errors.Is(err, repository.ErrConflict) {
@@ -4749,7 +4891,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				if child, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, pullTask.ID); err != nil || child != nil {
 					t.Fatalf("attention pull successor = %#v, %v", child, err)
 				}
-				runtime.testMaxAttempts = nil
+				runtime.testDependencyRetries = nil
 				coordinateTask, err = runtime.service.Retry(ctx, coordinateTask.ID)
 				if err != nil || itemStatus() != storagereplacement.ItemStatusPending {
 					t.Fatalf("replacement retry = %#v, %v", coordinateTask, err)
@@ -4772,7 +4914,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				wantRetries++
 			}
 			coordinateTask = runOneStorageTask(t, runtime, coordinateTask, model.TaskStatusPending)
-			if coordinateTask.RetryCount != wantRetries || coordinateTask.FailureReason == nil || *coordinateTask.FailureReason != "replacement_copy_failed" {
+			if coordinateTask.RetryCount != wantRetries || coordinateTask.FailureReason != nil {
 				t.Fatalf("pull retry coordinator = %#v, want retry count %d", coordinateTask, wantRetries)
 			}
 			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, pullTask.ID)
@@ -5008,17 +5150,18 @@ func TestReplacementHandsOverUnsignedSourceWrites(t *testing.T) {
 // evidence.
 func TestReplacementHoldsRetirementForSignedSourceWrites(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		stopped  bool
-		attempts int
-		want     model.TaskStatus
+		name              string
+		stopped           bool
+		attempts          int
+		dependencyRetries int
+		want              model.TaskStatus
 	}{
-		{name: "waiting", attempts: 1, want: model.TaskStatusPending},
-		{name: "recovered", stopped: true, attempts: 2, want: model.TaskStatusPending},
+		{name: "waiting", attempts: 1, dependencyRetries: 1, want: model.TaskStatusPending},
+		{name: "recovered", stopped: true, attempts: 2, dependencyRetries: 1, want: model.TaskStatusPending},
 		{name: "exhausted", stopped: true, attempts: 1, want: model.TaskStatusFailed},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newReplacementSourceFixture(t, handlerRuntimeOptions{maxAttempts: &tt.attempts})
+			f := newReplacementSourceFixture(t, handlerRuntimeOptions{maxAttempts: &tt.attempts, dependencyRetries: &tt.dependencyRetries})
 			ctx := t.Context()
 			// The content has no live version, so the whole migration is this one
 			// signed write.
@@ -5080,9 +5223,15 @@ func TestReplacementHoldsRetirementForSignedSourceWrites(t *testing.T) {
 					t.Fatalf("coordinator = %#v replacement = %#v, want both waiting for the signed write", coordinator, stored)
 				}
 			case "recovered":
+				var progress struct {
+					DependencyRetries map[string]int `json:"dependency_retries"`
+				}
+				if err := json.Unmarshal(coordinator.Checkpoint, &progress); err != nil || progress.DependencyRetries["storage_commit_request:"+requestID] != 1 {
+					t.Fatalf("source write retry counts = %s, %v", coordinator.Checkpoint, err)
+				}
 				if successor == nil || successor.Type != model.TaskTypeStorageCommit || successor.ResumeMode != model.TaskResumeModeRecover ||
 					successor.RetryCount != 0 || !testutil.JSONEqual(successor.Checkpoint, []byte(checkpoint)) ||
-					request.TaskID == nil || *request.TaskID != successor.ID || coordinator.RetryCount != 1 || stored.Status != storagereplacement.StatusMigrating {
+					request.TaskID == nil || *request.TaskID != successor.ID || coordinator.RetryCount != 0 || stored.Status != storagereplacement.StatusMigrating {
 					t.Fatalf("batch recovery lost its evidence or budget: coordinator=%#v request=%#v successor=%#v", coordinator, request, successor)
 				}
 			case "exhausted":
@@ -5096,56 +5245,84 @@ func TestReplacementHoldsRetirementForSignedSourceWrites(t *testing.T) {
 }
 
 func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	ctx := t.Context()
-	sequence := storedObjectSequence.Add(1)
-	id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 38000+sequence*10+offset) }
-	bucket := &model.Bucket{
-		Name: fmt.Sprintf("engine-failed-coordinator-%d", sequence), Status: model.BucketStatusActive,
-		DefaultCopies: 1, MinimumDurableCopies: 1,
-	}
-	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-	source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0,
-	})
-	if err != nil {
-		t.Fatalf("create source: %v", err)
-	}
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
-		t.Fatalf("mark source ready: %v", err)
-	}
-	replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
-		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
-		TargetProviderID: id(5), ClientRequestID: bucket.Name,
-	})
-	if err != nil {
-		t.Fatalf("authorize replacement: %v", err)
-	}
-	// A coordinator written by a build whose input this one cannot read.
-	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, handlerTaskFixture(t, runtime, &model.Task{
-		Type:         model.TaskTypeProviderReplacementCoordinate,
-		InputVersion: 99, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)),
-		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
-	}))
-	if err != nil {
-		t.Fatalf("enqueue coordinator: %v", err)
-	}
-	if err := runtime.repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, coordinator.ID); err != nil {
-		t.Fatalf("bind coordinator: %v", err)
-	}
+	for _, internalFailure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("internal error %t", internalFailure), func(t *testing.T) {
+			limit := 1
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{maxAttempts: &limit})
+			ctx := t.Context()
+			sequence := storedObjectSequence.Add(1)
+			id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 38000+sequence*10+offset) }
+			bucket := &model.Bucket{
+				Name: fmt.Sprintf("engine-failed-coordinator-%d", sequence), Status: model.BucketStatusActive,
+				DefaultCopies: 1, MinimumDurableCopies: 1,
+			}
+			if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
+				t.Fatalf("create bucket: %v", err)
+			}
+			source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+				BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0,
+			})
+			if err != nil {
+				t.Fatalf("create source: %v", err)
+			}
+			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
+				t.Fatalf("mark source ready: %v", err)
+			}
+			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+				TargetProviderID: id(5), ClientRequestID: bucket.Name,
+			})
+			if err != nil {
+				t.Fatalf("authorize replacement: %v", err)
+			}
+			inputVersion := 99
+			if internalFailure {
+				inputVersion = 1
+			}
+			coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, handlerTaskFixture(t, runtime, &model.Task{
+				Type:         model.TaskTypeProviderReplacementCoordinate,
+				InputVersion: inputVersion, Input: []byte(fmt.Sprintf(`{"replacement_id":%d,"generation":%d}`, replacement.ID, replacement.TaskGeneration)),
+				Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+			}))
+			if err != nil {
+				t.Fatalf("enqueue coordinator: %v", err)
+			}
+			if err := runtime.repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, coordinator.ID); err != nil {
+				t.Fatalf("bind coordinator: %v", err)
+			}
 
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	failed := waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusFailed
-	})
-	stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
-	if failed.FailureReason == nil || *failed.FailureReason != "input_version_unsupported" || err != nil ||
-		!stored.Status.Retryable() {
-		t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement retryable", failed, stored, err)
+			contents := runtime.repos.Contents
+			if internalFailure {
+				runtime.repos.Contents = replacementBindingFailureRepository{StorageContentRepository: contents}
+			}
+			failed := runOneStorageTask(t, runtime, coordinator, model.TaskStatusFailed)
+			runtime.repos.Contents = contents
+			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+			wantReason := "input_version_unsupported"
+			if internalFailure {
+				wantReason = "attempts_exhausted"
+			}
+			if failed.FailureReason == nil || *failed.FailureReason != wantReason || err != nil || !stored.Status.Retryable() {
+				t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement retryable", failed, stored, err)
+			}
+			if internalFailure {
+				if eligible, err := runtime.service.RetryableContext(ctx, failed); err != nil || !eligible {
+					t.Fatalf("coordinator retry eligible=%t, %v", eligible, err)
+				}
+				if successor, err := runtime.service.Retry(ctx, failed.ID); err != nil || successor == nil {
+					t.Fatalf("coordinator retry = %#v, %v", successor, err)
+				}
+			}
+		})
 	}
+}
+
+type replacementBindingFailureRepository struct {
+	repository.StorageContentRepository
+}
+
+func (replacementBindingFailureRepository) GetDataSetBindingByID(context.Context, int64) (*model.StorageDataSet, error) {
+	return nil, errors.New("data set lookup unavailable")
 }
 
 func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {

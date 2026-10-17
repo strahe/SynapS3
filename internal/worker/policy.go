@@ -18,6 +18,7 @@ type BackoffPolicy struct {
 
 type ExecutionPolicy struct {
 	MaxAttempts         int            `json:"max_attempts"`
+	DependencyRetries   int            `json:"dependency_retries,omitempty"`
 	Backoff             BackoffPolicy  `json:"backoff"`
 	ResendBackoff       *BackoffPolicy `json:"resend_backoff,omitempty"`
 	InvocationTimeout   time.Duration  `json:"invocation_timeout"`
@@ -32,7 +33,7 @@ func DefaultBackoffPolicy() BackoffPolicy {
 }
 
 func (p ExecutionPolicy) validate() error {
-	if p.MaxAttempts < 1 || p.InvocationTimeout < 0 || p.WaitInterval < 0 || p.ObservationWindow < 0 || p.ObservationInterval < 0 || !p.Backoff.valid() || (p.ResendBackoff != nil && (!p.ResendBackoff.valid() || p.ResendBackoff.Jitter != 0)) {
+	if p.MaxAttempts < 1 || p.DependencyRetries < 0 || p.InvocationTimeout < 0 || p.WaitInterval < 0 || p.ObservationWindow < 0 || p.ObservationInterval < 0 || !p.Backoff.valid() || (p.ResendBackoff != nil && (!p.ResendBackoff.valid() || p.ResendBackoff.Jitter != 0)) {
 		return ErrInvalidPolicy
 	}
 	return nil
