@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagepull"
@@ -62,7 +63,7 @@ func (r *BunStorageContentRepo) SetCopyCacheRestore(ctx context.Context, copyID,
 		if pullAttemptID != "" {
 			result, err := db.NewUpdate().Model((*storagepull.Attempt)(nil)).
 				Set("status = ?", storagepull.AttemptStatusAbandoned).
-				Set("resolved_at = ?", now).Set("last_error = ?", lastError).
+				Set("resolved_at = ?", now).Set("last_error = ?", errtext.Redact(lastError)).
 				Set("updated_at = ?", now).
 				Where("attempt_id = ? AND content_id = ? AND storage_data_set_id = ?", pullAttemptID, copyRow.ContentID, copyRow.StorageDataSetID).
 				Where("status = ? AND resolved_at IS NULL", storagepull.AttemptStatusAttempted).Exec(ctx)

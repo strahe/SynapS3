@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/walletoperation"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -172,7 +173,7 @@ func (r *BunWalletOperationRepo) MarkFailed(ctx context.Context, id, taskID int6
 	res, err := r.db.NewUpdate().
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusFailed).
-		Set("last_error = ?", lastError).
+		Set("last_error = ?", errtext.Redact(lastError)).
 		Set("task_id = NULL").
 		Set("completed_at = ?", now).
 		Set("updated_at = ?", now).
@@ -187,7 +188,7 @@ func (r *BunWalletOperationRepo) MarkUnknown(ctx context.Context, id, taskID int
 	res, err := r.db.NewUpdate().
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusUnknown).
-		Set("last_error = ?", lastError).
+		Set("last_error = ?", errtext.Redact(lastError)).
 		Set("task_id = NULL").
 		Set("completed_at = ?", now).
 		Set("updated_at = ?", now).

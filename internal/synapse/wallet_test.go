@@ -150,8 +150,8 @@ func TestWalletQuerier_FILGasBalanceErrorDoesNotHidePaymentAccount(t *testing.T)
 	if info.PaymentAccount == nil {
 		t.Fatal("PaymentAccount = nil, want USDFC account")
 	}
-	if got := info.Errors["fil_gas_balance"]; got != "RPC call failed" {
-		t.Fatalf("fil_balance error = %q, want RPC call failed", got)
+	if got := info.Errors["fil_gas_balance"]; got != "fil rpc down" {
+		t.Fatalf("fil_balance error = %q, want fil rpc down", got)
 	}
 }
 

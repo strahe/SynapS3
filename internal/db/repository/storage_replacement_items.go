@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
@@ -404,7 +405,7 @@ func settleReplacementItem(
 	result, err := db.NewUpdate().
 		Model((*storagereplacement.Item)(nil)).
 		Set("status = ?", status).
-		Set("last_error = ?", nullableText(lastError)).
+		Set("last_error = ?", nullableText(errtext.Redact(lastError))).
 		Set("updated_at = ?", now).
 		Where("id = ? AND status = ?", item.ID, storagereplacement.ItemStatusPending).
 		Exec(ctx)

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -777,21 +776,10 @@ func textPointer(value string) *string {
 	return &value
 }
 
-// maxTaskErrorBytes bounds the error text kept on a task. A provider may reply
-// with a body of several megabytes, and the row is rewritten on every attempt.
-const maxTaskErrorBytes = 4096
-
 func errorPointer(err error) *string {
 	if err == nil {
 		return nil
 	}
 	message := err.Error()
-	if len(message) > maxTaskErrorBytes {
-		cut := maxTaskErrorBytes
-		for cut > 0 && !utf8.RuneStart(message[cut]) {
-			cut--
-		}
-		message = message[:cut] + "…"
-	}
 	return &message
 }

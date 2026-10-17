@@ -18,6 +18,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/observability"
@@ -119,6 +120,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	startedAt := time.Now()
 	cfg := opts.Config
 	logger := opts.Logger
+	errtext.Configure(cfg.Filecoin.RPCURL, cfg.Filecoin.PrivateKey, cfg.Admin.Auth.SessionSecret, cfg.Admin.Auth.PasswordHash)
 	repos := repository.NewRepositories(opts.Database)
 	maxCacheBytes := int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024
 	localCache, err := cache.NewFilesystem(cfg.Cache.Dir, maxCacheBytes)

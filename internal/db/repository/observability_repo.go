@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
@@ -378,6 +379,7 @@ func validProviderStateStatus(state observability.ProviderState) error {
 }
 
 func prepareProviderState(state *observability.ProviderState, checkedAt time.Time) {
+	state.LastError = errtext.RedactPtr(state.LastError)
 	if state.ReasonCodes == nil {
 		state.ReasonCodes = []observability.ReasonCode{}
 	}
@@ -391,6 +393,7 @@ func prepareProviderState(state *observability.ProviderState, checkedAt time.Tim
 }
 
 func prepareDataSetState(state *observability.DataSetState, checkedAt time.Time) {
+	state.LastError = errtext.RedactPtr(state.LastError)
 	if state.ReasonCodes == nil {
 		state.ReasonCodes = []observability.ReasonCode{}
 	}

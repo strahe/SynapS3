@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -549,7 +550,7 @@ func (r *BunStorageContentRepo) DropCommitEvidence(ctx context.Context, requestI
 		Model((*storagecommit.Request)(nil)).
 		Set("transaction_id = NULL").
 		Set("status_url = NULL").
-		Set("last_error = ?", lastError).
+		Set("last_error = ?", errtext.Redact(lastError)).
 		Set("updated_at = ?", commitInputTime(now)).
 		Where("request_id = ? AND task_id = ? AND status = ?", requestID, taskID, storagecommit.RequestStatusSubmitted).
 		Exec(ctx)
@@ -753,7 +754,7 @@ func abandonCommitRequest(ctx context.Context, db bun.IDB, input AbandonCommitRe
 		Set("status = ?", storagecommit.RequestStatusAbandoned).
 		Set("seal_requested_at = NULL").
 		Set("task_id = NULL").
-		Set("last_error = ?", input.Reason).
+		Set("last_error = ?", errtext.Redact(input.Reason)).
 		Set("attention_code = NULL").
 		Set("attention_at = NULL").
 		Set("updated_at = ?", now).
@@ -985,7 +986,7 @@ func (r *BunStorageContentRepo) ReleaseMemberTransfer(ctx context.Context, input
 			WHERE id = ? AND content_id = ? AND work_generation = ? AND active_task_id = ?
 			  AND commit_position IS NOT NULL
 			RETURNING commit_request_id`,
-			model.StorageCopyStatusCommitted, input.LastError, now,
+			model.StorageCopyStatusCommitted, errtext.Redact(input.LastError), now,
 			input.StorageCopyID, input.ContentID, input.Generation, input.TaskID).Scan(ctx, &requestID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrConflict

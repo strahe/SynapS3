@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
@@ -549,7 +550,7 @@ func (r *BunStorageReplacementRepo) MarkFailed(
 			},
 			storagereplacement.StatusFailed,
 			func(q *bun.UpdateQuery) *bun.UpdateQuery {
-				return q.Set("last_error = ?", lastError).
+				return q.Set("last_error = ?", errtext.Redact(lastError)).
 					Set("wait_reason = NULL").
 					Set("failure_reason = ?", reason)
 			}, time.Now())
@@ -566,7 +567,7 @@ func (r *BunStorageReplacementRepo) MarkCleanupAttention(ctx context.Context, re
 		[]storagereplacement.Status{storagereplacement.StatusRetiring, storagereplacement.StatusWaiting, storagereplacement.StatusCleanupAttention},
 		storagereplacement.StatusCleanupAttention,
 		func(q *bun.UpdateQuery) *bun.UpdateQuery {
-			return q.Set("last_error = ?", lastError).Set("wait_reason = NULL")
+			return q.Set("last_error = ?", errtext.Redact(lastError)).Set("wait_reason = NULL")
 		})
 }
 

@@ -2,12 +2,12 @@ package synapse
 
 import (
 	"context"
-	"errors"
 	"math/big"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/strahe/synaps3/internal/errtext"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
@@ -60,7 +60,7 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 
 	setErr := func(field string, err error) {
 		mu.Lock()
-		info.Errors[field] = sanitizeRPCError(err)
+		info.Errors[field] = errtext.Redact(err.Error())
 		mu.Unlock()
 	}
 
@@ -177,17 +177,4 @@ func cloneBigInt(v *big.Int) *big.Int {
 		return nil
 	}
 	return new(big.Int).Set(v)
-}
-
-// sanitizeRPCError returns a user-safe error description, stripping
-// potential RPC endpoint URLs that may contain API keys.
-func sanitizeRPCError(err error) string {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		return "request timed out"
-	case errors.Is(err, context.Canceled):
-		return "request cancelled"
-	default:
-		return "RPC call failed"
-	}
 }
