@@ -9,6 +9,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepipeline"
+	"github.com/strahe/synaps3/internal/storagepull"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
@@ -35,9 +36,9 @@ func (h *CopyCoordinator) inspectCopyRetry(ctx context.Context, repos *repositor
 	if row == nil || row.WorkGeneration != input.Generation {
 		return repository.ErrConflict
 	}
-	_, session, err := copyRetryCheckpoint(source, row)
+	_, session, err := copyRetryCheckpoint(ctx, repos, source, row)
 	if err != nil {
-		return repository.ErrConflict
+		return err
 	}
 	if row.ActiveTaskID != nil {
 		if *row.ActiveTaskID == source.ID {
@@ -79,27 +80,73 @@ func (h *CopyCoordinator) inspectCopyRetry(ctx context.Context, repos *repositor
 	return nil
 }
 
-func copyRetryCheckpoint(source *model.Task, row *model.StorageCopy) (json.RawMessage, bool, error) {
-	if source.Type != model.TaskTypeStorageStore || len(source.Checkpoint) == 0 {
+// copyRetryCheckpoint returns ErrConflict for unusable evidence and preserves repository failures.
+func copyRetryCheckpoint(ctx context.Context, repos *repository.Repositories, source *model.Task, row *model.StorageCopy) (json.RawMessage, bool, error) {
+	if len(source.Checkpoint) == 0 {
+		return source.Checkpoint, false, nil
+	}
+	if source.Type == model.TaskTypeStoragePull {
+		checkpoint, err := pullRetryCheckpoint(ctx, repos, source, row)
+		return checkpoint, false, err
+	}
+	if source.Type != model.TaskTypeStorageStore {
 		return source.Checkpoint, false, nil
 	}
 	var checkpoint storeCheckpoint
 	if err := json.Unmarshal(source.Checkpoint, &checkpoint); err != nil {
-		return nil, false, err
+		return nil, false, errors.Join(repository.ErrConflict, err)
 	}
 	if err := validateStoreCheckpoint(checkpoint, row.ContentSize); err != nil {
-		return nil, false, err
+		return nil, false, errors.Join(repository.ErrConflict, err)
 	}
 	if checkpoint.IngressAttempt != 0 && checkpoint.IngressAttempt != row.IngressStoreAttempt {
 		return nil, false, repository.ErrConflict
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(source.Checkpoint, &fields); err != nil {
-		return nil, false, err
+		return nil, false, errors.Join(repository.ErrConflict, err)
 	}
 	delete(fields, "observation_started_at")
 	encoded, err := json.Marshal(fields)
-	return encoded, checkpoint.SessionID != "", err
+	if err != nil {
+		return nil, false, errors.Join(repository.ErrConflict, err)
+	}
+	return encoded, checkpoint.SessionID != "", nil
+}
+
+func pullRetryCheckpoint(ctx context.Context, repos *repository.Repositories, source *model.Task, row *model.StorageCopy) (json.RawMessage, error) {
+	if row.ActiveTaskID == nil || *row.ActiveTaskID != source.ID {
+		return source.Checkpoint, nil
+	}
+	var checkpoint pullCheckpoint
+	if err := json.Unmarshal(source.Checkpoint, &checkpoint); err != nil {
+		return nil, errors.Join(repository.ErrConflict, err)
+	}
+	if checkpoint.AttemptID == "" {
+		return nil, repository.ErrConflict
+	}
+	attempt, err := repos.Contents.GetPullAttempt(ctx, checkpoint.AttemptID, row.ContentID, row.StorageDataSetID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, repository.ErrConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	if attempt.Status == storagepull.AttemptStatusAttempted {
+		return source.Checkpoint, nil
+	}
+	if attempt.Status != storagepull.AttemptStatusAbandoned || attempt.ResolvedAt == nil ||
+		row.Status != model.StorageCopyStatusPending || row.TransferMethod != model.StorageCopyTransferMethodPeerPull || row.CommitSealed() {
+		return nil, repository.ErrConflict
+	}
+	replacement, err := repos.Contents.IsPendingReplacementCopy(ctx, row.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !replacement {
+		return nil, repository.ErrConflict
+	}
+	return nil, nil
 }
 
 func loadCopyRetryCheckpoint(ctx context.Context, repos *repository.Repositories, source *model.Task) (json.RawMessage, error) {
@@ -114,7 +161,7 @@ func loadCopyRetryCheckpoint(ctx context.Context, repos *repository.Repositories
 	if row == nil {
 		return nil, repository.ErrNotFound
 	}
-	checkpoint, _, err := copyRetryCheckpoint(source, row)
+	checkpoint, _, err := copyRetryCheckpoint(ctx, repos, source, row)
 	return checkpoint, err
 }
 
@@ -130,7 +177,7 @@ func (h *CopyCoordinator) prepareCopyRetry(ctx context.Context, repos *repositor
 	if row == nil {
 		return taskengine.RetryPreparation{}, repository.ErrNotFound
 	}
-	checkpoint, _, err := copyRetryCheckpoint(source, row)
+	checkpoint, _, err := copyRetryCheckpoint(ctx, repos, source, row)
 	if err != nil {
 		return taskengine.RetryPreparation{}, err
 	}
@@ -176,7 +223,7 @@ func (h *CopyCoordinator) prepareCopyRecovery(ctx context.Context, repos *reposi
 		return taskengine.RetryPreparation{}, repository.ErrConflict
 	}
 	input := storagepipeline.CopyGenerationInput{CopyID: row.ID, Generation: previous.Generation + 1}
-	checkpoint, session, err := copyRetryCheckpoint(source, row)
+	checkpoint, session, err := copyRetryCheckpoint(ctx, repos, source, row)
 	if err != nil {
 		return taskengine.RetryPreparation{}, err
 	}

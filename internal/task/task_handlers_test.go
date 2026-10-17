@@ -2613,7 +2613,7 @@ func TestTransferPlanWaitsOnUnknownTransferMethod(t *testing.T) {
 	}
 }
 
-func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePresent bool) (*model.StorageCopy, *testutil.MockStorageTarget, int64) {
+func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePresent bool) (*model.StorageCopy, *testutil.MockStorageTarget, seededCopyPipeline) {
 	t.Helper()
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
 	version := &model.ObjectVersion{
@@ -2673,7 +2673,7 @@ func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePr
 			return testutil.CommitExtraData(7), nil
 		},
 	}
-	return copyRow, target, pipeline.source.StorageDataSetID
+	return copyRow, target, pipeline
 }
 
 func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
@@ -2682,66 +2682,69 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 		cachePresent bool
 		noSource     bool
 		pullErr      error
+		pullStatus   storage.PullStatus
+		taskType     model.TaskType
+		retry        bool
 		wantMethod   model.StorageCopyTransferMethod
 		wantStatus   model.TaskStatus
 		wantReason   string
 	}{
 		{name: "terminal pull with cache", cachePresent: true, wantMethod: model.StorageCopyTransferMethodCacheRestore, wantStatus: model.TaskStatusCompleted},
-		{name: "terminal pull without cache", wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
+		{name: "terminal pull without cache", retry: true, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
+		{name: "confirmed missing piece without cache", pullStatus: storage.PullStatusComplete, retry: true, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
 		{name: "temporary pull failure", cachePresent: true, pullErr: &pdp.HTTPError{StatusCode: http.StatusServiceUnavailable}, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusPending, wantReason: "pull_request_failed"},
-		{name: "no source with cache", cachePresent: true, noSource: true, wantMethod: model.StorageCopyTransferMethodCacheRestore, wantStatus: model.TaskStatusCompleted},
-		{name: "no source without cache", noSource: true, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
+		{name: "no source with cache", cachePresent: true, noSource: true, taskType: model.TaskTypeStorageTransferPlan, wantMethod: model.StorageCopyTransferMethodCacheRestore, wantStatus: model.TaskStatusCompleted},
+		{name: "no source without cache", noSource: true, taskType: model.TaskTypeStorageTransferPlan, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
+		{name: "no source without cache (pull)", noSource: true, taskType: model.TaskTypeStoragePull, retry: true, wantMethod: model.StorageCopyTransferMethodPeerPull, wantStatus: model.TaskStatusFailed, wantReason: "migration_cache_missing"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cacheStore := &testutil.MockCache{ExistsFunc: func(context.Context, string, string) bool { return tt.cachePresent }}
 			storageClient := &testutil.MockStorageClient{}
+			pieceState := synapse.ParkedPieceMissing
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 				cache: cacheStore, storage: storageClient, policy: cache.EvictionPolicyNone,
+				parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+					return pieceState, nil
+				}),
 			})
-			copyRow, target, sourceDataSetID := seedReplacementPullTarget(t, runtime, tt.cachePresent)
+			copyRow, target, pipeline := seedReplacementPullTarget(t, runtime, tt.cachePresent)
+			var signatures, calls atomic.Uint64
+			target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+				return testutil.CommitExtraData(6 + signatures.Add(1)), nil
+			}
 			if tt.noSource {
 				if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
 					Set("status = ?", model.StorageDataSetStatusRetired).Set("is_current = ?", false).
-					Where("id = ?", sourceDataSetID).Exec(t.Context()); err != nil {
+					Where("id = ?", pipeline.source.StorageDataSetID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}
 			target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				calls.Add(1)
 				if tt.noSource {
 					t.Error("Pull was called without a source")
 				}
 				if tt.pullErr != nil {
 					return nil, tt.pullErr
 				}
-				return pullStatusResult(request, storage.PullStatusFailed), nil
+				status := tt.pullStatus
+				if status == "" {
+					status = storage.PullStatusFailed
+				}
+				return pullStatusResult(request, status), nil
 			}
 			storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
 				return target, nil
 			}
-			taskType := model.TaskTypeStoragePull
-			if tt.noSource {
-				taskType = model.TaskTypeStorageTransferPlan
+			taskType := tt.taskType
+			if taskType == "" {
+				taskType = model.TaskTypeStoragePull
 			}
 			taskRow := bindCopyTask(t, runtime, copyRow, taskType)
-			limitedRepos := *runtime.repos
-			limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
-			engine, err := taskengine.NewEngine(taskengine.EngineConfig{
-				Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
-			}, &limitedRepos, handlerExecutionRegistry(t, runtime), slog.Default())
-			if err != nil {
-				t.Fatal(err)
+			result := runOneStorageTask(t, runtime, taskRow, tt.wantStatus)
+			if tt.wantStatus == model.TaskStatusPending && (result.RetryCount == 0 || result.ResumeMode != model.TaskResumeModeRecover) {
+				t.Fatalf("temporary Pull failure did not retain recovery: %#v", result)
 			}
-			cancel, done := runEngine(t, engine)
-			defer stopHandlerEngine(t, cancel, done)
-			result := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-				if task.Status != tt.wantStatus {
-					return false
-				}
-				if tt.wantStatus == model.TaskStatusPending {
-					return task.RetryCount > 0 && task.ResumeMode == model.TaskResumeModeRecover
-				}
-				return true
-			})
 			if tt.wantStatus == model.TaskStatusFailed && (result.FailureReason == nil || *result.FailureReason != tt.wantReason) {
 				t.Fatalf("failure reason = %v, want %s", result.FailureReason, tt.wantReason)
 			}
@@ -2757,6 +2760,94 @@ func TestReplacementPullFallsBackOnlyToRetainedCache(t *testing.T) {
 				if err != nil || next.Type != model.TaskTypeStorageStore {
 					t.Fatalf("cache restore task = %#v, err=%v", next, err)
 				}
+			}
+			if !tt.retry {
+				return
+			}
+			if tt.noSource {
+				if len(result.Checkpoint) != 0 {
+					t.Fatalf("Pull without a source persisted a checkpoint: %s", result.Checkpoint)
+				}
+				successor, err := runtime.service.Retry(t.Context(), taskRow.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(successor.Checkpoint) != 0 {
+					t.Fatalf("Pull retry without a source changed its empty checkpoint: %s", successor.Checkpoint)
+				}
+				owned, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
+				if err != nil || owned.ActiveTaskID == nil || *owned.ActiveTaskID != successor.ID {
+					t.Fatalf("Pull retry without a source did not transfer ownership: %#v, err=%v", owned, err)
+				}
+				return
+			}
+			var initialCheckpoint struct {
+				AttemptID string `json:"attempt_id"`
+			}
+			if err := json.Unmarshal(result.Checkpoint, &initialCheckpoint); err != nil {
+				t.Fatal(err)
+			}
+			initialAttempt, err := runtime.repos.Contents.GetPullAttempt(t.Context(), initialCheckpoint.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID)
+			if err != nil || initialAttempt.Status != storagepull.AttemptStatusAbandoned || initialAttempt.ResolvedAt == nil || initialAttempt.LastError == nil {
+				t.Fatalf("initial Pull attempt was not abandoned: %v", err)
+			}
+			secondURL := "https://second.example/piece/" + pipeline.pieceCID.String()
+			secondPieceID := testOnChainID(t, 990004)
+			testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
+				StorageCopyID: pipeline.target.ID, ContentID: copyRow.ContentID, CopyIndex: pipeline.target.CopyIndex,
+				PieceCID: pipeline.pieceCID.String(), PieceID: &secondPieceID, RetrievalURL: secondURL,
+			})
+			pieceState = synapse.ParkedPieceReady
+			target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				calls.Add(1)
+				if request.From(pipeline.pieceCID) != secondURL || !bytes.Equal(request.ExtraData, testutil.CommitExtraData(8)) {
+					t.Error("Pull retry did not use the second source and a fresh authorization")
+				}
+				return pullStatusResult(request, storage.PullStatusComplete), nil
+			}
+			successor, err := runtime.service.Retry(t.Context(), taskRow.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(successor.Checkpoint) != 0 {
+				t.Fatalf("Pull successor inherited an abandoned attempt: %s", successor.Checkpoint)
+			}
+			completed := runStorageTaskClaims(t, runtime, successor, model.TaskStatusCompleted, 2)
+			var nextCheckpoint struct {
+				AttemptID string `json:"attempt_id"`
+			}
+			if err := json.Unmarshal(completed.Checkpoint, &nextCheckpoint); err != nil || nextCheckpoint.AttemptID == "" || nextCheckpoint.AttemptID == initialCheckpoint.AttemptID {
+				t.Fatalf("Pull retry did not persist a fresh attempt identity: %v", err)
+			}
+			var attempts []storagepull.Attempt
+			if err := runtime.db.NewSelect().Model(&attempts).
+				Where("content_id = ? AND storage_data_set_id = ?", copyRow.ContentID, copyRow.StorageDataSetID).
+				Scan(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 2 || signatures.Load() != 2 || calls.Load() != 2 {
+				t.Fatalf("Pull retry attempts=%d signatures=%d calls=%d, want two of each", len(attempts), signatures.Load(), calls.Load())
+			}
+			for _, attempt := range attempts {
+				if attempt.AttemptID == initialCheckpoint.AttemptID {
+					if attempt.Status != storagepull.AttemptStatusAbandoned || attempt.ResolvedAt == nil || !attempt.ResolvedAt.Equal(*initialAttempt.ResolvedAt) ||
+						attempt.LastError == nil || *attempt.LastError != *initialAttempt.LastError || attempt.ExtraDataHex != initialAttempt.ExtraDataHex {
+						t.Fatal("Pull retry changed the abandoned attempt evidence")
+					}
+					continue
+				}
+				if attempt.AttemptID != nextCheckpoint.AttemptID || attempt.Status != storagepull.AttemptStatusAttempted || attempt.ResolvedAt == nil ||
+					!attempt.SourceProviderID.Equal(pipeline.target.ProviderID) || !attempt.SourceDataSetID.Equal(*pipeline.targetSet.DataSetID) || attempt.SourceRetrievalURL != secondURL {
+					t.Fatal("Pull retry did not resolve the second source attempt")
+				}
+			}
+			stored, err = runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyRow.ID)
+			if err != nil || stored.Status != model.StorageCopyStatusPieceReady {
+				t.Fatalf("Pull retry copy = %#v, err=%v, want piece_ready", stored, err)
+			}
+			history, err := runtime.repos.Tasks.GetByID(t.Context(), taskRow.ID)
+			if err != nil || history.Status != model.TaskStatusFailed || history.SupersededAt == nil || !bytes.Equal(history.Checkpoint, result.Checkpoint) {
+				t.Fatalf("Pull retry changed source task evidence: %v", err)
 			}
 		})
 	}
@@ -4548,6 +4639,170 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
 			if err != nil || stored.Status == storagereplacement.StatusFailed {
 				t.Fatalf("replacement = %#v err=%v, want it waiting for the migration retry", stored, err)
+			}
+		})
+	}
+	for _, scenario := range []struct {
+		name        string
+		exhausted   bool
+		readFailure bool
+	}{
+		{name: "pull retry"},
+		{name: "pull attention retry", exhausted: true},
+		{name: "pull evidence read failure", readFailure: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			storageClient := &testutil.MockStorageClient{}
+			options := handlerRuntimeOptions{
+				storage: storageClient, policy: cache.EvictionPolicyNone,
+				parkedPieces: parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
+					return synapse.ParkedPieceReady, nil
+				}),
+			}
+			if scenario.exhausted {
+				limit := 1
+				options.maxAttempts = &limit
+			}
+			runtime := newHandlerTestRuntime(t, options)
+			ctx := t.Context()
+			copyRow, target, pipeline := seedReplacementPullTarget(t, runtime, false)
+			var presigns, calls atomic.Int64
+			target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+				return testutil.CommitExtraData(uint64(6 + presigns.Add(1))), nil
+			}
+			secondURL := "https://second.example/piece/" + pipeline.pieceCID.String()
+			target.SubmitPullFunc = func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+				if calls.Add(1) == 1 {
+					return pullStatusResult(request, storage.PullStatusFailed), nil
+				}
+				if got := request.From(pipeline.pieceCID); got != secondURL || !bytes.Equal(request.ExtraData, testutil.CommitExtraData(8)) {
+					t.Errorf("restarted pull = source %q, authorization %x, want the second source and new authorization", got, request.ExtraData)
+				}
+				return pullStatusResult(request, storage.PullStatusComplete), nil
+			}
+			storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+				return target, nil
+			}
+			pullTask := bindCopyTask(t, runtime, copyRow, model.TaskTypeStoragePull)
+			failed := runOneStorageTask(t, runtime, pullTask, model.TaskStatusFailed)
+			if failed.FailureReason == nil || *failed.FailureReason != "migration_cache_missing" {
+				t.Fatalf("initial pull failure = %#v", failed)
+			}
+			var checkpoint struct {
+				AttemptID string `json:"attempt_id"`
+			}
+			if err := json.Unmarshal(failed.Checkpoint, &checkpoint); err != nil || checkpoint.AttemptID == "" {
+				t.Fatalf("initial pull checkpoint = %s, %v", failed.Checkpoint, err)
+			}
+			oldCheckpoint := append(json.RawMessage(nil), failed.Checkpoint...)
+			oldAttempt, err := runtime.repos.Contents.GetPullAttempt(ctx, checkpoint.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID)
+			if err != nil || oldAttempt.Status != storagepull.AttemptStatusAbandoned || oldAttempt.ResolvedAt == nil {
+				t.Fatalf("initial pull attempt = %#v, %v", oldAttempt, err)
+			}
+			reason := storagepull.FailureOutcomeUnknown
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("failure_reason = ?", reason).
+				Where("id = ? AND status = ?", pullTask.ID, model.TaskStatusFailed).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
+				StorageCopyID: pipeline.target.ID, ContentID: pipeline.upload.ID, CopyIndex: pipeline.target.CopyIndex,
+				PieceCID: pipeline.pieceCID.String(), RetrievalURL: secondURL,
+			})
+			replacement, err := runtime.repos.Replacements.GetByClientRequestID(ctx, copyRow.BucketID, "migration-pull-test")
+			if err != nil || replacement == nil {
+				t.Fatalf("load pull replacement = %#v, %v", replacement, err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
+				Set("seeding_complete = ?", true).Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
+				Type:  model.TaskTypeProviderReplacementCoordinate,
+				Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
+			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			itemStatus := func() storagereplacement.ItemStatus {
+				var item storagereplacement.Item
+				if err := runtime.db.NewSelect().Model(&item).
+					Where("replacement_id = ? AND content_id = ?", replacement.ID, copyRow.ContentID).Scan(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return item.Status
+			}
+			wantRetries := 1
+			if scenario.exhausted {
+				coordinateTask = runOneStorageTask(t, runtime, coordinateTask, model.TaskStatusFailed)
+				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+				if err != nil || stored.Status != storagereplacement.StatusFailed || itemStatus() != storagereplacement.ItemStatusAttention ||
+					coordinateTask.FailureReason == nil || *coordinateTask.FailureReason != "attempts_exhausted" {
+					t.Fatalf("exhausted replacement = %#v, task=%#v, err=%v", stored, coordinateTask, err)
+				}
+				if _, err := runtime.service.Retry(ctx, pullTask.ID); !errors.Is(err, repository.ErrConflict) {
+					t.Fatalf("attention pull retry = %v, want conflict", err)
+				}
+				if child, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, pullTask.ID); err != nil || child != nil {
+					t.Fatalf("attention pull successor = %#v, %v", child, err)
+				}
+				runtime.testMaxAttempts = nil
+				coordinateTask, err = runtime.service.Retry(ctx, coordinateTask.ID)
+				if err != nil || itemStatus() != storagereplacement.ItemStatusPending {
+					t.Fatalf("replacement retry = %#v, %v", coordinateTask, err)
+				}
+			}
+			if scenario.readFailure {
+				faults := &pullEvidenceFailureRepository{StorageContentRepository: runtime.repos.Contents, stage: "attempt"}
+				faults.remaining.Store(1)
+				runtime.repos.Contents = faults
+				coordinateTask = runOneStorageTask(t, runtime, coordinateTask, model.TaskStatusPending)
+				runtime.repos.Contents = faults.StorageContentRepository
+				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+				if err != nil || stored.Status == storagereplacement.StatusFailed || itemStatus() != storagereplacement.ItemStatusPending ||
+					coordinateTask.RetryCount != 1 || coordinateTask.FailureReason == nil || *coordinateTask.FailureReason != "replacement_retry_eligibility_failed" {
+					t.Fatalf("eligibility read failure = task %#v, replacement %#v, err=%v", coordinateTask, stored, err)
+				}
+				if child, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, pullTask.ID); err != nil || child != nil || calls.Load() != 1 {
+					t.Fatalf("eligibility failure started recovery: child=%#v, calls=%d, err=%v", child, calls.Load(), err)
+				}
+				wantRetries++
+			}
+			coordinateTask = runOneStorageTask(t, runtime, coordinateTask, model.TaskStatusPending)
+			if coordinateTask.RetryCount != wantRetries || coordinateTask.FailureReason == nil || *coordinateTask.FailureReason != "replacement_copy_failed" {
+				t.Fatalf("pull retry coordinator = %#v, want retry count %d", coordinateTask, wantRetries)
+			}
+			successor, err := runtime.repos.Tasks.GetDirectSuccessor(ctx, pullTask.ID)
+			if err != nil || successor == nil || successor.RetryOfTaskID == nil || *successor.RetryOfTaskID != pullTask.ID || len(successor.Checkpoint) != 0 {
+				t.Fatalf("pull recovery successor = %#v, %v", successor, err)
+			}
+			runStorageTaskClaims(t, runtime, successor, model.TaskStatusCompleted, 2)
+			copyAfter, err := runtime.repos.Contents.GetUploadCopyByID(ctx, copyRow.ID)
+			if err != nil || copyAfter.Status != model.StorageCopyStatusPieceReady || copyAfter.CommitRequestID == nil ||
+				calls.Load() != 2 || presigns.Load() != 2 {
+				t.Fatalf("restarted pull = copy %#v, calls=%d, presigns=%d, err=%v", copyAfter, calls.Load(), presigns.Load(), err)
+			}
+			var attempts []storagepull.Attempt
+			if err := runtime.db.NewSelect().Model(&attempts).
+				Where("content_id = ? AND storage_data_set_id = ?", copyRow.ContentID, copyRow.StorageDataSetID).
+				OrderExpr("attempted_at ASC, attempt_id ASC").Scan(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 2 || attempts[0].AttemptID != oldAttempt.AttemptID || attempts[0].Status != storagepull.AttemptStatusAbandoned ||
+				attempts[0].ResolvedAt == nil || attempts[0].LastError == nil || oldAttempt.LastError == nil || *attempts[0].LastError != *oldAttempt.LastError ||
+				attempts[1].AttemptID == oldAttempt.AttemptID || attempts[1].Status != storagepull.AttemptStatusAttempted || attempts[1].ResolvedAt == nil ||
+				!attempts[1].SourceProviderID.Equal(pipeline.target.ProviderID) || attempts[1].SourceRetrievalURL != secondURL {
+				t.Fatalf("migration pull attempts = %#v", attempts)
+			}
+			sourceHistory, err := runtime.repos.Tasks.GetByID(ctx, pullTask.ID)
+			if err != nil || sourceHistory.Status != model.TaskStatusFailed || sourceHistory.SupersededAt == nil || !bytes.Equal(sourceHistory.Checkpoint, oldCheckpoint) {
+				t.Fatalf("original pull evidence = %#v, %v", sourceHistory, err)
+			}
+			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil || stored.Status == storagereplacement.StatusFailed {
+				t.Fatalf("replacement after pull recovery = %#v, %v", stored, err)
 			}
 		})
 	}
