@@ -4488,16 +4488,16 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T) {
 	dependencyLimit := 1
 	for _, tt := range []struct {
-		name              string
-		contents          int
-		invalidCheckpoint bool
-		exhaustedFirst    bool
-		dependencyRetries *int
+		name                   string
+		contents               int
+		invalidStoreCheckpoint bool
+		exhaustedFirst         bool
+		dependencyRetries      *int
 	}{
 		{name: "retryable", contents: 1},
 		{name: "retryable batch", contents: 7},
 		{name: "exhausted dependency leaves others running", contents: 2, exhaustedFirst: true},
-		{name: "invalid checkpoint", contents: 1, invalidCheckpoint: true},
+		{name: "invalid Store checkpoint", contents: 1, invalidStoreCheckpoint: true},
 		{name: "dependency limit and manual reset", contents: 1, dependencyRetries: &dependencyLimit},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -4553,7 +4553,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				}
 				reason := "store_outcome_unknown"
 				var checkpoint json.RawMessage
-				if tt.invalidCheckpoint {
+				if tt.invalidStoreCheckpoint {
 					reason = "invalid_checkpoint"
 				} else {
 					checkpoint = json.RawMessage(fmt.Sprintf(`{"attempted_at":"2026-09-11T00:00:00Z","intended_piece_cid":%q,"provider_service_url":"https://target.example","session_id":"00000000-0000-4000-8000-000000000001","stage":"upload","ingress_attempt":0}`, identity.CIDv2.String()))
@@ -4581,7 +4581,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 					t.Fatal(err)
 				}
 			}
-			if tt.invalidCheckpoint {
+			if tt.invalidStoreCheckpoint {
 				coordinator = runStorageTaskClaims(t, runtime, coordinator, model.TaskStatusFailed, 2)
 				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
 				copyAfter, copyErr := runtime.repos.Contents.GetUploadCopyByID(ctx, copies[0].ID)
@@ -4596,9 +4596,6 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				return
 			}
 			coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
-			if coordinator.WaitReason != nil {
-				t.Logf("coordinator wait=%s", *coordinator.WaitReason)
-			}
 			if coordinator.RetryCount != 0 || coordinator.FailureReason != nil {
 				t.Fatalf("dependency recovery consumed coordinator budget: %#v", coordinator)
 			}
@@ -4635,6 +4632,21 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				t.Fatalf("replacement = %#v, %v", stored, err)
 			}
 			if tt.dependencyRetries == nil {
+				if tt.contents == 1 {
+					testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{StorageCopyID: copies[0].ID})
+					coordinator = runOneStorageTask(t, runtime, coordinator, model.TaskStatusPending)
+					var item storagereplacement.Item
+					if err := runtime.db.NewSelect().Model(&item).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil || item.Status != storagereplacement.ItemStatusCopied {
+						t.Fatalf("completed item = %#v, %v", item, err)
+					}
+					progress.DependencyRetries = nil
+					if err := json.Unmarshal(coordinator.Checkpoint, &progress); err != nil {
+						t.Fatal(err)
+					}
+					if _, exists := progress.DependencyRetries[fmt.Sprintf("storage_copy:%d", copies[0].ID)]; exists {
+						t.Fatalf("completed copy retained its dependency retry count: %s", coordinator.Checkpoint)
+					}
+				}
 				return
 			}
 			var claimed *model.Task
@@ -5306,6 +5318,9 @@ func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 				t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement retryable", failed, stored, err)
 			}
 			if internalFailure {
+				if stored.LastError == nil || *stored.LastError != "Replacement work stopped because of an internal error. Retry the replacement; if it stops again, check its task on the Tasks page." {
+					t.Fatalf("replacement last error = %v", stored.LastError)
+				}
 				if eligible, err := runtime.service.RetryableContext(ctx, failed); err != nil || !eligible {
 					t.Fatalf("coordinator retry eligible=%t, %v", eligible, err)
 				}

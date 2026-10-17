@@ -51,19 +51,19 @@ test('determinate progress exposes active recovery states without raw errors', (
   assert.equal(view.activity, '1 in progress · 1 retrying · 1 waiting for source · 1 failed')
 })
 
-test('confirmation attention stays distinct from failed replacement work', () => {
+test('content that could not be copied stays distinct from failed replacement work', () => {
   const view = providerReplacementProgressView(
     progress({ items_active: 0, items_attention: 2, items_retrying: 0, items_waiting_source: 0 })
   )
-  assert.equal(view.activity, '2 confirmations need attention · 1 failed')
+  assert.equal(view.activity, "2 couldn't be copied · 1 failed")
 })
 
-test('confirmation attention takes priority over the coordinator status message', () => {
+test('content that could not be copied takes priority over the replacement status message', () => {
   const view = providerReplacementProgressView(
     progress({ items_active: 4, items_attention: 1, items_retrying: 0, items_waiting_source: 0, items_failed: 0 }),
     'Moving stored content'
   )
-  assert.equal(view.activity, '1 confirmation needs attention · Moving stored content')
+  assert.equal(view.activity, "1 couldn't be copied · Moving stored content")
 })
 
 test('completed progress separates copied and no-longer-needed items at 100 percent', () => {

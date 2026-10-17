@@ -34,7 +34,8 @@ type (
 )
 
 const (
-	replacementSeedBatchSize = 100
+	replacementSeedBatchSize        = 100
+	replacementInternalErrorMessage = "Replacement work stopped because of an internal error. Retry the replacement; if it stops again, check its task on the Tasks page."
 )
 
 type Handler struct {
@@ -71,8 +72,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, DependencyRetries: 5, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
 		OnEngineFailure: func(task *model.Task, _ string) taskengine.Settlement {
 			return func(ctx context.Context, repos *repository.Repositories) error {
-				return repos.Replacements.FailForEngineTask(ctx, task.ID,
-					"Replacement work stopped because of an internal error. Retry the replacement; if it stops again, check its task on the Tasks page.")
+				return repos.Replacements.FailForEngineTask(ctx, task.ID, replacementInternalErrorMessage)
 			}
 		},
 	}
@@ -629,6 +629,7 @@ func (h *Handler) waitForSourceWrites(
 ) taskengine.Result {
 	dependencies := make(map[int64]dependencyRetry)
 	waiting := false
+	retrying := false
 	for i := range writes {
 		taskID := writes[i].WorkTaskID()
 		if taskID == nil {
@@ -653,6 +654,7 @@ func (h *Handler) waitForSourceWrites(
 		dependencies[source.ID] = decision
 		if !decision.at.IsZero() {
 			waiting = true
+			retrying = true
 		}
 	}
 	const message = "The old provider did not finish writes it had already accepted, so it cannot be shut down yet. Retry the replacement after the old provider recovers."
@@ -680,38 +682,42 @@ func (h *Handler) waitForSourceWrites(
 			return repos.Replacements.MarkFailed(ctx, replacement.ID, nil, message)
 		})
 	}
-	return taskengine.Wait(model.TaskResumeModeRecover, "source_writes", "Waiting for writes on the old provider to finish", func(ctx context.Context, repos *repository.Repositories) error {
-		if _, err := repos.Replacements.LockCoordinatorTask(ctx, replacement.ID, replacement.TaskGeneration, execution.ID()); err != nil {
-			return err
-		}
-		current, err := lockFailedDependencies(ctx, repos, dependencies)
-		if err != nil {
-			return err
-		}
-		progress := checkpoint
-		progress.DependencyRetries = maps.Clone(checkpoint.DependencyRetries)
-		if progress.DependencyRetries == nil {
-			progress.DependencyRetries = make(map[string]int)
-		}
-		for _, id := range slices.Sorted(maps.Keys(dependencies)) {
-			decision := dependencies[id]
-			if !current[id] || decision.at.IsZero() {
-				continue
+	var settlement taskengine.Settlement
+	if retrying {
+		settlement = func(ctx context.Context, repos *repository.Repositories) error {
+			if _, err := repos.Replacements.LockCoordinatorTask(ctx, replacement.ID, replacement.TaskGeneration, execution.ID()); err != nil {
+				return err
 			}
-			owned, err := dependencyOwnerCurrent(ctx, repos, decision.source)
+			current, err := lockFailedDependencies(ctx, repos, dependencies)
 			if err != nil {
 				return err
 			}
-			if !owned {
-				continue
+			progress := checkpoint
+			progress.DependencyRetries = maps.Clone(checkpoint.DependencyRetries)
+			if progress.DependencyRetries == nil {
+				progress.DependencyRetries = make(map[string]int)
 			}
-			if _, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, id, decision.at); err != nil {
-				return err
+			for _, id := range slices.Sorted(maps.Keys(dependencies)) {
+				decision := dependencies[id]
+				if !current[id] || decision.at.IsZero() {
+					continue
+				}
+				owned, err := dependencyOwnerCurrent(ctx, repos, decision.source)
+				if err != nil {
+					return err
+				}
+				if !owned {
+					continue
+				}
+				if _, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, id, decision.at); err != nil {
+					return err
+				}
+				progress.DependencyRetries[decision.key]++
 			}
-			progress.DependencyRetries[decision.key]++
+			return writeProgressCheckpoint(ctx, repos, execution, progress)
 		}
-		return writeProgressCheckpoint(ctx, repos, execution, progress)
-	})
+	}
+	return taskengine.Wait(model.TaskResumeModeRecover, "source_writes", "Waiting for writes on the old provider to finish", settlement)
 }
 
 func dependencyOwnerCurrent(ctx context.Context, repos *repository.Repositories, source *model.Task) (bool, error) {
@@ -739,8 +745,7 @@ func (h *Handler) failReplacement(replacementID int64, err error, reason string)
 
 func (h *Handler) retryReplacement(execution taskengine.Execution, _ int64, err error, reason string) taskengine.Result {
 	return taskengine.Retry(err, reason, nil).WithRetrySettlements(nil, func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.Replacements.FailForEngineTask(ctx, execution.ID(),
-			"Replacement work stopped because of an internal error. Retry the replacement; if it stops again, check its task on the Tasks page.")
+		return repos.Replacements.FailForEngineTask(ctx, execution.ID(), replacementInternalErrorMessage)
 	})
 }
 

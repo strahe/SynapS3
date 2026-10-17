@@ -373,6 +373,43 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 	}
 }
 
+func TestDependencyRetryAtHonorsBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		limit   int
+		retries int
+		allowed bool
+	}{
+		{name: "negative count", limit: 2, retries: -1},
+		{name: "disabled", retries: 0},
+		{name: "last allowed retry", limit: 2, retries: 1, allowed: true},
+		{name: "exhausted", limit: 2, retries: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			execution := Execution{policy: ExecutionPolicy{
+				MaxAttempts:       1,
+				DependencyRetries: tc.limit,
+				Backoff:           BackoffPolicy{InitialDelay: time.Second, Multiplier: 2, MaximumDelay: 4 * time.Second},
+			}}
+			before := time.Now().Add(2 * time.Second)
+			at, allowed := execution.DependencyRetryAt(tc.retries)
+			after := time.Now().Add(2 * time.Second)
+			if allowed != tc.allowed {
+				t.Fatalf("allowed = %t, want %t", allowed, tc.allowed)
+			}
+			if !allowed {
+				if !at.IsZero() {
+					t.Fatalf("rejected retry time = %s", at)
+				}
+				return
+			}
+			if at.Before(before) || at.After(after) {
+				t.Fatalf("retry time = %s, want between %s and %s", at, before, after)
+			}
+		})
+	}
+}
+
 func TestResendAtRequiresDeclaredDeterministicPolicy(t *testing.T) {
 	policy := ExecutionPolicy{MaxAttempts: 6, Backoff: DefaultBackoffPolicy(), ResendBackoff: &BackoffPolicy{InitialDelay: time.Minute, Multiplier: 2, MaximumDelay: 4 * time.Minute}}
 	execution := Execution{policy: policy}
@@ -453,29 +490,32 @@ func TestWaitUsesPolicyIntervalsAndAbsoluteDeadline(t *testing.T) {
 	}
 }
 
-func TestRegistryValidatesWaitIntervals(t *testing.T) {
+func TestRegistryValidatesWaitAndDependencyPolicy(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		waitInterval time.Duration
-		interval     time.Duration
-		want         time.Duration
-		invalid      bool
+		name              string
+		waitInterval      time.Duration
+		interval          time.Duration
+		dependencyRetries int
+		want              time.Duration
+		invalid           bool
 	}{
 		{name: "default", want: 30 * time.Second},
 		{name: "observation", interval: 11 * time.Second, want: 11 * time.Second},
 		{name: "ordinary", waitInterval: 41 * time.Second, want: 30 * time.Second},
 		{name: "negative observation", interval: -time.Second, invalid: true},
 		{name: "negative ordinary", waitInterval: -time.Second, invalid: true},
+		{name: "negative dependency retries", dependencyRetries: -1, invalid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			definition := testDefinition(nil, true)
 			definition.Policy.WaitInterval = tc.waitInterval
 			definition.Policy.ObservationInterval = tc.interval
+			definition.Policy.DependencyRetries = tc.dependencyRetries
 			registry := NewRegistry()
 			err := registry.Register(scriptedHandler{definition: definition})
 			if tc.invalid {
 				if !errors.Is(err, ErrInvalidPolicy) {
-					t.Fatalf("negative interval: %v", err)
+					t.Fatalf("invalid policy: %v", err)
 				}
 				return
 			}
