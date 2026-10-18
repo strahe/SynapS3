@@ -3,6 +3,7 @@ package task_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -44,8 +45,12 @@ func runBatchTaskClaim(t *testing.T, runtime handlerTestRuntime, row *model.Task
 	}, cfg.Worker.Tasks.LeaseDuration)
 }
 
-func replacementBatchFixture(t *testing.T, count int, remoteSource bool) (handlerTestRuntime, *storagereplacement.Replacement, *model.Task) {
+func replacementBatchFixture(t *testing.T, count int, remoteSource bool, sizes ...int64) (handlerTestRuntime, *storagereplacement.Replacement, *model.Task) {
 	t.Helper()
+	contentSize := int64(11)
+	if len(sizes) > 0 {
+		contentSize = sizes[0]
+	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
 	ctx := t.Context()
 	bucket := &model.Bucket{Name: "replacement-batch", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
@@ -89,11 +94,11 @@ func replacementBatchFixture(t *testing.T, count int, remoteSource bool) (handle
 	}
 	for i := range count {
 		key := fmt.Sprintf("content-%03d", i)
-		content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{BucketID: bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(key), RequestedCopies: 1})
+		content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{BucketID: bucket.ID, ContentSize: contentSize, Checksum: testutil.StorageChecksum(key), RequestedCopies: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: key, ContentID: &content.ID, Size: 11, ETag: key, ContentType: "application/octet-stream"}
+		version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: key, ContentID: &content.ID, Size: contentSize, ETag: key, ContentType: "application/octet-stream"}
 		if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 			t.Fatal(err)
 		}
@@ -327,7 +332,16 @@ func TestReplacementFailedCopyRecoveryRechecksLiveVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 			if exhausted {
-				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("retry_count = ?", 5).Where("id = ?", coordinator.ID).Exec(t.Context()); err != nil {
+				var checkpoint map[string]any
+				if err := json.Unmarshal(coordinator.Checkpoint, &checkpoint); err != nil {
+					t.Fatal(err)
+				}
+				checkpoint["dependency_retries"] = map[string]int{fmt.Sprintf("storage_copy:%d", copy.ID): 5}
+				coordinator.Checkpoint, err = json.Marshal(checkpoint)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?::jsonb", string(coordinator.Checkpoint)).Where("id = ?", coordinator.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -381,12 +395,12 @@ func TestReplacementFailedCopyRecoveryRechecksLiveVersion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantRetries := 0
-			if exhausted {
-				wantRetries = 5
-			}
-			if stored.RetryCount != wantRetries {
+			if stored.RetryCount != 0 || !testutil.JSONEqual(stored.Checkpoint, coordinator.Checkpoint) {
 				t.Fatalf("retry budget changed after deletion = %#v", stored)
+			}
+			var item storagereplacement.Item
+			if err := runtime.db.NewSelect().Model(&item).Where("id = ?", items[0].ID).Scan(t.Context()); err != nil || item.Status == storagereplacement.ItemStatusAttention {
+				t.Fatalf("item changed after deletion = %#v, %v", item, err)
 			}
 			row, err := runtime.repos.Replacements.GetByID(t.Context(), replacement.ID)
 			if err != nil || row.Status != storagereplacement.StatusMigrating {

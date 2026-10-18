@@ -408,6 +408,13 @@ func (e Execution) ResendAt(sentAt time.Time, sends int) (time.Time, error) {
 	return sentAt.UTC().Add(time.Duration(p.baseDelay(sends - 1))), nil
 }
 
+func (e Execution) DependencyRetryAt(retries int) (time.Time, bool) {
+	if retries < 0 || retries >= e.policy.DependencyRetries {
+		return time.Time{}, false
+	}
+	return time.Now().UTC().Add(e.policy.Backoff.delay(retries)), true
+}
+
 func (e Execution) ObserveOperation(ctx context.Context, key string) (time.Time, error) {
 	if e.observe == nil {
 		return time.Time{}, errors.New("operation observation is unavailable")

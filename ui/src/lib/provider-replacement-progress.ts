@@ -25,7 +25,7 @@ export function providerReplacementProgressView(
   const parts: string[] = []
   let attentionActivity = ''
   if (progress.items_attention > 0) {
-    attentionActivity = `${progress.items_attention} confirmation${progress.items_attention === 1 ? '' : 's'} need${progress.items_attention === 1 ? 's' : ''} attention`
+    attentionActivity = `${progress.items_attention} couldn't be copied`
     parts.push(attentionActivity)
   }
   if (progress.items_active > 0) parts.push(`${progress.items_active} in progress`)
