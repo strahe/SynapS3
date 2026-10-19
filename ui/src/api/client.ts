@@ -322,6 +322,7 @@ export interface StorageDataSetSummary {
   provider_id: string
   provider_identity?: ProviderIdentity
   upload_speed_test?: ProviderUploadSpeedTest
+  upload_speed_unavailable_reason?: string
   data_set_id?: string
   client_data_set_id?: string
   status: string

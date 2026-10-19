@@ -127,13 +127,25 @@ test('Subject preserves identity, one-based replicas, provenance, and exact wall
     copy_index: 0,
     size: 1024,
     file: { key: 'a/long/object/path.txt', source: 'deleted', other_versions: 3 },
-    provider: { id: '701', name: 'North' },
+    provider: { id: '701', name: ' North ' },
   })
   assert.equal(fields.length, 4)
   assert.equal(fields[0]?.value, 'a/long/object/path.txt')
   assert.equal(fields[0]?.note, 'Deleted · 3 other linked versions')
   assert.equal(fields[3]?.label, 'Replica / Provider')
-  assert.equal(fields[3]?.value, 'Replica 1 · North (#701)')
+  assert.equal(fields[3]?.value, 'Replica 1 · North (Registry 701)')
+  const providerID = '184467440737095516160'
+  for (const name of [undefined, '', ' \t ']) {
+    const provider = { id: providerID, name }
+    const providerFields = taskSubjectFields({ subject_type: 'provider', subject_key: providerID, provider })
+    assert.equal(providerFields[0]?.value, `Registry ${providerID}`)
+    assert.equal(providerFields[1]?.value, providerID)
+    const dataSetFields = taskSubjectFields({ subject_type: 'storage_data_set', subject_key: '23', provider })
+    assert.equal(dataSetFields[2]?.value, `Registry ${providerID}`)
+  }
+  const missingProviderFields = taskSubjectFields({ subject_type: 'provider', subject_key: providerID })
+  assert.equal(missingProviderFields[0]?.value, 'Unavailable')
+  assert.equal(missingProviderFields[1]?.value, providerID)
   const dataset = taskSubjectFields({
     subject_type: 'storage_data_set',
     subject_key: '23',

@@ -116,6 +116,7 @@ type storageDataSetSummaryResponse struct {
 	ProviderID                    string                    `json:"provider_id"`
 	ProviderIdentity              *providerIdentityResponse `json:"provider_identity,omitempty"`
 	UploadSpeedTest               *providerUploadSpeedView  `json:"upload_speed_test,omitempty"`
+	UploadSpeedUnavailableReason  string                    `json:"upload_speed_unavailable_reason,omitempty"`
 	DataSetID                     *string                   `json:"data_set_id,omitempty"`
 	ClientDataSetID               *string                   `json:"client_data_set_id,omitempty"`
 	Status                        string                    `json:"status"`
@@ -673,11 +674,15 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 		localIDs = append(localIDs, summary.ID)
 	}
 	profiles := make(map[string]observability.ProviderProfile)
+	speedUnavailable := s.repos == nil || s.repos.Observability == nil || s.repos.ProviderUploadSpeed == nil
 	if s.repos != nil && s.repos.Observability != nil {
 		var err error
 		profiles, err = s.repos.Observability.ProviderProfiles(ctx, providerIDs)
-		if err != nil && s.logger != nil {
-			s.logger.Warn("api: failed to load saved provider profiles", "error", err)
+		if err != nil {
+			speedUnavailable = true
+			if s.logger != nil {
+				s.logger.Warn("api: failed to load saved provider profiles", "error", err)
+			}
 		}
 	}
 	identities := s.providerIdentitiesFromProfiles(profiles)
@@ -685,14 +690,21 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 	if len(providerIDStrings) > 0 && s.repos != nil && s.repos.ProviderUploadSpeed != nil {
 		var err error
 		speedTests, err = s.repos.ProviderUploadSpeed.ListByProviderIDs(ctx, providerIDStrings)
-		if err != nil && s.logger != nil {
-			s.logger.Warn("api: failed to list provider upload speed tests", "error", err)
+		if err != nil {
+			speedUnavailable = true
+			if s.logger != nil {
+				s.logger.Warn("api: failed to list provider upload speed tests", "error", err)
+			}
 		}
+	}
+	speedUnavailableReason := ""
+	if speedUnavailable {
+		speedUnavailableReason = "Could not load upload speed. Refresh to try again."
 	}
 	healthByLocalID, healthFailed := s.dataSetStorageHealthStates(ctx, localIDs)
 	for _, summary := range summaries {
 		var speedTest *providerUploadSpeedView
-		if row, ok := speedTests[summary.ProviderID.String()]; ok {
+		if row, ok := speedTests[summary.ProviderID.String()]; ok && !speedUnavailable {
 			var profile *observability.ProviderProfile
 			if saved, ok := profiles[summary.ProviderID.String()]; ok {
 				profile = &saved
@@ -729,6 +741,7 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			ProviderID:                    summary.ProviderID.String(),
 			ProviderIdentity:              providerIdentityFromSnapshot(identities, summary.ProviderID),
 			UploadSpeedTest:               speedTest,
+			UploadSpeedUnavailableReason:  speedUnavailableReason,
 			DataSetID:                     onChainIDStringPtr(summary.DataSetID),
 			ClientDataSetID:               onChainIDStringPtr(summary.ClientDataSetID),
 			Status:                        string(summary.Status),

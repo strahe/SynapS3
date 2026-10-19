@@ -2194,8 +2194,16 @@ function BucketStorageDataSets({
                           <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
                         </TableCell>
                         <TableCell className="overflow-hidden px-4 text-right tabular-nums">
-                          <span className="block truncate" title={providerUploadSpeedLabel(dataSet.upload_speed_test)}>
-                            {providerUploadSpeedShortLabel(dataSet.upload_speed_test)}
+                          <span
+                            className="block truncate"
+                            title={
+                              dataSet.upload_speed_unavailable_reason ||
+                              providerUploadSpeedLabel(dataSet.upload_speed_test)
+                            }
+                          >
+                            {dataSet.upload_speed_unavailable_reason
+                              ? 'Unavailable'
+                              : providerUploadSpeedShortLabel(dataSet.upload_speed_test)}
                           </span>
                         </TableCell>
                         <TableCell className="overflow-hidden px-4 text-muted-foreground">
