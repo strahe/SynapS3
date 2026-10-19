@@ -1,90 +1,79 @@
 ---
 title: Filecoin Storage Flow
-description: Understand how background tasks store locally durable objects with Filecoin storage providers.
+description: Learn how SynapS3 stores objects as replicas with storage providers, how replica settings affect the cache, and how to replace a storage provider.
 ---
 
 # Filecoin Storage Flow
 
-Filecoin storage starts after the S3 write is accepted. Background tasks read locally durable objects, store them with storage providers, and record the resulting replicas.
+Filecoin storage starts after an S3 write succeeds. Background tasks store each object as replicas with the bucket's storage providers, one replica per storage provider.
 
-## Task Chain
+## Bucket Preparation
 
-```mermaid
-flowchart TD
-  put["S3 write accepted"] --> cached["cached"]
-  cached --> uploading["uploading"]
-  uploading --> committing["committing"]
-  committing --> replicating["replicating"]
-  replicating --> stored["stored"]
-  stored --> policy{"cache eviction policy"}
-  policy -->|"after_upload"| evict["remove local cache"]
-  policy -->|"lru at high watermark"| evict
-  policy -->|"none"| retain["retain local cache"]
-```
+When you create a bucket, SynapS3 assigns a storage provider to each replica and creates a paid data set with each one. The bucket shows **Provisioning** until every data set is ready, then **Ready**. Uploads to a bucket that is not ready fail with `503 SlowDown`. If preparation stops, the bucket shows the reason and links to the task to retry. How storage providers are chosen is described in [Provider Selection](../configuration/model.md#provider-selection).
 
 ## Object States
 
-| State | Meaning |
-| --- | --- |
-| `cached` | Object is durable locally and queued for upload. |
-| `uploading` | A background task is preparing remote storage or uploading bytes. |
-| `committing` | The provider has the piece, and its batch is waiting to be submitted or confirmed on chain; uploads to the same data set are batched within the configured `commit_max_wait` window. |
-| `replicating` | At least one readable committed replica exists, but the bucket's minimum durable replicas are not yet met. |
-| `stored` | The bucket's minimum durable replicas are readable and committed; remaining target replicas may still be syncing. |
-| `failed` | The active lifecycle step failed and may be retried. |
+| State | Dashboard | Meaning |
+| --- | --- | --- |
+| `cached` | **Stored in cache** | Stored locally and waiting for upload. |
+| `uploading` | **Uploading** | Being uploaded to a storage provider. |
+| `committing` | **Submitting to Filecoin** | The storage provider has the data; its batch is waiting to be submitted or confirmed on chain. |
+| `replicating` | **Syncing replicas** | At least one replica is committed, but fewer than the bucket's minimum durable replicas. |
+| `stored` | **Stored on Filecoin** | The minimum durable replicas are committed and readable. Remaining replicas may still be syncing. |
+| `failed` | **Needs attention** | A storage step failed. See [Failed Tasks](../operations/troubleshooting.md#failed-tasks). |
 
-Cache presence is tracked separately from storage state. A `stored` object may remain in the local cache or be available only from remote storage.
+The state does not say whether the object is still in the local cache; a `stored` object may be cached or only on Filecoin.
 
-Local uploads use the assigned provider with the fastest valid speed measurement. Providers without a valid measurement follow in replica order. If that upload fails before a readable replica is committed, the next eligible assigned replica uses the same ranking. Other replicas pull from a readable committed source. Speed tests do not delay uploads to assigned providers.
+## Upload and Replication
 
-## Retries and Recovery
+1. SynapS3 uploads the object from the local cache to one of the bucket's storage providers: the one with the fastest valid speed test, or, without valid tests, the first in replica order. If that upload fails before any replica is committed, the next assigned storage provider takes over the upload in the same order.
+2. The replica is added to the storage provider's data set on chain in a batch. See [Batches](../configuration/model.md#batches).
+3. The bucket's other storage providers copy the object from a committed replica and commit their own replicas the same way.
 
-If SynapS3 is interrupted, unfinished tasks become eligible to continue after the service restarts.
+If an assigned storage provider becomes unreachable before its replica is stored, the other replicas continue. The unfinished replica waits without using up retries and resumes when the storage provider is reachable again. SynapS3 does not automatically replace a replica's assigned storage provider; see [Replace a Storage Provider](#replace-a-storage-provider).
 
-Retries are bounded by background task settings. A task that reaches its limit enters `failed` and needs operator action:
-
-```bash
-synaps3 admin task list --status failed --limit 100
-synaps3 admin task retry 42
-```
-
-Retry after restoring RPC connectivity, storage provider reachability, wallet funds, FWSS approval, or cache capacity, and only when the task is marked retryable.
-
-## Provider Health
-
-Health checks record storage provider and local data set status. The dashboard uses those results to show replicas that are `unavailable`, `degraded`, or `unknown`.
-
-If an established provider becomes temporarily unavailable while the initial replicas are still being stored, SynapS3 keeps using the other assigned writable replicas. The unfinished replica waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider; see [Replace a Storage Provider](#replace-a-storage-provider) for the operator-approved path. Repairing replicas that became unavailable after storage completed remains part of the planned replica repair feature below.
+Unfinished tasks resume after a restart. A task that exhausts its retries becomes `failed`; fix the cause, then retry it. See [Failed Tasks](../operations/troubleshooting.md#failed-tasks).
 
 ## Target and Minimum Replicas
 
-The target replica count is frozen when an upload starts. A new bucket sets **Release cache after** to its full replica count, so every target replica frozen for that upload must be readable and committed before the cache is released. A bucket can instead set an explicit count from 1 through the current target, and that count stays if Replicas later increases. **Replicas** can only be raised; lowering it is not supported. Once that threshold is met, the version becomes stored and its cache follows the configured eviction policy, while remaining replicas continue until the upload's target is reached. The dashboard keeps showing replica sync progress until every frozen target replica is done.
+Each bucket has two replica settings. Set them when you create the bucket, or later on the bucket's **Settings** tab under **Replica policy**.
 
-Changing the target affects new uploads. Changing the minimum also re-evaluates retained cache for current uploads. Increasing the minimum does not move versions that are already stored back to an earlier state and cannot restore cache that has already been deleted.
+| Setting | API field | Meaning |
+| --- | --- | --- |
+| **Replicas** | `default_copies` | Replica target, 1 to 8. A new bucket takes `filecoin.default_copies`. |
+| **Release cache after** | `minimum_durable_copies` | Minimum durable replicas: how many committed, readable replicas a version needs before it is `stored` and its cache can be released. A new bucket uses the full target. |
+
+- Each upload keeps the replica target that applied when it started. Changing **Replicas** affects new uploads only.
+- **Replicas** can only be raised. Raising it creates data sets for the new replicas.
+- An explicit **Release cache after** count stays unchanged when **Replicas** is raised. It never exceeds an upload's target.
+- Lowering **Release cache after** lets cached versions be released sooner, while remaining replicas keep syncing. Raising it does not move `stored` versions back and cannot restore cache that was already removed.
+
+The dashboard shows replica sync progress until every target replica of a version is stored.
+
+## Storage Provider Health
+
+SynapS3 checks storage providers and its data sets every `filecoin.observability.interval`. The dashboard flags replicas whose storage provider or data set fails these checks. A storage provider's details on the **Storage** page show why its last check failed.
 
 ## Replace a Storage Provider
 
-When a provider becomes permanently unavailable, or you plan to move away from one, open the bucket in the dashboard, go to the **Storage** tab, and replace the provider from the replica's menu in **Data sets**. This is always an explicit decision: SynapS3 never swaps a provider on its own, because doing so creates a new paid data set and changes where your data lives. A replica can be replaced only after its own data set is ready; if that setup failed, retry it on the Tasks page first. While its provider stays unavailable, the setup keeps waiting and the replica cannot be replaced.
+Replace a storage provider when it is permanently unavailable or when you want to move a replica away from it. Replacement creates a new paid data set and changes where the data is stored, so SynapS3 does it only on your request.
 
-One confirmation covers the whole move. SynapS3 creates the new data set, switches new uploads to it once it is ready, copies existing data across, and only then shuts down the old provider. Objects copy from another replica or from local cache. Data that can still be read from the old provider stays readable until every retained version is readable on the new one.
+1. Open the bucket, go to the **Storage** tab, and in **Data sets** open the replica's menu.
+2. Select **Replace provider**.
+3. Under **New provider**, select **Choose automatically** or **Choose a provider**, review the price list, and confirm.
 
-While replacements run, the **Storage** tab shows every move that still needs progress or operator attention, including parallel moves on other replicas. Discovery uses an indeterminate progress bar because the final count is not known yet. Once discovery finishes, progress uses the processed share of the final total. Progress counts unique stored content, so content shared by several versions is copied once, and separates content transferred from content deleted before it needed to move.
+One confirmation covers the whole move: SynapS3 creates the new data set, sends new uploads to it once it is ready, copies the bucket's stored data from another replica or the local cache, and then terminates the old data set. Data stays readable from the old storage provider until every retained version is readable on the new one.
 
-Some steps wait rather than fail. The dashboard distinguishes creating the new data set, waiting for it to become writable, an unreachable provider, wallet funds, and missing readable content. Most waits resume on their own. Temporary transfer failures resume after a restart and do not stop other content or another replacement. Recoverable failures, including content with neither a readable replica nor local cache, have separate retry limits for each piece of content and each batch. Content that exhausts its retries or needs attention is set aside while other content continues. After the remaining content is processed, the replacement stops without shutting down the old provider. Review its error and use **Retry** on the **Storage** tab to retry the content set aside. New uploads switch to the new provider as soon as its data set is ready, and uploads still unfinished on the old provider move to the new one. Batches and transfers already signed for the old provider must finish before it is shut down; if one cannot finish, the replacement stops and shows why. Use **Retry** after the old provider recovers. If the result of shutting down the old provider is unclear, SynapS3 checks the chain and tries again on its own. Use **Retry** on the **Storage** tab after settling any payment required to shut down the old provider. A target already in use cannot be retried; choose another provider. A replica cannot be replaced again while an earlier replacement is still setting up its new data set; wait for it to finish, or retry that setup on the Tasks page.
+A replica can be replaced when its data set is ready, or when its data set setup task has failed. While the setup task is still pending or running, for example because its storage provider is unreachable, the replica cannot be replaced.
 
-## What Users See
-
-- S3 upload can succeed before Filecoin storage finishes.
-- Dashboard task and topology views show storage progress.
-- Reads prefer local cache. If remote metadata exists, SynapS3 can retrieve the object from the provider.
-- Cache eviction is an operational optimization, not the write acceptance point. `after_upload` removes a version after its minimum durable replicas are ready, `lru` waits for capacity pressure, and `none` retains it.
+The **Storage** tab shows the progress of each replacement and what it is waiting for: the new data set, the new storage provider, wallet funds, or a readable source. Most waits resume on their own. Content that cannot be copied after its retries, such as content with no readable replica and no local copy, is set aside while the rest continues. The replacement then stops before terminating the old data set; fix the cause and select **Retry** on the **Storage** tab. If terminating the old data set requires settling a payment, settle it, then select **Retry**.
 
 ## Planned Replica Repair
 
 Replica repair is planned for a future release. After a storage provider becomes unavailable, it will:
 
-- identify stored replicas affected by the provider outage,
-- create replacement replicas until the configured target replica count is restored,
-- show repair progress and failures that require operator action.
+- identify stored replicas affected by the outage,
+- create replacement replicas until the bucket's replica target is met again,
+- show repair progress and failures that need operator action.
 
-This is distinct from completing the initial target replicas and retrying failed storage tasks.
+Replica repair is separate from completing an upload's initial replicas and from retrying failed tasks.

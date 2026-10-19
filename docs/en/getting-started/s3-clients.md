@@ -1,64 +1,40 @@
 ---
 title: S3 Clients
-description: Create SynapS3 S3 credentials and verify path-style access with common clients.
+description: Create S3 credentials and configure AWS CLI, rclone, and MinIO Client for SynapS3.
 ---
 
 # S3 Clients
 
-After SynapS3 is running, confirm the Admin API is reachable on `127.0.0.1:9090`. Then create an S3 user and verify bucket and object operations with a path-style client.
-
-## Prerequisites
-
-- SynapS3 is running.
-- `curl http://127.0.0.1:9090/healthz` returns `{"status":"ok"}`.
-- The S3 API is reachable at `http://localhost:8080`.
-- The admin API is reachable from the machine where you run `synaps3 admin`.
-- `SYNAPS3_ADMIN_PASSWORD` is set, `admin-initial-password` exists next to the config file, or you can enter the Admin password at the prompt.
+SynapS3 requires path-style addressing. The examples use `http://localhost:8080`; for production, use the HTTPS endpoint of your S3 TLS setup.
 
 ## Create Credentials
 
-Create a regular S3 user:
+Create an S3 user on the dashboard's **S3 users** page, or with the CLI:
 
 ```bash
 synaps3 admin s3-user create
-```
-
-Enter the Admin password at the no-echo prompt when no protected password file is available. The command prints an access key, secret key, and role. The secret is shown only once: save it in a client credential file protected with `0600`, and rotate it immediately if it is exposed.
-
-List users later with:
-
-```bash
 synaps3 admin s3-user list
 ```
 
-## Prepare Test Object
+The CLI needs the Admin password; see [Admin Commands](../reference/cli.md#admin-commands). `create` prints the access key, secret key, and role. The secret key is shown only once; store it in a client configuration file with mode `0600`.
 
-Create one test file before choosing a client:
+| Role | Dashboard label | Permissions |
+| --- | --- | --- |
+| `userplus` (default) | **User+** | Creates buckets and accesses the buckets it owns. |
+| `user` | **User** | Accesses the buckets it owns; cannot create buckets. |
+| `admin` | **Admin** | Accesses all buckets and administers S3 API operations. |
+
+Bucket names are written to Filecoin data set metadata, which is public on-chain. Do not put sensitive information in bucket names.
+
+Objects must be 127 to 1,065,353,216 bytes. See [Stable Limits](../reference/s3-compatibility.md#stable-limits) for key and multipart limits. The examples upload this test file:
 
 ```bash
 printf '%*s\n' 128 'hello synaps3' > hello.txt
 ```
 
-`hello.txt` should be at least 128 bytes.
-
-> [!IMPORTANT]
-> The Filecoin upload path requires objects of at least 127 bytes. Keep test files at 128 bytes or larger.
-
-## Choose a Bucket Name
-
-Bucket names may be recorded publicly on-chain. Do not include sensitive information.
-
-## Stable Object Limits
-
-- Object size must be from `127` through `1,065,353,216` bytes.
-- Object keys must be valid UTF-8, must not contain NUL, and must be no more than `1024` bytes.
-- Multipart uploads support at most `10,000` parts, and the completed object remains subject to the object size limit.
-
-See [S3 Compatibility](../reference/s3-compatibility.md) for the full support boundary.
-
 ## AWS CLI
 
-Enter the access key and secret interactively, then configure path-style addressing:
+Enter the access key and secret key at the prompts, then set the region and path-style addressing:
 
 ```bash
 aws configure --profile synaps3
@@ -67,19 +43,17 @@ aws configure set profile.synaps3.s3.addressing_style path
 chmod 600 ~/.aws/credentials
 ```
 
-Create a bucket and upload a small test object:
-
 ```bash
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3api create-bucket --bucket demo
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3 cp hello.txt s3://demo/hello.txt
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3 cp s3://demo/hello.txt -
 ```
 
-The final command prints the padded `hello synaps3` content.
+The last command prints the file content.
 
 ## rclone
 
-Create a remote in `rclone.conf`:
+Add a remote to `rclone.conf` and keep the file at mode `0600`:
 
 ```ini
 [synaps3]
@@ -92,21 +66,15 @@ region = us-east-1
 force_path_style = true
 ```
 
-Verify bucket and object access:
-
 ```bash
 rclone mkdir synaps3:demo
 rclone copyto hello.txt synaps3:demo/hello.txt
 rclone cat synaps3:demo/hello.txt
 ```
 
-`rclone cat` prints the uploaded object.
-
-Keep `rclone.conf` at permission mode `0600` because it contains the secret key.
-
 ## MinIO Client
 
-Read the credentials interactively, create an alias, and upload the same file:
+The `read -rs` prompt keeps the secret key out of shell history; `mc` stores it in `~/.mc/config.json`:
 
 ```bash
 printf 'S3 access key: '
@@ -122,21 +90,12 @@ mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
 ```
 
-`mc cat` prints the uploaded object.
-
-The alias stores credentials in `~/.mc/config.json`. The no-echo prompt keeps the secret key out of shell history; keep the resulting configuration protected with `0600` permissions.
-
-The HTTP endpoints in these examples are for local evaluation. For production, use the HTTPS endpoint provided by native TLS or your controlled TLS reverse proxy.
-
 ## Common Failures
 
-| Symptom | Check |
+| Symptom | Fix |
 | --- | --- |
-| `AccessDenied` | Confirm the access key and secret key came from `synaps3 admin s3-user create`. |
-| Client tries virtual-hosted buckets | Enable path-style addressing or equivalent client setting. |
-| The first upload after creating a bucket returns `SlowDown` | Check the bucket's preparation message and the dashboard's speed-test notice. Preparation waits for eligible trusted providers to finish testing and enough successful providers to meet the replica policy. Follow the notice, then retry the upload. |
-| Uploading data right after deleting its last version with `versionId` returns `SlowDown` | SynapS3 is still cleaning up the earlier replica of the same bytes. Wait a few minutes, then retry the upload. |
-| Uploads return `SlowDown` while many earlier uploads are still waiting for Filecoin storage | The local cache is full. Retry later; if it continues, see [Cache Full](../operations/troubleshooting.md#cache-full). |
-| Upload succeeds but Filecoin storage is pending | Check the dashboard task view or `synaps3 admin task list --status pending`. |
-| Object size is rejected | Keep the object between `127` and `1,065,353,216` bytes. |
-| Remote host cannot reach the admin dashboard | Keep admin on loopback and use `ssh -L 9090:127.0.0.1:9090 user@server`. |
+| `AccessDenied` | Check the access key and secret key. Creating a bucket needs the `userplus` or `admin` role. |
+| The client uses virtual-hosted bucket URLs | Enable path-style addressing. |
+| `503 SlowDown` | Read the error message and see [S3 Requests Return SlowDown](../operations/troubleshooting.md#s3-requests-return-slowdown). |
+| Object size is rejected | Keep the object between 127 and 1,065,353,216 bytes. |
+| The upload succeeds but Filecoin storage is pending | Check the dashboard **Tasks** page or `synaps3 admin task list --status pending`. |

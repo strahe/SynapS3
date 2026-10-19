@@ -1,88 +1,71 @@
 ---
 title: Production Checklist
-description: Prepare a SynapS3 deployment.
+description: Check network exposure, data, secrets, wallet, configuration, and monitoring before serving production traffic.
 ---
 
 # Production Checklist
 
-Before serving traffic, verify local disk, database health, background tasks, transport security, and recovery paths.
+Complete these checks before you serve production traffic.
 
 ## Network Exposure
 
-| Surface | Recommended exposure |
+| Surface | Exposure |
 | --- | --- |
-| S3 API | Require native TLS or a controlled TLS reverse proxy; expose only to trusted clients or an authenticated edge. |
-| Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling or HTTPS reverse proxy for remote access. |
-| Metrics | Scrape with Admin auth from the private network or host-local agent only. |
+| S3 API (`server.port`, default `:8080`) | Serve it over TLS, natively or through your own proxy. Expose it only to the clients that need it. |
+| Dashboard and Admin API (`admin.addr`, default `127.0.0.1:9090`) | Keep it on loopback. For remote access, use an SSH tunnel, the Docker Admin HTTPS option, or an HTTPS reverse proxy with access control. Never bind it to a public interface. |
+| `/metrics` | Requires Admin authentication. Scrape it from the same host or a private network. |
+| `/healthz` | Requires no authentication. An `unhealthy` response names the failing check. |
 
-Do not bind the Admin listener or port 9090 to a public interface. For internet access, keep SynapS3 on loopback, use an HTTPS reverse proxy, and keep Admin authentication enabled.
+The Admin API can change data, S3 credentials, and wallet funds. Keep `admin.auth.enabled = true`. Behind a reverse proxy, set `admin.trusted_proxies` to the proxy address only if the proxy strips forwarded headers sent by clients.
 
-## Runtime Data
+SynapS3 needs outbound access to `filecoin.rpc_url` and to the storage providers' service URLs.
 
-- Put `/var/lib/synaps3` or `~/.synaps3` on durable storage.
-- Keep PostgreSQL on durable storage, and keep its DSN in protected configuration or `.env`.
-- S3 secret keys are stored as plaintext in PostgreSQL. Restrict database and backup access as strictly as access to S3 credentials.
-- Stop SynapS3 before backup. Use a database-native backup plus matching configuration and cache data.
-- Keep the database and cache at the same recovery point, verify backup archives, and test the documented restore order.
-- Watch free space on the database volume and cache volume.
-- Keep `config.toml`, `.env`, `.postgres-admin-password`, databases, cache data, and wallet material out of git. Protect configuration, secret, and credential files with `0600` permissions.
+## Data and Backups
+
+- Put the SynapS3 data directory (`~/.synaps3` or `/var/lib/synaps3`) and PostgreSQL on durable storage, and monitor free space on both.
+- The database and its backups contain S3 secret keys in plaintext. Restrict access to them as you would to S3 credentials.
+- Back up and test a restore as described in [Runtime Data](../configuration/runtime-data.md).
+- Keep `config.toml`, `.env`, `.postgres-admin-password`, database dumps, cache data, and wallet keys out of git, with mode `0600` for credential files.
 
 ## Secrets and Wallet
 
-- Store `SYNAPS3_FILECOIN_PRIVATE_KEY` in a host environment, `.env`, or secret manager.
-- Store the Admin password securely. Rotate it offline with `synaps3 admin-auth reset-password --config <path>` when it is lost or exposed; this also invalidates existing browser sessions.
-- Confirm `synaps3 admin status` reports a healthy wallet after startup.
-- Deposit USDFC and approve FWSS before expected uploads. This example deposits `2 USDFC`:
+- Keep `SYNAPS3_FILECOIN_PRIVATE_KEY` in the host environment, `.env`, or a secret manager.
+- Keep the Admin password in a password manager. If it is lost or exposed, run `synaps3 admin-auth reset-password --config <path>` and restart SynapS3; this also signs out all browser sessions.
+- Fund the wallet before uploads: keep FIL for gas, deposit USDFC, and approve FWSS on the **Wallet** page or with the CLI:
 
-```bash
-synaps3 wallet deposit 2 # 2 USDFC
-synaps3 wallet approve
-```
-
-A new deposit or approval should print `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`.
+  ```bash
+  synaps3 wallet deposit 2 # 2 USDFC
+  synaps3 wallet approve
+  ```
 
 ## Configuration Review
-
-Check the effective settings:
 
 ```bash
 synaps3 admin settings get
 ```
 
-Review these values first:
-
 | Field | Check |
 | --- | --- |
-| `admin.addr` | Keep `127.0.0.1:9090` unless protected by HTTPS and access control. |
-| `admin.trusted_proxies` | Keep empty unless trusted proxies strip untrusted forwarded headers. |
-| `admin.auth.enabled` | Keep `true` for production. |
-| Admin password hash and `admin.auth.session_secret` | Must be present; generate the hash with init/reset and manage the session secret as a secret. |
-| `filecoin.network` | Must match the database's Filecoin chain; use a separate database for another network. |
-| `filecoin.allow_private_networks` | `false` unless provider URLs are trusted private endpoints |
-| `cache.max_size_gb` | Size it for expected upload backlog |
-| `logging.format` | Compose sets `json`; built-in default is `text`. |
-
-After saving settings, restart SynapS3, check `/healthz`, and run `synaps3 admin settings get` again to verify the effective values.
+| `admin.addr` | `127.0.0.1:9090`, unless it is behind HTTPS and access control. |
+| `admin.trusted_proxies` | Empty, unless a trusted proxy strips client forwarded headers. |
+| `admin.auth.enabled` | `true`. |
+| `filecoin.network`, `filecoin.rpc_url` | The intended network; one database per network. |
+| `filecoin.allow_private_networks` | `false`, unless you trust storage providers on private networks. |
+| `cache.max_size_gb` | Large enough for the upload backlog that is not yet on Filecoin. |
+| `logging.format` | `json` for log collection. The built-in default is `text`; the Docker deployment sets `json`. |
 
 ## Monitoring
 
-At minimum, monitor:
+Monitor at least:
 
-- `GET /healthz`
-- `GET /metrics`
-- cache usage
-- task queue depth
-- failed task count
-- background task activity
-- provider and data set health
+- the `status` field of `/healthz`, not only the HTTP status;
+- `synaps3_cache_used_bytes` against `cache.max_size_gb`;
+- `synaps3_task_queue_depth` and the failed task count from `synaps3 admin task stats`;
+- storage provider and data set health on the dashboard.
 
-Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, cache, or background task checks failed.
+See [What to Alert On](./health-metrics.md#what-to-alert-on).
 
-## Recovery Readiness
-
-Keep a verified backup of the database, matching cache, and executable. Follow [Backup and Recovery](./upgrade-recovery.md) for recovery checks.
-
-Check:
+## Before Go-Live
 
 ```bash
 curl http://127.0.0.1:9090/healthz
@@ -90,10 +73,4 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 50
 ```
 
-Expected result: health is `ok`, task queues are understood, and every failed task has a clear handling decision.
-
-## Recovery Entry Points
-
-- Health issue: start with [Health and Metrics](./health-metrics.md).
-- Failed background work: use [Troubleshooting](./troubleshooting.md).
-- Backup or restore: follow [Backup and Recovery](./upgrade-recovery.md).
+Go live when health is `ok`, every failed task has a known cause, and you have a verified backup.

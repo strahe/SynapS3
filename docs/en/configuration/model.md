@@ -1,86 +1,52 @@
 ---
 title: Configuration Model
-description: Understand SynapS3 configuration sources, defaults, editable settings, and high-risk fields.
+description: Find where SynapS3 reads settings, how changes apply, and what each setting group controls.
 ---
 
 # Configuration Model
 
-SynapS3 reads TOML configuration first, then applies `SYNAPS3_` environment overrides. Use a config file for stable settings and environment variables for secrets or deployment-specific overrides.
+SynapS3 reads a TOML configuration file, then applies `SYNAPS3_` [environment variables](./environment.md) on top. Keep stable settings in the file and secrets or host-specific values in the environment.
 
-## Source Rules
+## Sources and Changes
 
-- Without `--config`, SynapS3 reads `~/.synaps3/config.toml`.
-- Pass `--config <path>` to use another file.
-- A `config.toml` in the current directory is ignored unless passed explicitly.
-- `synaps3 init --dir <path>` creates files but does not change the default config source.
-- Admin settings writes rewrite `config.toml`; comments and ordering are not preserved.
-
-Check the effective settings:
+- Commands read the file given by `--config`, then `SYNAPS3_CONFIG`, then `~/.synaps3/config.toml`. A `config.toml` in the current directory is not read unless you pass it.
+- After `synaps3 init --dir <path>`, pass `--config <path>/config.toml` to later commands.
+- The **Settings** page and `synaps3 admin settings set` rewrite `config.toml`; comments and ordering are not kept.
+- A field set by an environment variable cannot be changed from **Settings** or the CLI. Change the environment instead.
+- Saved settings apply after a restart. `synaps3 admin settings get` shows the saved values and **Restart required**.
 
 ```bash
 synaps3 admin settings get
 ```
 
-The output shows the config path, whether writes are allowed, and whether restart is required.
+## Required Settings
 
-After saving settings, restart SynapS3, check `/healthz`, and run `synaps3 admin settings get` again to confirm the effective values.
-
-## Required Secrets
-
-Set the Filecoin wallet private key before normal serving:
-
-```toml
-[filecoin]
-private_key = "0x..."
-```
-
-Or manage the value through `SYNAPS3_FILECOIN_PRIVATE_KEY`; see [Environment Variables](./environment.md) for supported overrides.
-
-Each database is bound to one wallet address and Filecoin chain; a different wallet or network prevents startup. You can change the RPC endpoint when it serves the same chain.
-
-Keep private keys out of commits, container images, and shell history.
-
-Admin auth also requires a password hash and `admin.auth.session_secret` when `admin.auth.enabled = true`. `synaps3 init` creates both for new configs; use `synaps3 admin-auth reset-password --config <path>` when a password is missing or must be rotated. Password reset also rotates the session secret.
-
-Keep configuration, `.env`, and credential files at permission mode `0600`.
-
-## S3 Server
-
-The S3 API supports native TLS through these fields:
-
-```toml
-[server.tls]
-enabled = true
-cert_file = "/path/to/tls.crt"
-key_file = "/path/to/tls.key"
-```
-
-The certificate and private key must be readable by the SynapS3 process. In a container deployment, their configured paths must exist inside the container, typically through read-only mounts. Production S3 traffic must use native TLS or a controlled TLS reverse proxy.
-
-The Admin endpoint has separate exposure controls. Keep `admin.addr` on loopback, use an SSH tunnel, or place it behind an access-controlled HTTPS reverse proxy.
-
-## Database Choice
-
-SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL such as `postgres://synaps3:PASSWORD@db.example.com:5432/synaps3?sslmode=require`; it has no default. The role must be able to create tables in the database, because SynapS3 applies its migrations at startup. Keep the DSN in protected configuration or secret storage.
-
-`database.max_open_conns` sizes the connection pool.
-
-## Main Sections
-
-| Section | Purpose |
+| Field | Notes |
 | --- | --- |
-| `server` | S3 API listener, concurrency limits, and TLS fields. |
-| `s3` | Region reported to S3 clients. |
-| `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and replica policy. |
-| `filecoin.observability` | Provider and local data set health checks. |
-| `filecoin.upload_speed_test` | Automatic upload speed tests and periodic remeasurement. |
-| `database` | PostgreSQL metadata database. |
-| `cache` | Local object cache directory, capacity, and eviction policy. |
-| `worker.tasks` | Global background task and upload concurrency limits. |
-| `logging` | Runtime log level, format, and S3 access logs. |
-| `admin` | Dashboard, Admin API listener, and Admin auth settings. |
+| `database.dsn` | PostgreSQL connection URL, for example `postgres://synaps3:PASSWORD@db.example.com:5432/synaps3?sslmode=require`. No default. The role must be able to create tables; SynapS3 applies its schema migrations at startup. |
+| `filecoin.private_key` | Wallet private key. Without it, SynapS3 starts in setup mode. Set it in the file or `SYNAPS3_FILECOIN_PRIVATE_KEY`; the dashboard cannot set it. |
+| `admin.auth.password_hash`, `admin.auth.session_secret` | Required while `admin.auth.enabled = true`. `synaps3 init` creates both. `synaps3 admin-auth reset-password --config <path>` sets a new password and rotates the session secret, which signs out all browser sessions. |
 
-## Important Defaults
+A database is bound to the first wallet address and Filecoin network that use it. Starting with another wallet or network fails with `database belongs to another Filecoin wallet or network`. You can change `filecoin.rpc_url` to another endpoint on the same network.
+
+Keep the configuration file, `.env`, and other credential files at mode `0600`, and keep private keys out of commits, images, and shell history.
+
+## Sections
+
+| Section | Controls |
+| --- | --- |
+| `server` | S3 API listener, connection and request limits, and TLS. |
+| `s3` | Region reported to S3 clients. |
+| `filecoin` | Network, RPC endpoint, wallet, private-network storage provider URLs, CDN retrieval, default replica target, and storage provider selection. |
+| `filecoin.observability` | Storage provider and data set health checks. |
+| `filecoin.upload_speed_test` | Automatic upload speed tests. |
+| `database` | PostgreSQL connection and pool size. |
+| `cache` | Local cache directory, capacity, and eviction policy. |
+| `worker.tasks` | Background task concurrency and batch submission. |
+| `logging` | Log level, format, and S3 access logs. |
+| `admin` | Dashboard and Admin API listener, trusted proxies, and authentication. |
+
+## Defaults
 
 | Field | Default |
 | --- | --- |
@@ -89,13 +55,17 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `server.max_requests` | `512` |
 | `s3.region` | `us-east-1` |
 | `filecoin.network` | `calibration` |
+| `filecoin.rpc_url` | `https://api.calibration.node.glif.io/rpc/v1` |
 | `filecoin.default_copies` | `3` |
 | `filecoin.anchor_provider_tier` | `approved` |
 | `filecoin.upload_speed_test.auto_scope` | `trusted` |
 | `filecoin.upload_speed_test.retest_interval` | `0s` |
-| `database.driver` | `postgres` |
+| `filecoin.observability.interval` | `5m` |
+| `filecoin.observability.timeout` | `5s` |
+| `filecoin.observability.concurrency` | `8` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
+| `cache.dir` | `~/.synaps3/cache` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
 | `cache.lru_high_watermark_percent` | `80` |
@@ -106,83 +76,118 @@ SynapS3 stores metadata in PostgreSQL. Set `database.dsn` to a connection URL su
 | `worker.tasks.upload_concurrency` | `4` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
-| `worker.tasks.commit_seal_on_cache_pressure` | `false` |
 | `worker.tasks.commit_max_backlog` | `256` |
+| `worker.tasks.commit_seal_on_cache_pressure` | `false` |
+| `logging.level` | `info` |
+| `logging.format` | `text` (the Docker deployment sets `json`) |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` limits all running background tasks, including recovery. `upload_concurrency` additionally limits simultaneous uploads, including reading and hashing cached data. Both must be positive; an upload limit above the global limit is valid. Tasks without a free slot remain queued in due order while other task types can proceed. Wallet operations and upload measurements each run one at a time. Task settings require a SynapS3 restart. Each task type declares its finite retry policy; each execution retains the policy recorded when created. Task history is retained indefinitely.
+## Allowed Values
 
-Uploads and replicas sent to the same data set collect into a batch until submission can proceed. `commit_max_pieces` (1–200) limits pieces per transaction, not the collection size; data sets with an ID below 1,559 on Mainnet or 32,331 on Calibration take at most 80. The next batch becomes eligible when collected pieces reach the applicable per-transaction limit, the data set stops accepting new data, submission is requested manually, or the oldest piece has waited `commit_max_wait` (0–30m); `0s` removes the collection delay. Every batch waits for one of the data set's four in-flight slots and for earlier signed batches ready to submit. It then signs the oldest pieces up to the limit and immediately attempts submission; remaining pieces keep collecting with their original wait times. Upload data awaiting submission stays in the local cache. Longer windows delay submission, replicas that need a committed source, and local cache eviction.
+- `filecoin.network`: `calibration`, `mainnet`. `filecoin.rpc_url` must serve the same network; the Mainnet default is `https://api.node.glif.io/rpc/v1`. When you change the network on the **Settings** page, a default RPC URL switches with it.
+- `filecoin.default_copies`: `1` through `8`.
+- `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
+- `filecoin.upload_speed_test.auto_scope`: `trusted`, `all`. `retest_interval` must be `0s` or more.
+- `cache.eviction_policy`: `lru`, `after_upload`, `none`.
+- `cache.lru_low_watermark_percent` and `cache.lru_high_watermark_percent`: `0 <= low < high <= 100`.
+- `worker.tasks.commit_max_pieces`: `1` through `200`. `commit_max_wait`: `0s` through `30m`. `commit_max_backlog`: at least `commit_max_pieces`.
+- `server.max_requests`: at most `server.max_connections`. `database.max_idle_conns`: at most `database.max_open_conns`.
+- `logging.level`: `debug`, `info`, `warn`, `error`. `logging.format`: `json`, `text`.
+- `admin.trusted_proxies`: IP addresses or CIDR ranges.
 
-Once `commit_max_backlog` transferred pieces (at least `commit_max_pieces`), from uploads or replicas, wait on one data set for an unsent batch, new uploads and replicas to it wait. A batch that does not fit one add-pieces message is split and signed again with fewer pieces.
+## S3 Listener
 
-Enable **Submit batches early to free cache space** in Settings (`worker.tasks.commit_seal_on_cache_pressure`) to submit batches early when safe automatic cleanup cannot free enough space. Early submission still waits for an in-flight slot and any earlier batches ready to submit. It is off by default and requires restart. With `lru`, it follows the effective cleanup target; with `after_upload`, a refused write supplies the required space. It has no automatic effect under `none`. Smaller batches can increase transaction costs. Confirmation and the bucket's durability requirements still apply before cache removal.
+Enable native TLS for the S3 API:
 
-Open **Batches** to see collected data. **Submit next batch** requests one submission up to the piece limit; remaining data stays waiting. Manual submission works independently of the automatic switch and cache policy, and waits for submission capacity. Open a batch to see its pieces, submission times, transaction ID, and errors; a stopped batch shows **Retry** when recovery is allowed. Each piece lists a linked object and the number of other versions sharing its data. Missing historical object information or size is marked unavailable.
+```toml
+[server.tls]
+enabled = true
+cert_file = "/path/to/tls.crt"
+key_file = "/path/to/tls.key"
+```
+
+The SynapS3 process must be able to read both files. Without native TLS, put the S3 API behind your own TLS proxy for production traffic.
+
+When more than `server.max_requests` S3 requests are in flight, extra requests receive `503 SlowDown`.
+
+## Cache
+
+`cache.max_size_gb` caps local cache usage in GiB. A write reserves its full size before SynapS3 reads the body; if it does not fit, the write fails with `503 SlowDown`. See [Cache Full](../operations/troubleshooting.md#cache-full).
+
+| `cache.eviction_policy` | Behavior |
+| --- | --- |
+| `lru` | When usage reaches the high watermark, or a write is refused, SynapS3 removes the least recently read versions that are safe to remove until usage reaches the low watermark. The target always leaves room for one maximum-size object (1,065,353,216 bytes). |
+| `after_upload` | SynapS3 removes each version once its bucket's minimum durable replicas are committed. |
+| `none` | SynapS3 never removes cached data automatically. |
+
+Watermarks apply only to `lru`. Removal runs in the background; a write does not wait for it. Which versions are safe to remove is described in [Write Path and Cache](../concepts/write-path-cache.md#cache-eviction).
+
+## Background Tasks
+
+`worker.tasks.concurrency` (**Task concurrency**) limits all background tasks. `worker.tasks.upload_concurrency` (**Upload concurrency**) also limits uploads to storage providers, including reading and hashing cached data. When a limit is reached, tasks wait in the queue. Failed tasks retry a fixed number of times; task history is kept indefinitely.
+
+## Batches
+
+SynapS3 adds uploaded pieces to their data set on chain in batches, one transaction per batch. The **Batches** page lists them.
+
+| Field | Settings label | Effect |
+| --- | --- | --- |
+| `worker.tasks.commit_max_pieces` | **Batch size** | Maximum pieces per transaction. |
+| `worker.tasks.commit_max_wait` | **Batch wait** | Maximum time the oldest piece waits for its batch to fill. `0s` submits without waiting. |
+| `worker.tasks.commit_max_backlog` | **Batch backlog** | When this many transferred pieces wait for one data set, new uploads and replicas to that data set wait. |
+| `worker.tasks.commit_seal_on_cache_pressure` | **Submit batches early to free cache space** | Submits batches early when automatic cache cleanup cannot free enough space. Has no effect with `cache.eviction_policy = none`. |
+
+A batch is submitted when it reaches the batch size, when its oldest piece reaches the batch wait, when the data set stops accepting data, or when you select **Submit next batch** on the **Batches** page. Each data set has at most four submitted batches awaiting confirmation; later batches wait.
+
+Pieces waiting for submission stay in the local cache. A longer batch wait delays cache release and replicas that copy from the first replica. Smaller batches mean more transactions and higher fees.
+
+Open a batch to see its pieces, transaction, and errors. A stopped batch shows **Retry**.
 
 ## Provider Selection
 
-New replica providers need fresh healthy observations and a successful upload speed test for their current service URL. `filecoin.anchor_provider_tier` requires at least one selected provider from the configured Approved or Endorsed list; `none` removes this requirement. Endorsed membership is independent of Approved. Assigned providers stay assigned when membership or speed results change.
+SynapS3 chooses storage providers when it prepares a bucket, adds replicas, or replaces a storage provider automatically. A candidate needs a recent healthy check and a successful upload speed test for its current service URL. Assigned storage providers stay assigned when their tier membership or speed results change, and uploads to them do not wait for speed tests.
 
-Bucket creation succeeds while storage is prepared. Automatic provider selection waits for eligible Approved and Endorsed providers to complete tests for their current URL, then checks the replica target and anchor tier. Waiting does not consume retries. A confirmed empty required tier list stops preparation; resolve the cause shown in the bucket or task, then use **Retry**. Uploads to assigned providers do not wait for tests.
+`filecoin.anchor_provider_tier` (**Provider requirement**) requires at least one selected storage provider from the FWSS approved list (`approved`) or the endorsed list (`endorsed`); `none` drops the requirement. If the required list is empty, bucket preparation stops; fix the cause shown on the bucket or task, then select **Retry**.
 
-Choose **Provider preference** at bucket creation: `distribution` (default) ranks by fewer non-retired data sets, then faster uploads; `speed` reverses that order. Exact ties are randomized. The preference is fixed for the bucket and applies to additional replicas and automatic replacements; manual replacements bypass ranking. S3-created buckets use distribution. The API accepts and returns `provider_selection_strategy`. Additional replicas and manual replacements may reuse an eligible provider after all its data sets for the bucket are retired; automatic replacements exclude previously used providers.
+Speed tests:
 
-Approved, Endorsed, and bound providers are automatically tested when first eligible and after a service URL change. `filecoin.upload_speed_test.auto_scope = "all"` also tests other eligible providers. The default `trusted` selection pool consists of trusted, bound, and manually tested providers. Setting `anchor_provider_tier = "none"` does not expand it. Test other providers with **Test remaining providers** or individual tests in **Storage**.
+- Approved, endorsed, and assigned storage providers are tested automatically when they first become eligible and after their service URL changes.
+- `auto_scope = "trusted"` (**Trusted providers**) tests only those. Other storage providers become candidates after you test them with **Test remaining providers** or from their details on the **Storage** page. `all` (**All providers**) tests every eligible storage provider.
+- `retest_interval` greater than `0s` retests storage providers periodically. With `0s`, a failed or timed-out test stays failed until you select **Retry**.
 
-Set `retest_interval` to a positive duration for periodic remeasurement; `0s` disables it. Upload failures and timeouts require **Retry** unless periodic remeasurement is enabled. Interrupted tests are retried automatically. Changes to `anchor_provider_tier` and `upload_speed_test` require restart.
+A bucket is created immediately. Its storage preparation waits until eligible approved and endorsed storage providers finish speed tests, then checks the replica target and the provider requirement. Waiting does not use up retries.
 
-## Admin Session Lifetime
+**Provider preference** is chosen at bucket creation and cannot be changed:
 
-`admin.auth.session_ttl` controls the lifetime of each standard Admin UI session token. It is neither a server-enforced idle timeout nor an absolute cap on a login. After the earlier of five minutes or half the token lifetime, the server permits renewal. The official dashboard requests renewal only after a trusted pointer, click, keyboard, or wheel interaction; background polling and returning to a visible tab do not trigger it. Any client holding the valid session cookie and matching CSRF token can call the refresh endpoint after `refresh_after`. If no client requests renewal, the token expires at `expires_at`.
+| Option | API value | Ranking |
+| --- | --- | --- |
+| **Distribution first** (default) | `distribution` | Storage providers with fewer active data sets first, then faster uploads. |
+| **Speed first** | `speed` | Faster uploads first, then fewer active data sets. |
 
-The login page uses a browser-session cookie by default. Selecting **Keep me signed in** creates a persistent cookie and uses the greater of 30 days or `admin.auth.session_ttl`. While the dashboard continues to receive user activity, it can keep requesting renewal; the server applies no absolute login lifetime cap.
+Ties are broken randomly. Buckets created through the S3 API use `distribution`. The preference applies to additional replicas and automatic replacements. A storage provider can serve a bucket again only after all its data sets for that bucket are retired, and automatic replacement never picks a storage provider the bucket has used before.
 
-## Allowed Values
+## Admin Sessions
 
-- `filecoin.network`: `calibration`, `mainnet`.
-- `filecoin.default_copies`: `1` through `8`.
-- `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
-- `filecoin.upload_speed_test.auto_scope`: `trusted`, `all`; `retest_interval` must be nonnegative.
-- `database.driver`: `postgres`.
-- `cache.eviction_policy`: `lru`, `after_upload`, `none`.
-- `logging.level`: `debug`, `info`, `warn`, `error`.
-- `logging.format`: `json`, `text`.
-- `admin.trusted_proxies`: IP or CIDR entries. Keep empty unless a trusted reverse proxy strips untrusted forwarded headers.
+`admin.auth.session_ttl` sets the lifetime of a dashboard session. While you use the dashboard (pointer, click, keyboard, or wheel input), it renews the session; background polling does not. A session that is not renewed expires after `session_ttl`. There is no maximum login lifetime.
 
-Cache eviction policies have these user-visible results:
-
-- `lru`: when cache usage reaches the high watermark, or a write is refused because the cache is full, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark. The effective low watermark never leaves less than one largest object (`1,065,353,216` bytes) of free space, which matters only for small caches.
-- `after_upload`: after a version meets its bucket's minimum durable replicas, SynapS3 queues it for asynchronous removal. A later remote read can restore the cache, and that restored entry is not immediately removed again.
-- `none`: SynapS3 does not automatically remove local cache data.
-
-The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain saved but have no effect under `after_upload` or `none`.
-
-```toml
-[cache]
-eviction_policy = "lru"
-lru_high_watermark_percent = 80
-lru_low_watermark_percent = 50
-```
-
-Eviction settings take effect after restart. Cache cleanup is asynchronous: a write does not wait for an LRU pass, and a refused write only requests the next one.
+By default the login cookie lasts for the browser session. **Keep me signed in** sets a persistent cookie that lasts 30 days or `session_ttl`, whichever is longer.
 
 ## High-Risk Fields
 
 | Field | Risk |
 | --- | --- |
-| `admin.addr` | Exposing Admin API allows operational writes. Keep loopback unless protected by HTTPS and access control. |
-| `admin.trusted_proxies` | Enables `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, and `X-Forwarded-Host` trust for matching proxies. Configure only proxies you control. |
-| Admin password hash | Controls Admin login. Do not configure it manually; generate it with `synaps3 init` or `synaps3 admin-auth reset-password`. |
-| `admin.auth.session_secret` | Signs Admin browser sessions. Treat as secret. |
-| `filecoin.private_key` | Controls wallet spending and storage operations. Treat as a secret. |
-| `database.dsn` | May contain database credentials. Treat it as a secret. |
-| `filecoin.network` | Must match the database's Filecoin chain and the RPC endpoint. |
-| `filecoin.allow_private_networks` | Allows private-network provider URLs. Enable only for trusted private deployments. |
-| `cache.max_size_gb` | Too small blocks writes; too large can consume the host disk. |
-| `cache.lru_high_watermark_percent` | A high value leaves less headroom for writes while eviction catches up. |
-| `cache.lru_low_watermark_percent` | A low value removes more cached data during each LRU cycle. |
+| `admin.addr` | The Admin API can change data, credentials, and wallet funds. Keep it on loopback unless it is behind HTTPS and access control. |
+| `admin.trusted_proxies` | SynapS3 trusts `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, and `X-Forwarded-Host` from these addresses. List only proxies you control that strip these headers from client requests. |
+| `admin.auth.password_hash` | Controls Admin login. Generate it with `synaps3 init` or `synaps3 admin-auth reset-password`. |
+| `admin.auth.session_secret` | Signs Admin sessions. Treat it as a secret. |
+| `filecoin.private_key` | Spends wallet funds. Treat it as a secret. |
+| `database.dsn` | Usually contains the database password. Treat it as a secret. |
+| `filecoin.network` | Must match the database and `filecoin.rpc_url`. Use a separate database per network. |
+| `filecoin.allow_private_networks` | Allows storage provider URLs on private networks. Enable only when you trust those storage providers. |
+| `cache.max_size_gb` | Too small refuses writes; too large can fill the disk. |
+| `cache.lru_high_watermark_percent` | A high value leaves less room for writes while cleanup runs. |
+| `cache.lru_low_watermark_percent` | A low value removes more cached data in each cleanup. |

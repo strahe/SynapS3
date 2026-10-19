@@ -20,27 +20,27 @@ hero:
       link: /en/getting-started/s3-clients
 features:
   - title: Self-Hosted Gateway
-    details: Run SynapS3 in your own environment with Docker or a local build.
+    details: Run a single SynapS3 node with Docker Compose or a source build.
     link: /en/getting-started/overview#start-here
     linkText: Installation Options
   - title: S3 Client Compatibility
-    details: Create S3 credentials and connect AWS CLI, rclone, or MinIO Client.
+    details: Connect AWS CLI, rclone, or MinIO Client with path-style addressing.
     link: /en/getting-started/s3-clients
     linkText: Client Examples
   - title: Filecoin Storage
-    details: Write objects to Filecoin while keeping standard S3 access.
+    details: Store objects with Filecoin storage providers behind a standard S3 endpoint.
     link: /en/concepts/filecoin-storage-flow
     linkText: Storage Flow
   - title: Admin Dashboard
-    details: View buckets, objects, wallet, tasks, topology, settings, and health.
+    details: Manage buckets, objects, wallet, tasks, storage providers, settings, and health.
     link: /en/reference/admin-api
     linkText: Admin API Reference
   - title: Operations
-    details: Check health and task queues, then handle upgrades, recovery, and troubleshooting.
+    details: Monitor health and tasks, back up runtime data, and recover from failures.
     link: /en/operations/troubleshooting
     linkText: Troubleshooting
   - title: Replica Repair
-    details: "Coming soon: replica repair for provider outages."
+    details: "Coming soon: replica repair for storage provider outages."
     link: /en/concepts/filecoin-storage-flow#planned-replica-repair
     linkText: Feature Details
 ---

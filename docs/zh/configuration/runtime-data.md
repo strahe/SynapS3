@@ -1,86 +1,51 @@
 ---
 title: 运行数据
-description: 理解 SynapS3 配置、元数据、缓存数据的存放位置和备份范围。
+description: 了解 SynapS3 的数据存放位置，并把它们作为同一个恢复点进行备份和恢复。
 ---
 
 # 运行数据
 
-SynapS3 将配置和缓存对象数据存储在本地磁盘，元数据存储在 PostgreSQL 中。应把它们都放在可靠存储上。可用的备份必须让数据库和缓存处于同一恢复时间点。
+SynapS3 把配置和缓存对象放在本地磁盘上，把元数据放在 PostgreSQL 中。缓存里可能有尚未存到 Filecoin 的对象，数据库则记录每个对象存在哪里。两者都要放在持久存储上，并一起备份、一起恢复。
 
-## 默认本地布局
+## 存放位置
 
-```text
-~/.synaps3/
-  config.toml
-  admin-initial-password
-  cache/
-```
+| 数据 | 默认位置 | 内容 |
+| --- | --- | --- |
+| `config.toml` | `~/.synaps3/` | 设置和 Admin 凭据；通常还包含数据库 DSN 和钱包私钥。 |
+| `admin-initial-password` | `~/.synaps3/` | 非交互式 `synaps3 init` 或 `synaps3 admin-auth reset-password` 写入的 Admin 密码。 |
+| `cache/` | `~/.synaps3/cache/`，或 `cache.dir` | 缓存的对象数据，包括尚未存到 Filecoin 的对象。 |
+| PostgreSQL 数据库 | `database.dsn` | 存储桶、对象、版本、副本、任务、钱包操作和 S3 用户。S3 secret key 以明文保存。 |
+| 环境变量中的密钥 | `.env` 或主机环境 | 私钥、DSN 和其他覆盖项。 |
 
-显式配置的 `cache.dir` 优先于默认值。
+Docker 部署中，这些文件位于 `synaps3-data` 卷的 `/var/lib/synaps3/`，托管数据库位于 `synaps3-postgres-data` 卷。
 
-## Docker 布局
-
-容器使用 `/var/lib/synaps3`：
-
-```text
-/var/lib/synaps3/
-  config.toml
-  admin-initial-password
-  cache/
-```
-
-Docker 部署通过 `synaps3-data` volume 挂载该路径，托管 PostgreSQL 数据库保存在 `synaps3-postgres-data` volume 中。Docker 专用的生命周期和备份命令见 [Docker 部署](../getting-started/docker.md)。
-
-## 必须持久保存的数据
-
-| 数据 | 原因 |
-| --- | --- |
-| `config.toml` | 保存未由环境变量管理的稳定运行设置。 |
-| `admin-initial-password` | 保存非交互 init 和密码重置生成的 Admin 密码。保持 `0600` 权限；安全保存密码后，只在本地 CLI 仍需自动读取时保留。 |
-| PostgreSQL 数据库 | 保存存储桶、对象、版本、后台任务、S3 用户和存储元数据。 |
-| `cache/` | 保存本地持久化的对象字节，用于 Filecoin 上传和读取回填。 |
-| 环境密钥 | 可能保存 Filecoin 私钥和部署特定覆盖项。 |
-
-让 `config.toml`、`.env`、凭据文件和导出的密钥保持 `0600` 权限。不要把钱包私钥提交到仓库或放进未受保护的归档。
-
-## 备份前检查
-
-1. 检查 `curl http://127.0.0.1:9090/healthz`，并记录任何非 `ok` 结果。
-2. 运行 `synaps3 admin task stats` 和 `synaps3 admin task list --status failed`，检查活动任务和失败任务。
-3. 使用当前部署方式的服务管理器停止 SynapS3，避免备份过程中对象数据、元数据和任务状态继续变化。
-
-不要在 SynapS3 仍在运行时创建文件系统归档。
+`config.toml`、`admin-initial-password`、`.env` 和备份文件只允许运行 SynapS3 的账户读取。密码存入密码管理器后，删除 `admin-initial-password`，除非本机的 `synaps3 admin` 命令还要读取它。
 
 ## 备份
 
-停止 SynapS3 后：
+Docker 部署可以直接使用[备份 Docker 数据](../getting-started/docker.md#备份-docker-数据)中的命令。
 
-1. 使用 `pg_dump`、托管数据库快照，或部署批准的 PostgreSQL 备份工具创建数据库原生备份。
-2. 备份 SynapS3 配置和缓存目录。
-3. 为数据库备份以及配置和缓存归档标记相同的恢复时间点。
-4. 验证两个备份产物后再重启服务。
+1. 记录当前状态：
 
-托管数据库的具体命令见 [Docker 部署](../getting-started/docker.md#备份-docker-数据)。
+   ```bash
+   curl http://127.0.0.1:9090/healthz
+   synaps3 admin task stats
+   synaps3 admin task list --status failed
+   ```
 
-## 重启并验证
-
-备份成功后，使用当前部署方式的服务管理器启动 SynapS3，然后运行：
-
-```bash
-curl http://127.0.0.1:9090/healthz
-synaps3 admin task stats
-```
-
-`/healthz` 应返回 `{"status":"ok"}`。恢复 S3 流量前，先排查 `setup` 或 `unhealthy`。
+2. 用服务管理器停止 SynapS3。SynapS3 运行期间打包的数据不一致。
+3. 用 `pg_dump` 或数据库快照备份数据库。
+4. 打包配置文件和缓存目录。
+5. 给数据库备份和打包文件标记同一个恢复点，记录校验和，并逐一验证。
+6. 启动 SynapS3，确认 `/healthz` 返回 `{"status":"ok"}`。
 
 ## 恢复顺序
 
 1. 停止 SynapS3，并保持 S3 流量关闭。
-2. 验证备份校验和，确认数据库与缓存带有相同的恢复时间点标记。
-3. 先把数据库原生备份恢复到空数据库，再把匹配的配置和缓存数据恢复到空位置。
-4. 确认恢复后的配置和凭据文件权限为 `0600`，并允许 SynapS3 运行账户读取。
-5. 启动 SynapS3，检查 `/healthz`、任务统计和失败任务，再通过 S3 API 读取一个已知对象。
+2. 验证校验和，确认数据库备份和打包文件带有同一个恢复点标记。
+3. 把数据库恢复到空数据库，再把配置和缓存恢复到空目录。
+4. 确认恢复后的配置和凭据文件权限为 `0600`，属主是运行 SynapS3 的账户。
+5. 启动写出该备份的 SynapS3 版本。
+6. 检查 `/healthz`、`synaps3 admin task stats` 和失败任务，再通过 S3 API 读取一个已知对象。
 
-不要把一个时间点的数据库备份与另一个时间点的缓存数据混用。
-
-使用与备份匹配的程序恢复。如果启动时报告数据库不兼容，请保持备份不变，并按[备份与恢复](../operations/upgrade-recovery.md)处理。
+不要把数据库备份和另一个恢复点的缓存数据混用。启动时报告数据库不兼容，见[数据库不兼容时](../operations/backup-recovery.md#数据库不兼容时)。

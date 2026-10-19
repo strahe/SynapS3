@@ -1,88 +1,71 @@
 ---
 title: 生产环境检查清单
-description: 准备 SynapS3 部署。
+description: 承接生产流量前，检查网络暴露、数据、密钥、钱包、配置和监控。
 ---
 
 # 生产环境检查清单
 
-承载流量前，检查本地磁盘、数据库健康、后台任务、传输安全和恢复路径。
+承接生产流量前，完成以下检查。
 
 ## 网络暴露
 
-| 界面 | 建议暴露方式 |
+| 入口 | 暴露方式 |
 | --- | --- |
-| S3 API | 使用原生 TLS 或受控的 TLS 反向代理；只暴露给可信客户端或认证后的入口。 |
-| 仪表盘和 Admin API | 保持在 `127.0.0.1:9090`；远程访问使用 SSH 隧道或 HTTPS 反向代理。 |
-| 指标 | 使用 Admin 认证，只允许私有网络或本机采集 agent 访问。 |
+| S3 API（`server.port`，默认 `:8080`） | 通过 TLS 提供服务，使用原生 TLS 或你自己的代理。只对需要的客户端开放。 |
+| 仪表盘和 Admin API（`admin.addr`，默认 `127.0.0.1:9090`） | 保持在回环地址。远程访问时使用 SSH 隧道、Docker 部署的 Admin HTTPS 选项，或带访问控制的 HTTPS 反向代理。不要绑定到公网接口。 |
+| `/metrics` | 需要 Admin 认证。从同一主机或私有网络抓取。 |
+| `/healthz` | 无需认证。`unhealthy` 响应会列出失败的检查项。 |
 
-不要把 Admin 监听地址或 9090 端口绑定到公网接口。需要公网访问时，让 SynapS3 保持监听回环地址，通过 HTTPS 反向代理访问，并保持 Admin 认证开启。
+Admin API 可以修改数据、S3 凭据和钱包资金。保持 `admin.auth.enabled = true`。位于反向代理之后时，只有代理会清除客户端发送的转发标头，才把代理地址填入 `admin.trusted_proxies`。
 
-## 运行数据
+SynapS3 需要能出站访问 `filecoin.rpc_url` 和存储提供方的服务 URL。
 
-- 将 `/var/lib/synaps3` 或 `~/.synaps3` 放在可靠磁盘上。
-- 将 PostgreSQL 放在可靠存储上，并把其 DSN 保存在受保护的配置或 `.env` 中。
-- PostgreSQL 以明文保存 S3 密钥。数据库和备份的访问权限应与 S3 凭据同样严格。
-- 备份前停止 SynapS3。使用数据库原生备份，并保存同一时间点的配置和缓存。
-- 让数据库与缓存处于同一恢复时间点，验证备份归档，并演练文档中的恢复顺序。
-- 监控数据库卷和缓存卷的剩余空间。
-- 不要把 `config.toml`、`.env`、`.postgres-admin-password`、数据库、缓存数据和钱包材料提交到 git。配置、密钥和凭据文件使用 `0600` 权限。
+## 数据与备份
 
-## 密钥和钱包
+- 把 SynapS3 数据目录（`~/.synaps3` 或 `/var/lib/synaps3`）和 PostgreSQL 放在持久存储上，并监控两者的剩余空间。
+- 数据库及其备份中有明文的 S3 secret key。按照 S3 凭据的标准限制访问。
+- 按[运行数据](../configuration/runtime-data.md)完成备份，并演练一次恢复。
+- `config.toml`、`.env`、`.postgres-admin-password`、数据库导出文件、缓存数据和钱包密钥不要进入 git；凭据文件权限设为 `0600`。
 
-- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在主机环境、`.env` 或密钥管理系统中。
-- 安全保存 Admin 密码。密码丢失或泄露时，用 `synaps3 admin-auth reset-password --config <path>` 离线轮换；这也会让已有浏览器 session 失效。
-- 启动后确认 `synaps3 admin status` 显示钱包状态正常。
-- 在预期上传前存入 USDFC 并批准 FWSS。以下示例存入 `2 USDFC`：
+## 密钥与钱包
 
-```bash
-synaps3 wallet deposit 2 # 2 USDFC
-synaps3 wallet approve
-```
+- `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在主机环境、`.env` 或密钥管理系统中。
+- Admin 密码存入密码管理器。丢失或泄露时，运行 `synaps3 admin-auth reset-password --config <path>` 并重启 SynapS3；所有浏览器会话也会随之退出登录。
+- 上传前为钱包准备资金：保留用于 gas 的 FIL，在 **Wallet** 页面或用 CLI 存入 USDFC 并批准 FWSS：
 
-新的 deposit 或 approval 应输出 `Transaction: <hash>` 和 `Status: confirmed`；已经完成 approval 时会输出 `FWSS approval: already approved`。
+  ```bash
+  synaps3 wallet deposit 2 # 2 USDFC
+  synaps3 wallet approve
+  ```
 
 ## 配置检查
-
-查看当前生效设置：
 
 ```bash
 synaps3 admin settings get
 ```
 
-优先检查这些字段：
-
-| 字段 | 检查点 |
+| 字段 | 检查 |
 | --- | --- |
-| `admin.addr` | 除非有 HTTPS 和访问控制保护，否则保持 `127.0.0.1:9090`。 |
-| `admin.trusted_proxies` | 除非可信代理会清理不可信 forwarded headers，否则保持空。 |
-| `admin.auth.enabled` | 生产环境保持 `true`。 |
-| Admin password hash 和 `admin.auth.session_secret` | 必须存在；password hash 由 init/reset 生成，session secret 按密钥管理。 |
-| `filecoin.network` | 必须与数据库绑定的 Filecoin 链一致；使用其他网络需要独立数据库。 |
-| `filecoin.allow_private_networks` | 除非存储提供方 URL 是可信私有端点，否则保持 `false` |
-| `cache.max_size_gb` | 按预计上传积压量规划 |
-| `logging.format` | Compose 设置为 `json`；内置默认值是 `text`。 |
-
-保存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效值。
+| `admin.addr` | `127.0.0.1:9090`，除非有 HTTPS 和访问控制保护。 |
+| `admin.trusted_proxies` | 为空，除非可信代理会清除客户端的转发标头。 |
+| `admin.auth.enabled` | `true`。 |
+| `filecoin.network`、`filecoin.rpc_url` | 目标网络；每个网络使用单独的数据库。 |
+| `filecoin.allow_private_networks` | `false`，除非信任私有网络中的存储提供方。 |
+| `cache.max_size_gb` | 足够容纳尚未存到 Filecoin 的上传积压。 |
+| `logging.format` | 接入日志采集时用 `json`。内置默认值是 `text`；Docker 部署设为 `json`。 |
 
 ## 监控
 
 至少监控：
 
-- `GET /healthz`
-- `GET /metrics`
-- 缓存使用量
-- 任务队列深度
-- failed 任务数量
-- 后台任务活动
-- 存储提供方和数据集健康状态
+- `/healthz` 的 `status` 字段，而不只是 HTTP 状态码；
+- `synaps3_cache_used_bytes` 相对 `cache.max_size_gb` 的比例；
+- `synaps3_task_queue_depth`，以及 `synaps3 admin task stats` 中的失败任务数；
+- 仪表盘中存储提供方和数据集的健康状态。
 
-`{"status":"unhealthy"}` 表示数据库、缓存或后台任务检查失败，需要处理。
+见[告警建议](./health-metrics.md#告警建议)。
 
-## 恢复准备
-
-保留经过验证的数据库备份、匹配缓存和对应程序。恢复检查见[备份与恢复](./upgrade-recovery.md)。
-
-检查：
+## 上线前
 
 ```bash
 curl http://127.0.0.1:9090/healthz
@@ -90,10 +73,4 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 50
 ```
 
-预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 failed 任务都有明确处理方式。
-
-## 恢复入口
-
-- 健康问题：先看[健康检查与指标](./health-metrics.md)。
-- 后台任务失败：使用[故障排查](./troubleshooting.md)。
-- 备份或恢复：按[备份与恢复](./upgrade-recovery.md)处理。
+健康状态为 `ok`、每个失败任务的原因都已查明、且有经过验证的备份后，再上线。

@@ -20,23 +20,23 @@ hero:
       link: /zh/getting-started/s3-clients
 features:
   - title: 自部署网关
-    details: 使用 Docker 或源码构建，在自己的环境中运行 SynapS3。
+    details: 使用 Docker Compose 或源码构建运行单节点 SynapS3。
     link: /zh/getting-started/overview#从哪里开始
     linkText: 安装方式
   - title: S3 客户端兼容
-    details: 创建 S3 凭据，连接 AWS CLI、rclone 或 MinIO Client。
+    details: 以 path-style 方式连接 AWS CLI、rclone 或 MinIO Client。
     link: /zh/getting-started/s3-clients
     linkText: 客户端示例
   - title: Filecoin 存储
-    details: 把对象写入 Filecoin，同时保留标准 S3 访问方式。
+    details: 通过标准 S3 端点，把对象存到 Filecoin 存储提供方。
     link: /zh/concepts/filecoin-storage-flow
     linkText: 存储流程
   - title: 仪表盘
-    details: 查看存储桶、对象、钱包、后台任务、存储拓扑、设置和健康状态。
+    details: 管理存储桶、对象、钱包、任务、存储提供方、设置和健康状态。
     link: /zh/reference/admin-api
     linkText: Admin API 参考
   - title: 运维
-    details: 检查健康状态和任务队列，处理升级、恢复和故障排查。
+    details: 监控健康状态和任务，备份运行数据，从故障中恢复。
     link: /zh/operations/troubleshooting
     linkText: 故障排查
   - title: 副本修复

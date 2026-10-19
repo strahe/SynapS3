@@ -1,86 +1,52 @@
 ---
 title: 配置模型
-description: 理解 SynapS3 配置来源、默认值、可编辑设置和高风险字段。
+description: 了解 SynapS3 从哪里读取设置、修改如何生效，以及各组设置控制什么。
 ---
 
 # 配置模型
 
-SynapS3 先读取 TOML 配置，再应用 `SYNAPS3_` 环境变量覆盖。稳定设置建议写在配置文件中；密钥和部署专用设置更适合放在环境变量里。
+SynapS3 先读取 TOML 配置文件，再用 `SYNAPS3_` [环境变量](./environment.md)覆盖。稳定的设置放在配置文件中，密钥和与主机相关的值放在环境变量中。
 
-## 来源规则
+## 来源与修改
 
-- 不传 `--config` 时，SynapS3 读取 `~/.synaps3/config.toml`。
-- 使用 `--config <path>` 指定其他文件。
-- 当前目录中的 `config.toml` 不会自动读取，除非显式传入。
-- `synaps3 init --dir <path>` 会创建文件，但不会改变默认配置来源。
-- Admin settings 写入会重写 `config.toml`；注释和顺序不会保留。
-
-查看当前生效设置：
+- 命令按顺序读取 `--config` 指定的文件、`SYNAPS3_CONFIG`、`~/.synaps3/config.toml`。当前目录下的 `config.toml` 不会被读取，除非显式传入。
+- 运行 `synaps3 init --dir <path>` 后，后续命令要传 `--config <path>/config.toml`。
+- **Settings** 页面和 `synaps3 admin settings set` 会重写 `config.toml`，注释和顺序不会保留。
+- 由环境变量设置的字段，不能在 **Settings** 页面或 CLI 中修改，要改环境变量。
+- 保存的设置在重启后生效。`synaps3 admin settings get` 显示已保存的值和 **Restart required**。
 
 ```bash
 synaps3 admin settings get
 ```
 
-输出会显示配置路径、是否允许写入，以及是否需要重启。
+## 必需设置
 
-保存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get`，确认实际生效值。
-
-## 必需密钥
-
-正常启动服务前，需要设置 Filecoin 钱包私钥：
-
-```toml
-[filecoin]
-private_key = "0x..."
-```
-
-也可以用 `SYNAPS3_FILECOIN_PRIVATE_KEY` 管理这个值；支持的覆盖项见[环境变量](./environment.md)。
-
-每个数据库固定绑定一个钱包地址和 Filecoin 链；换成其他钱包或网络会拒绝启动。RPC 地址可以更换，但必须连接同一条链。
-
-不要把私钥放进代码仓库、容器镜像或 shell history。
-
-当 `admin.auth.enabled = true` 时，Admin 认证还需要密码 hash 和 `admin.auth.session_secret`。新配置会由 `synaps3 init` 创建；如果缺失或需要轮换密码，运行 `synaps3 admin-auth reset-password --config <path>` 重新生成。重置密码也会轮换 session secret。
-
-配置、`.env` 和凭据文件都应保持 `0600` 权限。
-
-## S3 服务
-
-S3 API 通过以下字段支持原生 TLS：
-
-```toml
-[server.tls]
-enabled = true
-cert_file = "/path/to/tls.crt"
-key_file = "/path/to/tls.key"
-```
-
-证书和私钥必须允许 SynapS3 进程读取。在容器部署中，配置的路径必须存在于容器内，通常通过只读挂载提供。生产 S3 流量必须使用原生 TLS 或受控的 TLS 反向代理。
-
-Admin 端点有独立的暴露范围控制。让 `admin.addr` 保持回环地址、使用 SSH 隧道，或放在带访问控制的 HTTPS 反向代理之后。
-
-## 数据库选择
-
-SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 URL，例如 `postgres://synaps3:PASSWORD@db.example.com:5432/synaps3?sslmode=require`；它没有默认值。SynapS3 启动时会执行迁移，因此该角色必须能在数据库中建表。DSN 必须保存在受保护的配置或密钥存储中。
-
-`database.max_open_conns` 决定连接池大小。
-
-## 主要配置段
-
-| 配置段 | 用途 |
+| 字段 | 说明 |
 | --- | --- |
-| `server` | S3 API 监听、并发限制和 TLS 字段。 |
-| `s3` | 返回给 S3 客户端的 region。 |
-| `filecoin` | 网络、RPC、钱包、存储提供方 URL 策略、CDN hints 和副本策略。 |
-| `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
-| `filecoin.upload_speed_test` | 自动上传测速和定期重测。 |
-| `database` | PostgreSQL 元数据数据库。 |
-| `cache` | 本地对象缓存目录、容量和淘汰策略。 |
-| `worker.tasks` | 后台任务全局并发和上传并发限制。 |
-| `logging` | 运行时日志等级、格式和 S3 access log。 |
-| `admin` | 仪表盘、Admin API 监听地址和 Admin 认证设置。 |
+| `database.dsn` | PostgreSQL 连接 URL，例如 `postgres://synaps3:PASSWORD@db.example.com:5432/synaps3?sslmode=require`。没有默认值。该角色必须能建表；SynapS3 在启动时执行数据库迁移。 |
+| `filecoin.private_key` | 钱包私钥。未设置时 SynapS3 以设置模式启动。在配置文件或 `SYNAPS3_FILECOIN_PRIVATE_KEY` 中设置；仪表盘不能设置。 |
+| `admin.auth.password_hash`、`admin.auth.session_secret` | `admin.auth.enabled = true` 时必需。`synaps3 init` 会生成这两项。`synaps3 admin-auth reset-password --config <path>` 设置新密码并轮换会话密钥，所有浏览器会话随之退出登录。 |
 
-## 重要默认值
+数据库与第一次使用它的钱包地址和 Filecoin 网络绑定。换用其他钱包或网络启动会失败，报错 `database belongs to another Filecoin wallet or network`。`filecoin.rpc_url` 可以换成同一网络的其他端点。
+
+配置文件、`.env` 和其他凭据文件的权限保持 `0600`；私钥不要进入提交、镜像或 shell 历史。
+
+## 配置段
+
+| 配置段 | 控制内容 |
+| --- | --- |
+| `server` | S3 API 监听地址、连接和请求上限、TLS。 |
+| `s3` | 向 S3 客户端报告的区域。 |
+| `filecoin` | 网络、RPC 端点、钱包、私有网络中的存储提供方 URL、CDN 检索、默认目标副本数和存储提供方选择。 |
+| `filecoin.observability` | 存储提供方和数据集健康检查。 |
+| `filecoin.upload_speed_test` | 自动上传测速。 |
+| `database` | PostgreSQL 连接和连接池大小。 |
+| `cache` | 本地缓存目录、容量和淘汰策略。 |
+| `worker.tasks` | 后台任务并发和批次提交。 |
+| `logging` | 日志级别、格式和 S3 访问日志。 |
+| `admin` | 仪表盘和 Admin API 监听地址、可信代理和认证。 |
+
+## 默认值
 
 | 字段 | 默认值 |
 | --- | --- |
@@ -89,13 +55,17 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `server.max_requests` | `512` |
 | `s3.region` | `us-east-1` |
 | `filecoin.network` | `calibration` |
+| `filecoin.rpc_url` | `https://api.calibration.node.glif.io/rpc/v1` |
 | `filecoin.default_copies` | `3` |
 | `filecoin.anchor_provider_tier` | `approved` |
 | `filecoin.upload_speed_test.auto_scope` | `trusted` |
 | `filecoin.upload_speed_test.retest_interval` | `0s` |
-| `database.driver` | `postgres` |
+| `filecoin.observability.interval` | `5m` |
+| `filecoin.observability.timeout` | `5s` |
+| `filecoin.observability.concurrency` | `8` |
 | `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
+| `cache.dir` | `~/.synaps3/cache` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
 | `cache.lru_high_watermark_percent` | `80` |
@@ -106,83 +76,118 @@ SynapS3 把元数据存储在 PostgreSQL 中。把 `database.dsn` 设为连接 U
 | `worker.tasks.upload_concurrency` | `4` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
-| `worker.tasks.commit_seal_on_cache_pressure` | `false` |
 | `worker.tasks.commit_max_backlog` | `256` |
+| `worker.tasks.commit_seal_on_cache_pressure` | `false` |
+| `logging.level` | `info` |
+| `logging.format` | `text`（Docker 部署设为 `json`） |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` 限制全部正在运行的后台任务，包括恢复任务。`upload_concurrency` 额外限制同时上传的数量，读取和哈希本地缓存也计入其中。两项都必须大于零；上传上限可以高于总上限，实际仍受总上限约束。没有空闲名额的任务保持排队，保留原有到期顺序，其他类型任务可以继续执行。钱包操作和上传测速各自一次执行一个。任务设置修改后必须重启 SynapS3。每类任务声明有限重试策略，每轮执行保留创建时记录的策略。任务历史永久保存。
-
-写入同一数据集的上传和副本会收集成一个批次，直到可以提交。`commit_max_pieces`（1–200）只限制一笔交易的 piece 数，不限制收集数量；Mainnet 上 ID 小于 1,559、Calibration 上小于 32,331 的数据集每次最多 80 个。收集数量达到该数据集适用的单笔上限、数据集不再接受新数据、手动提交或最早的 piece 等待达到 `commit_max_wait`（0–30m）后，下一批达到提交条件；`0s` 表示无需等待收集窗口。所有批次都要等该数据集的 4 个在途名额空出，并让更早的可提交已签名批次先发送。轮到下一批时，取最早准备好的 piece，最多取单笔上限，签名后立即尝试发送；剩余数据继续收集，保留原来的等待起点。等待提交的上传数据保留在本地缓存。更长的窗口会推迟提交、需要已提交来源的副本及本地缓存淘汰。
-
-某个数据集上等待未提交批次的已传输 piece（包括上传和副本）达到 `commit_max_backlog`（不小于 `commit_max_pieces`）后，写入该数据集的新上传和新副本都会等待。一个批次超出单条 add-pieces 消息大小时，会拆分后用更少的 piece 重新签名。
-
-在 Settings 启用 **Submit batches early to free cache space**（`worker.tasks.commit_seal_on_cache_pressure`），可在安全自动清理无法腾出足够空间时提前提交未满批次。提前提交仍需等待在途名额和更早的可提交批次。默认关闭，修改后需要重启。`lru` 按实际清理目标判断；`after_upload` 按被拒绝写入所需的容量判断；`none` 不自动提前提交。更小的批次可能增加交易成本。缓存删除仍需等待确认并满足存储桶的耐久要求。
-
-打开 **Batches** 查看已收集的数据，点击 **Submit next batch** 请求提交下一批，最多提交单笔上限的 piece，其余数据继续等待。手动操作独立于自动开关和缓存策略，也需要等待提交名额。打开某个批次可查看其中的 piece、提交时间、交易 ID 和错误；停止的批次在允许恢复时显示 **Retry**。每个 piece 展示一个关联对象，以及共享该数据的其他版本数量。历史对象信息或大小缺失时会标明不可用。
-
-## 节点选择
-
-副本的新节点必须有未过期的健康观测，并在当前服务 URL 下上传测速成功。`filecoin.anchor_provider_tier` 要求至少选中一个所配置名单（Approved 或 Endorsed）中的节点；`none` 取消此要求。Endorsed 不要求同时属于 Approved。名单或测速结果变化时，已分配的节点保持不变。
-
-创建存储桶的请求成功后，存储继续准备。自动选择节点会等待可选的 Approved 和 Endorsed 节点完成当前 URL 下的测速，再检查副本目标和锚定层级。等待不消耗重试次数。所需名单确认为空时，准备会停止；解决存储桶或任务提示的原因后，使用 **Retry**。使用已分配节点的上传不等待测速。
-
-创建存储桶时，**Provider preference** 可选分布优先（`distribution`，默认）或速度优先（`speed`）。分布优先按未退役数据集更少、上传更快排序；速度优先调换两者顺序。条件相同则随机选择。偏好在创建后固定，用于补副本和自动替换；手动替换跳过排序。S3 创建的存储桶使用分布优先。API 通过 `provider_selection_strategy` 接受和返回偏好。补副本和手动替换可复用合格节点，前提是其在该桶的数据集已全部退役；自动替换排除该桶用过的节点。
-
-Approved、Endorsed 和已绑定的节点在首次满足测速条件及服务 URL 变化后会自动测速。`filecoin.upload_speed_test.auto_scope = "all"` 还会测试其他符合条件的节点。默认 `trusted` 可选节点池由可信、已绑定和手动测过的节点组成。仅把 `anchor_provider_tier` 设为 `none` 不会扩大该池。通过 **Test remaining providers** 或 **Storage** 中的单节点测速可测试其他节点。
-
-将 `retest_interval` 设为正时长可定期重测；`0s` 表示关闭。上传失败和超时需要使用 **Retry**，除非启用了定期重测。中断的测速会自动重试。修改 `anchor_provider_tier` 和 `upload_speed_test` 后需重启。
-
-## Admin 会话时长
-
-`admin.auth.session_ttl` 控制每个普通 Admin UI 会话 token 的有效时长，既不是服务端强制的空闲超时，也不是一次登录的绝对上限。经过 5 分钟或 token 有效时长的一半（取较短者）后，服务端允许续期。官方仪表盘只在可信的指针、点击、键盘或滚轮操作后请求续期；后台轮询和仅切回可见标签页不会触发续期。任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后调用续期接口。没有客户端请求续期时，token 会在 `expires_at` 到期。
-
-登录页默认使用 browser-session cookie。选择 **Keep me signed in** 后，会改用持久 cookie，并使用 30 天或 `admin.auth.session_ttl` 中较长的时长。只要仪表盘持续收到用户操作，就可以继续请求续期；服务端不设置登录的绝对时长上限。
-
 ## 允许值
 
-- `filecoin.network`: `calibration`, `mainnet`。
-- `filecoin.default_copies`: `1` 到 `8`。
-- `filecoin.anchor_provider_tier`: `approved`, `endorsed`, `none`.
-- `filecoin.upload_speed_test.auto_scope`：`trusted`、`all`；`retest_interval` 不得为负数。
-- `database.driver`: `postgres`。
-- `cache.eviction_policy`: `lru`, `after_upload`, `none`。
-- `logging.level`: `debug`, `info`, `warn`, `error`。
-- `logging.format`: `json`, `text`。
-- `admin.trusted_proxies`: IP 或 CIDR。除非可信反向代理会清理不可信 forwarded headers，否则保持空。
+- `filecoin.network`：`calibration`、`mainnet`。`filecoin.rpc_url` 必须属于同一网络；Mainnet 默认端点是 `https://api.node.glif.io/rpc/v1`。在 **Settings** 页面切换网络时，默认 RPC URL 会随之切换。
+- `filecoin.default_copies`：`1` 到 `8`。
+- `filecoin.anchor_provider_tier`：`approved`、`endorsed`、`none`。
+- `filecoin.upload_speed_test.auto_scope`：`trusted`、`all`。`retest_interval` 不小于 `0s`。
+- `cache.eviction_policy`：`lru`、`after_upload`、`none`。
+- `cache.lru_low_watermark_percent` 和 `cache.lru_high_watermark_percent`：`0 <= low < high <= 100`。
+- `worker.tasks.commit_max_pieces`：`1` 到 `200`。`commit_max_wait`：`0s` 到 `30m`。`commit_max_backlog`：不小于 `commit_max_pieces`。
+- `server.max_requests` 不大于 `server.max_connections`；`database.max_idle_conns` 不大于 `database.max_open_conns`。
+- `logging.level`：`debug`、`info`、`warn`、`error`。`logging.format`：`json`、`text`。
+- `admin.trusted_proxies`：IP 地址或 CIDR 网段。
 
-缓存淘汰策略会产生以下用户可见结果：
+## S3 监听
 
-- `lru`：缓存使用量达到高水位后，或有写入因缓存已满被拒绝时，SynapS3 按最近访问时间淘汰最久未使用且远端安全的条目，直到降至低水位。实际低水位不会让可用空间小于一个最大对象（`1,065,353,216` 字节），这只在缓存较小时起作用。
-- `after_upload`：版本达到其存储桶要求的最低耐久副本数后，会加入异步清理。之后从远端读取并回填的缓存不会再次被立即删除。
-- `none`：SynapS3 不会自动清理本地缓存。
-
-LRU 水位始终必须满足 `0 <= low < high <= 100`。在 `after_upload` 或 `none` 下仍会保存这些值，但不会生效。
+为 S3 API 启用原生 TLS：
 
 ```toml
-[cache]
-eviction_policy = "lru"
-lru_high_watermark_percent = 80
-lru_low_watermark_percent = 50
+[server.tls]
+enabled = true
+cert_file = "/path/to/tls.crt"
+key_file = "/path/to/tls.key"
 ```
 
-淘汰设置会在重启后生效。缓存清理是异步流程：写入不会等待 LRU 检查，被拒绝的写入只会请求下一次检查。
+SynapS3 进程必须能读取这两个文件。不启用原生 TLS 时，生产 S3 流量要经过你自己的 TLS 代理。
+
+同时处理的 S3 请求超过 `server.max_requests` 时，多出的请求收到 `503 SlowDown`。
+
+## 缓存
+
+`cache.max_size_gb` 是本地缓存用量上限，单位 GiB。写入在读取请求体之前先预留完整大小；放不下时，写入失败并返回 `503 SlowDown`。见[缓存已满](../operations/troubleshooting.md#缓存已满)。
+
+| `cache.eviction_policy` | 行为 |
+| --- | --- |
+| `lru` | 用量达到高水位，或有写入被拒绝时，SynapS3 按最近读取时间删除可安全删除的版本，直到用量降到低水位。清理目标始终至少留出一个最大对象（1,065,353,216 字节）的空间。 |
+| `after_upload` | 版本达到所在存储桶的最小持久副本数并完成提交后，SynapS3 删除其缓存。 |
+| `none` | SynapS3 从不自动删除缓存数据。 |
+
+水位只对 `lru` 生效。删除在后台进行，写入不会等待。哪些版本可以安全删除，见[写入路径与缓存](../concepts/write-path-cache.md#缓存淘汰)。
+
+## 后台任务
+
+`worker.tasks.concurrency`（**Task concurrency**）限制所有后台任务的并发数。`worker.tasks.upload_concurrency`（**Upload concurrency**）另外限制上传到存储提供方的并发数，包括读取缓存数据和计算哈希。达到上限时，任务在队列中等待。失败的任务按固定次数重试；任务历史永久保留。
+
+## 批次
+
+SynapS3 把上传的 piece 按批次加入链上数据集，每个批次一笔交易。**Batches** 页面列出这些批次。
+
+| 字段 | Settings 标签 | 作用 |
+| --- | --- | --- |
+| `worker.tasks.commit_max_pieces` | **Batch size** | 每笔交易最多包含的 piece 数。 |
+| `worker.tasks.commit_max_wait` | **Batch wait** | 最早的 piece 等待批次凑满的最长时间。`0s` 表示不等待，直接提交。 |
+| `worker.tasks.commit_max_backlog` | **Batch backlog** | 某个数据集等待提交的已传输 piece 达到该数量时，发往该数据集的新上传和新副本会等待。 |
+| `worker.tasks.commit_seal_on_cache_pressure` | **Submit batches early to free cache space** | 自动缓存清理释放不出足够空间时，提前提交批次。`cache.eviction_policy = none` 时无效。 |
+
+满足以下任一条件时提交批次：达到批次大小；最早的 piece 等到批次等待时间；数据集不再接收数据；在 **Batches** 页面点击 **Submit next batch**。每个数据集最多有四个已提交、待确认的批次，之后的批次排队等待。
+
+等待提交的 piece 保留在本地缓存中。批次等待时间越长，缓存释放和从首个副本复制的其他副本就越晚。批次越小，交易越多，费用越高。
+
+打开批次可以查看其中的 piece、交易和错误。已停止的批次会显示 **Retry**。
+
+## 存储提供方选择
+
+SynapS3 在准备存储桶、补充副本或自动替换存储提供方时选择存储提供方。候选者必须有近期的健康检查结果，并且在当前服务 URL 下上传测速成功。已分配的存储提供方不会因层级成员资格或测速结果变化而被撤换，发往它们的上传也不等待测速。
+
+`filecoin.anchor_provider_tier`（**Provider requirement**）要求选出的存储提供方中至少有一个来自 FWSS approved 列表（`approved`）或 endorsed 列表（`endorsed`）；`none` 不作要求。所需列表为空时，存储桶准备会停止；按存储桶或任务上显示的原因处理后，点击 **Retry**。
+
+上传测速：
+
+- approved、endorsed 和已分配的存储提供方在首次符合条件时以及服务 URL 变化后自动测速。
+- `auto_scope = "trusted"`（**Trusted providers**）只测这些存储提供方。其他存储提供方要在 **Storage** 页面通过 **Test remaining providers** 或其详情中的测速入口完成测速后，才能成为候选者。`all`（**All providers**）测试所有符合条件的存储提供方。
+- `retest_interval` 大于 `0s` 时定期重测。为 `0s` 时，失败或超时的测速保持失败，直到点击 **Retry**。
+
+存储桶会立即创建。其存储准备会等到符合条件的 approved 和 endorsed 存储提供方完成测速，再检查目标副本数和存储提供方要求。等待不消耗重试次数。
+
+**Provider preference** 在创建存储桶时选择，之后不能修改：
+
+| 选项 | API 值 | 排序 |
+| --- | --- | --- |
+| **Distribution first**（默认） | `distribution` | 先选活跃数据集较少的存储提供方，再看上传速度。 |
+| **Speed first** | `speed` | 先看上传速度，再看活跃数据集数量。 |
+
+排序相同时随机选择。通过 S3 API 创建的存储桶使用 `distribution`。该偏好也用于补充副本和自动替换。存储提供方为某个存储桶保存的所有数据集都退役后，才能再次服务该存储桶；自动替换不会选择该存储桶用过的存储提供方。
+
+## Admin 会话
+
+`admin.auth.session_ttl` 设置仪表盘会话的有效期。你在仪表盘上操作（指针、点击、键盘或滚轮输入）时，会话会续期；后台轮询不会续期。未续期的会话在 `session_ttl` 后过期。登录没有最长有效期上限。
+
+默认情况下，登录 Cookie 只在浏览器会话内有效。勾选 **Keep me signed in** 会设置持久 Cookie，有效期取 30 天和 `session_ttl` 中较长的一个。
 
 ## 高风险字段
 
 | 字段 | 风险 |
 | --- | --- |
-| `admin.addr` | 暴露 Admin API 会允许运维写操作。除非有 HTTPS 和访问控制保护，否则保持本机回环地址。 |
-| `admin.trusted_proxies` | 对匹配代理信任 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`。只配置你控制的代理。 |
-| Admin password hash | 控制 Admin 登录。不要手动配置；用 `synaps3 init` 或 `synaps3 admin-auth reset-password` 生成。 |
-| `admin.auth.session_secret` | 用于签名 Admin 浏览器会话。按密钥处理。 |
-| `filecoin.private_key` | 控制钱包支付和存储操作。必须作为私钥处理。 |
-| `database.dsn` | 可能包含数据库凭据，必须作为敏感值处理。 |
-| `filecoin.network` | 必须与数据库绑定的 Filecoin 链和 RPC 地址对应的链一致。 |
-| `filecoin.allow_private_networks` | 允许私有网络存储提供方 URL。只在可信私有部署中开启。 |
-| `cache.max_size_gb` | 太小会阻塞写入；太大会占满主机磁盘。 |
-| `cache.lru_high_watermark_percent` | 高水位过高会减少淘汰追赶期间可供新写入使用的余量。 |
-| `cache.lru_low_watermark_percent` | 低水位过低会让每轮 LRU 清理更多缓存数据。 |
+| `admin.addr` | Admin API 可以修改数据、凭据和钱包资金。除非有 HTTPS 和访问控制保护，否则保持在回环地址。 |
+| `admin.trusted_proxies` | SynapS3 信任来自这些地址的 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`。只填写由你控制、并会清除客户端同名标头的代理。 |
+| `admin.auth.password_hash` | 控制 Admin 登录。用 `synaps3 init` 或 `synaps3 admin-auth reset-password` 生成。 |
+| `admin.auth.session_secret` | 签名 Admin 会话，按密钥保管。 |
+| `filecoin.private_key` | 可以动用钱包资金，按密钥保管。 |
+| `database.dsn` | 通常包含数据库密码，按密钥保管。 |
+| `filecoin.network` | 必须与数据库和 `filecoin.rpc_url` 一致。每个网络使用单独的数据库。 |
+| `filecoin.allow_private_networks` | 允许使用私有网络中的存储提供方 URL。只在信任这些存储提供方时启用。 |
+| `cache.max_size_gb` | 太小会拒绝写入，太大可能占满磁盘。 |
+| `cache.lru_high_watermark_percent` | 值越高，清理期间留给写入的空间越少。 |
+| `cache.lru_low_watermark_percent` | 值越低，每次清理删除的缓存越多。 |

@@ -1,21 +1,18 @@
 ---
 title: Build from Source
-description: Build SynapS3 locally, initialize runtime data, and verify the embedded dashboard and S3 API.
+description: Build the SynapS3 binary, prepare PostgreSQL and the wallet, and start the node.
 ---
 
 # Build from Source
 
-Build from source when you are developing SynapS3, need a custom binary, or want to inspect the embedded dashboard build.
-
-For a container installation, see [Docker Deployment](./docker.md). This page covers building and running the binary directly.
+This page builds the `synaps3` binary and runs it directly. For containers, see [Docker Deployment](./docker.md).
 
 ## Prerequisites
 
 - Go 1.27.2 or later.
 - `make`.
 - A C toolchain for cgo, such as `gcc` or `clang`.
-- Node.js 22.12 or later.
-- pnpm 11.
+- Node.js 22.12 or later and pnpm 11.
 - PostgreSQL 18, or Docker to run it locally.
 
 ## Build
@@ -26,11 +23,11 @@ cd SynapS3
 make build
 ```
 
-The command builds the React dashboard, embeds it, and writes `bin/synaps3`.
+`make build` builds the dashboard, embeds it, and writes `bin/synaps3`.
 
 ## Prepare PostgreSQL
 
-SynapS3 stores metadata in PostgreSQL. Use an existing database owned by a non-superuser role, or start a local server for evaluation. The example creates a database and application role named `synaps3`; other names are supported through the connection URL.
+Use a database owned by a non-superuser role. To run PostgreSQL locally with Docker, with a database and role both named `synaps3`:
 
 ```bash
 printf 'PostgreSQL administrator password: '
@@ -48,7 +45,7 @@ docker run -d --name synaps3-postgres --restart unless-stopped \
 unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 ```
 
-The role and passwords are created only when the volume is empty. To upgrade an existing PostgreSQL 17 volume, back up with 17 and restore into a new 18 volume; keep the original until the restored database is verified.
+PostgreSQL creates the role and passwords only when the volume is empty.
 
 ## Initialize Runtime Data
 
@@ -57,9 +54,9 @@ The role and passwords are created only when the volume is empty. To upgrade an 
 ./bin/synaps3 wallet generate
 ```
 
-`synaps3 init` creates `~/.synaps3/config.toml`, `cache/`, and Admin auth. Save the printed Admin password in a password manager. If init is non-interactive, read it from `~/.synaps3/admin-initial-password` in a private terminal. Keep the configuration and password file at permission mode `0600`.
+`synaps3 init` creates `~/.synaps3/config.toml`, the `cache/` directory, and the Admin credentials. In a terminal, it prints the Admin password once; otherwise it writes the password to `~/.synaps3/admin-initial-password`. Store the password in a password manager.
 
-Add the PostgreSQL connection URL with the application password and the generated wallet private key to `~/.synaps3/config.toml`. For an existing database, use its role and database name:
+Add the database connection URL and the wallet private key to `~/.synaps3/config.toml`:
 
 ```toml
 [database]
@@ -69,15 +66,15 @@ dsn = "postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable"
 private_key = "0x..."
 ```
 
-Do not place the database password or private key in shell history. The configuration file contains credentials and wallet material and must remain readable only by the SynapS3 account.
+The file holds credentials and wallet material. Keep it at mode `0600`, readable only by the account that runs SynapS3.
 
-For Calibration testing, fund the wallet:
+On Calibration, claim test FIL and USDFC:
 
 ```bash
 ./bin/synaps3 wallet fund-testnet 0x...
 ```
 
-Successful faucet claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`.
+A successful claim prints `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`.
 
 ## Serve
 
@@ -85,15 +82,13 @@ Successful faucet claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`
 ./bin/synaps3 serve
 ```
 
-Default endpoints:
-
-| Endpoint | Address |
+| Endpoint | Default |
 | --- | --- |
 | S3 API | `http://localhost:8080` |
 | Dashboard and Admin API | `http://127.0.0.1:9090` |
 | Runtime data | `~/.synaps3/` |
 
-In another terminal, verify health, deposit USDFC, and approve FWSS:
+In another terminal, check health, deposit USDFC, and approve FWSS:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
@@ -101,45 +96,18 @@ curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 wallet approve
 ```
 
-Expected result: health returns `{"status":"ok"}`. A new deposit or approval prints `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`.
+Health returns `{"status":"ok"}`. Each transaction prints `Transaction: <hash>` and `Status: confirmed`; if FWSS is already approved, `approve` prints `FWSS approval: already approved`.
 
-These HTTP endpoints are for local evaluation. Production S3 traffic must use native TLS or a controlled TLS reverse proxy; keep the Admin endpoint on loopback, through an SSH tunnel, or behind an access-controlled HTTPS reverse proxy.
+Plain HTTP is for local evaluation. For production, see [Network Exposure](../operations/production-checklist.md#network-exposure).
 
-## Verify with an S3 Client
+Continue with [Quick Start](./quick-start.md) to create S3 credentials and upload a first object.
 
-Create an S3 user:
+## Common Build and Startup Issues
 
-```bash
-./bin/synaps3 admin s3-user create
-```
-
-Enter the Admin password at the no-echo prompt. The command prints the S3 secret only once; save it to a client credential file protected with `0600` and rotate it immediately if it is exposed.
-
-Then use a path-style S3 client:
-
-```bash
-printf '%*s\n' 128 'hello synaps3' > hello.txt
-printf 'S3 access key: '
-read -r S3_ACCESS_KEY
-printf 'S3 secret key: '
-read -rs S3_SECRET_KEY
-printf '\n'
-mc alias set synaps3 http://localhost:8080 "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"
-unset S3_ACCESS_KEY S3_SECRET_KEY
-chmod 600 ~/.mc/config.json
-mc mb synaps3/demo
-mc cp hello.txt synaps3/demo/hello.txt
-mc cat synaps3/demo/hello.txt
-```
-
-`mc cat` prints the uploaded object. The alias stores the credentials in `~/.mc/config.json`; keep that file at permission mode `0600`. See [S3 Clients](./s3-clients.md) for more client examples.
-
-## Common Build Issues
-
-| Symptom | Check |
+| Symptom | Fix |
 | --- | --- |
-| UI build fails | Confirm Node.js 22.12 or later and pnpm 11 are installed. |
-| Go build fails on cgo | Confirm a C toolchain is installed and visible in `PATH`. |
-| `serve` fails with Admin auth validation | Run `./bin/synaps3 init` for a fresh config, or `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml` for an existing config. |
-| `serve` reports `database.dsn is not set` | Set `database.dsn` in config or `SYNAPS3_DATABASE_DSN`. |
-| `serve` starts in setup mode | Set `filecoin.private_key` in config or `SYNAPS3_FILECOIN_PRIVATE_KEY`. |
+| Dashboard build fails | Install Node.js 22.12 or later and pnpm 11. |
+| Go build fails on cgo | Install a C toolchain and make sure it is in `PATH`. |
+| `serve` fails Admin auth validation | If `config.toml` exists, run `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml`; otherwise run `./bin/synaps3 init`. |
+| `serve` reports `database.dsn is not set` | Set `database.dsn` in the config file or `SYNAPS3_DATABASE_DSN`. |
+| `/healthz` returns `setup` | Set `filecoin.private_key` in the config file or `SYNAPS3_FILECOIN_PRIVATE_KEY`, then restart. |
