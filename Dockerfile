@@ -1,4 +1,4 @@
-ARG GO_BUILD_IMAGE=golang:1.26-alpine
+ARG GO_BUILD_IMAGE=golang:1.27.2-alpine
 
 # Build stage - frontend
 FROM node:26-alpine AS frontend

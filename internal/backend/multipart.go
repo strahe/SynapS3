@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	versitybackend "github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -31,6 +32,9 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 	keyName := derefStr(input.Key)
 	if err := validateObjectKey(keyName); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	bucket, err := b.requireWritableBucket(ctx, bucketName)
@@ -54,7 +58,7 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 		SystemMetadata: model.ObjectSystemMetadata{
 			CacheControl:       derefStr(input.CacheControl),
 			ContentDisposition: derefStr(input.ContentDisposition),
-			ContentEncoding:    storedContentEncoding(input.ContentEncoding),
+			ContentEncoding:    derefStr(input.ContentEncoding),
 			ContentLanguage:    derefStr(input.ContentLanguage),
 			Expires:            derefStr(input.Expires),
 		},
@@ -85,6 +89,9 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 			requiredArg("UploadId", input.UploadId == nil),
 			requiredArg("PartNumber", input.PartNumber == nil),
 		)
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
@@ -146,6 +153,10 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 			requiredArg("PartNumber", input.PartNumber == nil),
 			requiredArg(copySourceArgumentName, input.CopySource == nil),
 		)
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5,
+		input.CopySourceSSECustomerAlgorithm, input.CopySourceSSECustomerKey, input.CopySourceSSECustomerKeyMD5) {
+		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
@@ -224,6 +235,9 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	}
 	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrMalformedXML)
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	bucketName := *input.Bucket
@@ -511,6 +525,9 @@ func (b *SynapseBackend) ListParts(ctx context.Context, input *s3.ListPartsInput
 			requiredArg("Key", input.Key == nil),
 			requiredArg("UploadId", input.UploadId == nil),
 		)
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)

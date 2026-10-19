@@ -15,7 +15,8 @@ from pathlib import Path
 SOURCE_PATHS = (
     "cmd/", "internal/", "tests/", ":(glob)ui/*.go", "Makefile",
     ".github/actions/setup-go/", ".github/actions/save-go-cache/",
-    ".github/workflows/ci.yml", "scripts/go_cache_key.py",
+    ".github/workflows/ci.yml", ".github/workflows/s3-compatibility.yml",
+    "scripts/go_cache_key.py",
 )
 UI_PATHS = (
     "ui/src/", "ui/public/", "ui/index.html", "ui/package.json",

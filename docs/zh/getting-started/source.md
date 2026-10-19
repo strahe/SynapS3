@@ -11,7 +11,7 @@ description: 在本地构建 SynapS3，初始化运行数据，并验证内嵌�
 
 ## 前置条件
 
-- Go 1.26.3 或更高版本。
+- Go 1.27.2 或更高版本。
 - `make`。
 - cgo 所需的 C toolchain，例如 `gcc` 或 `clang`。
 - Node.js 22.12 或更高版本。

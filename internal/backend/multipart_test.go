@@ -298,7 +298,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 		ContentType:        &ct,
 		CacheControl:       aws.String("max-age=120"),
 		ContentDisposition: aws.String(`attachment; filename="assembled\u0000.bin"`),
-		ContentEncoding:    aws.String("identity, aws-chunked"),
+		ContentEncoding:    aws.String("identity"),
 		ContentLanguage:    aws.String("en"),
 		Expires:            aws.String("Mon, 21 Oct 2030 07:28:00 GMT"),
 	})

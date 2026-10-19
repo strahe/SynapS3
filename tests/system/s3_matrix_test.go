@@ -13,7 +13,6 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -411,19 +409,10 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 		}
 	})
 	t.Run("StreamingContentEncoding", func(t *testing.T) {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.DisableCompression = true
-		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", harness.S3SocketPath())
-		}
-		defer transport.CloseIdleConnections()
-		rawClient := &http.Client{Transport: transport}
+		rawClient := matrixHTTPClient(t, harness.S3SocketPath())
 		doRequest := func(t *testing.T, request *http.Request, payloadHash string) *http.Response {
 			t.Helper()
-			request.Header.Set("X-Amz-Content-Sha256", payloadHash)
-			if err := v4.NewSigner().SignHTTP(ctx, aws.Credentials{AccessKeyID: systemtest.OwnerAccess, SecretAccessKey: systemtest.OwnerSecret}, request, payloadHash, "s3", "us-east-1", time.Now()); err != nil {
-				t.Fatal(err)
-			}
+			matrixSignRequest(t, request, payloadHash)
 			response, err := rawClient.Do(request)
 			if err != nil {
 				t.Fatal(err)
@@ -467,29 +456,24 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 				if readErr != nil || response.StatusCode != http.StatusOK {
 					t.Fatalf("streaming PUT = %d, %s, %v", response.StatusCode, result, readErr)
 				}
-				copyKey := "copied-" + key
-				if _, err := client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: bucket, Key: &copyKey, CopySource: aws.String(*bucket + "/" + key)}); err != nil {
-					t.Fatal(err)
-				}
-				for _, objectKey := range []string{key, copyKey} {
-					for _, method := range []string{http.MethodGet, http.MethodHead} {
-						request, err := http.NewRequestWithContext(ctx, method, "http://synaps3.system.test/"+*bucket+"/"+objectKey, nil)
-						if err != nil {
-							t.Fatal(err)
-						}
-						response := doRequest(t, request, "UNSIGNED-PAYLOAD")
-						result, readErr := io.ReadAll(response.Body)
-						_ = response.Body.Close()
-						if readErr != nil || response.StatusCode != http.StatusOK || response.Header.Get("Content-Encoding") != tc.wantEncoding || response.ContentLength != int64(len(tc.body)) {
-							t.Fatalf("%s %s = status %d, encoding %q, length %d, %v", method, objectKey, response.StatusCode, response.Header.Get("Content-Encoding"), response.ContentLength, readErr)
-						}
-						if method == http.MethodGet && !bytes.Equal(result, tc.body) {
-							t.Fatalf("GET %s bytes differ from uploaded content", objectKey)
-						}
-					}
-				}
+				matrixAssertEncodedObject(t, rawClient, client, *bucket, key, tc.wantEncoding, tc.body)
 			})
 		}
+	})
+	t.Run("ACLAuthorization", func(t *testing.T) {
+		testMatrixACLAuthorization(t, harness, client)
+	})
+	t.Run("DeleteObjectsValidation", func(t *testing.T) {
+		testMatrixDeleteValidation(t, harness, client)
+	})
+	t.Run("ContentEncoding", func(t *testing.T) {
+		testMatrixContentEncoding(t, harness, client, *bucket)
+	})
+	t.Run("UploadErrors", func(t *testing.T) {
+		testMatrixUploadErrors(t, harness, client, *bucket)
+	})
+	t.Run("SSECustomerEncryption", func(t *testing.T) {
+		testMatrixSSECustomerEncryption(t, logger)
 	})
 }
 

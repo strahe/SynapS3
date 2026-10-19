@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/valyala/fasthttp"
 	"github.com/versity/versitygw/s3api/utils"
@@ -69,7 +70,7 @@ func TestLoggerOmitsQueryAndObjectDetailFields(t *testing.T) {
 func TestLoggerLogsS3ErrorStatusAndCode(t *testing.T) {
 	tests := []struct {
 		name string
-		err  s3err.S3Error
+		err  error
 	}{
 		{
 			name: "api error",
@@ -77,7 +78,19 @@ func TestLoggerLogsS3ErrorStatusAndCode(t *testing.T) {
 		},
 		{
 			name: "typed invalid argument error",
-			err:  s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, "0"),
+			err:  s3err.GetInvalidArgumentErr(s3err.InvalidArgAuthHeader, "sensitive-argument"),
+		},
+		{
+			name: "malformed authorization component",
+			err:  s3err.MalformedAuth.MalformedComponent("Signature=sensitive-component=extra"),
+		},
+		{
+			name: "malformed credential scope",
+			err:  s3err.MalformedAuth.IncorrectService("", "sensitive-scope"),
+		},
+		{
+			name: "wrapped authorization error",
+			err:  fmt.Errorf("sensitive-wrapper: %w", s3err.MalformedAuth.IncorrectRegion("expected", "sensitive-region")),
 		},
 	}
 
@@ -87,11 +100,21 @@ func TestLoggerLogsS3ErrorStatusAndCode(t *testing.T) {
 				Action: "HeadBucket",
 			})
 
-			baseErr := tt.err.BaseError()
-			assertOnlyLogFields(t, record, "time", "level", "msg", "component", "operation", "method", "path", "status", "duration_ms", "error", "error_code")
+			var s3Err s3err.S3Error
+			if !errors.As(tt.err, &s3Err) {
+				t.Fatalf("error %T does not contain an S3 error", tt.err)
+			}
+			baseErr := s3Err.BaseError()
+			assertOnlyLogFields(t, record, "time", "level", "msg", "component", "operation", "method", "path", "status", "duration_ms", "error_code")
 			assertLogNumber(t, record, "status", baseErr.HTTPStatusCode)
 			assertLogField(t, record, "error_code", baseErr.Code)
-			assertLogField(t, record, "error", tt.err.Error())
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("Marshal log: %v", err)
+			}
+			if strings.Contains(string(encoded), "sensitive-") {
+				t.Fatalf("S3 error details leaked into log: %s", encoded)
+			}
 		})
 	}
 }
@@ -129,7 +152,7 @@ func captureRequestLogAtLevel(t *testing.T, level, method, target string, logErr
 	start := time.Now().Add(-1500 * time.Millisecond)
 
 	app := fiber.New()
-	app.All("/*", func(ctx *fiber.Ctx) error {
+	app.All("/*", func(ctx fiber.Ctx) error {
 		utils.ContextKeyStartTime.Set(ctx, start)
 		auditLogger.Log(ctx, logErr, body, meta)
 		return ctx.SendStatus(http.StatusOK)

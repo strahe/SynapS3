@@ -96,6 +96,19 @@ func (s *Service) GetUserAccount(access string) (auth.Account, error) {
 	return toAuthAccount(account), nil
 }
 
+func (s *Service) ResolveAccounts(accessKeyIDs []string) ([]string, error) {
+	var missing []string
+	for _, access := range accessKeyIDs {
+		if _, err := s.GetUserAccount(access); err != nil {
+			if !errors.Is(err, auth.ErrNoSuchUser) {
+				return nil, err
+			}
+			missing = append(missing, access)
+		}
+	}
+	return missing, nil
+}
+
 func (s *Service) UpdateUserAccount(access string, props auth.MutableProps) error {
 	root, err := s.repos.S3Accounts.GetRoot(context.Background())
 	if err != nil {

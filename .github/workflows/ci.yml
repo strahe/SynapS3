@@ -22,6 +22,7 @@ jobs:
       go_tests: ${{ steps.plan.outputs.go_tests }}
       race: ${{ steps.plan.outputs.race }}
       system: ${{ steps.plan.outputs.system }}
+      s3_compatibility: ${{ steps.plan.outputs.s3_compatibility }}
       modules_writer: ${{ steps.plan.outputs.modules_writer }}
       plan: ${{ steps.plan.outputs.plan }}
     steps:
@@ -110,54 +111,6 @@ jobs:
         if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: make test-system
 
-      - name: Validate report rules
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
-        env:
-          PYTHONDONTWRITEBYTECODE: '1'
-        run: python3 -m unittest discover -s scripts -p 'test_s3_compatibility_report.py'
-
-      - name: Restore S3 clients
-        id: clients_cache
-        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
-        uses: actions/cache/restore@v5
-        timeout-minutes: 1
-        continue-on-error: true
-        env:
-          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
-        with:
-          path: ${{ runner.temp }}/synaps3-s3-clients
-          key: &s3-clients-key s3-clients-v1-${{ runner.os }}-${{ runner.arch }}-aws-2.31.0-rclone-1.71.0-mc-2025-08-13-${{ hashFiles('.github/actions/setup-s3-clients/action.yml') }}
-
-      - name: Set up pinned S3 clients
-        id: clients
-        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
-        uses: ./.github/actions/setup-s3-clients
-
-      - name: Save S3 clients
-        if: ${{ !cancelled() && steps.clients.outcome == 'success' && steps.clients_cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v5
-        timeout-minutes: 1
-        continue-on-error: true
-        with:
-          path: ${{ runner.temp }}/synaps3-s3-clients
-          key: *s3-clients-key
-
-      - name: Test documented S3 operations
-        id: matrix
-        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
-        run: |
-          set -o pipefail
-          go test -json -trimpath -tags='dev systemtest s3compat' -count=1 \
-            -run '^TestS3CompatibilityMatrix$' ./tests/system | tee "$RUNNER_TEMP/s3-matrix.json"
-
-      - name: Test AWS CLI, rclone, and MinIO Client
-        id: client-tests
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.clients.outcome == 'success' }}
-        run: |
-          set -o pipefail
-          go test -json -trimpath -tags='dev systemtest s3compat' -count=1 \
-            -run '^TestS3Clients$' ./tests/system | tee "$RUNNER_TEMP/s3-clients.json"
-
       - name: Save Go caches
         if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.system.outcome == 'success' || steps.system.outcome == 'failure') }}
         uses: ./.github/actions/save-go-cache
@@ -173,17 +126,12 @@ jobs:
           modules-ready: ${{ steps.modules_cache.outputs.cache-hit == 'true' || steps.modules.outcome == 'success' }}
           module-writer: ${{ needs.changes.outputs.modules_writer == github.job }}
 
-      - name: Publish compatibility summary
-        if: ${{ always() && steps.checkout.outcome == 'success' }}
-        env:
-          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          python3 scripts/s3_compatibility_report.py \
-            --matrix-json "$RUNNER_TEMP/s3-matrix.json" \
-            --clients-json "$RUNNER_TEMP/s3-clients.json" \
-            --summary "$GITHUB_STEP_SUMMARY" \
-            --source-sha "$SOURCE_SHA" \
-            --checkout-sha "$(git rev-parse HEAD)"
+  s3_compatibility:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.s3_compatibility == 'true'
+    uses: ./.github/workflows/s3-compatibility.yml
+    with:
+      plan: ${{ needs.changes.outputs.plan }}
 
   verify:
     needs: changes
@@ -237,7 +185,7 @@ jobs:
       - name: Install golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.11.4
+          version: v2.15.0
           install-only: true
 
       - name: Verify code and build
@@ -294,7 +242,7 @@ jobs:
         with: *save-go-cache
 
   check:
-    needs: [changes, verify, race, system]
+    needs: [changes, verify, race, system, s3_compatibility]
     if: ${{ always() }}
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 5

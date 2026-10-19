@@ -937,8 +937,7 @@ func TestTeeReadCloserReadReturnsEOFBeforeRehydrationCompletes(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		close(done)
-		<-errCh
-		t.Fatal("Read blocked waiting for cache rehydration to finish")
+		t.Fatalf("Read blocked waiting for cache rehydration to finish: %v", <-errCh)
 	}
 }
 

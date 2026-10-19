@@ -11,7 +11,7 @@ For a container installation, see [Docker Deployment](./docker.md). This page co
 
 ## Prerequisites
 
-- Go 1.26.3 or later.
+- Go 1.27.2 or later.
 - `make`.
 - A C toolchain for cgo, such as `gcc` or `clang`.
 - Node.js 22.12 or later.

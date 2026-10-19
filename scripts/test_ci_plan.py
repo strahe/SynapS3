@@ -16,13 +16,13 @@ import ci_plan
 
 class RoutingTest(unittest.TestCase):
     def test_paths_select_the_affected_work(self):
-        core = ci_plan.CORE
+        core = {"verify", "go_tests", "race", "system", "s3_compatibility"}
         cases = (
             ("docs/en/getting-started/overview.md", {"docs"}),
             ("docs/package.json", {"docs"}),
-            ("README.md", {"system", "docs"}),
-            ("docs/en/reference/s3-compatibility.md", {"system", "docs"}),
-            ("docs/zh/reference/s3-compatibility.md", {"system", "docs"}),
+            ("README.md", {"s3_compatibility", "docs"}),
+            ("docs/en/reference/s3-compatibility.md", {"s3_compatibility", "docs"}),
+            ("docs/zh/reference/s3-compatibility.md", {"s3_compatibility", "docs"}),
             ("ui/src/main.tsx", {"verify", "docker_image"}),
             ("ui/package.json", {"verify", "docker_image"}),
             ("ui/test/tasks.test.ts", set()),
@@ -32,6 +32,7 @@ class RoutingTest(unittest.TestCase):
             ("ui/embed_dev.go", core | {"docker_image"}),
             ("internal/backend/object.go", core | {"docker_image"}),
             ("internal/db/migrations/baseline.sql", core | {"docker_image"}),
+            ("go.mod", core | {"docker_image"}),
             ("go.sum", core | {"docker_image"}),
             ("cmd/synaps3/admin_test.go", {"verify", "go_tests", "race"}),
             ("internal/db/repository/object_repo_test.go", {"verify", "go_tests", "race"}),
@@ -40,10 +41,15 @@ class RoutingTest(unittest.TestCase):
             ("internal/testutil/mocks.go", core),
             ("internal/testpg/postgres.go", core),
             ("cmd/synaps3-systemtest/main.go", core),
-            ("tests/system/s3_matrix_test.go", {"system"}),
-            ("tests/testutil/e2e/readiness.go", {"system"}),
-            ("scripts/s3_compatibility_report.py", {"system"}),
-            ("scripts/test_s3_compatibility_report.py", {"system"}),
+            ("tests/system/s3_matrix_test.go", {"s3_compatibility"}),
+            ("tests/system/s3_clients_test.go", {"s3_compatibility"}),
+            ("tests/system/s3_upgrade_test.go", {"s3_compatibility"}),
+            ("tests/system/main_test.go", {"system", "s3_compatibility"}),
+            ("tests/system/task_lifecycle_test.go", {"system", "s3_compatibility"}),
+            ("tests/system/testdata/fixture.json", {"system", "s3_compatibility"}),
+            ("tests/testutil/e2e/readiness.go", {"system", "s3_compatibility"}),
+            ("scripts/s3_compatibility_report.py", {"s3_compatibility"}),
+            ("scripts/test_s3_compatibility_report.py", {"s3_compatibility"}),
             ("Dockerfile", {"docker_image"}),
             (".dockerignore", {"docker_image"}),
             ("docker/entrypoint.sh", {"docker_image", "docker_deployment"}),
@@ -63,6 +69,7 @@ class RoutingTest(unittest.TestCase):
     def test_global_and_unknown_changes_run_everything(self):
         for path in (
             "Makefile", ".golangci.yml", ".github/workflows/ci.yml",
+            ".github/workflows/s3-compatibility.yml",
             ".github/actions/setup-go/action.yml", "scripts/ci_plan.py",
             "scripts/test_ci_plan.py", "new-subsystem/input.txt", "docker/new-config.toml",
         ):
@@ -74,6 +81,7 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual({flag for flag in ci_plan.FLAGS if plan[flag]}, {"docs", "verify", "docker_image"})
         self.assertEqual(plan["modules_writer"], "verify")
         self.assertEqual(ci_plan.plan_for_paths(["tests/system/main_test.go"])["modules_writer"], "system")
+        self.assertEqual(ci_plan.plan_for_paths(["tests/system/s3_matrix_test.go"])["modules_writer"], "")
         self.assertEqual(ci_plan.plan_for_paths(["docs/index.md"])["modules_writer"], "")
         self.assertFalse(any(ci_plan.plan_for_paths([])[flag] for flag in ci_plan.FLAGS))
 
@@ -202,27 +210,49 @@ class ResultGateTest(unittest.TestCase):
         self.results.update({job: {"result": "success" if self.plan[job] else "skipped"} for job in ci_plan.CORE_JOBS})
 
     def test_expected_skips_and_selected_success_pass(self):
-        self.assertEqual(ci_plan.check_core_results(self.plan, self.results), [])
+        self.assertEqual(ci_plan.check_job_results(self.plan, self.results), [])
+        plan = ci_plan.plan_for_paths(["docs/index.md"])
+        results = {"changes": "success", **{job: "skipped" for job in ci_plan.CORE_JOBS}}
+        self.assertEqual(ci_plan.check_job_results(plan, results), [])
 
     def test_selected_failure_cancel_skip_or_missing_never_pass(self):
-        for result in ("failure", "cancelled", "skipped", None):
-            with self.subTest(result=result):
-                self.results["system"] = {"result": result}
-                self.assertTrue(ci_plan.check_core_results(self.plan, self.results))
+        for job in ("system", "s3_compatibility"):
+            for result in ("failure", "cancelled", "skipped", None):
+                with self.subTest(job=job, result=result):
+                    results = {**self.results, job: {"result": result}}
+                    self.assertTrue(ci_plan.check_job_results(self.plan, results))
+
+    def test_main_push_ci_expects_the_separate_s3_run(self):
+        results = {**self.results, "s3_compatibility": {"result": "skipped"}}
+        self.assertEqual(ci_plan.check_job_results(self.plan, results, event_name="push"), [])
+        self.assertTrue(ci_plan.check_job_results(self.plan, results, event_name="pull_request"))
+        self.assertTrue(ci_plan.check_job_results(self.plan, self.results, event_name="push"))
+
+    def test_s3_scope_checks_selection_on_every_event(self):
+        for event_name in ("pull_request", "push", "workflow_dispatch"):
+            for selected in (True, False):
+                plan = ci_plan.plan_for_paths(["README.md"] if selected else ["docs/index.md"])
+                results = {"changes": "success", "s3_compatibility": "success" if selected else "skipped"}
+                with self.subTest(event=event_name, selected=selected):
+                    self.assertEqual(ci_plan.check_job_results(plan, results, "s3", event_name), [])
+                    for result in ("failure", "cancelled", None, "skipped" if selected else "success"):
+                        results["s3_compatibility"] = result
+                        self.assertTrue(ci_plan.check_job_results(plan, results, "s3", event_name))
 
     def test_unplanned_execution_and_unsuccessful_selector_fail(self):
         self.results["verify"] = {"result": "success"}
-        self.assertTrue(ci_plan.check_core_results(self.plan, self.results))
+        self.assertTrue(ci_plan.check_job_results(self.plan, self.results))
         self.results["verify"] = {"result": "skipped"}
         for result in ("failure", "cancelled", "skipped", None):
             with self.subTest(result=result):
                 self.results["changes"] = {"result": result}
-                self.assertTrue(ci_plan.check_core_results(self.plan, self.results))
+                for scope in ("ci", "s3"):
+                    self.assertTrue(ci_plan.check_job_results(self.plan, self.results, scope))
 
     def test_incomplete_or_nonboolean_plans_fail(self):
         for malformed in ({}, {**self.plan, "verify": "false"}, {**self.plan, "modules_writer": "verify"}):
             with self.subTest(plan=malformed):
-                self.assertTrue(ci_plan.check_core_results(malformed, self.results))
+                self.assertTrue(ci_plan.check_job_results(malformed, self.results))
 
     def test_action_outputs_are_strict_booleans_and_complete_json(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -243,10 +273,12 @@ class ResultGateTest(unittest.TestCase):
             output = Path(temp) / "output"
             env = dict(os.environ, GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_EVENT_PATH=str(event),
                        GITHUB_REF="refs/heads/main", GITHUB_SHA="", GITHUB_OUTPUT=str(output))
-            process = subprocess.run([sys.executable, str(script), "plan"], env=env,
-                                     check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            self.assertEqual(json.loads(process.stdout), ci_plan.full_plan())
-            self.assertIn("docker_image=true\n", output.read_text())
+            for arguments in ([], ["--input-plan", ""]):
+                with self.subTest(arguments=arguments):
+                    process = subprocess.run([sys.executable, str(script), "plan", *arguments], env=env,
+                                             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    self.assertEqual(json.loads(process.stdout), ci_plan.full_plan())
+                    self.assertIn("docker_image=true\n", output.read_text())
         self.results["system"] = {"result": "cancelled"}
         process = subprocess.run([
             sys.executable, str(script), "check", "--plan", json.dumps(self.plan),
@@ -254,6 +286,65 @@ class ResultGateTest(unittest.TestCase):
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(process.returncode, 1)
         self.assertIn("expected success, got cancelled", process.stderr)
+
+    def test_command_line_reuses_parent_plan_without_recomputing_diff(self):
+        with tempfile.TemporaryDirectory() as temp:
+            event = Path(temp) / "event.json"
+            event.write_text("{}", encoding="utf-8")
+            output = Path(temp) / "output"
+            for parent in (ci_plan.full_plan(), ci_plan.plan_for_paths(["README.md"])):
+                for event_path in (event, Path(temp) / "unavailable.json"):
+                    arguments = [ci_plan.__file__, "plan", "--input-plan", json.dumps(parent),
+                                 "--event-name", "pull_request", "--event-path", str(event_path),
+                                 "--output", str(output)]
+                    stdout = io.StringIO()
+                    docs_plan = ci_plan.plan_for_paths(["docs/index.md"])
+                    with self.subTest(parent=parent, event=event_path.name), patch.object(sys, "argv", arguments), \
+                            patch.object(ci_plan, "event_plan", return_value=docs_plan) as recompute, \
+                            contextlib.redirect_stdout(stdout):
+                        self.assertEqual(ci_plan.main(), 0)
+                    recompute.assert_not_called()
+                    self.assertEqual(json.loads(stdout.getvalue()), parent)
+                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    self.assertEqual(json.loads(values["plan"]), parent)
+                    self.assertEqual(values["s3_compatibility"], "true")
+
+    def test_command_line_rejects_invalid_parent_plans_without_outputs(self):
+        script = Path(ci_plan.__file__).resolve()
+        malformed = ("{", "{}", "null", json.dumps({**self.plan, "s3_compatibility": "false"}),
+                     json.dumps({**self.plan, "modules_writer": "verify"}))
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            for parent in malformed:
+                with self.subTest(parent=parent):
+                    process = subprocess.run([
+                        sys.executable, str(script), "plan", "--input-plan", parent,
+                        "--output", str(output),
+                    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    self.assertEqual(process.returncode, 1)
+                    self.assertIn("Invalid input CI plan", process.stderr)
+                    self.assertEqual(process.stdout, "")
+                    self.assertFalse(output.exists())
+
+    def test_check_command_uses_scope_and_event_environment(self):
+        script = Path(ci_plan.__file__).resolve()
+        results = {**self.results, "s3_compatibility": {"result": "skipped"}}
+        command = [sys.executable, str(script), "check", "--plan", json.dumps(self.plan),
+                   "--results", json.dumps(results)]
+        for event_name, scope, expected in (("push", "ci", 0), ("pull_request", "ci", 1),
+                                             ("push", "s3", 1)):
+            with self.subTest(event=event_name, scope=scope):
+                process = subprocess.run(command + ["--scope", scope],
+                                         env=dict(os.environ, GITHUB_EVENT_NAME=event_name),
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.assertEqual(process.returncode, expected, process.stderr)
+        env = dict(os.environ)
+        env.pop("GITHUB_EVENT_NAME", None)
+        process = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(process.returncode, 1)
+        process = subprocess.run(command + ["--event-name", "push"], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
 
 
 if __name__ == "__main__":

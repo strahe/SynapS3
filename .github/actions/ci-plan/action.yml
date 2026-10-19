@@ -1,5 +1,10 @@
 name: Plan CI work
 description: Select CI jobs from the event diff, running everything when the diff is unavailable.
+inputs:
+  plan:
+    description: A complete parent workflow plan to reuse without recomputing the event diff.
+    required: false
+    default: ''
 outputs:
   verify:
     description: Run code verification and production builds.
@@ -11,8 +16,11 @@ outputs:
     description: Run the CI race checks.
     value: ${{ steps.plan.outputs.race }}
   system:
-    description: Run system and S3 compatibility tests.
+    description: Run system runtime tests.
     value: ${{ steps.plan.outputs.system }}
+  s3_compatibility:
+    description: Run S3 compatibility tests and validate the report.
+    value: ${{ steps.plan.outputs.s3_compatibility }}
   docker_image:
     description: Build Docker images.
     value: ${{ steps.plan.outputs.docker_image }}
@@ -34,4 +42,6 @@ runs:
     - name: Classify changed paths
       id: plan
       shell: bash
-      run: python3 "${{ github.action_path }}/../../../scripts/ci_plan.py" plan
+      env:
+        CI_PARENT_PLAN: ${{ inputs.plan }}
+      run: python3 "${{ github.action_path }}/../../../scripts/ci_plan.py" plan --input-plan "$CI_PARENT_PLAN"

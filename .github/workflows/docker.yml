@@ -167,7 +167,7 @@ jobs:
           cache-from: type=gha,scope=synaps3-image-amd64,timeout=2m
           cache-to: type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true,timeout=2m
           build-args: |
-            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.26-alpine' }}
+            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
@@ -224,7 +224,7 @@ jobs:
           cache-from: type=gha,scope=synaps3-image-amd64,timeout=2m
           cache-to: type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true,timeout=2m
           build-args: |
-            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.26-alpine' }}
+            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
             VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
@@ -274,7 +274,7 @@ jobs:
           cache-from: type=gha,scope=synaps3-image-arm64,timeout=2m
           cache-to: type=gha,scope=synaps3-image-arm64,mode=max,ignore-error=true,timeout=2m
           build-args: |
-            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.26-alpine' }}
+            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
             VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
