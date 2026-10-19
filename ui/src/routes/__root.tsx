@@ -25,6 +25,7 @@ import { type AuthSession, addAuthInvalidationListener, api } from '@/api/client
 import { AdminLogin } from '@/components/app/AdminLogin'
 import { Banner } from '@/components/app/Banner'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
+import { PageError } from '@/components/app/PageState'
 import { ProviderSpeedNotice } from '@/components/app/ProviderSpeedNotice'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -72,7 +73,13 @@ import {
 } from '@/lib/theme'
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
 import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
-import { authSessionQueryOptions, clearLocalAuthSession } from './-auth-session'
+import {
+  authSessionContentKind,
+  authSessionQueryOptions,
+  clearLocalAuthSession,
+  logoutLocalAuthSession,
+  storeLocalAuthSession,
+} from './-auth-session'
 import {
   filecoinRuntimeReadinessEnabled,
   fullRuntimeAvailable,
@@ -123,7 +130,7 @@ function RootLayout() {
   const queryClient = useQueryClient()
   const authSession = useQuery({
     queryKey: ['authSession'],
-    queryFn: api.getAuthSession,
+    queryFn: ({ signal }) => api.getAuthSession({ signal }),
     retry: false,
     ...authSessionQueryOptions,
   })
@@ -166,7 +173,8 @@ function RootLayout() {
 
   const toaster = <Toaster theme={dark ? 'dark' : 'light'} position="bottom-right" />
 
-  if (authSession.isLoading) {
+  const authContent = authSessionContentKind(authSession.data, authSession.error)
+  if (authContent === 'loading') {
     return (
       <main className="flex min-h-screen items-center justify-center bg-background">
         <LoaderCircle className="size-5 animate-spin text-muted-foreground" aria-hidden="true" />
@@ -174,12 +182,26 @@ function RootLayout() {
     )
   }
 
-  if (authSession.isError || !authSession.data) {
+  if (authContent === 'unavailable') {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-background p-6">
+        <PageError
+          title="Could not verify your session."
+          onRetry={() => void authSession.refetch()}
+          retrying={authSession.isFetching}
+          className="max-w-sm"
+        />
+        {toaster}
+      </main>
+    )
+  }
+
+  if (authContent === 'login' || !authSession.data) {
     return (
       <>
         <AdminLogin
           onAuthenticated={(session) => {
-            queryClient.setQueryData(['authSession'], session)
+            storeLocalAuthSession(queryClient, session)
           }}
         />
         {toaster}
@@ -191,6 +213,9 @@ function RootLayout() {
     <>
       <AuthenticatedRootLayout
         session={authSession.data}
+        verificationUnavailable={authSession.isError}
+        retryVerification={() => void authSession.refetch()}
+        verifying={authSession.isFetching}
         themePreference={themePreference}
         onThemePreferenceChange={handleThemePreferenceChange}
       />
@@ -201,29 +226,35 @@ function RootLayout() {
 
 function AuthenticatedRootLayout({
   session,
+  verificationUnavailable,
+  retryVerification,
+  verifying,
   themePreference,
   onThemePreferenceChange,
 }: {
   session: AuthSession
+  verificationUnavailable: boolean
+  retryVerification: () => void
+  verifying: boolean
   themePreference: ThemePreference
   onThemePreferenceChange: (preference: ThemePreference) => void
 }) {
   const queryClient = useQueryClient()
   const location = useLocation()
   const { data: settings, isLoading: settingsLoading } = useSettings()
-  const stopSessionRenewal = useAuthSessionRenewal(session)
+  const renewal = useAuthSessionRenewal(session)
+  const [logoutFailed, setLogoutFailed] = useState(false)
   const runtimeAvailable = fullRuntimeAvailable(settings, settingsLoading)
   const activeNavItems = settingsLoading || rootUsesSetupShell(settings) ? setupNavItems : navItems
   const contentKind = rootContentKind(settings, location.pathname)
 
   const handleLogout = useCallback(async () => {
-    await stopSessionRenewal()
     try {
-      await api.logout()
-    } finally {
-      clearLocalAuthSession(queryClient)
+      await logoutLocalAuthSession(queryClient, renewal)
+    } catch {
+      setLogoutFailed(true)
     }
-  }, [queryClient, stopSessionRenewal])
+  }, [queryClient, renewal])
 
   return (
     <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>
@@ -239,6 +270,26 @@ function AuthenticatedRootLayout({
 
       {/* A page that marks itself data-fill-viewport gets the height left after the alert, instead of the full screen. */}
       <SidebarInset className="overflow-auto has-data-[fill-viewport]:h-svh">
+        {verificationUnavailable && (
+          <Alert variant="destructive">
+            <AlertDescription className="flex items-center justify-between gap-3">
+              Could not verify your session.
+              <Button variant="outline" size="sm" onClick={retryVerification} disabled={verifying}>
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+        {logoutFailed && (
+          <Alert variant="destructive">
+            <AlertDescription className="flex items-center justify-between gap-3">
+              Could not sign out.
+              <Button variant="outline" size="sm" onClick={() => void handleLogout()}>
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
         <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-4 md:hidden">
           <SidebarTrigger />
           <span className="font-semibold">SynapS3</span>

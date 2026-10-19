@@ -34,8 +34,10 @@ var Migrations = func() *migrate.Migrations {
 // The baseline's table inventory recognizes a committed schema whose migration
 // marker was lost. Later migrations have their own recovery contracts.
 var initialSchemaTables2026090101 = []string{
+	"admin_sessions",
 	"bucket_replica_slots",
 	"buckets",
+	"deployment_identity",
 	"multipart_parts",
 	"multipart_uploads",
 	"object_cache",

@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	appTypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synaps3/internal/walletoperation"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
@@ -1099,3 +1100,15 @@ var (
 	_ synapse.DataSetTarget        = (*memoryDataSetTarget)(nil)
 	_ synapse.CleanupContext       = (*memoryDataSetTarget)(nil)
 )
+
+func (m *MemoryFilecoin) PDPVerifierAddress() common.Address {
+	return common.HexToAddress("0x00000000000000000000000000000000000000c3")
+}
+
+func (m *MemoryFilecoin) WalletIdentity() walletoperation.ExecutionIdentity {
+	return walletoperation.NewExecutionIdentity(m.ContextIdentity(), common.HexToAddress("0x00000000000000000000000000000000000000d4"), memoryUSDFCAddress)
+}
+
+func (c *memoryDataSetTarget) ContextIdentity() storage.ContextIdentity {
+	return c.filecoin.ContextIdentity()
+}

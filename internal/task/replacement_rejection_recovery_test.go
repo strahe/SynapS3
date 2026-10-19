@@ -100,7 +100,7 @@ func seedFailedInitializationReplacement(t *testing.T, runtime handlerTestRuntim
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceEnsure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: source.ID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+	sourceEnsure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: source.ID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, source.ID, task.ID)
 	})
 	if err != nil {
@@ -111,7 +111,7 @@ func seedFailedInitializationReplacement(t *testing.T, runtime handlerTestRuntim
 		t.Fatal(err)
 	}
 	if len(readySource) != 0 && readySource[0] {
-		if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 1001)}); err != nil {
+		if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 1001)}); err != nil {
 			t.Fatal(err)
 		}
 		if err := runtime.repos.Contents.CompleteDataSetEnsureTask(t.Context(), source.ID, sourceEnsure.ID); err != nil {
@@ -122,7 +122,7 @@ func seedFailedInitializationReplacement(t *testing.T, runtime handlerTestRuntim
 	if err != nil {
 		t.Fatal(err)
 	}
-	ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: row.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
+	ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: row.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, row.TargetDataSetID, task.ID)
 	})
 	if err != nil {

@@ -624,3 +624,11 @@ func LegacyPieceStorageIDLimit(network string) uint64 {
 	}
 	return selected.LegacyPieceStorageIDLimit()
 }
+
+func ValidateNetworkChainID(network string, actual int64) error {
+	expected, ok := chainForReadinessNetwork(network)
+	if !ok || expected.ChainID() != actual {
+		return fmt.Errorf("RPC chain %d does not match Filecoin network %s", actual, normalizeReadinessNetwork(network))
+	}
+	return nil
+}

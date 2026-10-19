@@ -749,6 +749,18 @@ func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWrite
 	if versionCount != 1 {
 		t.Fatalf("version count = %d, want 1", versionCount)
 	}
+	changed := newObjectVersion(bucket.ID, "same-key.txt", "01J00000000000000000000DZ", 100)
+	changed.ETag = "same-etag"
+	changed.ContentID = &sharedContentID
+	changed.SystemMetadata = model.ObjectSystemMetadata{CacheControl: "private", ContentDisposition: `attachment; filename="version\u0000.txt"`}
+	result, err := repos.Objects.CreateVersionAndSetCurrentIfChanged(ctx, changed)
+	if err != nil || !result.Created || result.VersionID != changed.VersionID {
+		t.Fatalf("changed system metadata write = %#v, %v", result, err)
+	}
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "same-key.txt")
+	if err != nil || current == nil || current.SystemMetadata != changed.SystemMetadata {
+		t.Fatalf("current system metadata = %#v, %v", current, err)
+	}
 }
 
 func TestObjectRepo_ListByBucketReadsCurrentVersionOnly(t *testing.T) {

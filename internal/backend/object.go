@@ -112,7 +112,14 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 				ETag:        cacheInfo.ETag,
 				ContentType: contentType,
 				Metadata:    meta,
-				ContentID:   &content.ID,
+				SystemMetadata: model.ObjectSystemMetadata{
+					CacheControl:       derefStr(input.CacheControl),
+					ContentDisposition: derefStr(input.ContentDisposition),
+					ContentEncoding:    storedContentEncoding(input.ContentEncoding),
+					ContentLanguage:    derefStr(input.ContentLanguage),
+					Expires:            derefStr(input.Expires),
+				},
+				ContentID: &content.ID,
 			}
 			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
 			if err != nil {
@@ -225,15 +232,20 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 	}
 	admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 	return &s3.GetObjectOutput{
-		Body:          b.transferCounters.WrapReadCloser(observability.ClientDownload, out.Body),
-		ContentLength: &length,
-		ContentRange:  contentRange,
-		AcceptRanges:  &acceptRanges,
-		ETag:          &etag,
-		ContentType:   &contentType,
-		VersionId:     &out.VersionID,
-		LastModified:  &out.LastModified,
-		Metadata:      out.Metadata,
+		Body:               b.transferCounters.WrapReadCloser(observability.ClientDownload, out.Body),
+		ContentLength:      &length,
+		ContentRange:       contentRange,
+		AcceptRanges:       &acceptRanges,
+		ETag:               &etag,
+		ContentType:        &contentType,
+		VersionId:          &out.VersionID,
+		LastModified:       &out.LastModified,
+		Metadata:           out.Metadata,
+		CacheControl:       stringOrNil(out.SystemMetadata.CacheControl),
+		ContentDisposition: stringOrNil(out.SystemMetadata.ContentDisposition),
+		ContentEncoding:    stringOrNil(out.SystemMetadata.ContentEncoding),
+		ContentLanguage:    stringOrNil(out.SystemMetadata.ContentLanguage),
+		ExpiresString:      stringOrNil(out.SystemMetadata.Expires),
 	}, nil
 }
 
@@ -261,12 +273,17 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 	}
 
 	return &s3.HeadObjectOutput{
-		ContentLength: &meta.Size,
-		ETag:          &meta.QuotedETag,
-		ContentType:   &meta.ContentType,
-		LastModified:  &meta.LastModified,
-		VersionId:     &meta.VersionID,
-		Metadata:      meta.Metadata,
+		ContentLength:      &meta.Size,
+		ETag:               &meta.QuotedETag,
+		ContentType:        &meta.ContentType,
+		LastModified:       &meta.LastModified,
+		VersionId:          &meta.VersionID,
+		Metadata:           meta.Metadata,
+		CacheControl:       stringOrNil(meta.SystemMetadata.CacheControl),
+		ContentDisposition: stringOrNil(meta.SystemMetadata.ContentDisposition),
+		ContentEncoding:    stringOrNil(meta.SystemMetadata.ContentEncoding),
+		ContentLanguage:    stringOrNil(meta.SystemMetadata.ContentLanguage),
+		ExpiresString:      stringOrNil(meta.SystemMetadata.Expires),
 	}, nil
 }
 
@@ -705,7 +722,14 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		MetadataDirective: input.MetadataDirective,
 		Metadata:          input.Metadata,
 		ContentType:       input.ContentType,
-		SourceVisibility:  objectreader.S3Visibility,
+		SystemMetadata: model.ObjectSystemMetadata{
+			CacheControl:       derefStr(input.CacheControl),
+			ContentDisposition: derefStr(input.ContentDisposition),
+			ContentEncoding:    storedContentEncoding(input.ContentEncoding),
+			ContentLanguage:    derefStr(input.ContentLanguage),
+			Expires:            derefStr(input.Expires),
+		},
+		SourceVisibility: objectreader.S3Visibility,
 	})
 	if err != nil {
 		return s3response.CopyObjectOutput{}, b.copyObjectError(err)
@@ -736,6 +760,7 @@ type copyObjectVersionInput struct {
 	MetadataDirective types.MetadataDirective
 	Metadata          map[string]string
 	ContentType       *string
+	SystemMetadata    model.ObjectSystemMetadata
 	SourceVisibility  objectreader.BucketVisibility
 	Restore           *restoreVersionPrecondition
 }
@@ -773,11 +798,13 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 
 	metadata := make(map[string]string)
 	contentType := input.SourceVersion.ContentType
+	systemMetadata := input.SourceVersion.SystemMetadata
 	if input.MetadataDirective == types.MetadataDirectiveReplace {
 		if input.Metadata != nil {
 			metadata = input.Metadata
 		}
 		contentType = stringOrDefault(input.ContentType, "application/octet-stream")
+		systemMetadata = input.SystemMetadata
 	} else {
 		maps.Copy(metadata, input.SourceVersion.Metadata)
 	}
@@ -803,14 +830,15 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 			}
 
 			version := &model.ObjectVersion{
-				VersionID:   versionID,
-				BucketID:    input.DestinationBucket.ID,
-				Key:         input.DestinationKey,
-				Size:        cacheInfo.Size,
-				ETag:        cacheInfo.ETag,
-				ContentType: contentType,
-				Metadata:    metadata,
-				ContentID:   &content.ID,
+				VersionID:      versionID,
+				BucketID:       input.DestinationBucket.ID,
+				Key:            input.DestinationKey,
+				Size:           cacheInfo.Size,
+				ETag:           cacheInfo.ETag,
+				ContentType:    contentType,
+				Metadata:       metadata,
+				SystemMetadata: systemMetadata,
+				ContentID:      &content.ID,
 			}
 			if input.Restore == nil {
 				objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
@@ -939,6 +967,7 @@ func restoreSourceAlreadyCurrent(source, current *model.ObjectVersion) bool {
 	return current.Size == source.Size &&
 		current.Checksum == source.Checksum &&
 		current.ContentType == source.ContentType &&
+		current.SystemMetadata == source.SystemMetadata &&
 		maps.Equal(current.Metadata, source.Metadata)
 }
 
@@ -1118,6 +1147,26 @@ func derefStr(s *string) string {
 	return *s
 }
 
+func storedContentEncoding(value *string) string {
+	encodings := strings.Split(derefStr(value), ",")
+	stored := encodings[:0]
+	for _, encoding := range encodings {
+		encoding = strings.TrimSpace(encoding)
+		// The gateway removes aws-chunked framing before passing the body to the backend.
+		if encoding != "" && !strings.EqualFold(encoding, "aws-chunked") {
+			stored = append(stored, encoding)
+		}
+	}
+	return strings.Join(stored, ",")
+}
+
+func stringOrNil(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
 func validateObjectKey(key string) error {
 	if err := objectkey.Validate(key); err != nil {
 		return s3err.InvalidArgumentError{
@@ -1137,6 +1186,7 @@ type objectMetadataResult struct {
 	MultipartUploadID *string
 	LastModified      time.Time
 	Metadata          map[string]string
+	SystemMetadata    model.ObjectSystemMetadata
 }
 
 func (b *SynapseBackend) objectMetadata(ctx context.Context, bucketID int64, key, versionID string) (objectMetadataResult, error) {
@@ -1154,6 +1204,7 @@ func (b *SynapseBackend) objectMetadata(ctx context.Context, bucketID int64, key
 		MultipartUploadID: version.MultipartUploadID,
 		LastModified:      version.CreatedAt,
 		Metadata:          maps.Clone(version.Metadata),
+		SystemMetadata:    version.SystemMetadata,
 	}, nil
 }
 

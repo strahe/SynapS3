@@ -116,7 +116,6 @@ Admin API 包含设置、钱包操作、任务重试和 S3 用户管理的写端
 高风险变更需要确认：
 
 ```bash
-synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
 synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes

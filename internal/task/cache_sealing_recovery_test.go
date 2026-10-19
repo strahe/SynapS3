@@ -177,7 +177,7 @@ func TestPressureSealsLaterReplicasUntilMinimumDurability(t *testing.T) {
 			t.Fatal(err)
 		}
 		chainID, clientID := testOnChainID(t, 600000+binding.ID), testOnChainID(t, 700000+binding.ID)
-		if err := f.runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: chainID, ClientDataSetID: &clientID}); err != nil {
+		if err := markTestDataSetReady(t, f.runtime, ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: chainID, ClientDataSetID: &clientID}); err != nil {
 			t.Fatal(err)
 		}
 		binding.DataSetID, binding.ClientDataSetID = &chainID, &clientID

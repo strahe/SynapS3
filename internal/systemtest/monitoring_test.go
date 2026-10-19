@@ -13,11 +13,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/tests/testutil/e2e"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
+	"github.com/strahe/synapse-go/warmstorage"
 )
 
 func TestRuntimeMonitoringUsesStorageAdapterCounters(t *testing.T) {
@@ -35,7 +39,18 @@ func TestRuntimeMonitoringUsesStorageAdapterCounters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := synapse.AdaptStorageService(service, nil, storage.ContextIdentity{})
+	chainClient := ethclient.NewClient(rpc.DialInProc(rpc.NewServer()))
+	t.Cleanup(chainClient.Close)
+	identity := (&MemoryFilecoin{}).ContextIdentity()
+	dataSets, err := warmstorage.New(warmstorage.Options{
+		Client: chainClient, FWSS: identity.RecordKeeper,
+		ViewContract: common.HexToAddress("0x00000000000000000000000000000000000000e5"),
+		PDPVerifier:  (&MemoryFilecoin{}).PDPVerifierAddress(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := synapse.AdaptStorageService(service, dataSets, identity)
 	harness, err := NewHarness(t.Context(), slog.New(slog.NewTextHandler(io.Discard, nil)), HarnessOptions{Storage: adapter})
 	if err != nil {
 		t.Fatal(err)

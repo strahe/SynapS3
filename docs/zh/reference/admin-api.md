@@ -32,7 +32,8 @@ Setup 模式不提供运行时指标、存储桶、对象、后台任务、钱�
 | --- | --- |
 | `/healthz` | 无。 |
 | `/api/v1/auth/login`、`/api/v1/auth/session` | 登录和会话端点。没有有效浏览器会话时，`/session` 返回 `401`。 |
-| `/api/v1/auth/refresh`、`/api/v1/auth/logout` | 需要有效浏览器会话和 CSRF header；不接受 HTTP Basic auth。 |
+| `/api/v1/auth/refresh` | 需要未过期的浏览器 session cookie 和 CSRF header；不接受 HTTP Basic auth。 |
+| `/api/v1/auth/logout` | 需要可验证的浏览器 session cookie 和 CSRF header；可接受已过期 cookie。不接受 HTTP Basic auth。 |
 | `/api/v1/*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 | `/metrics` | 浏览器 session cookie 或 HTTP Basic auth。 |
 
@@ -44,7 +45,7 @@ Setup 模式不提供运行时指标、存储桶、对象、后台任务、钱�
 
 登录、会话和续期响应包含 `username`、`csrf_token`、`expires_at` 和 `refresh_after`。任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后请求续期。登录没有绝对时长上限。没有客户端请求续期时，token 会在 `expires_at` 到期。
 
-续期会保留会话时长、CSRF token 和登录 family。退出会撤销整个 family，包括最近一次续期之前签发的 token。撤销记录保存在内存中；重启 SynapS3 会清空这些记录，但正常退出时浏览器 cookie 仍会被删除。
+续期会保留会话时长、CSRF token 和登录 family。退出会撤销整个 family，包括续期签发的 token。正常模式重启会保留会话和已完成的退出结果；Setup 模式的会话在重启后失效。
 
 ### CLI 和 Basic auth
 
@@ -72,10 +73,10 @@ synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
 | --- | --- | --- |
 | `POST` | `/api/v1/auth/login` | 校验用户名和密码，接受可选的 `remember`，设置浏览器 cookie，并返回会话。 |
 | `GET` | `/api/v1/auth/session` | 返回当前浏览器会话。 |
-| `POST` | `/api/v1/auth/refresh` | 需要会话和 CSRF；会话允许续期时重新签发，过早请求只返回当前会话且不修改 cookie。 |
-| `POST` | `/api/v1/auth/logout` | 需要会话和 CSRF，结束当前浏览器会话并清除 cookie。 |
+| `POST` | `/api/v1/auth/refresh` | 续期符合条件的浏览器会话。过早请求只返回当前会话且不修改 cookie。 |
+| `POST` | `/api/v1/auth/logout` | 撤销浏览器登录并清除 cookie；`204` 确认成功。 |
 
-退出登录或收到 `401` API 响应后，仪表盘会返回登录页。
+退出之外的 API 返回 `401` 时，仪表盘会显示登录页。退出请求失败时应重试。`503` 和网络错误会保留已缓存的会话；首次无法验证时显示 **Retry**。
 
 ## 安全标头
 
@@ -87,7 +88,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 | 范围 | 端点 | 风险 |
 | --- | --- | --- |
-| 设置 | `PUT /api/v1/settings` | 变更可能需要重启，或把节点切换到不同 Filecoin 网络。保存前先验证设置和 Filecoin readiness。 |
+| 设置 | `PUT /api/v1/settings` | 变更可能需要重启。钱包和网络必须与部署匹配；保存前先验证设置和 Filecoin readiness。 |
 | 钱包 | `POST /api/v1/wallet/fund`、`POST /api/v1/wallet/withdraw`、`POST /api/v1/wallet/approve` | 创建链上支付操作。 |
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
@@ -109,7 +110,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | Method | Path | 用途 |
 | --- | --- | --- |
 | `GET` | `/api/v1/overview` | 仪表盘摘要。 |
-| `GET` | `/api/v1/events` | 仪表盘事件流。 |
+| `GET` | `/api/v1/events` | 仪表盘事件流。使用 cookie 认证时，会话到期、被撤销或无法验证都会关闭连接。空闲连接每 15 秒检查一次，每次验证最多 5 秒。 |
 | `GET` | `/api/v1/buckets` | 列出存储桶。 |
 | `POST` | `/api/v1/buckets` | 创建存储桶。 |
 | `GET` | `/api/v1/buckets/{name}` | 读取存储桶详情。 |

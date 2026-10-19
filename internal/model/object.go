@@ -47,23 +47,33 @@ type Object struct {
 	Bucket *Bucket `bun:"rel:belongs-to,join:bucket_id=id"`
 }
 
+// ObjectSystemMetadata contains S3 response headers owned by a version or upload.
+type ObjectSystemMetadata struct {
+	CacheControl       string `json:"cache_control,omitempty"`
+	ContentDisposition string `json:"content_disposition,omitempty"`
+	ContentEncoding    string `json:"content_encoding,omitempty"`
+	ContentLanguage    string `json:"content_language,omitempty"`
+	Expires            string `json:"expires,omitempty"`
+}
+
 // ObjectVersion stores immutable per-version identity plus mutable lifecycle state.
 type ObjectVersion struct {
 	bun.BaseModel `bun:"table:object_versions"`
 
-	VersionID         string            `bun:"type:text,pk"`
-	ObjectID          int64             `bun:",notnull"`
-	BucketID          int64             `bun:",notnull"`
-	Key               string            `bun:"type:text,notnull"`
-	ContentID         *int64            `bun:",nullzero"`
-	Size              int64             `bun:",notnull"`
-	ETag              string            `bun:"type:text,notnull"`
-	ContentType       string            `bun:"type:text,notnull,default:'application/octet-stream'"`
-	Metadata          map[string]string `bun:"type:jsonb,notnull,default:'{}'"`
-	MultipartUploadID *string           `bun:"type:text,nullzero"`
-	IsDeleteMarker    bool              `bun:",notnull,default:false"`
-	CreatedAt         time.Time         `bun:",nullzero,notnull"`
-	UpdatedAt         time.Time         `bun:",nullzero,notnull"`
+	VersionID         string               `bun:"type:text,pk"`
+	ObjectID          int64                `bun:",notnull"`
+	BucketID          int64                `bun:",notnull"`
+	Key               string               `bun:"type:text,notnull"`
+	ContentID         *int64               `bun:",nullzero"`
+	Size              int64                `bun:",notnull"`
+	ETag              string               `bun:"type:text,notnull"`
+	ContentType       string               `bun:"type:text,notnull,default:'application/octet-stream'"`
+	Metadata          map[string]string    `bun:"type:jsonb,notnull,default:'{}'"`
+	SystemMetadata    ObjectSystemMetadata `bun:"type:jsonb,notnull,default:'{}'"`
+	MultipartUploadID *string              `bun:"type:text,nullzero"`
+	IsDeleteMarker    bool                 `bun:",notnull,default:false"`
+	CreatedAt         time.Time            `bun:",nullzero,notnull"`
+	UpdatedAt         time.Time            `bun:",nullzero,notnull"`
 
 	// Everything below is projected by repository reads rather than stored.
 	// Durability and pipeline position are functions of the copy rows, cache

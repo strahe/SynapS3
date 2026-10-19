@@ -165,6 +165,9 @@ func (h *CopyCoordinator) copyContextFailure(
 	err error,
 	settleSafe bool,
 ) taskengine.Result {
+	if storagepipeline.IsExecutionIdentityError(err) {
+		return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+	}
 	if errors.Is(err, repository.ErrNotFound) {
 		if settleSafe {
 			return h.failCopyTask(execution, input, copyRow, err, "copy_owner_missing")

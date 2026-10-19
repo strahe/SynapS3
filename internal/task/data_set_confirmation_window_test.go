@@ -160,7 +160,7 @@ func TestDataSetGenerationCreatesOwnRequestAfterReturningToProvider(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstEnsure, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: source.ID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+	firstEnsure, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: source.ID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, source.ID, row.ID)
 	})
 	if err != nil {
@@ -187,7 +187,7 @@ func TestDataSetGenerationCreatesOwnRequestAfterReturningToProvider(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextEnsure, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: second.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+	nextEnsure, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: second.TargetDataSetID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, second.TargetDataSetID, row.ID)
 	})
 	if err != nil {

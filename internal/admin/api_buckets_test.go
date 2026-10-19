@@ -84,6 +84,7 @@ func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies
 	}
 	entryPoints, err := task.Register(registry, service, task.Dependencies{
 		Repositories: repos, Cache: localCache, CacheGate: srv.cacheGate, CacheTracker: srv.cacheAccessTracker,
+		Storage:       &testutil.MockStorageClient{},
 		DefaultCopies: filecoinDefaultCopies, Logger: testLogger(),
 	})
 	if err != nil {

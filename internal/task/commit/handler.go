@@ -14,6 +14,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
+	bindingtask "github.com/strahe/synaps3/internal/task/binding"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
@@ -27,6 +28,7 @@ const (
 // commitCheckpoint records the latest send of a commit request. The request
 // row holds the send history; the checkpoint only fences the send itself.
 type commitCheckpoint struct {
+	storagepipeline.ExecutionIdentity
 	RequestID     string    `json:"request_id"`
 	Sends         int       `json:"sends"`
 	SentAt        time.Time `json:"sent_at"`
@@ -94,6 +96,7 @@ func (h *Handler) commitHandler() *taskengine.FuncHandler {
 
 // commitRun is one claim of a request's task.
 type commitRun struct {
+	identity   storagepipeline.ExecutionIdentity
 	execution  taskengine.Execution
 	checkpoint commitCheckpoint
 	request    *storagecommit.Request
@@ -131,7 +134,29 @@ func (h *Handler) runCommit(ctx context.Context, execution taskengine.Execution,
 		}
 		return retryTask(err, "dataset_load_failed")
 	}
+	identity, err := h.deps.Resolver.ExecutionIdentity(ctx, binding)
+	if err != nil {
+		if storagepipeline.IsExecutionIdentityError(err) {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+		return retryTask(err, "storage_identity_load_failed")
+	}
+	if input.Present() {
+		if err := input.Match(identity); err != nil {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+	}
+	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[commitCheckpoint](execution)
+	if err != nil {
+		return taskengine.Fail(err, "invalid_checkpoint", nil)
+	}
+	if hasCheckpoint {
+		if err := checkpoint.Match(identity); err != nil {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+	}
 	run := commitRun{
+		identity: identity, checkpoint: checkpoint,
 		execution: execution, request: request, binding: binding, mayExec: mayExecute,
 		advancer: storagecommit.Advancer{Nonces: h.deps.CommitNonces},
 	}
@@ -266,7 +291,7 @@ func (h *Handler) sealCommit(ctx context.Context, run commitRun, members []repos
 	for i, member := range members {
 		sealMembers[i] = repository.SealMember{CopyID: member.ID, ContentID: member.ContentID, PieceCID: member.PieceCID}
 	}
-	return run.execution.WriteCheckpointWith(ctx, commitCheckpoint{RequestID: run.request.RequestID}, func(ctx context.Context, repos *repository.Repositories) error {
+	return run.execution.WriteCheckpointWith(ctx, commitCheckpoint{ExecutionIdentity: run.identity, RequestID: run.request.RequestID}, func(ctx context.Context, repos *repository.Repositories) error {
 		spilled, err := repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
 			RequestID: run.request.RequestID, TaskID: run.taskID(), Members: sealMembers, ExtraDataHex: extraHex,
 		})
@@ -280,7 +305,7 @@ func (h *Handler) sealCommit(ctx context.Context, run commitRun, members []repos
 		if err != nil {
 			return err
 		}
-		taskID, err := h.enqueueCommitTask(ctx, repos, requestID, time.Time{})
+		taskID, err := h.enqueueCommitTask(ctx, repos, requestID, run.binding.ID, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -347,7 +372,7 @@ func (h *Handler) runReadyCommit(ctx context.Context, run commitRun) taskengine.
 	if err != nil {
 		return retryTask(err, "commit_policy_invalid")
 	}
-	run.checkpoint = commitCheckpoint{RequestID: request.RequestID, Sends: 1, SentAt: now, NextResendAt: resendAt}
+	run.checkpoint = commitCheckpoint{ExecutionIdentity: run.identity, RequestID: request.RequestID, Sends: 1, SentAt: now, NextResendAt: resendAt}
 	attempted, err := run.execution.WithCheckpointedEffect(ctx, "commit:"+request.RequestID,
 		run.checkpoint,
 		func(ctx context.Context, repos *repository.Repositories) error {
@@ -496,7 +521,7 @@ func (h *Handler) runSubmittedCommit(ctx context.Context, run commitRun) taskeng
 	if err != nil {
 		return retryTask(err, "commit_policy_invalid")
 	}
-	run.checkpoint = commitCheckpoint{RequestID: request.RequestID, Sends: sends, SentAt: now, NextResendAt: resendAt}
+	run.checkpoint = commitCheckpoint{ExecutionIdentity: run.identity, RequestID: request.RequestID, Sends: sends, SentAt: now, NextResendAt: resendAt}
 	var sent storagecommit.SendResult
 	attempted, err := run.execution.WithCheckpointedEffect(ctx, "commit:"+request.RequestID,
 		run.checkpoint,
@@ -573,7 +598,8 @@ func (h *Handler) commitResendDeadline(ctx context.Context, run commitRun) (time
 		return time.Time{}, err
 	}
 	checkpoint = commitCheckpoint{
-		RequestID: request.RequestID, Sends: request.Sends, SentAt: *request.LastSentAt, NextResendAt: resendAt,
+		ExecutionIdentity: run.identity,
+		RequestID:         request.RequestID, Sends: request.Sends, SentAt: *request.LastSentAt, NextResendAt: resendAt,
 	}
 	if request.TransactionID != nil {
 		checkpoint.TransactionID = *request.TransactionID
@@ -1036,7 +1062,7 @@ func (h *Handler) queueCommit(ctx context.Context, repos *repository.Repositorie
 	if err != nil {
 		return err
 	}
-	taskID, err := h.enqueueCommitTask(ctx, repos, requestID, time.Time{})
+	taskID, err := h.enqueueCommitTask(ctx, repos, requestID, copyRow.StorageDataSetID, time.Time{})
 	if err != nil {
 		return err
 	}
@@ -1047,13 +1073,21 @@ func (h *Handler) queueCommit(ctx context.Context, repos *repository.Repositorie
 
 // enqueueCommitTask creates the task that drives a request, runnable from
 // availableAt (now when zero).
-func (h *Handler) enqueueCommitTask(ctx context.Context, repos *repository.Repositories, requestID string, availableAt time.Time) (int64, error) {
+func (h *Handler) enqueueCommitTask(ctx context.Context, repos *repository.Repositories, requestID string, dataSetID int64, availableAt time.Time) (int64, error) {
 	if h.deps.Scheduler == nil {
 		return 0, errors.New("task service is unavailable")
 	}
+	binding, err := repos.Contents.GetDataSetBindingByID(ctx, dataSetID)
+	if err != nil {
+		return 0, err
+	}
+	identity, err := bindingtask.RecordedIdentity(ctx, repos, binding)
+	if err != nil {
+		return 0, err
+	}
 	taskRow, _, err := h.deps.Scheduler.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 		Type:        model.TaskTypeStorageCommit,
-		Input:       storagepipeline.CommitRequestInput{RequestID: requestID},
+		Input:       storagepipeline.CommitRequestInput{RequestID: requestID, ExecutionIdentity: identity},
 		AvailableAt: availableAt,
 	})
 	if err != nil {
@@ -1072,6 +1106,21 @@ func commitAttentionError(request *storagecommit.Request) error {
 }
 
 func (h *Handler) retryStalledMembers(ctx context.Context, run commitRun, stalled []int64, observed taskengine.Settlement) taskengine.Result {
+	for _, copyID := range stalled {
+		copyRow, err := h.deps.Repositories.Contents.GetUploadCopyByID(ctx, copyID)
+		if err != nil {
+			return retryTask(err, "commit_member_recovery_load_failed")
+		}
+		if copyRow != nil && copyRow.ActiveTaskID != nil {
+			source, err := h.deps.Repositories.Tasks.GetByID(ctx, *copyRow.ActiveTaskID)
+			if err != nil {
+				return retryTask(err, "commit_member_recovery_load_failed")
+			}
+			if source != nil && source.FailureReason != nil && storagepipeline.ExecutionIdentityBlocked(*source.FailureReason) {
+				return taskengine.Fail(errors.New("batch member requires manual recovery"), "commit_member_recovery_blocked", observed)
+			}
+		}
+	}
 	canResign := run.request.Status == storagecommit.RequestStatusReady && run.request.Sends == 0 && run.request.TransactionID == nil
 	if canResign && run.execution.RetryCount()+1 >= run.execution.Policy().MaxAttempts {
 		return h.giveUpUnacceptedCommit(ctx, run)

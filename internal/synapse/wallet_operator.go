@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/strahe/synaps3/internal/walletoperation"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synapse-go/payments"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -19,11 +21,14 @@ type walletPaymentOperator interface {
 type walletOperator struct {
 	payments walletPaymentOperator
 	usdfc    common.Address
+	identity walletoperation.ExecutionIdentity
 }
 
-func NewWalletOperator(paySvc *payments.Service, usdfc common.Address) WalletOperator {
-	return &walletOperator{payments: paySvc, usdfc: usdfc}
+func NewWalletOperator(paySvc *payments.Service, usdfc common.Address, identity walletoperation.ExecutionIdentity) WalletOperator {
+	return &walletOperator{payments: paySvc, usdfc: usdfc, identity: identity}
 }
+
+func (o *walletOperator) WalletIdentity() walletoperation.ExecutionIdentity { return o.identity }
 
 func (o *walletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string, error) {
 	res, err := o.payments.Fund(ctx, amount)

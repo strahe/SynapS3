@@ -116,7 +116,6 @@ The Admin API contains write endpoints for settings, wallet operations, task ret
 High-risk changes require confirmation:
 
 ```bash
-synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
 synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes

@@ -6,7 +6,9 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/walletoperation"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -40,6 +42,7 @@ type ProviderTarget interface {
 // DataSetTarget is an immutable existing data set used for piece operations.
 type DataSetTarget interface {
 	StorageTarget
+	ContextIdentity() storage.ContextIdentity
 	CreateStoreSession(ctx context.Context) (string, error)
 	UploadStoreSession(ctx context.Context, serviceURL, sessionID string, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error)
 	FinalizeStoreSession(ctx context.Context, serviceURL, sessionID string, pieceCID cid.Cid) error
@@ -61,6 +64,8 @@ type CleanupContext interface {
 // StorageClient abstracts the synapse-go storage service for download plus
 // staged provider operations.
 type StorageClient interface {
+	ContextIdentity() storage.ContextIdentity
+	PDPVerifierAddress() common.Address
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
 	PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*sdkcosts.MultiContextCosts, error)
 	SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]StorageTarget, error)
@@ -92,6 +97,7 @@ type ParkedPieceChecker interface {
 // only after replacement cleanup authorization and the retirement safety gate
 // have both passed.
 type ServiceTerminator interface {
+	PDPVerifierAddress() common.Address
 	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, error)
 	// VerifyServicePayer reads the data set's record and fails with
 	// ErrServicePaidByAnother when this wallet does not pay for it; any other
@@ -120,11 +126,13 @@ type ChainEpochReader interface {
 
 // WalletQuerier provides on-chain wallet state for the admin dashboard.
 type WalletQuerier interface {
+	WalletIdentity() walletoperation.ExecutionIdentity
 	GetWalletInfo(ctx context.Context) (*WalletInfo, error)
 }
 
 // WalletOperator broadcasts wallet payment transactions.
 type WalletOperator interface {
+	WalletIdentity() walletoperation.ExecutionIdentity
 	FundUSDFC(ctx context.Context, amount *big.Int) (string, error)
 	WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error)
 	ApproveFWSS(ctx context.Context) (string, error)

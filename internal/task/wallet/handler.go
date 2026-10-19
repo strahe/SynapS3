@@ -102,6 +102,12 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 	if err != nil {
 		return decodeFailure(string(model.TaskTypeWalletOperation), err)
 	}
+	if h.deps.Wallet == nil {
+		return taskengine.Fail(errors.New("wallet operator is unavailable"), "dependency_unavailable", nil)
+	}
+	if err := input.Match(h.deps.Wallet.WalletIdentity()); err != nil {
+		return taskengine.Fail(err, "wallet_identity_changed", nil)
+	}
 	op, err := h.deps.Repositories.WalletOperations.GetByID(ctx, input.OperationID)
 	if err != nil {
 		return h.retryWalletOperation(execution, input.OperationID, err, "wallet_load_failed")
@@ -121,7 +127,7 @@ func (h *Handler) executeWalletOperation(ctx context.Context, execution taskengi
 			return repos.WalletOperations.MarkFailed(ctx, op.ID, execution.ID(), "invalid wallet operation amount")
 		})
 	}
-	checkpoint := walletoperation.Checkpoint{BroadcastAttempted: true}
+	checkpoint := walletoperation.Checkpoint{ExecutionIdentity: input.ExecutionIdentity, BroadcastAttempted: true}
 	var txHash string
 	var alreadyComplete bool
 	attempted, err := execution.WithCheckpointedEffect(ctx, fmt.Sprintf("wallet:%d", op.ID), checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
@@ -169,6 +175,12 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 	if err != nil {
 		return decodeFailure(string(model.TaskTypeWalletOperation), err)
 	}
+	if h.deps.Wallet == nil {
+		return taskengine.Fail(errors.New("wallet operator is unavailable"), "dependency_unavailable", nil)
+	}
+	if err := input.Match(h.deps.Wallet.WalletIdentity()); err != nil {
+		return taskengine.Fail(err, "wallet_identity_changed", nil)
+	}
 	op, err := h.deps.Repositories.WalletOperations.GetByID(ctx, input.OperationID)
 	if err != nil {
 		return h.retryWalletOperation(execution, input.OperationID, err, "wallet_load_failed")
@@ -183,6 +195,11 @@ func (h *Handler) recoverWalletOperation(ctx context.Context, execution taskengi
 	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[walletoperation.Checkpoint](execution)
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
+	}
+	if hasCheckpoint {
+		if err := checkpoint.Match(input.ExecutionIdentity); err != nil {
+			return taskengine.Fail(err, "wallet_identity_changed", nil)
+		}
 	}
 	txHash := ""
 	if op.TxHash != nil {

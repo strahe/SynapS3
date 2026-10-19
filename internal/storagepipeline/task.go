@@ -15,6 +15,7 @@ type UploadPlanInput struct {
 }
 
 type DataSetInput struct {
+	ExecutionIdentity
 	DataSetID int64 `json:"data_set_id"`
 }
 
@@ -30,6 +31,7 @@ type CopyGenerationInput struct {
 
 // CommitRequestInput names the commit request a storage_commit task drives.
 type CommitRequestInput struct {
+	ExecutionIdentity
 	RequestID string `json:"request_id"`
 }
 

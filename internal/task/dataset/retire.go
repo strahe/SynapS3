@@ -10,10 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
+	bindings "github.com/strahe/synaps3/internal/task/binding"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
@@ -38,10 +41,9 @@ type retirementCheckpoint struct {
 	Sends                     int       `json:"sends,omitempty"`
 	NextResendAt              time.Time `json:"next_resend_at,omitzero"`
 	ProtocolNextObservationAt time.Time `json:"protocol_next_observation_at,omitzero"`
-	// Identity is what the first request signed for. A numeric data set ID means
-	// something else on another chain, so recovery compares this before it reads
-	// the chain or sends again.
-	Identity *storage.ContextIdentity `json:"identity,omitempty"`
+	// Creation identity binds observations and termination requests to the same signing domain.
+	Identity    *storage.ContextIdentity `json:"identity,omitempty"`
+	PDPVerifier *common.Address          `json:"pdp_verifier,omitempty"`
 }
 
 type RetireHandler struct {
@@ -149,6 +151,19 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		return taskengine.Fail(errors.New("data set has no remote identity"), "retirement_identity_missing", nil)
 	}
 
+	recordedIdentity, err := bindings.RecordedIdentity(ctx, h.deps.Repositories, dataSet)
+	if err != nil {
+		if storagepipeline.IsExecutionIdentityError(err) {
+			return stopRetirementIdentity(abandoned, row.ID, err)
+		}
+		return retryTask(err, "storage_identity_load_failed")
+	}
+	if h.deps.Terminator == nil {
+		return taskengine.Fail(errors.New("data set terminator is unavailable"), "dependency_unavailable", nil)
+	}
+	if err := recordedIdentity.Match(storagepipeline.NewExecutionIdentity(h.deps.Terminator.ContextIdentity(), h.deps.Terminator.PDPVerifierAddress())); err != nil {
+		return stopRetirementIdentity(abandoned, row.ID, err)
+	}
 	var terminationEpoch *int64
 	if abandoned {
 		terminationEpoch = row.AbandonedTerminationEpoch
@@ -180,17 +195,14 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
-	if hasCheckpoint && (checkpoint.Sends > 0 || !checkpoint.AttemptedAt.IsZero() || checkpoint.TransactionHash != "") && checkpoint.Identity == nil {
-		return taskengine.Fail(errors.New("data set retirement checkpoint has no request identity"), "invalid_checkpoint", nil)
+	if !hasCheckpoint {
+		checkpoint.Identity = recordedIdentity.Identity
+		checkpoint.PDPVerifier = recordedIdentity.PDPVerifier
 	}
-	if hasCheckpoint && checkpoint.Identity != nil && h.deps.Terminator != nil &&
-		*checkpoint.Identity != h.deps.Terminator.ContextIdentity() {
-		// The wallet or network moved after a request went out. The same numeric
-		// data set ID names a different service on another chain, and an end
-		// epoch read there would say nothing about ours, so this reads nothing
-		// and sends nothing until the original configuration is back.
-		return stopRetirement(abandoned, row.ID,
-			errors.New("the wallet or network changed after data set retirement began"), "termination_identity_changed")
+	if hasCheckpoint {
+		if err := (storagepipeline.ExecutionIdentity{Identity: checkpoint.Identity, PDPVerifier: checkpoint.PDPVerifier}).Match(recordedIdentity); err != nil {
+			return stopRetirementIdentity(abandoned, row.ID, err)
+		}
 	}
 	if terminationEpoch == nil && checkpoint.TerminationEpoch != nil {
 		if *checkpoint.TerminationEpoch < 0 {
@@ -265,7 +277,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			return retryTask(err, "termination_payer_observation_failed")
 		}
 		checkpoint = retirementCheckpoint{
-			AttemptedAt: time.Now().UTC(), Sends: checkpoint.Sends + 1, Identity: &identity,
+			AttemptedAt: time.Now().UTC(), Sends: checkpoint.Sends + 1, Identity: &identity, PDPVerifier: recordedIdentity.PDPVerifier,
 		}
 		checkpoint.NextResendAt, err = execution.ResendAt(checkpoint.AttemptedAt, checkpoint.Sends)
 		if err != nil {
@@ -375,6 +387,14 @@ func stopRetirement(abandoned bool, replacementID int64, err error, reason strin
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.Replacements.MarkCleanupAttention(ctx, replacementID, err.Error())
 	})
+}
+
+func stopRetirementIdentity(abandoned bool, replacementID int64, err error) taskengine.Result {
+	reason := storagepipeline.ExecutionIdentityFailure(err)
+	if errors.Is(err, storagepipeline.ErrExecutionIdentityChanged) {
+		reason = "termination_identity_changed"
+	}
+	return stopRetirement(abandoned, replacementID, err, reason)
 }
 
 func containsString(values []string, wanted string) bool {

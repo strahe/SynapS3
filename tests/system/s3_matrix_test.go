@@ -4,16 +4,25 @@ package system_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -42,6 +51,7 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 	key := aws.String("item.bin")
 	body := bytes.Repeat([]byte("matrix object\n"), 20)
 	var firstVersion string
+	expires := time.Date(2030, time.October, 21, 7, 28, 0, 0, time.UTC)
 	var firstCopyMarker string
 	var batchCopyMarker string
 
@@ -130,7 +140,12 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 	})
 	t.Run("PutObject", func(t *testing.T) {
 		out := e2e.Eventually(t, ctx, 10*time.Second, "bucket provisioning", func(ctx context.Context) (*s3.PutObjectOutput, bool, error) {
-			got, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: key, Body: bytes.NewReader(body), Metadata: map[string]string{"custom": "first"}})
+			got, err := client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: bucket, Key: key, Body: bytes.NewReader(body),
+				Metadata:     map[string]string{"custom": "first", "_system": "user value"},
+				CacheControl: aws.String("max-age=3600"), ContentDisposition: aws.String(`attachment; filename="item.bin"`),
+				ContentEncoding: aws.String("identity"), ContentLanguage: aws.String("en"), Expires: &expires,
+			})
 			return got, err == nil, err
 		})
 		firstVersion = aws.ToString(out.VersionId)
@@ -138,7 +153,7 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 			t.Fatal("missing version ID")
 		}
 		second := e2e.Eventually(t, ctx, 10*time.Second, "second object version", func(ctx context.Context) (*s3.PutObjectOutput, bool, error) {
-			got, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: key, Body: bytes.NewReader(body), Metadata: map[string]string{"custom": "second"}})
+			got, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: key, Body: bytes.NewReader(body), Metadata: map[string]string{"custom": "second"}, CacheControl: aws.String("private")})
 			return got, err == nil, err
 		})
 		if aws.ToString(second.VersionId) == firstVersion {
@@ -155,6 +170,21 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 		if err != nil || !bytes.Equal(got, body[2:6]) || out.ContentRange == nil || out.LastModified == nil || out.Metadata["custom"] != "first" {
 			t.Fatalf("range GET = %q, %#v, %v", got, out, err)
 		}
+		if aws.ToString(out.CacheControl) != "max-age=3600" || aws.ToString(out.ContentDisposition) != `attachment; filename="item.bin"` ||
+			aws.ToString(out.ContentEncoding) != "identity" || aws.ToString(out.ContentLanguage) != "en" ||
+			aws.ToString(out.ExpiresString) != expires.Format(http.TimeFormat) || out.Metadata["_system"] != "user value" || len(out.Metadata) != 2 {
+			t.Fatalf("GET system/user metadata = %#v", out)
+		}
+		overridden, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: bucket, Key: key, VersionId: &firstVersion, ResponseCacheControl: aws.String("no-store"), Range: aws.String("bytes=2-5"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = overridden.Body.Close()
+		if aws.ToString(overridden.CacheControl) != "no-store" {
+			t.Fatalf("GET response override = %#v", overridden.CacheControl)
+		}
 		_, err = client.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: key, Range: aws.String("bytes=999999-")})
 		requireS3ErrorCode(t, err, "InvalidRange")
 	})
@@ -163,11 +193,43 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 		if err != nil || out.LastModified == nil || out.Metadata["custom"] != "first" {
 			t.Fatalf("HEAD = %#v, %v", out, err)
 		}
+		if aws.ToString(out.CacheControl) != "max-age=3600" || aws.ToString(out.ContentDisposition) != `attachment; filename="item.bin"` ||
+			aws.ToString(out.ContentEncoding) != "identity" || aws.ToString(out.ContentLanguage) != "en" ||
+			aws.ToString(out.ExpiresString) != expires.Format(http.TimeFormat) || out.Metadata["_system"] != "user value" || len(out.Metadata) != 2 {
+			t.Fatalf("HEAD system/user metadata = %#v", out)
+		}
 	})
 	t.Run("CopyObject", func(t *testing.T) {
-		out, err := client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: bucket, Key: aws.String("z-copy.bin"), CopySource: aws.String(*bucket + "/" + *key)})
+		out, err := client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket: bucket, Key: aws.String("z-copy.bin"), CopySource: aws.String(*bucket + "/" + *key + "?versionId=" + firstVersion),
+			CacheControl: aws.String("ignored under COPY"),
+		})
 		if err != nil || out.CopyObjectResult == nil {
 			t.Fatalf("copy = %#v, %v", out, err)
+		}
+		copiedVersion := aws.ToString(out.VersionId)
+		head, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: bucket, Key: aws.String("z-copy.bin")})
+		if err != nil || aws.ToString(head.CacheControl) != "max-age=3600" || head.Metadata["custom"] != "first" ||
+			aws.ToString(head.ContentDisposition) != `attachment; filename="item.bin"` || aws.ToString(head.ContentEncoding) != "identity" ||
+			aws.ToString(head.ContentLanguage) != "en" || aws.ToString(head.ExpiresString) != expires.Format(http.TimeFormat) {
+			t.Fatalf("copied headers = %#v, %v", head, err)
+		}
+		replaced, err := client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket: bucket, Key: aws.String("z-copy.bin"), CopySource: aws.String(*bucket + "/z-copy.bin"),
+			MetadataDirective: types.MetadataDirectiveReplace, CacheControl: aws.String("no-store"), ContentLanguage: aws.String("zh"),
+			ContentType: head.ContentType, Metadata: head.Metadata,
+		})
+		if err != nil || aws.ToString(replaced.VersionId) == copiedVersion {
+			t.Fatalf("same-key replace = %#v, %v", replaced, err)
+		}
+		head, err = client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: bucket, Key: aws.String("z-copy.bin")})
+		if err != nil || aws.ToString(head.CacheControl) != "no-store" || aws.ToString(head.ContentLanguage) != "zh" ||
+			head.ContentDisposition != nil || head.ContentEncoding != nil || head.ExpiresString != nil || head.Metadata["custom"] != "first" || head.Metadata["_system"] != "user value" {
+			t.Fatalf("replaced headers = %#v, %v", head, err)
+		}
+		historical, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: bucket, Key: aws.String("z-copy.bin"), VersionId: &copiedVersion})
+		if err != nil || aws.ToString(historical.CacheControl) != "max-age=3600" || historical.Metadata["custom"] != "first" {
+			t.Fatalf("copy history = %#v, %v", historical, err)
 		}
 	})
 	for _, operation := range []string{"ListObjects", "ListObjectsV2"} {
@@ -244,7 +306,11 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 	var uploadID string
 	var partETags []types.CompletedPart
 	t.Run("CreateMultipartUpload", func(t *testing.T) {
-		out, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: bucket, Key: partKey, Metadata: map[string]string{"source": "multipart"}})
+		out, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: bucket, Key: partKey, Metadata: map[string]string{"source": "multipart"},
+			CacheControl: aws.String("max-age=120"), ContentDisposition: aws.String(`attachment; filename="multipart.bin"`),
+			ContentEncoding: aws.String("identity"), ContentLanguage: aws.String("en"), Expires: &expires,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -278,6 +344,14 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatal(err)
+		}
+	})
+	t.Run("MultipartSystemMetadata", func(t *testing.T) {
+		out, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: bucket, Key: partKey})
+		if err != nil || aws.ToString(out.CacheControl) != "max-age=120" || aws.ToString(out.ContentDisposition) != `attachment; filename="multipart.bin"` ||
+			aws.ToString(out.ContentEncoding) != "identity" || aws.ToString(out.ContentLanguage) != "en" ||
+			aws.ToString(out.ExpiresString) != expires.Format(http.TimeFormat) || out.Metadata["source"] != "multipart" {
+			t.Fatalf("multipart system metadata = %#v, %v", out, err)
 		}
 	})
 	t.Run("GetObjectAttributes", func(t *testing.T) {
@@ -334,6 +408,87 @@ func TestS3CompatibilityMatrix(t *testing.T) {
 		}
 		if _, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: bucket, Key: aws.String("abort.bin"), UploadId: out.UploadId}); err != nil {
 			t.Fatal(err)
+		}
+	})
+	t.Run("StreamingContentEncoding", func(t *testing.T) {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.DisableCompression = true
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", harness.S3SocketPath())
+		}
+		defer transport.CloseIdleConnections()
+		rawClient := &http.Client{Transport: transport}
+		doRequest := func(t *testing.T, request *http.Request, payloadHash string) *http.Response {
+			t.Helper()
+			request.Header.Set("X-Amz-Content-Sha256", payloadHash)
+			if err := v4.NewSigner().SignHTTP(ctx, aws.Credentials{AccessKeyID: systemtest.OwnerAccess, SecretAccessKey: systemtest.OwnerSecret}, request, payloadHash, "s3", "us-east-1", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			response, err := rawClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return response
+		}
+		plain := make([]byte, 256)
+		for i := range plain {
+			plain[i] = byte(i)
+		}
+		var compressed bytes.Buffer
+		writer := gzip.NewWriter(&compressed)
+		if _, err := writer.Write(plain); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name, encoding, wantEncoding string
+			body                         []byte
+		}{
+			{"only framing", "aws-chunked", "", plain},
+			{"gzip and framing", "aws-chunked,gzip", "gzip", compressed.Bytes()},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var checksum [4]byte
+				binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(tc.body))
+				framed := []byte(fmt.Sprintf("%x\r\n%s\r\n0\r\nx-amz-checksum-crc32:%s\r\n\r\n", len(tc.body), tc.body, base64.StdEncoding.EncodeToString(checksum[:])))
+				key := "streamed-" + tc.wantEncoding + ".bin"
+				request, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://synaps3.system.test/"+*bucket+"/"+key, bytes.NewReader(framed))
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("Content-Encoding", tc.encoding)
+				request.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(tc.body)))
+				request.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+				response := doRequest(t, request, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+				result, readErr := io.ReadAll(response.Body)
+				_ = response.Body.Close()
+				if readErr != nil || response.StatusCode != http.StatusOK {
+					t.Fatalf("streaming PUT = %d, %s, %v", response.StatusCode, result, readErr)
+				}
+				copyKey := "copied-" + key
+				if _, err := client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: bucket, Key: &copyKey, CopySource: aws.String(*bucket + "/" + key)}); err != nil {
+					t.Fatal(err)
+				}
+				for _, objectKey := range []string{key, copyKey} {
+					for _, method := range []string{http.MethodGet, http.MethodHead} {
+						request, err := http.NewRequestWithContext(ctx, method, "http://synaps3.system.test/"+*bucket+"/"+objectKey, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						response := doRequest(t, request, "UNSIGNED-PAYLOAD")
+						result, readErr := io.ReadAll(response.Body)
+						_ = response.Body.Close()
+						if readErr != nil || response.StatusCode != http.StatusOK || response.Header.Get("Content-Encoding") != tc.wantEncoding || response.ContentLength != int64(len(tc.body)) {
+							t.Fatalf("%s %s = status %d, encoding %q, length %d, %v", method, objectKey, response.StatusCode, response.Header.Get("Content-Encoding"), response.ContentLength, readErr)
+						}
+						if method == http.MethodGet && !bytes.Equal(result, tc.body) {
+							t.Fatalf("GET %s bytes differ from uploaded content", objectKey)
+						}
+					}
+				}
+			})
 		}
 	})
 }

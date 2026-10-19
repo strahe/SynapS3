@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"unicode/utf8"
@@ -81,8 +82,31 @@ func (r *redactor) redact(text string) string {
 	for _, secret := range r.secrets {
 		text = strings.ReplaceAll(text, secret, placeholder)
 	}
+	text = safeText(text)
 	text = urlPattern.ReplaceAllStringFunc(text, r.redactURL)
 	return truncate(text)
+}
+
+// safeText preserves invalid database text as visible escapes.
+func safeText(text string) string {
+	if !strings.ContainsRune(text, 0) && utf8.ValidString(text) {
+		return text
+	}
+	var result strings.Builder
+	for len(text) > 0 {
+		r, size := utf8.DecodeRuneInString(text)
+		switch {
+		case r == 0:
+			result.WriteString(`\u0000`)
+		case r == utf8.RuneError && size == 1:
+			quoted := strconv.Quote(text[:1])
+			result.WriteString(quoted[1 : len(quoted)-1])
+		default:
+			result.WriteRune(r)
+		}
+		text = text[size:]
+	}
+	return result.String()
 }
 
 func (r *redactor) redactURL(raw string) string {

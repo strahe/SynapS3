@@ -100,6 +100,50 @@ func selectionProviderState(id idtypes.OnChainID, checkedAt time.Time) observabi
 	}
 }
 
+func TestProviderSelectionStopsForUnknownPersistedStrategy(t *testing.T) {
+	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
+		for _, strategy := range []string{"", "future-strategy"} {
+			t.Run(string(taskType)+"/"+strategy, func(t *testing.T) {
+				var opened atomic.Int64
+				runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{
+					OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+						opened.Add(1)
+						return nil, errors.New("unexpected provider access")
+					},
+					OpenDataSetTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+						opened.Add(1)
+						return nil, errors.New("unexpected data set access")
+					},
+				}})
+				bucket := &model.Bucket{Name: "unknown-strategy", Status: model.BucketStatusProvisioning, DefaultCopies: 1, MinimumDurableCopies: 1}
+				if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
+					t.Fatal(err)
+				}
+				binding, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+					BucketID: bucket.ID, CopyIndex: 0, ProviderID: testOnChainID(t, 202),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 2202)}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.Bucket)(nil)).
+					Set("provider_selection_strategy = ?", strategy).Where("id = ?", bucket.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				row := providerSelectionWork(t, runtime, bucket, taskType)
+				cancel, done := runHandlerEngine(t, runtime)
+				defer stopHandlerEngine(t, cancel, done)
+				row = waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusFailed })
+				if row.FailureReason == nil || *row.FailureReason != "invalid_provider_selection_strategy" || row.RetryCount != 0 || opened.Load() != 0 {
+					t.Fatalf("unknown strategy task = %#v, provider accesses = %d", row, opened.Load())
+				}
+			})
+		}
+	}
+}
+
 func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
 		for _, scenario := range []string{"approved", "endorsed", "none", "existing trusted", "inactive", "missing PDP", "ordinary shortage", "speed tests"} {
@@ -168,7 +212,7 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 1101)}); err != nil {
+					if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 1101)}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -549,7 +593,7 @@ func TestProviderSelectionContextFailuresRetainCauseAndDiagnostics(t *testing.T)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 2202)}); err != nil {
+				if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 2202)}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -608,7 +652,7 @@ func TestProviderSelectionContextErrorsPreserveClassification(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 2202)}); err != nil {
+					if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: testOnChainID(t, 2202)}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -958,7 +1002,7 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 1101)}); err != nil {
+			if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 1101)}); err != nil {
 				t.Fatal(err)
 			}
 			increasedCopies := 2
@@ -1023,7 +1067,7 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			if err != nil || replacement == nil {
 				t.Fatalf("replacement = %#v err=%v", replacement, err)
 			}
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 2303)}); err != nil {
+			if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 2303)}); err != nil {
 				t.Fatal(err)
 			}
 			if err := activateReplacement(t, runtime, replacement.ID); err != nil {

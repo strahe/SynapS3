@@ -293,9 +293,14 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 
 	ct := "application/octet-stream"
 	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
-		Bucket:      aws.String("cmp-bucket"),
-		Key:         aws.String("assembled.bin"),
-		ContentType: &ct,
+		Bucket:             aws.String("cmp-bucket"),
+		Key:                aws.String("assembled.bin"),
+		ContentType:        &ct,
+		CacheControl:       aws.String("max-age=120"),
+		ContentDisposition: aws.String(`attachment; filename="assembled\u0000.bin"`),
+		ContentEncoding:    aws.String("identity, aws-chunked"),
+		ContentLanguage:    aws.String("en"),
+		Expires:            aws.String("Mon, 21 Oct 2030 07:28:00 GMT"),
 	})
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
@@ -324,6 +329,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 		uploadedBytes += uint64(len(partBody))
 	}
 
+	reopenTestBackend(t, tb)
 	// Complete.
 	pn1, pn2 := int32(1), int32(2)
 	completeResult, versionID, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
@@ -361,6 +367,13 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 	if obj.MultipartUploadID == nil || *obj.MultipartUploadID != uploadID {
 		t.Fatalf("object multipart_upload_id = %v, want %s", obj.MultipartUploadID, uploadID)
+	}
+	wantMetadata := model.ObjectSystemMetadata{
+		CacheControl: "max-age=120", ContentDisposition: `attachment; filename="assembled\u0000.bin"`,
+		ContentEncoding: "identity", ContentLanguage: "en", Expires: "Mon, 21 Oct 2030 07:28:00 GMT",
+	}
+	if obj.SystemMetadata != wantMetadata {
+		t.Fatalf("completed system metadata = %#v, want %#v", obj.SystemMetadata, wantMetadata)
 	}
 	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute, repository.TaskClaimFilter{})
 	if err != nil {

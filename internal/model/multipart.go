@@ -21,14 +21,15 @@ const (
 type MultipartUpload struct {
 	bun.BaseModel `bun:"table:multipart_uploads"`
 
-	UploadID    string            `bun:"type:text,pk"`
-	BucketID    int64             `bun:",notnull"`
-	Key         string            `bun:"type:text,notnull"`
-	ContentType string            `bun:"type:text,notnull,default:'application/octet-stream'"`
-	Metadata    map[string]string `bun:"type:jsonb,notnull,default:'{}'"`
-	Status      MultipartStatus   `bun:"type:text,notnull,default:'initiated'"`
-	CreatedAt   time.Time         `bun:",nullzero,notnull"`
-	UpdatedAt   time.Time         `bun:",nullzero,notnull"`
+	UploadID       string               `bun:"type:text,pk"`
+	BucketID       int64                `bun:",notnull"`
+	Key            string               `bun:"type:text,notnull"`
+	ContentType    string               `bun:"type:text,notnull,default:'application/octet-stream'"`
+	Metadata       map[string]string    `bun:"type:jsonb,notnull,default:'{}'"`
+	SystemMetadata ObjectSystemMetadata `bun:"type:jsonb,notnull,default:'{}'"`
+	Status         MultipartStatus      `bun:"type:text,notnull,default:'initiated'"`
+	CreatedAt      time.Time            `bun:",nullzero,notnull"`
+	UpdatedAt      time.Time            `bun:",nullzero,notnull"`
 
 	Bucket *Bucket `bun:"rel:belongs-to,join:bucket_id=id"`
 }

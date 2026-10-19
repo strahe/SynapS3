@@ -7,6 +7,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/storage"
@@ -44,6 +45,10 @@ func (h *Resolver) OpenReadyDataSet(ctx context.Context, binding *model.StorageD
 	if h == nil || h.deps.Storage == nil {
 		return nil, errors.New("storage client is unavailable")
 	}
+	identity, err := h.ExecutionIdentity(ctx, binding)
+	if err != nil {
+		return nil, err
+	}
 	providerID := binding.ProviderID.SDK()
 	target, err := h.deps.Storage.OpenDataSetTarget(ctx, binding.DataSetID.SDK(), storage.NewDataSetContextOptions{ProviderID: &providerID})
 	if err != nil {
@@ -51,6 +56,9 @@ func (h *Resolver) OpenReadyDataSet(ctx context.Context, binding *model.StorageD
 	}
 	if target == nil {
 		return nil, errors.New("storage client returned no data set context")
+	}
+	if target.ContextIdentity() != *identity.Identity {
+		return nil, storagepipeline.ErrExecutionIdentityChanged
 	}
 	if got := idtypes.OnChainIDFromSDK(target.ProviderID()); !got.Equal(binding.ProviderID) {
 		return nil, fmt.Errorf("data set resolved provider %s, want %s", got.String(), binding.ProviderID.String())

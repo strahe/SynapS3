@@ -290,7 +290,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 			return points, err
 		}
 	}
-	callbackOwnHandover0, err := dataset.NewEnsureDataSetReceiver(dataset.EnsureReceiverDependencies{Scheduler: datasetScheduler})
+	callbackOwnHandover0, err := dataset.NewEnsureDataSetReceiver(dataset.EnsureReceiverDependencies{Scheduler: datasetScheduler, Identity: binding.CurrentIdentity(deps.Storage)})
 	if err != nil {
 		return points, fmt.Errorf("constructing dataset.ensure: %w", err)
 	}

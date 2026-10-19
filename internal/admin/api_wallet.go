@@ -220,6 +220,10 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "wallet operations unavailable"})
 		return
 	}
+	if !s.wallet.WalletIdentity().Complete() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "wallet operations unavailable"})
+		return
+	}
 	var op *model.WalletOperation
 	err = s.repos.WithTx(r.Context(), func(txRepos *repository.Repositories) error {
 		var createErr error
@@ -231,7 +235,7 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 		}
 		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(r.Context(), txRepos, taskengine.EnqueueRequest{
 			Type:  model.TaskTypeWalletOperation,
-			Input: walletoperation.Input{OperationID: op.ID},
+			Input: walletoperation.Input{OperationID: op.ID, ExecutionIdentity: s.wallet.WalletIdentity()},
 		})
 		if enqueueErr != nil {
 			return enqueueErr

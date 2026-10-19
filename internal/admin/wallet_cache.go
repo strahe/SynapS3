@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/walletoperation"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -187,4 +188,8 @@ func cloneStringMap(v map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func (c *cachedWalletQuerier) WalletIdentity() walletoperation.ExecutionIdentity {
+	return c.inner.WalletIdentity()
 }

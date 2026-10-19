@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/versity/versitygw/auth"
 )
@@ -210,12 +211,18 @@ func TestBucketRepo_UpdateCopyPolicyRefusesLoweringTheTarget(t *testing.T) {
 	}
 }
 
-func TestBucketRepo_RejectsCopiesAboveTheLimitAndUnknownStatus(t *testing.T) {
+func TestBucketRepo_RejectsCopiesAboveTheLimitAndUnknownValues(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
 	unknown := model.BucketStatus("deleting")
+	if err := repos.Buckets.Create(ctx, &model.Bucket{
+		Name: "unknown-strategy", ProviderSelectionStrategy: providerselect.Strategy("unknown"),
+		Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1,
+	}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("Create with unknown strategy error = %v, want ErrInvalidInput", err)
+	}
 	if err := repos.Buckets.Create(ctx, &model.Bucket{
 		Name: "unknown-status", Status: unknown, DefaultCopies: 1, MinimumDurableCopies: 1,
 	}); !errors.Is(err, repository.ErrInvalidInput) {
@@ -244,6 +251,20 @@ func TestBucketRepo_RejectsCopiesAboveTheLimitAndUnknownStatus(t *testing.T) {
 
 	if err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, unknown); !errors.Is(err, repository.ErrInvalidInput) {
 		t.Fatalf("UpdateStatus to unknown status error = %v, want ErrInvalidInput", err)
+	}
+	for _, strategy := range []providerselect.Strategy{"", "future-strategy"} {
+		if _, err := db.NewUpdate().Model((*model.Bucket)(nil)).
+			Set("provider_selection_strategy = ?", strategy).Where("id = ?", bucket.ID).Exec(ctx); err != nil {
+			t.Fatalf("persist strategy %q: %v", strategy, err)
+		}
+		got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+		if err != nil || got == nil || got.ProviderSelectionStrategy != strategy {
+			t.Fatalf("persisted strategy %q = %#v, %v", strategy, got, err)
+		}
+		if _, err := providerselect.Select(providerselect.Inventory{Admission: providerselect.Admission{Tier: providerselect.TierNone}},
+			got.ProviderSelectionStrategy, 1, nil, false); !errors.Is(err, providerselect.ErrInventoryUnavailable) {
+			t.Fatalf("select with persisted strategy %q = %v, want ErrInventoryUnavailable", strategy, err)
+		}
 	}
 }
 

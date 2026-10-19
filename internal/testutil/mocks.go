@@ -9,6 +9,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/walletoperation"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -25,6 +26,8 @@ var (
 
 // MockStorageClient is a configurable test double for synapse.StorageClient.
 type MockStorageClient struct {
+	ContextIdentityValue    storage.ContextIdentity
+	PDPVerifierAddressValue common.Address
 	UploadFunc              func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
 	DownloadFunc            func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
 	PrepareUploadFunc       func(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error)
@@ -537,3 +540,33 @@ func (m *MockChainEpochReader) CurrentEpoch(ctx context.Context) (int64, error) 
 	}
 	return 0, nil
 }
+
+var (
+	DefaultPDPVerifierAddress = common.HexToAddress("0x00000000000000000000000000000000000000c3")
+	DefaultPaymentsAddress    = common.HexToAddress("0x00000000000000000000000000000000000000d4")
+	DefaultUSDFCAddress       = common.HexToAddress("0x00000000000000000000000000000000000000e5")
+)
+
+func DefaultWalletExecutionIdentity() walletoperation.ExecutionIdentity {
+	return walletoperation.NewExecutionIdentity(DefaultContextIdentity, DefaultPaymentsAddress, DefaultUSDFCAddress)
+}
+
+func (m *MockStorageClient) ContextIdentity() storage.ContextIdentity {
+	if m.ContextIdentityValue != (storage.ContextIdentity{}) {
+		return m.ContextIdentityValue
+	}
+	return DefaultContextIdentity
+}
+
+func (m *MockStorageClient) PDPVerifierAddress() common.Address {
+	if m.PDPVerifierAddressValue != (common.Address{}) {
+		return m.PDPVerifierAddressValue
+	}
+	return DefaultPDPVerifierAddress
+}
+
+func (m *MockWalletQuerier) WalletIdentity() walletoperation.ExecutionIdentity {
+	return DefaultWalletExecutionIdentity()
+}
+
+func (m *MockServiceTerminator) PDPVerifierAddress() common.Address { return DefaultPDPVerifierAddress }

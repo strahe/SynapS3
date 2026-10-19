@@ -11,11 +11,13 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
 type ReadyDataSetResolver interface {
+	ExecutionIdentity(context.Context, *model.StorageDataSet) (storagepipeline.ExecutionIdentity, error)
 	OpenReadyDataSet(context.Context, *model.StorageDataSet) (synapse.DataSetTarget, error)
 }
 

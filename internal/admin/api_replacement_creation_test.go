@@ -32,7 +32,7 @@ func failedReplacementAPISource(t *testing.T, f *replacementAPIFixture) *model.T
 	}
 	ensure, _, err := f.srv.taskService.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
 		Type:  model.TaskTypeStorageDataSetEnsure,
-		Input: storagepipeline.DataSetInput{DataSetID: f.source.ID},
+		Input: storagepipeline.DataSetInput{DataSetID: f.source.ID, ExecutionIdentity: storagepipeline.NewExecutionIdentity(testutil.DefaultContextIdentity, testutil.DefaultPDPVerifierAddress)},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, f.source.ID, row.ID)
 	})

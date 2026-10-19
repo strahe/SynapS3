@@ -2,6 +2,8 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,7 +117,8 @@ func (h *StoreHandler) openStoreBody(ctx context.Context, execution taskengine.E
 		return nil, cid.Undef, err
 	}
 	reader := newStoreContextReader(ctx, raw)
-	info, calculateErr := piece.Calculate(reader)
+	checksum := sha256.New()
+	info, calculateErr := piece.Calculate(io.TeeReader(reader, checksum))
 	closeErr := reader.Close()
 	if err := ctx.Err(); err != nil {
 		return nil, cid.Undef, err
@@ -126,7 +129,10 @@ func (h *StoreHandler) openStoreBody(ctx context.Context, execution taskengine.E
 	if closeErr != nil {
 		return nil, cid.Undef, closeErr
 	}
-	if !info.CIDv2.Defined() || content.ContentSize < 0 || info.RawSize != uint64(content.ContentSize) || (expected != "" && info.CIDv2.String() != expected) {
+	if !info.CIDv2.Defined() || content.ContentSize < 0 || info.RawSize != uint64(content.ContentSize) ||
+		hex.EncodeToString(checksum.Sum(nil)) != content.Checksum ||
+		(content.PieceCID != nil && info.CIDv2.String() != *content.PieceCID) ||
+		(expected != "" && info.CIDv2.String() != expected) {
 		return nil, cid.Undef, errStoreIdentity
 	}
 	raw, _, err = h.deps.Cache.Get(ctx, bucket.Name, key)
@@ -139,7 +145,7 @@ func (h *StoreHandler) openStoreBody(ctx context.Context, execution taskengine.E
 
 func (h *StoreHandler) storeBodyFailure(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, hasCheckpoint bool, err error) taskengine.Result {
 	if errors.Is(err, errStoreIdentity) {
-		if hasCheckpoint {
+		if hasCheckpoint || copyRow.IngressStoreAttempt > 0 {
 			return taskengine.Fail(err, "store_identity_mismatch", nil)
 		}
 		return h.failCopyTask(execution, input, copyRow, err, "store_identity_mismatch")

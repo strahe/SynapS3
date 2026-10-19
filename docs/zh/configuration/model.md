@@ -36,6 +36,8 @@ private_key = "0x..."
 
 也可以用 `SYNAPS3_FILECOIN_PRIVATE_KEY` 管理这个值；支持的覆盖项见[环境变量](./environment.md)。
 
+每个数据库固定绑定一个钱包地址和 Filecoin 链；换成其他钱包或网络会拒绝启动。RPC 地址可以更换，但必须连接同一条链。
+
 不要把私钥放进代码仓库、容器镜像或 shell history。
 
 当 `admin.auth.enabled = true` 时，Admin 认证还需要密码 hash 和 `admin.auth.session_secret`。新配置会由 `synaps3 init` 创建；如果缺失或需要轮换密码，运行 `synaps3 admin-auth reset-password --config <path>` 重新生成。重置密码也会轮换 session secret。
@@ -179,14 +181,8 @@ lru_low_watermark_percent = 50
 | `admin.auth.session_secret` | 用于签名 Admin 浏览器会话。按密钥处理。 |
 | `filecoin.private_key` | 控制钱包支付和存储操作。必须作为私钥处理。 |
 | `database.dsn` | 可能包含数据库凭据，必须作为敏感值处理。 |
-| `filecoin.network` | 切换到 `mainnet` 会改变支付和存储环境。 |
+| `filecoin.network` | 必须与数据库绑定的 Filecoin 链和 RPC 地址对应的链一致。 |
 | `filecoin.allow_private_networks` | 允许私有网络存储提供方 URL。只在可信私有部署中开启。 |
 | `cache.max_size_gb` | 太小会阻塞写入；太大会占满主机磁盘。 |
 | `cache.lru_high_watermark_percent` | 高水位过高会减少淘汰追赶期间可供新写入使用的余量。 |
 | `cache.lru_low_watermark_percent` | 低水位过低会让每轮 LRU 清理更多缓存数据。 |
-
-高风险设置可能需要显式确认：
-
-```bash
-synaps3 admin settings set filecoin.network=mainnet --yes
-```

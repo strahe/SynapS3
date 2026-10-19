@@ -56,18 +56,12 @@ Review these values first:
 | `admin.trusted_proxies` | Keep empty unless trusted proxies strip untrusted forwarded headers. |
 | `admin.auth.enabled` | Keep `true` for production. |
 | Admin password hash and `admin.auth.session_secret` | Must be present; generate the hash with init/reset and manage the session secret as a secret. |
-| `filecoin.network` | `calibration` until you intentionally move to `mainnet` |
+| `filecoin.network` | Must match the database's Filecoin chain; use a separate database for another network. |
 | `filecoin.allow_private_networks` | `false` unless provider URLs are trusted private endpoints |
 | `cache.max_size_gb` | Size it for expected upload backlog |
 | `logging.format` | Compose sets `json`; built-in default is `text`. |
 
 After saving settings, restart SynapS3, check `/healthz`, and run `synaps3 admin settings get` again to verify the effective values.
-
-High-risk settings require explicit confirmation:
-
-```bash
-synaps3 admin settings set filecoin.network=mainnet --yes
-```
 
 ## Monitoring
 

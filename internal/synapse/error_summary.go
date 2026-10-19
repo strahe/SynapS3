@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synapse-go/pdp"
 )
 
@@ -32,6 +33,7 @@ func ErrorSummary(err error) string {
 			text += ": " + httpErr.Body
 		}
 	}
+	text = errtext.Redact(text)
 	text = requestURLPattern.ReplaceAllStringFunc(text, urlOrigin)
 	text = strings.Join(strings.Fields(text), " ")
 	if utf8.RuneCountInString(text) > errorSummaryLimit {

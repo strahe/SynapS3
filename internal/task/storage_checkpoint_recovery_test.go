@@ -54,7 +54,7 @@ func storeRecoveryFixture(t *testing.T, retries int, payload string, parked syna
 		t.Fatal(err)
 	}
 	if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).
-		Set("piece_cid = ?", info.CIDv2.String()).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
+		Set("piece_cid = ?", info.CIDv2.String()).Set("checksum = ?", testutil.StorageChecksum(payload)).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
@@ -69,8 +69,18 @@ func storeRecoveryFixture(t *testing.T, retries int, payload string, parked syna
 
 func seedStoreCheckpoint(t *testing.T, runtime handlerTestRuntime, taskID, copyID int64, pieceCID cid.Cid, providerURL string, attemptedAt time.Time) {
 	t.Helper()
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), copyID)
+	if err != nil || copyRow == nil {
+		t.Fatalf("load checkpoint copy: %v", err)
+	}
+	content, err := runtime.repos.Contents.GetByID(t.Context(), copyRow.ContentID)
+	if err != nil || content == nil {
+		t.Fatalf("load checkpoint content: %v", err)
+	}
 	checkpoint, err := json.Marshal(map[string]any{
-		"attempted_at": attemptedAt.UTC(), "intended_piece_cid": pieceCID.String(),
+		"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress,
+		"verified_checksum": content.Checksum,
+		"attempted_at":      attemptedAt.UTC(), "intended_piece_cid": pieceCID.String(),
 		"provider_service_url": providerURL, "ingress_attempt": 1,
 		"session_id": "00000000-0000-4000-8000-000000000001", "stage": "upload",
 		"observation_started_at": attemptedAt.UTC(),
@@ -430,7 +440,19 @@ func TestStoreWorkStartsAfterHashPreparation(t *testing.T) {
 
 type storeClaimObserver struct {
 	repository.TaskRepository
-	lost chan struct{}
+	lost           chan struct{}
+	identityLoaded chan struct{}
+}
+
+func (r *storeClaimObserver) GetByID(ctx context.Context, id int64) (*model.Task, error) {
+	row, err := r.TaskRepository.GetByID(ctx, id)
+	if row != nil && row.Type == model.TaskTypeStorageDataSetEnsure {
+		select {
+		case r.identityLoaded <- struct{}{}:
+		default:
+		}
+	}
+	return row, err
 }
 
 func (r *storeClaimObserver) ValidateClaim(ctx context.Context, id, generation int64) error {
@@ -461,11 +483,11 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 			}
 			runtime, pipeline, _ := storeRecoveryFixture(t, 1, strings.Repeat("h", 128), nil, cacheStore, target)
 			row := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
-			observer := &storeClaimObserver{TaskRepository: runtime.repos.Tasks, lost: make(chan struct{}, 1)}
+			observer := &storeClaimObserver{TaskRepository: runtime.repos.Tasks, lost: make(chan struct{}, 1), identityLoaded: make(chan struct{}, 1)}
 			runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: observer, maximum: 1}
-			prepared := make(chan struct{}, 1)
+			var opened atomic.Int64
 			runtime.storage.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
-				prepared <- struct{}{}
+				opened.Add(1)
 				return target, nil
 			}
 			locked, release, unlocked := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -489,9 +511,9 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 				<-done
 			})
 			select {
-			case <-prepared:
+			case <-observer.identityLoaded:
 			case <-time.After(3 * time.Second):
-				t.Fatal("store did not prepare its target")
+				t.Fatal("store did not load its creation identity")
 			}
 			if scenario == "cancelled" {
 				cancel()
@@ -520,8 +542,8 @@ func TestStoreRechecksExecutionAfterWaitingForCacheReadLock(t *testing.T) {
 				cancel()
 			}
 			<-done
-			if reads.Load() != 0 || uploads.Load() != 0 {
-				t.Fatalf("stopped store read cache %d times and uploaded %d times", reads.Load(), uploads.Load())
+			if reads.Load() != 0 || uploads.Load() != 0 || opened.Load() != 0 {
+				t.Fatalf("stopped store read cache %d times, opened provider %d times and uploaded %d times", reads.Load(), opened.Load(), uploads.Load())
 			}
 		})
 	}
@@ -1214,7 +1236,7 @@ func TestPeerPullWaitsUntilStoreCopyIsReadable(t *testing.T) {
 		}
 		dataSetID := testOnChainID(t, int64(62001+i))
 		clientID := testOnChainID(t, int64(63001+i))
-		if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+		if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{
 			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); err != nil {
 			t.Fatal(err)

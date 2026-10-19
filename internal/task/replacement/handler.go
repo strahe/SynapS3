@@ -174,7 +174,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 					if err != nil {
 						return err
 					}
-					if child != nil && child.Status == model.TaskStatusFailed {
+					if child != nil && child.Status == model.TaskStatusFailed && (child.FailureReason == nil || !storagepipeline.ExecutionIdentityBlocked(*child.FailureReason)) {
 						if _, err := h.deps.Scheduler.RetryInTransaction(ctx, repos, child.ID, time.Now().UTC()); err != nil {
 							return err
 						}
@@ -409,6 +409,9 @@ func (h *Handler) planDependencyRetry(ctx context.Context, execution taskengine.
 	if source.LastError != nil {
 		decision.message = *source.LastError
 	}
+	if source.FailureReason != nil && storagepipeline.ExecutionIdentityBlocked(*source.FailureReason) {
+		return decision, nil
+	}
 	eligible, err := h.deps.RetryPolicy.RetryableContext(ctx, source)
 	if err != nil {
 		return decision, err
@@ -439,6 +442,14 @@ func (h *Handler) coordinateReplacementItems(ctx context.Context, execution task
 		}
 		if copyRow.Status == model.StorageCopyStatusFailed && copyRow.ActiveTaskID == nil {
 			decision := dependencyRetry{key: copyDependencyKey(copyRow.ID), message: "replacement copy transfer failed"}
+			latest, loadErr := h.deps.Repositories.Tasks.LatestForSubject(ctx, model.TaskSubjectStorageCopy, strconv.FormatInt(copyRow.ID, 10), model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
+			if loadErr != nil {
+				return h.retryReplacement(execution, replacement.ID, loadErr, "replacement_copy_task_load_failed")
+			}
+			if latest != nil && latest.FailureReason != nil && storagepipeline.ExecutionIdentityBlocked(*latest.FailureReason) {
+				decisions = append(decisions, replacementItemRetry{itemID: item.ID, copyID: copyRow.ID, dependencyRetry: decision})
+				continue
+			}
 			decision.at, _ = execution.DependencyRetryAt(checkpoint.DependencyRetries[decision.key])
 			decisions = append(decisions, replacementItemRetry{itemID: item.ID, copyID: copyRow.ID, dependencyRetry: decision})
 			continue

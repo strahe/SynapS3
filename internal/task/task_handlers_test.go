@@ -228,7 +228,8 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 }
 
 type testWalletOperator struct {
-	fund func(context.Context, *big.Int) (string, error)
+	identity walletoperation.ExecutionIdentity
+	fund     func(context.Context, *big.Int) (string, error)
 }
 
 func (o testWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string, error) {
@@ -538,7 +539,7 @@ func seedStoredCacheObject(t *testing.T, runtime handlerTestRuntime, size int64,
 	if err != nil {
 		t.Fatalf("create data set binding: %v", err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark data set ready: %v", err)
@@ -756,7 +757,7 @@ func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 	}
 	content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
 		BucketID: bucket.ID, ContentSize: 128,
-		Checksum: testutil.StorageChecksum(fmt.Sprintf("terminal-%d", sequence)), RequestedCopies: 1,
+		Checksum: testutil.StorageChecksum(strings.Repeat("s", 128)), RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("ensure terminal content: %v", err)
@@ -777,7 +778,7 @@ func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create terminal copy binding: %v", err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark terminal copy binding ready: %v", err)
@@ -1093,7 +1094,7 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 				checkpointCopyID++
 				attemptedAt = time.Now().Add(-time.Hour)
 			}
-			checkpoint := map[string]any{"copy_id": checkpointCopyID}
+			checkpoint := map[string]any{"copy_id": checkpointCopyID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress}
 			if !tc.missingTime {
 				checkpoint["attempted_at"] = attemptedAt
 			}
@@ -1409,7 +1410,7 @@ func TestStorageCleanupManualRetryWithoutHashDoesNotAutomaticallyResend(t *testi
 		t.Fatalf("fail old request: %v", err)
 	}
 	oldAttempt := time.Now().Add(-25 * time.Hour)
-	checkpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "attempted_at": oldAttempt})
+	checkpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "attempted_at": oldAttempt})
 	if err != nil {
 		t.Fatalf("encode cleanup checkpoint: %v", err)
 	}
@@ -1493,7 +1494,7 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 		t.Fatalf("age old failure: %v", err)
 	}
 	checkpoint, err := json.Marshal(map[string]any{
-		"copy_id": copyRow.ID, "attempted_at": time.Now().Add(-30 * time.Minute), "retry_of_tx_hash": oldHash.Hex(),
+		"copy_id": copyRow.ID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "attempted_at": time.Now().Add(-30 * time.Minute), "retry_of_tx_hash": oldHash.Hex(),
 	})
 	if err != nil {
 		t.Fatalf("encode old retry checkpoint: %v", err)
@@ -1521,7 +1522,7 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 		t.Fatalf("age old failure further: %v", err)
 	}
 	agedCheckpoint, err := json.Marshal(map[string]any{
-		"copy_id": copyRow.ID, "attempted_at": time.Now().Add(-25 * time.Hour), "retry_of_tx_hash": oldHash.Hex(),
+		"copy_id": copyRow.ID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "attempted_at": time.Now().Add(-25 * time.Hour), "retry_of_tx_hash": oldHash.Hex(),
 	})
 	if err != nil {
 		t.Fatalf("encode aged retry checkpoint: %v", err)
@@ -1775,7 +1776,7 @@ func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
 	if copyRow.Status != model.StorageCleanupCopyStatusPending || copyRow.DeleteTxHash != nil {
 		t.Fatalf("unrecorded request ledger = %#v", copyRow)
 	}
-	agedCheckpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "attempted_at": time.Now().Add(-25 * time.Hour)})
+	agedCheckpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "attempted_at": time.Now().Add(-25 * time.Hour)})
 	if err != nil {
 		t.Fatalf("encode aged checkpoint: %v", err)
 	}
@@ -1884,7 +1885,7 @@ func seedStorageCleanup(t *testing.T, runtime handlerTestRuntime, statuses ...mo
 		if err != nil {
 			t.Fatalf("create cleanup binding %d: %v", copyIndex, err)
 		}
-		if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 		}); err != nil {
 			t.Fatalf("mark cleanup binding %d ready: %v", copyIndex, err)
@@ -1950,7 +1951,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create cleanup admission binding: %v", err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{
 		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark cleanup admission binding ready: %v", err)
@@ -2468,7 +2469,7 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 	// Content identity comes first: a data version cannot exist without it.
 	upload, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
 		BucketID: bucket.ID, ContentSize: 128,
-		Checksum: testutil.StorageChecksum(fmt.Sprintf("copy-checksum-%d", sequence)), RequestedCopies: 2,
+		Checksum: testutil.StorageChecksum(strings.Repeat("s", 128)), RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("start copy upload: %v", err)
@@ -2485,7 +2486,7 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 		if bindErr != nil {
 			t.Fatalf("create copy binding %d: %v", copyIndex, bindErr)
 		}
-		if readyErr := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		if readyErr := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); readyErr != nil {
 			t.Fatalf("mark copy binding %d ready: %v", copyIndex, readyErr)
@@ -2505,7 +2506,11 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 	if err != nil || len(copies) != 2 {
 		t.Fatalf("list copy rows = %#v, err=%v", copies, err)
 	}
-	pieceCID := testPieceCID(t, fmt.Sprintf("copy-piece-%d", sequence))
+	pieceInfo, err := piece.Calculate(strings.NewReader(strings.Repeat("s", 128)))
+	if err != nil {
+		t.Fatalf("calculate copy piece CID: %v", err)
+	}
+	pieceCID := pieceInfo.CIDv2
 	pieceID := testOnChainID(t, 8000+sequence)
 	testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
 		StorageCopyID: copies[0].ID, ContentID: upload.ID, CopyIndex: 0, PieceCID: pieceCID.String(),
@@ -2644,7 +2649,7 @@ func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePr
 		t.Fatal(err)
 	}
 	dataSetID, clientID := testOnChainID(t, 990002), testOnChainID(t, 990003)
-	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{
 		ID:        replacement.TargetDataSetID,
 		DataSetID: dataSetID, ClientDataSetID: &clientID,
 	}); err != nil {
@@ -3200,7 +3205,7 @@ func TestDataSetEnsureSchedulesBoundCopyWorkWhenReady(t *testing.T) {
 			}
 			ensureTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
 				Type:  model.TaskTypeStorageDataSetEnsure,
-				Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
+				Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: binding.ID},
 			}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 				return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 			})
@@ -3209,7 +3214,7 @@ func TestDataSetEnsureSchedulesBoundCopyWorkWhenReady(t *testing.T) {
 			}
 			dataSetID := testOnChainID(t, 10000+sequence)
 			clientDataSetID := testOnChainID(t, 11000+sequence)
-			if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+			if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{
 				ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 			}); err != nil {
 				t.Fatalf("mark data set ready: %v", err)
@@ -3303,7 +3308,7 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	}
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
 		Type:  model.TaskTypeStorageDataSetEnsure,
-		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
+		Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -3607,7 +3612,7 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		t.Fatalf("create parked store version: %v", err)
 	}
 	if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).
-		Set("piece_cid = ?", info.CIDv2.String()).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
+		Set("piece_cid = ?", info.CIDv2.String()).Set("checksum = ?", testutil.StorageChecksum(payload)).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("align parked store content identity: %v", err)
 	}
 	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
@@ -3623,6 +3628,8 @@ func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 		t.Fatalf("interrupted store = %#v calls:%d, want checkpointed recovery after one Store", recovering, storeCalls.Load())
 	}
 	var checkpoint struct {
+		storagepipeline.ExecutionIdentity
+		VerifiedChecksum     string    `json:"verified_checksum,omitempty"`
 		AttemptedAt          time.Time `json:"attempted_at"`
 		IntendedPieceCID     string    `json:"intended_piece_cid"`
 		ProviderServiceURL   string    `json:"provider_service_url"`
@@ -4196,7 +4203,7 @@ func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 		}
 		taskRow, _, err = runtime.service.EnqueueInTransaction(t.Context(), repos, taskengine.EnqueueRequest{
 			Type:  model.TaskTypeWalletOperation,
-			Input: walletoperation.Input{OperationID: operation.ID},
+			Input: walletoperation.Input{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), OperationID: operation.ID},
 		})
 		if err != nil {
 			return err
@@ -4312,6 +4319,7 @@ func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 func TestWalletReceiptLookupHasIndependentDeadline(t *testing.T) {
 	var observations atomic.Int64
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		wallet:               testWalletOperator{},
 		walletReceiptTimeout: 20 * time.Millisecond,
 		receipts: testReceiptChecker{check: func(ctx context.Context, _ common.Hash) (*ethtypes.Receipt, error) {
 			observations.Add(1)
@@ -4357,7 +4365,7 @@ func seedWalletTask(t *testing.T, runtime handlerTestRuntime, requestID string) 
 		}
 		taskRow, _, err = runtime.service.EnqueueInTransaction(t.Context(), repos, taskengine.EnqueueRequest{
 			Type:  model.TaskTypeWalletOperation,
-			Input: walletoperation.Input{OperationID: operation.ID},
+			Input: walletoperation.Input{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), OperationID: operation.ID},
 		})
 		if err != nil {
 			return err
@@ -4401,7 +4409,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 		t.Fatalf("create source binding: %v", err)
 	}
 	sourceClientID := testOnChainID(t, 7402)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: source.ID, DataSetID: testOnChainID(t, 7403), ClientDataSetID: &sourceClientID,
 	}); err != nil {
 		t.Fatalf("mark source ready: %v", err)
@@ -4419,7 +4427,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 		t.Fatalf("load target = %#v err=%v", target, err)
 	}
 	targetClientID := testOnChainID(t, 7405)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: target.ID, DataSetID: testOnChainID(t, 7406), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
@@ -4491,6 +4499,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 		name                   string
 		contents               int
 		invalidStoreCheckpoint bool
+		blockedReason          string
 		exhaustedFirst         bool
 		dependencyRetries      *int
 	}{
@@ -4498,6 +4507,8 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 		{name: "retryable batch", contents: 7},
 		{name: "exhausted dependency leaves others running", contents: 2, exhaustedFirst: true},
 		{name: "invalid Store checkpoint", contents: 1, invalidStoreCheckpoint: true},
+		{name: "identity mismatch requires operator", contents: 1, blockedReason: "storage_identity_changed"},
+		{name: "content mismatch requires operator", contents: 1, blockedReason: "store_identity_mismatch"},
 		{name: "dependency limit and manual reset", contents: 1, dependencyRetries: &dependencyLimit},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -4552,6 +4563,9 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 					t.Fatalf("claim migration task = %#v, %v", claimed, err)
 				}
 				reason := "store_outcome_unknown"
+				if tt.blockedReason != "" {
+					reason = tt.blockedReason
+				}
 				var checkpoint json.RawMessage
 				if tt.invalidStoreCheckpoint {
 					reason = "invalid_checkpoint"
@@ -4581,7 +4595,7 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 					t.Fatal(err)
 				}
 			}
-			if tt.invalidStoreCheckpoint {
+			if tt.invalidStoreCheckpoint || tt.blockedReason != "" {
 				coordinator = runStorageTaskClaims(t, runtime, coordinator, model.TaskStatusFailed, 2)
 				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
 				copyAfter, copyErr := runtime.repos.Contents.GetUploadCopyByID(ctx, copies[0].ID)
@@ -4592,6 +4606,10 @@ func TestReplacementRecoversFailedMigrationWithinCoordinatorBudget(t *testing.T)
 				if err != nil || stored.Status != storagereplacement.StatusFailed || stored.LastError == nil || *stored.LastError != "Some stored content could not be copied to the new provider. Retry the replacement to try it again." ||
 					coordinator.FailureReason == nil || *coordinator.FailureReason != "replacement_item_attention" || item.Status != storagereplacement.ItemStatusAttention || copyErr != nil || copyAfter.ActiveTaskID == nil {
 					t.Fatalf("attention = task %#v, replacement %#v, item %#v, copy %#v, errors %v %v", coordinator, stored, item, copyAfter, err, copyErr)
+				}
+				count, err := runtime.db.NewSelect().Model((*model.Task)(nil)).Where("retry_of_task_id = ?", stopped[0].ID).Count(ctx)
+				if err != nil || count != 0 {
+					t.Fatalf("blocked dependency created %d successors: %v", count, err)
 				}
 				return
 			}
@@ -4990,7 +5008,7 @@ func newReplacementSourceFixture(t *testing.T, options handlerRuntimeOptions) re
 	if err != nil {
 		t.Fatalf("create source: %v", err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
+	if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
 		t.Fatalf("mark source ready: %v", err)
 	}
 	return replacementSourceFixture{runtime: runtime, bucket: bucket, source: source, id: id}
@@ -5055,7 +5073,7 @@ func (f replacementSourceFixture) replace(t *testing.T) (*storagereplacement.Rep
 	if err != nil {
 		t.Fatalf("authorize replacement: %v", err)
 	}
-	if err := f.runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: f.id(6)}); err != nil {
+	if err := markTestDataSetReady(t, f.runtime, ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: f.id(6)}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
 	}
 	coordinateTask, _, err := f.runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
@@ -5277,7 +5295,7 @@ func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create source: %v", err)
 			}
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
+			if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
 				t.Fatalf("mark source ready: %v", err)
 			}
 			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
@@ -5359,7 +5377,7 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 		t.Fatalf("create retirement admission source: %v", err)
 	}
 	sourceClientID := testOnChainID(t, 29202)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: source.ID, DataSetID: testOnChainID(t, 29203), ClientDataSetID: &sourceClientID,
 	}); err != nil {
 		t.Fatalf("mark retirement admission source ready: %v", err)
@@ -5376,7 +5394,7 @@ func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 		t.Fatalf("load retirement admission target = %#v, err=%v", target, err)
 	}
 	targetClientID := testOnChainID(t, 29205)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: target.ID, DataSetID: testOnChainID(t, 29206), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark retirement admission target ready: %v", err)
@@ -5476,7 +5494,7 @@ func seedAbandonedTargetRetirement(t *testing.T, runtime handlerTestRuntime, seq
 		t.Fatalf("create source: %v", err)
 	}
 	sourceClientID := id(2)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: source.ID, DataSetID: id(3), ClientDataSetID: &sourceClientID,
 	}); err != nil {
 		t.Fatalf("mark source ready: %v", err)
@@ -5489,7 +5507,7 @@ func seedAbandonedTargetRetirement(t *testing.T, runtime handlerTestRuntime, seq
 		t.Fatalf("authorize replacement: %v", err)
 	}
 	targetClientID := id(5)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: first.TargetDataSetID, DataSetID: id(6), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
@@ -5593,7 +5611,7 @@ func seedSourceRetirement(t *testing.T, runtime handlerTestRuntime, sequence int
 		t.Fatalf("create source: %v", err)
 	}
 	sourceClientID := id(2)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: source.ID, DataSetID: id(3), ClientDataSetID: &sourceClientID,
 	}); err != nil {
 		t.Fatalf("mark source ready: %v", err)
@@ -5606,7 +5624,7 @@ func seedSourceRetirement(t *testing.T, runtime handlerTestRuntime, sequence int
 		t.Fatalf("authorize replacement: %v", err)
 	}
 	targetClientID := id(5)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: replacement.TargetDataSetID, DataSetID: id(6), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
@@ -5640,7 +5658,7 @@ func seedSourceRetirement(t *testing.T, runtime handlerTestRuntime, sequence int
 // nothing and stops for an operator.
 func TestRetirementStopsWhenTheSigningIdentityChanged(t *testing.T) {
 	movedIdentity := testutil.DefaultContextIdentity
-	movedIdentity.ChainID = testutil.DefaultContextIdentity.ChainID + 1
+	movedIdentity.ChainID = 314
 	tests := []struct {
 		name       string
 		seed       func(*testing.T, handlerTestRuntime, int64) (*storagereplacement.Replacement, *model.Task)
@@ -5664,7 +5682,7 @@ func TestRetirementStopsWhenTheSigningIdentityChanged(t *testing.T) {
 			// was never observed.
 			checkpoint, err := json.Marshal(map[string]any{
 				"attempted_at": time.Now().UTC().Add(-time.Hour),
-				"identity":     testutil.DefaultContextIdentity, "sends": 1,
+				"identity":     testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1,
 			})
 			if err != nil {
 				t.Fatalf("encode checkpoint: %v", err)
@@ -5794,7 +5812,7 @@ func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *t
 		t.Fatalf("create retirement source: %v", err)
 	}
 	sourceClientID := testOnChainID(t, 7201)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: source.ID, DataSetID: testOnChainID(t, 7301), ClientDataSetID: &sourceClientID,
 	}); err != nil {
 		t.Fatalf("mark retirement source ready: %v", err)
@@ -5812,7 +5830,7 @@ func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *t
 		t.Fatalf("load retirement target = %#v err=%v", target, err)
 	}
 	targetClientID := testOnChainID(t, 7202)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 		ID: target.ID, DataSetID: testOnChainID(t, 7302), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark retirement target ready: %v", err)
@@ -6091,7 +6109,7 @@ func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *test
 	}
 	ensureTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
 		Type:  model.TaskTypeStorageDataSetEnsure,
-		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
+		Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -6100,7 +6118,7 @@ func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *test
 	}
 	checkpoint, err := json.Marshal(map[string]any{
 		"attempted_at": time.Now().UTC(), "client_data_set_id": clientDataSetID.String(),
-		"identity": testutil.DefaultContextIdentity, "sends": 1,
+		"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1,
 		"transaction_id": "0xrejected", "status_url": "https://provider.example/status",
 	})
 	if err != nil {
@@ -6185,7 +6203,7 @@ func seedDataSetEnsure(t *testing.T, runtime handlerTestRuntime, providerID idty
 	}
 	ensureTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
 		Type:  model.TaskTypeStorageDataSetEnsure,
-		Input: storagepipeline.DataSetInput{DataSetID: binding.ID},
+		Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: binding.ID},
 	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
 		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
 	})
@@ -6366,7 +6384,7 @@ func TestDataSetCreationRecoveryRecordsIndependentRoundStart(t *testing.T) {
 			}
 			checkpoint, err := json.Marshal(map[string]any{
 				"attempted_at": attemptedAt, "client_data_set_id": clientID.String(),
-				"identity": testutil.DefaultContextIdentity, "sends": tc.sends,
+				"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": tc.sends,
 				"transaction_id": transactionID, "status_url": statusURL,
 			})
 			if err != nil {
@@ -6499,7 +6517,7 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			}
 			recorded := map[string]any{
 				"attempted_at": time.Now().UTC().Add(-time.Hour), "client_data_set_id": clientID.String(),
-				"identity": testutil.DefaultContextIdentity, "sends": 1,
+				"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1,
 			}
 			if tt.submission {
 				const transactionID, statusURL = "0xsubmitted", "https://provider.example/status"
@@ -6579,7 +6597,7 @@ func TestDataSetCreationWithUnusableCheckpointPreservesConfirmedOrPendingFacts(t
 				t.Fatal(err)
 			}
 			if confirmed {
-				if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+				if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 					ID: fixture.binding.ID, DataSetID: testOnChainID(t, 43000+sequence), ClientDataSetID: &clientID,
 				}); err != nil {
 					t.Fatal(err)
@@ -6644,7 +6662,7 @@ func TestDataSetEnsurePreservesAnUnsentGenerationWithIncompleteIdentity(t *testi
 	failed := waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "dependency_unavailable" || !handlerTaskRetryable(t, runtime, failed) {
+	if failed.FailureReason == nil || *failed.FailureReason != "storage_identity_changed" || !handlerTaskRetryable(t, runtime, failed) {
 		t.Fatalf("failure = %v retryable=%v, want recovery after restoring the signing identity", failed.FailureReason, handlerTaskRetryable(t, runtime, failed))
 	}
 	kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
@@ -6692,7 +6710,7 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 	// only means that one may have created the data set first.
 	checkpoint, err := json.Marshal(map[string]any{
 		"attempted_at": time.Now().UTC().Add(-time.Hour), "client_data_set_id": clientID.String(),
-		"identity": testutil.DefaultContextIdentity, "sends": 2,
+		"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 2,
 		"transaction_id": "0xdead", "status_url": "https://provider.example/status",
 	})
 	if err != nil {
@@ -6778,4 +6796,19 @@ func activateReplacement(t *testing.T, runtime handlerTestRuntime, id int64) err
 	}
 	settleHandlerTaskFixture(t, runtime, task.ID, model.TaskStatusCancelled, nil)
 	return nil
+}
+
+func (o testWalletOperator) WalletIdentity() walletoperation.ExecutionIdentity {
+	if o.identity.Identity != nil {
+		return o.identity
+	}
+	return testutil.DefaultWalletExecutionIdentity()
+}
+
+func (*testServiceTerminator) PDPVerifierAddress() common.Address {
+	return testutil.DefaultPDPVerifierAddress
+}
+
+func (*sequencedTerminator) PDPVerifierAddress() common.Address {
+	return testutil.DefaultPDPVerifierAddress
 }
