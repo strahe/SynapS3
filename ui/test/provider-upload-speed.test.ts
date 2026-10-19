@@ -84,7 +84,17 @@ test('upload speed labels distinguish results from failed or outdated tests', ()
     ['upload_failed', 'Upload test failed'],
   ]) {
     assert.equal(
-      providerUploadSpeedLabel({ state: 'failed', sample_bytes: 32 << 20, failure_code: failureCode }),
+      providerUploadSpeedLabel({
+        state: 'failed',
+        sample_bytes: 32 << 20,
+        failure_code: failureCode,
+        last_success: {
+          sample_bytes: 32 << 20,
+          duration_ms: 1000,
+          bytes_per_second: 10 << 20,
+          tested_at: '2026-10-19T00:00:00Z',
+        },
+      }),
       label
     )
   }

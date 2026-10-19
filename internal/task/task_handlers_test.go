@@ -129,7 +129,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		storageClient.DeletionStateFunc = options.deletionState
 		if storageClient.DeletionStateFunc == nil {
 			storageClient.DeletionStateFunc = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-				return synapse.CleanupPieceState{}, nil
+				return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved}, nil
 			}
 		}
 	}
@@ -847,7 +847,7 @@ func TestStorageCleanupContinuesPastUnsupportedCopy(t *testing.T) {
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-		return synapse.CleanupPieceState{Live: true}, nil
+		return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent}, nil
 	}})
 	ctx := t.Context()
 	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusUnsupported, model.StorageCleanupCopyStatusPending)
@@ -925,11 +925,14 @@ func TestStorageCleanupRecoveryIgnoresOwnUnacceptedCopy(t *testing.T) {
 	if err := runtime.db.NewSelect().Model(cleanupCopy).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
 		t.Fatalf("load cleanup copy: %v", err)
 	}
-	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+	copyRow := &model.StorageCopy{
+		ContentID: content.ID, BucketID: content.BucketID, ContentSize: content.ContentSize,
 		StorageDataSetID: cleanupCopy.StorageDataSetID, CopyIndex: 0,
 		TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: cleanupCopy.ProviderID,
-	}}); err != nil {
-		t.Fatalf("create committed copy binding: %v", err)
+		Status: model.StorageCopyStatusPending,
+	}
+	if _, err := runtime.db.NewInsert().Model(copyRow).Exec(ctx); err != nil {
+		t.Fatalf("seed cleanup's committed copy: %v", err)
 	}
 	testutil.CommitStorageCopy(t, runtime.db, runtime.repos, testutil.CommitCopyInput{
 		ContentID: content.ID, CopyIndex: 0, PieceCID: cleanupCopy.PieceCID,
@@ -970,7 +973,14 @@ func TestStorageCleanupKeepsCheckingScheduledDeletionBeforeDeadline(t *testing.T
 			return cleanupContext, nil
 		},
 	}, deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-		return synapse.CleanupPieceState{Live: pieceExists.Load(), Queued: pieceQueued.Load()}, nil
+		status := synapse.CleanupPieceRemoved
+		if pieceExists.Load() {
+			status = synapse.CleanupPiecePresent
+			if pieceQueued.Load() {
+				status = synapse.CleanupPieceScheduled
+			}
+		}
+		return synapse.CleanupPieceState{Status: status}, nil
 	}, receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
 		receiptCalls.Add(1)
 		return nil, ethereum.NotFound
@@ -1062,7 +1072,11 @@ func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
 					return cleanupContext, nil
 				}},
 				deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-					return synapse.CleanupPieceState{Live: true, Queued: pieceQueued.Load(), BlockNumber: 100}, nil
+					status := synapse.CleanupPiecePresent
+					if pieceQueued.Load() {
+						status = synapse.CleanupPieceScheduled
+					}
+					return synapse.CleanupPieceState{Status: status, BlockNumber: 100}, nil
 				},
 				receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
 					return nil, ethereum.NotFound
@@ -1231,7 +1245,7 @@ func TestStorageCleanupLeavesUnknownCopyStatusUntouched(t *testing.T) {
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
 			stateChecks.Add(1)
-			return synapse.CleanupPieceState{Live: true}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent}, nil
 		},
 	})
 	ctx := t.Context()
@@ -1277,7 +1291,7 @@ func TestStorageCleanupReissuesOnlyAfterConfirmedFailureAndManualRetry(t *testin
 			return cleanupContext, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
 		},
 		receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
 			if hash == oldHash {
@@ -1350,7 +1364,7 @@ func TestStorageCleanupUnknownRequestOutcomeDoesNotResend(t *testing.T) {
 			return cleanupContext, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			return synapse.CleanupPieceState{Live: true}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent}, nil
 		},
 	})
 	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
@@ -1391,7 +1405,7 @@ func TestStorageCleanupManualRetryWithoutHashDoesNotAutomaticallyResend(t *testi
 			return cleanupContext, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
 		},
 		receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
 			return &ethtypes.Receipt{Status: ethtypes.ReceiptStatusFailed, BlockNumber: big.NewInt(99)}, nil
@@ -1474,7 +1488,7 @@ func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
 			}}, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
 		},
 	})
 	ctx := t.Context()
@@ -1568,7 +1582,7 @@ func TestStorageCleanupLegacyFailedCopyWithoutHashCanRetry(t *testing.T) {
 			}}, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
 		},
 	})
 	ctx := t.Context()
@@ -1618,8 +1632,9 @@ func TestStorageCleanupManualRetryChecksChainBeforeSending(t *testing.T) {
 		name  string
 		state synapse.CleanupPieceState
 	}{
-		{name: "already removed", state: synapse.CleanupPieceState{Live: false}},
-		{name: "already queued", state: synapse.CleanupPieceState{Live: true, Queued: true}},
+		{name: "already removed", state: synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved}},
+		{name: "already queued", state: synapse.CleanupPieceState{Status: synapse.CleanupPieceScheduled}},
+		{name: "data set cleanup", state: synapse.CleanupPieceState{Status: synapse.CleanupPieceDataSetCleanup}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var deleteCalls atomic.Int64
@@ -1659,13 +1674,21 @@ func TestStorageCleanupManualRetryChecksChainBeforeSending(t *testing.T) {
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
 			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-				if tc.state.Live {
+				if tc.state.Status != synapse.CleanupPieceRemoved {
 					return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
 				}
 				return task.Status == model.TaskStatusCompleted
 			})
 			if deleteCalls.Load() != 0 {
 				t.Fatalf("cleanup sent %d requests despite chain evidence", deleteCalls.Load())
+			}
+			if tc.state.Status != synapse.CleanupPieceRemoved {
+				if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if copyRow.Status != model.StorageCleanupCopyStatusFailed {
+					t.Fatalf("unconfirmed removal changed cleanup ledger: %#v", copyRow)
+				}
 			}
 		})
 	}
@@ -1693,7 +1716,7 @@ func TestStorageCleanupManualRetryCheckpointFailureDoesNotSend(t *testing.T) {
 					}}, nil
 				}},
 				deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-					return synapse.CleanupPieceState{Live: true}, nil
+					return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent}, nil
 				},
 			})
 			ctx := t.Context()
@@ -1750,7 +1773,7 @@ func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
 			}}, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
 		},
 	})
 	ctx := t.Context()
@@ -1929,7 +1952,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 		},
 	}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, maxAttempts: taskTestMaxAttempts(&noRetries), deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-		return synapse.CleanupPieceState{Live: true}, nil
+		return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent}, nil
 	}})
 	bucket := &model.Bucket{Name: "cleanup-admission", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
@@ -6012,14 +6035,14 @@ func TestBucketProvisionRecoversFromAFailedDataSetGeneration(t *testing.T) {
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	// A failed generation does not hold a current slot or qualify for selection.
+	// An unfinished creation retains its provider identity outside the current slot.
 	failed, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
 		BucketID: bucket.ID, ProviderID: failedProvider, CopyIndex: 0,
 	})
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("status = ?", model.StorageDataSetStatusFailed).Set("is_current = ?", false).Where("id = ?", failed.ID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("status = ?", model.StorageDataSetStatusCreating).Set("is_current = ?", false).Where("id = ?", failed.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 

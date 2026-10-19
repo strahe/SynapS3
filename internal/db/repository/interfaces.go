@@ -199,9 +199,7 @@ type ObjectRepository interface {
 	RecordContentCacheCommit(ctx context.Context, contentID int64, accessedAt time.Time) error
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
-	// AggregateByState returns object counts and sizes grouped by state.
-	AggregateByState(ctx context.Context) ([]ObjectStateAggregate, error)
-	CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error)
+	OverviewSnapshot(ctx context.Context) (ObjectOverviewSnapshot, error)
 	// CountByBucket returns the number of current objects in a bucket.
 	CountByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// TotalSizeByBucket returns the sum of current object sizes in a bucket.
@@ -501,6 +499,7 @@ type StorageContentRepository interface {
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
 	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
+	LockForCopyCreation(ctx context.Context, contentID int64) (*model.StorageContent, error)
 	CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, contentID int64, copyIndex int) (*model.StorageCopy, error)
 	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageCopy, error)
@@ -919,6 +918,7 @@ type ProviderUploadSpeedRepository interface {
 	FailActiveTask(context.Context, int64, string) error
 	Get(context.Context, string) (*providerbenchmark.Result, error)
 	ListByProviderIDs(context.Context, []string) (map[string]providerbenchmark.Result, error)
+	ListLastSuccessByProviderURLs(context.Context, map[string]string) (map[string]providerbenchmark.SuccessfulMeasurement, error)
 }
 
 type CreateWalletOperationInput struct {
@@ -956,6 +956,11 @@ type ObjectStateAggregate struct {
 type ObjectAttentionCount struct {
 	NeedsAttention int64 `bun:"needs_attention"`
 	Unavailable    int64 `bun:"unavailable"`
+}
+
+type ObjectOverviewSnapshot struct {
+	States    []ObjectStateAggregate
+	Attention ObjectAttentionCount
 }
 
 // BucketStatusCount holds a bucket count grouped by status.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -196,8 +197,24 @@ func (r *BunStorageReplacementRepo) scanMigrationCandidates(
 		return nil, row.SeedCursorContentID, 0, nil
 	}
 	cursor = candidates[len(candidates)-1]
+	// The coordinator already owns the data-set locks, while Commit takes
+	// content first. Contention must roll back this whole batch, including its
+	// cursor, rather than waiting in the opposite lock order.
+	var locked []int64
+	if err := r.db.NewSelect().Model((*model.StorageContent)(nil)).Column("id").
+		Where("id IN (?)", bun.List(candidates)).OrderExpr("id ASC").
+		For("NO KEY UPDATE NOWAIT").Scan(ctx, &locked); err != nil {
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "55P03" {
+			return nil, 0, 0, fmt.Errorf("locking replacement content: %w", ErrRepositoryContended)
+		}
+		return nil, 0, 0, fmt.Errorf("locking replacement content: %w", err)
+	}
+	if len(locked) == 0 {
+		return nil, cursor, len(candidates), nil
+	}
 	query := r.db.NewSelect().TableExpr("storage_contents AS candidate").ColumnExpr("candidate.id").
-		Where("candidate.id IN (?)", bun.List(candidates)).Where(slotObligationSQL("candidate", "live_version"), row.CopyIndex).
+		Where("candidate.id IN (?)", bun.List(locked)).Where("candidate.cleanup_generation = 0").
+		Where(slotObligationSQL("candidate", "live_version"), row.CopyIndex).
 		OrderExpr("candidate.id")
 	if err := query.Scan(ctx, &eligible); err != nil {
 		return nil, 0, 0, fmt.Errorf("selecting replacement candidates: %w", err)

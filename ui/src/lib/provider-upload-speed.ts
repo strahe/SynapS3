@@ -65,6 +65,11 @@ export function providerUploadSampleSize(test?: ProviderUploadSpeedTest): string
   return `${Number((test.sample_bytes / (1024 * 1024)).toFixed(1))} MiB`
 }
 
+export function providerUploadSpeedLastSuccessLabel(test?: ProviderUploadSpeedTest): string | undefined {
+  if (!test?.last_success || test.bytes_per_second) return undefined
+  return `Last success: ${formatUploadSpeed(test.last_success.bytes_per_second)}`
+}
+
 export function providerUploadSpeedTestErrorMessage(error: unknown, providerLabel: string) {
   return error instanceof APIError && error.status === 409
     ? `A test is already running, or ${providerLabel} is not available for testing. Check its details before trying again.`

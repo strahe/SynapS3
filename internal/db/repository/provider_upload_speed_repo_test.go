@@ -242,3 +242,53 @@ func TestProviderUploadSpeedCompletionPreservesTaskHistory(t *testing.T) {
 		t.Fatalf("result after task cleanup = %#v, %v", row, err)
 	}
 }
+
+func TestProviderUploadSpeedLastSuccessUsesCompletedCurrentURLHistory(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	url, changedURL := "https://provider.example", "https://changed.example"
+	hash, changedHash := providerbenchmark.URLHash(url), providerbenchmark.URLHash(changedURL)
+	base := time.Date(2026, time.October, 19, 0, 0, 0, 0, time.UTC)
+	checkpoint := `{"attempted":true,"sample_bytes":8388608,"duration_ms":1000,"bytes_per_second":8388608}`
+	add := func(id, taskHash string, version int, status model.TaskStatus, evidence string, offset time.Duration) {
+		t.Helper()
+		row := enqueueProviderSpeedTask(t, repos, id, taskHash, "history")
+		query := db.NewUpdate().Model((*model.Task)(nil)).
+			Set("input_version = ?", version).Set("status = ?", status).
+			Set("checkpoint_json = ?::jsonb", evidence).Where("id = ?", row.ID)
+		if status == model.TaskStatusCompleted || status == model.TaskStatusFailed {
+			query = query.Set("finished_at = ?", base.Add(offset))
+		}
+		if _, err := query.Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("101", hash, 1, model.TaskStatusCompleted, checkpoint, time.Minute)
+	add("101", hash, 1, model.TaskStatusCompleted, checkpoint, 2*time.Minute)
+	add("101", changedHash, 1, model.TaskStatusCompleted, checkpoint, 3*time.Minute)
+	add("101", hash, 2, model.TaskStatusCompleted, checkpoint, 4*time.Minute)
+	add("101", hash, 1, model.TaskStatusFailed, checkpoint, 5*time.Minute)
+	add("101", hash, 1, model.TaskStatusPending, checkpoint, 0)
+	add("202", hash, 1, model.TaskStatusCompleted, checkpoint, time.Minute)
+	add("303", hash, 2, model.TaskStatusCompleted, checkpoint, time.Minute)
+	add("404", hash, 1, model.TaskStatusCompleted, `{"attempted":true,"sample_bytes":"bad","duration_ms":1000,"bytes_per_second":1000}`, time.Minute)
+	add("505", hash, 1, model.TaskStatusCompleted, `{"sample_bytes":8388608,"duration_ms":1000,"bytes_per_second":8388608}`, time.Minute)
+	add("606", hash, 1, model.TaskStatusCompleted, `{"attempted":true,"sample_bytes":8388608,"duration_ms":0,"bytes_per_second":8388608}`, time.Minute)
+	add("808", hash, 1, model.TaskStatusCompleted, `{"attempted":true,"duration_ms":1000,"bytes_per_second":33554432}`, time.Minute)
+	hashes := map[string]string{"101": hash, "202": hash, "303": hash, "404": hash, "505": hash, "606": hash, "707": hash, "808": hash}
+	got, err := repos.ProviderUploadSpeed.ListLastSuccessByProviderURLs(t.Context(), hashes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || !got["101"].TestedAt.Equal(base.Add(2*time.Minute)) || !got["202"].TestedAt.Equal(base.Add(time.Minute)) || got["101"].BytesPerSecond != providerbenchmark.MinimumSampleBytes || got["808"].SampleBytes != providerbenchmark.SampleBytes {
+		t.Fatalf("current URL history = %#v", got)
+	}
+	got, err = repos.ProviderUploadSpeed.ListLastSuccessByProviderURLs(t.Context(), map[string]string{"101": changedHash, "202": changedHash})
+	if err != nil || len(got) != 1 || !got["101"].TestedAt.Equal(base.Add(3*time.Minute)) {
+		t.Fatalf("changed URL history = %#v, %v", got, err)
+	}
+	got, err = repos.ProviderUploadSpeed.ListLastSuccessByProviderURLs(t.Context(), map[string]string{"101": hash})
+	if err != nil || len(got) != 1 || !got["101"].TestedAt.Equal(base.Add(2*time.Minute)) {
+		t.Fatalf("restored URL history = %#v, %v", got, err)
+	}
+}

@@ -893,6 +893,23 @@ func requireDataSetStatusUpdate(ctx context.Context, db bun.IDB, id int64, resul
 	return fmt.Errorf("%s: data set state changed: %w", operation, ErrConflict)
 }
 
+// LockForCopyCreation holds the content lock until the caller's transaction
+// ends and rejects content reserved for cleanup.
+func (r *BunStorageContentRepo) LockForCopyCreation(ctx context.Context, contentID int64) (*model.StorageContent, error) {
+	contents, err := lockStorageContentsByID(ctx, r.db, []int64{contentID})
+	if err != nil {
+		return nil, err
+	}
+	content := contents[contentID]
+	if content == nil {
+		return nil, ErrNotFound
+	}
+	if content.CleanupGeneration != 0 {
+		return nil, ErrContentCleanupInProgress
+	}
+	return content, nil
+}
+
 func (r *BunStorageContentRepo) CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error {
 	if len(copies) == 0 {
 		return nil
@@ -908,16 +925,9 @@ func (r *BunStorageContentRepo) CreateUploadCopiesForBindings(ctx context.Contex
 		dataSetIDs[i] = input.StorageDataSetID
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		var content struct {
-			BucketID    int64 `bun:"bucket_id"`
-			ContentSize int64 `bun:"content_size"`
-		}
-		if err := db.NewSelect().
-			Model((*model.StorageContent)(nil)).
-			Column("bucket_id", "content_size").
-			Where("id = ?", contentID).
-			Scan(ctx, &content); err != nil {
-			return fmt.Errorf("loading storage content for bound copy: %w", err)
+		content, err := (&BunStorageContentRepo{db: db}).LockForCopyCreation(ctx, contentID)
+		if err != nil {
+			return fmt.Errorf("locking storage content for bound copy: %w", err)
 		}
 		var bindings []model.StorageDataSet
 		if err := db.NewSelect().Model(&bindings).Where("id IN (?)", bun.List(dataSetIDs)).Scan(ctx); err != nil {

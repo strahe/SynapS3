@@ -232,6 +232,12 @@ export interface ProviderUploadSpeedTest {
   bytes_per_second?: number
   tested_at?: string
   failure_code?: string
+  last_success?: {
+    sample_bytes: number
+    duration_ms: number
+    bytes_per_second: number
+    tested_at: string
+  }
 }
 
 export interface UploadSpeedCounts {

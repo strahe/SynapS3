@@ -363,7 +363,7 @@ func TestAPIProviderUploadSpeedTestAdmitsOneTaskAndListsResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := &Server{
-		repos: repos, observability: observability.NewService(observability.ServiceOptions{Store: repos.Observability}),
+		db: db, repos: repos, observability: observability.NewService(observability.ServiceOptions{Store: repos.Observability}),
 		taskService: newAdminTestTaskService(t, repos), logger: testLogger(),
 	}
 	request := func() *httptest.ResponseRecorder {
@@ -411,6 +411,26 @@ func TestAPIProviderUploadSpeedTestAdmitsOneTaskAndListsResult(t *testing.T) {
 	if got := getSpeed(); got.State != string(providerbenchmark.StateSucceeded) || got.BytesPerSecond == nil {
 		t.Fatalf("successful speed test = %+v", got)
 	}
+	historyTime := seedUploadSpeedHistory(t, srv, "101", serviceURL)
+	if rr := request(); rr.Code != http.StatusAccepted {
+		t.Fatalf("retest POST = %d: %s", rr.Code, rr.Body.String())
+	}
+	row, err = repos.ProviderUploadSpeed.Get(t.Context(), "101")
+	if err != nil || row == nil || row.ActiveTaskID == nil {
+		t.Fatalf("active retest = %+v, %v", row, err)
+	}
+	if err := repos.ProviderUploadSpeed.Finish(t.Context(), "101", *row.ActiveTaskID, providerbenchmark.StateFailed, 0, 0, 0, "timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if got := getSpeed(); got.State != "failed" || got.BytesPerSecond != nil || got.FailureCode == nil || *got.FailureCode != "timeout" || got.LastSuccess == nil || got.LastSuccess.BytesPerSecond != providerbenchmark.SampleBytes || !got.LastSuccess.TestedAt.Equal(historyTime) {
+		t.Fatalf("failed retest with historical reference = %+v", got)
+	}
+	original := repos.ProviderUploadSpeed
+	repos.ProviderUploadSpeed = failingUploadSpeedHistory{ProviderUploadSpeedRepository: original}
+	if got := getSpeed(); got.State != "failed" || got.LastSuccess != nil || got.FailureCode == nil || *got.FailureCode != "timeout" {
+		t.Fatalf("history failure changed latest result = %+v", got)
+	}
+	repos.ProviderUploadSpeed = original
 	newURL := "https://another-provider.example"
 	if err := repos.Observability.ReplaceProviderStates(t.Context(), time.Now().UTC(), []observability.ProviderState{{
 		ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable,
@@ -419,7 +439,7 @@ func TestAPIProviderUploadSpeedTestAdmitsOneTaskAndListsResult(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := getSpeed(); got.State != "stale" || got.BytesPerSecond != nil {
+	if got := getSpeed(); got.State != "stale" || got.BytesPerSecond != nil || got.LastSuccess != nil {
 		t.Fatalf("changed-address speed test = %+v", got)
 	}
 	if rr := request(); rr.Code != http.StatusAccepted {

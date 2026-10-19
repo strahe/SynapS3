@@ -21,6 +21,7 @@ Do not bind the Admin listener or port 9090 to a public interface. For internet 
 
 - Put `/var/lib/synaps3` or `~/.synaps3` on durable storage.
 - Keep PostgreSQL on durable storage, and keep its DSN in protected configuration or `.env`.
+- S3 secret keys are stored as plaintext in PostgreSQL. Restrict database and backup access as strictly as access to S3 credentials.
 - Stop SynapS3 before backup. Use a database-native backup plus matching configuration and cache data.
 - Keep the database and cache at the same recovery point, verify backup archives, and test the documented restore order.
 - Watch free space on the database volume and cache volume.

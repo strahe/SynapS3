@@ -1,12 +1,50 @@
 package admin
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 )
+
+type failingUploadSpeedHistory struct {
+	repository.ProviderUploadSpeedRepository
+}
+
+func (failingUploadSpeedHistory) ListLastSuccessByProviderURLs(context.Context, map[string]string) (map[string]providerbenchmark.SuccessfulMeasurement, error) {
+	return nil, errors.New("history unavailable")
+}
+
+func seedUploadSpeedHistory(t *testing.T, srv *Server, providerID, serviceURL string) time.Time {
+	t.Helper()
+	input, err := json.Marshal(providerbenchmark.Input{ProviderID: providerID, ServiceURLHash: providerbenchmark.URLHash(serviceURL)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _, err := srv.repos.Tasks.Enqueue(t.Context(), &model.Task{
+		Type: model.TaskTypeProviderUploadSpeedTest, InputVersion: 1, Input: input, Runtime: json.RawMessage(`{}`),
+		SubjectType: "provider", SubjectKey: providerID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := json.Marshal(providerbenchmark.Checkpoint{Attempted: true, SampleBytes: providerbenchmark.SampleBytes, DurationMS: 1000, BytesPerSecond: providerbenchmark.SampleBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusCompleted).
+		Set("finished_at = ?", finishedAt).Set("checkpoint_json = ?::jsonb", string(checkpoint)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	return finishedAt
+}
 
 func TestUploadSpeedViewUsesCurrentProfileURL(t *testing.T) {
 	oldURL := "https://old.example"

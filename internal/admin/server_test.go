@@ -9,8 +9,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
@@ -389,10 +392,76 @@ func TestRefreshMetrics(t *testing.T) {
 	for _, metric := range []string{
 		"synaps3_task_queue_depth",
 		"synaps3_object_state_distribution",
+		"synaps3_database_metrics_collection_success",
+		"synaps3_database_metrics_last_success_timestamp_seconds",
 	} {
 		if !strings.Contains(text, metric) {
 			t.Errorf("metrics output missing %q", metric)
 		}
+	}
+	metricValue := func(g prometheus.Gauge) float64 {
+		t.Helper()
+		var metric dto.Metric
+		if err := g.Write(&metric); err != nil {
+			t.Fatal(err)
+		}
+		return metric.GetGauge().GetValue()
+	}
+	lastSuccess := metricValue(DatabaseMetricsLastSuccess)
+	if lastSuccess <= 0 || metricValue(DatabaseMetricsCollectionSuccess) != 1 {
+		t.Fatal("successful database sample has no freshness evidence")
+	}
+
+	db.SetMaxOpenConns(1)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	srv.refreshMetrics(blockedCtx)
+	cancel()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if metricValue(DatabaseMetricsCollectionSuccess) != 0 || metricValue(DatabaseMetricsLastSuccess) != lastSuccess {
+		t.Fatal("failed database sample replaced freshness evidence")
+	}
+	if count := metricValue(ObjectStateDistribution.WithLabelValues(string(model.ObjectStateCached))); count != 1 {
+		t.Fatalf("failed sample changed object count to %v", count)
+	}
+
+	taskGauge := TaskQueueDepth.WithLabelValues(string(model.TaskTypeStorageStore), string(model.TaskStatusPending))
+	previousTaskCount := metricValue(taskGauge)
+	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "second-refresh-task", model.TaskStatusPending)
+	if _, err := db.ExecContext(ctx, "ALTER TABLE storage_copies RENAME TO metrics_unavailable_copies"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := db.ExecContext(context.Background(), "ALTER TABLE IF EXISTS metrics_unavailable_copies RENAME TO storage_copies"); err != nil {
+			t.Errorf("restore object metrics table: %v", err)
+		}
+	})
+	srv.refreshMetrics(ctx)
+	if metricValue(taskGauge) != previousTaskCount ||
+		metricValue(ObjectStateDistribution.WithLabelValues(string(model.ObjectStateCached))) != 1 ||
+		metricValue(DatabaseMetricsLastSuccess) != lastSuccess || metricValue(DatabaseMetricsCollectionSuccess) != 0 {
+		t.Fatal("failed object query published a partial database metrics sample")
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE metrics_unavailable_copies RENAME TO storage_copies"); err != nil {
+		t.Fatal(err)
+	}
+	srv.refreshMetrics(ctx)
+	if metricValue(taskGauge) != previousTaskCount+1 || metricValue(DatabaseMetricsCollectionSuccess) != 1 {
+		t.Fatal("database metrics did not recover after the failed object query")
+	}
+	stopped, stop := context.WithCancel(ctx)
+	stop()
+	finished := make(chan struct{})
+	go func() { srv.RunDatabaseMetrics(stopped); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("database sampling did not stop")
 	}
 }
 

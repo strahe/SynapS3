@@ -105,6 +105,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/workers` | 后台任务活动和健康状态。 |
 | `GET` | `/api/v1/cache/stats` | 缓存使用量和容量。 |
 
+指标含义和采样新鲜度见[健康检查和指标](../operations/health-metrics.md#prometheus-metrics)。
+
 ## 仪表盘数据
 
 | Method | Path | 用途 |
@@ -348,7 +350,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的批次数量。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
-存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`。每次在 30 秒内最多上传 32 MiB；窗口到期时，至少传输 8 MiB 才能估算速度。单次样本不保证实际对象上传速度。自动测速和重测见[节点选择](../configuration/model.md#节点选择)。
+存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。可选的 `upload_speed_test.last_success` 提供当前服务地址的最近成功测速，仅供参考；最新测速失败仍阻止新绑定。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`。每次在 30 秒内最多上传 32 MiB；窗口到期时，至少传输 8 MiB 才能估算速度。单次样本不保证实际对象上传速度。自动测速和重测见[节点选择](../configuration/model.md#节点选择)。
 
 同一 URL 重测时，`state: "testing"` 一并返回上次完成的结果；保留的成功速度仍可用于选择。当前服务 URL 缺失或变化时，结果为 `stale`。失败测速提供 `retry_task_id`，用于任务 Retry 接口。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
 

@@ -6,6 +6,14 @@ import (
 )
 
 var (
+	DatabaseMetricsCollectionSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "synaps3", Subsystem: "database_metrics", Name: "collection_success",
+		Help: "Whether the most recent database metrics collection succeeded",
+	})
+	DatabaseMetricsLastSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "synaps3", Subsystem: "database_metrics", Name: "last_success_timestamp_seconds",
+		Help: "Unix timestamp of the last successful database metrics collection",
+	})
 	// ObjectOperationsTotal counts S3 object operations by type and status.
 	ObjectOperationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "synaps3",

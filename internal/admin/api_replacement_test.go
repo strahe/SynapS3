@@ -349,7 +349,7 @@ func TestReplacementSelectionRespectsBucketHistory(t *testing.T) {
 			}
 			status := model.StorageDataSetStatusRetired
 			if tc.unretired {
-				status = model.StorageDataSetStatusFailed
+				status = model.StorageDataSetStatusCreating
 			}
 			previous := &model.StorageDataSet{
 				BucketID: bucketID, ProviderID: onChainIDValue("202"), CopyIndex: tc.copyIndex,
@@ -416,7 +416,7 @@ func TestReplacementAuthorizationRechecksHistoryAfterSelection(t *testing.T) {
 		want   error
 	}{
 		{name: "retired target", status: model.StorageDataSetStatusRetired, want: storagereplacement.ErrNoEligibleProvider},
-		{name: "unretired target", status: model.StorageDataSetStatusFailed, want: storagereplacement.ErrTargetInUse},
+		{name: "unretired target", status: model.StorageDataSetStatusCreating, want: storagereplacement.ErrTargetInUse},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
@@ -1015,6 +1015,7 @@ func TestReplacementRequiresSuccessfulCurrentURLUploadSpeed(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "failed":
+				seedUploadSpeedHistory(t, fixture.srv, "202", "https://provider.example")
 				if _, err := query.Set("state = ?", providerbenchmark.StateFailed).Set("duration_ms = NULL").Set("bytes_per_second = NULL").Set("failure_code = ?", "upload_failed").Exec(ctx); err != nil {
 					t.Fatal(err)
 				}
@@ -1042,6 +1043,9 @@ func TestReplacementRequiresSuccessfulCurrentURLUploadSpeed(t *testing.T) {
 			}
 			if len(body.Providers) != 1 || body.Providers[0].ManualSelectable != (tc.reason == "") || body.Providers[0].ManualBlockReason != tc.reason {
 				t.Fatalf("provider speed eligibility = %+v, want %q", body.Providers, tc.reason)
+			}
+			if tc.name == "failed" && (body.Providers[0].UploadSpeedTest == nil || body.Providers[0].UploadSpeedTest.State != "failed" || body.Providers[0].UploadSpeedTest.LastSuccess == nil || body.Providers[0].UploadSpeedTest.LastSuccess.BytesPerSecond != providerbenchmark.SampleBytes) {
+				t.Fatalf("failed candidate lost reference measurement = %+v", body.Providers[0].UploadSpeedTest)
 			}
 			rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
 			if tc.reason == "" {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -145,6 +146,58 @@ func (r *BunProviderUploadSpeedRepo) ListByProviderIDs(ctx context.Context, ids 
 	}
 	for _, row := range rows {
 		out[row.ProviderID] = row
+	}
+	return out, nil
+}
+
+// ListLastSuccessByProviderURLs reads completed measurements for the requested URL fingerprints.
+func (r *BunProviderUploadSpeedRepo) ListLastSuccessByProviderURLs(ctx context.Context, hashes map[string]string) (map[string]providerbenchmark.SuccessfulMeasurement, error) {
+	out := make(map[string]providerbenchmark.SuccessfulMeasurement, len(hashes))
+	if len(hashes) == 0 {
+		return out, nil
+	}
+	ids := make([]string, 0, len(hashes))
+	for id := range hashes {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	requests := make([]providerbenchmark.Input, 0, len(ids))
+	for _, id := range ids {
+		requests = append(requests, providerbenchmark.Input{ProviderID: id, ServiceURLHash: hashes[id]})
+	}
+	var rows []model.Task
+	query := r.db.NewSelect().With("requested", r.db.NewValues(&requests)).
+		TableExpr("requested").ColumnExpr("history.subject_key, history.input_json, history.checkpoint_json, history.finished_at").
+		Join(`CROSS JOIN LATERAL (
+			SELECT subject_key, input_json, checkpoint_json, finished_at
+			FROM tasks
+			WHERE subject_type = 'provider' AND subject_key = requested.provider_id
+			  AND type = ? AND status = ? AND input_version = 1
+			  AND finished_at IS NOT NULL
+			  AND input_json ->> 'provider_id' = requested.provider_id
+			  AND input_json ->> 'service_url_hash' = requested.service_url_hash
+			ORDER BY id DESC LIMIT 1
+		) AS history`, model.TaskTypeProviderUploadSpeedTest, model.TaskStatusCompleted)
+	if err := query.Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		var input providerbenchmark.Input
+		var checkpoint providerbenchmark.Checkpoint
+		if json.Unmarshal(row.Input, &input) != nil || input.ProviderID != row.SubjectKey || input.ServiceURLHash != hashes[row.SubjectKey] ||
+			json.Unmarshal(row.Checkpoint, &checkpoint) != nil || !checkpoint.Attempted || row.FinishedAt.IsZero() {
+			continue
+		}
+		if checkpoint.SampleBytes == 0 {
+			checkpoint.SampleBytes = providerbenchmark.SampleBytes
+		}
+		if checkpoint.SampleBytes < 0 || checkpoint.DurationMS <= 0 || checkpoint.BytesPerSecond <= 0 {
+			continue
+		}
+		out[row.SubjectKey] = providerbenchmark.SuccessfulMeasurement{
+			SampleBytes: checkpoint.SampleBytes, DurationMS: checkpoint.DurationMS,
+			BytesPerSecond: checkpoint.BytesPerSecond, TestedAt: *row.FinishedAt,
+		}
 	}
 	return out, nil
 }

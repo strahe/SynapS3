@@ -22,6 +22,7 @@ import {
 } from '@/components/app/DetailPanel'
 import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { ProviderUploadSpeedButton } from '@/components/app/ProviderUploadSpeedButton'
+import { ProviderUploadSpeedHistory } from '@/components/app/ProviderUploadSpeedHistory'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -198,6 +199,7 @@ function ProviderDetails({
                     Tested {timeAgo(test.tested_at)} with {providerUploadSampleSize(test)}
                   </DetailNote>
                 )}
+                <ProviderUploadSpeedHistory test={test} />
               </DetailField>
               <DetailField label="Declared location">{location ?? '—'}</DetailField>
               <DetailField label="Registry status">{registryStateLabel(provider.facts)}</DetailField>

@@ -278,7 +278,7 @@ func TestCheckDataSetsClassifiesLocalAndChainEvidence(t *testing.T) {
 			BucketName: "eta",
 			ProviderID: onChainID(t, "108"),
 			DataSetID:  onChainIDPtr(t, "1008"),
-			Status:     model.StorageDataSetStatusFailed,
+			Status:     model.StorageDataSetStatusRetired,
 		},
 		{
 			ID:         9,
@@ -418,7 +418,7 @@ func TestCheckDataSetsMergesWalletScanFailureWithLocalStatus(t *testing.T) {
 			BucketName: "alpha",
 			ProviderID: onChainID(t, "103"),
 			DataSetID:  onChainIDPtr(t, "1003"),
-			Status:     model.StorageDataSetStatusFailed,
+			Status:     model.StorageDataSetStatusRetired,
 		},
 	})
 	if err != nil {

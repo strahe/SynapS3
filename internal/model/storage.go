@@ -33,7 +33,6 @@ const (
 	StorageDataSetStatusPending  StorageDataSetStatus = "pending"
 	StorageDataSetStatusCreating StorageDataSetStatus = "creating"
 	StorageDataSetStatusReady    StorageDataSetStatus = "ready"
-	StorageDataSetStatusFailed   StorageDataSetStatus = "failed"
 	StorageDataSetStatusDraining StorageDataSetStatus = "draining"
 	StorageDataSetStatusRetired  StorageDataSetStatus = "retired"
 )

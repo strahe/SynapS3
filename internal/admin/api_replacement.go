@@ -899,6 +899,17 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 		s.writeReplacementError(w, err, name)
 		return
 	}
+	hashes := make(map[string]string, len(candidates))
+	for _, candidate := range candidates {
+		var observedServiceURL *string
+		if candidate.Observation != nil {
+			observedServiceURL = candidate.Observation.Facts.ServiceURL
+		}
+		if url := uploadSpeedServiceURL(candidate.Profile, observedServiceURL); url != "" {
+			hashes[candidate.ProviderID.String()] = providerbenchmark.URLHash(url)
+		}
+	}
+	history := s.uploadSpeedHistory(ctx, hashes)
 
 	providers := make([]replacementProviderResponse, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -920,6 +931,9 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 				observedServiceURL = candidate.Observation.Facts.ServiceURL
 			}
 			view.UploadSpeedTest = s.uploadSpeedViewWithRetry(ctx, candidate.ProviderID.String(), row, view.ProviderProfile, observedServiceURL)
+			if success, ok := history[candidate.ProviderID.String()]; ok {
+				view.UploadSpeedTest.LastSuccess = &success
+			}
 		}
 		view.UploadSpeedTestable, view.UploadSpeedUnavailableReason = uploadSpeedAvailability(candidate.Observation, view.ProviderProfile, test)
 		if s.taskService == nil {

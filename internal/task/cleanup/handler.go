@@ -182,6 +182,12 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		if err != nil {
 			return retryTask(err, "storage_identity_load_failed")
 		}
+		if binding == nil || binding.DataSetID == nil || binding.ClientDataSetID == nil || copyRow.ClientDataSetID == nil {
+			return taskengine.Fail(storagepipeline.ErrExecutionIdentityMissing, storagepipeline.ExecutionIdentityFailure(storagepipeline.ErrExecutionIdentityMissing), nil)
+		}
+		if !binding.DataSetID.Equal(*copyRow.DataSetID) || !binding.ClientDataSetID.Equal(*copyRow.ClientDataSetID) {
+			return taskengine.Fail(storagepipeline.ErrExecutionIdentityChanged, storagepipeline.ExecutionIdentityFailure(storagepipeline.ErrExecutionIdentityChanged), nil)
+		}
 		identity, err := bindingtask.RecordedIdentity(ctx, h.deps.Repositories, binding)
 		if err == nil {
 			err = identity.Match(bindingtask.CurrentIdentity(h.deps.Storage))
@@ -204,7 +210,9 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		if err != nil {
 			return retryTask(err, "cleanup_status_failed")
 		}
-		if !state.Live {
+		//exhaustive:enforce
+		switch state.Status {
+		case synapse.CleanupPieceRemoved:
 			checkpoint, err = h.resolveCopyOperation(ctx, execution, copyRow.ID, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.StorageCleanup.MarkCopyRemoved(ctx, copyRow.ID)
 			})
@@ -213,9 +221,12 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			}
 			hasCheckpoint = checkpoint.CopyID != 0
 			continue
-		}
-		if state.Queued {
+		case synapse.CleanupPieceScheduled, synapse.CleanupPieceDataSetCleanup:
 			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
+		case synapse.CleanupPiecePresent:
+			// Admission and recovery evidence determine whether deletion is safe.
+		default:
+			return retryTask(fmt.Errorf("unknown remote cleanup state: %q", state.Status), "cleanup_status_failed")
 		}
 		previousHash := ""
 		if copyRow.DeleteTxHash != nil {
