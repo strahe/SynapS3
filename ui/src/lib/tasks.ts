@@ -5,6 +5,7 @@ export function taskRetryErrorMessage(error: unknown) {
   return error instanceof APIError && error.status === 409 ? error.message : 'Could not retry. Refresh and try again.'
 }
 
+import { providerDisplayName } from './provider-display.ts'
 import { replicaLabel } from './storage-status-labels.ts'
 import { formatBytes, formatTokenAmount } from './utils.ts'
 
@@ -48,10 +49,11 @@ const subjectLabels: Record<string, string> = {
   storage_commit_request: 'Batch',
 }
 
-export function taskSubjectLabel(task: Pick<TaskItem, 'subject_type' | 'subject_key'>) {
+export function taskSubjectLabel(task: Pick<TaskItem, 'subject_type' | 'subject_key' | 'provider_identity'>) {
   if (task.subject_type === 'system') return 'System'
   if (!task.subject_type || !task.subject_key) return '—'
   if (task.subject_type === 'storage_commit_request') return 'Batch'
+  if (task.subject_type === 'provider') return providerDisplayName(task.subject_key, task.provider_identity?.name)
   return `${subjectLabels[task.subject_type] ?? 'Resource'} #${task.subject_key}`
 }
 

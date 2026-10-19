@@ -420,6 +420,12 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
       queryClient.invalidateQueries({ queryKey: ['replacement-providers'] })
       queryClient.invalidateQueries({ queryKey: ['bucket'] })
       queryClient.invalidateQueries({ queryKey: ['objectProvenance'] })
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
+      queryClient.invalidateQueries({ queryKey: ['task'] })
+      queryClient.invalidateQueries({ queryKey: ['taskEvents'] })
+      queryClient.invalidateQueries({ queryKey: ['taskSubjectInfo'] })
+      queryClient.invalidateQueries({ queryKey: ['commitBatch'] })
+      queryClient.invalidateQueries({ queryKey: ['commitBatches'] })
     }
     events.addEventListener('provider_identity_updated', (event) => {
       applyProviderIdentityEventData(queryClient, event.data)

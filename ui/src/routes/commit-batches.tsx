@@ -29,6 +29,7 @@ import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useCommitBatch, useCommitBatches } from '@/hooks/queries'
+import { providerDisplayName } from '@/lib/provider-display'
 import { formatBytes } from '@/lib/utils'
 
 type StatusFilter = CommitBatchStatus | 'all'
@@ -190,7 +191,7 @@ function CommitBatchesPage() {
                       {batch.bucket_name}
                     </Link>
                   </TableCell>
-                  <TableCell className="px-4">{batch.provider_name ?? batch.provider_id}</TableCell>
+                  <TableCell className="px-4">{providerDisplayName(batch.provider_id, batch.provider_name)}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{batch.member_count}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">
                     {batch.total_bytes === null ? '—' : formatBytes(batch.total_bytes)}
@@ -249,7 +250,7 @@ function CommitBatchesPage() {
             kind="Batch"
             title={
               detail.data
-                ? `${detail.data.bucket_name} → ${detail.data.provider_name ?? detail.data.provider_id}`
+                ? `${detail.data.bucket_name} → ${providerDisplayName(detail.data.provider_id, detail.data.provider_name)}`
                 : 'Batch'
             }
             badge={detail.data && <BatchStatus batch={detail.data} />}
@@ -303,7 +304,7 @@ function BatchDetails({ batch }: { batch: CommitBatchDetails }) {
             <CopyableValue
               label="Provider"
               value={batch.provider_id}
-              displayValue={batch.provider_name ?? batch.provider_id}
+              displayValue={providerDisplayName(batch.provider_id, batch.provider_name)}
               maxLength={28}
             />
           </DetailField>

@@ -109,6 +109,57 @@ test('provider identity events ignore unrelated providers', () => {
   assert.equal(qc.getQueryState(['bucket', 'photos'])?.isInvalidated, false)
 })
 
+test('provider identity events refresh providers referenced only by replacement history', () => {
+  for (const side of ['source', 'target'] as const) {
+    const qc = new QueryClient()
+    qc.setQueryData(['bucket', 'photos'], {
+      data_sets: [dataSet('202')],
+      replacements: [
+        {
+          source: { provider_id: side === 'source' ? '101' : '303' },
+          target: { provider_id: side === 'target' ? '101' : '303' },
+        },
+      ],
+    })
+
+    applyProviderIdentityEventData(qc, JSON.stringify({ topic: 'provider_identity_updated', provider_id: '101' }))
+
+    assert.equal(qc.getQueryState(['bucket', 'photos'])?.isInvalidated, true, side)
+  }
+})
+
+test('provider identity events refresh task and batch references while profiles are missing', () => {
+  const providerID = '184467440737095516160'
+  const qc = new QueryClient()
+  const cases: [readonly unknown[], unknown][] = [
+    [['tasks', 'work'], { tasks: [{ subject_type: 'provider', subject_key: providerID }] }],
+    [['tasks', 'history'], { tasks: [{ storage_confirmation: { provider_id: providerID } }] }],
+    [['task', 1], { task: { subject_type: 'provider', subject_key: providerID } }],
+    [['task', 2], { task: { storage_confirmation: { provider_id: providerID } } }],
+    [['taskEvents', 3], { events: [{ provider_selection: { rejections: [{ provider_id: providerID }] } }] }],
+    [['taskSubjectInfo', 'provider', providerID], { provider: { id: providerID } }],
+    [['taskSubjectInfo', 'storage_copy', '4'], { provider: { id: providerID } }],
+    [['taskSubjectInfo', 'storage_replacement', '5'], { source_provider: { id: providerID } }],
+    [['taskSubjectInfo', 'storage_replacement', '6'], { target_provider: { id: providerID } }],
+    [['commitBatch', 'request-1'], { provider_id: providerID }],
+    [['commitBatch', 'request-2'], { provider_id: '202', task: { storage_confirmation: { provider_id: providerID } } }],
+  ]
+  for (const [key, data] of cases) qc.setQueryData(key, data)
+  const unrelated: [readonly unknown[], unknown][] = [
+    [['tasks', 'other'], { tasks: [{ subject_type: 'provider', subject_key: '202' }] }],
+    [['task', 7], { task: { subject_type: 'storage_data_set', subject_key: providerID } }],
+    [['taskEvents', 8], { events: [{ provider_selection: { rejections: [{ provider_id: '202' }] } }] }],
+    [['taskSubjectInfo', 'provider', '202'], { provider: { id: '202' } }],
+    [['commitBatch', 'request-3'], { provider_id: '202' }],
+  ]
+  for (const [key, data] of unrelated) qc.setQueryData(key, data)
+
+  applyProviderIdentityEventData(qc, JSON.stringify({ topic: 'provider_identity_updated', provider_id: providerID }))
+
+  for (const [key] of cases) assert.equal(qc.getQueryState(key)?.isInvalidated, true, JSON.stringify(key))
+  for (const [key] of unrelated) assert.equal(qc.getQueryState(key)?.isInvalidated, false, JSON.stringify(key))
+})
+
 test('provider identity events invalidate only matching replacement choices', () => {
   const qc = new QueryClient()
   qc.setQueryData(['replacement-providers', 'photos', 1], { providers: [{ provider_id: '101' }] })

@@ -43,22 +43,24 @@ type taskListItem struct {
 	CreatedAt              string  `json:"created_at"`
 	UpdatedAt              string  `json:"updated_at"`
 
-	StorageConfirmation *taskStorageConfirmation `json:"storage_confirmation,omitempty"`
+	ProviderIdentity    *providerIdentityResponse `json:"provider_identity,omitempty"`
+	StorageConfirmation *taskStorageConfirmation  `json:"storage_confirmation,omitempty"`
 }
 
 // taskStorageConfirmation describes the storage registration a Confirm
 // storage task holds while it is flagged for attention.
 type taskStorageConfirmation struct {
-	RequestID     string   `json:"request_id"`
-	ReasonCode    string   `json:"reason_code"`
-	ProviderID    string   `json:"provider_id"`
-	DataSetID     string   `json:"data_set_id,omitempty"`
-	PieceCount    int      `json:"piece_count"`
-	PieceCIDs     []string `json:"piece_cids"`
-	TransactionID string   `json:"transaction_id,omitempty"`
-	SubmitError   string   `json:"submit_error,omitempty"`
-	SubmittedAt   string   `json:"submitted_at"`
-	AttentionAt   string   `json:"attention_at"`
+	RequestID        string                    `json:"request_id"`
+	ReasonCode       string                    `json:"reason_code"`
+	ProviderID       string                    `json:"provider_id"`
+	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID        string                    `json:"data_set_id,omitempty"`
+	PieceCount       int                       `json:"piece_count"`
+	PieceCIDs        []string                  `json:"piece_cids"`
+	TransactionID    string                    `json:"transaction_id,omitempty"`
+	SubmitError      string                    `json:"submit_error,omitempty"`
+	SubmittedAt      string                    `json:"submitted_at"`
+	AttentionAt      string                    `json:"attention_at"`
 }
 
 type taskListResponse struct {
@@ -86,6 +88,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	s.attachTaskProviderIdentities(r.Context(), items)
 	response := taskListResponse{Tasks: items}
 	if page.NextBeforeID > 0 {
 		response.NextCursor = &page.NextBeforeID
@@ -502,6 +505,7 @@ func (s *Server) handleAPIGetTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	s.attachTaskProviderIdentities(r.Context(), items)
 	response := struct {
 		Task   taskListItem    `json:"task"`
 		Policy *taskPolicyView `json:"policy"`
@@ -597,6 +601,7 @@ func (s *Server) handleAPITaskHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	s.attachTaskProviderIdentities(r.Context(), response.Tasks)
 	if page.NextBeforeID > 0 {
 		response.NextCursor = &page.NextBeforeID
 	}
@@ -645,33 +650,39 @@ func (s *Server) handleAPITaskEvents(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(event.Details, &safe)
 		response.Events = append(response.Events, taskEventView{Sequence: event.ID, Type: event.Type, CreatedAt: event.CreatedAt.Format(time.RFC3339Nano), FailureReason: safe.FailureReason, Attempt: safe.Attempt, NextAttempt: safe.NextAttempt, RetryTaskID: safe.RetryTaskID, ProviderSelection: safeProviderSelection(safe.ProviderSelection)})
 	}
+	s.attachTaskEventProviderIdentities(r.Context(), response.Events)
 	writeJSON(w, 200, response)
 }
 
 type taskEventView struct {
-	ProviderSelection *providerselect.SelectionDiagnostics `json:"provider_selection,omitempty"`
-	FailureReason     *string                              `json:"failure_reason,omitempty"`
-	Attempt           *int                                 `json:"attempt,omitempty"`
-	NextAttempt       *int                                 `json:"next_attempt,omitempty"`
-	RetryTaskID       *int64                               `json:"retry_task_id,omitempty"`
-	Sequence          int64                                `json:"sequence"`
-	Type              string                               `json:"type"`
-	CreatedAt         string                               `json:"created_at"`
+	ProviderSelection *taskProviderSelectionView `json:"provider_selection,omitempty"`
+	FailureReason     *string                    `json:"failure_reason,omitempty"`
+	Attempt           *int                       `json:"attempt,omitempty"`
+	NextAttempt       *int                       `json:"next_attempt,omitempty"`
+	RetryTaskID       *int64                     `json:"retry_task_id,omitempty"`
+	Sequence          int64                      `json:"sequence"`
+	Type              string                     `json:"type"`
+	CreatedAt         string                     `json:"created_at"`
 }
 
-func safeProviderSelection(report *providerselect.SelectionDiagnostics) *providerselect.SelectionDiagnostics {
+func safeProviderSelection(report *providerselect.SelectionDiagnostics) *taskProviderSelectionView {
 	if report == nil || !report.Tier.Valid() || report.RequestedCount < 0 || report.EligibleCount < 0 || report.RejectedTotal < 0 || report.RejectedOmitted < 0 {
 		return nil
 	}
-	view := *report
-	view.Rejections = make([]providerselect.ProviderRejection, 0, min(len(report.Rejections), 100))
+	view := taskProviderSelectionView{
+		Tier: report.Tier, TierCheckedAt: report.TierCheckedAt, HasTrusted: report.HasTrusted,
+		RequestedCount: report.RequestedCount, EligibleCount: report.EligibleCount,
+		Rejections: make([]taskProviderRejectionView, 0, min(len(report.Rejections), 100)),
+	}
 	for _, rejection := range report.Rejections[:min(len(report.Rejections), 100)] {
 		switch rejection.Reason {
 		case "observation_missing", "observation_stale", "profile_missing", "profile_url_changed", "provider_inactive", "provider_missing_pdp", "provider_unhealthy", "service_url_missing", "provider_unavailable", "bucket_in_use", "previously_used", "context_open_failed", "upload_speed_untested", "upload_speed_failed":
 		default:
 			rejection.Reason = "provider_unavailable"
 		}
-		view.Rejections = append(view.Rejections, rejection)
+		view.Rejections = append(view.Rejections, taskProviderRejectionView{
+			ProviderID: rejection.ProviderID, Reason: rejection.Reason, ObservationCheckedAt: rejection.ObservationCheckedAt,
+		})
 	}
 	view.RejectedTotal = max(report.RejectedTotal, len(report.Rejections))
 	view.RejectedOmitted = view.RejectedTotal - len(view.Rejections)

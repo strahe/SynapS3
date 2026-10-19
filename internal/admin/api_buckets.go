@@ -25,6 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -114,6 +115,7 @@ type storageDataSetSummaryResponse struct {
 	SetupError                    string                    `json:"setup_error,omitempty"`
 	ProviderID                    string                    `json:"provider_id"`
 	ProviderIdentity              *providerIdentityResponse `json:"provider_identity,omitempty"`
+	UploadSpeedTest               *providerUploadSpeedView  `json:"upload_speed_test,omitempty"`
 	DataSetID                     *string                   `json:"data_set_id,omitempty"`
 	ClientDataSetID               *string                   `json:"client_data_set_id,omitempty"`
 	Status                        string                    `json:"status"`
@@ -663,14 +665,40 @@ func bucketOwnerACL(owner string) ([]byte, error) {
 func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries []repository.StorageDataSetSummary) []storageDataSetSummaryResponse {
 	out := make([]storageDataSetSummaryResponse, 0, len(summaries))
 	providerIDs := make([]idtypes.OnChainID, 0, len(summaries))
+	providerIDStrings := make([]string, 0, len(summaries))
 	localIDs := make([]int64, 0, len(summaries))
 	for _, summary := range summaries {
 		providerIDs = append(providerIDs, summary.ProviderID)
+		providerIDStrings = append(providerIDStrings, summary.ProviderID.String())
 		localIDs = append(localIDs, summary.ID)
 	}
-	identities := s.providerIdentities(ctx, providerIDs)
+	profiles := make(map[string]observability.ProviderProfile)
+	if s.repos != nil && s.repos.Observability != nil {
+		var err error
+		profiles, err = s.repos.Observability.ProviderProfiles(ctx, providerIDs)
+		if err != nil && s.logger != nil {
+			s.logger.Warn("api: failed to load saved provider profiles", "error", err)
+		}
+	}
+	identities := s.providerIdentitiesFromProfiles(profiles)
+	var speedTests map[string]providerbenchmark.Result
+	if len(providerIDStrings) > 0 && s.repos != nil && s.repos.ProviderUploadSpeed != nil {
+		var err error
+		speedTests, err = s.repos.ProviderUploadSpeed.ListByProviderIDs(ctx, providerIDStrings)
+		if err != nil && s.logger != nil {
+			s.logger.Warn("api: failed to list provider upload speed tests", "error", err)
+		}
+	}
 	healthByLocalID, healthFailed := s.dataSetStorageHealthStates(ctx, localIDs)
 	for _, summary := range summaries {
+		var speedTest *providerUploadSpeedView
+		if row, ok := speedTests[summary.ProviderID.String()]; ok {
+			var profile *observability.ProviderProfile
+			if saved, ok := profiles[summary.ProviderID.String()]; ok {
+				profile = &saved
+			}
+			speedTest = uploadSpeedView(row, profile, nil)
+		}
 		storageHealth := s.dataSetStorageHealthInfo(healthByLocalID[summary.ID])
 		source, _, eligibilityErr := s.repos.Replacements.SourceEligibility(ctx, summary.ID)
 		blockedReason := storagereplacement.Code(eligibilityErr)
@@ -700,6 +728,7 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			SetupError:                    setupError,
 			ProviderID:                    summary.ProviderID.String(),
 			ProviderIdentity:              providerIdentityFromSnapshot(identities, summary.ProviderID),
+			UploadSpeedTest:               speedTest,
 			DataSetID:                     onChainIDStringPtr(summary.DataSetID),
 			ClientDataSetID:               onChainIDStringPtr(summary.ClientDataSetID),
 			Status:                        string(summary.Status),

@@ -110,7 +110,15 @@ test('Subject preserves identity, one-based replicas, provenance, and exact wall
   assert.equal(taskSubjectLabel({ subject_type: 'storage_copy', subject_key: '447' }), 'Replica #447')
   assert.equal(
     taskSubjectLabel({ subject_type: 'provider', subject_key: '184467440737095516160' }),
-    'Provider #184467440737095516160'
+    'Registry 184467440737095516160'
+  )
+  assert.equal(
+    taskSubjectLabel({
+      subject_type: 'provider',
+      subject_key: '701',
+      provider_identity: { registry_provider_id: '701', name: 'North' },
+    }),
+    'North'
   )
   const fields = taskSubjectFields({
     subject_type: 'storage_copy',

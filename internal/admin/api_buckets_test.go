@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/task"
@@ -1316,6 +1317,33 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	}
 	if len(identityResolver.requests) != 0 {
 		t.Fatalf("provider identity requests = %#v, want no Registry fallback", identityResolver.requests)
+	}
+	for _, provider := range []struct{ id, serviceURL string }{{"101", "https://alpha.example"}, {"202", "https://beta.example"}} {
+		id := onChainID(t, provider.id)
+		if err := repos.Observability.UpsertProviderObservation(ctx, checkedAt, observability.ProviderState{
+			ProviderID: id, Status: observability.StatusAvailable,
+			Profile: &observability.ProviderProfile{ProviderID: id, ServiceURL: provider.serviceURL, RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedReplacementProviderSpeed(t, srv, "101", "https://alpha.example")
+	seedReplacementProviderSpeed(t, srv, "202", "https://previous-beta.example")
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/buckets/detail-datasets-bucket", nil))
+	var speeds struct {
+		DataSets []storageDataSetSummaryResponse `json:"data_sets"`
+	}
+	decodeJSON(t, rr, &speeds)
+	if rr.Code != http.StatusOK || len(speeds.DataSets) != 2 {
+		t.Fatalf("data set speeds = %d %s", rr.Code, rr.Body.String())
+	}
+	current, stale := speeds.DataSets[0].UploadSpeedTest, speeds.DataSets[1].UploadSpeedTest
+	if current == nil || current.State != "succeeded" || current.BytesPerSecond == nil || *current.BytesPerSecond != providerbenchmark.SampleBytes {
+		t.Fatalf("current provider speed = %#v", current)
+	}
+	if stale == nil || stale.State != "stale" || stale.BytesPerSecond != nil {
+		t.Fatalf("changed provider URL speed = %#v", stale)
 	}
 }
 

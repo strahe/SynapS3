@@ -179,7 +179,7 @@ import {
   replacementStatusLabel,
   replacementStatusTone,
 } from '@/lib/provider-replacement'
-import { providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
+import { providerUploadSpeedLabel, providerUploadSpeedShortLabel } from '@/lib/provider-upload-speed'
 import { ownerLabel } from '@/lib/s3-owner'
 import { bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import {
@@ -1940,23 +1940,35 @@ function ProviderReplacementProgressCard({
   onOpenLastError: (text: string) => void
 }) {
   const nextStep = replacementNextStep(replacement, sourceReplaceable)
+  const retiringDataSet = replacement.status === 'superseded' ? replacement.target : replacement.source
 
   return (
     <div className="flex flex-col gap-2 rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium">
+        <div className="flex flex-wrap items-center gap-1.5 text-sm font-medium">
           {replacement.retirement_attention ? (
             <>
-              Retiring storage for {replicaLabel(replacement.copy_index)} ·{' '}
-              {replacement.status === 'superseded' ? replacement.target.provider_id : replacement.source.provider_id}
+              <span>Retiring storage for {replicaLabel(replacement.copy_index)} ·</span>
+              <ProviderIdentityCell
+                providerID={retiringDataSet.provider_id}
+                identity={retiringDataSet.provider_identity}
+              />
             </>
           ) : (
             <>
-              Replacing {replicaLabel(replacement.copy_index)} · {replacement.source.provider_id} →{' '}
-              {replacement.target.provider_id}
+              <span>Replacing {replicaLabel(replacement.copy_index)} ·</span>
+              <ProviderIdentityCell
+                providerID={replacement.source.provider_id}
+                identity={replacement.source.provider_identity}
+              />
+              <span>→</span>
+              <ProviderIdentityCell
+                providerID={replacement.target.provider_id}
+                identity={replacement.target.provider_identity}
+              />
             </>
           )}
-        </span>
+        </div>
         <StatusBadge tone={replacement.retirement_attention ? 'danger' : replacementStatusTone(replacement.status)}>
           {replacement.retirement_attention ? 'Retirement stopped' : replacementStatusLabel(replacement.status)}
         </StatusBadge>
@@ -2125,22 +2137,23 @@ function BucketStorageDataSets({
         ) : (
           <DataTableFrame>
             <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
-              <Table className="min-w-[860px] table-fixed">
+              <Table className="min-w-[1000px] table-fixed">
                 <TableHeader>
                   <TableRow className={tableHeaderRowClassName}>
                     <TableHead className="w-[10%] px-4">Replica</TableHead>
-                    <TableHead className="w-[18%] px-4">Provider</TableHead>
-                    <TableHead className="w-[12%] px-4">Data set</TableHead>
-                    <TableHead className="w-[19%] px-4">Storage health</TableHead>
-                    <TableHead className="w-[17%] px-4">Impact</TableHead>
+                    <TableHead className="w-[17%] px-4">Provider</TableHead>
+                    <TableHead className="w-[13%] px-4 text-right">Upload speed</TableHead>
+                    <TableHead className="w-[11%] px-4">Data set</TableHead>
+                    <TableHead className="w-[15%] px-4">Storage health</TableHead>
+                    <TableHead className="w-[14%] px-4">Impact</TableHead>
                     <TableHead
-                      className="w-[8%] px-2 text-right"
+                      className="w-[7%] px-2 text-right"
                       aria-label="Current object versions referencing this data set"
                     >
                       Current
                     </TableHead>
                     <TableHead
-                      className="w-[9%] px-2 text-right"
+                      className="w-[7%] px-2 text-right"
                       aria-label="Total non-delete-marker versions referencing this data set"
                     >
                       Total
@@ -2179,6 +2192,11 @@ function BucketStorageDataSets({
                         </TableCell>
                         <TableCell className="overflow-hidden px-4">
                           <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
+                        </TableCell>
+                        <TableCell className="overflow-hidden px-4 text-right tabular-nums">
+                          <span className="block truncate" title={providerUploadSpeedLabel(dataSet.upload_speed_test)}>
+                            {providerUploadSpeedShortLabel(dataSet.upload_speed_test)}
+                          </span>
                         </TableCell>
                         <TableCell className="overflow-hidden px-4 text-muted-foreground">
                           {topologyLink.copyValue ? (
