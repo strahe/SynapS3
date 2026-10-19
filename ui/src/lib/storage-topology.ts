@@ -262,8 +262,8 @@ export function dataSetChainIDValue(dataSet: DataSetDisplaySource) {
   return formatOptionalTopologyID(chainDataSetID)
 }
 
-export function dataSetTopologyPath(dataSet: ObservabilityDataSetObservation) {
-  return `${dataSet.facts.bucket_name} -> ${replicaLabel(dataSet.facts.copy_index)} -> ${dataSetDisplayLabel(dataSet)} -> ${providerRegistryLabel(dataSet.facts.provider_id)}`
+export function dataSetTopologyPath(dataSet: ObservabilityDataSetObservation, providerName?: string | null) {
+  return `${dataSet.facts.bucket_name} -> ${replicaLabel(dataSet.facts.copy_index)} -> ${dataSetDisplayLabel(dataSet)} -> ${providerDisplayName(dataSet.facts.provider_id, providerName)}`
 }
 
 export function bucketStorageDataSetTopologyLinkModel(
@@ -543,7 +543,7 @@ export function buildStorageTopologyGraph(
     x: storageTopologyGraphLayout.dataSetX,
     y,
     data: {
-      path: dataSetTopologyPath(dataSet),
+      path: dataSetTopologyPath(dataSet, providerMap.get(dataSet.facts.provider_id)?.provider_profile?.name),
       status: dataSet.signal.status,
       level: dataSet.signal.level,
       signal: dataSet.signal,
@@ -566,7 +566,7 @@ export function buildStorageTopologyGraph(
   )
 
   const edges = visibleDataSets.flatMap<StorageTopologyEdge>((dataSet) => {
-    const chainPath = dataSetTopologyPath(dataSet)
+    const chainPath = dataSetTopologyPath(dataSet, providerMap.get(dataSet.facts.provider_id)?.provider_profile?.name)
     const replicaPath = `${dataSet.facts.bucket_name} -> ${replicaLabel(dataSet.facts.copy_index)} -> ${dataSetDisplayLabel(dataSet)}`
     return [
       {

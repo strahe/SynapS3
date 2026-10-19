@@ -221,13 +221,14 @@ function TopologyViewport({
         x: `${viewportPadding}px`,
         y: 0,
       })
+      const zoom = viewport.zoom / 1.2
       initialization.current = setViewport({
-        ...viewport,
+        zoom,
         x:
-          bounds.width * viewport.zoom > width - viewportPadding * 2
-            ? viewportPadding - bounds.x * viewport.zoom
-            : viewport.x,
-        y: viewportPadding - bounds.y * viewport.zoom,
+          bounds.width * zoom > width - viewportPadding * 2
+            ? viewportPadding - bounds.x * zoom
+            : width / 2 - (bounds.x + bounds.width / 2) * zoom,
+        y: viewportPadding - bounds.y * zoom,
       })
     }
 

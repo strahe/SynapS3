@@ -15,9 +15,11 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
 )
@@ -169,6 +171,67 @@ func TestAPITasksUsesCursorAndServerPresentation(t *testing.T) {
 	decodeJSON(t, rr, &cachePage)
 	if len(cachePage.Tasks) != 1 || cachePage.Tasks[0].Presentation != "waiting" || cachePage.Tasks[0].WaitReason == nil || *cachePage.Tasks[0].WaitReason != "durability" {
 		t.Fatalf("waiting task = %#v", cachePage)
+	}
+}
+
+type unavailableTaskProviderProfiles struct {
+	repository.ObservabilityRepository
+}
+
+func (unavailableTaskProviderProfiles) ProviderProfiles(context.Context, []types.OnChainID) (map[string]observability.ProviderProfile, error) {
+	return nil, errors.New("provider profiles unavailable")
+}
+
+func TestAPITasksProviderIdentitiesPreserveSubjects(t *testing.T) {
+	f := newAdminTaskFixture(t)
+	providerID := "184467440737095516160"
+	provider := onChainID(t, providerID)
+	if err := f.repos.Observability.UpsertProviderObservation(t.Context(), time.Now(), observability.ProviderState{
+		ProviderID: provider, Status: observability.StatusAvailable,
+		Profile: &observability.ProviderProfile{ProviderID: provider, Name: "North", ServiceURL: "https://north.example", RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	known := f.enqueue(t, model.TaskTypeProviderUploadSpeedTest, "known-provider", time.Now(), "provider", providerID)
+	missing := f.enqueue(t, model.TaskTypeProviderUploadSpeedTest, "missing-provider", time.Now(), "provider", "702")
+	invalid := f.enqueue(t, model.TaskTypeProviderUploadSpeedTest, "invalid-provider", time.Now(), "provider", "unavailable")
+	other := f.enqueue(t, model.TaskTypeUploadPlan, "other-subject", time.Now(), "storage_content", providerID)
+	rr := f.request(http.MethodGet, "/api/v1/tasks", nil)
+	var page taskListResponse
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 4 {
+		t.Fatalf("tasks = %d %s", rr.Code, rr.Body.String())
+	}
+	for _, item := range page.Tasks {
+		if item.ID == known.ID {
+			if item.SubjectKey != providerID || item.ProviderIdentity == nil || item.ProviderIdentity.RegistryProviderID != providerID || item.ProviderIdentity.Name != "North" {
+				t.Fatalf("known provider = %#v", item)
+			}
+		} else if item.ProviderIdentity != nil {
+			t.Fatalf("subject without a provider profile has identity: %#v", item)
+		}
+	}
+	for _, task := range []*model.Task{missing, invalid, other} {
+		rr = f.request(http.MethodGet, "/api/v1/tasks/"+strconv.FormatInt(task.ID, 10), nil)
+		var detail struct {
+			Task taskListItem `json:"task"`
+		}
+		decodeJSON(t, rr, &detail)
+		if rr.Code != http.StatusOK || detail.Task.SubjectKey != task.SubjectKey || detail.Task.ProviderIdentity != nil {
+			t.Fatalf("subject fallback = %d %s", rr.Code, rr.Body.String())
+		}
+	}
+	f.repos.Observability = unavailableTaskProviderProfiles{ObservabilityRepository: f.repos.Observability}
+	rr = f.request(http.MethodGet, "/api/v1/tasks", nil)
+	page = taskListResponse{}
+	decodeJSON(t, rr, &page)
+	if rr.Code != http.StatusOK || len(page.Tasks) != 4 {
+		t.Fatalf("profile lookup fallback = %d %s", rr.Code, rr.Body.String())
+	}
+	for _, item := range page.Tasks {
+		if item.ProviderIdentity != nil {
+			t.Fatalf("failed profile lookup has identity: %#v", item)
+		}
 	}
 }
 
@@ -444,6 +507,13 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 		FailureReason: new("submission_mismatch"), LastError: new("batch requires attention"),
 	})
 	now := time.Date(2026, 9, 30, 19, 53, 39, 0, time.UTC)
+	providerID := onChainID(t, "32")
+	if err := fixture.repos.Observability.UpsertProviderObservation(t.Context(), now, observability.ProviderState{
+		ProviderID: providerID, Status: observability.StatusAvailable,
+		Profile: &observability.ProviderProfile{ProviderID: providerID, Name: "North", RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	fixture.repos.Contents = &commitAttentionTaskRepo{StorageContentRepository: fixture.repos.Contents, records: []storagecommit.AttentionRecord{{
 		RequestID: "request-447", TaskID: &stopped.ID, ProviderID: "32", DataSetID: "39911", PieceCIDs: []string{"piece-1"},
 		TransactionID: "0xcommit", SubmitError: "provider returned HTTP 500: piece not found",
@@ -462,6 +532,7 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	if confirmation := page.Tasks[0].StorageConfirmation; confirmation.RequestID != "request-447" ||
 		confirmation.SubmitError != "provider returned HTTP 500: piece not found" ||
 		confirmation.ProviderID != "32" || confirmation.DataSetID != "39911" ||
+		confirmation.ProviderIdentity == nil || confirmation.ProviderIdentity.Name != "North" || page.Tasks[0].ProviderIdentity != nil ||
 		confirmation.PieceCount != 1 || confirmation.PieceCIDs[0] != "piece-1" || confirmation.TransactionID != "0xcommit" {
 		t.Fatalf("confirmation = %#v, want the confirmation with the provider reply", confirmation)
 	}
@@ -471,15 +542,22 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 		Task taskListItem `json:"task"`
 	}
 	decodeJSON(t, rr, &detail)
-	if rr.Code != http.StatusOK || detail.Task.Acknowledgeable || detail.Task.StorageConfirmation == nil {
+	if rr.Code != http.StatusOK || detail.Task.Acknowledgeable || detail.Task.StorageConfirmation == nil || detail.Task.StorageConfirmation.ProviderIdentity == nil || detail.Task.StorageConfirmation.ProviderIdentity.Name != "North" {
 		t.Fatalf("details = %d %s", rr.Code, rr.Body.String())
 	}
 	rr = fixture.request(http.MethodGet, path+"/history", nil)
 	decodeJSON(t, rr, &page)
-	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || page.Tasks[0].StorageConfirmation == nil {
+	if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].Acknowledgeable || page.Tasks[0].StorageConfirmation == nil || page.Tasks[0].StorageConfirmation.ProviderIdentity == nil || page.Tasks[0].StorageConfirmation.ProviderIdentity.Name != "North" {
 		t.Fatalf("history = %d %s", rr.Code, rr.Body.String())
 	}
 	attentionRepo := fixture.repos.Contents.(*commitAttentionTaskRepo)
+	attentionRepo.records[0].ProviderID = "33"
+	rr = fixture.request(http.MethodGet, path, nil)
+	detail.Task = taskListItem{}
+	decodeJSON(t, rr, &detail)
+	if rr.Code != http.StatusOK || detail.Task.StorageConfirmation == nil || detail.Task.StorageConfirmation.ProviderID != "33" || detail.Task.StorageConfirmation.ProviderIdentity != nil {
+		t.Fatalf("confirmation provider fallback = %d %s", rr.Code, rr.Body.String())
+	}
 	attentionRepo.err = errors.New("attention lookup failed")
 	for _, endpoint := range []string{"/api/v1/tasks", path, path + "/history"} {
 		rr = fixture.request(http.MethodGet, endpoint, nil)
@@ -956,7 +1034,14 @@ func decodeJSON(t *testing.T, rr *httptest.ResponseRecorder, target any) {
 
 func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 	f := newAdminTaskFixture(t)
-	first := f.enqueue(t, model.TaskTypeUploadPlan, "task-history", time.Now(), "bucket", "1")
+	providerID := onChainID(t, "701")
+	if err := f.repos.Observability.UpsertProviderObservation(t.Context(), time.Now(), observability.ProviderState{
+		ProviderID: providerID, Status: observability.StatusAvailable,
+		Profile: &observability.ProviderProfile{ProviderID: providerID, Name: "North", RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := f.enqueue(t, model.TaskTypeProviderUploadSpeedTest, "task-history", time.Now(), "provider", "701")
 	if _, err := f.db.NewUpdate().Table("tasks").Set("retry_count = 5").Where("id = ?", first.ID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -980,6 +1065,9 @@ func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 	if rr.Code != http.StatusOK || detail.Task.Status != "failed" || detail.Task.RetryCount != 5 || (detail.Task.LastError == nil || *detail.Task.LastError != "first failure") || detail.Policy != nil || detail.Task.MaxAttempts != nil {
 		t.Fatalf("original execution details: %d %s", rr.Code, rr.Body.String())
 	}
+	if detail.Task.ProviderIdentity == nil || detail.Task.ProviderIdentity.Name != "North" || detail.Task.SubjectKey != "701" {
+		t.Fatalf("provider details = %#v", detail.Task)
+	}
 	if strings.Contains(rr.Body.String(), "checkpoint") || strings.Contains(rr.Body.String(), "input") {
 		t.Fatalf("details exposed execution payload: %s", rr.Body.String())
 	}
@@ -995,6 +1083,9 @@ func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 		if rr.Code != http.StatusOK || len(page.Tasks) != 1 || page.Tasks[0].ID != want {
 			t.Fatalf("history page: %d %s, want %d", rr.Code, rr.Body.String(), want)
 		}
+		if page.Tasks[0].ProviderIdentity == nil || page.Tasks[0].ProviderIdentity.Name != "North" {
+			t.Fatalf("provider history = %d %s", rr.Code, rr.Body.String())
+		}
 		cursor = page.NextCursor
 	}
 	if cursor != nil {
@@ -1004,6 +1095,13 @@ func TestAPITaskDetailsAndHistoryPreserveExecutions(t *testing.T) {
 
 func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 	f := newAdminTaskFixture(t)
+	providerID := onChainID(t, "2")
+	if err := f.repos.Observability.UpsertProviderObservation(t.Context(), time.Now(), observability.ProviderState{
+		ProviderID: providerID, Status: observability.StatusAvailable,
+		Profile: &observability.ProviderProfile{ProviderID: providerID, Name: "North", RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	row := f.enqueue(t, model.TaskTypeUploadPlan, "task-events", time.Now(), "bucket", "1")
 	for _, details := range []string{`{"attempt":1,"operation_key":"private-effect","checkpoint":{"secret":"private-payload"},"error":"private-round-error"}`, `{"next_attempt":2,"failure_reason":"attempts_exhausted","error":"private-retry-error"}`} {
 		if err := f.repos.Tasks.AppendEvent(t.Context(), row.ID, "retry", json.RawMessage(details)); err != nil {
@@ -1025,7 +1123,7 @@ func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 	if rr.Code != http.StatusOK || len(page.Events) != 1 || page.Events[0].Attempt == nil || *page.Events[0].Attempt != 1 || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), "checkpoint") || strings.Contains(rr.Body.String(), `"error"`) {
 		t.Fatalf("unsafe event page: %d %s", rr.Code, rr.Body.String())
 	}
-	selection := json.RawMessage(`{"provider_selection":{"tier":"approved","has_trusted":false,"requested_count":3,"eligible_count":1,"rejected_total":2,"rejected_omitted":0,"service_url":"private-url","rejections":[{"provider_id":"2","reason":"observation_stale","observation_checked_at":"2026-10-11T09:00:00Z","error":"private-provider-error"},{"provider_id":"4","reason":"private-reason"}]},"checkpoint":{"secret":"private-payload"}}`)
+	selection := json.RawMessage(`{"provider_selection":{"tier":"approved","has_trusted":false,"requested_count":3,"eligible_count":1,"rejected_total":2,"rejected_omitted":0,"service_url":"private-url","rejections":[{"provider_id":"2","reason":"observation_stale","observation_checked_at":"2026-10-11T09:00:00Z","error":"private-provider-error","provider_identity":{"name":"private-saved-name"}},{"provider_id":"4","reason":"private-reason"}]},"checkpoint":{"secret":"private-payload"}}`)
 	if err := f.repos.Tasks.AppendEvent(t.Context(), row.ID, "provider_selection", selection); err != nil {
 		t.Fatal(err)
 	}
@@ -1037,6 +1135,9 @@ func TestAPITaskEventsExposeOnlyDiagnosticFields(t *testing.T) {
 	report := page.Events[0].ProviderSelection
 	if report.RequestedCount != 3 || report.RejectedTotal != 2 || len(report.Rejections) != 2 || report.Rejections[0].Reason != "observation_stale" || report.Rejections[1].Reason != "provider_unavailable" || strings.Contains(rr.Body.String(), "private-") || strings.Contains(rr.Body.String(), "checkpoint") {
 		t.Fatalf("unsafe selection report: %s", rr.Body.String())
+	}
+	if report.Rejections[0].ProviderIdentity == nil || report.Rejections[0].ProviderIdentity.Name != "North" || report.Rejections[0].ProviderIdentity.RegistryProviderID != "2" || report.Rejections[1].ProviderIdentity != nil {
+		t.Fatalf("provider selection identities = %s", rr.Body.String())
 	}
 }
 

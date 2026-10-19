@@ -192,6 +192,7 @@ func (s *Server) writeCommitBatch(w http.ResponseWriter, r *http.Request, status
 				s.commitBatchError(w, err)
 				return
 			}
+			s.attachTaskProviderIdentities(r.Context(), items)
 			response.Task = &items[0]
 		}
 	}

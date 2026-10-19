@@ -484,6 +484,7 @@ export function useTestProviderUploadSpeed() {
   return useMutation({
     mutationFn: api.testProviderUploadSpeed,
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['bucket'] })
       qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
       qc.invalidateQueries({ queryKey: ['uploadSpeedSummary'] })
       qc.invalidateQueries({ queryKey: ['replacement-providers'] })
@@ -509,6 +510,7 @@ export function useStartAllUploadSpeedTests() {
   return useMutation({
     mutationFn: api.startAllUploadSpeedTests,
     onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['bucket'] })
       qc.invalidateQueries({ queryKey: ['uploadSpeedSummary'] })
       qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
       qc.invalidateQueries({ queryKey: ['replacement-providers'] })

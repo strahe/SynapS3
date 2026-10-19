@@ -1,12 +1,18 @@
 import type { TaskStorageConfirmation } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
 
 export function StorageConfirmationDetails({ confirmation }: { confirmation: TaskStorageConfirmation }) {
   const pieceCIDs = confirmation.piece_cids ?? []
 
   return (
     <dl className="flex flex-col gap-2 text-sm">
-      <DetailRow label="Provider" value={confirmation.provider_id} />
+      <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-2">
+        <dt className="text-muted-foreground">Provider</dt>
+        <dd className="min-w-0">
+          <ProviderIdentityCell providerID={confirmation.provider_id} identity={confirmation.provider_identity} />
+        </dd>
+      </div>
       <DetailRow label="Data set" value={confirmation.data_set_id} />
       <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-2">
         <dt className="text-muted-foreground">{confirmation.piece_count === 1 ? 'Piece' : 'Pieces'}</dt>

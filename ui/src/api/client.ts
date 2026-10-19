@@ -321,6 +321,8 @@ export interface StorageDataSetSummary {
   setup_error?: string
   provider_id: string
   provider_identity?: ProviderIdentity
+  upload_speed_test?: ProviderUploadSpeedTest
+  upload_speed_unavailable_reason?: string
   data_set_id?: string
   client_data_set_id?: string
   status: string
@@ -828,6 +830,7 @@ export interface TaskItem {
   presentation_status: 'queued' | 'scheduled' | 'waiting' | 'running' | 'completed' | 'failed' | 'cancelled'
   subject_type?: string
   subject_key?: string
+  provider_identity?: ProviderIdentity
   retry_of_task_id: number | null
   superseded_at?: string
   retry_count: number
@@ -891,6 +894,7 @@ export interface TaskProviderSelection {
   rejected_omitted: number
   rejections: {
     provider_id: string
+    provider_identity?: ProviderIdentity
     reason: string
     observation_checked_at?: string
   }[]
@@ -935,6 +939,7 @@ export interface TaskStorageConfirmation {
   request_id: string
   reason_code: string
   provider_id: string
+  provider_identity?: ProviderIdentity
   data_set_id?: string
   piece_count: number
   piece_cids: string[]

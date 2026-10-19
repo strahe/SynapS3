@@ -5,6 +5,7 @@ export function taskRetryErrorMessage(error: unknown) {
   return error instanceof APIError && error.status === 409 ? error.message : 'Could not retry. Refresh and try again.'
 }
 
+import { providerDisplayName, providerRegistryLabel } from './provider-display.ts'
 import { replicaLabel } from './storage-status-labels.ts'
 import { formatBytes, formatTokenAmount } from './utils.ts'
 
@@ -48,10 +49,11 @@ const subjectLabels: Record<string, string> = {
   storage_commit_request: 'Batch',
 }
 
-export function taskSubjectLabel(task: Pick<TaskItem, 'subject_type' | 'subject_key'>) {
+export function taskSubjectLabel(task: Pick<TaskItem, 'subject_type' | 'subject_key' | 'provider_identity'>) {
   if (task.subject_type === 'system') return 'System'
   if (!task.subject_type || !task.subject_key) return '—'
   if (task.subject_type === 'storage_commit_request') return 'Batch'
+  if (task.subject_type === 'provider') return providerDisplayName(task.subject_key, task.provider_identity?.name)
   return `${subjectLabels[task.subject_type] ?? 'Resource'} #${task.subject_key}`
 }
 
@@ -138,7 +140,10 @@ export interface TaskSubjectField {
 }
 
 function providerLabel(provider?: TaskSubjectProvider) {
-  return provider ? (provider.name ? `${provider.name} (#${provider.id})` : `Provider #${provider.id}`) : 'Unavailable'
+  if (!provider) return 'Unavailable'
+  const name = providerDisplayName(provider.id, provider.name)
+  const registry = providerRegistryLabel(provider.id)
+  return name === registry ? registry : `${name} (${registry})`
 }
 
 export function taskSubjectFields(info: TaskSubjectInfo): TaskSubjectField[] {
@@ -174,7 +179,10 @@ export function taskSubjectFields(info: TaskSubjectInfo): TaskSubjectField[] {
       return [{ label: 'Name', value: info.bucket || 'Unavailable' }]
     case 'provider':
       return [
-        { label: 'Name', value: info.provider?.name || 'Unavailable' },
+        {
+          label: 'Name',
+          value: info.provider ? providerDisplayName(info.provider.id, info.provider.name) : 'Unavailable',
+        },
         { label: 'Provider ID', value: info.provider?.id ?? info.subject_key },
         { label: 'Service address', value: info.provider?.service_url || 'Unavailable' },
       ]

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -18,6 +20,13 @@ import (
 
 func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 	f := newAdminTaskFixture(t)
+	providerID := onChainID(t, "701")
+	if err := f.repos.Observability.UpsertProviderObservation(t.Context(), time.Now(), observability.ProviderState{
+		ProviderID: providerID, Status: observability.StatusAvailable,
+		Profile: &observability.ProviderProfile{ProviderID: providerID, Name: "North", RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/commit-batches", f.server.handleAPIListCommitBatches)
 	mux.HandleFunc("GET /api/v1/commit-batches/{id}", f.server.handleAPIGetCommitBatch)
@@ -144,11 +153,18 @@ func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 	if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("failure_reason = ?", "handler_panic").Set("last_error = ?", "stopped").Where("id = ?", *row.TaskID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	f.repos.Contents = &commitAttentionTaskRepo{StorageContentRepository: f.repos.Contents, records: []storagecommit.AttentionRecord{{
+		RequestID: "b", TaskID: row.TaskID, ProviderID: "701", Code: storagecommit.AttentionSubmissionMismatch,
+		SubmittedAt: created, AttentionAt: created,
+	}}}
 	rr = request(http.MethodGet, "/api/v1/commit-batches/b", nil)
 	var stopped commitBatchResponse
 	decodeJSON(t, rr, &stopped)
 	if stopped.CanSeal || stopped.Task == nil || !stopped.Task.Retryable {
 		t.Fatalf("stopped = %#v", stopped)
+	}
+	if stopped.Task.StorageConfirmation == nil || stopped.Task.StorageConfirmation.ProviderIdentity == nil || stopped.Task.StorageConfirmation.ProviderIdentity.Name != "North" || stopped.Task.ProviderIdentity != nil {
+		t.Fatalf("stopped task provider = %#v", stopped.Task)
 	}
 	if rr := request(http.MethodPost, "/api/v1/commit-batches/b/seal", nil); rr.Code != 409 {
 		t.Fatalf("stopped request = %d: %s", rr.Code, rr.Body.String())

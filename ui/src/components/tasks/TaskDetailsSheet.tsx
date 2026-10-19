@@ -5,6 +5,7 @@ import { api, type TaskItem, type TaskProviderSelection } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { CursorPagination } from '@/components/app/CursorPagination'
 import { DetailHeader } from '@/components/app/DetailPanel'
+import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
 import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { RetryButton } from '@/components/tasks/RetryButton'
@@ -105,7 +106,9 @@ function ProviderSelectionDetails({ selection }: { selection: TaskProviderSelect
             <TableBody>
               {selection.rejections.map((provider) => (
                 <TableRow key={provider.provider_id}>
-                  <TableCell>#{provider.provider_id}</TableCell>
+                  <TableCell>
+                    <ProviderIdentityCell providerID={provider.provider_id} identity={provider.provider_identity} />
+                  </TableCell>
                   <TableCell className="whitespace-normal">{providerSelectionBlockedReason(provider.reason)}</TableCell>
                   <TableCell>
                     {provider.observation_checked_at ? (

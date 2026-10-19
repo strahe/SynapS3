@@ -1,5 +1,15 @@
 import type { QueryClient } from '@tanstack/react-query'
-import type { BucketDetail, ObjectProvenance, ReplacementProviderCandidate } from '@/api/client'
+import type {
+  BucketDetail,
+  CommitBatch,
+  ObjectProvenance,
+  ReplacementProviderCandidate,
+  TaskDetail,
+  TaskEvents,
+  TaskItem,
+  TaskListResponse,
+  TaskSubjectInfo,
+} from '@/api/client'
 
 interface ProviderIdentityEventPayload {
   topic?: string
@@ -23,7 +33,14 @@ export function applyProviderIdentityEventData(queryClient: QueryClient, raw: st
       const family = query.queryKey[0]
       if (family === 'bucket') {
         const bucket = query.state.data as BucketDetail | undefined
-        return bucket?.data_sets?.some((dataSet) => dataSet.provider_id === providerID) ?? false
+        return (
+          (bucket?.data_sets?.some((dataSet) => dataSet.provider_id === providerID) ?? false) ||
+          (bucket?.replacements?.some(
+            (replacement) =>
+              replacement.source.provider_id === providerID || replacement.target.provider_id === providerID
+          ) ??
+            false)
+        )
       }
       if (family === 'objectProvenance') {
         const provenance = query.state.data as ObjectProvenance | undefined
@@ -33,7 +50,40 @@ export function applyProviderIdentityEventData(queryClient: QueryClient, raw: st
         const result = query.state.data as { providers?: ReplacementProviderCandidate[] } | undefined
         return result?.providers?.some((provider) => provider.provider_id === providerID) ?? false
       }
+      if (family === 'tasks') {
+        const result = query.state.data as TaskListResponse | undefined
+        return result?.tasks.some((task) => taskReferencesProvider(task, providerID)) ?? false
+      }
+      if (family === 'task') {
+        const detail = query.state.data as TaskDetail | undefined
+        return taskReferencesProvider(detail?.task, providerID)
+      }
+      if (family === 'taskEvents') {
+        const result = query.state.data as TaskEvents | undefined
+        return (
+          result?.events.some((event) =>
+            event.provider_selection?.rejections.some((provider) => provider.provider_id === providerID)
+          ) ?? false
+        )
+      }
+      if (family === 'taskSubjectInfo') {
+        const info = query.state.data as TaskSubjectInfo | undefined
+        return [info?.provider, info?.source_provider, info?.target_provider].some(
+          (provider) => provider?.id === providerID
+        )
+      }
+      if (family === 'commitBatch') {
+        const batch = query.state.data as CommitBatch | undefined
+        return batch?.provider_id === providerID || taskReferencesProvider(batch?.task, providerID)
+      }
       return false
     },
   })
+}
+
+function taskReferencesProvider(task: TaskItem | undefined, providerID: string) {
+  return (
+    (task?.subject_type === 'provider' && task.subject_key === providerID) ||
+    task?.storage_confirmation?.provider_id === providerID
+  )
 }

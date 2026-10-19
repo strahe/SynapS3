@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/task"
@@ -1278,6 +1279,14 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if _, ok := raw.DataSets[0]["observability"]; ok {
 		t.Fatalf("internal data set field is present: %s", payload)
 	}
+	for _, dataSet := range raw.DataSets {
+		if _, ok := dataSet["upload_speed_test"]; ok {
+			t.Fatalf("unrecorded upload speed has a result: %s", payload)
+		}
+		if _, ok := dataSet["upload_speed_unavailable_reason"]; ok {
+			t.Fatalf("available upload speed lookup has an error: %s", payload)
+		}
+	}
 
 	var body struct {
 		DataSets []struct {
@@ -1316,6 +1325,64 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	}
 	if len(identityResolver.requests) != 0 {
 		t.Fatalf("provider identity requests = %#v, want no Registry fallback", identityResolver.requests)
+	}
+	for _, provider := range []struct{ id, serviceURL string }{{"101", "https://alpha.example"}, {"202", "https://beta.example"}} {
+		id := onChainID(t, provider.id)
+		if err := repos.Observability.UpsertProviderObservation(ctx, checkedAt, observability.ProviderState{
+			ProviderID: id, Status: observability.StatusAvailable,
+			Profile: &observability.ProviderProfile{ProviderID: id, ServiceURL: provider.serviceURL, RegistrySnapshot: json.RawMessage(`{"version":1}`)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedReplacementProviderSpeed(t, srv, "101", "https://alpha.example")
+	seedReplacementProviderSpeed(t, srv, "202", "https://previous-beta.example")
+	loadDataSets := func(t *testing.T) []storageDataSetSummaryResponse {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		newBucketAPIMux(srv).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/buckets/detail-datasets-bucket", nil))
+		var speeds struct {
+			DataSets []storageDataSetSummaryResponse `json:"data_sets"`
+		}
+		decodeJSON(t, rr, &speeds)
+		if rr.Code != http.StatusOK || len(speeds.DataSets) != 2 {
+			t.Fatalf("data set speeds = %d %s", rr.Code, rr.Body.String())
+		}
+		return speeds.DataSets
+	}
+	speeds := loadDataSets(t)
+	current, stale := speeds[0].UploadSpeedTest, speeds[1].UploadSpeedTest
+	if current == nil || current.State != "succeeded" || current.BytesPerSecond == nil || *current.BytesPerSecond != providerbenchmark.SampleBytes {
+		t.Fatalf("current provider speed = %#v", current)
+	}
+	if stale == nil || stale.State != "stale" || stale.BytesPerSecond != nil {
+		t.Fatalf("changed provider URL speed = %#v", stale)
+	}
+	profiles, speedTests := repos.Observability, repos.ProviderUploadSpeed
+	for _, scenario := range []struct {
+		name     string
+		profiles repository.ObservabilityRepository
+		speeds   repository.ProviderUploadSpeedRepository
+	}{
+		{name: "profile lookup failed", profiles: unavailableTaskProviderProfiles{ObservabilityRepository: profiles}, speeds: speedTests},
+		{name: "speed lookup failed", profiles: profiles, speeds: failingUploadSpeedList{ProviderUploadSpeedRepository: speedTests}},
+		{name: "profile repository missing", speeds: speedTests},
+		{name: "speed repository missing", profiles: profiles},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			repos.Observability, repos.ProviderUploadSpeed = scenario.profiles, scenario.speeds
+			t.Cleanup(func() { repos.Observability, repos.ProviderUploadSpeed = profiles, speedTests })
+			for _, dataSet := range loadDataSets(t) {
+				if dataSet.UploadSpeedTest != nil || dataSet.UploadSpeedUnavailableReason != "Could not load upload speed. Refresh to try again." {
+					t.Fatalf("unavailable upload speed = %#v", dataSet)
+				}
+			}
+		})
+	}
+	for i, dataSet := range loadDataSets(t) {
+		if dataSet.UploadSpeedUnavailableReason != "" || dataSet.UploadSpeedTest == nil || dataSet.UploadSpeedTest.State != speeds[i].UploadSpeedTest.State {
+			t.Fatalf("recovered upload speed = %#v", dataSet)
+		}
 	}
 }
 
