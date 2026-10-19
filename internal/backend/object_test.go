@@ -1340,7 +1340,7 @@ func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
 		Metadata:           map[string]string{"custom": "first", "_system": "user value", "cache_control": "user cache rule"},
 		CacheControl:       aws.String("max-age=3600"),
 		ContentDisposition: aws.String(`attachment; filename="first\u0000.txt"`),
-		ContentEncoding:    aws.String("aws-chunked, identity"),
+		ContentEncoding:    aws.String("identity"),
 		ContentLanguage:    aws.String("en"),
 		Expires:            aws.String("Mon, 21 Oct 2030 07:28:00 GMT"),
 	})
@@ -3172,7 +3172,7 @@ func TestCopyObject_MetadataDirectives(t *testing.T) {
 		{"explicit copy", "mr-dst", "copied.txt", types.MetadataDirectiveCopy, "text/plain", "original", wantSourceMetadata, nil},
 		{"replace", "mr-dst", "file.json", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private"}, nil},
 		{"same key replace", "mr-src", "file.txt", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private"}, nil},
-		{"replace encoding", "mr-dst", "encoded.gz", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private", ContentEncoding: "gzip"}, aws.String("gzip, AWS-CHUNKED")},
+		{"replace encoding", "mr-dst", "encoded.gz", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private", ContentEncoding: "gzip"}, aws.String("gzip")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{

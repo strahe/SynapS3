@@ -58,7 +58,7 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Multipart | `ListMultipartUploads` | ✅ | Lists open uploads |
 | Multipart | `ListParts` | ✅ | Lists uploaded parts |
 
-See the system job in [CI runs](https://github.com/strahe/SynapS3/actions/workflows/ci.yml) for individual S3 compatibility reports.
+See [S3 Compatibility runs on main](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml?query=branch%3Amain) for individual operation and client reports.
 
 ## License
 

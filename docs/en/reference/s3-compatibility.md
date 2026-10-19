@@ -14,6 +14,8 @@ SynapS3 mainly supports path-style S3 access for writing bucket and object data 
 - Use credentials created by `synaps3 admin s3-user create`.
 - Keep objects and object keys within the stable limits below.
 
+Bucket ACL grants let other accounts read, write, and list data according to their permissions. Even `FULL_CONTROL` does not authorize `GetObjectAttributes`, deletion with `versionId`, `ListParts`, `AbortMultipartUpload`, or bucket configuration. Use the bucket owner's or an administrator's credentials for these operations. A shared account can create, upload, and complete multipart uploads with write permission, but needs the owner or an administrator to list parts or abort an upload.
+
 ## Stable Limits
 
 - Object size: `127` through `1,065,353,216` bytes.
@@ -43,7 +45,7 @@ SynapS3 mainly supports path-style S3 access for writing bucket and object data 
 | Object | `GetObject` | Supported | Reads from cache or committed remote storage, including single byte ranges, version metadata, and `Last-Modified`. A cold remote range still downloads the complete source for integrity verification. |
 | Object | `HeadObject` | Supported | Reads object metadata, including custom metadata on the requested version. |
 | Object | `DeleteObject` | Supported | Creates a delete marker without `versionId`; with `versionId`, deletes an eligible data version or delete marker. |
-| Object | `DeleteObjects` | Supported | Applies the same version-aware deletion rules to each entry and reports entry-specific failures. |
+| Object | `DeleteObjects` | Supported | Applies the same version-aware deletion rules to each entry and reports entry-specific failures. `Quiet=true` omits successful entries. |
 | Object | `CopyObject` | Supported | Source object must be readable from cache or committed remote storage. |
 | Object | `ListObjects` | Supported | Marker pagination. |
 | Object | `ListObjectsV2` | Supported | Continuation-token pagination. |
@@ -59,6 +61,8 @@ SynapS3 mainly supports path-style S3 access for writing bucket and object data 
 
 ## Versioning Behavior
 
+`DeleteObjects` accepts 1–1000 entries. A key that resolves outside the bucket, such as `../file.txt`, rejects the whole batch before any entry is deleted.
+
 Buckets behave as versioning-enabled. A delete without `versionId` creates a delete marker. A delete with `versionId` either deletes that data version or delete marker, or returns an error; the gateway does not keep the request and run it later. Deleting a delete marker is not blocked by Filecoin storage. A data-version delete returns `400 InvalidRequest`, or an entry-specific `InvalidRequest` from `DeleteObjects`, while storage work is active or a submitted Filecoin transaction is awaiting confirmation. For an otherwise eligible data version, stopped storage work that has not submitted a transaction does not block deletion. After a data version is deleted, unreferenced remote storage is queued for background cleanup; storage shared with another version is preserved. Cleanup asks the storage provider to remove the replica, which not every provider supports: a replica the provider will not or cannot remove may remain with it after the version is gone from the gateway. Until that cleanup finishes, usually within minutes, uploading the same bytes to the bucket returns `503 SlowDown`; a later retry stores them as new data. Version listing returns object versions and delete markers.
 
 ## What Is Intentionally Out of Scope
@@ -66,6 +70,7 @@ Buckets behave as versioning-enabled. A delete without `versionId` creates a del
 - Bucket deletion.
 - Suspending bucket versioning.
 - Object ACL authorization, bucket policies, and bucket or object tagging.
+- Server-side encryption, including customer-provided keys (SSE-C).
 - Ownership modes other than `BucketOwnerPreferred`.
 - `TotalPartsCount` in `GetObjectAttributes.ObjectParts`.
 - Multipart range copy for `UploadPartCopy`.

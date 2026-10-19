@@ -61,6 +61,7 @@ type Harness struct {
 type HarnessOptions struct {
 	CommitMaxWait *time.Duration
 	Storage       synapse.StorageClient
+	ServerTLS     config.TLSConfig
 }
 
 // NewHarness creates and starts an isolated production runtime.
@@ -104,6 +105,9 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	cfg.Server.Port = "127.0.0.1:18080"
 	cfg.Server.MaxConnections = 64
 	cfg.Server.MaxRequests = 32
+	if len(options) > 0 {
+		cfg.Server.TLS = options[0].ServerTLS
+	}
 	cfg.Admin.Addr = "127.0.0.1:0"
 	cfg.Cache.Dir = filepath.Join(tempDir, "cache")
 	cfg.Cache.MaxSizeGB = 1

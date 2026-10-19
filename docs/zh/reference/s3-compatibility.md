@@ -14,6 +14,8 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 - 使用 `synaps3 admin s3-user create` 创建的凭据。
 - 对象和对象键必须符合下面的稳定限制。
 
+存储桶 ACL 按权限允许其他账号读写和列举数据。即使授予 `FULL_CONTROL`，也不能调用 `GetObjectAttributes`、带 `versionId` 的删除、`ListParts`、`AbortMultipartUpload` 或存储桶配置操作；这些操作需要存储桶 owner 或管理员凭据。拥有写权限的共享账号可以创建、上传和完成分段上传，但列举 parts 或中止上传需要 owner 或管理员执行。
+
 ## 稳定限制
 
 - 对象大小：`127` 到 `1,065,353,216` 字节。
@@ -43,7 +45,7 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 | 对象 | `GetObject` | 支持 | 从缓存或已提交的远端存储读取，支持单段字节 Range，并返回指定版本的自定义元数据和 `Last-Modified`。冷缓存远端 Range 仍需完整下载来源以校验内容。 |
 | 对象 | `HeadObject` | 支持 | 读取对象元数据，包括指定版本的自定义元数据。 |
 | 对象 | `DeleteObject` | 支持 | 不带 `versionId` 时创建 delete marker；带 `versionId` 时删除符合条件的数据版本或 delete marker。 |
-| 对象 | `DeleteObjects` | 支持 | 对每个条目应用相同的版本删除规则，并分别返回失败结果。 |
+| 对象 | `DeleteObjects` | 支持 | 对每个条目应用相同的版本删除规则，并分别返回失败结果。`Quiet=true` 不返回成功条目。 |
 | 对象 | `CopyObject` | 支持 | 源对象必须可从缓存或已提交的远端存储读取。 |
 | 对象 | `ListObjects` | 支持 | Marker 分页。 |
 | 对象 | `ListObjectsV2` | 支持 | Continuation-token 分页。 |
@@ -59,6 +61,8 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 
 ## 版本控制行为
 
+`DeleteObjects` 接受 1–1000 个条目。包含 `../file.txt` 这类解析后超出存储桶的对象键时，整个批次会在删除任何条目前被拒绝。
+
 存储桶按 versioning-enabled 处理。不带 `versionId` 的删除会创建 delete marker。带 `versionId` 的请求要么删除对应的数据版本或 delete marker，要么返回错误；系统不会保留请求并在之后自动执行。删除 delete marker 不受 Filecoin 存储进度阻塞。当存储工作仍在进行，或已提交的 Filecoin 交易仍在等待确认时，删除数据版本会收到 `400 InvalidRequest`，`DeleteObjects` 则为对应条目返回 `InvalidRequest`。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。数据版本删除后，不再被任何版本引用的远端存储会进入后台清理；其他版本仍在使用的共享存储会保留。清理会请求存储提供方删除副本，但并非所有存储提供方都支持：提供方不支持或无法删除的副本，在该版本从网关消失后仍可能留在提供方处。清理完成前（通常几分钟内），向该存储桶上传相同内容会收到 `503 SlowDown`；稍后重试即可，届时会作为新数据存储。Version listing 会返回对象版本和 delete markers。
 
 ## 有意不支持
@@ -66,6 +70,7 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 - 删除存储桶。
 - 暂停存储桶 versioning。
 - 对象 ACL 授权、存储桶 Policy，以及存储桶或对象 Tagging。
+- 服务端加密，包括客户提供密钥的加密（SSE-C）。
 - `BucketOwnerPreferred` 之外的 Ownership Controls 模式。
 - `GetObjectAttributes.ObjectParts` 中的 `TotalPartsCount`。
 - `UploadPartCopy` 的 multipart range copy。

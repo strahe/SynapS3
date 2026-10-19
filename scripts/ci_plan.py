@@ -1,4 +1,4 @@
-"""Select CI work from complete Git diffs and validate core job results."""
+"""Select CI work from complete Git diffs and validate scheduled job results."""
 
 import argparse
 import json
@@ -10,16 +10,21 @@ from pathlib import Path
 
 
 FLAGS = (
-    "verify", "go_tests", "race", "system",
+    "verify", "go_tests", "race", "system", "s3_compatibility",
     "docker_image", "docker_deployment", "docs",
 )
-CORE = {"verify", "go_tests", "race", "system"}
-CORE_JOBS = ("verify", "race", "system")
+CORE = {"verify", "go_tests", "race", "system", "s3_compatibility"}
+CORE_JOBS = ("verify", "race", "system", "s3_compatibility")
 WRITER_ORDER = ("verify", "system", "race")
 S3_DOCS = {
     "README.md",
     "docs/en/reference/s3-compatibility.md",
     "docs/zh/reference/s3-compatibility.md",
+}
+S3_TESTS = {
+    "tests/system/s3_matrix_test.go",
+    "tests/system/s3_clients_test.go",
+    "tests/system/s3_upgrade_test.go",
 }
 SHARED_GO_HELPERS = (
     "internal/systemtest/", "internal/testutil/", "internal/testpg/",
@@ -40,7 +45,7 @@ def selected_flags(path):
     ):
         return set(FLAGS)
     if path in S3_DOCS:
-        return {"system", "docs"}
+        return {"s3_compatibility", "docs"}
     if path.startswith("docs/"):
         return {"docs"}
     if path.startswith("ui/") and path.endswith(".go"):
@@ -55,11 +60,10 @@ def selected_flags(path):
         or path in {"go.mod", "go.sum"}
     ):
         return CORE | {"docker_image"}
-    if (
-        path.startswith(("tests/system/", "tests/testutil/"))
-        or path in {"scripts/s3_compatibility_report.py", "scripts/test_s3_compatibility_report.py"}
-    ):
-        return {"system"}
+    if path in S3_TESTS or path in {"scripts/s3_compatibility_report.py", "scripts/test_s3_compatibility_report.py"}:
+        return {"s3_compatibility"}
+    if path.startswith(("tests/system/", "tests/testutil/")):
+        return {"system", "s3_compatibility"}
     if path.startswith(("ui/e2e/", "ui/test/")) or path == "ui/playwright.config.ts":
         return set()
     if path.startswith("ui/"):
@@ -175,7 +179,7 @@ def validate_plan(plan):
         raise ValueError("modules_writer does not match the scheduled jobs")
 
 
-def check_core_results(plan, results):
+def check_job_results(plan, results, event_name="pull_request"):
     try:
         validate_plan(plan)
     except ValueError as error:
@@ -191,7 +195,8 @@ def check_core_results(plan, results):
     if result("changes") != "success":
         errors.append("changes must succeed before job results can be accepted")
     for job in CORE_JOBS:
-        expected = "success" if plan[job] else "skipped"
+        selected = plan[job] and (job != "s3_compatibility" or event_name == "pull_request")
+        expected = "success" if selected else "skipped"
         actual = result(job)
         if actual != expected:
             errors.append(f"{job}: expected {expected}, got {actual}")
@@ -213,33 +218,43 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     select = commands.add_parser("plan")
+    select.add_argument("--input-plan", default="")
     select.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME", ""))
     select.add_argument("--event-path", default=os.environ.get("GITHUB_EVENT_PATH", ""))
     select.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""))
     select.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
     select.add_argument("--output", default=os.environ.get("GITHUB_OUTPUT", ""))
     check = commands.add_parser("check")
+    check.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME") or "pull_request")
     check.add_argument("--plan", required=True)
     check.add_argument("--results", required=True)
     args = parser.parse_args()
     if args.command == "check":
         try:
-            errors = check_core_results(json.loads(args.plan), json.loads(args.results))
+            errors = check_job_results(json.loads(args.plan), json.loads(args.results), args.event_name)
         except (ValueError, TypeError) as error:
             errors = [f"Invalid CI check input: {error}"]
         if errors:
             print("\n".join(errors), file=sys.stderr)
             return 1
-        print("Core job results match the CI plan")
+        print("Job results match the CI plan")
         return 0
-    try:
-        event = json.loads(Path(args.event_path).read_text(encoding="utf-8"))
-        if not isinstance(event, dict):
-            raise ValueError("event must be an object")
-        plan = event_plan(args.event_name, event, args.ref, args.sha)
-    except (OSError, ValueError):
-        print("CI plan: event data is unavailable; running all checks", file=sys.stderr)
-        plan = full_plan()
+    if args.input_plan:
+        try:
+            plan = json.loads(args.input_plan)
+            validate_plan(plan)
+        except (ValueError, TypeError) as error:
+            print(f"Invalid input CI plan: {error}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            event = json.loads(Path(args.event_path).read_text(encoding="utf-8"))
+            if not isinstance(event, dict):
+                raise ValueError("event must be an object")
+            plan = event_plan(args.event_name, event, args.ref, args.sha)
+        except (OSError, ValueError):
+            print("CI plan: event data is unavailable; running all checks", file=sys.stderr)
+            plan = full_plan()
     print(write_outputs(plan, args.output))
     return 0
 

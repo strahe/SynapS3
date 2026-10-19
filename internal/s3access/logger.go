@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3log"
@@ -28,7 +28,7 @@ func NewLogger(logger *slog.Logger, level string) *Logger {
 	return &Logger{logger: logger, level: parseLevel(level)}
 }
 
-func (l *Logger) Log(ctx *fiber.Ctx, err error, _ []byte, meta s3log.LogMeta) {
+func (l *Logger) Log(ctx fiber.Ctx, err error, _ []byte, meta s3log.LogMeta) {
 	if ctx == nil {
 		return
 	}
@@ -41,13 +41,13 @@ func (l *Logger) Log(ctx *fiber.Ctx, err error, _ []byte, meta s3log.LogMeta) {
 		"duration_ms", durationMillis(ctx),
 	}
 	if err != nil {
-		attrs = append(attrs, "error", err.Error())
-		var s3Err s3err.S3Error
-		if errors.As(err, &s3Err) {
+		if s3Err, ok := errors.AsType[s3err.S3Error](err); ok {
 			attrs = append(attrs, "error_code", s3Err.BaseError().Code)
+		} else {
+			attrs = append(attrs, "error", err.Error())
 		}
 	}
-	// UserContext lazily mutates request values still used by streamed reads.
+	// Context lazily mutates request values still used by streamed reads.
 	l.logger.Log(context.Background(), l.level, "s3 request completed", attrs...)
 }
 
@@ -72,7 +72,7 @@ func parseLevel(level string) slog.Level {
 	}
 }
 
-func statusCode(ctx *fiber.Ctx, err error, meta s3log.LogMeta) int {
+func statusCode(ctx fiber.Ctx, err error, meta s3log.LogMeta) int {
 	var s3Err s3err.S3Error
 	if err != nil && errors.As(err, &s3Err) {
 		return s3Err.StatusCode()
@@ -89,7 +89,7 @@ func statusCode(ctx *fiber.Ctx, err error, meta s3log.LogMeta) int {
 	return http.StatusOK
 }
 
-func durationMillis(ctx *fiber.Ctx) int64 {
+func durationMillis(ctx fiber.Ctx) int64 {
 	start, ok := utils.ContextKeyStartTime.Get(ctx).(time.Time)
 	if !ok || start.IsZero() {
 		return 0

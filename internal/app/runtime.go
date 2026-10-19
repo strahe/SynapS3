@@ -34,9 +34,9 @@ import (
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
+	"github.com/versity/versitygw/iamapi"
 	"github.com/versity/versitygw/s3api"
 	"github.com/versity/versitygw/s3api/middlewares"
-	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3log"
 	"golang.org/x/sync/errgroup"
 )
@@ -636,7 +636,7 @@ func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {
 		s3api.WithQuiet(),
 	}
 	if cfg.TLS.Enabled {
-		certificates := utils.NewCertStorage()
+		certificates := iamapi.NewCertStorage()
 		if err := certificates.SetCertificate(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
 			return nil, fmt.Errorf("loading S3 TLS certificate: %w", err)
 		}

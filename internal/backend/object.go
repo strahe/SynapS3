@@ -42,6 +42,9 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		return s3response.PutObjectOutput{}, err
 	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 
 	bucket, err := b.requireWritableBucket(ctx, bucketName)
 	if err != nil {
@@ -115,7 +118,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 				SystemMetadata: model.ObjectSystemMetadata{
 					CacheControl:       derefStr(input.CacheControl),
 					ContentDisposition: derefStr(input.ContentDisposition),
-					ContentEncoding:    storedContentEncoding(input.ContentEncoding),
+					ContentEncoding:    derefStr(input.ContentEncoding),
 					ContentLanguage:    derefStr(input.ContentLanguage),
 					Expires:            derefStr(input.Expires),
 				},
@@ -171,6 +174,9 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 			requiredArg("Bucket", input.Bucket == nil),
 			requiredArg("Key", input.Key == nil),
 		)
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	var out *objectreader.Result
@@ -261,6 +267,9 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 			requiredArg("Key", input.Key == nil),
 		)
 	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
 	if err != nil {
@@ -299,6 +308,9 @@ func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetO
 			requiredArg("Bucket", input.Bucket == nil),
 			requiredArg("Key", input.Key == nil),
 		)
+	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5) {
+		return s3response.GetObjectAttributesResponse{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -431,7 +443,7 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 		VersionIdMarker: input.VersionIdMarker,
 		MaxKeys:         &maxKeys,
 		IsTruncated:     &isTruncated,
-		DeleteMarkers:   []types.DeleteMarkerEntry{},
+		DeleteMarkers:   []s3response.DeleteMarkerEntry{},
 	}
 	if maxKeys == 0 {
 		return result, nil
@@ -454,7 +466,7 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 		lastModified := row.CreatedAt
 		isLatest := row.IsCurrent
 		if row.IsDeleteMarker {
-			result.DeleteMarkers = append(result.DeleteMarkers, types.DeleteMarkerEntry{
+			result.DeleteMarkers = append(result.DeleteMarkers, s3response.DeleteMarkerEntry{
 				Key:          &key,
 				VersionId:    &versionID,
 				IsLatest:     &isLatest,
@@ -522,7 +534,6 @@ func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObje
 		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrMalformedXML)
 	}
 
-	// TODO: Support Quiet after upstream issue is resolved: https://github.com/versity/versitygw/issues/2124
 	result := s3response.DeleteResult{}
 	for _, obj := range input.Delete.Objects {
 		if obj.Key == nil || *obj.Key == "" {
@@ -695,6 +706,10 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 	if err := validateObjectKey(dstKey); err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
+	if versitybackend.HasSSEC(input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5,
+		input.CopySourceSSECustomerAlgorithm, input.CopySourceSSECustomerKey, input.CopySourceSSECustomerKeyMD5) {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 
 	// Validate source and destination buckets
 	srcBucket, err := b.getBucket(ctx, srcBucketName)
@@ -725,7 +740,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		SystemMetadata: model.ObjectSystemMetadata{
 			CacheControl:       derefStr(input.CacheControl),
 			ContentDisposition: derefStr(input.ContentDisposition),
-			ContentEncoding:    storedContentEncoding(input.ContentEncoding),
+			ContentEncoding:    derefStr(input.ContentEncoding),
 			ContentLanguage:    derefStr(input.ContentLanguage),
 			Expires:            derefStr(input.Expires),
 		},
@@ -1102,10 +1117,7 @@ func (b *SynapseBackend) requireWritableBucket(ctx context.Context, name string)
 	return bucket, nil
 }
 
-// contentWriteError reports write failures the client can act on as S3
-// errors. A retry succeeds once the earlier copy of the same bytes has been
-// removed, or once the cache has room again; a body longer than its declared
-// length is the client's to fix. Other errors are returned unchanged.
+// S3 errors must reach the gateway directly to retain their status and XML fields.
 func contentWriteError(err error) error {
 	switch {
 	case errors.Is(err, repository.ErrContentCleanupInProgress):
@@ -1118,9 +1130,11 @@ func contentWriteError(err error) error {
 		return apiErr
 	case errors.Is(err, cache.ErrSizeExceeded):
 		return s3err.GetAPIError(s3err.ErrContentLengthMismatch)
-	default:
-		return err
 	}
+	if s3Err, ok := errors.AsType[s3err.S3Error](err); ok {
+		return s3Err
+	}
+	return err
 }
 
 // declaredWriteSize is the capacity a write reserves in the cache: its
@@ -1145,19 +1159,6 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-func storedContentEncoding(value *string) string {
-	encodings := strings.Split(derefStr(value), ",")
-	stored := encodings[:0]
-	for _, encoding := range encodings {
-		encoding = strings.TrimSpace(encoding)
-		// The gateway removes aws-chunked framing before passing the body to the backend.
-		if encoding != "" && !strings.EqualFold(encoding, "aws-chunked") {
-			stored = append(stored, encoding)
-		}
-	}
-	return strings.Join(stored, ",")
 }
 
 func stringOrNil(value string) *string {

@@ -8,7 +8,7 @@ linters:
     exhaustive:
       # Only switches marked //exhaustive:enforce must name every constant, so
       # a new value fails lint where it has to be classified.
-      explicit-exhaustive-switch: true
+      explicit-exhaustive: true
   exclusions:
     paths:
       - ^versitygw/

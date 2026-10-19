@@ -34,6 +34,7 @@ class GoCacheKeyTest(unittest.TestCase):
             ".github/actions/setup-go/action.yml": "name: Setup\n",
             ".github/actions/save-go-cache/action.yml": "name: Save\n",
             ".github/workflows/ci.yml": "name: CI\n",
+            ".github/workflows/s3-compatibility.yml": "name: S3 Compatibility\n",
             "scripts/go_cache_key.py": "# cache identity\n",
             "README.md": "Project documentation\n",
         }
@@ -76,6 +77,7 @@ class GoCacheKeyTest(unittest.TestCase):
             "internal/server/testdata/example.bin", "tests/systemtest/fixture.json",
             "ui/embed.go", "Makefile", ".github/actions/setup-go/action.yml",
             ".github/actions/save-go-cache/action.yml", ".github/workflows/ci.yml",
+            ".github/workflows/s3-compatibility.yml",
             "scripts/go_cache_key.py",
         ):
             with self.subTest(path=relative):
