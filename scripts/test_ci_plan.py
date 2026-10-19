@@ -228,17 +228,6 @@ class ResultGateTest(unittest.TestCase):
         self.assertTrue(ci_plan.check_job_results(self.plan, results, event_name="pull_request"))
         self.assertTrue(ci_plan.check_job_results(self.plan, self.results, event_name="push"))
 
-    def test_s3_scope_checks_selection_on_every_event(self):
-        for event_name in ("pull_request", "push", "workflow_dispatch"):
-            for selected in (True, False):
-                plan = ci_plan.plan_for_paths(["README.md"] if selected else ["docs/index.md"])
-                results = {"changes": "success", "s3_compatibility": "success" if selected else "skipped"}
-                with self.subTest(event=event_name, selected=selected):
-                    self.assertEqual(ci_plan.check_job_results(plan, results, "s3", event_name), [])
-                    for result in ("failure", "cancelled", None, "skipped" if selected else "success"):
-                        results["s3_compatibility"] = result
-                        self.assertTrue(ci_plan.check_job_results(plan, results, "s3", event_name))
-
     def test_unplanned_execution_and_unsuccessful_selector_fail(self):
         self.results["verify"] = {"result": "success"}
         self.assertTrue(ci_plan.check_job_results(self.plan, self.results))
@@ -246,8 +235,7 @@ class ResultGateTest(unittest.TestCase):
         for result in ("failure", "cancelled", "skipped", None):
             with self.subTest(result=result):
                 self.results["changes"] = {"result": result}
-                for scope in ("ci", "s3"):
-                    self.assertTrue(ci_plan.check_job_results(self.plan, self.results, scope))
+                self.assertTrue(ci_plan.check_job_results(self.plan, self.results))
 
     def test_incomplete_or_nonboolean_plans_fail(self):
         for malformed in ({}, {**self.plan, "verify": "false"}, {**self.plan, "modules_writer": "verify"}):
@@ -326,15 +314,14 @@ class ResultGateTest(unittest.TestCase):
                     self.assertEqual(process.stdout, "")
                     self.assertFalse(output.exists())
 
-    def test_check_command_uses_scope_and_event_environment(self):
+    def test_check_command_uses_event_environment(self):
         script = Path(ci_plan.__file__).resolve()
         results = {**self.results, "s3_compatibility": {"result": "skipped"}}
         command = [sys.executable, str(script), "check", "--plan", json.dumps(self.plan),
                    "--results", json.dumps(results)]
-        for event_name, scope, expected in (("push", "ci", 0), ("pull_request", "ci", 1),
-                                             ("push", "s3", 1)):
-            with self.subTest(event=event_name, scope=scope):
-                process = subprocess.run(command + ["--scope", scope],
+        for event_name, expected in (("push", 0), ("pull_request", 1)):
+            with self.subTest(event=event_name):
+                process = subprocess.run(command,
                                          env=dict(os.environ, GITHUB_EVENT_NAME=event_name),
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 self.assertEqual(process.returncode, expected, process.stderr)

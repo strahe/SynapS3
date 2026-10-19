@@ -179,15 +179,13 @@ def validate_plan(plan):
         raise ValueError("modules_writer does not match the scheduled jobs")
 
 
-def check_job_results(plan, results, scope="ci", event_name="pull_request"):
+def check_job_results(plan, results, event_name="pull_request"):
     try:
         validate_plan(plan)
     except ValueError as error:
         return [f"Invalid CI plan: {error}"]
     if not isinstance(results, dict):
         return ["Job results must be a JSON object"]
-    if scope not in ("ci", "s3"):
-        return [f"Unknown job results scope: {scope}"]
 
     def result(job):
         value = results.get(job)
@@ -196,9 +194,8 @@ def check_job_results(plan, results, scope="ci", event_name="pull_request"):
     errors = []
     if result("changes") != "success":
         errors.append("changes must succeed before job results can be accepted")
-    jobs = CORE_JOBS if scope == "ci" else ("s3_compatibility",)
-    for job in jobs:
-        selected = plan[job] and (job != "s3_compatibility" or scope == "s3" or event_name == "pull_request")
+    for job in CORE_JOBS:
+        selected = plan[job] and (job != "s3_compatibility" or event_name == "pull_request")
         expected = "success" if selected else "skipped"
         actual = result(job)
         if actual != expected:
@@ -228,20 +225,19 @@ def main():
     select.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
     select.add_argument("--output", default=os.environ.get("GITHUB_OUTPUT", ""))
     check = commands.add_parser("check")
-    check.add_argument("--scope", choices=("ci", "s3"), default="ci")
     check.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME") or "pull_request")
     check.add_argument("--plan", required=True)
     check.add_argument("--results", required=True)
     args = parser.parse_args()
     if args.command == "check":
         try:
-            errors = check_job_results(json.loads(args.plan), json.loads(args.results), args.scope, args.event_name)
+            errors = check_job_results(json.loads(args.plan), json.loads(args.results), args.event_name)
         except (ValueError, TypeError) as error:
             errors = [f"Invalid CI check input: {error}"]
         if errors:
             print("\n".join(errors), file=sys.stderr)
             return 1
-        print(f"Job results match the {args.scope} plan")
+        print("Job results match the CI plan")
         return 0
     if args.input_plan:
         try:

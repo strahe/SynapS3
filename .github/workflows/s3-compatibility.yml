@@ -20,29 +20,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  changes:
-    name: Select S3 compatibility checks
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 5
-    outputs:
-      s3_compatibility: ${{ steps.plan.outputs.s3_compatibility }}
-      plan: ${{ steps.plan.outputs.plan }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
-
-      - name: Select checks
-        id: plan
-        uses: ./.github/actions/ci-plan
-        with:
-          plan: ${{ inputs.plan }}
-
   s3_compatibility:
     name: S3 operations and clients
-    needs: changes
-    if: needs.changes.outputs.s3_compatibility == 'true'
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 25
     services:
@@ -66,13 +45,23 @@ jobs:
       - name: Checkout
         id: checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Select checks
+        id: plan
+        uses: ./.github/actions/ci-plan
+        with:
+          plan: ${{ inputs.plan }}
 
       - name: Set up Go
         id: go
+        if: steps.plan.outputs.s3_compatibility == 'true'
         uses: ./.github/actions/setup-go
 
       - name: Restore Go modules
         id: modules_cache
+        if: steps.go.outcome == 'success'
         uses: actions/cache/restore@v5
         timeout-minutes: 1
         continue-on-error: true
@@ -84,6 +73,7 @@ jobs:
 
       - name: Restore compiled Go packages
         id: build_cache
+        if: steps.go.outcome == 'success'
         uses: actions/cache/restore@v5
         timeout-minutes: 1
         continue-on-error: true
@@ -96,13 +86,13 @@ jobs:
 
       - name: Complete Go module cache
         id: modules
-        if: steps.modules_cache.outputs.cache-hit != 'true'
+        if: steps.go.outcome == 'success' && steps.modules_cache.outputs.cache-hit != 'true'
         timeout-minutes: 2
         continue-on-error: true
         run: go mod download
 
       - name: Validate report rules
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.plan.outputs.s3_compatibility == 'true' }}
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python3 -m unittest discover -s scripts -p 'test_s3_compatibility_report.py'
@@ -165,7 +155,7 @@ jobs:
           module-writer: 'true'
 
       - name: Publish compatibility summary
-        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        if: ${{ always() && steps.checkout.outcome == 'success' && steps.plan.outputs.s3_compatibility == 'true' }}
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -175,21 +165,3 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY" \
             --source-sha "$SOURCE_SHA" \
             --checkout-sha "$(git rev-parse HEAD)"
-
-  s3-check:
-    name: S3 compatibility result
-    needs: [changes, s3_compatibility]
-    if: ${{ always() }}
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Require selected S3 checks to pass
-        env:
-          CI_PLAN: ${{ needs.changes.outputs.plan }}
-          CI_RESULTS: ${{ toJSON(needs) }}
-          PYTHONDONTWRITEBYTECODE: '1'
-        run: |
-          python3 scripts/ci_plan.py check --scope s3 --plan "$CI_PLAN" --results "$CI_RESULTS"
