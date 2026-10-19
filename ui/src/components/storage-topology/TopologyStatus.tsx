@@ -5,6 +5,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import {
   providerUploadSampleSize,
   providerUploadSpeedLabel,
+  providerUploadSpeedLastSuccessLabel,
   providerUploadSpeedShortLabel,
 } from '@/lib/provider-upload-speed'
 import { storageConfirmationTasksSearch } from '@/lib/storage-confirmation-attention'
@@ -54,6 +55,9 @@ function uploadSpeedDetails(test?: ProviderUploadSpeedTest) {
   const fullLabel = providerUploadSpeedLabel(test)
   if (fullLabel !== providerUploadSpeedShortLabel(test)) details.push(fullLabel)
   if (test.tested_at) details.push(`Tested ${timeAgo(test.tested_at)} with ${providerUploadSampleSize(test)}`)
+  const lastSuccess = providerUploadSpeedLastSuccessLabel(test)
+  if (lastSuccess && test.last_success)
+    details.push(`${lastSuccess} · ${timeAgo(test.last_success.tested_at)} (reference)`)
   return details
 }
 

@@ -23,6 +23,14 @@ type Measurement struct {
 	Duration time.Duration
 }
 
+// SuccessfulMeasurement is a historical reference, independent of current admission.
+type SuccessfulMeasurement struct {
+	SampleBytes    int64     `json:"sample_bytes"`
+	DurationMS     int64     `json:"duration_ms"`
+	BytesPerSecond int64     `json:"bytes_per_second"`
+	TestedAt       time.Time `json:"tested_at"`
+}
+
 // UploadProbe measures one upload sample against a provider service URL.
 type UploadProbe interface {
 	Probe(context.Context, string) (Measurement, error)

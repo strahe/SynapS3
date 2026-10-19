@@ -43,7 +43,7 @@ func TestCopyRetryDecision(t *testing.T) {
 		{"deleted", func(f *CopyRetryFacts) { f.ObjectDeleted = true }, CopyRetryObjectDeleted},
 		{"replacement", func(f *CopyRetryFacts) { f.ReplacementInProgress = true }, CopyRetryReplacementInProgress},
 		{"draining", func(f *CopyRetryFacts) { f.Current = false }, CopyRetryStorageServiceUnavailable},
-		{"not ready", func(f *CopyRetryFacts) { f.DataSetStatus = model.StorageDataSetStatusFailed }, CopyRetryStorageServiceUnavailable},
+		{"not ready", func(f *CopyRetryFacts) { f.DataSetStatus = model.StorageDataSetStatusCreating }, CopyRetryStorageServiceUnavailable},
 		{"unresolved", func(f *CopyRetryFacts) { f.UnresolvedPull = true }, CopyRetryRecoveryRequiresAttention},
 		{"owned", func(f *CopyRetryFacts) { f.Owned = true }, ""},
 		{"sealed", func(f *CopyRetryFacts) { f.Sealed = true }, ""},

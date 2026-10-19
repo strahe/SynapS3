@@ -226,7 +226,7 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			}
 			return h.failReplacement(row.ID, err, "replacement_target_missing")
 		}
-		if target.Status == model.StorageDataSetStatusRetired || target.Status == model.StorageDataSetStatusFailed {
+		if target.Status == model.StorageDataSetStatusRetired {
 			return h.failReplacement(row.ID, errors.New("replacement target storage setup stopped; choose another provider"), "replacement_target_failed")
 		}
 		if !source.IsCurrent && !target.IsCurrent {
@@ -298,9 +298,6 @@ func (h *Handler) replacementCoordinateHandler() *taskengine.FuncHandler {
 			}
 		}
 		if target.Status != model.StorageDataSetStatusReady || target.DataSetID == nil || target.DataSetID.IsZero() {
-			if target.Status == model.StorageDataSetStatusFailed {
-				return h.failReplacement(row.ID, errors.New("replacement target data set failed"), "replacement_target_failed")
-			}
 			if target.EnsureTaskID == nil {
 				return taskengine.Wait(model.TaskResumeModeRecover, "target", "Preparing replacement data set", func(ctx context.Context, repos *repository.Repositories) error {
 					if err := h.enqueueDataSetEnsure(ctx, repos, target); err != nil {

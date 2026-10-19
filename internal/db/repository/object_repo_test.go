@@ -47,7 +47,7 @@ func withContent(t *testing.T, repos *repository.Repositories, version *model.Ob
 	return version
 }
 
-func TestObjectRepo_AggregateByStateIncludesTotalSize(t *testing.T) {
+func TestObjectRepo_OverviewSnapshotIncludesStateTotals(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -64,27 +64,40 @@ func TestObjectRepo_AggregateByStateIncludesTotalSize(t *testing.T) {
 		t.Fatalf("seed failed version: %v", err)
 	}
 	seedFailedContentCopy(t, db, repos, bucket.ID, *failed.ContentID)
+	shared := newObjectVersion(bucket.ID, "shared.txt", "01J00000000000000000000B04", 20)
+	shared.ContentID = failed.ContentID
+	if _, err := createVersion(t, repos, shared); err != nil {
+		t.Fatal(err)
+	}
+	revision := newObjectVersion(bucket.ID, "failed.txt", "01J00000000000000000000B05", 20)
+	revision.ContentID = failed.ContentID
+	if _, err := createVersion(t, repos, revision); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "deleted.txt", "01J00000000000000000000B03"); err != nil {
 		t.Fatalf("seed delete marker: %v", err)
 	}
 
-	rows, err := repos.Objects.AggregateByState(ctx)
+	snapshot, err := repos.Objects.OverviewSnapshot(ctx)
 	if err != nil {
-		t.Fatalf("AggregateByState: %v", err)
+		t.Fatalf("OverviewSnapshot: %v", err)
 	}
-	byState := make(map[string]repository.ObjectStateAggregate, len(rows))
-	for _, row := range rows {
+	byState := make(map[string]repository.ObjectStateAggregate, len(snapshot.States))
+	for _, row := range snapshot.States {
 		byState[row.State] = row
 	}
 	if got := byState[string(model.ObjectStateCached)]; got.Count != 1 || got.TotalSize != 10 {
 		t.Fatalf("cached aggregate = count:%d size:%d, want 1/10", got.Count, got.TotalSize)
 	}
-	if got := byState[string(model.ObjectStateFailed)]; got.Count != 1 || got.TotalSize != 20 {
-		t.Fatalf("failed aggregate = count:%d size:%d, want 1/20", got.Count, got.TotalSize)
+	if got := byState[string(model.ObjectStateFailed)]; got.Count != 2 || got.TotalSize != 40 {
+		t.Fatalf("failed aggregate = count:%d size:%d, want 2/40", got.Count, got.TotalSize)
+	}
+	if snapshot.Attention.NeedsAttention != 2 || snapshot.Attention.Unavailable != 0 {
+		t.Fatalf("overview attention = %#v, want 2/0", snapshot.Attention)
 	}
 }
 
-func TestObjectRepo_CountOverviewAttention(t *testing.T) {
+func TestObjectRepo_OverviewSnapshotAttention(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -127,10 +140,11 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 		t.Fatalf("seed deleted marker: %v", err)
 	}
 
-	counts, err := repos.Objects.CountOverviewAttention(ctx)
+	snapshot, err := repos.Objects.OverviewSnapshot(ctx)
 	if err != nil {
-		t.Fatalf("CountOverviewAttention: %v", err)
+		t.Fatalf("OverviewSnapshot: %v", err)
 	}
+	counts := snapshot.Attention
 	if counts.NeedsAttention != 1 {
 		t.Fatalf("NeedsAttention = %d, want 1", counts.NeedsAttention)
 	}

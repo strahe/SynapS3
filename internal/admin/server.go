@@ -281,7 +281,6 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return errors.New("admin listener is required")
 	}
 	if !s.setupOnly {
-		go s.refreshMetricsLoop(ctx)
 		if runner, ok := s.providerIdentity.(providerIdentityRunner); ok {
 			go runner.Run(ctx)
 		}
@@ -561,7 +560,8 @@ func (s *Server) handleAPITaskAcknowledge(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"status": "acknowledged"})
 }
 
-func (s *Server) refreshMetricsLoop(ctx context.Context) {
+// RunDatabaseMetrics samples read-only database statistics until cancellation.
+func (s *Server) RunDatabaseMetrics(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -579,44 +579,42 @@ func (s *Server) refreshMetricsLoop(ctx context.Context) {
 }
 
 func (s *Server) refreshMetrics(ctx context.Context) {
-	taskCounts, err := s.repos.Tasks.CountByScope(ctx, repository.TaskScopeWork)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	sample, err := s.repos.DatabaseMetrics(ctx)
 	if err != nil {
-		s.logger.Warn("failed to refresh task queue metrics", "error", err)
-	} else {
-		currentTaskLabels := make(map[[2]string]struct{}, len(taskCounts))
-		for _, tc := range taskCounts {
-			if !isActiveTaskStatus(tc.Status) {
-				continue
-			}
-			key := [2]string{tc.Type, tc.Status}
-			currentTaskLabels[key] = struct{}{}
-			TaskQueueDepth.WithLabelValues(tc.Type, tc.Status).Set(float64(tc.Count))
-		}
-		// Zero out labels that disappeared since the last refresh.
-		for key := range s.prevTaskLabels {
-			if _, ok := currentTaskLabels[key]; !ok {
-				TaskQueueDepth.WithLabelValues(key[0], key[1]).Set(0)
-			}
-		}
-		s.prevTaskLabels = currentTaskLabels
+		DatabaseMetricsCollectionSuccess.Set(0)
+		s.logger.Warn("failed to collect database metrics", "error", err)
+		return
 	}
-
-	objCounts, err := s.repos.Objects.CountByState(ctx)
-	if err != nil {
-		s.logger.Warn("failed to refresh object state metrics", "error", err)
-	} else {
-		currentObjLabels := make(map[string]struct{}, len(objCounts))
-		for _, oc := range objCounts {
-			currentObjLabels[oc.State] = struct{}{}
-			ObjectStateDistribution.WithLabelValues(oc.State).Set(float64(oc.Count))
+	currentTaskLabels := make(map[[2]string]struct{}, len(sample.Tasks))
+	for _, tc := range sample.Tasks {
+		if !isActiveTaskStatus(tc.Status) {
+			continue
 		}
-		for key := range s.prevObjectLabels {
-			if _, ok := currentObjLabels[key]; !ok {
-				ObjectStateDistribution.WithLabelValues(key).Set(0)
-			}
-		}
-		s.prevObjectLabels = currentObjLabels
+		key := [2]string{tc.Type, tc.Status}
+		currentTaskLabels[key] = struct{}{}
+		TaskQueueDepth.WithLabelValues(tc.Type, tc.Status).Set(float64(tc.Count))
 	}
+	for key := range s.prevTaskLabels {
+		if _, ok := currentTaskLabels[key]; !ok {
+			TaskQueueDepth.WithLabelValues(key[0], key[1]).Set(0)
+		}
+	}
+	s.prevTaskLabels = currentTaskLabels
+	currentObjectLabels := make(map[string]struct{}, len(sample.Objects))
+	for _, oc := range sample.Objects {
+		currentObjectLabels[oc.State] = struct{}{}
+		ObjectStateDistribution.WithLabelValues(oc.State).Set(float64(oc.Count))
+	}
+	for key := range s.prevObjectLabels {
+		if _, ok := currentObjectLabels[key]; !ok {
+			ObjectStateDistribution.WithLabelValues(key).Set(0)
+		}
+	}
+	s.prevObjectLabels = currentObjectLabels
+	DatabaseMetricsLastSuccess.SetToCurrentTime()
+	DatabaseMetricsCollectionSuccess.Set(1)
 }
 
 func isActiveTaskStatus(status string) bool {

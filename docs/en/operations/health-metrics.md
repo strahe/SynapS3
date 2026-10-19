@@ -76,6 +76,8 @@ scrape_configs:
 
 This target is for Prometheus running on the SynapS3 host. A containerized Prometheus cannot use the host loopback address: place both services on an explicitly configured private network, bind the Admin endpoint only to the required private interface, keep Admin authentication enabled, and do not publish the Admin port publicly.
 
+Database-backed metrics are sampled every 30 seconds; failed collections retain the last successful values. Check collection status and the last successful sample time before treating those values as current.
+
 Key metrics:
 
 | Metric | Meaning |
@@ -87,6 +89,8 @@ Key metrics:
 | `synaps3_cache_lru_eviction_paused` | `1` when LRU eviction is paused because recent cache access could not be retained safely. Resolve the persistence error and restart SynapS3. |
 | `synaps3_task_queue_depth` | Active tasks by type and status. |
 | `synaps3_object_state_distribution` | Object counts by lifecycle state. |
+| `synaps3_database_metrics_collection_success` | `1` if the latest database collection succeeded; `0` otherwise. |
+| `synaps3_database_metrics_last_success_timestamp_seconds` | Last successful database collection time, in Unix seconds. |
 
 ## Operator Signals
 

@@ -73,7 +73,8 @@ type StorageClient interface {
 	OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (DataSetTarget, error)
 	FindMatchingDataSet(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
 	OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error)
-	// DeletionState reads the exact piece ID and its removal queue at one chain block.
+	// DeletionState reads exact piece or data-set cleanup evidence at one block.
+	// Removed data sets require the caller's recorded creation identity.
 	DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error)
 }
 

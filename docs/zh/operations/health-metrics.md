@@ -76,6 +76,8 @@ scrape_configs:
 
 这个 target 适用于 Prometheus 与 SynapS3 运行在同一主机的情况。容器中的 Prometheus 不能使用主机回环地址：应把两个服务放入显式配置的私有网络，只让 Admin 端点监听所需的私有接口，保持 Admin 认证开启，并且不要公开发布 Admin 端口。
 
+数据库指标每 30 秒采样；采样失败时保留上次成功值。使用这些数值前，检查采样状态和上次成功时间。
+
 关键指标：
 
 | Metric | 含义 |
@@ -87,6 +89,8 @@ scrape_configs:
 | `synaps3_cache_lru_eviction_paused` | 因近期缓存访问记录无法安全保留而暂停 LRU 淘汰时为 `1`；请先排除持久化错误，再重启 SynapS3。 |
 | `synaps3_task_queue_depth` | 按类型和状态统计的活跃任务。 |
 | `synaps3_object_state_distribution` | 按生命周期状态统计的对象数量。 |
+| `synaps3_database_metrics_collection_success` | 最近一次数据库采样成功时为 `1`，否则为 `0`。 |
+| `synaps3_database_metrics_last_success_timestamp_seconds` | 上次成功采样的 Unix 时间戳，单位为秒。 |
 
 ## 运维信号
 

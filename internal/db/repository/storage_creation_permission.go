@@ -9,7 +9,7 @@ import (
 
 // A local replacement source keeps its slot but permanently gives up creation.
 func dataSetCreationStoppedSQL(alias string) string {
-	return fmt.Sprintf(`(%[1]s.status IN ('failed', 'retired') OR (%[1]s.data_set_id IS NULL AND EXISTS (
+	return fmt.Sprintf(`(%[1]s.status = 'retired' OR (%[1]s.data_set_id IS NULL AND EXISTS (
 		SELECT 1 FROM storage_replacements AS replacement_owner WHERE replacement_owner.source_data_set_id = %[1]s.id)))`, alias)
 }
 

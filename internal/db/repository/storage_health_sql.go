@@ -61,7 +61,6 @@ var storageHealthSQLLiterals = func() map[string]struct{} {
 		string(model.StorageDataSetStatusPending),
 		string(model.StorageDataSetStatusCreating),
 		string(model.StorageDataSetStatusReady),
-		string(model.StorageDataSetStatusFailed),
 		string(model.StorageDataSetStatusDraining),
 		string(model.StorageDataSetStatusRetired),
 		string(model.StorageCopyStatusPending),

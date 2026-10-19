@@ -107,24 +107,20 @@ func (s *Server) handleAPIRefreshProvider(w http.ResponseWriter, r *http.Request
 }
 
 type providerUploadSpeedView struct {
-	RetryUnavailableReason string     `json:"retry_unavailable_reason,omitempty"`
-	Retryable              bool       `json:"retryable"`
-	RetryTaskID            *int64     `json:"retry_task_id"`
-	State                  string     `json:"state"`
-	SampleBytes            int64      `json:"sample_bytes"`
-	DurationMS             *int64     `json:"duration_ms,omitempty"`
-	BytesPerSecond         *int64     `json:"bytes_per_second,omitempty"`
-	TestedAt               *time.Time `json:"tested_at,omitempty"`
-	FailureCode            *string    `json:"failure_code,omitempty"`
+	RetryUnavailableReason string                                   `json:"retry_unavailable_reason,omitempty"`
+	Retryable              bool                                     `json:"retryable"`
+	RetryTaskID            *int64                                   `json:"retry_task_id"`
+	State                  string                                   `json:"state"`
+	SampleBytes            int64                                    `json:"sample_bytes"`
+	DurationMS             *int64                                   `json:"duration_ms,omitempty"`
+	BytesPerSecond         *int64                                   `json:"bytes_per_second,omitempty"`
+	TestedAt               *time.Time                               `json:"tested_at,omitempty"`
+	FailureCode            *string                                  `json:"failure_code,omitempty"`
+	LastSuccess            *providerbenchmark.SuccessfulMeasurement `json:"last_success,omitempty"`
 }
 
 func uploadSpeedView(row providerbenchmark.Result, profile *observability.ProviderProfile, observedServiceURL *string) *providerUploadSpeedView {
-	serviceURL := ""
-	if profile != nil {
-		serviceURL = profile.ServiceURL
-	} else if observedServiceURL != nil {
-		serviceURL = *observedServiceURL
-	}
+	serviceURL := uploadSpeedServiceURL(profile, observedServiceURL)
 	_, settled := row.Outcome(serviceURL)
 	if !settled && (row.State != providerbenchmark.StateTesting || serviceURL == "" || providerbenchmark.URLHash(serviceURL) != row.ServiceURLHash) {
 		return &providerUploadSpeedView{State: "stale", SampleBytes: row.SampleBytes, TestedAt: row.TestedAt}
@@ -137,6 +133,28 @@ func uploadSpeedView(row providerbenchmark.Result, profile *observability.Provid
 		view.FailureCode = row.FailureCode
 	}
 	return view
+}
+
+func uploadSpeedServiceURL(profile *observability.ProviderProfile, observedServiceURL *string) string {
+	serviceURL := ""
+	if profile != nil {
+		serviceURL = profile.ServiceURL
+	} else if observedServiceURL != nil {
+		serviceURL = *observedServiceURL
+	}
+	return serviceURL
+}
+
+func (s *Server) uploadSpeedHistory(ctx context.Context, hashes map[string]string) map[string]providerbenchmark.SuccessfulMeasurement {
+	if s.repos == nil || s.repos.ProviderUploadSpeed == nil {
+		return nil
+	}
+	history, err := s.repos.ProviderUploadSpeed.ListLastSuccessByProviderURLs(ctx, hashes)
+	if err != nil {
+		s.logger.Warn("api: failed to load provider upload speed history", "error", err)
+		return nil
+	}
+	return history
 }
 
 type providerObservationWithSpeed struct {
@@ -179,6 +197,17 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 	if testErr != nil {
 		s.logger.Error("api: failed to list provider upload speed tests", "error", testErr)
 	}
+	hashes := make(map[string]string, len(page.Items))
+	for _, item := range page.Items {
+		var profile *observability.ProviderProfile
+		if row, ok := profiles[item.Facts.ProviderID.String()]; ok {
+			profile = &row
+		}
+		if url := uploadSpeedServiceURL(profile, item.Facts.ServiceURL); url != "" {
+			hashes[item.Facts.ProviderID.String()] = providerbenchmark.URLHash(url)
+		}
+	}
+	history := s.uploadSpeedHistory(r.Context(), hashes)
 	items := make([]providerObservationWithSpeed, 0, len(page.Items))
 	for _, item := range page.Items {
 		view := providerObservationWithSpeed{ProviderObservation: item}
@@ -190,6 +219,9 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 		if row, ok := tests[item.Facts.ProviderID.String()]; ok {
 			test = &row
 			view.UploadSpeedTest = s.uploadSpeedViewWithRetry(r.Context(), item.Facts.ProviderID.String(), row, view.ProviderProfile, item.Facts.ServiceURL)
+			if success, ok := history[item.Facts.ProviderID.String()]; ok {
+				view.UploadSpeedTest.LastSuccess = &success
+			}
 		}
 		view.UploadSpeedTestable, view.UploadSpeedUnavailableReason = uploadSpeedAvailability(&item, view.ProviderProfile, test)
 		if !available || profileErr != nil || testErr != nil {

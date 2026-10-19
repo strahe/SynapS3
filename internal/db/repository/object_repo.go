@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagepull"
@@ -854,72 +855,15 @@ func (r *BunObjectRepo) recordContentCacheAccess(ctx context.Context, contentID 
 }
 
 func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, error) {
-	var counts []ObjectStateCount
-	state := objectVersionStateSQL("object_version")
-	err := r.db.NewSelect().
-		Model((*model.ObjectVersion)(nil)).
-		ColumnExpr(state+" AS state, COUNT(*) AS count").
-		Join("LEFT JOIN storage_contents AS storage_content ON storage_content.id = object_version.content_id").
-		Where(currentVersionPredicateSQL("object_version")).
-		Where("object_version.is_delete_marker = ?", false).
-		GroupExpr(state).
-		Scan(ctx, &counts)
+	rows, err := r.aggregateCurrentObjects(ctx, false)
 	if err != nil {
-		return nil, fmt.Errorf("counting current object versions by state: %w", err)
+		return nil, err
+	}
+	counts := make([]ObjectStateCount, 0, len(rows))
+	for _, row := range rows {
+		counts = append(counts, ObjectStateCount{State: row.State, Count: row.Count})
 	}
 	return counts, nil
-}
-
-// AggregateByState returns current object counts and sizes grouped by state.
-func (r *BunObjectRepo) AggregateByState(ctx context.Context) ([]ObjectStateAggregate, error) {
-	var rows []ObjectStateAggregate
-	state := objectVersionStateSQL("object_version")
-	err := r.db.NewSelect().
-		Model((*model.ObjectVersion)(nil)).
-		ColumnExpr(state+" AS state, COUNT(*) AS count, COALESCE(SUM(object_version.size), 0) AS total_size").
-		Join("LEFT JOIN storage_contents AS storage_content ON storage_content.id = object_version.content_id").
-		Where(currentVersionPredicateSQL("object_version")).
-		Where("object_version.is_delete_marker = ?", false).
-		GroupExpr(state).
-		Scan(ctx, &rows)
-	if err != nil {
-		return nil, fmt.Errorf("aggregating current object versions by state: %w", err)
-	}
-	return rows, nil
-}
-
-func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error) {
-	var count ObjectAttentionCount
-	// Pipeline position and cache residency are derived from the content's
-	// copies and its cache entry, so the counts read those rather than columns
-	// object_versions no longer owns. A content's error message is display text
-	// and can outlive the failure it describes, so it does not count here.
-	query := `WITH current_versions AS (
-			SELECT object_version.version_id,
-			       object_version.content_id,
-			       ` + objectVersionStateSQL("object_version") + ` AS state,
-			       COALESCE(cache_entry.in_cache, FALSE) AS in_cache
-			FROM object_versions AS object_version
-			LEFT JOIN storage_contents AS storage_content
-			  ON storage_content.id = object_version.content_id
-			LEFT JOIN object_cache AS cache_entry
-			  ON cache_entry.content_id = object_version.content_id
-			WHERE ` + currentVersionPredicateSQL("object_version") + `
-			  AND object_version.is_delete_marker = ?
-		)
-		SELECT
-			COALESCE(SUM(CASE WHEN current_version.state = ? THEN 1 ELSE 0 END), 0) AS needs_attention,
-			COALESCE(SUM(CASE WHEN current_version.in_cache = ? AND NOT ` + usableCopyExistsSQL("current_version.content_id") + ` THEN 1 ELSE 0 END), 0) AS unavailable
-		FROM current_versions AS current_version`
-	err := r.db.NewRaw(query,
-		false,
-		model.ObjectStateFailed,
-		false,
-	).Scan(ctx, &count)
-	if err != nil {
-		return ObjectAttentionCount{}, fmt.Errorf("counting overview object attention: %w", err)
-	}
-	return count, nil
 }
 
 // CountByBucket returns the number of current objects in a bucket.
@@ -1050,18 +994,20 @@ func contentPipelineStateSQL() string {
 		" AND live_copy.status <> '" + string(model.StorageCopyStatusFailed) + "')"
 	committing := "EXISTS (SELECT 1 FROM storage_copies AS committing_copy WHERE committing_copy.content_id = " + contentID +
 		" AND committing_copy.status IN ('" + string(model.StorageCopyStatusPieceReady) + "', '" + string(model.StorageCopyStatusCommitting) + "'))"
+	return contentPipelineStateFromFactsSQL(readableSlots, anyCopy, everyCopyFailed, committing)
+}
+
+func contentPipelineStateFromFactsSQL(readableSlots, anyCopy, everyCopyFailed, committing string) string {
 	return fmt.Sprintf(`CASE
-		WHEN %[1]s >= COALESCE(storage_content.requested_copies, 1) THEN '%[5]s'
-		WHEN %[1]s >= 1 THEN '%[6]s'
-		WHEN %[2]s AND %[3]s THEN '%[7]s'
-		WHEN %[4]s THEN '%[8]s'
-		WHEN %[2]s THEN '%[9]s'
-		ELSE '%[10]s'
-	END`,
-		readableSlots, anyCopy, everyCopyFailed, committing,
+  WHEN %[1]s >= COALESCE(storage_content.requested_copies, 1) THEN '%[5]s'
+  WHEN %[1]s >= 1 THEN '%[6]s'
+  WHEN %[2]s AND %[3]s THEN '%[7]s'
+  WHEN %[4]s THEN '%[8]s'
+  WHEN %[2]s THEN '%[9]s'
+  ELSE '%[10]s'
+ END`, readableSlots, anyCopy, everyCopyFailed, committing,
 		model.ObjectStateStored, model.ObjectStateReplicating, model.ObjectStateFailed,
-		model.ObjectStateCommitting, model.ObjectStateUploading, model.ObjectStateCached,
-	)
+		model.ObjectStateCommitting, model.ObjectStateUploading, model.ObjectStateCached)
 }
 
 func usableCopyExistsSQL(contentIDExpr string) string {
@@ -1102,33 +1048,6 @@ func prepareObjectVersionsForPermanentDelete(
 	sort.Strings(deletingVersionIDs)
 
 	contentIDs := sortedContentIDs(uploadsByID)
-	var copies []model.StorageCopy
-	if len(contentIDs) > 0 {
-		query := db.NewSelect().Model(&copies)
-		projectCommitRequest(query, "storage_copy")
-		if err := query.
-			Where("storage_copy.content_id IN (?)", bun.List(contentIDs)).
-			OrderExpr("storage_copy.id ASC").
-			Scan(ctx); err != nil {
-			return fmt.Errorf("loading storage copies for permanent delete: %w", err)
-		}
-	}
-	if len(copies) > 0 {
-		copyIDs := make([]int64, len(copies))
-		for i := range copies {
-			copyIDs[i] = copies[i].ID
-		}
-		var locked []int64
-		if err := db.NewSelect().Model((*model.StorageCopy)(nil)).Column("id").
-			Where("id IN (?)", bun.List(copyIDs)).OrderExpr("id ASC").For("NO KEY UPDATE").
-			Scan(ctx, &locked); err != nil {
-			return fmt.Errorf("locking storage copies for permanent delete: %w", err)
-		}
-		if len(locked) != len(copyIDs) {
-			return fmt.Errorf("locking storage copies for permanent delete: %w", ErrConflict)
-		}
-	}
-
 	if len(contentIDs) == 0 {
 		return nil
 	}
@@ -1143,13 +1062,34 @@ func prepareObjectVersionsForPermanentDelete(
 		Column("id", "status").
 		Where("subject_type = ? AND subject_key IN (?)", model.TaskSubjectStorageContent, bun.List(contentSubjectKeys)).
 		OrderExpr("id ASC").
-		For("NO KEY UPDATE")
+		For("NO KEY UPDATE NOWAIT")
 	if err := taskQuery.Scan(ctx); err != nil {
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "55P03" {
+			return ErrPermanentDeleteStorageBusy
+		}
 		return fmt.Errorf("loading storage tasks for permanent delete: %w", err)
 	}
 	for i := range relatedTasks {
 		if relatedTasks[i].Status == model.TaskStatusPending || relatedTasks[i].Status == model.TaskStatusRunning {
 			return ErrPermanentDeleteStorageBusy
+		}
+	}
+
+	// Task settlement locks the task before its content. Never wait for that
+	// task while holding content, and read copy evidence only after fencing it.
+	var lockedCopyIDs []int64
+	if err := db.NewSelect().Model((*model.StorageCopy)(nil)).Column("id").
+		Where("content_id IN (?)", bun.List(contentIDs)).OrderExpr("id ASC").
+		For("NO KEY UPDATE").Scan(ctx, &lockedCopyIDs); err != nil {
+		return fmt.Errorf("locking storage copies for permanent delete: %w", err)
+	}
+	var copies []model.StorageCopy
+	if len(lockedCopyIDs) > 0 {
+		query := db.NewSelect().Model(&copies)
+		projectCommitRequest(query, "storage_copy")
+		if err := query.Where("storage_copy.id IN (?)", bun.List(lockedCopyIDs)).
+			OrderExpr("storage_copy.id ASC").Scan(ctx); err != nil {
+			return fmt.Errorf("loading locked storage copies for permanent delete: %w", err)
 		}
 	}
 

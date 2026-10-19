@@ -210,6 +210,9 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 			if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
 				return err
 			}
+			if _, err := repos.Contents.LockForCopyCreation(ctx, upload.ID); err != nil {
+				return err
+			}
 			if err := bindingtask.ValidateSelection(ctx, repos, bucket.ID, bindingPlan); err != nil {
 				return err
 			}

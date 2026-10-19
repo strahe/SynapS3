@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +33,11 @@ func TestCleanupContinuesAcrossDeletedCopies(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: client, deletionState: func(_ context.Context, _, piece sdktypes.BigInt) (synapse.CleanupPieceState, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		return synapse.CleanupPieceState{Live: deleted[piece.String()] == 0}, nil
+		status := synapse.CleanupPiecePresent
+		if deleted[piece.String()] != 0 {
+			status = synapse.CleanupPieceRemoved
+		}
+		return synapse.CleanupPieceState{Status: status}, nil
 	}})
 	content, row := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending, model.StorageCleanupCopyStatusPending)
 	for range 5 {
@@ -67,7 +72,7 @@ func TestCleanupDropsPrecedingCheckpointWithoutResettingNextClock(t *testing.T) 
 	for _, age := range []time.Duration{23 * time.Hour, 25 * time.Hour} {
 		t.Run(age.String(), func(t *testing.T) {
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-				return synapse.CleanupPieceState{Live: true}, nil
+				return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent}, nil
 			}})
 			content, row := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusRemoved, model.StorageCleanupCopyStatusPending)
 			copies, err := runtime.repos.StorageCleanup.AuthorizeTask(t.Context(), content.ID, content.CleanupGeneration, row.ID)
@@ -112,5 +117,57 @@ func TestCleanupDropsPrecedingCheckpointWithoutResettingNextClock(t *testing.T) 
 				t.Fatalf("expired next-copy observation = %#v", result)
 			}
 		})
+	}
+}
+
+func TestCleanupRequiresMatchingRecordedDataSetBeforeObservation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		field  string
+		value  any
+		reason string
+	}{
+		{name: "missing creation client", field: "client_data_set_id", reason: "storage_identity_missing"},
+		{name: "changed creation client", field: "client_data_set_id", value: "999999", reason: "storage_identity_changed"},
+		{name: "changed data set", field: "data_set_id", value: "999999", reason: "storage_identity_changed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var observations atomic.Int64
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+				observations.Add(1)
+				return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved}, nil
+			}})
+			content, row := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+				Set(tc.field+" = ?", tc.value).Where("content_id = ?", content.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			failed := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			if observations.Load() != 0 || failed.FailureReason == nil || *failed.FailureReason != tc.reason {
+				t.Fatalf("cleanup accepted unproven data set: observations=%d task=%#v", observations.Load(), failed)
+			}
+			copies, err := runtime.repos.StorageCleanup.AuthorizeTask(t.Context(), content.ID, content.CleanupGeneration, row.ID)
+			if err != nil || len(copies) != 1 || copies[0].Status != model.StorageCleanupCopyStatusPending {
+				t.Fatalf("cleanup evidence changed: %#v, %v", copies, err)
+			}
+		})
+	}
+}
+
+func TestCleanupRetainsEvidenceForUnknownObservation(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+		return synapse.CleanupPieceState{}, nil
+	}})
+	content, row := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	result := runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+	if result.RetryCount != 1 || result.FailureReason == nil || *result.FailureReason != "cleanup_status_failed" {
+		t.Fatalf("unconfirmed observation = %#v", result)
+	}
+	copies, err := runtime.repos.StorageCleanup.AuthorizeTask(t.Context(), content.ID, content.CleanupGeneration, row.ID)
+	if err != nil || len(copies) != 1 || copies[0].Status != model.StorageCleanupCopyStatusPending {
+		t.Fatalf("cleanup evidence changed: %#v, %v", copies, err)
+	}
+	if current, err := runtime.repos.Contents.GetByID(t.Context(), content.ID); err != nil || current == nil {
+		t.Fatalf("content lost without confirmed removal: %#v, %v", current, err)
 	}
 }

@@ -212,7 +212,7 @@ func TestCleanupResolvesEachCopiesOwnCreationIdentity(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{
 		DeletionStateFunc: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
 			observations.Add(1)
-			return synapse.CleanupPieceState{Live: false}, nil
+			return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved}, nil
 		},
 	}})
 	content, row := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending, model.StorageCleanupCopyStatusPending)

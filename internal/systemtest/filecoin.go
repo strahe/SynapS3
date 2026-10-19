@@ -879,12 +879,12 @@ func (m *MemoryFilecoin) DeletionState(ctx context.Context, dataSetID, pieceID s
 	defer m.mu.RUnlock()
 	dataSet := m.dataSets[dataSetID.String()]
 	if dataSet == nil {
-		return synapse.CleanupPieceState{BlockNumber: uint64(m.epoch)}, nil
+		return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved, BlockNumber: uint64(m.epoch)}, nil
 	}
 	if _, found := dataSet.pieces[pieceID.String()]; found {
-		return synapse.CleanupPieceState{Live: true, BlockNumber: uint64(m.epoch)}, nil
+		return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: uint64(m.epoch)}, nil
 	}
-	return synapse.CleanupPieceState{BlockNumber: uint64(m.epoch)}, nil
+	return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved, BlockNumber: uint64(m.epoch)}, nil
 }
 
 func (c *memoryDataSetTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {

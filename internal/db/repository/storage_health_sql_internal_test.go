@@ -15,7 +15,6 @@ func TestStorageHealthSQLLiteralAcceptsEveryDomainStatus(t *testing.T) {
 		model.StorageDataSetStatusPending,
 		model.StorageDataSetStatusCreating,
 		model.StorageDataSetStatusReady,
-		model.StorageDataSetStatusFailed,
 		model.StorageDataSetStatusDraining,
 		model.StorageDataSetStatusRetired,
 	}

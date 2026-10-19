@@ -105,6 +105,8 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/workers` | Background task activity and health. |
 | `GET` | `/api/v1/cache/stats` | Cache usage and capacity. |
 
+See [Health and Metrics](../operations/health-metrics.md#prometheus-metrics) for metric definitions and sampling freshness.
+
 ## Dashboard Data
 
 | Method | Path | Purpose |
@@ -348,7 +350,7 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 | `GET` | `/api/v1/observability/data-sets` | Local data set health data, with stopped batches per listed data set in `storage_confirmations_by_data_set`. |
 | `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
 
-Provider listings and replacement candidates include `upload_speed_testable`, an optional `upload_speed_unavailable_reason`, and `upload_speed_test` when a result is recorded. Testing eligibility is independent of bucket replacement eligibility. Successful results report `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`. Tests upload up to 32 MiB within 30 seconds; at least 8 MiB is required to estimate speed if the window expires. The sample does not guarantee object upload speed. See [Provider Selection](../configuration/model.md#provider-selection) for automatic testing and remeasurement.
+Provider listings and replacement candidates include `upload_speed_testable`, an optional `upload_speed_unavailable_reason`, and `upload_speed_test` when a result is recorded. Testing eligibility is independent of bucket replacement eligibility. `upload_speed_test.last_success`, when present, reports the last successful test for the current service address, for reference only. The latest failed test still blocks new bindings. Successful results report `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`. Tests upload up to 32 MiB within 30 seconds; at least 8 MiB is required to estimate speed if the window expires. The sample does not guarantee object upload speed. See [Provider Selection](../configuration/model.md#provider-selection) for automatic testing and remeasurement.
 
 Same-URL remeasurement returns `state: "testing"` with the last completed result; a retained successful speed remains valid for selection. A missing or changed service URL makes the result `stale`. Failed tests expose `retry_task_id` for the task Retry endpoint. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
 

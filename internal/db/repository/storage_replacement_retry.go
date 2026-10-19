@@ -45,7 +45,7 @@ func replacementRetryEligibility(ctx context.Context, db bun.IDB, row *storagere
 	if err != nil {
 		return err
 	}
-	if target == nil || target.Status == model.StorageDataSetStatusRetired || target.Status == model.StorageDataSetStatusFailed {
+	if target == nil || target.Status == model.StorageDataSetStatusRetired {
 		return &storagereplacement.NotRetryableError{Message: "Storage setup has ended. Choose another provider for the original replica."}
 	}
 	source, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.SourceDataSetID)

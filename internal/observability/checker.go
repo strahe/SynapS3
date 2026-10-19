@@ -537,7 +537,7 @@ func localStatusSeverity(status model.StorageDataSetStatus) Status {
 		return StatusAvailable
 	case model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating:
 		return StatusDegraded
-	case model.StorageDataSetStatusFailed, model.StorageDataSetStatusRetired:
+	case model.StorageDataSetStatusRetired:
 		return StatusUnavailable
 	default:
 		return StatusDegraded

@@ -489,6 +489,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	group, groupCtx := errgroup.WithContext(runCtx)
 	group.Go(func() error {
+		r.adminServer.RunDatabaseMetrics(groupCtx)
+		return nil
+	})
+	group.Go(func() error {
 		r.monitoring.Run(groupCtx)
 		return nil
 	})

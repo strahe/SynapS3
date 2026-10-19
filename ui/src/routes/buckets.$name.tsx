@@ -61,6 +61,7 @@ import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { ProviderReplacementProgress as ReplacementProgressView } from '@/components/app/ProviderReplacementProgress'
 import { ProviderSelect } from '@/components/app/ProviderSelect'
 import { ProviderUploadSpeedButton } from '@/components/app/ProviderUploadSpeedButton'
+import { ProviderUploadSpeedHistory } from '@/components/app/ProviderUploadSpeedHistory'
 import { RelativeTime } from '@/components/app/RelativeTime'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { RowActionItem, RowActionsMenu } from '@/components/app/RowActionsMenu'
@@ -1810,6 +1811,7 @@ function ReplaceProviderDialog({
                 <p className="text-xs text-muted-foreground">
                   Upload speed: {providerUploadSpeedLabel(inspectedProvider.upload_speed_test)}
                 </p>
+                <ProviderUploadSpeedHistory test={inspectedProvider.upload_speed_test} />
                 <div className="flex flex-wrap gap-2">
                   <Button
                     type="button"
