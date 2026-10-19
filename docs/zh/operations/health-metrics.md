@@ -1,67 +1,42 @@
 ---
 title: 健康检查与指标
-description: 监控 SynapS3 健康检查、后台任务活动、缓存使用量、任务队列和 Prometheus 指标。
+description: 读取 SynapS3 的健康检查端点、仪表盘监控和 Prometheus 指标。
 ---
 
 # 健康检查与指标
 
-Admin 服务提供健康检查、Prometheus 指标，以及仪表盘使用的运维视图。`/healthz` 不需要认证；`/metrics` 和仪表盘 API 端点需要 Admin 认证。
+Admin 监听地址提供无需认证的 `/healthz`，以及需要 Admin 认证的 `/metrics`。
 
 ## 健康检查
 
-正常运行时，`GET /healthz` 会检查数据库连接、缓存目录可用性和后台任务活动。
-
 ```bash
-synaps3 admin status
 curl http://127.0.0.1:9090/healthz
 ```
 
-健康状态：
+| 响应 | HTTP 状态码 | 含义 |
+| --- | --- | --- |
+| `{"status":"ok"}` | `200` | 数据库可达，缓存目录存在，后台任务正常运行。 |
+| `{"status":"setup"}` | `200` | 缺少必需设置或设置无效。只能使用 Admin 设置，不提供 S3 API。 |
+| `{"status":"unhealthy","errors":[...]}` | `503` | 有检查项失败。`errors` 中包含 `db: unreachable`、`cache: directory not found` 或 `worker/tasks: not responding`。 |
 
-```json
-{"status":"ok"}
-```
+`setup` 同样返回 `200`，只检查 HTTP 状态码的探针会把它当作健康。请检查 `status` 字段。
 
-缺少必要配置时：
+`worker/tasks: not responding` 表示后台任务处理已停止上报活动，即使当前没有上传也会出现。
 
-```json
-{"status":"setup"}
-```
+`synaps3 admin status` 显示健康状态、版本、运行时长、缓存用量和后台任务状态。在设置模式下，它会列出需要修正的设置。
 
-检查失败时：
+## 仪表盘监控
 
-```json
-{"status":"unhealthy","errors":["worker/tasks: not responding"]}
-```
+**Overview** 页面显示：
 
-`setup` 表示需要补齐缺失配置。`unhealthy` 表示数据库、缓存或后台任务检查失败，优先查看返回的错误列表。
+- **Process resources**：SynapS3 的 CPU 使用量（核数）和常驻内存。
+- **Application traffic**：上传和下载速率。**Client** 统计 S3 和仪表盘的对象传输；**Storage** 统计 SynapS3 与存储提供方之间的传输。测速和存储提供方之间的复制不计入。信息按钮显示采样时间和启动以来的字节数。
 
-## 后台任务活动
+图表每 15 秒采样一次，保留一小时。重启会清空历史；需要更长保留时间时使用 Prometheus。
 
-仪表盘概览只统计本节点的数据集及其存储提供方；**Storage** 的 **Providers** 标签页仍显示完整的观测名单。
+## Prometheus 指标
 
-如果后台任务处理长时间没有在配置的健康窗口内报告活动，SynapS3 会将其标记为不健康。即使没有正在上传的对象，这项检查也能发现后台存储已经停滞。
-
-检查后台任务状态：
-
-```bash
-synaps3 admin status
-synaps3 admin task stats
-```
-
-status 应显示后台任务处理正常。已确认失败仍计为 failed；pending 工作显示为 queued、scheduled 或 waiting。
-
-## Overview 监控
-
-**Process resources** 显示 SynapS3 进程的 CPU 使用核数和 RSS 内存。**Application traffic** 显示上传、下载速率：**Client** 统计 S3 和 Admin 对象传输，**Storage** 统计 SynapS3 与存储提供方之间的传输。点击信息按钮可查看采样时间和启动以来的累计字节数。
-
-图表每 15 秒采样，展示最近一小时。关闭或刷新页面后仍可查看已有历史；重启 SynapS3 会清空历史和累计量。长期历史请使用 Prometheus。
-
-流量统计对象正文，包括部分失败和重试产生的字节。两个视角分别统计，不包含本地文件操作、测速和提供方之间的直接传输。
-
-## Prometheus Metrics
-
-指标暴露在 Admin 端口：
+同一主机上的 Prometheus 可以用 Basic 认证抓取 Admin 监听地址：
 
 ```yaml
 scrape_configs:
@@ -74,32 +49,26 @@ scrape_configs:
       password_file: /run/secrets/synaps3-admin-password
 ```
 
-这个 target 适用于 Prometheus 与 SynapS3 运行在同一主机的情况。容器中的 Prometheus 不能使用主机回环地址：应把两个服务放入显式配置的私有网络，只让 Admin 端点监听所需的私有接口，保持 Admin 认证开启，并且不要公开发布 Admin 端口。
+容器中的 Prometheus 无法访问宿主机的回环地址。把 `admin.addr` 绑定到只有 Prometheus 能访问的私有网络接口，保持 Admin 认证开启，并且不要公开该端口。
 
-数据库指标每 30 秒采样；采样失败时保留上次成功值。使用这些数值前，检查采样状态和上次成功时间。
-
-关键指标：
-
-| Metric | 含义 |
+| 指标 | 含义 |
 | --- | --- |
-| `synaps3_backend_object_operations_total` | 按类型和状态统计的 S3 操作。 |
-| `synaps3_transfer_bytes_total` | 按 `scope`（`client` 或 `storage`）和 `direction`（`upload` 或 `download`）统计的对象正文字节数，重启后重新累计。 |
-| `synaps3_cache_used_bytes` | 当前缓存磁盘使用量。 |
-| `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | 缓存读取行为。 |
-| `synaps3_cache_lru_eviction_paused` | 因近期缓存访问记录无法安全保留而暂停 LRU 淘汰时为 `1`；请先排除持久化错误，再重启 SynapS3。 |
-| `synaps3_task_queue_depth` | 按类型和状态统计的活跃任务。 |
-| `synaps3_object_state_distribution` | 按生命周期状态统计的对象数量。 |
-| `synaps3_database_metrics_collection_success` | 最近一次数据库采样成功时为 `1`，否则为 `0`。 |
-| `synaps3_database_metrics_last_success_timestamp_seconds` | 上次成功采样的 Unix 时间戳，单位为秒。 |
+| `synaps3_backend_object_operations_total` | 按类型和状态统计的 S3 对象操作数。 |
+| `synaps3_transfer_bytes_total` | 按 `scope`（`client`、`storage`）和 `direction`（`upload`、`download`）统计的对象字节数。重启后归零。 |
+| `synaps3_cache_used_bytes` | 缓存磁盘用量。 |
+| `synaps3_cache_hits_total`、`synaps3_cache_misses_total` | 命中缓存的读取数和未命中的读取数。 |
+| `synaps3_task_queue_depth` | 按类型和状态统计的等待中和运行中任务数，不含失败任务。 |
+| `synaps3_object_state_distribution` | 按状态（`cached`、`uploading`、`committing`、`replicating`、`stored`、`failed`）统计的对象数。 |
+| `synaps3_database_metrics_collection_success` | 上一次采集数据库指标成功为 `1`，否则为 `0`。 |
+| `synaps3_database_metrics_last_success_timestamp_seconds` | 上一次采集成功的时间，Unix 秒。 |
 
-## 运维信号
+基于数据库的指标（`synaps3_task_queue_depth` 和 `synaps3_object_state_distribution`）每 30 秒采集一次。采集失败时保留上一次的值；使用这些值前先检查两个采集状态指标。
 
-| 信号 | 处理方式 |
+## 告警建议
+
+| 信号 | 处理 |
 | --- | --- |
-| `/healthz` 返回 `setup` | 运行 `synaps3 admin status` 或 `synaps3 admin settings get`，按报告补齐必要配置，重启后再次检查。 |
-| `/healthz` 返回 `unhealthy` | 检查数据库、缓存目录和后台任务错误信息。 |
-| 缓存使用量接近容量 | 增大容量，或恢复上传和淘汰进度。 |
-| failed 任务增加 | 修复依赖后，只重试标记为可重试的任务。 |
-| 存储提供方健康状态下降 | 检查 RPC、存储提供方 URL 和网络可达性。 |
-
-恢复步骤见[故障排查](./troubleshooting.md)。
+| `/healthz` 状态不是 `ok` | 见[故障排查](./troubleshooting.md#首先检查)。 |
+| 缓存用量接近 `cache.max_size_gb` | 见[缓存已满](./troubleshooting.md#缓存已满)。 |
+| 失败任务增加（`synaps3 admin task stats` 或 `GET /api/v1/tasks/stats`） | 见[失败任务](./troubleshooting.md#失败任务)。 |
+| 存储提供方或数据集未通过健康检查 | 见[存储提供方或 RPC 问题](./troubleshooting.md#存储提供方或-rpc-问题)。 |

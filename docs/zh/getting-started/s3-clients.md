@@ -1,64 +1,40 @@
 ---
 title: S3 客户端
-description: 创建 SynapS3 S3 凭据，并使用常见客户端验证 path-style 访问。
+description: 创建 S3 凭据，并为 SynapS3 配置 AWS CLI、rclone 和 MinIO Client。
 ---
 
 # S3 客户端
 
-SynapS3 启动后，先确认 Admin API 可以通过 `127.0.0.1:9090` 访问。然后创建 S3 用户，并用 path-style 客户端验证存储桶和对象操作。
-
-## 前置条件
-
-- SynapS3 正在运行。
-- `curl http://127.0.0.1:9090/healthz` 返回 `{"status":"ok"}`。
-- S3 API 可通过 `http://localhost:8080` 访问。
-- 运行 `synaps3 admin` 的机器能访问 Admin API。
-- 已设置 `SYNAPS3_ADMIN_PASSWORD`，或配置文件同目录存在 `admin-initial-password`，或可以在命令提示中输入 Admin 密码。
+SynapS3 要求使用 path-style 寻址。示例使用 `http://localhost:8080`；生产环境请改用 S3 TLS 配置提供的 HTTPS 端点。
 
 ## 创建凭据
 
-创建普通 S3 用户：
+在仪表盘的 **S3 users** 页面创建 S3 用户，或者使用 CLI：
 
 ```bash
 synaps3 admin s3-user create
-```
-
-没有受保护的密码文件时，在无回显提示中输入 Admin 密码。命令会输出 access key、secret key 和 role。secret key 只显示一次：请保存到权限为 `0600` 的客户端凭据文件；如果泄露，立即轮换。
-
-之后可以列出用户：
-
-```bash
 synaps3 admin s3-user list
 ```
 
-## 准备测试对象
+CLI 需要 Admin 密码，见 [Admin 命令](../reference/cli.md#admin-命令)。`create` 输出 access key、secret key 和角色。Secret key 只显示一次，请保存到权限为 `0600` 的客户端配置文件中。
 
-选择客户端前先创建一个测试文件：
+| 角色 | 仪表盘标签 | 权限 |
+| --- | --- | --- |
+| `userplus`（默认） | **User+** | 可以创建存储桶，并访问自己拥有的存储桶。 |
+| `user` | **User** | 可以访问自己拥有的存储桶，不能创建存储桶。 |
+| `admin` | **Admin** | 可以访问所有存储桶，并管理 S3 API 操作。 |
+
+存储桶名称会写入 Filecoin 数据集元数据，在链上公开可见。不要在存储桶名称中包含敏感信息。
+
+对象大小必须在 127 到 1,065,353,216 字节之间。对象键和分段上传的限制见[稳定限制](../reference/s3-compatibility.md#稳定限制)。示例上传下面这个测试文件：
 
 ```bash
 printf '%*s\n' 128 'hello synaps3' > hello.txt
 ```
 
-`hello.txt` 应至少有 128 字节。
-
-> [!IMPORTANT]
-> Filecoin 上传路径要求对象不小于 127 字节。测试文件请保持 128 字节或更大。
-
-## 选择存储桶名称
-
-存储桶名称可能公开记录在链上，请勿包含敏感信息。
-
-## 稳定对象限制
-
-- 对象大小必须在 `127` 到 `1,065,353,216` 字节之间。
-- 对象键必须是有效 UTF-8，不得包含 NUL，并且最多 `1024` 字节。
-- 分段上传最多支持 `10,000` 个 parts，完整对象仍受对象大小上限约束。
-
-完整支持边界见 [S3 兼容性](../reference/s3-compatibility.md)。
-
 ## AWS CLI
 
-交互输入 access key 和 secret key，再配置 path-style addressing：
+按提示输入 access key 和 secret key，再设置区域和 path-style 寻址：
 
 ```bash
 aws configure --profile synaps3
@@ -67,19 +43,17 @@ aws configure set profile.synaps3.s3.addressing_style path
 chmod 600 ~/.aws/credentials
 ```
 
-创建存储桶并上传测试对象：
-
 ```bash
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3api create-bucket --bucket demo
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3 cp hello.txt s3://demo/hello.txt
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3 cp s3://demo/hello.txt -
 ```
 
-最后一个命令会输出填充后的 `hello synaps3` 内容。
+最后一条命令会输出文件内容。
 
 ## rclone
 
-在 `rclone.conf` 中创建 remote：
+在 `rclone.conf` 中添加 remote，并保持文件权限为 `0600`：
 
 ```ini
 [synaps3]
@@ -92,21 +66,15 @@ region = us-east-1
 force_path_style = true
 ```
 
-验证存储桶和对象访问：
-
 ```bash
 rclone mkdir synaps3:demo
 rclone copyto hello.txt synaps3:demo/hello.txt
 rclone cat synaps3:demo/hello.txt
 ```
 
-`rclone cat` 会输出上传的对象内容。
-
-`rclone.conf` 包含 secret key，应保持 `0600` 权限。
-
 ## MinIO Client
 
-通过终端交互读取凭据，创建 alias，并上传同一个文件：
+`read -rs` 提示符让 secret key 不进入 shell 历史；`mc` 会把它保存在 `~/.mc/config.json`：
 
 ```bash
 printf 'S3 access key: '
@@ -122,21 +90,12 @@ mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
 ```
 
-`mc cat` 会输出上传的对象内容。
-
-alias 会把凭据保存在 `~/.mc/config.json`。无回显提示可以避免 secret key 进入 shell history；生成的配置应保持 `0600` 权限。
-
-这些示例中的 HTTP 端点只用于本地评估。生产环境请使用原生 TLS 或受控 TLS 反向代理提供的 HTTPS 端点。
-
 ## 常见失败
 
-| 现象 | 检查项 |
+| 现象 | 处理 |
 | --- | --- |
-| `AccessDenied` | 确认 access key 和 secret key 来自 `synaps3 admin s3-user create`。 |
-| 客户端使用 virtual-hosted 存储桶访问 | 开启 path-style addressing 或客户端中的等价设置。 |
-| 创建存储桶后的首次上传返回 `SlowDown` | 查看存储桶的准备说明和仪表盘顶部的测速提示。准备过程会等待可选可信节点完成测速，并确认成功节点足以满足副本策略。按提示处理后重试上传。 |
-| 用 `versionId` 删除某份数据的最后一个版本后，立即上传相同内容返回 `SlowDown` | SynapS3 仍在清理这份数据的旧副本。等待几分钟后再重试上传。 |
-| 大量早先上传仍在等待 Filecoin 存储时，上传返回 `SlowDown` | 本地缓存已满。稍后重试；持续出现时参考[缓存已满](../operations/troubleshooting.md#缓存已满)。 |
-| 上传成功但 Filecoin 存储仍在等待 | 查看仪表盘任务页，或运行 `synaps3 admin task list --status pending`。 |
-| 对象大小被拒绝 | 确保对象大小在 `127` 到 `1,065,353,216` 字节之间。 |
-| 远程主机无法访问 Admin 仪表盘 | 保持 Admin 监听本机回环地址，并使用 `ssh -L 9090:127.0.0.1:9090 user@server`。 |
+| `AccessDenied` | 检查 access key 和 secret key。创建存储桶需要 `userplus` 或 `admin` 角色。 |
+| 客户端使用 virtual-hosted 风格的存储桶 URL | 启用 path-style 寻址。 |
+| `503 SlowDown` | 查看错误消息，并参考 [S3 请求返回 SlowDown](../operations/troubleshooting.md#s3-请求返回-slowdown)。 |
+| 对象大小被拒绝 | 对象大小保持在 127 到 1,065,353,216 字节之间。 |
+| 上传成功，但 Filecoin 存储仍在等待 | 查看仪表盘 **Tasks** 页面，或运行 `synaps3 admin task list --status pending`。 |

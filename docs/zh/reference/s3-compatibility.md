@@ -1,81 +1,74 @@
 ---
 title: S3 兼容性
-description: SynapS3 支持的存储桶、对象、版本控制和分段上传 S3 操作及限制。
+description: 查询 SynapS3 支持哪些 S3 操作、对象限制，以及版本控制和删除行为。
 ---
 
 # S3 兼容性
 
-SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写入 Filecoin。
-
 ## 客户端要求
 
-- 使用 path-style addressing。
-- 本地评估时，将客户端端点设置为 `http://localhost:8080`。生产 S3 流量必须使用原生 TLS 或受控的 TLS 反向代理。
-- 使用 `synaps3 admin s3-user create` 创建的凭据。
-- 对象和对象键必须符合下面的稳定限制。
-
-存储桶 ACL 按权限允许其他账号读写和列举数据。即使授予 `FULL_CONTROL`，也不能调用 `GetObjectAttributes`、带 `versionId` 的删除、`ListParts`、`AbortMultipartUpload` 或存储桶配置操作；这些操作需要存储桶 owner 或管理员凭据。拥有写权限的共享账号可以创建、上传和完成分段上传，但列举 parts 或中止上传需要 owner 或管理员执行。
+- 使用 path-style 寻址。
+- 使用在 **S3 users** 页面或通过 `synaps3 admin s3-user create` 创建的凭据。
+- 生产流量使用 TLS，原生 TLS 或你自己的代理均可。
 
 ## 稳定限制
 
-- 对象大小：`127` 到 `1,065,353,216` 字节。
-- 对象键：必须是有效 UTF-8、不得包含 NUL，并且最多 `1024` 字节。
-- 分段上传：最多 `10,000` 个 parts；完整对象仍受对象大小上限约束。
+- 对象大小：127 到 1,065,353,216 字节。过小或过大的对象会被拒绝，返回 `EntityTooSmall` 或 `EntityTooLarge`。
+- 对象键：合法 UTF-8，不含 NUL 字符，最长 1,024 字节。
+- 分段上传：最多 10,000 个分段。完成后的对象同样受对象大小限制。
 
 ## 操作矩阵
 
-| 领域 | 操作 | 状态 | 说明 |
+| 类别 | 操作 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| 存储桶 | `CreateBucket` | 支持 | 创建存储桶。 |
-| 存储桶 | `HeadBucket` | 支持 | 检查存储桶元数据。 |
-| 存储桶 | `ListBuckets` | 支持 | 列出有效存储桶。 |
-| 存储桶 | `DeleteBucket` | 不支持 | 返回 `501`；SynapS3 生命周期不包含删除存储桶。 |
-| 存储桶 | `GetBucketVersioning` | 支持 | 存储桶始终按 versioning-enabled 处理。 |
-| 存储桶 | `PutBucketVersioning` | 部分支持 | 接受 `Enabled`，拒绝 `Suspended`。 |
-| 存储桶 ACL | `GetBucketAcl` | 支持 | 返回已保存的存储桶 ACL。 |
-| 存储桶 ACL | `PutBucketAcl` | 支持 | 保存用于访问控制的存储桶 owner 和 ACL 变更。 |
-| 对象 ACL | `GetObjectAcl`, `PutObjectAcl` | 不支持 | 不要依赖对象级 ACL 状态或授权变更。 |
-| 存储桶 Policy | `GetBucketPolicy`, `PutBucketPolicy`, `DeleteBucketPolicy` | 不支持 | 不保存或执行存储桶 Policy。 |
-| 存储桶 Tagging | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` | 不支持 | 不保存存储桶 tags。 |
-| 对象 Tagging | `GetObjectTagging`, `PutObjectTagging`, `DeleteObjectTagging` | 不支持 | 不保存对象 tags。 |
-| Ownership Controls | `GetBucketOwnershipControls` | 部分支持 | 返回 `BucketOwnerPreferred`。 |
-| Ownership Controls | `PutBucketOwnershipControls` | 部分支持 | 只接受 `BucketOwnerPreferred`，拒绝其他 ownership modes。 |
-| Ownership Controls | `DeleteBucketOwnershipControls` | 部分支持 | 保持 ACL 兼容的 `BucketOwnerPreferred` 行为。 |
-| 对象 | `PutObject` | 支持 | 按缓存优先的写入模型存储对象。 |
-| 对象 | `GetObject` | 支持 | 从缓存或已提交的远端存储读取，支持单段字节 Range，并返回指定版本的自定义元数据和 `Last-Modified`。冷缓存远端 Range 仍需完整下载来源以校验内容。 |
-| 对象 | `HeadObject` | 支持 | 读取对象元数据，包括指定版本的自定义元数据。 |
-| 对象 | `DeleteObject` | 支持 | 不带 `versionId` 时创建 delete marker；带 `versionId` 时删除符合条件的数据版本或 delete marker。 |
-| 对象 | `DeleteObjects` | 支持 | 对每个条目应用相同的版本删除规则，并分别返回失败结果。`Quiet=true` 不返回成功条目。 |
-| 对象 | `CopyObject` | 支持 | 源对象必须可从缓存或已提交的远端存储读取。 |
-| 对象 | `ListObjects` | 支持 | Marker 分页。 |
-| 对象 | `ListObjectsV2` | 支持 | Continuation-token 分页。 |
-| 对象 | `ListObjectVersions` | 支持 | 列出对象版本和 delete markers。 |
-| 对象 | `GetObjectAttributes` | 部分支持 | 返回元数据和 multipart `ObjectParts`，但不包含 `TotalPartsCount`。 |
-| 分段上传 | `CreateMultipartUpload` | 支持 | 开始上传。 |
-| 分段上传 | `UploadPart` | 支持 | 上传单个 part。 |
-| 分段上传 | `UploadPartCopy` | 部分支持 | 仅支持整对象复制，不支持 range copy。 |
-| 分段上传 | `CompleteMultipartUpload` | 支持 | 组装 parts。 |
-| 分段上传 | `AbortMultipartUpload` | 支持 | 取消上传。 |
-| 分段上传 | `ListMultipartUploads` | 支持 | 列出未完成上传。 |
-| 分段上传 | `ListParts` | 支持 | 列出已上传 parts。 |
+| Bucket | `CreateBucket` | 支持 | |
+| Bucket | `HeadBucket` | 支持 | |
+| Bucket | `ListBuckets` | 支持 | |
+| Bucket | `DeleteBucket` | 不支持 | 返回 `501 NotImplemented`。 |
+| Bucket | `GetBucketVersioning` | 支持 | 存储桶始终启用版本控制。 |
+| Bucket | `PutBucketVersioning` | 部分支持 | 接受 `Enabled`，拒绝 `Suspended`。 |
+| Bucket ACL | `GetBucketAcl` | 支持 | |
+| Bucket ACL | `PutBucketAcl` | 支持 | 授权会生效，见[访问控制](#访问控制)。 |
+| Object ACL | `GetObjectAcl`, `PutObjectAcl` | 不支持 | |
+| Bucket policy | `GetBucketPolicy`, `PutBucketPolicy`, `DeleteBucketPolicy` | 不支持 | 不保存也不执行策略。 |
+| Bucket tagging | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` | 不支持 | |
+| Object tagging | `GetObjectTagging`, `PutObjectTagging`, `DeleteObjectTagging` | 不支持 | |
+| Ownership controls | `GetBucketOwnershipControls` | 部分支持 | 返回 `BucketOwnerPreferred`。 |
+| Ownership controls | `PutBucketOwnershipControls` | 部分支持 | 只接受 `BucketOwnerPreferred`。 |
+| Ownership controls | `DeleteBucketOwnershipControls` | 部分支持 | 存储桶保持 `BucketOwnerPreferred`。 |
+| Object | `PutObject` | 支持 | |
+| Object | `GetObject` | 支持 | 支持单个字节范围。对未缓存的对象做 Range 读取时，会从存储提供方下载整个对象。 |
+| Object | `HeadObject` | 支持 | 返回所请求版本的自定义元数据。 |
+| Object | `DeleteObject` | 支持 | 见[版本控制与删除](#版本控制与删除)。 |
+| Object | `DeleteObjects` | 支持 | 1 到 1,000 个键。按键报告失败；`Quiet=true` 时不列出成功的键。 |
+| Object | `CopyObject` | 支持 | 源对象必须在缓存中，或有已提交的副本。 |
+| Object | `ListObjects` | 支持 | Marker 分页。 |
+| Object | `ListObjectsV2` | 支持 | Continuation token 分页。 |
+| Object | `ListObjectVersions` | 支持 | 列出版本和删除标记。 |
+| Object | `GetObjectAttributes` | 部分支持 | 对分段上传的对象返回 `ObjectParts`，但不含 `TotalPartsCount`。 |
+| Multipart | `CreateMultipartUpload` | 支持 | |
+| Multipart | `UploadPart` | 支持 | |
+| Multipart | `UploadPartCopy` | 部分支持 | 只支持复制整个对象；指定源范围时返回 `NotImplemented`。 |
+| Multipart | `CompleteMultipartUpload` | 支持 | |
+| Multipart | `AbortMultipartUpload` | 支持 | |
+| Multipart | `ListMultipartUploads` | 支持 | |
+| Multipart | `ListParts` | 支持 | |
 
-## 版本控制行为
+不支持服务端加密；使用客户提供密钥（SSE-C）的请求返回 `501 NotImplemented`。
 
-`DeleteObjects` 接受 1–1000 个条目。包含 `../file.txt` 这类解析后超出存储桶的对象键时，整个批次会在删除任何条目前被拒绝。
+## 访问控制
 
-存储桶按 versioning-enabled 处理。不带 `versionId` 的删除会创建 delete marker。带 `versionId` 的请求要么删除对应的数据版本或 delete marker，要么返回错误；系统不会保留请求并在之后自动执行。删除 delete marker 不受 Filecoin 存储进度阻塞。当存储工作仍在进行，或已提交的 Filecoin 交易仍在等待确认时，删除数据版本会收到 `400 InvalidRequest`，`DeleteObjects` 则为对应条目返回 `InvalidRequest`。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。数据版本删除后，不再被任何版本引用的远端存储会进入后台清理；其他版本仍在使用的共享存储会保留。清理会请求存储提供方删除副本，但并非所有存储提供方都支持：提供方不支持或无法删除的副本，在该版本从网关消失后仍可能留在提供方处。清理完成前（通常几分钟内），向该存储桶上传相同内容会收到 `503 SlowDown`；稍后重试即可，届时会作为新数据存储。Version listing 会返回对象版本和 delete markers。
+Bucket ACL 授权允许其他 S3 用户按所授权限读取、写入和列出数据。即使是 `FULL_CONTROL`，也不允许 `GetObjectAttributes`、删除指定版本、`ListParts`、`AbortMultipartUpload` 或修改存储桶配置；这些操作需要存储桶所有者，或 `admin` 角色的 S3 用户。拥有写权限的用户可以创建并完成分段上传，但列出分段或中止上传需要所有者或 admin。
 
-## 有意不支持
+## 版本控制与删除
 
-- 删除存储桶。
-- 暂停存储桶 versioning。
-- 对象 ACL 授权、存储桶 Policy，以及存储桶或对象 Tagging。
-- 服务端加密，包括客户提供密钥的加密（SSE-C）。
-- `BucketOwnerPreferred` 之外的 Ownership Controls 模式。
-- `GetObjectAttributes.ObjectParts` 中的 `TotalPartsCount`。
-- `UploadPartCopy` 的 multipart range copy。
-- 多个 SynapS3 节点之间的分布式协调。
+存储桶始终保留版本。
 
-## 验证
+- 不带 `versionId` 的 `DeleteObject` 会添加删除标记。
+- 带 `versionId` 的 `DeleteObject` 立即删除该版本或删除标记，否则直接失败；不会排队稍后执行。
+- 数据版本的存储工作仍在进行，或已提交的 Filecoin 交易等待确认时，删除该版本会失败并返回 `400 InvalidRequest`。从未提交过交易的失败存储工作不会阻止删除；存储工作也从不阻止删除删除标记。在 `DeleteObjects` 中，该错误只影响对应的键。
+- 在 `DeleteObjects` 中，如果某个键解析到存储桶之外（例如 `../file.txt`），整个请求会在删除任何对象前被拒绝。
 
-AWS CLI、rclone 和 MinIO Client 示例见 [S3 客户端](../getting-started/s3-clients.md)。
+数据版本删除后，SynapS3 会移除不再被其他版本使用的远端副本，并请求各存储提供方删除其副本。不支持删除的存储提供方会保留其副本。移除完成前（通常几分钟内），向该存储桶上传相同字节会返回 `503 SlowDown`；之后再上传，会作为新数据保存。
+
+客户端配置示例见 [S3 客户端](../getting-started/s3-clients.md)。

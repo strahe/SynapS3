@@ -1,170 +1,105 @@
 ---
 title: Admin API
-description: Reference for SynapS3 health, metrics, dashboard, settings, wallet, task, and S3 user endpoints.
+description: Look up SynapS3 Admin API authentication, endpoints, request fields, and error codes.
 ---
 
 # Admin API
 
-The Admin API is used by the dashboard and CLI. Admin authentication is enabled by default. Keep the listener on loopback for local access; use an HTTPS reverse proxy or SSH tunnel for remote access.
+The dashboard and the `synaps3 admin` CLI use the Admin API. Its base URL is `admin.addr`, by default `http://127.0.0.1:9090`. Requests and responses use JSON unless noted. Errors return `{"error": "<message>"}`, plus `code` where listed below.
 
-Default base URL:
+For safe exposure, see [Network Exposure](../operations/production-checklist.md#network-exposure).
 
-```text
-http://127.0.0.1:9090
-```
+## Authentication
 
-## Setup Mode
-
-When `/healthz` returns `{"status":"setup"}`, the Admin endpoint exposes only the surfaces needed to finish configuration:
-
-- `/healthz`, Admin login, session, refresh, and logout;
-- the dashboard shell;
-- `GET /api/v1/settings`, `PUT /api/v1/settings`, and `POST /api/v1/settings/validate`;
-- `POST /api/v1/filecoin/readiness/preflight`.
-
-Runtime metrics, buckets, objects, tasks, wallet operations, storage health, and S3 user management are unavailable in setup mode. Save valid settings, restart SynapS3, and verify that `/healthz` returns `{"status":"ok"}` before using the full API.
-
-## Auth Model
-
-`/healthz` is public so process health checks can run without credentials. The dashboard shell and static assets can load before login, but dashboard data and write operations require Admin auth.
-
-| Surface | Required auth |
+| Path | Authentication |
 | --- | --- |
 | `/healthz` | None. |
-| `/api/v1/auth/login`, `/api/v1/auth/session` | Login and session endpoints. Session returns `401` when no valid browser session exists. |
-| `/api/v1/auth/refresh` | Unexpired browser session cookie and CSRF header; HTTP Basic auth is not accepted. |
-| `/api/v1/auth/logout` | Verifiable browser session cookie and CSRF header; an expired cookie is accepted. HTTP Basic auth is not accepted. |
-| `/api/v1/*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
-| `/metrics` | Browser session cookie or HTTP Basic auth. |
+| `/api/v1/auth/login` | Username and password in the body. |
+| `/api/v1/auth/session` | Browser session cookie. Returns `401` without a valid session. |
+| `/api/v1/auth/refresh`, `/api/v1/auth/logout` | Browser session cookie and CSRF header. Basic authentication is not accepted. Logout also accepts an expired cookie. |
+| Other `/api/v1/*` paths and `/metrics` | Browser session cookie, or HTTP Basic authentication. |
 
-### Browser Sessions
+The dashboard pages and static files load without authentication; their data does not.
 
-Browser login sets the `synaps3_admin_session` HttpOnly cookie and returns a CSRF token. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests must include `X-SynapS3-CSRF`. Refresh and logout only accept browser sessions.
+**Browser sessions.** Login sets the HttpOnly cookie `synaps3_admin_session` and returns a CSRF token. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests must send it in `X-SynapS3-CSRF`. Login, session, and refresh responses contain `username`, `csrf_token`, `expires_at`, and `refresh_after`. The optional login field `remember` (default `false`) makes the cookie persistent for 30 days or `admin.auth.session_ttl`, whichever is longer. Refresh after `refresh_after` extends the session; an earlier refresh returns the current session unchanged. Logout ends the session and all its refreshed tokens. Sessions survive restarts, except sessions created in setup mode.
 
-The optional `remember` boolean in the login request defaults to `false`. A standard login uses a browser-session cookie and the configured `admin.auth.session_ttl`. When `remember` is `true`, the cookie persists for the greater of 30 days or the configured session TTL. Some browsers can restore browser-session cookies when restoring a previous browsing session.
+**Basic authentication.** Use `admin.auth.username` and the Admin password; no CSRF header is needed. Basic-authenticated requests whose `Sec-Fetch-Site`, `Origin`, or `Referer` header shows a cross-site browser origin are rejected.
 
-Login, session, and refresh responses contain `username`, `csrf_token`, `expires_at`, and `refresh_after`. Any client holding the valid session cookie and matching CSRF token can request renewal after `refresh_after`. The login has no absolute lifetime cap. If no client requests renewal, the token expires at `expires_at`.
+After 5 failed password attempts from one client IP, further attempts are rejected for one minute. Behind a reverse proxy, the client IP comes from forwarded headers only when the proxy address is in `admin.trusted_proxies`.
 
-Refresh preserves the session lifetime, CSRF token, and login family. Logout revokes the whole family, including refreshed tokens. Sessions and completed logouts survive normal-mode restarts; setup-mode sessions end on restart.
+Every response carries `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. Responses under `/api/`, `/metrics`, and `/healthz` also carry `Cache-Control: no-store`.
 
-### CLI and Basic Auth
+### Setup Mode
 
-CLI and script calls can use HTTP Basic auth and do not need a CSRF header. Browser Basic-auth requests are rejected when `Sec-Fetch-Site`, `Origin`, or `Referer` show a cross-site origin. Requests without browser-origin headers still work for CLI and scripts.
+While `/healthz` returns `{"status":"setup"}`, only these endpoints are available: `/healthz`, the `/api/v1/auth/*` endpoints, `GET` and `PUT /api/v1/settings`, `POST /api/v1/settings/validate`, `POST /api/v1/filecoin/readiness/preflight`, and the dashboard pages. Save valid settings and restart SynapS3 to use the rest of the API.
 
-Failed password checks are rate-limited by resolved client IP; additional login attempts are rejected while the limit is active.
+## Endpoints
 
-### Reverse Proxies
-
-When SynapS3 is behind a reverse proxy, forwarded client, scheme, and host headers are used only when `admin.trusted_proxies` contains the proxy IP or CIDR. Keep it empty unless the proxy removes untrusted `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, and `X-Forwarded-Host` headers.
-
-### Admin Credentials
-
-Admin credentials are created by `synaps3 init`. Interactive init prints the password once. Non-interactive and Docker init write it to `admin-initial-password` in the runtime data directory with file mode `0600`. Local `synaps3 admin` commands locate config through `--config`, `SYNAPS3_CONFIG`, then the default path; they use `SYNAPS3_ADMIN_PASSWORD` first, then `admin-initial-password` next to the config file, then the prompt.
-
-Resetting the password also rotates `admin.auth.session_secret`, invalidating existing browser sessions. Reset it offline with:
-
-```bash
-synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
-```
-
-## Auth Endpoints
+### Auth
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/login` | Validate username and password, accept optional `remember`, set the browser cookie, and return the session. |
-| `GET` | `/api/v1/auth/session` | Return the current browser session. |
-| `POST` | `/api/v1/auth/refresh` | Renew an eligible browser session. Early requests return the current session without changing the cookie. |
-| `POST` | `/api/v1/auth/logout` | Revoke the browser login and clear the cookie. `204` confirms success. |
+| `POST` | `/api/v1/auth/login` | Log in with `username`, `password`, and optional `remember`. |
+| `GET` | `/api/v1/auth/session` | Return the current session. |
+| `POST` | `/api/v1/auth/refresh` | Extend the session. |
+| `POST` | `/api/v1/auth/logout` | End the session. Returns `204`. |
 
-Outside logout, an API `401` returns the dashboard to login. Retry failed logout requests. `503` and network errors preserve a cached session; initial verification failures show **Retry**.
-
-## Security Headers
-
-Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The default content policy keeps dashboard resources on the same origin. `/api/`, `/admin/`, `/metrics`, and `/healthz` also send `Cache-Control: no-store`. Dashboard page assets do not.
-
-## High-Risk Operations
-
-Treat these endpoints as change-window operations. They can change data, credentials, wallet payment state, or background state.
-
-| Area | Endpoints | Risk |
-| --- | --- | --- |
-| Settings | `PUT /api/v1/settings` | Changes can require restart. The wallet and network must match the deployment; validate settings and Filecoin readiness before saving. |
-| Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
-| S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
-| Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
-| Tasks and storage health | task retry and acknowledgement, storage provider and data set refresh | Creates another execution, acknowledges a reviewed failure, or refreshes operational status. |
-| Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement` | Creates a new paid data set, moves a replica to it, and ends any existing old data set. |
-
-## Health and Metrics
+### Health and Monitoring
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/healthz` | Health status for database, cache, and background tasks. |
-| `GET` | `/metrics` | Prometheus metrics. Requires Admin auth. |
-| `GET` | `/api/v1/system/info` | Version and runtime information. |
-| `GET` | `/api/v1/workers` | Background task activity and health. |
+| `GET` | `/healthz` | Health status; see [Health](../operations/health-metrics.md#health). |
+| `GET` | `/metrics` | Prometheus metrics; see [Prometheus Metrics](../operations/health-metrics.md#prometheus-metrics). |
+| `GET` | `/api/v1/system/info` | Version, commit, and uptime. |
+| `GET` | `/api/v1/workers` | Background task status. |
 | `GET` | `/api/v1/cache/stats` | Cache usage and capacity. |
+| `GET` | `/api/v1/overview` | Dashboard summary. `tasks.attention.failed` counts unacknowledged failed tasks. |
+| `GET` | `/api/v1/monitoring` | CPU, memory, and traffic samples for the last hour. |
+| `GET` | `/api/v1/events` | Server-sent event stream for the dashboard. A cookie-authenticated stream closes when its session ends. |
 
-See [Health and Metrics](../operations/health-metrics.md#prometheus-metrics) for metric definitions and sampling freshness.
-
-## Dashboard Data
+### Buckets and Objects
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/overview` | Dashboard summary. |
-| `GET` | `/api/v1/events` | Dashboard event stream. Cookie-authenticated streams close when the session expires, is revoked, or cannot be verified. Idle streams are checked every 15 seconds; verification takes at most 5 seconds. |
 | `GET` | `/api/v1/buckets` | List buckets. |
 | `POST` | `/api/v1/buckets` | Create a bucket. |
-| `GET` | `/api/v1/buckets/{name}` | Read bucket detail. |
-| `PUT` | `/api/v1/buckets/{name}/owner` | Update bucket owner. |
-| `PUT` | `/api/v1/buckets/{name}/copy-policy` | Update target replicas and/or the cache-release threshold. |
-| `DELETE` | `/api/v1/buckets/{name}` | Not supported. Returns `501 Not Implemented`. |
+| `GET` | `/api/v1/buckets/{name}` | Bucket detail, including data sets and the 50 most recent storage provider replacements (`replacements`, newest first). |
+| `PUT` | `/api/v1/buckets/{name}/owner` | Change the owner (`owner_access_key`). |
+| `PUT` | `/api/v1/buckets/{name}/copy-policy` | Change the replica settings. |
+| `DELETE` | `/api/v1/buckets/{name}` | Not supported. Returns `501`. |
 | `GET` | `/api/v1/buckets/{name}/objects` | List objects. |
-| `DELETE` | `/api/v1/buckets/{name}/objects` | Create an object delete marker. |
-| `POST` | `/api/v1/buckets/{name}/objects/upload` | Upload an object through the dashboard. |
-| `GET` | `/api/v1/buckets/{name}/objects/download` | Download an object through the dashboard. |
-| `GET` | `/api/v1/buckets/{name}/objects/versions` | List object versions and return the current version token. |
-| `POST` | `/api/v1/buckets/{name}/objects/versions/restore` | Create a new current version from an existing data version. |
-| `GET` | `/api/v1/buckets/{name}/objects/provenance` | Inspect object storage provenance. |
-| `GET` | `/api/v1/buckets/{name}/objects/status-detail` | Read detailed object state. |
+| `DELETE` | `/api/v1/buckets/{name}/objects` | Add a delete marker. |
+| `POST` | `/api/v1/buckets/{name}/objects/upload` | Upload an object. The request `Content-Type` becomes the object's content type. |
+| `GET` | `/api/v1/buckets/{name}/objects/download` | Download an object. |
+| `GET` | `/api/v1/buckets/{name}/objects/versions` | List versions. Includes `current_version_id` when the object has versions. |
+| `POST` | `/api/v1/buckets/{name}/objects/versions/restore` | Copy an earlier version to a new current version. |
+| `GET` | `/api/v1/buckets/{name}/objects/provenance` | Replicas of an object version and their storage providers. |
+| `GET` | `/api/v1/buckets/{name}/objects/status-detail` | Detailed storage state of an object version. |
 | `GET` | `/api/v1/buckets/{name}/objects/deleted` | List deleted objects. |
-| `GET` | `/api/v1/buckets/{name}/objects/deletions` | List object delete markers. |
-| `POST` | `/api/v1/buckets/{name}/objects/restore` | Restore an object from a delete marker. |
-| `POST` | `/api/v1/buckets/{name}/objects/permanent-delete` | Permanently delete an object version. |
-| `POST` | `/api/v1/buckets/{name}/objects/deleted/permanent-delete` | Permanently delete a deleted object version. |
-| `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | List versions affected by storage health issues. |
-| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | List the providers this replica can move to, and why the others cannot take it. |
-| `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
-| `GET` | `/api/v1/storage-confirmations` | List batches that need operator attention. |
+| `GET` | `/api/v1/buckets/{name}/objects/deletions` | List delete markers. |
+| `POST` | `/api/v1/buckets/{name}/objects/restore` | Restore a deleted object. |
+| `POST` | `/api/v1/buckets/{name}/objects/permanent-delete` | Permanently delete a version. |
+| `POST` | `/api/v1/buckets/{name}/objects/deleted/permanent-delete` | Permanently delete a deleted object. |
+| `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | Versions affected by storage health problems. |
 
-For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
+#### Replica Settings
 
-### Bucket Replica Policy
+`POST /api/v1/buckets` accepts `name`, `owner_access_key`, and optional `default_copies`, `minimum_durable_copies`, and `provider_selection_strategy` (`distribution` or `speed`). Omitted values come from the configuration. A bucket keeps its values when the configuration changes later. Bucket responses include `default_copies`, `minimum_durable_copies`, `provider_selection_strategy`, `status`, and `setup_message` while storage is being prepared. See [Target and Minimum Replicas](../concepts/filecoin-storage-flow.md#target-and-minimum-replicas).
 
-`POST /api/v1/buckets` accepts optional `default_copies` and `minimum_durable_copies` fields. Either one left out is taken from the server configuration. A bucket stores the policy it was created with, so later configuration changes leave existing buckets alone. Bucket list, detail, create, and policy-update responses include both values as plain integers:
+`PUT /api/v1/buckets/{name}/copy-policy` accepts `default_copies` and `minimum_durable_copies`:
 
-- `default_copies`: the bucket's replica target;
-- `minimum_durable_copies`: how many replicas must be stored before the cache may be released. It never exceeds the target.
+- An omitted field is unchanged. `"default_copies": null` resets the target to `filecoin.default_copies`; `"minimum_durable_copies": null` sets the minimum to the target.
+- Values must be `1` to `8`, and the minimum must not exceed the resulting target.
+- Lowering `default_copies`, including through a `null` reset, returns `400`. Replicas above a lower target would keep running and costing money.
+- An empty request or an invalid combination returns `400`.
 
-Bucket list and detail responses include `setup_message` while storage is being prepared. It explains waits for speed tests, providers, funds, or storage setup, and points to Tasks when preparation needs Retry.
+#### Permanent Deletion
 
-`PUT /api/v1/buckets/{name}/copy-policy` accepts `default_copies` and `minimum_durable_copies` independently. An omitted field is unchanged. `null` resets that field: `default_copies: null` restores the configured default, and `minimum_durable_copies: null` sets the minimum equal to the replica target. An explicit value must be between `1` and `8`, and the minimum cannot exceed the target produced by the same request. An empty request or an invalid final combination returns `400 Bad Request`.
+`permanent-delete` takes `key` and `version_id`; `deleted/permanent-delete` takes `key` and `delete_marker_version_id`. Both return `409` while storage work for the version is active or a submitted Filecoin transaction awaits confirmation, and when the version is not eligible for deletion. Failed storage work that never submitted a transaction does not block deletion. Invalid requests return `400`; missing buckets, objects, or versions return `404`. Remote replicas used only by the deleted versions are removed in the background.
 
-**Lowering `default_copies` is not supported and returns `400 Bad Request`.** The replicas above a lower target would keep running and keep costing, and nothing retires them, so the target can only be raised. A `null` reset that would land below the bucket's current target is refused for the same reason.
+#### Version Restore
 
-Target changes affect new uploads. Minimum changes also re-evaluate retained cache for current uploads. Increasing the minimum cannot restore cache that has already been deleted.
-
-### Permanently Delete Object Versions
-
-`POST /api/v1/buckets/{name}/objects/permanent-delete` accepts `key` and `version_id`. `POST /api/v1/buckets/{name}/objects/deleted/permanent-delete` accepts `key` and `delete_marker_version_id`.
-
-Both endpoints fail immediately with `409 Conflict` while storage work for a version is active or a submitted Filecoin transaction is awaiting confirmation. Check the related tasks, then try again. For an otherwise eligible data version, stopped storage work that has not submitted a transaction does not block deletion. A selected version or deleted object that is no longer eligible for permanent deletion also returns `409 Conflict`; invalid requests return `400 Bad Request`, and missing buckets, objects, or versions return `404 Not Found`.
-
-After a successful delete, remote storage used only by the removed versions is queued for background cleanup. Storage shared with remaining versions is kept.
-
-### Restore an Object Version
-
-`GET /api/v1/buckets/{name}/objects/versions` includes `current_version_id` on every page when the object has version history. Pass that value when confirming a restore:
+Request:
 
 ```json
 {
@@ -174,222 +109,162 @@ After a successful delete, remote storage used only by the removed versions is q
 }
 ```
 
-`POST /api/v1/buckets/{name}/objects/versions/restore` copies a historical data version to a new version of the same bucket and key. It does not modify or remove existing data versions or delete markers. The selected version must differ from the readable current object representation. Selecting the current version, or an equivalent historical version, is rejected without changing the object. A failed or unavailable current version can still be restored from a readable historical version.
+Use `current_version_id` from the version list as `expected_current_version_id`. On success, the response contains `key`, `source_version_id`, and the new `version_id`; earlier versions and delete markers are unchanged. The restore runs synchronously for up to one hour and needs cache space for the new version.
 
-Successful response:
-
-```json
-{
-  "key": "path/file.txt",
-  "source_version_id": "source-version-id",
-  "version_id": "new-current-version-id"
-}
-```
-
-The request returns `409 Conflict` when the selected version is a delete marker or `expected_current_version_id` is no longer current. Refresh the version list and confirm again with the new token. When the selected version already matches the current object, the response uses a stable code so clients can treat it as a no-op:
-
-```json
-{
-  "error": "selected version already matches the current object",
-  "code": "object_version_already_current"
-}
-```
-
-A missing or permanently deleted source returns `404 Not Found`; insufficient cache capacity returns `503 Service Unavailable`; invalid input returns `400 Bad Request`; source read and internal failures return `500 Internal Server Error`.
-
-The restore streams synchronously for up to one hour and requires enough cache capacity for the new destination version.
-
-### Replace a Storage Provider
-
-`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` is the only way to replace the storage provider behind a replica. One confirmation authorizes all of it: a new paid data set, moving new uploads to it, copying existing data across, and ending any existing old data set once every retained version is readable on the new provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down.
-
-Choose the new provider automatically:
-
-```json
-{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint from the price-list endpoint>" }
-```
-
-Automatic selection excludes every provider the bucket has ever used, including retired ones. Or name the provider yourself:
-
-```json
-{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint from the price-list endpoint>" }
-```
-
-A named provider must have a fresh available, active, PDP-capable health observation and a successful upload speed test for its current service URL. It may be one the bucket used before, provided that earlier service has already been retired. The provider being replaced, and any provider still holding a live generation of this bucket, are rejected. Both selection modes preserve the [configured anchor tier](../configuration/model.md#provider-selection). Automatic selection returns `409 Conflict` with `provider_speed_tests` while eligible trusted providers are waiting for speed tests to finish.
-
-Read `GET /api/v1/filecoin/warm-storage/price-list` before confirmation. It returns the current token address, all rates, fees and lockups as decimal integer strings, the read time, and a fingerprint. A new confirmation rereads the contract price list; `price_list_unavailable`, `price_list_changed`, or `unsupported_price_token` prevents authorization. Review the updated list and use a new request ID after a price change. The fingerprint records the prices reviewed at authorization; on-chain prices may change later.
-
-`client_request_id` is required after trimming and must contain 1–128 characters. The first successful request returns `201 Created`. Replaying the same bucket, source, mode, manual provider, and price fingerprint with the same ID returns the original record and `200 OK`, even after the replica has switched. Reusing the ID with different parameters returns `409 Conflict` with `replacement_idempotency_conflict`. A replay is resolved before current price or, for automatic selection, approval checks, so changes to those inputs cannot authorize a different provider or block a matching replay.
-
-An unfinished replacement reserves its source, target, and replica slot. If its target is not ready and the current setup task is Failed, confirming another provider for the original source replica supersedes that replacement. Other unfinished replacements keep the slot reserved. Known unused services from superseded requests follow normal shutdown. `replacement_active` means the requested replica still belongs to an unfinished replacement; follow its reported next step.
-
-A current replica can be replaced when its service is ready, or when its service is not ready and its current setup task is Failed. Pending or running setup blocks this initialization recovery, including a new task started by Retry. A saved request ID, submitted transaction, or unavailable lookup does not prevent replacement after that failure; no provider lookup is required. Bucket responses provide `replaceable`, optional `replacement_blocked_reason`, and optional `setup_error`; submission rechecks eligibility. Optional `replacement_has_late_service_risk` indicates that a superseded creation request could still create a service.
-
-For a replica without a known service, confirmation stops further creation work for the replaced provider and prepares the selected provider. The original replica keeps its slot until the new service is ready. New uploads that need this replica wait for setup and resume at handover. Required content is restored from another replica or cache; content with neither needs attention. A superseded request that succeeds later can create an unused data set and incur creation charges. SynapS3 does not automatically adopt or clean up such late services.
-
-A successful first confirmation returns `201 Created` with the replacement record; an exact replay returns `200 OK`. `GET /api/v1/buckets/{name}` returns the bucket's recent replacements in `replacements`, newest first, up to the 50 most recent.
-
-Replacement moves through these states:
-
-| Status | Meaning |
+| Status | Cause |
 | --- | --- |
-| `preparing_target` | The new service is being created. A ready source keeps receiving writes; otherwise new uploads wait for the selected provider. |
-| `migrating` | The new provider receives new uploads while existing data is copied across. |
-| `waiting` | Paused. `wait_reason` and `wait_message` distinguish service creation (`target_creating`), writable confirmation (`target_writable`), an unreachable provider (`target`), funding, source availability, and safe retirement waits. Most waits resume without action. |
-| `retiring` | Everything is copied and the old service is being ended. |
-| `cleanup_attention` | Ending the old service needs an operator decision, such as settling payment debt. |
-| `failed` | Work stopped and needs action. Follow `retryable` and the reported next step. |
-| `completed` | Required replicas are readable on the new provider, and any old data set has ended. |
-| `superseded` | A later confirmation replaced this request. |
+| `400` | Invalid request. |
+| `404` | The source version does not exist. |
+| `409` | The source is a delete marker, or the current version changed; reload the list and confirm again. With `"code": "object_version_already_current"`, the source already matches the current object. |
+| `503` | Not enough cache space. |
 
-A stopped retirement also exposes `retirement_attention`, an error, and, when recovery is safe, its bound `retry_task_id`, including for a superseded replacement whose unused target still needs retirement. `last_error` is otherwise set only for `failed` and `cleanup_attention`, and is cleared by a retry. Waiting never sets it, because waiting is not a failure. A failed response may also include `failure_reason`. `target_in_use` requires choosing another provider. `target_rejected` alone does not determine retry eligibility; follow `retryable` and the reported next step. Failed target setup does not restart automatically. Before handover, use **Retry** from **Tasks** when offered to continue with the selected provider, or choose another provider from the original source replica.
-
-`items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
-
-Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, `items_failed`, and `items_attention` report mutually exclusive current work counts. Confirmation work is included in `items_active`; work that needs an operator is included only in `items_attention`. Both counts remain outstanding work. `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
-
-Use the replacement response’s `retry_task_id` with the task Retry endpoint. It continues on the same approved provider.
-
-Choosing a different provider requires a new confirmation, and is only available while the retiring provider still holds the replica. Once the new provider has taken the replica over, each generation holds data the other does not, so confirming again on either one is refused (`replacement_source_not_current` on the old, `replacement_active` on the new) and the approved replacement has to be finished with retry.
-
-Conflicts return `409 Conflict` with a stable code:
-
-```json
-{
-  "error": "that provider already stores a replica of this bucket",
-  "code": "replacement_target_in_use"
-}
-```
-
-The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_target_creating`, `replacement_source_not_current`, `replacement_source_running`, `replacement_source_outcome_unknown`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, `replacement_idempotency_conflict`, and `provider_speed_tests`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; an unavailable manual target returns `400` with `replacement_target_unavailable`; a failed on-chain approval check during automatic selection returns `503 Service Unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; unavailable Filecoin storage returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
-
-`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists all providers with a recorded health observation. Each row includes `manual_selectable`, `manual_block_reason`, `approved_fresh`, `previously_used`, the saved Registry profile when available, health, and recent upload speed. An ineligible provider remains visible for inspection. Reasons include `current_source`, `already_serves_bucket`, `provider_unavailable`, `observation_stale`, `profile_missing`, `profile_url_changed`, `upload_speed_untested`, and `upload_speed_failed`. Test an unmeasured provider or Retry its failed test before confirming it as a target.
-
-Manual confirmation does not check whether the provider still holds a data set for this bucket on chain. A provider that still holds a data set for this bucket on chain is detected when the replacement prepares its target: the replacement stops at `failed` with the provider and data set named, and the operator confirms again on a different provider. The replica has not moved at that point. A provider whose earlier data set for this bucket was retired normally can be chosen again.
-
-### Batches That Need Attention
-
-A batch covers one or more pieces sent to the same data set in one signed request. When the provider rejects it, gives no reply, or still cannot be asked about it 15 minutes after it was sent, SynapS3 checks on chain whether those pieces were added. If they were not, SynapS3 submits the original request again; the chain accepts that request only once. While the provider reports the request as pending, SynapS3 keeps waiting for it. A provider that refuses the request is asked again later, and a piece it dropped before the batch was confirmed is uploaded again before the whole request is sent again. When the chain shows the request's nonce already used for other pieces or another data set, a request the provider never accepted is signed again with a new nonce, while one the provider accepted stops for review. Automatic recovery uses a finite execution budget; when it runs out, the saved batch remains available for manual Retry.
-
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists batches that need attention, including any still unconfirmed after 15 minutes while SynapS3 keeps trying: the batch (`request_id`), owning task (`task_id`), provider and data set, its pieces (`piece_count`, `piece_cids`), the known transaction, the provider's reply when the submission failed (`submit_error`), `submitted_at`, `attention_at`, and stable `reason_code`. The Tasks page shows the same batches on their Commit batch tasks. Retry a stopped one with `POST /api/v1/tasks/{id}/retry`; a new execution resumes from the saved batch evidence.
-
-### Failed Replica Recovery
-
-Provenance replicas and replacement details expose `retryable` and `retry_task_id`. Use the task Retry endpoint for that ID. A missing historical task has no Retry action. A replica reaches `committed` when its recovery is complete.
-
-## Tasks
+### Storage Providers and Replacement
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/tasks` | List work or history. Supports `scope`, `type`, `status`, `limit`, and ID-based `cursor`. |
-| `GET` | `/api/v1/tasks/stats` | Count tasks by status within `scope=work` or `scope=history`. |
-| `GET` | `/api/v1/tasks/{id}` | Read the task and its frozen execution policy. |
-| `GET` | `/api/v1/tasks/{id}/history` | Read its execution chain with `limit` and `cursor`. |
-| `GET` | `/api/v1/tasks/{id}/events` | Read retained key events with `limit` and `cursor`. Selection failures include sanitized `provider_selection` evidence. |
-| `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | Read one task subject and its known related information. |
-| `POST` | `/api/v1/tasks/{id}/retry` | Create a new execution when `retryable` is true. |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | Move a reviewed failure to the `history` scope when `acknowledgeable` is true; preserve its result and Retry eligibility. |
-| `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk acknowledgement would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
-| `POST` | `/api/v1/tasks/acknowledge` | Acknowledge matching failures. Returns `acknowledged` with the number updated. |
+| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | Storage providers that can take this replica, and why the others cannot. |
+| `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Replace the storage provider of a replica. |
+| `GET` | `/api/v1/filecoin/warm-storage/price-list` | Current storage prices and a `fingerprint` to confirm a replacement. |
+| `GET` | `/api/v1/observability/providers` | Storage providers with health, registry profile, approved and endorsed membership, and latest speed test. |
+| `POST` | `/api/v1/observability/providers/refresh` | Recheck storage provider health. |
+| `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | Recheck one storage provider's profile and health. |
+| `POST` | `/api/v1/observability/provider-tiers/refresh` | Reload the approved and endorsed lists. |
+| `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | Start a speed test. Returns `202` with `task_id`; `404` for an unknown storage provider; `409` if a test is running or the storage provider is not eligible. |
+| `POST` | `/api/v1/observability/providers/upload-speed-tests` | Queue speed tests for eligible storage providers without a result. Returns `202` with `queued`. |
+| `GET` | `/api/v1/observability/providers/upload-speed-summary` | Speed test progress and whether storage providers can be selected. |
+| `GET` | `/api/v1/observability/data-sets` | Health of this node's data sets. |
+| `POST` | `/api/v1/observability/data-sets/refresh` | Recheck data set health. |
 
-`POST /api/v1/tasks/{id}/retry` takes no body and returns `202 {"task_id":456}`. Automatic retries stay in the original execution; manual Retry creates a successor with a fresh policy and budget. Repeating the same request returns the same successor. Missing tasks return 404; obsolete or unsafe sources return 409 with an explanation. Temporary transaction contention returns 503; retry the request.
+A speed test uploads up to 32 MiB within 30 seconds and needs at least 8 MiB to produce a result. Results apply only to the storage provider's current service URL. Storage provider entries include `upload_speed_testable`, `upload_speed_unavailable_reason`, and `upload_speed_test` (`bytes_per_second`, `duration_ms`, `sample_bytes`, `tested_at`, and `state`, which is `testing` during a retest of the same URL and `stale` after the URL changes). A failed test includes `retry_task_id`. When a health check fails, `signal.last_error` gives the reason.
 
-`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`. Responses also include `operation`, optional subject identity, and server-computed `retryable`, `retry_task_id`, and `acknowledgeable` fields. In task entries, `retry_task_id` identifies the source to pass to Retry; in a superseded event, it identifies the successor returned by Retry. Task lists and details check current recovery conditions; details may include `retry_unavailable_reason`. Retry always rechecks safety and ownership before creating a successor. A Commit batch task whose batch needs attention also includes `storage_confirmation` with `request_id`, `reason_code`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, any known `transaction_id`, `submit_error`, and timestamps. Such a task is never `acknowledgeable`, and acknowledging it returns `409 Conflict`; retry it instead.
+The speed test summary returns `auto_scope`, `trusted` and `other` counts (`total`, `succeeded`, `failed`, `testing`, `untested`), `selectable_providers`, `required_copies`, `ready`, `can_provision_default`, and `can_test_remaining`.
 
-List and statistics default to `scope=work`: pending, running, and unacknowledged failures. `scope=history` contains completed, cancelled, acknowledged, and superseded executions, including periodic work. `work` accepts `pending`, `running`, or `failed`; `history` accepts `completed`, `cancelled`, or `failed`. An invalid scope or unavailable status returns 400. Acknowledgement moves a failure to `history` without changing its Failed result or Retry eligibility; history is retained indefinitely. The Tasks page shows `work` as Open and `history` as Closed.
-
-Subject lookup accepts `storage_content`, `storage_copy`, `storage_data_set`, `bucket`, `provider`, `storage_replacement`, `wallet_operation`, and `storage_commit_request`. Local resource keys are positive integer IDs, provider keys are decimal uint256 IDs, and batch keys are request IDs; encode each path segment separately. The response includes `subject_type`, `subject_key`, and available resource fields. `copy_index` starts at zero; `local_data_set_id` and string `data_set_id` distinguish local and on-chain data sets. A file sample has `key`, `source` (`current`, `historical`, or `deleted`), and `other_versions`. Wallet amounts remain strings in USDFC base units. Invalid parameters return `400`, unavailable subjects return `404`, and query failures return `500`. Lookup uses local records and may return partial information.
-
-`started_at` is when actual task work first began. Uploads start after waiting for storage resources and hashing the data, immediately before transfer. The field is omitted when work has not started or its start cannot be reliably determined, including tasks that finish without starting work. A new execution records its own actual start or recovery time. `started_at` and `finished_at` retain fractional seconds.
-
-Duration measures actual start to finish, including later waits, retries, and recovery gaps. Pending and running tasks and tasks without a known start show no duration; acknowledgement does not change it. The Tasks page reads subjects only when their tooltip or popover opens.
-
-Bulk acknowledgement takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
+#### Replacement Request
 
 ```json
-{
-  "type": "storage_store",
-  "failed_before": "2026-09-12T08:30:00Z"
-}
+{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint>" }
 ```
 
-Failures recorded after that moment stay visible, so a backlog can be cleared without hiding a failure nobody has reviewed. An unknown `type` or an unparsable `failed_before` returns `400 Bad Request`, as does a body with unknown fields, trailing content, or more than 4 KiB.
+```json
+{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint>" }
+```
 
-To show a number before acknowledging, count first and then confirm with the cutoff that count was taken at:
+- `client_request_id` (1 to 128 characters) makes the request idempotent. The first request returns `201`; the same request again returns the original record with `200`. The same ID with different parameters returns `409` with `replacement_idempotency_conflict`.
+- `price_list_fingerprint` comes from the price list. If prices changed, the request fails with `price_list_changed`; `price_list_unavailable` and `unsupported_price_token` also block it. Reload the price list and use a new request ID.
+- Automatic mode never picks a storage provider the bucket has used. It returns `409` with `provider_speed_tests` while eligible storage providers are still being tested.
+- Manual mode accepts a storage provider with a fresh healthy check and a successful speed test, which does not hold a current replica of the bucket. A storage provider whose data sets for this bucket are all retired can be chosen again.
+- Both modes keep the `filecoin.anchor_provider_tier` requirement.
+- If the chosen storage provider already holds a data set for this bucket on chain, the replacement stops with `failed` before the replica moves. Confirm again with another storage provider.
+
+The candidate list (`replacement/providers`) includes every storage provider with a health result, with `manual_selectable` and `manual_block_reason`: `current_source`, `already_serves_bucket`, `provider_unavailable`, `observation_stale`, `profile_missing`, `profile_url_changed`, `upload_speed_untested`, or `upload_speed_failed`.
+
+Data set entries in bucket responses include `replaceable`, `replacement_blocked_reason`, and `setup_error`. A replica can be replaced when its data set is ready or its setup task has failed.
+
+#### Replacement Status
+
+| `status` | Meaning |
+| --- | --- |
+| `preparing_target` | The new data set is being created. |
+| `migrating` | New uploads go to the new storage provider while stored data is copied. |
+| `waiting` | Paused until a condition clears; see `wait_reason` and `wait_message`. |
+| `retiring` | Copying is done; the old data set is being terminated. |
+| `cleanup_attention` | Terminating the old data set needs operator action, such as settling a payment. |
+| `failed` | Stopped. Follow `retryable` and the error. `failure_reason` is `target_in_use` (choose another storage provider) or `target_rejected`. |
+| `completed` | Every retained version is readable on the new storage provider, and the old data set is terminated. |
+| `superseded` | A later confirmation for the same replica replaced this request. |
+
+`wait_reason` values: `target_creating`, `target_writable`, `target` (new storage provider unreachable), `funding`, `readable_source` (no replica or cache copy to copy from), `provider`, `source_writes`, `coverage`, and `termination_epoch`. Most waits clear on their own.
+
+To retry, pass `retry_task_id` to `POST /api/v1/tasks/{id}/retry`. The retry continues with the same storage provider. To choose a different storage provider, confirm a new replacement; this works only while the old storage provider still holds the replica. After the new storage provider takes over, a new confirmation returns `replacement_source_not_current` (old replica) or `replacement_active` (new replica), and the replacement must be finished with retries.
+
+`progress` reports `phase` (`prepare`, `migrate`, `retire`, or `none`), `seeding_complete`, `items_total`, `items_processed` (`items_copied` + `items_no_longer_needed`), `percent` (only after `seeding_complete`), the current counts `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, `items_failed`, and `items_attention`, and `next_retry_at`. Items count unique stored content, not object versions.
+
+#### Replacement Errors
+
+| Status | Code |
+| --- | --- |
+| `400` | `replacement_target_invalid`, `replacement_target_unavailable` (manual mode) |
+| `404` | Unknown bucket, data set, or replacement. |
+| `409` | `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_target_creating`, `replacement_source_not_current`, `replacement_source_running`, `replacement_source_outcome_unknown`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, `replacement_idempotency_conflict`, `provider_speed_tests` |
+| `503` | Filecoin storage or the on-chain approval check is unavailable. |
+
+### Batches
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/commit-batches` | List batches. Accepts `status` (`collecting`, `ready`, `submitted`, `confirmed`, `abandoned`), `limit` (1 to 100, default 20), and `cursor`. |
+| `GET` | `/api/v1/commit-batches/{id}` | Batch detail, including pieces and transaction. |
+| `POST` | `/api/v1/commit-batches/{id}/seal` | Request early submission of the next batch (**Submit next batch**). Empty body. |
+| `GET` | `/api/v1/storage-confirmations` | Batches that need attention. Accepts `status=needs_attention` and `limit`. |
+
+Each entry from `storage-confirmations` has `request_id`, `task_id`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, `transaction_id`, `submit_error` (the storage provider's reply), `reason_code`, `submitted_at`, and `attention_at`. A batch appears here when the storage provider rejected it or it is still unconfirmed 15 minutes after submission. Retry it with `POST /api/v1/tasks/{task_id}/retry`.
+
+### Tasks
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/tasks` | List tasks. Accepts `scope`, `type`, `status`, `limit`, and `cursor`. |
+| `GET` | `/api/v1/tasks/stats` | Count tasks by status in a `scope`. |
+| `GET` | `/api/v1/tasks/{id}` | A task and its retry policy. |
+| `GET` | `/api/v1/tasks/{id}/history` | Earlier executions. Accepts `limit` and `cursor`. |
+| `GET` | `/api/v1/tasks/{id}/events` | Key events. Accepts `limit` and `cursor`. |
+| `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | What a task works on. |
+| `POST` | `/api/v1/tasks/{id}/retry` | Retry a failed task. |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | Acknowledge a failed task. |
+| `GET` | `/api/v1/tasks/acknowledge/preview` | Count the failures a bulk acknowledgement would cover. |
+| `POST` | `/api/v1/tasks/acknowledge` | Acknowledge failed tasks in bulk. |
+
+`scope` is `work` (default: pending, running, and unacknowledged failed tasks) or `history` (completed, cancelled, acknowledged, and superseded executions). `status` accepts `pending`, `running`, or `failed` with `work`, and `completed`, `cancelled`, or `failed` with `history`; other values return `400`. Lists are newest first; pass `next_cursor` as `cursor` for the next page. Task types are listed in the [CLI Reference](./cli.md#tasks).
+
+A task includes `type`, `operation`, `status` (`pending`, `running`, `completed`, `failed`, `cancelled`), `presentation_status` (`queued`, `scheduled`, or `waiting` for pending tasks), `retryable`, `retry_task_id`, `retry_unavailable_reason`, `acknowledgeable`, `last_error`, `started_at`, and `finished_at`. A **Commit batch** task whose batch needs attention also includes `storage_confirmation`; it cannot be acknowledged (`409`) and must be retried.
+
+**Retry.** `POST /api/v1/tasks/{retry_task_id}/retry` takes no body and returns `202` with `{"task_id": <new-id>}`. Repeating it returns the same new task. It returns `404` for an unknown task, `409` with an explanation when retry is not safe, and `503` when the server is busy; retry the request then. Replica, replacement, and speed test entries elsewhere in the API expose `retryable` and `retry_task_id` for this endpoint.
+
+**Acknowledge.** Acknowledging moves a failure to `history` without changing its result or whether it can be retried. The bulk endpoint takes an optional `type` and an optional RFC 3339 `failed_before` (default: the time of the request), and returns `acknowledged`. Unknown fields, an unknown `type`, an invalid time, or a body over 4 KiB return `400`. To acknowledge exactly what you counted, pass the preview's `as_of` as `failed_before`:
 
 ```bash
-curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
+curl -s -u admin "http://127.0.0.1:9090/api/v1/tasks/acknowledge/preview?type=storage_store"
 # {"count":12,"as_of":"2026-09-12T08:30:00.123456789Z"}
 ```
 
-Passing that `as_of` back as `failed_before` acknowledges exactly what was counted.
+**Subjects.** `subject_type` is `storage_content`, `storage_copy`, `storage_data_set`, `bucket`, `provider`, `storage_replacement`, `wallet_operation`, or `storage_commit_request`. URL-encode each path segment. Wallet amounts are strings in USDFC base units.
 
-`/api/v1/overview` groups `tasks.by_status` by status. It reports current work; acknowledged and superseded failures are in History. `tasks.attention.failed` counts failures that still need attention.
-
-Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacements and failed speed tests use the same task Retry endpoint. Retry eligibility depends on the current operation and saved evidence; uncertain external effects are observed before any safe resend. Missing task history prevents Retry.
-
-## Wallet and Filecoin
+### Wallet and Filecoin
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/wallet` | Wallet identity, balances, and contract state. |
-| `POST` | `/api/v1/wallet/fund` | Create a wallet funding operation. |
-| `POST` | `/api/v1/wallet/withdraw` | Create a wallet withdrawal operation. |
-| `POST` | `/api/v1/wallet/approve` | Create an explicit FWSS approval operation. Payload only accepts `client_request_id`. |
-| `GET` | `/api/v1/wallet/operations` | List wallet operations. |
-| `GET` | `/api/v1/filecoin/readiness` | Check Filecoin readiness. |
-| `POST` | `/api/v1/filecoin/readiness/preflight` | Validate pending Filecoin settings. |
-| `GET` | `/api/v1/filecoin/warm-storage/price-list` | Current Warm Storage price fields and review fingerprint. |
-| `GET` | `/api/v1/observability/providers` | Provider health, saved Registry profile with independent FWSS approved and endorsed membership and collection times, and latest upload speed. |
-| `POST` | `/api/v1/observability/providers/refresh` | Refresh provider health. |
-| `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | Refresh one provider's Registry profile and health. Concurrent requests for the same ID conflict. |
-| `POST` | `/api/v1/observability/provider-tiers/refresh` | Refresh approved and endorsed lists concurrently. Returns `approved_result` and `endorsed_result`, each with success, attempt time, and collection time or error. A failed list retains its previous profile flags and collection times. |
-| `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | Start one 32 MiB upload speed test for an available provider. Returns `202 Accepted` with `task_id`, `404 Not Found` for an unknown provider, or `409 Conflict` if a test is already running or the provider is ineligible. |
-| `GET` | `/api/v1/observability/providers/upload-speed-summary` | Read stored speed-test progress and provider selection readiness without refreshing the network. |
-| `POST` | `/api/v1/observability/providers/upload-speed-tests` | Queue eligible providers with no completed result for their current URL. Returns `202 Accepted` with `queued`; running tests and completed results are skipped. |
-| `GET` | `/api/v1/observability/data-sets` | Local data set health data, with stopped batches per listed data set in `storage_confirmations_by_data_set`. |
-| `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
+| `GET` | `/api/v1/wallet` | Wallet address, balances, payment account, and FWSS approval. |
+| `POST` | `/api/v1/wallet/fund` | Deposit USDFC into the payment account. Body: `client_request_id`, `amount`. |
+| `POST` | `/api/v1/wallet/withdraw` | Withdraw USDFC from the payment account. Body: `client_request_id`, `amount`. |
+| `POST` | `/api/v1/wallet/approve` | Approve FWSS. Body: `client_request_id` only. |
+| `GET` | `/api/v1/wallet/operations` | Recent wallet operations. |
+| `GET` | `/api/v1/filecoin/readiness` | Filecoin readiness checks. |
+| `POST` | `/api/v1/filecoin/readiness/preflight` | Check Filecoin settings before saving them. |
 
-Provider listings and replacement candidates include `upload_speed_testable`, an optional `upload_speed_unavailable_reason`, and `upload_speed_test` when a result is recorded. Testing eligibility is independent of bucket replacement eligibility. `upload_speed_test.last_success`, when present, reports the last successful test for the current service address, for reference only. The latest failed test still blocks new bindings. Successful results report `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`. Tests upload up to 32 MiB within 30 seconds; at least 8 MiB is required to estimate speed if the window expires. The sample does not guarantee object upload speed. See [Provider Selection](../configuration/model.md#provider-selection) for automatic testing and remeasurement.
+`amount` is a decimal string in USDFC base units. These endpoints send on-chain transactions that spend wallet funds.
 
-Same-URL remeasurement returns `state: "testing"` with the last completed result; a retained successful speed remains valid for selection. A missing or changed service URL makes the result `stale`. Failed tests expose `retry_task_id` for the task Retry endpoint. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
-
-The summary returns `auto_scope`, separate `trusted` and `other` counts (`total`, `succeeded`, `failed`, `testing`, `untested`), `selectable_providers`, and `required_copies`. `ready` means eligible trusted providers have completed results. `can_provision_default` also checks the default replica count and, when required, fresh anchor-tier membership. `can_test_remaining` indicates whether more untested providers can be queued.
-
-When a provider health check fails, the provider's `signal.last_error` says why: the check timed out, could not connect, was redirected, received an HTTP error status, or got a reply that is not from a PDP service.
-
-The two tier lists are collected independently. A profile with no collection time has unknown membership; after a successful collection, `false` means it was not listed. Membership is fresh for two configured refresh intervals. Only providers with a saved Registry profile are annotated.
-
-The single-provider refresh response has separate `profile_result` and `health_result` objects, each with success, attempt time, and a collection time or error. A failed part retains its previous successful data and observation time.
-
-## Settings and S3 Users
+### Settings and S3 Users
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/settings` | Read effective settings and metadata. |
-| `PUT` | `/api/v1/settings` | Persist settings changes. |
-| `POST` | `/api/v1/settings/validate` | Validate a settings payload without saving. |
+| `GET` | `/api/v1/settings` | Saved settings, field metadata, and fields set by environment variables. |
+| `PUT` | `/api/v1/settings` | Save settings. Applies after a restart. |
+| `POST` | `/api/v1/settings/validate` | Validate settings without saving. |
 | `GET` | `/api/v1/s3-users` | List S3 users. |
 | `POST` | `/api/v1/s3-users` | Create an S3 user. |
-| `PUT` | `/api/v1/s3-users/{accessKey}` | Update an S3 user name or role. |
-| `POST` | `/api/v1/s3-users/{accessKey}/secret` | Rotate an S3 secret key. |
+| `PUT` | `/api/v1/s3-users/{accessKey}` | Change an S3 user's name or role. |
+| `POST` | `/api/v1/s3-users/{accessKey}/secret` | Rotate the secret key. |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | Delete an S3 user. |
 
-`POST /api/v1/s3-users` accepts an optional `name` alongside `role`. `PUT /api/v1/s3-users/{accessKey}` accepts either field; omit `name` to leave it unchanged or send `"name": ""` to clear it. Names are trimmed, limited to 128 Unicode characters, cannot contain control characters, and must be unique among nonempty names (case-sensitive). List, create, and update responses include `name`. Access keys remain the credential and bucket-owner identity.
+`GET /api/v1/settings` also returns `runtime_filecoin_default_copies`, the default replica target the running process uses; `config.filecoin.default_copies` is the saved value for the next restart.
 
-Cache settings expose `eviction_policy`, `lru_high_watermark_percent`, and `lru_low_watermark_percent` under `cache`. Valid policies are `lru`, `after_upload`, and `none`. Watermarks must satisfy `0 <= low < high <= 100` and only affect `lru`.
-
-When the full runtime is available, `GET /api/v1/settings` also returns `runtime_filecoin_default_copies`. This is the value used by the current process. `config.filecoin.default_copies` remains the saved value that takes effect after the next restart.
-
-After saving settings, restart SynapS3, check `/healthz`, and read settings again to confirm the effective values.
-
-## Write Example
+`POST /api/v1/s3-users` accepts `role` (`user`, `userplus`, `admin`; default `userplus`) and an optional `name`. `PUT` accepts either field; `"name": ""` clears the name. Names are at most 128 characters, contain no control characters, and are unique (case-sensitive); a duplicate returns `409`. The create and rotate responses contain the secret key, which is not shown again.
 
 ```bash
 curl -X POST http://127.0.0.1:9090/api/v1/s3-users \
   -u admin \
   -H 'Content-Type: application/json' \
-  -d '{"role":"user"}'
+  -d '{"role":"userplus"}'
 ```
 
-Enter the Admin password at curl's no-echo prompt. The response contains an access key, secret key, and role. The secret is shown only once; save it in a credential file protected with `0600` and rotate it immediately if exposed.
+curl prompts for the Admin password.

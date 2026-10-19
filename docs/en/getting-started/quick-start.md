@@ -1,48 +1,39 @@
 ---
 title: Quick Start
-description: Start a SynapS3 node and upload the first object.
+description: Check a new SynapS3 node, create S3 credentials, and upload a first object.
 ---
 
 # Quick Start
 
-Choose an installation method first:
-
-- Run the node in containers: follow [Docker Deployment](./docker.md).
-- Build and run the binary directly: follow [Build from Source](./source.md).
-
-Complete initialization, wallet configuration, and startup on the selected page before continuing here.
+Complete [Docker Deployment](./docker.md) or [Build from Source](./source.md) first, including the wallet setup.
 
 ## Check the Node
-
-The default Admin address is `http://127.0.0.1:9090`:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 ```
 
-The expected response is `{"status":"ok"}`. `setup` means required settings are still missing. `unhealthy` means the database, cache, or workers need attention. See [Troubleshooting](../operations/troubleshooting.md) for recovery steps.
+Continue when the response is `{"status":"ok"}`. For `setup` or `unhealthy`, see [Troubleshooting](../operations/troubleshooting.md).
 
-If the node runs on a remote host without Admin HTTPS, use an SSH tunnel for dashboard access:
+To open the dashboard on a remote host without Admin HTTPS, forward the Admin port and browse to `http://127.0.0.1:9090`:
 
 ```bash
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-Do not bind port 9090 directly to a public interface.
-
 ## Create an S3 User
 
-Sign in to the dashboard and create a user on the **S3 users** page. You can also use the native Admin CLI in the installation environment:
+In the dashboard, open **S3 users** and select **Create S3 user**, or run:
 
 ```bash
 synaps3 admin s3-user create
 ```
 
-The secret key is shown only once. Store the credentials in a client configuration protected with `0600`, and rotate them immediately if exposed.
+The secret key is shown only once. Store it in a client configuration file with mode `0600`.
 
 ## Upload the First Object
 
-This MinIO Client example reads credentials interactively so the secret key is not placed in shell history:
+This MinIO Client example reads the credentials at a prompt so the secret key stays out of shell history:
 
 ```bash
 printf '%*s\n' 128 'hello synaps3' > hello.txt
@@ -59,6 +50,8 @@ mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
 ```
 
-`mc cat` prints the uploaded content. The sample file is padded because the Filecoin upload path requires objects of at least 127 bytes.
+`mc cat` prints the uploaded content. Objects must be at least 127 bytes, so the sample file is padded to 128 characters.
 
-See [S3 Clients](./s3-clients.md) for AWS CLI and rclone examples. Complete the [Production Checklist](../operations/production-checklist.md) before serving production traffic.
+Uploads to a new bucket return `503 SlowDown` until SynapS3 finishes preparing its storage. Retry when the bucket is ready; see [S3 Requests Return SlowDown](../operations/troubleshooting.md#s3-requests-return-slowdown).
+
+Next, configure other clients with [S3 Clients](./s3-clients.md), and complete the [Production Checklist](../operations/production-checklist.md) before serving production traffic.

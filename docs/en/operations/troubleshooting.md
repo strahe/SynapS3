@@ -1,11 +1,9 @@
 ---
 title: Troubleshooting
-description: Diagnose common SynapS3 setup, health, wallet, cache, task, and provider issues.
+description: Diagnose and fix SynapS3 startup, health, S3, cache, task, wallet, and storage provider problems.
 ---
 
 # Troubleshooting
-
-Start here when an upload, download, login, or background storage operation fails. Check health first, then narrow the problem by wallet, cache, task, or storage provider signals.
 
 ## First Checks
 
@@ -15,155 +13,136 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-Expected healthy baseline:
-
-```json
-{"status":"ok"}
-```
-
-If health is not `ok`, use the error text as the next branch.
+If the status is not `ok`, go to the matching section below. Status meanings are listed in [Health](./health-metrics.md#health).
 
 ## Setup Mode
 
-Health may return:
+`{"status":"setup"}` means required settings are missing or invalid. `synaps3 admin status` and the **Settings** page list them.
 
-```json
-{"status":"setup"}
-```
+The most common cause is a missing wallet private key. Set `SYNAPS3_FILECOIN_PRIVATE_KEY` or `filecoin.private_key` (generate one with `synaps3 wallet generate` if needed), restart SynapS3, and check that `/healthz` returns `ok`.
 
-This means SynapS3 is missing required settings. Review the configuration validation details before changing a value.
+## Startup Fails
 
-Check the reported fields:
-
-```bash
-synaps3 admin status
-synaps3 admin settings get
-```
-
-If the wallet private key is missing, generate one:
-
-```bash
-synaps3 wallet generate
-```
-
-If the missing value is the wallet key, set the generated private key in `SYNAPS3_FILECOIN_PRIVATE_KEY` or `filecoin.private_key` in the config file. Restart SynapS3, check `/healthz`, and verify the effective settings.
-
-Expected result: health changes from `setup` to `ok` after restart.
+| Error | Fix |
+| --- | --- |
+| `database.dsn is not set` | Set `database.dsn` or `SYNAPS3_DATABASE_DSN`. |
+| `database belongs to another Filecoin wallet or network` | The private key or `filecoin.network` differs from the one the database was created with. Use the original private key and network, or a separate database. |
+| `database contains an incompatible SynapS3 schema` | See [If the Database Is Incompatible](./backup-recovery.md#if-the-database-is-incompatible). |
+| `locking migrator` | A previous migration was killed. If no other SynapS3 process is running, run `synaps3 migrate --force-unlock`, then start again. |
+| A validation error for `admin.auth.*` | Run `synaps3 admin-auth reset-password --config <path>`. |
 
 ## Unhealthy Background Tasks
 
-Example:
+`{"status":"unhealthy","errors":["worker/tasks: not responding"]}` means background task processing has stopped.
 
-```json
-{"status":"unhealthy","errors":["worker/tasks: not responding"]}
-```
+1. Record the current state:
 
-Check task pressure:
+   ```bash
+   synaps3 admin task stats
+   synaps3 admin task list --status running --limit 20
+   ```
 
-```bash
-synaps3 admin task stats
-synaps3 admin task list --status running --limit 20
-```
+2. Check the SynapS3 logs for errors.
+3. Restart SynapS3. Unfinished tasks resume after the restart.
 
-After a restart, unfinished tasks become eligible to continue. If background task processing stays unhealthy, record the current task state, inspect logs, and then restart the service.
+## S3 Requests Return SlowDown
 
-## Wallet Funding or Deposit Fails
+SynapS3 returns `503 SlowDown` for several conditions. The error message names the cause:
 
-Check wallet status:
+| Message | Cause | Action |
+| --- | --- | --- |
+| `The bucket is still being prepared. Please retry shortly.` | The bucket's data sets are not ready yet. | Check the bucket's status and preparation message in the dashboard, and the speed-test notice on the **Storage** page. Retry when the bucket is **Ready**. |
+| `The local cache is full. Please retry later.` | The write does not fit in the cache. | See [Cache Full](#cache-full). |
+| `The same data is still being removed after an earlier delete. Please retry shortly.` | You deleted the last version holding these bytes, and SynapS3 is still removing the remote replicas. | Retry after a few minutes. The upload is then stored as new data. |
+| Any other message | More than `server.max_requests` requests are in flight. | Retry with backoff, or raise `server.max_requests`. |
 
-```bash
-synaps3 admin status
-```
-
-For Calibration, fund the wallet address again:
-
-```bash
-synaps3 wallet fund-testnet 0x...
-```
-
-Then retry deposit and FWSS approval:
-
-```bash
-synaps3 wallet deposit 2 # 2 USDFC
-synaps3 wallet approve
-```
-
-If faucet funding fails, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/), then rerun `synaps3 admin status`.
-
-Successful faucet claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`. A confirmed deposit or approval prints `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`. If these results do not appear, verify RPC connectivity, wallet funds, and the reported error before retrying.
+S3 clients retry `SlowDown` a few times by default and may give up before the condition clears; retry the operation later.
 
 ## Cache Full
 
-When the local cache cannot hold a write, S3 clients and dashboard uploads receive `503 SlowDown`. Uploads in progress hold cache capacity for their full size, so a new upload can be refused while reported usage is still below the limit. Completing a multipart upload needs free capacity for the assembled object in addition to its parts. Check usage:
+A write that does not fit in the cache fails with `503 SlowDown`. Writes in progress reserve their full size, so a write can be refused while reported usage is below the limit.
 
 ```bash
 synaps3 admin status
 synaps3 admin settings get cache.max_size_gb
 synaps3 admin settings get cache.eviction_policy
-synaps3 admin settings get cache.lru_high_watermark_percent
-synaps3 admin settings get cache.lru_low_watermark_percent
 ```
 
-Recovery options:
+The cache frees space only after versions reach their bucket's minimum durable replicas; see [Cache Eviction](../concepts/write-path-cache.md#cache-eviction). To recover:
 
-- Confirm the host has free disk space, then increase `cache.max_size_gb` if capacity allows.
-- Restore storage provider connectivity and background task progress so queued uploads can complete and cache eviction can run.
-- If batches are waiting to fill, open **Batches** and choose **Submit next batch**, or enable [automatic early submission](../configuration/model.md) in Settings and restart.
-- Use the default `lru` policy for capacity-based cleanup. Lower the high watermark to leave more write headroom, and keep `0 <= low < high <= 100`.
-- Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable replicas commit.
-- Use `none` when automatic removal must be disabled.
+- Restore storage provider connectivity and background task progress, so pending uploads finish and cache can be released.
+- If batches are waiting to fill, select **Submit next batch** on the **Batches** page, or enable **Submit batches early to free cache space** in **Settings** and restart.
+- If the host disk has room, raise `cache.max_size_gb` and restart.
+- With `lru`, lower `cache.lru_high_watermark_percent` to start cleanup earlier.
+- Lower the bucket's **Release cache after** to release cache sooner.
 
-LRU cannot remove multipart staging data, versions below their bucket's minimum durable replicas, or versions without a readable committed replica. With `lru`, a refused write requests background cleanup when usage exceeds the effective low watermark. Writes do not wait for cleanup, so `503 SlowDown` can continue until cleanup catches up or safe candidates become available. Default S3 client retries may give up sooner; retry the upload later.
+If the **Manage cache capacity** task waits with `Waiting for reliable cache access records`, LRU cleanup is paused until restart. Fix the database errors in the logs, then restart SynapS3.
 
-Failed LRU deletion tasks remain visible as failed work. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` when the task is marked retryable.
-
-After changing a cache setting, restart SynapS3, check `/healthz`, and verify the effective cache values with `synaps3 admin settings get`.
+A failed **Release cache** task stays in the failed list. Fix the reported filesystem or database problem, then retry it.
 
 ## Failed Tasks
 
-List failed work:
-
 ```bash
 synaps3 admin task list --status failed --limit 100
-```
-
-Retry only after RPC connectivity, storage provider availability, wallet funds, FWSS approval, and cache disk capacity are ready.
-
-```bash
 synaps3 admin task retry 42
 ```
 
-The API indicates whether Retry is available for each failed task. Recover provider replacements from the bucket's **Storage** tab. Failed data set setup can be retried from Tasks, including setup for a replacement provider; choose another provider from Storage only after setup fails. A wallet operation can be recovered from Tasks when no broadcast started, or when it stopped because of an internal error; recovery sends the transaction only if it was never broadcast, and an uncertain broadcast remains non-retryable. A failed **Upload data** task offers **Retry**; it checks the provider first and resends the piece only if missing. For remote replica removal that remains unconfirmed after 24 hours, **Retry** checks the chain first and may submit another paid request if the replica is still present and not queued; the earlier request may still succeed. During on-chain data set cleanup, the task waits; confirmed data set deletion marks its replicas removed. Unverifiable chain state leaves removal unconfirmed and cleanup protection in place. Use **Acknowledge** or `synaps3 admin task acknowledge <id>` to mark a reviewed failure as viewed; history is retained indefinitely. When failures have piled up, select **Open** and **Failed** on the Tasks page to show **Acknowledge all**. The Operation filter narrows which failures it clears, and `synaps3 admin task acknowledge --type <operation> --yes` does the same from the CLI; failures recorded after you confirm stay in the list.
+Fix the cause first: RPC connectivity, storage provider reachability, wallet funds, FWSS approval, or cache space. Then select **Retry** on the **Tasks** page, or run `synaps3 admin task retry <id>`. **Retry** is offered only when it is safe; otherwise the task shows why.
 
-For a failed replica, use **Retry** in **Tasks** or the object's **Provenance → Replicas** table. It creates a new execution and preserves earlier failed executions for that replica. Check Provenance for **Stored** to confirm completion. Confirmed peer sync failures use retained local cache automatically when available; otherwise replica recovery needs a readable remote source or local cache. If recovery is unavailable, follow the reason shown beside the replica.
+| Operation | Recovery |
+| --- | --- |
+| **Create data set** | **Retry** continues with the same storage provider. To use another one instead, open the bucket's **Storage** tab and replace the provider. |
+| **Upload data** | **Retry** checks whether the storage provider already has the data and uploads it again only if it is missing. |
+| **Replace provider** | Recover from the bucket's **Storage** tab. |
+| **Commit batch** | Restore the dependency, then **Retry**. SynapS3 checks the chain before it resubmits the batch. `synaps3 admin storage-confirmation list` lists batches that need attention. |
+| **Wallet operation** | **Retry** is offered only if the transaction was never broadcast, or it stopped on an internal error. If a broadcast may have gone out without a recorded transaction, the operation cannot be retried; check the wallet on chain. |
+| **Clean up deleted data** | If removing a remote replica is still unconfirmed after 24 hours, **Retry** checks the chain and may submit another paid removal request. The earlier request can still succeed. |
+
+For a failed replica, use **Retry** on the **Tasks** page or in the object's **Provenance** dialog. The replica is complete when it shows **Stored**.
+
+After you review a failure, select **Acknowledge** or run `synaps3 admin task acknowledge <id>` to move it to **Closed**. Acknowledging does not change its result or whether it can be retried. To clear many failures, open **Open**, filter by **Failed** and optionally **Operation**, and select **Acknowledge all**; or run `synaps3 admin task acknowledge --type <type> --yes`. Failures recorded after you confirm stay open.
+
+## Wallet Funding Fails
+
+Check the balances and FWSS approval on the **Wallet** page, or with:
+
+```bash
+curl -u admin http://127.0.0.1:9090/api/v1/wallet
+```
+
+On Calibration, claim test funds again, then deposit and approve:
+
+```bash
+synaps3 wallet fund-testnet 0x...
+synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
+```
+
+If the faucet claim fails, use [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/). If a command fails, check RPC connectivity and the wallet's FIL balance for gas. Expected output is listed in [Wallet Commands](../reference/cli.md#wallet-commands).
 
 ## Provider or RPC Issues
 
-Check this node's storage health on Overview and Filecoin readiness in Settings, or inspect the Admin API:
+The **Overview** page shows storage health, and the **Settings** page shows Filecoin readiness. The same data is available from the Admin API:
 
 ```bash
 curl -u admin http://127.0.0.1:9090/api/v1/filecoin/readiness
 curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 ```
 
-Enter the Admin password at curl's no-echo prompt.
+To recover:
 
-Filecoin readiness checks provider network availability; the dashboard's speed-test notice shows selection readiness. If bucket preparation waits for tests, check its preparation message.
+- Fix `filecoin.rpc_url`, or the network path to it.
+- Confirm that storage provider URLs are reachable from the SynapS3 host. The storage provider's details on the **Storage** page show why the last health check failed.
+- Keep `filecoin.allow_private_networks = false` unless you trust storage providers on private networks.
 
-Use **Test remaining providers** to test eligible providers without a result. For failed tests, use **Retry** in **Tasks** or the provider details in **Storage**. See [Provider Selection](../configuration/model.md#provider-selection) for selection requirements and automatic remeasurement.
-
-Recovery:
-
-- Restore the configured `filecoin.rpc_url`.
-- Confirm provider URLs are reachable from the SynapS3 host. The provider details in **Storage** show why the last health check failed.
-- Keep `filecoin.allow_private_networks = false` unless private provider URLs are expected and trusted.
+Buckets wait for speed tests before they choose storage providers. Use **Test remaining providers** to test eligible storage providers without a result, and **Retry** for failed tests. See [Provider Selection](../configuration/model.md#provider-selection).
 
 ## S3 Client Cannot Upload
 
-Check these in order:
+Check in order:
 
-1. S3 client uses path-style addressing.
-2. Access key and secret came from `synaps3 admin s3-user create`.
-3. Endpoint is `http://localhost:8080` for local evaluation or the correct HTTPS address for production.
-4. Object size is between `127` and `1,065,353,216` bytes, and the object key meets the [S3 compatibility limits](../reference/s3-compatibility.md#stable-limits).
-5. Dashboard task view shows whether Filecoin storage is queued, running, waiting, or failed.
+1. The client uses path-style addressing.
+2. The access key and secret key are correct, and the user's role allows the operation; see [Create Credentials](../getting-started/s3-clients.md#create-credentials).
+3. The endpoint is correct: `http://localhost:8080` for local evaluation, or your HTTPS endpoint.
+4. The object is 127 to 1,065,353,216 bytes, and its key is within the [Stable Limits](../reference/s3-compatibility.md#stable-limits).
+5. For `503 SlowDown`, see [S3 Requests Return SlowDown](#s3-requests-return-slowdown).

@@ -86,14 +86,13 @@ const enSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: 'Production Checklist', link: '/en/operations/production-checklist' },
       { text: 'Health and Metrics', link: '/en/operations/health-metrics' },
-      { text: 'Backup and Recovery', link: '/en/operations/upgrade-recovery' },
+      { text: 'Backup and Recovery', link: '/en/operations/backup-recovery' },
       { text: 'Troubleshooting', link: '/en/operations/troubleshooting' },
     ],
   },
   {
     text: 'Concepts',
     items: [
-      { text: 'Architecture', link: '/en/concepts/architecture' },
       { text: 'Write Path and Cache', link: '/en/concepts/write-path-cache' },
       { text: 'Filecoin Storage Flow', link: '/en/concepts/filecoin-storage-flow' },
     ],
@@ -102,7 +101,7 @@ const enSidebar: DefaultTheme.Sidebar = [
     text: 'Reference',
     items: [
       { text: 'S3 Compatibility', link: '/en/reference/s3-compatibility' },
-      { text: 'CLI Reference', link: '/en/reference/cli-api' },
+      { text: 'CLI Reference', link: '/en/reference/cli' },
       { text: 'Admin API', link: '/en/reference/admin-api' },
     ],
   },
@@ -132,14 +131,13 @@ const zhSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: '生产环境检查清单', link: '/zh/operations/production-checklist' },
       { text: '健康检查与指标', link: '/zh/operations/health-metrics' },
-      { text: '备份与恢复', link: '/zh/operations/upgrade-recovery' },
+      { text: '备份与恢复', link: '/zh/operations/backup-recovery' },
       { text: '故障排查', link: '/zh/operations/troubleshooting' },
     ],
   },
   {
     text: '概念',
     items: [
-      { text: '架构', link: '/zh/concepts/architecture' },
       { text: '写入路径与缓存', link: '/zh/concepts/write-path-cache' },
       { text: 'Filecoin 存储流程', link: '/zh/concepts/filecoin-storage-flow' },
     ],
@@ -148,7 +146,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
     text: '参考',
     items: [
       { text: 'S3 兼容性', link: '/zh/reference/s3-compatibility' },
-      { text: 'CLI 参考', link: '/zh/reference/cli-api' },
+      { text: 'CLI 参考', link: '/zh/reference/cli' },
       { text: 'Admin API', link: '/zh/reference/admin-api' },
     ],
   },
@@ -271,7 +269,7 @@ export default defineConfig({
       label: '简体中文',
       lang: 'zh-CN',
       title: 'SynapS3',
-      description: '基于 Filecoin 的 S3 兼容网关。',
+      description: '基于 Filecoin 存储的 S3 兼容网关。',
       themeConfig: {
         nav: zhNav,
         sidebar: zhSidebar,

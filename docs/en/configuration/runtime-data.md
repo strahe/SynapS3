@@ -1,86 +1,51 @@
 ---
 title: Runtime Data
-description: Understand where SynapS3 stores configuration, metadata, cache data, and what to back up.
+description: Find where SynapS3 keeps its data, and back it up and restore it as one recovery point.
 ---
 
 # Runtime Data
 
-SynapS3 stores configuration and cached object data on local disk, and metadata in PostgreSQL. Place all of them on durable storage. A usable backup must keep the database and cache at the same recovery point.
+SynapS3 keeps its configuration and cached objects on local disk and its metadata in PostgreSQL. The cache can hold objects that are not on Filecoin yet, and the database records where every object is stored. Put both on durable storage, and back them up and restore them together.
 
-## Default Local Layout
+## Layout
 
-```text
-~/.synaps3/
-  config.toml
-  admin-initial-password
-  cache/
-```
+| Data | Default location | Contents |
+| --- | --- | --- |
+| `config.toml` | `~/.synaps3/` | Settings and Admin credentials; often the database DSN and wallet private key. |
+| `admin-initial-password` | `~/.synaps3/` | Admin password written by a non-interactive `synaps3 init` or by `synaps3 admin-auth reset-password`. |
+| `cache/` | `~/.synaps3/cache/`, or `cache.dir` | Cached object data, including objects not yet stored on Filecoin. |
+| PostgreSQL database | `database.dsn` | Buckets, objects, versions, replicas, tasks, wallet operations, and S3 users. S3 secret keys are stored in plaintext. |
+| Environment secrets | `.env` or host environment | Private key, DSN, and other overrides. |
 
-An explicit `cache.dir` value takes precedence over the default.
+In the Docker deployment, the files are in `/var/lib/synaps3/` on the `synaps3-data` volume, and the managed database is on the `synaps3-postgres-data` volume.
 
-## Docker Layout
-
-The container uses `/var/lib/synaps3`:
-
-```text
-/var/lib/synaps3/
-  config.toml
-  admin-initial-password
-  cache/
-```
-
-The Docker deployment mounts this path through the `synaps3-data` volume, and keeps the managed PostgreSQL database in the `synaps3-postgres-data` volume. Docker-specific lifecycle and backup commands are documented on the [Docker Deployment](../getting-started/docker.md) page.
-
-## What Must Be Durable
-
-| Data | Why it matters |
-| --- | --- |
-| `config.toml` | Holds stable runtime settings when they are not environment-managed. |
-| `admin-initial-password` | Stores the generated Admin password for non-interactive init and password reset. Keep it at `0600`; after saving the password securely, retain it only if local CLI commands still need it. |
-| PostgreSQL database | Stores buckets, objects, versions, tasks, users, and storage metadata. |
-| `cache/` | Holds locally durable object bytes for Filecoin upload and read rehydration. |
-| Environment secrets | May hold the Filecoin private key and deployment-specific overrides. |
-
-Keep `config.toml`, `.env`, credential files, and exported secrets at permission mode `0600`. Do not commit or copy wallet private keys into unprotected archives.
-
-## Before a Backup
-
-1. Check `curl http://127.0.0.1:9090/healthz` and record any non-`ok` result.
-2. Review active and failed work with `synaps3 admin task stats` and `synaps3 admin task list --status failed`.
-3. Stop SynapS3 with the service manager used by your deployment so object data, metadata, and task state cannot change during the backup.
-
-Do not create a filesystem archive while SynapS3 is still running.
+Keep `config.toml`, `admin-initial-password`, `.env`, and backups readable only by the account that runs SynapS3. Delete `admin-initial-password` once the password is in a password manager, unless local `synaps3 admin` commands read it.
 
 ## Back Up
 
-With SynapS3 stopped:
+Docker deployments can use the commands in [Back Up Docker Data](../getting-started/docker.md#back-up-docker-data).
 
-1. Create a database-native backup with `pg_dump`, a managed-database snapshot, or the approved PostgreSQL backup tool for your deployment.
-2. Back up the SynapS3 configuration and cache directory.
-3. Label the database backup and the configuration and cache archive with the same recovery point.
-4. Verify both artifacts before restarting the service.
+1. Record the current state:
 
-The [Docker Deployment](../getting-started/docker.md#back-up-docker-data) page has the commands for the managed database.
+   ```bash
+   curl http://127.0.0.1:9090/healthz
+   synaps3 admin task stats
+   synaps3 admin task list --status failed
+   ```
 
-## Restart and Verify
-
-After a successful backup, start SynapS3 with the service manager used by your deployment, then run:
-
-```bash
-curl http://127.0.0.1:9090/healthz
-synaps3 admin task stats
-```
-
-`/healthz` should return `{"status":"ok"}`. Investigate `setup` or `unhealthy` before resuming S3 traffic.
+2. Stop SynapS3 with your service manager. An archive taken while SynapS3 runs is not consistent.
+3. Back up the database with `pg_dump` or a database snapshot.
+4. Archive the configuration file and the cache directory.
+5. Label the database backup and the archive with the same recovery point, record checksums, and verify both.
+6. Start SynapS3 and confirm that `/healthz` returns `{"status":"ok"}`.
 
 ## Restore Order
 
-1. Stop SynapS3 and keep S3 traffic disabled.
-2. Verify the backup checksums and confirm the database and cache have the same recovery-point label.
-3. Restore the database-native backup into an empty database, then restore the matching configuration and cache data into an empty location.
-4. Confirm the restored configuration and credential files are `0600` and readable by the SynapS3 account.
-5. Start SynapS3, check `/healthz`, review task statistics and failed tasks, then read a known object through the S3 API.
+1. Stop SynapS3 and keep S3 traffic off.
+2. Verify the checksums, and confirm that the database backup and the archive carry the same recovery-point label.
+3. Restore the database into an empty database, then restore the configuration and cache into an empty directory.
+4. Confirm that the restored configuration and credential files have mode `0600` and belong to the SynapS3 account.
+5. Start the SynapS3 version that wrote the backup.
+6. Check `/healthz`, `synaps3 admin task stats`, and failed tasks, then read a known object through the S3 API.
 
-Do not combine a database backup with cache data from another point in time.
-
-Restore a backup with its matching executable. If startup reports that the database is incompatible, leave the backup unchanged and follow [Backup and Recovery](../operations/upgrade-recovery.md).
+Never combine a database backup with cache data from another recovery point. If startup reports an incompatible database, see [If the Database Is Incompatible](../operations/backup-recovery.md#if-the-database-is-incompatible).

@@ -1,38 +1,49 @@
 ---
 title: Overview
-description: Understand the SynapS3 gateway role, write boundary, and first setup path.
+description: Learn what SynapS3 does, how a node is put together, and choose an installation path.
 ---
 
 # Overview
 
-SynapS3 is an open-source, self-hosted S3-compatible gateway for Filecoin storage. Existing S3 clients keep using the S3 API; SynapS3 saves objects locally before returning success, then continues Filecoin storage in the background.
-
-## Why It Exists
-
-S3 clients need an endpoint, credentials, and bucket/object operations. Filecoin storage also needs provider selection, data submission, and remote durability after the S3 response. SynapS3 keeps that Filecoin work behind the gateway so clients do not need to understand the storage path.
+SynapS3 is a self-hosted S3-compatible gateway for Filecoin storage. S3 clients use the S3 API; SynapS3 selects storage providers, creates data sets, and pays for storage from its wallet.
 
 ## What SynapS3 Does
 
-- Accepts common S3 bucket, object, versioning, and multipart requests.
-- Persists object data and metadata locally before returning write success.
-- Uses background tasks to complete the initial target replicas, retry failed work, and safely evict cache.
-- Shows buckets, tasks, wallet operations, topology, settings, and health in the dashboard and Admin API.
+- Serves common S3 bucket, object, versioning, and multipart operations. See [S3 Compatibility](../reference/s3-compatibility.md).
+- Stores each object as replicas with Filecoin storage providers, and keeps a local cache in front of them.
+- Provides a dashboard, Admin API, and CLI for buckets, objects, wallet, tasks, storage providers, settings, and health.
+
+Coming soon: replica repair for storage provider outages. See [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
 
 ## Architecture
 
 <img class="architecture-overview architecture-overview--light" src="/architecture-overview-light.svg" alt="SynapS3 architecture">
 <img class="architecture-overview architecture-overview--dark" src="/architecture-overview.svg" alt="SynapS3 architecture">
 
-A successful S3 write means the object is durable in local cache and its metadata has been recorded. Reads use local cache first; on a cache miss, SynapS3 can fetch an available replica. After the S3 response, background tasks complete the initial target replicas, retry failures, and clean cache when the configured policy allows it.
+SynapS3 runs as a single process. Run exactly one SynapS3 instance per database; several instances sharing a database or wallet are not supported.
 
-Repairing replicas affected by a storage provider becoming unavailable is a separate product capability that is coming soon. See [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
+| Component | Address or location | Role |
+| --- | --- | --- |
+| S3 API | `server.port`, default `:8080` | Serves S3 requests. |
+| Dashboard and Admin API | `admin.addr`, default `127.0.0.1:9090` | Serves the dashboard, Admin API, `/healthz`, and `/metrics`. |
+| Local cache | `cache.dir` | Holds object data until enough replicas are committed and the eviction policy removes it. |
+| PostgreSQL | `database.dsn` | Holds metadata, tasks, and storage records. |
+| Background tasks | In process | Upload and replicate objects, submit batches, release cache, clean up deleted data, run wallet operations, and check storage provider health. |
+| Filecoin RPC | `filecoin.rpc_url` (outbound) | Reads chain state and sends transactions signed by the wallet. |
+| Storage providers | Storage provider service URLs (outbound) | Store, copy, and serve the pieces of each replica. |
 
-SynapS3 supports single-node deployments. The cache disk and database are runtime data; do not treat them as scratch storage.
+Data moves through a node like this:
 
-For deeper details, see [Architecture](../concepts/architecture.md), [Write Path and Cache](../concepts/write-path-cache.md), and [Filecoin Storage Flow](../concepts/filecoin-storage-flow.md).
+1. An S3 write is stored in the local cache and committed to PostgreSQL before SynapS3 responds. See [Write Path and Cache](../concepts/write-path-cache.md).
+2. Background tasks upload the object to one of the bucket's storage providers and add it to that storage provider's data set on chain. The bucket's other storage providers then copy it from that replica. See [Filecoin Storage Flow](../concepts/filecoin-storage-flow.md).
+3. Reads use the local cache, or a committed replica when the cache does not hold the object.
+4. Once the bucket's minimum durable replicas are committed, the cache eviction policy can remove the local copy.
+
+The local cache and the database hold data that may not be on Filecoin yet. Keep both on durable storage and back them up together; see [Runtime Data](../configuration/runtime-data.md). For which ports to expose, see [Network Exposure](../operations/production-checklist.md#network-exposure).
 
 ## Start Here
 
-- Choose [Docker Deployment](./docker.md) or [Build from Source](./source.md) for the intended runtime.
-- After installation, use [Quick Start](./quick-start.md) to check the node and upload the first object.
-- To connect tooling, use [S3 Clients](./s3-clients.md) for AWS CLI, rclone, and MinIO Client examples.
+1. Install with [Docker Deployment](./docker.md) or [Build from Source](./source.md).
+2. Follow [Quick Start](./quick-start.md) to check the node and upload a first object.
+3. Configure clients with [S3 Clients](./s3-clients.md).
+4. Complete the [Production Checklist](../operations/production-checklist.md) before serving production traffic.

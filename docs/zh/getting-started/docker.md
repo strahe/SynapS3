@@ -1,142 +1,121 @@
 ---
 title: Docker 部署
-description: 使用 Docker 部署 SynapS3，并按需为 Admin 启用自动 HTTPS。
+description: 使用 Docker Compose 部署 SynapS3，可选启用公网 Admin HTTPS，并完成备份和升级。
 ---
 
 # Docker 部署
 
-Docker 默认让仪表盘和 Admin API 监听 `127.0.0.1:9090`。需要公网 Admin 域名时，可以选择 Caddy HTTPS；Caddy 不代理 S3 API。
+Docker 部署通过 Docker Compose 运行 SynapS3，默认同时运行 PostgreSQL 18。仪表盘和 Admin API 监听 `127.0.0.1:9090`。可选的 Caddy 代理通过公网 HTTPS 域名提供仪表盘和 Admin API；Caddy 不代理 S3 API。
 
 ## 前置条件
 
-- 安装了 Git、Make、curl、Docker Engine 和 Docker Compose v2.24 或更高版本的 Linux 主机。
-- 为 `synaps3-data` 和 `synaps3-postgres-data` volume 准备可靠的本地磁盘。
-- 从其他机器访问本机 Admin 时，需要 SSH 权限或可用的公网 HTTPS 域名。
-- 可充值的 Calibration 钱包；没有钱包时可以按本文步骤生成。
+- 一台 Linux 主机，已安装 Git、Make、curl、Docker Engine 和 Docker Compose v2.24 或更高版本。
+- 用于 `synaps3-data` 和 `synaps3-postgres-data` 卷的持久本地磁盘。
+- 如需公网 Admin HTTPS：一个公网域名，并放行入站 `80/TCP` 和 `443/TCP`。
+- 一个持有 FIL 和 USDFC 的 Filecoin 钱包。未设置 `SYNAPS3_FILECOIN_NETWORK` 时使用 Calibration。
 
 ## 初始化部署
-
-克隆仓库：
 
 ```bash
 git clone --depth 1 https://github.com/strahe/SynapS3.git
 cd SynapS3
 ```
 
-`docker-init` 创建权限为 `0600` 的 `.env`。首次初始化前，从下面四种组合中选择一条：
+选择一条初始化命令：
 
-| 镜像来源 | Admin 访问方式 | 初始化命令 |
+| 镜像来源 | Admin 访问方式 | 命令 |
 | --- | --- | --- |
-| 发布镜像（默认） | 本机 `127.0.0.1:9090` | `make docker-init` |
-| 发布镜像（默认） | 公网 HTTPS | `make docker-init ADMIN_DOMAIN=admin.example.com` |
-| 当前源码构建 | 本机 `127.0.0.1:9090` | `make docker-init IMAGE_SOURCE=local` |
-| 当前源码构建 | 公网 HTTPS | `make docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.com` |
+| 已发布镜像 | 本机 `127.0.0.1:9090` | `make docker-init` |
+| 已发布镜像 | 公网 HTTPS | `make docker-init ADMIN_DOMAIN=admin.example.com` |
+| 从当前代码构建 | 本机 `127.0.0.1:9090` | `make docker-init IMAGE_SOURCE=local` |
+| 从当前代码构建 | 公网 HTTPS | `make docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.com` |
 
-默认使用发布镜像，Admin 只监听 `127.0.0.1:9090`。`IMAGE_SOURCE=local` 让 `make docker-up` 从当前 checkout 构建镜像；`ADMIN_DOMAIN` 会加载 Caddy，自动签发和续签证书，并把 HTTP 重定向到 HTTPS。两项可以同时使用。
+`docker-init` 创建权限为 `0600` 的 `.env` 和 `.postgres-admin-password`，任一文件已存在时拒绝覆盖。它会生成两个 PostgreSQL 密码：`synaps3` 应用角色的密码写入 `.env`，管理员密码写入 `.postgres-admin-password`。`synaps3` 角色拥有数据库，但不是超级用户。
 
-每种组合都会同时启动 PostgreSQL 18 保存元数据。`docker-init` 会生成其密码：应用密码写入 `.env`，管理员密码写入 `.postgres-admin-password`。PostgreSQL 只监听 `127.0.0.1:15432`；需要其他端口时，在初始化命令中加上 `POSTGRES_PORT=<端口>`。SynapS3 以 `synaps3` 角色连接，该角色拥有数据库，但不是超级用户。
+托管的 PostgreSQL 监听 `127.0.0.1:15432`。要换端口，在命令中加上 `POSTGRES_PORT=<port>`。
 
-改用已有的 PostgreSQL 服务器时，在初始化命令中加上 `DATABASE_SOURCE=external`，然后在 `.env` 中把 `SYNAPS3_DATABASE_DSN` 设为其连接 URL。
-
-`docker-init` 拒绝覆盖已有 `.env` 或 `.postgres-admin-password`。创建后检查这两个文件，并始终保持 `0600` 权限。
+要使用外部 PostgreSQL，在命令中加上 `DATABASE_SOURCE=external`，然后在 `.env` 中设置 `SYNAPS3_DATABASE_DSN`。
 
 ### Admin HTTPS 要求
 
-公网 HTTPS 还需要：
+设置 `ADMIN_DOMAIN` 后，Caddy 负责申请和续期证书，把 HTTP 重定向到 HTTPS，并只对该域名发送 HSTS。前提条件：
 
-- Admin 域名的 A 记录指向主机公网 IPv4 地址。
-- 只有在 IPv6 同样可达时才配置 AAAA 记录。
-- 主机和云防火墙开放 `80/TCP` 与 `443/TCP`。
-- 如果域名使用 CAA，允许 Caddy 使用的公共 CA。
+- 该域名的 A 记录指向主机公网 IPv4 地址；只有主机可通过 IPv6 访问时才添加 AAAA 记录。
+- 主机防火墙和云防火墙放行入站 `80/TCP` 和 `443/TCP`。
+- 没有阻止 Caddy 所用公共 CA 的 CAA 记录。
 
-`ADMIN_DOMAIN` 只填写域名，不要包含 scheme、端口、路径或通配符。SynapS3 Admin 仍只监听 `127.0.0.1:9090`。
+`ADMIN_DOMAIN` 只填域名，不带协议、端口、路径或通配符。`docker-init` 只检查语法；内部域名或保留域名会导致证书申请失败，`make docker-verify` 也会失败。
 
-`docker-init` 只检查域名语法。证书签发仍要求该域名可以从公网解析，并且公共 CA 接受签发；内部域名和保留域名会导致 `docker-verify` 失败。HSTS 只作用于配置的 Admin 域名，不继承到子域，也不申请 preload。
+## 配置钱包
 
-## 配置钱包私钥
-
-已有钱包时，把私钥写入 `.env`。没有钱包时，先在私密终端中生成：
+需要新钱包时，在私密终端中运行：
 
 ```bash
 docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-将输出的私钥保存到受保护的位置，然后在 `.env` 中取消注释或添加：
+妥善保存输出的私钥，并写入 `.env`，不要放在命令行参数中：
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 ```
 
-不要把真实私钥放进 shell 命令。仪表盘只显示私钥是否已配置，不接收或保存私钥；Docker 部署应通过 `.env` 设置。其他覆盖项见[环境变量](../configuration/environment.md)。
-
-为钱包地址申请 Calibration 测试资产：
+在 Calibration 上，从水龙头领取测试 FIL 和 USDFC：
 
 ```bash
 docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
-如果 faucet 暂时不可用，可以使用 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取。
+领取失败时，可以到 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取。
 
-缺少私钥时容器仍会启动，但 SynapS3 只提供 Admin setup 模式，不能承载正常 S3 流量。写入私钥后启动或重启服务，再使用 `make docker-verify` 确认状态为 `ok`。
+未设置私钥时，SynapS3 以设置模式启动：只能使用 Admin 设置，不提供 S3 API。仪表盘会显示私钥是否已设置，但不能在仪表盘中设置私钥。
 
-## 启动并验证
+## 启动与验证
 
 ```bash
 make docker-up
 make docker-verify
 ```
 
-`docker-verify` 始终检查本机 `/healthz`。启用 Admin HTTPS 时，它还会检查可信证书和 HTTP 到 HTTPS 的跳转。
+`docker-verify` 检查本机 `/healthz`。启用 Admin HTTPS 时，还会检查证书、公网 `/healthz` 和 HTTP 到 HTTPS 的重定向。状态为 `ok` 后再承接 S3 流量；其他状态见[健康检查与指标](../operations/health-metrics.md#健康检查)。
 
-启用 Admin HTTPS 后，`https://admin.example.com/healthz` 仍无需 Admin 凭据，便于外部健康检查。`unhealthy` 响应可能指出异常的数据库、缓存或 worker。如果不希望公开这些状态，请改用本机 Admin 和 SSH 隧道。
+启用 Admin HTTPS 后，`https://admin.example.com/healthz` 无需凭据即可访问，`unhealthy` 响应会列出失败的检查项。如果这些信息不能公开，改用 SSH 隧道访问本机 Admin。
 
-| 状态 | 含义 |
-| --- | --- |
-| `setup` | Admin 可访问，但仍缺少必要设置。 |
-| `ok` | Admin 可访问，运行时健康检查通过。 |
-| `unhealthy` | 数据库、缓存或 worker 需要处理。 |
-
-只有 `ok` 状态可以承载正常 S3 流量。
-
-| 界面或数据 | 地址或位置 |
-| --- | --- |
-| S3 API | 单独配置 S3 TLS 前为 `http://<host>:8080` |
-| 本机 Admin | `http://127.0.0.1:9090` |
-| 公网 Admin | 仅 HTTPS 模式：`https://admin.example.com` |
-| SynapS3 运行数据 | Docker volume `synaps3-data` |
-| PostgreSQL 数据 | Docker volume `synaps3-postgres-data`（仅托管数据库） |
-| 数据库密码 | `.env` 和 `.postgres-admin-password` |
-| Caddy 状态 | 仅 HTTPS 模式：`synaps3-caddy-data`、`synaps3-caddy-config` |
-
-读取初始 Admin 密码：
+在私密终端中输出初始 Admin 密码，并保存到密码管理器。用户名是 `admin`。
 
 ```bash
 make docker-password
 ```
 
-用户名是 `admin`。只在私密终端中读取密码，并保存到密码管理器。
-
-本机 Admin 的远程访问使用 SSH 隧道：
+从其他机器访问本机 Admin 时，先转发端口，再在浏览器打开 `http://127.0.0.1:9090`：
 
 ```bash
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-启用 HTTPS 时直接访问配置的域名。不要把 9090 端口绑定到公网接口。
+在仪表盘打开 **Wallet**，用 **Fund** 存入 USDFC，再点击 **Approve FWSS**。两步都完成后才能上传。
 
-容器内 Admin CLI 仍使用原生命令：
+在容器内运行 Admin CLI 命令：
 
 ```bash
 docker compose exec -T synaps3 synaps3 admin status
 ```
 
+| 入口或数据 | 地址或位置 |
+| --- | --- |
+| S3 API | `http://<host>:8080`；配置 S3 TLS 后使用 HTTPS |
+| 本机 Admin | `http://127.0.0.1:9090` |
+| 公网 Admin | `https://admin.example.com`（仅 HTTPS 模式） |
+| SynapS3 运行数据 | Docker 卷 `synaps3-data` |
+| PostgreSQL 数据 | Docker 卷 `synaps3-postgres-data`（仅托管数据库） |
+| 数据库密码 | `.env` 和 `.postgres-admin-password` |
+| Caddy 状态 | Docker 卷 `synaps3-caddy-data` 和 `synaps3-caddy-config`（仅 HTTPS 模式） |
+
 ## S3 传输安全
 
-Caddy 只保护仪表盘和 Admin API，不处理 S3 API。
+Caddy 只服务仪表盘和 Admin API。生产 S3 流量要么用 `SYNAPS3_SERVER_TLS_ENABLED=true`、`SYNAPS3_SERVER_TLS_CERT_FILE` 和 `SYNAPS3_SERVER_TLS_KEY_FILE` 启用原生 TLS，要么放在你自己的 TLS 代理之后。证书和私钥路径必须在容器内存在，通常以只读方式挂载。
 
-生产 S3 流量应配置原生 TLS：设置 `SYNAPS3_SERVER_TLS_ENABLED=true`、`SYNAPS3_SERVER_TLS_CERT_FILE` 和 `SYNAPS3_SERVER_TLS_KEY_FILE`；也可以把 S3 API 放在单独的受控 TLS 代理之后。证书和私钥路径必须在容器内可见，通常使用只读挂载。
-
-## 日常操作
+## 日常运维
 
 ```bash
 make docker-status
@@ -147,20 +126,18 @@ make docker-logs DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 # 仅 HTTPS 模式
 make docker-down
 ```
 
-日志默认显示最近 100 行。`docker-down` 会移除容器，但保留 `.env`、`.postgres-admin-password`、数据 volume 和已有的 Caddy 证书 volume。
+`docker-logs` 输出最近 100 行。`docker-down` 删除容器，保留 `.env`、`.postgres-admin-password` 和所有卷。
 
-密码不会自动轮换。修改应用密码时，先在 PostgreSQL 中修改 `synaps3` 角色的密码，再更新 `.env` 中的 `POSTGRES_APP_PASSWORD`，然后运行 `make docker-up`。修改端口时，编辑 `.env` 中的 `POSTGRES_PORT` 并运行 `make docker-up`。
+密码不会自动轮换。要修改应用密码，先在 PostgreSQL 中修改 `synaps3` 角色的密码，再更新 `.env` 中的 `POSTGRES_APP_PASSWORD`，然后运行 `make docker-up`。要修改 PostgreSQL 端口，编辑 `.env` 中的 `POSTGRES_PORT` 并运行 `make docker-up`。
 
-已有 PostgreSQL 17 部署应先用 17 按下文步骤备份。恢复到 18 前，把 `compose.postgres.yaml` 中的 `volumes.postgres-data.name` 改为新的 volume 名称；验证恢复成功后再处理原 volume。
-
-PostgreSQL 只在 volume 为空时创建数据库和 `synaps3` 角色。如果首次启动失败，查看 `make docker-logs DOCKER_SERVICE=postgres`，修复原因后删除 `synaps3-postgres-data` volume，再运行 `make docker-up`。
+PostgreSQL 只在数据卷为空时创建数据库和 `synaps3` 角色。如果首次启动失败，查看 `make docker-logs DOCKER_SERVICE=postgres`，修复原因后删除 `synaps3-postgres-data` 卷，再运行 `make docker-up`。
 
 ## HTTPS 故障排查
 
-只在启用 Admin HTTPS 时需要本节。如果 `make docker-verify` 提示 HTTPS 尚未就绪：
+`make docker-verify` 报告 Admin HTTPS 未就绪时：
 
 1. 检查 A 记录和可选的 AAAA 记录。
-2. 确认没有其他服务占用 80 或 443 端口。
+2. 确认 80 和 443 端口没有被其他服务占用。
 3. 检查主机防火墙、云防火墙和 CAA 记录。
 4. 查看 Caddy 日志：
 
@@ -168,37 +145,43 @@ PostgreSQL 只在 volume 为空时创建数据库和 `synaps3` 角色。如果�
 make docker-logs DOCKER_SERVICE=caddy
 ```
 
-修复后 Caddy 会继续重试签发。不要删除 `synaps3-caddy-data`，其中保存证书私钥和 ACME 账户状态。
+修复原因后 Caddy 会自动重试。不要删除 `synaps3-caddy-data`，其中保存证书私钥和 ACME 账户。
 
 ## 备份 Docker 数据
 
-先检查健康状态，再停止 SynapS3，保持 PostgreSQL 运行：
+1. 检查健康状态，然后停止 SynapS3，保持 PostgreSQL 运行：
 
-```bash
-make docker-verify
-docker compose stop synaps3
-```
+   ```bash
+   make docker-verify
+   docker compose stop synaps3
+   ```
 
-导出托管数据库，并归档保存配置和缓存的运行数据 volume：
+2. 导出托管数据库，打包 `synaps3-data` 卷（配置和缓存），并记录校验和：
 
-```bash
-docker compose exec -T postgres pg_dump --username=synaps3 --dbname=synaps3 --format=custom > synaps3-db.dump
-docker run --rm \
-  -v synaps3-data:/data:ro \
-  -v "$PWD":/backup \
-  alpine:3 \
-  tar czf /backup/synaps3-data.tgz -C /data .
-docker run --rm \
-  -v "$PWD":/backup \
-  alpine:3 \
-  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-db.dump synaps3-data.tgz > synaps3-backup.sha256 && sha256sum -c synaps3-backup.sha256'
-```
+   ```bash
+   docker compose exec -T postgres pg_dump --username=synaps3 --dbname=synaps3 --format=custom > synaps3-db.dump
+   docker run --rm \
+     -v synaps3-data:/data:ro \
+     -v "$PWD":/backup \
+     alpine:3 \
+     tar czf /backup/synaps3-data.tgz -C /data .
+   docker run --rm \
+     -v "$PWD":/backup \
+     alpine:3 \
+     sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-db.dump synaps3-data.tgz > synaps3-backup.sha256 && sha256sum -c synaps3-backup.sha256'
+   ```
 
-把 `.env` 和 `.postgres-admin-password` 与备份一起保存。使用 `DATABASE_SOURCE=external` 时，改用该数据库服务器自己的工具备份，不要使用上面的 `pg_dump`。Caddy volume 不属于数据库与缓存的一致性恢复点，但应保留以避免替换证书和 ACME 账户。
+3. 把 `.env` 和 `.postgres-admin-password` 与备份放在一起。
+4. 重启并验证：
 
-备份完成后运行 `make docker-up` 和 `make docker-verify`。
+   ```bash
+   make docker-up
+   make docker-verify
+   ```
 
-恢复时，使用备份的 `.env` 和 `.postgres-admin-password`，从空 volume 开始，先导入数据库，再恢复运行数据：
+使用 `DATABASE_SOURCE=external` 时，用该数据库服务器自己的工具备份；上面的 `pg_dump` 命令只适用于托管数据库。Caddy 卷不属于恢复点，但应保留，以免重新签发证书。
+
+恢复时，从备份的 `.env`、`.postgres-admin-password` 和空卷开始，先恢复数据库，再恢复运行数据：
 
 ```bash
 docker compose up -d --wait postgres
@@ -212,11 +195,11 @@ make docker-up
 make docker-verify
 ```
 
-详细一致性与恢复顺序见[运行数据](../configuration/runtime-data.md)。
+一致性要求见[运行数据](../configuration/runtime-data.md)。
 
 ## 升级
 
-先创建并验证一致性备份。发布镜像部署使用：
+先完成备份。使用已发布镜像的部署运行：
 
 ```bash
 git pull --ff-only
@@ -225,4 +208,4 @@ make docker-up
 make docker-verify
 ```
 
-本地镜像部署省略 `docker compose pull`；更新 checkout 后，`make docker-up` 会重新构建镜像。当前发布通道是可移动的 `edge` 标签，没有自动回退。恢复正常流量前，完成[生产环境检查清单](../operations/production-checklist.md)。
+从当前代码构建镜像的部署跳过 `docker compose pull`，`make docker-up` 会重新构建镜像。已发布镜像使用可移动的 `edge` 标签，升级没有自动回滚。恢复正常流量前，完成[生产环境检查清单](../operations/production-checklist.md)。

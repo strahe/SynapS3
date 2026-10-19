@@ -1,22 +1,19 @@
 ---
 title: 源码构建
-description: 在本地构建 SynapS3，初始化运行数据，并验证内嵌仪表盘和 S3 API。
+description: 构建 SynapS3 二进制，准备 PostgreSQL 和钱包，并启动节点。
 ---
 
 # 源码构建
 
-开发 SynapS3、定制二进制或检查内嵌仪表盘构建时，从源码构建。
-
-容器安装见 [Docker 部署](./docker.md)；本页说明直接构建和运行二进制的流程。
+本页构建 `synaps3` 二进制并直接运行。容器部署见 [Docker 部署](./docker.md)。
 
 ## 前置条件
 
 - Go 1.27.2 或更高版本。
 - `make`。
-- cgo 所需的 C toolchain，例如 `gcc` 或 `clang`。
-- Node.js 22.12 或更高版本。
-- pnpm 11。
-- PostgreSQL 18，或用于本地运行它的 Docker。
+- 用于 cgo 的 C 工具链，例如 `gcc` 或 `clang`。
+- Node.js 22.12 或更高版本，以及 pnpm 11。
+- PostgreSQL 18，或者用于本地运行 PostgreSQL 的 Docker。
 
 ## 构建
 
@@ -26,11 +23,11 @@ cd SynapS3
 make build
 ```
 
-命令会构建 React 仪表盘，将其嵌入二进制，并生成 `bin/synaps3`。
+`make build` 构建仪表盘并嵌入二进制，输出 `bin/synaps3`。
 
 ## 准备 PostgreSQL
 
-SynapS3 把元数据存储在 PostgreSQL 中。可以使用归非超级用户角色所有的已有数据库，也可以在本地启动服务器用于评估。下面的示例创建名为 `synaps3` 的数据库和应用角色；其他名称通过连接 URL 指定。
+数据库应由非超级用户角色拥有。下面用 Docker 在本地运行 PostgreSQL，数据库和角色都叫 `synaps3`：
 
 ```bash
 printf 'PostgreSQL administrator password: '
@@ -48,7 +45,7 @@ docker run -d --name synaps3-postgres --restart unless-stopped \
 unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 ```
 
-只有 volume 为空时才会创建角色和设置密码。升级已有 PostgreSQL 17 volume 时，先用 17 备份，再恢复到新的 18 volume；验证恢复成功后再处理原 volume。
+PostgreSQL 只在数据卷为空时创建角色和密码。
 
 ## 初始化运行数据
 
@@ -57,9 +54,9 @@ unset POSTGRES_PASSWORD POSTGRES_APP_PASSWORD
 ./bin/synaps3 wallet generate
 ```
 
-`synaps3 init` 会创建 `~/.synaps3/config.toml`、`cache/` 和 Admin 认证。请把命令打印出的 Admin 密码保存到密码管理器。非交互 init 可以在私密终端中从 `~/.synaps3/admin-initial-password` 读取密码。配置文件和密码文件都应保持 `0600` 权限。
+`synaps3 init` 创建 `~/.synaps3/config.toml`、`cache/` 目录和 Admin 凭据。在终端中运行时，它只输出一次 Admin 密码；否则把密码写入 `~/.synaps3/admin-initial-password`。把密码保存到密码管理器。
 
-把使用应用密码的 PostgreSQL 连接 URL 和生成的钱包私钥写入 `~/.synaps3/config.toml`。使用已有数据库时，替换其中的角色和数据库名称：
+把数据库连接 URL 和钱包私钥写入 `~/.synaps3/config.toml`：
 
 ```toml
 [database]
@@ -69,15 +66,15 @@ dsn = "postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable"
 private_key = "0x..."
 ```
 
-不要让数据库密码或私钥进入 shell history。配置文件包含凭据和钱包材料，只应允许 SynapS3 运行账户读取。
+该文件包含凭据和钱包密钥。权限保持 `0600`，只允许运行 SynapS3 的账户读取。
 
-在 Calibration 测试时，为钱包充值：
+在 Calibration 上领取测试 FIL 和 USDFC：
 
 ```bash
 ./bin/synaps3 wallet fund-testnet 0x...
 ```
 
-Faucet 领取成功后会输出 `CalibnetUSDFC: <hash>` 和 `CalibnetFIL: <hash>`。
+领取成功时输出 `CalibnetUSDFC: <hash>` 和 `CalibnetFIL: <hash>`。
 
 ## 启动服务
 
@@ -85,15 +82,13 @@ Faucet 领取成功后会输出 `CalibnetUSDFC: <hash>` 和 `CalibnetFIL: <hash>
 ./bin/synaps3 serve
 ```
 
-默认端点：
-
-| 端点 | 地址 |
+| 入口 | 默认值 |
 | --- | --- |
 | S3 API | `http://localhost:8080` |
 | 仪表盘和 Admin API | `http://127.0.0.1:9090` |
 | 运行数据 | `~/.synaps3/` |
 
-在另一个终端检查健康状态、存入 USDFC，并批准 FWSS：
+在另一个终端中检查健康状态，存入 USDFC，并批准 FWSS：
 
 ```bash
 curl http://127.0.0.1:9090/healthz
@@ -101,45 +96,18 @@ curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 wallet approve
 ```
 
-预期结果：`/healthz` 返回 `{"status":"ok"}`。新的 deposit 或 approval 会输出 `Transaction: <hash>` 和 `Status: confirmed`；已经完成 approval 时会输出 `FWSS approval: already approved`。
+健康检查返回 `{"status":"ok"}`。每笔交易输出 `Transaction: <hash>` 和 `Status: confirmed`；FWSS 已批准时，`approve` 输出 `FWSS approval: already approved`。
 
-这些 HTTP 端点用于本地评估。生产 S3 流量必须使用原生 TLS 或受控的 TLS 反向代理；Admin 端点继续使用回环地址、SSH 隧道，或带访问控制的 HTTPS 反向代理。
+明文 HTTP 只用于本地评估。生产环境见[网络暴露](../operations/production-checklist.md#网络暴露)。
 
-## 使用 S3 客户端验证
+然后按[快速开始](./quick-start.md)创建 S3 凭据并上传第一个对象。
 
-创建 S3 用户：
+## 常见构建和启动问题
 
-```bash
-./bin/synaps3 admin s3-user create
-```
-
-在无回显提示中输入 Admin 密码。命令只显示一次 S3 secret key；请保存到权限为 `0600` 的客户端凭据文件，如果泄露则立即轮换。
-
-然后使用 path-style S3 客户端：
-
-```bash
-printf '%*s\n' 128 'hello synaps3' > hello.txt
-printf 'S3 access key: '
-read -r S3_ACCESS_KEY
-printf 'S3 secret key: '
-read -rs S3_SECRET_KEY
-printf '\n'
-mc alias set synaps3 http://localhost:8080 "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"
-unset S3_ACCESS_KEY S3_SECRET_KEY
-chmod 600 ~/.mc/config.json
-mc mb synaps3/demo
-mc cp hello.txt synaps3/demo/hello.txt
-mc cat synaps3/demo/hello.txt
-```
-
-`mc cat` 会输出上传对象。alias 会把凭据保存到 `~/.mc/config.json`，该文件应保持 `0600` 权限。更多客户端示例见 [S3 客户端](./s3-clients.md)。
-
-## 常见构建问题
-
-| 现象 | 检查项 |
+| 现象 | 处理 |
 | --- | --- |
-| UI 构建失败 | 确认 Node.js 22.12 或更高版本，以及 pnpm 11 已安装。 |
-| Go 构建因 cgo 失败 | 确认 C toolchain 已安装并在 `PATH` 中。 |
-| `serve` 因 Admin 认证校验失败 | 新配置运行 `./bin/synaps3 init`；已有配置运行 `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml`。 |
-| `serve` 报告 `database.dsn is not set` | 在配置中设置 `database.dsn`，或设置 `SYNAPS3_DATABASE_DSN`。 |
-| `serve` 进入 setup 模式 | 设置 `filecoin.private_key` 或 `SYNAPS3_FILECOIN_PRIVATE_KEY`。 |
+| 仪表盘构建失败 | 安装 Node.js 22.12 或更高版本和 pnpm 11。 |
+| Go 构建在 cgo 处失败 | 安装 C 工具链，并确保它在 `PATH` 中。 |
+| `serve` 报告 Admin 认证校验失败 | `config.toml` 存在时运行 `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml`；否则运行 `./bin/synaps3 init`。 |
+| `serve` 报告 `database.dsn is not set` | 在配置文件中设置 `database.dsn`，或设置 `SYNAPS3_DATABASE_DSN`。 |
+| `/healthz` 返回 `setup` | 在配置文件中设置 `filecoin.private_key`，或设置 `SYNAPS3_FILECOIN_PRIVATE_KEY`，然后重启。 |

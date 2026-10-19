@@ -1,11 +1,9 @@
 ---
 title: 故障排查
-description: 排查 SynapS3 setup 状态、健康检查、钱包、缓存、任务和存储提供方常见问题。
+description: 诊断并处理 SynapS3 的启动、健康状态、S3、缓存、任务、钱包和存储提供方问题。
 ---
 
 # 故障排查
-
-上传、下载、登录或后台存储失败时，从这里开始。先检查健康状态，再按钱包、缓存、后台任务或存储提供方信号缩小范围。
 
 ## 首先检查
 
@@ -15,156 +13,136 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-健康基线：
+状态不是 `ok` 时，转到下面对应的小节。各状态的含义见[健康检查](./health-metrics.md#健康检查)。
 
-```json
-{"status":"ok"}
-```
+## 设置模式
 
-如果健康状态不是 `ok`，优先按返回的错误文本继续排查。
+`{"status":"setup"}` 表示缺少必需设置或设置无效。`synaps3 admin status` 和 **Settings** 页面会列出这些设置。
 
-## setup 状态
+最常见的原因是缺少钱包私钥。设置 `SYNAPS3_FILECOIN_PRIVATE_KEY` 或 `filecoin.private_key`（需要时用 `synaps3 wallet generate` 生成），重启 SynapS3，确认 `/healthz` 返回 `ok`。
 
-`/healthz` 可能返回：
+## 启动失败
 
-```json
-{"status":"setup"}
-```
-
-这表示 SynapS3 缺少必要配置。修改设置前，先查看配置校验返回的详细信息。
-
-检查报告的字段：
-
-```bash
-synaps3 admin status
-synaps3 admin settings get
-```
-
-如果缺少钱包私钥，先生成钱包：
-
-```bash
-synaps3 wallet generate
-```
-
-如果缺少钱包私钥，将生成的私钥写入 `SYNAPS3_FILECOIN_PRIVATE_KEY`，或写入配置文件中的 `filecoin.private_key`。然后重启 SynapS3，检查 `/healthz` 并验证实际生效设置。
-
-预期结果：重启后健康状态从 `setup` 变为 `ok`。
+| 报错 | 处理 |
+| --- | --- |
+| `database.dsn is not set` | 设置 `database.dsn` 或 `SYNAPS3_DATABASE_DSN`。 |
+| `database belongs to another Filecoin wallet or network` | 私钥或 `filecoin.network` 与创建该数据库时不同。改回创建数据库时的私钥和网络，或改用单独的数据库。 |
+| `database contains an incompatible SynapS3 schema` | 见[数据库不兼容时](./backup-recovery.md#数据库不兼容时)。 |
+| `locking migrator` | 上一次迁移被强行终止。确认没有其他 SynapS3 进程在运行后，执行 `synaps3 migrate --force-unlock`，再重新启动。 |
+| `admin.auth.*` 校验失败 | 运行 `synaps3 admin-auth reset-password --config <path>`。 |
 
 ## 后台任务不健康
 
-示例：
+`{"status":"unhealthy","errors":["worker/tasks: not responding"]}` 表示后台任务处理已停止。
 
-```json
-{"status":"unhealthy","errors":["worker/tasks: not responding"]}
-```
+1. 记录当前状态：
 
-检查任务状态：
+   ```bash
+   synaps3 admin task stats
+   synaps3 admin task list --status running --limit 20
+   ```
 
-```bash
-synaps3 admin task stats
-synaps3 admin task list --status running --limit 20
-```
+2. 查看 SynapS3 日志中的错误。
+3. 重启 SynapS3。未完成的任务会在重启后继续。
 
-重启后，未完成的后台任务会重新进入可继续处理的状态。如果后台任务处理持续不健康，先记录当前任务状态并查看日志，然后重启服务。
+## S3 请求返回 SlowDown
 
-## 钱包充值或 deposit 失败
+多种情况下 SynapS3 都会返回 `503 SlowDown`，错误消息会说明原因：
 
-检查钱包状态：
+| 消息 | 原因 | 处理 |
+| --- | --- | --- |
+| `The bucket is still being prepared. Please retry shortly.` | 存储桶的数据集尚未就绪。 | 在仪表盘查看存储桶的状态和准备信息，以及 **Storage** 页面的测速提示。存储桶变为 **Ready** 后重试。 |
+| `The local cache is full. Please retry later.` | 缓存放不下这次写入。 | 见[缓存已满](#缓存已满)。 |
+| `The same data is still being removed after an earlier delete. Please retry shortly.` | 你删除了持有这些字节的最后一个版本，SynapS3 仍在删除远端副本。 | 几分钟后重试。届时这次上传会作为新数据保存。 |
+| 其他消息 | 同时处理的请求超过 `server.max_requests`。 | 退避后重试，或调高 `server.max_requests`。 |
 
-```bash
-synaps3 admin status
-```
-
-在 Calibration 上重新为地址领取测试资产：
-
-```bash
-synaps3 wallet fund-testnet 0x...
-```
-
-然后重试 deposit 和 FWSS approval：
-
-```bash
-synaps3 wallet deposit 2 # 2 USDFC
-synaps3 wallet approve
-```
-
-如果 faucet 失败，使用 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取，然后重新运行 `synaps3 admin status`。
-
-Faucet 领取成功后会输出 `CalibnetUSDFC: <hash>` 和 `CalibnetFIL: <hash>`。`deposit` 或 approval 确认后会输出 `Transaction: <hash>` 和 `Status: confirmed`；已经完成 approval 时会输出 `FWSS approval: already approved`。如果没有出现这些结果，先检查 RPC 连接、钱包余额和命令返回的错误，再重试。
+S3 客户端默认只对 `SlowDown` 重试几次，可能在问题消除前就放弃；请稍后重新执行该操作。
 
 ## 缓存已满
 
-本地缓存放不下一次写入时，S3 客户端和仪表盘上传会收到 `503 SlowDown`。进行中的上传会按完整大小占用缓存容量，因此显示的使用量还没达到上限时，新上传也可能被拒绝。完成 multipart 上传时，除已上传的分段外，还需要能容纳合并后对象的可用容量。检查使用量：
+缓存放不下的写入会失败并返回 `503 SlowDown`。进行中的写入会预留完整大小，因此报告的用量低于上限时，写入也可能被拒绝。
 
 ```bash
 synaps3 admin status
 synaps3 admin settings get cache.max_size_gb
 synaps3 admin settings get cache.eviction_policy
-synaps3 admin settings get cache.lru_high_watermark_percent
-synaps3 admin settings get cache.lru_low_watermark_percent
 ```
 
-恢复方式：
+只有版本达到所在存储桶的最小持久副本数后，缓存才能释放空间，见[缓存淘汰](../concepts/write-path-cache.md#缓存淘汰)。处理方法：
 
-- 先确认主机仍有可用磁盘空间，再按容量增大 `cache.max_size_gb`。
-- 恢复存储提供方连接和后台任务进度，让排队上传完成并触发缓存淘汰。
-- 默认的 `lru` 适合按容量自动清理。降低高水位可以为新写入保留更多余量，并始终满足 `0 <= low < high <= 100`。
-- 只有希望版本达到存储桶要求的最低耐久副本数后异步删除对应版本时，才使用 `after_upload`。
-- 需要完全禁用自动清理时使用 `none`。
+- 恢复存储提供方连接和后台任务进度，让等待中的上传完成，缓存得以释放。
+- 如果批次在等待凑满，在 **Batches** 页面点击 **Submit next batch**，或在 **Settings** 中启用 **Submit batches early to free cache space** 并重启。
+- 主机磁盘有余量时，调高 `cache.max_size_gb` 并重启。
+- 使用 `lru` 时，调低 `cache.lru_high_watermark_percent`，让清理更早开始。
+- 调低存储桶的 **Release cache after**，让缓存更早释放。
 
-LRU 无法清理 multipart 暂存数据、未达到存储桶最低耐久副本数的版本，或没有可读已提交远端副本的版本。使用 `lru` 时，如果缓存使用量高于实际低水位，被拒绝的写入会请求后台清理。写入不会等待清理完成，因此在清理追赶完成或出现安全候选前，仍可能继续返回 `503 SlowDown`。S3 客户端默认的重试可能更早放弃；请稍后重新上传。
+如果 **Manage cache capacity** 任务处于等待状态，并显示 `Waiting for reliable cache access records`，说明 LRU 清理已暂停，直到重启。先根据日志修复数据库错误，再重启 SynapS3。
 
-如果批次仍在等待提交，打开 **Batches** 点击 **Submit next batch**，或在 Settings 启用[自动提前提交批次](../configuration/model.md)并重启。请求提交后，仍需等待远端确认和耐久条件满足才能释放缓存。
+失败的 **Release cache** 任务会留在失败列表中。修复报告的文件系统或数据库问题后，重试该任务。
 
-LRU 删除失败后，任务仍会作为 failed 工作保留。先修复任务中报告的文件系统或数据库问题；任务标记为可重试时，可运行 `synaps3 admin task retry <id>`。
-
-修改缓存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效的缓存设置。
-
-## Failed 任务
-
-列出 failed 任务：
+## 失败任务
 
 ```bash
 synaps3 admin task list --status failed --limit 100
-```
-
-确认 RPC 连接、存储提供方可用性、钱包余额、FWSS approval 和缓存磁盘容量都已就绪后，再重试。
-
-```bash
 synaps3 admin task retry 42
 ```
 
-API 会标明每个失败任务是否可使用 Retry。存储提供方替换从存储桶的 **Storage** 标签页恢复。数据集创建任务失败时，可从 Tasks 重试，替换目标的数据集创建也适用；只有创建失败后，才能从 Storage 选择其他提供方。尚未发出广播、或因内部错误停止的钱包操作可以从 Tasks 恢复；只有从未广播过的交易才会被发出，广播结果不确定时仍不可重试。**Upload data** 任务失败时可使用 **Retry**；它先检查提供方，确认分片缺失才重新上传。远端副本删除超过 24 小时仍无法确认时，**Retry** 会先检查链上状态；若副本仍存在且未排队删除，可能再次提交付费请求，而先前的请求仍可能成功。数据集正在链上分批清理时，任务继续等待；确认数据集已从链上删除后，副本记为已删除。链上状态无法核实时，不会确认删除，也不会解除清理保护。只有在核对失败结果后才使用 **Acknowledge** 或 `synaps3 admin task acknowledge <id>`；确认不改变失败结果，任务历史默认永久保存。失败任务积压时，在任务页选择 **Open** 和 **Failed** 后使用 **Acknowledge all**；操作类型筛选可进一步缩小处理范围，命令行对应 `synaps3 admin task acknowledge --type <操作> --yes`；在你确认之后才记录的失败仍会留在列表里。
+先排除原因：RPC 连接、存储提供方可达性、钱包资金、FWSS 批准或缓存空间。然后在 **Tasks** 页面点击 **Retry**，或运行 `synaps3 admin task retry <id>`。只有在安全时才会提供 **Retry**；否则任务会显示原因。
 
-失败副本可从 **Tasks** 或对象的 **Provenance → Replicas** 表使用 **Retry**。它会创建新的恢复任务，并保留该副本此前的失败记录。Provenance 中显示 **Stored** 才表示恢复完成。确认的副本同步失败会在本地缓存可用时自动重新上传；否则恢复需要可读的远端副本或本地缓存。操作不可用时，按副本旁显示的原因处理。
+| 操作 | 恢复方式 |
+| --- | --- |
+| **Create data set** | **Retry** 会继续使用同一个存储提供方。要改用其他存储提供方，打开存储桶的 **Storage** 标签页替换存储提供方。 |
+| **Upload data** | **Retry** 先检查存储提供方是否已有该数据，缺失时才重新上传。 |
+| **Replace provider** | 在存储桶的 **Storage** 标签页恢复。 |
+| **Commit batch** | 恢复依赖后点击 **Retry**。SynapS3 会先查询链上状态再重新提交批次。`synaps3 admin storage-confirmation list` 列出需要处理的批次。 |
+| **Wallet operation** | 只有交易从未广播，或因内部错误停止时，才提供 **Retry**。如果交易可能已广播但没有记录，该操作不能重试；请到链上核对钱包。 |
+| **Clean up deleted data** | 删除远端副本超过 24 小时仍未确认时，**Retry** 会查询链上状态，并可能再提交一次付费删除请求。之前的请求仍可能成功。 |
+
+副本失败时，在 **Tasks** 页面或对象的 **Provenance** 对话框中点击 **Retry**。副本显示 **Stored** 即表示完成。
+
+确认过的失败，点击 **Acknowledge** 或运行 `synaps3 admin task acknowledge <id>`，即可移到 **Closed**。确认不会改变任务结果，也不影响能否重试。失败较多时，在 **Open** 中筛选 **Failed**，按需再筛选 **Operation**，然后点击 **Acknowledge all**；或者运行 `synaps3 admin task acknowledge --type <type> --yes`。确认之后才记录的失败仍保留在 **Open** 中。
+
+## 钱包充值失败
+
+在 **Wallet** 页面查看余额和 FWSS 批准状态，或者运行：
+
+```bash
+curl -u admin http://127.0.0.1:9090/api/v1/wallet
+```
+
+在 Calibration 上，重新领取测试资金，然后存入并批准：
+
+```bash
+synaps3 wallet fund-testnet 0x...
+synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
+```
+
+水龙头领取失败时，到 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取。命令失败时，检查 RPC 连接和钱包中用于支付 gas 的 FIL 余额。预期输出见 [Wallet 命令](../reference/cli.md#wallet-命令)。
 
 ## 存储提供方或 RPC 问题
 
-在 Overview 查看本节点存储健康状态，在 Settings 查看 Filecoin readiness，或检查 Admin API：
+**Overview** 页面显示存储健康状态，**Settings** 页面显示 Filecoin 就绪状态。也可以通过 Admin API 获取：
 
 ```bash
 curl -u admin http://127.0.0.1:9090/api/v1/filecoin/readiness
 curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 ```
 
-在 curl 的无回显提示中输入 Admin 密码。
+处理方法：
 
-Filecoin readiness 检查存储提供方的网络可用性；仪表盘顶部的测速提示说明节点选择是否就绪。存储桶准备等待测速时，查看其准备说明。
+- 修正 `filecoin.rpc_url`，或修复到 RPC 的网络连接。
+- 确认 SynapS3 主机能访问存储提供方 URL。**Storage** 页面的存储提供方详情会显示上次健康检查失败的原因。
+- 除非信任私有网络中的存储提供方，否则保持 `filecoin.allow_private_networks = false`。
 
-使用 **Test remaining providers** 测试尚无结果且符合测速条件的节点。测速失败时，在 **Tasks** 或 **Storage** 的节点详情中使用 **Retry**。选择条件和自动重测见[节点选择](../configuration/model.md#节点选择)。
-
-恢复方式：
-
-- 恢复配置中的 `filecoin.rpc_url`。
-- 确认 SynapS3 主机能访问存储提供方 URL。**Storage** 中的存储提供方详情会显示最近一次健康检查失败的原因。
-- 除非明确需要并信任私有存储提供方 URL，否则保持 `filecoin.allow_private_networks = false`。
+存储桶会等测速完成后再选择存储提供方。用 **Test remaining providers** 测试尚无结果的存储提供方，用 **Retry** 重试失败的测速。见[存储提供方选择](../configuration/model.md#存储提供方选择)。
 
 ## S3 客户端无法上传
 
-按顺序检查：
+依次检查：
 
-1. S3 客户端使用 path-style addressing。
-2. Access key 和 secret key 来自 `synaps3 admin s3-user create`。
-3. 本地评估使用 `http://localhost:8080`，生产环境使用正确的 HTTPS S3 地址。
-4. 对象大小在 `127` 到 `1,065,353,216` 字节之间，并且对象键符合 [S3 兼容性限制](../reference/s3-compatibility.md#稳定限制)。
-5. 仪表盘任务页显示 Filecoin 存储处于 `queued`、`running`、`waiting` 还是 `failed`。
+1. 客户端使用 path-style 寻址。
+2. Access key 和 secret key 正确，用户角色允许该操作，见[创建凭据](../getting-started/s3-clients.md#创建凭据)。
+3. 端点正确：本地评估用 `http://localhost:8080`，生产环境用你的 HTTPS 端点。
+4. 对象大小在 127 到 1,065,353,216 字节之间，对象键符合[稳定限制](../reference/s3-compatibility.md#稳定限制)。
+5. 遇到 `503 SlowDown` 时，见 [S3 请求返回 SlowDown](#s3-请求返回-slowdown)。

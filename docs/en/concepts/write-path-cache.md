@@ -1,65 +1,32 @@
 ---
 title: Write Path and Cache
-description: Learn how SynapS3 accepts S3 writes, persists bytes locally, and uses cache during reads.
+description: Learn when SynapS3 reports a write as successful, how reads use the cache, and when cached data can be removed.
 ---
 
 # Write Path and Cache
 
-SynapS3 uses a cache-first write model. A successful S3 write means object bytes are durable on local disk and metadata is committed to the database.
+SynapS3 returns success for an S3 write only after the object data is stored in the local cache and its metadata is committed to PostgreSQL. If either step fails, the client receives an error. Filecoin storage starts after the response, so write latency does not depend on storage providers.
 
-## PutObject Flow
+## Writes
 
-```mermaid
-flowchart TD
-  request["Receive write"] --> save["Save object locally"]
-  save --> metadata["Record metadata"]
-  metadata --> response["Return success with ETag"]
-  response --> storage["Continue Filecoin storage in the background"]
-```
+- A write reserves cache capacity for its declared size before SynapS3 reads the body. If the cache cannot hold it, the write fails with `503 SlowDown` and nothing is stored.
+- The response carries an S3-compatible ETag; multipart uploads return the S3 multipart ETag.
+- Writing bytes that the bucket already holds creates a new version without another Filecoin upload.
+- Multipart parts stay in the local cache until the upload is completed or aborted. Completing an upload needs free cache capacity for the assembled object in addition to its parts.
 
-SynapS3 validates the request, saves the object and its metadata, and returns an S3-compatible ETag. Filecoin storage continues after the client receives success.
+## Reads
 
-## Durability Invariant
+`GetObject` reads from the local cache. On a cache miss, SynapS3 reads a committed replica from a storage provider, verifies the complete object before delivering the last bytes, and after a complete read attempts to restore it to the cache. A range request on a cache miss still downloads the whole object for verification. A read that the client closes early leaves no partial cache entry.
 
-> [!IMPORTANT]
-> SynapS3 returns success only after both local cache persistence and database commit succeed.
-
-The S3 response does not wait for Filecoin provider latency. After the write is accepted, a background task continues the upload.
-
-## Read Path
-
-`GetObject` reads local cache first. If the cache entry is missing and an available replica is recorded, SynapS3 can retrieve the object from the storage provider, verify it, serve the response, and restore the local cache when possible.
-
-A single byte-range request returns only the requested bytes. On a cache miss, SynapS3 still downloads the complete remote object to verify it before the range response finishes; a complete read can also restore the local cache. Closing the request early does not leave a partial cache entry.
-
-Successful foreground cache opens refresh the entry's LRU access time. This includes S3 object and range reads, cached CopyObject sources, Admin content downloads, and version restores. Metadata-only operations such as `HeadObject` do not refresh it, and the background Uploader does not make an entry look recently used. A complete remote rehydration starts a new LRU age for the restored entry.
-
-Repeated reads of the same version coalesce access-time updates to at most one database write per minute. Access tracking is best effort and never turns a successful read into an error.
+These reads mark a cached version as recently used for `lru` eviction: S3 reads, including range reads; `CopyObject` sources read from the cache; dashboard downloads; and version restores. `HeadObject` and background uploads do not.
 
 ## Cache Eviction
 
-| Policy | Behavior |
-| --- | --- |
-| `lru` | At the high capacity watermark, or when a write is refused because the cache is full, queue the least recently accessed remotely safe versions until planned usage reaches the low watermark. |
-| `after_upload` | Queue each version for removal after its bucket's minimum durable replicas commit. |
-| `none` | Do not create or run automatic cache eviction work. |
+SynapS3 removes a version from the cache only when all of these hold:
 
-A bucket is created with the minimum equal to its replica target, so cache is released only once every replica of an upload is stored. In the dashboard, set this in the bucket's **Settings** tab under **Replica policy**. An operator can set an explicit count from 1 through the current target. That count stays if Replicas later increases. Replicas itself can only be raised: lowering it is not supported, so those options are shown but not selectable. Lowering the threshold makes retained cache eligible for removal while remaining replicas continue syncing. Actual removal still follows `after_upload`, `lru`, or `none`. The minimum is clamped to each upload's target. Raising it affects cache that still exists; it cannot recreate cache that has already been deleted.
+- The version has reached its bucket's [minimum durable replicas](./filecoin-storage-flow.md#target-and-minimum-replicas), and those replicas are committed and readable.
+- No upload or batch submission in progress still needs the cached data.
 
-Only versions that currently meet their minimum and have a readable committed replica are eligible. Eviction checks the current minimum again before authorizing deletion and waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `503 SlowDown` when cleanup cannot keep pace or no safe candidate exists.
+Eviction never removes multipart parts, and it waits for open reads of the version to finish. Which eligible versions are removed, and when, depends on `cache.eviction_policy`; see [Cache](../configuration/model.md#cache). Removal runs in the background. When it cannot keep up or no version is eligible, writes fail with `503 SlowDown`; see [Cache Full](../operations/troubleshooting.md#cache-full).
 
-## Multipart Uploads
-
-Multipart uploads keep parts in local storage until completion. Completing an upload validates the requested parts, assembles the final object, returns the S3 multipart ETag, and schedules background Filecoin storage.
-
-## Operational Impact
-
-| Condition | Meaning |
-| --- | --- |
-| Cache disk is full | New writes can fail before Filecoin storage is involved. |
-| Background storage is not running | Confirmed writes remain local, but remote storage will not progress. |
-| Cache entry is evicted | Reads can still succeed when remote metadata exists and retrieval works. |
-| LRU has no safe candidate | Existing unsafe or in-progress data remains local; new writes can still be refused with `SlowDown`. |
-| Database commit fails | The S3 write does not return success. |
-
-For capacity and recovery steps, see [Runtime Data](../configuration/runtime-data.md) and [Troubleshooting](../operations/troubleshooting.md).
+After removal, reads of that version come from a storage provider.

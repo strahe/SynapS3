@@ -1,15 +1,15 @@
 ---
 title: 环境变量
-description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
+description: 查询用于覆盖配置字段、控制 CLI 和容器的 SYNAPS3_ 环境变量。
 ---
 
 # 环境变量
 
-配置环境变量使用 `SYNAPS3_` 前缀，下划线会映射到配置路径。环境变量会覆盖文件值，适合放部署密钥和主机专用设置。
+环境变量会覆盖配置文件中的值。以这种方式设置的字段，不能在 **Settings** 页面或通过 `synaps3 admin settings set` 修改。私钥、数据库 DSN 等密钥，以及与主机相关的值，适合用环境变量设置。
 
-## 常用覆盖项
+## 配置覆盖
 
-| 环境变量 | 配置路径 |
+| 环境变量 | 配置字段 |
 | --- | --- |
 | `SYNAPS3_SERVER_PORT` | `server.port` |
 | `SYNAPS3_SERVER_MAX_CONNECTIONS` | `server.max_connections` |
@@ -52,64 +52,28 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | `SYNAPS3_LOGGING_S3_ACCESS_ENABLED` | `logging.s3_access.enabled` |
 | `SYNAPS3_LOGGING_S3_ACCESS_LEVEL` | `logging.s3_access.level` |
 | `SYNAPS3_ADMIN_ADDR` | `admin.addr` |
-| `SYNAPS3_ADMIN_TRUSTED_PROXIES` | `admin.trusted_proxies` |
+| `SYNAPS3_ADMIN_TRUSTED_PROXIES` | `admin.trusted_proxies`（逗号分隔的 IP 或 CIDR） |
 | `SYNAPS3_ADMIN_AUTH_ENABLED` | `admin.auth.enabled` |
 | `SYNAPS3_ADMIN_AUTH_USERNAME` | `admin.auth.username` |
+| `SYNAPS3_ADMIN_AUTH_PASSWORD_HASH` | `admin.auth.password_hash` |
 | `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` | `admin.auth.session_secret` |
 | `SYNAPS3_ADMIN_AUTH_SESSION_TTL` | `admin.auth.session_ttl` |
 
-`SYNAPS3_ADMIN_TRUSTED_PROXIES` 是逗号分隔的 IP 或 CIDR 列表。
+`synaps3 init` 和 `synaps3 admin-auth reset-password` 会把 `admin.auth.password_hash` 和 `admin.auth.session_secret` 写入配置文件。只有在外部密钥存储管理 Admin 凭据时，才通过环境变量设置这两项。
 
-## 高级生成字段
+## CLI 和容器变量
 
-| 环境变量 | 配置路径 |
-| --- | --- |
-| `SYNAPS3_ADMIN_AUTH_PASSWORD_HASH` | `admin.auth.password_hash` |
-
-`admin.auth.password_hash` 通常由 `synaps3 init` 或 `synaps3 admin-auth reset-password` 生成。除非外部流程已经接管 Admin 密码 hash，否则不要手写。
-
-## CLI 和容器路径变量
-
-下面这些变量不映射到 TOML 配置字段。
+这些变量不对应配置字段。
 
 | 环境变量 | 用途 |
 | --- | --- |
-| `SYNAPS3_DATA_DIR` | 自动执行 `synaps3 init` 时使用的运行数据目录；默认是 `/var/lib/synaps3`。 |
-| `SYNAPS3_CONFIG` | CLI 命令在未传 `--config` 时使用的配置文件；Compose 示例默认使用 `/var/lib/synaps3/config.toml` 且允许覆盖，entrypoint 启动 `serve` 时默认使用 `$SYNAPS3_DATA_DIR/config.toml`。 |
-| `SYNAPS3_ADMIN_PASSWORD` | 仅用于 CLI 认证的 Admin 密码。优先使用终端无回显提示或受保护的密钥来源，不要让密码进入 shell history。 |
+| `SYNAPS3_CONFIG` | 命令未传 `--config` 时使用的配置文件。Docker 部署将其设为 `/var/lib/synaps3/config.toml`。 |
+| `SYNAPS3_DATA_DIR` | 仅用于容器。配置文件不存在时，容器用 `synaps3 init` 初始化该数据目录。默认值：`/var/lib/synaps3`。 |
+| `SYNAPS3_ADMIN_PASSWORD` | `synaps3 admin` 命令使用的 Admin 密码。优先使用密码提示符，避免密码进入 shell 历史。 |
 
-## 何时使用环境变量
+## 密钥处理
 
-适合放在环境变量中的内容：
-
-- 钱包私钥和数据库 DSN，
-- 外部管理的 Admin session secret，
-- 容器专用路径，
-- 网络特定 RPC URL，
-- 部署特定日志格式，
-- 排障期间的临时覆盖。
-
-稳定设置如果希望在 `synaps3 admin settings get` 中清楚展示，建议放在 TOML 配置文件中。`SYNAPS3_DATA_DIR` 只用于 Docker entrypoint 路径控制；`SYNAPS3_CONFIG` 适合让容器内命令复用同一个配置文件。
-
-## 安全建议
-
-> [!WARNING]
-> 不要把钱包私钥、数据库凭据、Admin 密码和 Admin session secret 放进 git、容器镜像或 shell history。
-
-- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在密钥管理系统、`.env` 或主机环境中。`synaps3 init` 和 `synaps3 admin-auth reset-password` 会生成 `admin.auth.session_secret`；只有部署策略要求在 TOML 外管理时，才使用 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET`。
-- 把 `SYNAPS3_DATABASE_DSN`、`SYNAPS3_ADMIN_PASSWORD` 和 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` 作为敏感值处理。只要条件允许，就通过 CLI 的无回显提示输入 Admin 密码。
-- 让 `.env`、`config.toml` 和凭据文件保持 `0600` 权限。
-- 除非可信代理会在请求到达 SynapS3 前清理不可信 forwarded headers，否则保持 `SYNAPS3_ADMIN_TRUSTED_PROXIES` 为空。
-- 不要提交 `.env`、`config.toml`、本地数据库、缓存数据或钱包材料。
-- 除非明确信任私有存储提供方 URL，否则保持 `filecoin.allow_private_networks = false`。
-- 环境变量管理的字段会覆盖文件值；只改文件不会改变这些字段的生效值。
-
-## 验证生效设置
-
-```bash
-synaps3 admin settings get
-```
-
-输出会显示当前值，以及每个设置是否可写。
-
-修改设置后，重启 SynapS3，检查 `/healthz`，再运行此命令确认实际生效值。环境变量仍会覆盖文件值。
+- `SYNAPS3_FILECOIN_PRIVATE_KEY`、`SYNAPS3_DATABASE_DSN`、`SYNAPS3_ADMIN_PASSWORD` 和 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` 都按密钥处理。放在 `.env`、主机环境或密钥管理系统中，不要进入 git 或容器镜像。
+- `.env` 权限保持 `0600`。
+- 除非你的代理会清除客户端发送的转发标头，否则 `SYNAPS3_ADMIN_TRUSTED_PROXIES` 保持为空。
+- 除非信任私有网络中的存储提供方，否则不设置 `SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS`，或设为 `false`。

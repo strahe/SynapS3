@@ -1,83 +1,74 @@
 ---
 title: Docker Deployment
-description: Deploy SynapS3 with Docker and optionally enable automatic Admin HTTPS.
+description: Deploy SynapS3 with Docker Compose, optionally with public Admin HTTPS, and back it up or upgrade it.
 ---
 
 # Docker Deployment
 
-Docker keeps the dashboard and Admin API on `127.0.0.1:9090` by default. When a public Admin hostname is needed, select Caddy HTTPS. Caddy does not proxy the S3 API.
+The Docker deployment runs SynapS3 and, by default, PostgreSQL 18 with Docker Compose. The dashboard and Admin API listen on `127.0.0.1:9090`. An optional Caddy proxy serves them on a public HTTPS hostname; Caddy does not proxy the S3 API.
 
 ## Prerequisites
 
 - A Linux host with Git, Make, curl, Docker Engine, and Docker Compose v2.24 or later.
 - Durable local disk for the `synaps3-data` and `synaps3-postgres-data` volumes.
-- SSH access or a usable public HTTPS hostname when Admin is accessed from another machine.
-- A fundable Calibration wallet. If you do not have one, follow the wallet generation steps below.
+- For public Admin HTTPS: a public hostname and inbound `80/TCP` and `443/TCP`.
+- A Filecoin wallet with FIL and USDFC. The deployment uses Calibration unless you set `SYNAPS3_FILECOIN_NETWORK`.
 
 ## Initialize the Deployment
-
-Clone the repository:
 
 ```bash
 git clone --depth 1 https://github.com/strahe/SynapS3.git
 cd SynapS3
 ```
 
-`docker-init` creates `.env` with permission mode `0600`. Before the first initialization, choose one of these four combinations:
+Choose an initialization command:
 
-| Image source | Admin access | Initialization command |
+| Image source | Admin access | Command |
 | --- | --- | --- |
-| Published image (default) | Local `127.0.0.1:9090` | `make docker-init` |
-| Published image (default) | Public HTTPS | `make docker-init ADMIN_DOMAIN=admin.example.com` |
-| Current checkout | Local `127.0.0.1:9090` | `make docker-init IMAGE_SOURCE=local` |
-| Current checkout | Public HTTPS | `make docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.com` |
+| Published image | Local `127.0.0.1:9090` | `make docker-init` |
+| Published image | Public HTTPS | `make docker-init ADMIN_DOMAIN=admin.example.com` |
+| Built from this checkout | Local `127.0.0.1:9090` | `make docker-init IMAGE_SOURCE=local` |
+| Built from this checkout | Public HTTPS | `make docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.com` |
 
-The default uses the published image and keeps Admin on `127.0.0.1:9090`. `IMAGE_SOURCE=local` makes `make docker-up` build from the current checkout. `ADMIN_DOMAIN` loads Caddy, manages certificate issuance and renewal, and redirects HTTP to HTTPS. Both options can be used together.
+`docker-init` creates `.env` and `.postgres-admin-password` with mode `0600` and refuses to overwrite either file. It generates both PostgreSQL passwords: the `synaps3` application role password goes to `.env`, and the administrator password goes to `.postgres-admin-password`. The `synaps3` role owns the database but is not a superuser.
 
-Each combination also starts PostgreSQL 18 for metadata. `docker-init` generates its passwords: the application password goes to `.env`, and the administrator password goes to `.postgres-admin-password`. PostgreSQL listens only on `127.0.0.1:15432`; add `POSTGRES_PORT=<port>` to the initialization command to use another port. SynapS3 connects as the `synaps3` role, which owns the database but is not a superuser.
+The managed PostgreSQL listens on `127.0.0.1:15432`. Add `POSTGRES_PORT=<port>` to the command to use another port.
 
-To use an existing PostgreSQL server instead, add `DATABASE_SOURCE=external` to the initialization command, then set `SYNAPS3_DATABASE_DSN` in `.env` to its connection URL.
-
-`docker-init` refuses to overwrite an existing `.env` or `.postgres-admin-password`. Review both files after creation and keep their permission mode at `0600`.
+To use an external PostgreSQL server, add `DATABASE_SOURCE=external` to the command, then set `SYNAPS3_DATABASE_DSN` in `.env`.
 
 ### Admin HTTPS Requirements
 
-Public HTTPS also requires:
+With `ADMIN_DOMAIN`, Caddy obtains and renews the certificate, redirects HTTP to HTTPS, and sends HSTS for that hostname only. It requires:
 
-- An A record pointing the Admin hostname to the host's public IPv4 address.
-- An AAAA record only when the host is also reachable over IPv6.
-- Inbound `80/TCP` and `443/TCP` through host and cloud firewalls.
-- A CAA policy, when present, that permits a public CA available to Caddy.
+- An A record for the hostname that points to the host's public IPv4 address, and an AAAA record only if the host is reachable over IPv6.
+- Inbound `80/TCP` and `443/TCP` open in host and cloud firewalls.
+- No CAA record that blocks the public CAs Caddy uses.
 
-Use only the hostname for `ADMIN_DOMAIN`; do not include a scheme, port, path, or wildcard. SynapS3 Admin remains bound to `127.0.0.1:9090`.
+Set `ADMIN_DOMAIN` to the hostname only, without a scheme, port, path, or wildcard. `docker-init` checks only the syntax; internal or reserved names fail certificate issuance and `make docker-verify`.
 
-`docker-init` checks hostname syntax only. Certificate issuance still requires a publicly resolvable hostname accepted by a public CA; internal and reserved names will fail `docker-verify`. HSTS applies only to the configured Admin hostname, without subdomain inheritance or preload.
+## Configure the Wallet
 
-## Configure the Wallet Private Key
-
-If you already have a wallet, add its private key to `.env`. Otherwise, generate one in a private terminal:
+To generate a new wallet, run this in a private terminal:
 
 ```bash
 docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-Store the printed private key securely, then uncomment or add this entry in `.env`:
+Store the printed private key securely. Add it to `.env`; do not pass it on a command line:
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 ```
 
-Do not put the real private key in a shell command. The dashboard reports whether the key is configured, but it does not accept or store the key; Docker deployments should set it through `.env`. See [Environment Variables](../configuration/environment.md) for other supported overrides.
-
-Fund the wallet address on Calibration:
+On Calibration, claim test FIL and USDFC from the faucet:
 
 ```bash
 docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
-If faucet funding is unavailable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/).
+If the faucet claim fails, use [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/).
 
-Without the private key, the container starts but SynapS3 exposes only Admin setup mode and cannot serve normal S3 traffic. After setting the key, start or restart the service, then run `make docker-verify` and confirm that the status is `ok`.
+Without a private key, SynapS3 starts in setup mode: only the Admin settings are available and the S3 API is not served. The dashboard shows whether a key is set but cannot set it.
 
 ## Start and Verify
 
@@ -86,55 +77,43 @@ make docker-up
 make docker-verify
 ```
 
-`docker-verify` always checks the local `/healthz` endpoint. When Admin HTTPS is enabled, it also verifies the trusted certificate and the HTTP-to-HTTPS redirect.
+`docker-verify` checks the local `/healthz` endpoint. With Admin HTTPS, it also checks the certificate, the public `/healthz`, and the HTTP-to-HTTPS redirect. Serve S3 traffic only when the status is `ok`; see [Health and Metrics](../operations/health-metrics.md#health) for other statuses.
 
-With Admin HTTPS enabled, `https://admin.example.com/healthz` remains available without Admin credentials for external health checks. An `unhealthy` response can identify the affected database, cache, or worker. Use local Admin through an SSH tunnel instead if this status must not be public.
+With Admin HTTPS, `https://admin.example.com/healthz` answers without credentials, and an `unhealthy` response names the failing check. If that must not be public, use local Admin through an SSH tunnel instead.
 
-| Status | Meaning |
-| --- | --- |
-| `setup` | Admin is reachable, but required settings are missing. |
-| `ok` | Admin is reachable and runtime health checks pass. |
-| `unhealthy` | The database, cache, or workers need attention. |
-
-Only `ok` is ready for normal S3 traffic.
-
-| Surface or data | Address or location |
-| --- | --- |
-| S3 API | `http://<host>:8080` until S3 TLS is configured separately |
-| Local Admin | `http://127.0.0.1:9090` |
-| Public Admin | HTTPS mode only: `https://admin.example.com` |
-| SynapS3 runtime data | Docker volume `synaps3-data` |
-| PostgreSQL data | Docker volume `synaps3-postgres-data` (managed database only) |
-| Database passwords | `.env` and `.postgres-admin-password` |
-| Caddy state | HTTPS mode only: `synaps3-caddy-data` and `synaps3-caddy-config` |
-
-Read the initial Admin password:
+Print the initial Admin password in a private terminal and store it in a password manager. The username is `admin`.
 
 ```bash
 make docker-password
 ```
 
-The username is `admin`. Read the password only in a private terminal and store it in a password manager.
-
-Reach local Admin remotely through an SSH tunnel:
+To reach local Admin from another machine, forward the port and browse to `http://127.0.0.1:9090`:
 
 ```bash
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-When HTTPS is enabled, use the configured hostname directly. Never bind port 9090 to a public interface.
+In the dashboard, open **Wallet**, deposit USDFC with **Fund**, then select **Approve FWSS**. Uploads need both.
 
-Container-local Admin CLI operations continue to use the native command:
+Run Admin CLI commands inside the container:
 
 ```bash
 docker compose exec -T synaps3 synaps3 admin status
 ```
 
+| Surface or data | Address or location |
+| --- | --- |
+| S3 API | `http://<host>:8080`, or HTTPS after you configure S3 TLS |
+| Local Admin | `http://127.0.0.1:9090` |
+| Public Admin | `https://admin.example.com` (HTTPS mode only) |
+| SynapS3 runtime data | Docker volume `synaps3-data` |
+| PostgreSQL data | Docker volume `synaps3-postgres-data` (managed database only) |
+| Database passwords | `.env` and `.postgres-admin-password` |
+| Caddy state | Docker volumes `synaps3-caddy-data` and `synaps3-caddy-config` (HTTPS mode only) |
+
 ## S3 Transport Security
 
-Caddy protects only the dashboard and Admin API. It does not handle the S3 API.
-
-For production S3 traffic, either configure native TLS with `SYNAPS3_SERVER_TLS_ENABLED=true`, `SYNAPS3_SERVER_TLS_CERT_FILE`, and `SYNAPS3_SERVER_TLS_KEY_FILE`, or place the S3 API behind a separate controlled TLS proxy. Certificate and key paths must be visible inside the container, typically through read-only mounts.
+Caddy serves only the dashboard and Admin API. For production S3 traffic, either enable native TLS with `SYNAPS3_SERVER_TLS_ENABLED=true`, `SYNAPS3_SERVER_TLS_CERT_FILE`, and `SYNAPS3_SERVER_TLS_KEY_FILE`, or put the S3 API behind your own TLS proxy. The certificate and key paths must exist inside the container, usually as read-only mounts.
 
 ## Daily Operations
 
@@ -147,58 +126,62 @@ make docker-logs DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 # HTTPS mode only
 make docker-down
 ```
 
-Logs show the latest 100 lines by default. `docker-down` removes containers but preserves `.env`, `.postgres-admin-password`, the data volumes, and any existing Caddy certificate volumes.
+`docker-logs` prints the last 100 lines. `docker-down` removes the containers and keeps `.env`, `.postgres-admin-password`, and all volumes.
 
-Passwords are not rotated automatically. To change the application password, change it for the `synaps3` role in PostgreSQL, update `POSTGRES_APP_PASSWORD` in `.env`, then run `make docker-up`. To change the port, edit `POSTGRES_PORT` in `.env` and run `make docker-up`.
-
-For an existing PostgreSQL 17 deployment, back up with 17 using the steps below. Change `volumes.postgres-data.name` in `compose.postgres.yaml` to a new volume name before restoring on 18; keep the original volume until the restored deployment is verified.
+Passwords are never rotated automatically. To change the application password, change it for the `synaps3` role in PostgreSQL, update `POSTGRES_APP_PASSWORD` in `.env`, then run `make docker-up`. To change the PostgreSQL port, edit `POSTGRES_PORT` in `.env` and run `make docker-up`.
 
 PostgreSQL creates the database and the `synaps3` role only when its volume is empty. If that first start fails, read `make docker-logs DOCKER_SERVICE=postgres`, fix the cause, remove the `synaps3-postgres-data` volume, and run `make docker-up` again.
 
 ## HTTPS Troubleshooting
 
-This section applies only when Admin HTTPS is enabled. If `make docker-verify` reports that HTTPS is not ready:
+If `make docker-verify` reports that Admin HTTPS is not ready:
 
-1. Check the A record and optional AAAA record.
-2. Confirm that no other service occupies ports 80 or 443.
-3. Check host firewall, cloud firewall, and CAA policy.
+1. Check the A record and the optional AAAA record.
+2. Confirm that no other service uses ports 80 or 443.
+3. Check host and cloud firewalls and any CAA record.
 4. Read the Caddy logs:
 
 ```bash
 make docker-logs DOCKER_SERVICE=caddy
 ```
 
-Caddy continues retrying after the problem is fixed. Do not delete `synaps3-caddy-data`; it contains certificate private keys and ACME account state.
+Caddy keeps retrying after you fix the cause. Do not delete `synaps3-caddy-data`; it holds the certificate private keys and the ACME account.
 
 ## Back Up Docker Data
 
-Check health, then stop SynapS3 while PostgreSQL keeps running:
+1. Check health, then stop SynapS3 and leave PostgreSQL running:
 
-```bash
-make docker-verify
-docker compose stop synaps3
-```
+   ```bash
+   make docker-verify
+   docker compose stop synaps3
+   ```
 
-Dump the managed database and archive the runtime data volume, which holds the configuration and cache:
+2. Dump the managed database, archive the `synaps3-data` volume (configuration and cache), and record checksums:
 
-```bash
-docker compose exec -T postgres pg_dump --username=synaps3 --dbname=synaps3 --format=custom > synaps3-db.dump
-docker run --rm \
-  -v synaps3-data:/data:ro \
-  -v "$PWD":/backup \
-  alpine:3 \
-  tar czf /backup/synaps3-data.tgz -C /data .
-docker run --rm \
-  -v "$PWD":/backup \
-  alpine:3 \
-  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-db.dump synaps3-data.tgz > synaps3-backup.sha256 && sha256sum -c synaps3-backup.sha256'
-```
+   ```bash
+   docker compose exec -T postgres pg_dump --username=synaps3 --dbname=synaps3 --format=custom > synaps3-db.dump
+   docker run --rm \
+     -v synaps3-data:/data:ro \
+     -v "$PWD":/backup \
+     alpine:3 \
+     tar czf /backup/synaps3-data.tgz -C /data .
+   docker run --rm \
+     -v "$PWD":/backup \
+     alpine:3 \
+     sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-db.dump synaps3-data.tgz > synaps3-backup.sha256 && sha256sum -c synaps3-backup.sha256'
+   ```
 
-Keep `.env` and `.postgres-admin-password` with the backup. With `DATABASE_SOURCE=external`, back up the database with that server's own tools instead of `pg_dump` above. Caddy volumes are outside the database-and-cache recovery point, but retain them to avoid replacing certificates and the ACME account.
+3. Keep `.env` and `.postgres-admin-password` with the backup.
+4. Restart and verify:
 
-After the backup, run `make docker-up` and `make docker-verify`.
+   ```bash
+   make docker-up
+   make docker-verify
+   ```
 
-To restore, start from the backed-up `.env` and `.postgres-admin-password` with empty volumes, then load the database before the runtime data:
+With `DATABASE_SOURCE=external`, back up the database with that server's own tools; the `pg_dump` command above covers only the managed database. The Caddy volumes are not part of the recovery point; keep them to avoid reissuing certificates.
+
+To restore, start from the backed-up `.env` and `.postgres-admin-password` and empty volumes. Restore the database before the runtime data:
 
 ```bash
 docker compose up -d --wait postgres
@@ -212,11 +195,11 @@ make docker-up
 make docker-verify
 ```
 
-See [Runtime Data](../configuration/runtime-data.md) for consistency and restore order.
+See [Runtime Data](../configuration/runtime-data.md) for the consistency rules.
 
 ## Upgrade
 
-Create and verify a consistent backup first. For a published-image deployment:
+Back up first, then for a published-image deployment:
 
 ```bash
 git pull --ff-only
@@ -225,4 +208,4 @@ make docker-up
 make docker-verify
 ```
 
-For a local-image deployment, omit `docker compose pull`; after updating the checkout, `make docker-up` rebuilds the image. The current published channel is the movable `edge` tag and has no automatic rollback. Complete the [Production Checklist](../operations/production-checklist.md) before restoring normal traffic.
+For a deployment built from the checkout, skip `docker compose pull`; `make docker-up` rebuilds the image. The published image uses the movable `edge` tag, and the upgrade has no automatic rollback. Complete the [Production Checklist](../operations/production-checklist.md) before restoring normal traffic.

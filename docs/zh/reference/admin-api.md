@@ -1,170 +1,105 @@
 ---
 title: Admin API
-description: SynapS3 健康检查、指标、仪表盘、设置、钱包、任务和 S3 用户端点参考。
+description: 查询 SynapS3 Admin API 的认证方式、端点、请求字段和错误码。
 ---
 
 # Admin API
 
-Admin API 供仪表盘和 CLI 使用。Admin 认证默认开启。默认监听本机回环地址；远程访问应使用 HTTPS 反向代理或 SSH 隧道。
+仪表盘和 `synaps3 admin` CLI 都使用 Admin API。基础 URL 是 `admin.addr`，默认 `http://127.0.0.1:9090`。除非另有说明，请求和响应都使用 JSON。错误返回 `{"error": "<message>"}`，下文列出的情况还会带 `code`。
 
-默认 base URL：
+如何安全暴露，见[网络暴露](../operations/production-checklist.md#网络暴露)。
 
-```text
-http://127.0.0.1:9090
-```
+## 认证
 
-## Setup 模式
-
-当 `/healthz` 返回 `{"status":"setup"}` 时，Admin 端点只开放完成配置所需的范围：
-
-- `/healthz`，以及 Admin 登录、会话、续期和退出端点；
-- 仪表盘外壳；
-- `GET /api/v1/settings`、`PUT /api/v1/settings` 和 `POST /api/v1/settings/validate`；
-- `POST /api/v1/filecoin/readiness/preflight`。
-
-Setup 模式不提供运行时指标、存储桶、对象、后台任务、钱包操作、存储健康状态和 S3 用户管理。保存有效设置后重启 SynapS3；确认 `/healthz` 返回 `{"status":"ok"}`，再使用完整 API。
-
-## 认证模型
-
-`/healthz` 不需要认证，便于进程健康检查。仪表盘外壳和静态资源可以在登录前加载，但仪表盘数据和写操作都由 Admin 认证保护。
-
-| 访问范围 | 认证要求 |
+| 路径 | 认证方式 |
 | --- | --- |
 | `/healthz` | 无。 |
-| `/api/v1/auth/login`、`/api/v1/auth/session` | 登录和会话端点。没有有效浏览器会话时，`/session` 返回 `401`。 |
-| `/api/v1/auth/refresh` | 需要未过期的浏览器 session cookie 和 CSRF header；不接受 HTTP Basic auth。 |
-| `/api/v1/auth/logout` | 需要可验证的浏览器 session cookie 和 CSRF header；可接受已过期 cookie。不接受 HTTP Basic auth。 |
-| `/api/v1/*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
-| `/metrics` | 浏览器 session cookie 或 HTTP Basic auth。 |
+| `/api/v1/auth/login` | 请求体中的用户名和密码。 |
+| `/api/v1/auth/session` | 浏览器会话 Cookie。没有有效会话时返回 `401`。 |
+| `/api/v1/auth/refresh`、`/api/v1/auth/logout` | 浏览器会话 Cookie 和 CSRF 标头，不接受 Basic 认证。登出也接受已过期的 Cookie。 |
+| 其他 `/api/v1/*` 路径和 `/metrics` | 浏览器会话 Cookie，或 HTTP Basic 认证。 |
 
-### 浏览器会话
+仪表盘页面和静态文件无需认证即可加载，但其中的数据需要认证。
 
-浏览器登录会设置 `synaps3_admin_session` HttpOnly cookie，并返回 CSRF token。使用 cookie 认证的 `POST`、`PUT`、`PATCH`、`DELETE` 必须带 `X-SynapS3-CSRF`。续期和退出只接受浏览器会话。
+**浏览器会话。** 登录会设置 HttpOnly Cookie `synaps3_admin_session`，并返回 CSRF token。使用 Cookie 认证的 `POST`、`PUT`、`PATCH`、`DELETE` 请求必须在 `X-SynapS3-CSRF` 中携带它。登录、会话和续期响应包含 `username`、`csrf_token`、`expires_at` 和 `refresh_after`。登录时可选字段 `remember`（默认 `false`）会让 Cookie 持久保存，有效期取 30 天和 `admin.auth.session_ttl` 中较长的一个。在 `refresh_after` 之后续期会延长会话；更早续期则原样返回当前会话。登出会结束该会话及其所有续期 token。会话在重启后仍然有效，设置模式下创建的会话除外。
 
-登录请求中的可选布尔字段 `remember` 默认为 `false`。普通登录使用 browser-session cookie 和配置的 `admin.auth.session_ttl`。`remember = true` 时，cookie 会持久化 30 天或配置的 session TTL，以较长者为准。部分浏览器在恢复上次浏览会话时也会恢复 browser-session cookie。
+**Basic 认证。** 使用 `admin.auth.username` 和 Admin 密码，不需要 CSRF 标头。如果 `Sec-Fetch-Site`、`Origin` 或 `Referer` 标头显示请求来自跨站浏览器页面，Basic 认证请求会被拒绝。
 
-登录、会话和续期响应包含 `username`、`csrf_token`、`expires_at` 和 `refresh_after`。任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后请求续期。登录没有绝对时长上限。没有客户端请求续期时，token 会在 `expires_at` 到期。
+同一客户端 IP 连续 5 次密码错误后，之后的尝试会在一分钟内被拒绝。位于反向代理之后时，只有代理地址在 `admin.trusted_proxies` 中，才会从转发标头中获取客户端 IP。
 
-续期会保留会话时长、CSRF token 和登录 family。退出会撤销整个 family，包括续期签发的 token。正常模式重启会保留会话和已完成的退出结果；Setup 模式的会话在重启后失效。
+所有响应都带有 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 和 `Referrer-Policy: strict-origin-when-cross-origin`。`/api/`、`/metrics` 和 `/healthz` 下的响应还带有 `Cache-Control: no-store`。
 
-### CLI 和 Basic auth
+### 设置模式
 
-CLI 和脚本可以使用 HTTP Basic auth，不需要 CSRF header。如果浏览器发起的 Basic auth 请求通过 `Sec-Fetch-Site`、`Origin` 或 `Referer` 暴露出跨站来源，请求会被拒绝。没有浏览器来源标头的请求仍按 CLI/脚本处理。
+`/healthz` 返回 `{"status":"setup"}` 时，只能使用这些端点：`/healthz`、`/api/v1/auth/*`、`GET` 和 `PUT /api/v1/settings`、`POST /api/v1/settings/validate`、`POST /api/v1/filecoin/readiness/preflight`，以及仪表盘页面。保存有效设置并重启 SynapS3 后，才能使用其余 API。
 
-密码失败会按解析后的客户端 IP 限流；达到限制后，后续登录尝试会被拒绝一段时间。
+## 端点
 
-### 反向代理
+### 认证
 
-SynapS3 位于反向代理之后时，只有代理 IP 或 CIDR 配置在 `admin.trusted_proxies` 中，才会使用转发的客户端、协议和主机 header。除非代理会清理不可信的 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`，否则保持为空。
-
-### Admin 凭据
-
-Admin 凭据由 `synaps3 init` 创建。交互式 init 只打印一次密码。非交互和 Docker init 会把密码写到运行数据目录下的 `admin-initial-password`，文件权限为 `0600`。本地 `synaps3 admin` 命令按 `--config`、`SYNAPS3_CONFIG`、默认路径定位配置，再优先使用 `SYNAPS3_ADMIN_PASSWORD`，其次读取配置文件同目录的 `admin-initial-password`，最后提示输入。
-
-重置密码会同时轮换 `admin.auth.session_secret`，使已有浏览器会话失效。离线重置密码：
-
-```bash
-synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
-```
-
-## 认证端点
-
-| Method | Path | 用途 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/login` | 校验用户名和密码，接受可选的 `remember`，设置浏览器 cookie，并返回会话。 |
-| `GET` | `/api/v1/auth/session` | 返回当前浏览器会话。 |
-| `POST` | `/api/v1/auth/refresh` | 续期符合条件的浏览器会话。过早请求只返回当前会话且不修改 cookie。 |
-| `POST` | `/api/v1/auth/logout` | 撤销浏览器登录并清除 cookie；`204` 确认成功。 |
+| `POST` | `/api/v1/auth/login` | 用 `username`、`password` 和可选的 `remember` 登录。 |
+| `GET` | `/api/v1/auth/session` | 返回当前会话。 |
+| `POST` | `/api/v1/auth/refresh` | 延长会话。 |
+| `POST` | `/api/v1/auth/logout` | 结束会话，返回 `204`。 |
 
-退出之外的 API 返回 `401` 时，仪表盘会显示登录页。退出请求失败时应重试。`503` 和网络错误会保留已缓存的会话；首次无法验证时显示 **Retry**。
+### 健康检查与监控
 
-## 安全标头
-
-Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 和 `Referrer-Policy: strict-origin-when-cross-origin`。默认内容策略让仪表盘资源保持同源。`/api/`、`/admin/`、`/metrics` 和 `/healthz` 还会发送 `Cache-Control: no-store`。仪表盘页面资源不受该标头影响。
-
-## 高风险操作
-
-把这些端点当作变更窗口操作处理。它们可能改变数据、凭据、钱包支付状态或后台状态。
-
-| 范围 | 端点 | 风险 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| 设置 | `PUT /api/v1/settings` | 变更可能需要重启。钱包和网络必须与部署匹配；保存前先验证设置和 Filecoin readiness。 |
-| 钱包 | `POST /api/v1/wallet/fund`、`POST /api/v1/wallet/withdraw`、`POST /api/v1/wallet/approve` | 创建链上支付操作。 |
-| S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
-| 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
-| 后台任务和存储健康 | 任务重试与确认、存储提供方和数据集刷新 | 创建新的执行轮次、确认已查看的失败，或刷新运维状态。 |
-| 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement` | 创建新的付费数据集，把副本迁移过去，并终止已存在的旧数据集。 |
+| `GET` | `/healthz` | 健康状态，见[健康检查](../operations/health-metrics.md#健康检查)。 |
+| `GET` | `/metrics` | Prometheus 指标，见 [Prometheus 指标](../operations/health-metrics.md#prometheus-指标)。 |
+| `GET` | `/api/v1/system/info` | 版本、提交和运行时长。 |
+| `GET` | `/api/v1/workers` | 后台任务状态。 |
+| `GET` | `/api/v1/cache/stats` | 缓存用量和容量。 |
+| `GET` | `/api/v1/overview` | 仪表盘概要。`tasks.attention.failed` 是未确认的失败任务数。 |
+| `GET` | `/api/v1/monitoring` | 最近一小时的 CPU、内存和流量采样。 |
+| `GET` | `/api/v1/events` | 仪表盘使用的服务器推送事件流。使用 Cookie 认证的事件流会在会话结束时关闭。 |
 
-## 健康检查和指标
+### 存储桶与对象
 
-| Method | Path | 用途 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/healthz` | 数据库、缓存和后台任务健康状态。 |
-| `GET` | `/metrics` | Prometheus 指标。需要 Admin 认证。 |
-| `GET` | `/api/v1/system/info` | 版本和运行时信息。 |
-| `GET` | `/api/v1/workers` | 后台任务活动和健康状态。 |
-| `GET` | `/api/v1/cache/stats` | 缓存使用量和容量。 |
-
-指标含义和采样新鲜度见[健康检查和指标](../operations/health-metrics.md#prometheus-metrics)。
-
-## 仪表盘数据
-
-| Method | Path | 用途 |
-| --- | --- | --- |
-| `GET` | `/api/v1/overview` | 仪表盘摘要。 |
-| `GET` | `/api/v1/events` | 仪表盘事件流。使用 cookie 认证时，会话到期、被撤销或无法验证都会关闭连接。空闲连接每 15 秒检查一次，每次验证最多 5 秒。 |
 | `GET` | `/api/v1/buckets` | 列出存储桶。 |
 | `POST` | `/api/v1/buckets` | 创建存储桶。 |
-| `GET` | `/api/v1/buckets/{name}` | 读取存储桶详情。 |
-| `PUT` | `/api/v1/buckets/{name}/owner` | 更新存储桶 owner。 |
-| `PUT` | `/api/v1/buckets/{name}/copy-policy` | 更新目标副本数和/或缓存释放门槛。 |
-| `DELETE` | `/api/v1/buckets/{name}` | 不支持，返回 `501 Not Implemented`。 |
+| `GET` | `/api/v1/buckets/{name}` | 存储桶详情，包括数据集，以及最近 50 次存储提供方替换（`replacements`，最新的在前）。 |
+| `PUT` | `/api/v1/buckets/{name}/owner` | 修改所有者（`owner_access_key`）。 |
+| `PUT` | `/api/v1/buckets/{name}/copy-policy` | 修改副本设置。 |
+| `DELETE` | `/api/v1/buckets/{name}` | 不支持，返回 `501`。 |
 | `GET` | `/api/v1/buckets/{name}/objects` | 列出对象。 |
-| `DELETE` | `/api/v1/buckets/{name}/objects` | 创建对象 delete marker。 |
-| `POST` | `/api/v1/buckets/{name}/objects/upload` | 通过仪表盘上传对象。 |
-| `GET` | `/api/v1/buckets/{name}/objects/download` | 通过仪表盘下载对象。 |
-| `GET` | `/api/v1/buckets/{name}/objects/versions` | 列出对象版本，并返回当前版本 token。 |
-| `POST` | `/api/v1/buckets/{name}/objects/versions/restore` | 基于已有数据版本创建新的当前版本。 |
-| `GET` | `/api/v1/buckets/{name}/objects/provenance` | 查看对象存储来源。 |
-| `GET` | `/api/v1/buckets/{name}/objects/status-detail` | 读取对象详细状态。 |
-| `GET` | `/api/v1/buckets/{name}/objects/deleted` | 列出已删除对象。 |
-| `GET` | `/api/v1/buckets/{name}/objects/deletions` | 列出对象 delete markers。 |
-| `POST` | `/api/v1/buckets/{name}/objects/restore` | 从 delete marker 恢复对象。 |
-| `POST` | `/api/v1/buckets/{name}/objects/permanent-delete` | 永久删除对象版本。 |
-| `POST` | `/api/v1/buckets/{name}/objects/deleted/permanent-delete` | 永久删除已删除对象版本。 |
-| `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | 列出受存储健康问题影响的版本。 |
-| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的存储提供方，以及其他存储提供方不能接管的原因。 |
-| `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
-| `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的批次。 |
+| `DELETE` | `/api/v1/buckets/{name}/objects` | 添加删除标记。 |
+| `POST` | `/api/v1/buckets/{name}/objects/upload` | 上传对象。请求的 `Content-Type` 即对象的内容类型。 |
+| `GET` | `/api/v1/buckets/{name}/objects/download` | 下载对象。 |
+| `GET` | `/api/v1/buckets/{name}/objects/versions` | 列出版本。对象有版本时包含 `current_version_id`。 |
+| `POST` | `/api/v1/buckets/{name}/objects/versions/restore` | 把较早的版本复制为新的当前版本。 |
+| `GET` | `/api/v1/buckets/{name}/objects/provenance` | 对象版本的副本及其存储提供方。 |
+| `GET` | `/api/v1/buckets/{name}/objects/status-detail` | 对象版本的详细存储状态。 |
+| `GET` | `/api/v1/buckets/{name}/objects/deleted` | 列出已删除的对象。 |
+| `GET` | `/api/v1/buckets/{name}/objects/deletions` | 列出删除标记。 |
+| `POST` | `/api/v1/buckets/{name}/objects/restore` | 恢复已删除的对象。 |
+| `POST` | `/api/v1/buckets/{name}/objects/permanent-delete` | 永久删除一个版本。 |
+| `POST` | `/api/v1/buckets/{name}/objects/deleted/permanent-delete` | 永久删除一个已删除的对象。 |
+| `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | 受存储健康问题影响的版本。 |
 
-对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
+#### 副本设置
 
-### 存储桶副本策略
+`POST /api/v1/buckets` 接受 `name`、`owner_access_key`，以及可选的 `default_copies`、`minimum_durable_copies` 和 `provider_selection_strategy`（`distribution` 或 `speed`）。省略的值取自配置。之后配置变化时，存储桶保留自己的值。存储桶响应包含 `default_copies`、`minimum_durable_copies`、`provider_selection_strategy`、`status`，存储准备期间还包含 `setup_message`。见[目标副本数与最小持久副本数](../concepts/filecoin-storage-flow.md#目标副本数与最小持久副本数)。
 
-`POST /api/v1/buckets` 接受可选的 `default_copies` 和 `minimum_durable_copies` 字段，缺省时取服务端配置值。存储桶会保存创建时的策略，之后修改配置不影响已有存储桶。存储桶列表、详情、创建和策略更新响应中，这两个字段都是整数：
+`PUT /api/v1/buckets/{name}/copy-policy` 接受 `default_copies` 和 `minimum_durable_copies`：
 
-- `default_copies`：该存储桶的目标副本数；
-- `minimum_durable_copies`：释放缓存前必须完成的副本数，不会超过目标副本数。
+- 省略的字段保持不变。`"default_copies": null` 把目标副本数重置为 `filecoin.default_copies`；`"minimum_durable_copies": null` 把最小值设为目标副本数。
+- 取值必须在 `1` 到 `8` 之间，最小值不能超过修改后的目标副本数。
+- 调低 `default_copies`（包括通过 `null` 重置导致的调低）返回 `400`。高于新目标的副本会继续运行并持续计费。
+- 空请求或无效组合返回 `400`。
 
-存储桶准备期间，列表和详情响应包含 `setup_message`，说明正在等待测速、节点、资金还是存储服务；准备任务需要重试时会提示到 Tasks 处理。
+#### 永久删除
 
-`PUT /api/v1/buckets/{name}/copy-policy` 可以独立接收 `default_copies` 和 `minimum_durable_copies`。字段缺省时保持不变。传 `null` 表示重置该字段：`default_copies: null` 恢复为配置的默认值，`minimum_durable_copies: null` 将门槛设为与目标副本数相同。显式值必须在 `1` 到 `8` 之间，且门槛不能超过同一请求产生的最终目标副本数。空请求或无效的最终组合返回 `400 Bad Request`。
+`permanent-delete` 接受 `key` 和 `version_id`；`deleted/permanent-delete` 接受 `key` 和 `delete_marker_version_id`。该版本的存储工作仍在进行、已提交的 Filecoin 交易等待确认，或该版本不符合删除条件时，两者都返回 `409`。从未提交过交易的失败存储工作不会阻止删除。无效请求返回 `400`；存储桶、对象或版本不存在时返回 `404`。只被已删除版本使用的远端副本会在后台移除。
 
-**不支持调低 `default_copies`，调低会返回 `400 Bad Request`。** 超出新目标的那些副本仍会继续运行、继续计费，而且没有任何机制会退役它们，所以目标副本数只能调高。如果 `null` 重置后的值低于存储桶当前的目标副本数，同样会被拒绝。
+#### 版本恢复
 
-目标副本数变更只影响新上传。最低耐久副本数变更还会重新评估当前上传仍保留的缓存。提高门槛无法恢复已经删除的缓存。
-
-### 永久删除对象版本
-
-`POST /api/v1/buckets/{name}/objects/permanent-delete` 接受 `key` 和 `version_id`。`POST /api/v1/buckets/{name}/objects/deleted/permanent-delete` 接受 `key` 和 `delete_marker_version_id`。
-
-如果将被删除的任一版本仍有存储工作在进行，或已提交的 Filecoin 交易仍在等待确认，两个端点会立即返回 `409 Conflict`。请检查相关任务后重试。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。所选版本或已删除对象不再符合永久删除条件时，同样返回 `409 Conflict`；无效请求返回 `400 Bad Request`，存储桶、对象或版本不存在时返回 `404 Not Found`。
-
-删除成功后，仅由已删除版本使用的远程存储会排入后台清理；仍被其他版本共享的存储会保留。
-
-### 恢复对象版本
-
-对象存在版本历史时，`GET /api/v1/buckets/{name}/objects/versions` 的每一页都会返回 `current_version_id`。确认恢复时把该值传回服务端：
+请求：
 
 ```json
 {
@@ -174,222 +109,162 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-`POST /api/v1/buckets/{name}/objects/versions/restore` 会把选中的历史数据版本复制为同一存储桶、同一对象键下的新版本。已有数据版本和 delete marker 不会被修改或删除。选中版本必须与当前可读对象的表示不同；直接选择当前版本，或选择与当前版本等价的历史版本，请求会被拒绝，并且不会改变对象。当前版本失败或不可用时，仍可使用可读的历史版本恢复。
+`expected_current_version_id` 填版本列表中的 `current_version_id`。成功时响应包含 `key`、`source_version_id` 和新的 `version_id`；原有版本和删除标记保持不变。恢复同步执行，最长一小时，需要能容纳新版本的缓存空间。
 
-成功响应：
-
-```json
-{
-  "key": "path/file.txt",
-  "source_version_id": "source-version-id",
-  "version_id": "new-current-version-id"
-}
-```
-
-选中 delete marker，或 `expected_current_version_id` 已不再是当前版本时，请求返回 `409 Conflict`。刷新版本列表后，使用新的 token 重新确认。如果选中版本已经与当前对象一致，响应会返回稳定错误码，客户端可将其作为无操作处理：
-
-```json
-{
-  "error": "selected version already matches the current object",
-  "code": "object_version_already_current"
-}
-```
-
-源版本不存在或已被永久删除时返回 `404 Not Found`；缓存容量不足时返回 `503 Service Unavailable`；输入无效时返回 `400 Bad Request`；源版本读取失败或内部错误返回 `500 Internal Server Error`。
-
-恢复操作同步流式执行，最长一小时，并且缓存必须能容纳新的目标版本。
-
-### 替换存储提供方
-
-`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费数据集、把新上传切换过去、复制已有数据，并在每个保留版本都能从新存储提供方读取之后关闭已存在的旧数据集。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧存储提供方也不会被关闭。
-
-自动选择新的存储提供方：
-
-```json
-{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<从价格清单接口取得的指纹>" }
-```
-
-自动选择会排除该存储桶用过的所有存储提供方，包括已退休的。也可以指定存储提供方：
-
-```json
-{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<从价格清单接口取得的指纹>" }
-```
-
-指定的存储提供方必须有针对当前服务 URL 的未过期、可用、活跃且支持 PDP 的健康观测，并且上传测速成功。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的存储提供方，以及任何仍持有该存储桶活跃代的存储提供方，都会被拒绝。两种选择方式都必须保留[配置要求的锚定层级](../configuration/model.md#节点选择)。可选可信节点尚未完成测速时，自动选择返回 `409 Conflict` 和 `provider_speed_tests`。
-
-确认前读取 `GET /api/v1/filecoin/warm-storage/price-list`。接口返回当前币种地址、全部费率、费用、锁定额、读取时间及指纹；金额均为十进制整数字符串。新请求会重新读取合约价格；`price_list_unavailable`、`price_list_changed` 或 `unsupported_price_token` 都会阻止授权。价格变化后应审阅新清单并使用新的请求 ID。指纹记录授权时审阅的价格，链上价格此后仍可能变化。
-
-`client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式、手动存储提供方和价格指纹使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。重放会在读取当前价格以及自动选择的批准状态前命中原记录，因此清单后续变化不会改选存储提供方。
-
-未完成的替换会保留来源、目标和副本槽位。目标尚未就绪且当前创建任务为 Failed 时，可从原来源副本确认另一提供方，取代该次替换。其他未完成替换继续保留槽位。被取代请求中已知的闲置服务沿用正常关闭流程。`replacement_active` 表示请求的副本仍属于未完成替换，应按返回的提示处理。
-
-当前副本在服务已就绪，或服务尚未就绪且当前创建任务为 Failed 时可替换。创建任务处于 Pending 或 Running 时不能执行此初始化恢复，包括 Retry 启动的新任务。任务失败后，已保存的请求 ID、已提交交易或无法回查的结果不会阻止替换，也不要求查询提供方。存储桶响应提供 `replaceable`、可选的 `replacement_blocked_reason` 和 `setup_error`；提交时会重新核验。可选的 `replacement_has_late_service_risk` 表示被取代的创建请求仍可能成功创建服务。
-
-尚无已知服务的副本在确认后停止为被替换提供方继续创建，并准备所选提供方。新服务就绪前，原副本保留槽位。需要该副本的新上传会等待设置完成，交接后继续执行。所需内容从其他副本或缓存恢复，两者都没有的内容需要处理。被取代的请求迟到成功时，可能留下未使用的数据集并产生创建费用。SynapS3 不会自动接管或清理这类迟到服务。
-
-首次确认成功返回 `201 Created` 和替换记录；精确重放返回 `200 OK`。`GET /api/v1/buckets/{name}` 在 `replacements` 中返回该存储桶最近的替换记录，最新的在前，最多 50 条。
-
-替换会经历以下状态：
-
-| 状态 | 含义 |
+| 状态码 | 原因 |
 | --- | --- |
-| `preparing_target` | 正在创建新服务。已就绪的来源继续接收写入；来源尚无服务时，新上传等待所选提供方就绪。 |
-| `migrating` | 新存储提供方开始接收新上传，同时复制已有数据。 |
-| `waiting` | 已暂停。`wait_reason` 与 `wait_message` 会区分服务创建（`target_creating`）、可写确认（`target_writable`）、存储提供方不可达（`target`）、资金、来源可用性和安全退休等待。多数等待无需操作即可继续。 |
-| `retiring` | 数据已复制完毕，正在终止旧服务。 |
-| `cleanup_attention` | 终止旧服务需要运营者决定，例如结清欠费。 |
-| `failed` | 工作已停止，需要操作。根据 `retryable` 和返回的提示处理。 |
-| `completed` | 所需内容可从新提供方读取，存在的旧服务也已终止。 |
-| `superseded` | 更晚的一次确认取代了本次请求。 |
+| `400` | 请求无效。 |
+| `404` | 源版本不存在。 |
+| `409` | 源版本是删除标记，或当前版本已变化；重新加载列表后再确认。带 `"code": "object_version_already_current"` 时，源版本与当前对象相同。 |
+| `503` | 缓存空间不足。 |
 
-退役停止时还会返回 `retirement_attention` 和错误；恢复安全时，还会提供当前绑定的 `retry_task_id`，包括已被替代但仍需退役未使用目标的替换记录。其他情况下，`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 要求改选提供方。`target_rejected` 本身不决定重试资格，应按 `retryable` 和返回的提示处理。目标创建任务 Failed 后不会自动重新启动。交接前，可从 **Tasks** 使用可用的 **Retry** 继续使用所选提供方，或从原来源副本改选提供方。
+### 存储提供方与替换
 
-`items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
-
-每条替换记录还包含嵌套的 `progress` 对象。发现内容期间，`seeding_complete` 为 `false`，`items_total` 只是当前已发现数量，并且省略 `percent`。发现完成后，`items_total` 才是最终总数，`percent` 按 `items_processed / items_total` 计算，其中 `items_processed = items_copied + items_no_longer_needed`。因此，即使部分内容在复制前已删除，完成状态仍会达到 100%。`items_pending`、`items_active`、`items_retrying`、`items_waiting_source`、`items_failed` 与 `items_attention` 返回互斥的当前工作数量。等待确认的工作只计入 `items_active`；需要运营者处理的工作只计入 `items_attention`，两者都属于尚未完成的工作。存在未来的重试时返回 `next_retry_at`。`phase` 取 `prepare`、`migrate`、`retire` 或 `none`。
-
-使用替换响应中的 `retry_task_id` 调用任务 Retry 接口，继续使用原来批准的存储提供方。
-
-更换存储提供方需要重新确认，且仅在旧存储提供方仍持有该副本时可用。新存储提供方接管副本之后，两代各自持有对方没有的数据，因此对任意一代再次确认都会被拒绝（旧代返回 `replacement_source_not_current`，新代返回 `replacement_active`），此时只能用重试完成已批准的复制。
-
-冲突返回 `409 Conflict` 并附带稳定的 code：
-
-```json
-{
-  "error": "that provider already stores a replica of this bucket",
-  "code": "replacement_target_in_use"
-}
-```
-
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running`、`replacement_idempotency_conflict` 和 `provider_speed_tests`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；Filecoin 存储不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
-
-`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing`、`profile_url_changed`、`upload_speed_untested` 和 `upload_speed_failed`。确认目标前，先测试尚未测量的节点，或 Retry 其失败的测速。
-
-手动确认不检查存储提供方是否仍在链上为该存储桶保留数据集。这会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移。此前已正常退休的存储提供方可以再次选择。
-
-### 需要处理的批次
-
-一个批次用一个签名请求把写入同一数据集的一个或多个 piece 提交上链。存储提供方拒绝该批次、没有回复，或发送 15 分钟后仍无法查询其状态时，SynapS3 会在链上核对这些 piece 是否已添加。未添加时，SynapS3 会再次提交原请求；链上只接受该请求一次。存储提供方报告该请求仍在处理时，SynapS3 会继续等待。存储提供方拒绝该请求时会稍后再试；批次确认前已被存储提供方删除的 piece 会先重新上传，再整体重新提交该请求。链上记录显示该请求的 nonce 已用于其他 piece 或其他数据集时：存储提供方从未接受过的请求会换一个新 nonce 重新签名；已被接受的请求则停下等待核对。自动恢复受当前执行轮次的有限预算限制；预算耗尽后保留批次证据，供人工 Retry。
-
-`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出需要处理的批次，也包括超过 15 分钟仍未确认、SynapS3 仍在继续尝试的批次：批次（`request_id`）、所属任务（`task_id`）、存储提供方和数据集、包含的 piece（`piece_count`、`piece_cids`）、已知 transaction、提交失败时存储提供方的回复（`submit_error`）、`submitted_at`、`attention_at` 和稳定的 `reason_code`。Tasks 页面会在对应的 Commit batch 任务上显示同样的批次。对已停止的批次，使用 `POST /api/v1/tasks/{id}/retry` 重试；新一轮执行基于已保存的批次证据继续恢复。
-
-### 失败副本恢复
-
-Provenance 副本和替换详情提供 `retryable`、`retry_task_id`，使用该 ID 调用任务 Retry 接口。历史任务缺失时不提供 Retry。副本达到 `committed` 才表示恢复完成。
-
-## 任务
-
-| Method | Path | 用途 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/tasks` | 列出工作或历史。支持 `scope`、`type`、`status`、`limit` 和基于 ID 的 `cursor`。 |
-| `GET` | `/api/v1/tasks/stats` | 按状态统计 `scope=work` 或 `scope=history` 范围内的任务。 |
-| `GET` | `/api/v1/tasks/{id}` | 读取任务及冻结的执行策略。 |
-| `GET` | `/api/v1/tasks/{id}/history` | 用 `limit`、`cursor` 分页读取执行链。 |
-| `GET` | `/api/v1/tasks/{id}/events` | 用 `limit`、`cursor` 分页读取保留的关键事件；选择失败时包含经过筛选的 `provider_selection` 证据。 |
-| `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | 读取一个任务主体及已知关联信息。 |
-| `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时创建新的执行轮次。 |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时将已核对的失败移入 `history` 范围，保留结果和 Retry 资格。 |
-| `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
-| `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
+| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 可以接管该副本的存储提供方，以及其他存储提供方不能接管的原因。 |
+| `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 替换副本的存储提供方。 |
+| `GET` | `/api/v1/filecoin/warm-storage/price-list` | 当前存储价格，以及用于确认替换的 `fingerprint`。 |
+| `GET` | `/api/v1/observability/providers` | 存储提供方的健康状态、注册信息、approved 和 endorsed 成员资格，以及最新测速。 |
+| `POST` | `/api/v1/observability/providers/refresh` | 重新检查存储提供方健康状态。 |
+| `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | 重新检查单个存储提供方的注册信息和健康状态。 |
+| `POST` | `/api/v1/observability/provider-tiers/refresh` | 重新加载 approved 和 endorsed 列表。 |
+| `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 开始测速。返回 `202` 和 `task_id`；存储提供方未知时返回 `404`；已有测速在运行或存储提供方不符合条件时返回 `409`。 |
+| `POST` | `/api/v1/observability/providers/upload-speed-tests` | 为尚无结果、符合条件的存储提供方排队测速。返回 `202` 和 `queued`。 |
+| `GET` | `/api/v1/observability/providers/upload-speed-summary` | 测速进度，以及是否可以选择存储提供方。 |
+| `GET` | `/api/v1/observability/data-sets` | 本节点数据集的健康状态。 |
+| `POST` | `/api/v1/observability/data-sets/refresh` | 重新检查数据集健康状态。 |
 
-`POST /api/v1/tasks/{id}/retry` 无需请求体，返回 `202 {"task_id":456}`。自动重试留在原轮次；手动 Retry 创建后继，获得新的策略和独立预算。重复请求返回同一后继。任务不存在返回 404，来源已过时或恢复不安全返回 409，并说明原因。临时事务竞争返回 503，可重试请求。
+一次测速在 30 秒内最多上传 32 MiB，至少上传 8 MiB 才能得出结果。结果只对存储提供方当前的服务 URL 有效。存储提供方条目包含 `upload_speed_testable`、`upload_speed_unavailable_reason` 和 `upload_speed_test`（`bytes_per_second`、`duration_ms`、`sample_bytes`、`tested_at` 和 `state`；同一 URL 重测期间 `state` 为 `testing`，URL 变化后为 `stale`）。失败的测速包含 `retry_task_id`。健康检查失败时，`signal.last_error` 给出原因。
 
-`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable`、`retry_task_id` 和 `acknowledgeable`。任务条目的 `retry_task_id` 是调用 Retry 的源任务 ID；superseded 事件中的同名字段是 Retry 返回的后继任务 ID。任务列表和详情均检查当前恢复条件；详情还可能返回 `retry_unavailable_reason`。Retry 始终会在创建后继前重新检查安全证据和所有权。批次需要处理的 Commit batch 任务还会包含 `storage_confirmation`，其中有 `request_id`、`reason_code`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、已知的 `transaction_id`、`submit_error` 和时间。这类任务的 `acknowledgeable` 始终为 false，对其调用 acknowledge 会返回 `409 Conflict`，应改为重试该任务。
+测速概要返回 `auto_scope`、`trusted` 和 `other` 计数（`total`、`succeeded`、`failed`、`testing`、`untested`）、`selectable_providers`、`required_copies`、`ready`、`can_provision_default` 和 `can_test_remaining`。
 
-列表和统计默认使用 `scope=work`：Pending、Running 和未确认失败。`scope=history` 包含完成、取消、已确认和已被替代的执行轮次，也包含周期任务。`work` 的状态筛选支持 `pending`、`running`、`failed`；`history` 支持 `completed`、`cancelled`、`failed`。无效范围或不属于该范围的状态返回 400。确认将失败移入 `history`，保留 Failed 结果和 Retry 资格；历史永久保存。Tasks 页面把 `work` 显示为 Open，把 `history` 显示为 Closed。
-
-主体查询支持 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 和 `storage_commit_request`。本地资源 key 为正整数 ID，Provider key 为十进制 uint256 ID，批次 key 为请求 ID；分别编码两个路径参数。响应包含 `subject_type`、`subject_key` 和可用资源信息。`copy_index` 从 0 开始；`local_data_set_id` 与字符串 `data_set_id` 分别表示本地和链上数据集 ID。文件样例包含 `key`、`source`（`current`、`historical` 或 `deleted`）及 `other_versions`。钱包金额保留为 USDFC 最小单位字符串。参数无效返回 `400`，主体信息不可用返回 `404`，查询失败返回 `500`；接口读取本地记录，可能返回部分信息。
-
-`started_at` 表示任务首次实际开始工作的时间。上传在存储资源等待和数据哈希完成后、即将传输时开始计时。尚未开始工作或无法可靠确定开始时间时省略该字段，包括无需实际工作就结束的任务。新一轮执行记录自己的实际执行或恢复开始时间。`started_at` 和 `finished_at` 保留小数秒。
-
-Duration 计算实际开始至结束的耗时，包含开始后的等待、重试和恢复间隔。Pending、Running 及开始时间未知的任务不显示耗时；确认不改变耗时。Tasks 页面仅在打开主体弹层时查询信息。
-
-批量处理接受 JSON 请求体，其中 `type` 和 RFC 3339 格式的 `failed_before` 都是可选的，`failed_before` 默认为服务端处理请求的时刻：
+#### 替换请求
 
 ```json
-{
-  "type": "storage_store",
-  "failed_before": "2026-09-12T08:30:00Z"
-}
+{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint>" }
 ```
 
-该时刻之后记录的失败仍然可见，因此清理积压不会掩盖还没有人看过的失败。`type` 未知、`failed_before` 无法解析，或请求体包含未知字段、多余内容、超过 4 KiB 时返回 `400 Bad Request`。
+```json
+{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint>" }
+```
 
-需要先看到数量再处理时，先统计，再用统计时刻确认：
+- `client_request_id`（1 到 128 个字符）让请求具有幂等性。首次请求返回 `201`；重复同一请求返回原记录和 `200`。同一 ID 搭配不同参数返回 `409` 和 `replacement_idempotency_conflict`。
+- `price_list_fingerprint` 取自价格表。价格变化时请求失败，返回 `price_list_changed`；`price_list_unavailable` 和 `unsupported_price_token` 也会阻止请求。重新加载价格表，并使用新的请求 ID。
+- 自动模式不会选择该存储桶用过的存储提供方。仍有符合条件的存储提供方在测速时，返回 `409` 和 `provider_speed_tests`。
+- 手动模式接受健康检查新鲜、测速成功、且当前未持有该存储桶副本的存储提供方。为该存储桶保存的所有数据集都已退役的存储提供方可以再次选择。
+- 两种模式都遵守 `filecoin.anchor_provider_tier` 的要求。
+- 所选存储提供方在链上已持有该存储桶的数据集时，替换会在副本迁移前以 `failed` 停止。请换一个存储提供方重新确认。
+
+候选列表（`replacement/providers`）包含所有有健康检查结果的存储提供方，带有 `manual_selectable` 和 `manual_block_reason`：`current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing`、`profile_url_changed`、`upload_speed_untested` 或 `upload_speed_failed`。
+
+存储桶响应中的数据集条目包含 `replaceable`、`replacement_blocked_reason` 和 `setup_error`。副本的数据集已就绪，或其创建任务已失败时，可以替换该副本。
+
+#### 替换状态
+
+| `status` | 含义 |
+| --- | --- |
+| `preparing_target` | 正在创建新数据集。 |
+| `migrating` | 新上传发往新存储提供方，同时复制已存储的数据。 |
+| `waiting` | 暂停，等待条件满足；见 `wait_reason` 和 `wait_message`。 |
+| `retiring` | 复制完成，正在终止旧数据集。 |
+| `cleanup_attention` | 终止旧数据集需要运维人员处理，例如结清付款。 |
+| `failed` | 已停止。按 `retryable` 和错误信息处理。`failure_reason` 为 `target_in_use`（需换一个存储提供方）或 `target_rejected`。 |
+| `completed` | 每个保留的版本都能从新存储提供方读取，旧数据集已终止。 |
+| `superseded` | 同一副本之后的确认取代了此请求。 |
+
+`wait_reason` 取值：`target_creating`、`target_writable`、`target`（新存储提供方不可达）、`funding`、`readable_source`（没有可复制的副本或缓存）、`provider`、`source_writes`、`coverage` 和 `termination_epoch`。多数等待会自行解除。
+
+重试时，把 `retry_task_id` 传给 `POST /api/v1/tasks/{id}/retry`，重试会继续使用同一个存储提供方。要改选其他存储提供方，需要重新确认一次替换；这只能在旧存储提供方仍持有该副本时进行。新存储提供方接管后，再次确认会返回 `replacement_source_not_current`（旧副本）或 `replacement_active`（新副本），此时只能通过重试完成这次替换。
+
+`progress` 报告 `phase`（`prepare`、`migrate`、`retire` 或 `none`）、`seeding_complete`、`items_total`、`items_processed`（`items_copied` + `items_no_longer_needed`）、`percent`（仅在 `seeding_complete` 后提供）、当前计数 `items_pending`、`items_active`、`items_retrying`、`items_waiting_source`、`items_failed` 和 `items_attention`，以及 `next_retry_at`。这些计数按唯一存储内容统计，不按对象版本统计。
+
+#### 替换错误
+
+| 状态码 | Code |
+| --- | --- |
+| `400` | `replacement_target_invalid`、`replacement_target_unavailable`（手动模式） |
+| `404` | 存储桶、数据集或替换不存在。 |
+| `409` | `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_running`、`replacement_source_outcome_unknown`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running`、`replacement_idempotency_conflict`、`provider_speed_tests` |
+| `503` | Filecoin 存储或链上批准检查不可用。 |
+
+### 批次
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/v1/commit-batches` | 列出批次。接受 `status`（`collecting`、`ready`、`submitted`、`confirmed`、`abandoned`）、`limit`（1 到 100，默认 20）和 `cursor`。 |
+| `GET` | `/api/v1/commit-batches/{id}` | 批次详情，包括 piece 和交易。 |
+| `POST` | `/api/v1/commit-batches/{id}/seal` | 请求提前提交下一批（**Submit next batch**）。请求体为空。 |
+| `GET` | `/api/v1/storage-confirmations` | 需要处理的批次。接受 `status=needs_attention` 和 `limit`。 |
+
+`storage-confirmations` 的每个条目包含 `request_id`、`task_id`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、`transaction_id`、`submit_error`（存储提供方的回复）、`reason_code`、`submitted_at` 和 `attention_at`。存储提供方拒绝批次，或批次提交 15 分钟后仍未确认时，会出现在这里。用 `POST /api/v1/tasks/{task_id}/retry` 重试。
+
+### 任务
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/v1/tasks` | 列出任务。接受 `scope`、`type`、`status`、`limit` 和 `cursor`。 |
+| `GET` | `/api/v1/tasks/stats` | 按状态统计某个 `scope` 中的任务数。 |
+| `GET` | `/api/v1/tasks/{id}` | 任务及其重试策略。 |
+| `GET` | `/api/v1/tasks/{id}/history` | 之前的执行。接受 `limit` 和 `cursor`。 |
+| `GET` | `/api/v1/tasks/{id}/events` | 关键事件。接受 `limit` 和 `cursor`。 |
+| `GET` | `/api/v1/task-subjects/{subject_type}/{subject_key}` | 任务处理的对象。 |
+| `POST` | `/api/v1/tasks/{id}/retry` | 重试失败的任务。 |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | 确认失败的任务。 |
+| `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量确认会覆盖多少失败。 |
+| `POST` | `/api/v1/tasks/acknowledge` | 批量确认失败的任务。 |
+
+`scope` 为 `work`（默认：等待中、运行中和未确认的失败任务）或 `history`（已完成、已取消、已确认和已被取代的执行）。`work` 下 `status` 可取 `pending`、`running`、`failed`；`history` 下可取 `completed`、`cancelled`、`failed`；其他值返回 `400`。列表按从新到旧排列；把 `next_cursor` 作为 `cursor` 传入即可获取下一页。任务类型见 [CLI 参考](./cli.md#任务)。
+
+任务包含 `type`、`operation`、`status`（`pending`、`running`、`completed`、`failed`、`cancelled`）、`presentation_status`（等待中的任务为 `queued`、`scheduled` 或 `waiting`）、`retryable`、`retry_task_id`、`retry_unavailable_reason`、`acknowledgeable`、`last_error`、`started_at` 和 `finished_at`。批次需要处理的 **Commit batch** 任务还包含 `storage_confirmation`；这类任务不能确认（返回 `409`），只能重试。
+
+**重试。** `POST /api/v1/tasks/{retry_task_id}/retry` 不带请求体，返回 `202` 和 `{"task_id": <new-id>}`。重复请求返回同一个新任务。任务不存在时返回 `404`；重试不安全时返回 `409` 并说明原因；服务繁忙时返回 `503`，稍后重发请求即可。API 中副本、替换和测速条目提供的 `retryable` 和 `retry_task_id` 都用于此端点。
+
+**确认。** 确认会把失败移到 `history`，不改变其结果，也不影响能否重试。批量端点接受可选的 `type` 和可选的 RFC 3339 时间 `failed_before`（默认：收到请求的时间），返回 `acknowledged`。包含未知字段、未知 `type`、无效时间或请求体超过 4 KiB 时返回 `400`。要确认的范围与统计结果完全一致，把预览返回的 `as_of` 作为 `failed_before` 传入：
 
 ```bash
-curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
+curl -s -u admin "http://127.0.0.1:9090/api/v1/tasks/acknowledge/preview?type=storage_store"
 # {"count":12,"as_of":"2026-09-12T08:30:00.123456789Z"}
 ```
 
-把返回的 `as_of` 作为 `failed_before` 回传，处理的就正好是统计到的那些。
+**任务对象。** `subject_type` 为 `storage_content`、`storage_copy`、`storage_data_set`、`bucket`、`provider`、`storage_replacement`、`wallet_operation` 或 `storage_commit_request`。每个路径段分别做 URL 编码。钱包金额是以 USDFC 最小单位表示的字符串。
 
-`/api/v1/overview` 的 `tasks.by_status` 按状态统计，只统计当前工作；已确认和已被替代的失败位于 History。`tasks.attention.failed` 统计仍需处理的失败。
+### 钱包与 Filecoin
 
-分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换和失败测速共用任务 Retry 接口。是否允许重试取决于当前业务状态和持久证据；外部结果不确定时先观察，再决定是否可以安全重发。缺少任务历史时不能 Retry。
-
-## 钱包和 Filecoin
-
-| Method | Path | 用途 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/wallet` | 钱包身份、余额和合约状态。 |
-| `POST` | `/api/v1/wallet/fund` | 创建钱包充值操作。 |
-| `POST` | `/api/v1/wallet/withdraw` | 创建钱包提现操作。 |
-| `POST` | `/api/v1/wallet/approve` | 创建显式 FWSS approval 操作。payload 只接受 `client_request_id`。 |
-| `GET` | `/api/v1/wallet/operations` | 列出钱包操作。 |
-| `GET` | `/api/v1/filecoin/readiness` | 检查 Filecoin readiness。 |
-| `POST` | `/api/v1/filecoin/readiness/preflight` | 验证待保存的 Filecoin 设置。 |
-| `GET` | `/api/v1/filecoin/warm-storage/price-list` | 当前 Warm Storage 价格字段及审阅指纹。 |
-| `GET` | `/api/v1/observability/providers` | 存储提供方健康、已保存的 Registry 资料、独立的 FWSS approved 和 endorsed 状态及采集时间，以及最近测速。 |
-| `POST` | `/api/v1/observability/providers/refresh` | 刷新存储提供方健康状态。 |
-| `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | 刷新单个节点的 Registry 资料和健康状态；同 ID 并发刷新会冲突。 |
-| `POST` | `/api/v1/observability/provider-tiers/refresh` | 并行刷新 approved 和 endorsed 名单；分别返回成功状态、尝试时间及成功采集时间或错误。单路失败时保留该路之前的资料状态和采集时间。 |
-| `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 对可用的存储提供方发起一次 32 MiB 上传测速。返回 `202 Accepted` 和 `task_id`；存储提供方不存在时返回 `404 Not Found`；已有测速进行中或存储提供方不满足测速条件时返回 `409 Conflict`。 |
-| `GET` | `/api/v1/observability/providers/upload-speed-summary` | 读取已存储的测速进度和节点选择就绪状态，不刷新网络数据。 |
-| `POST` | `/api/v1/observability/providers/upload-speed-tests` | 为当前 URL 下尚无已完成结果的合格节点排队测速。返回 `202 Accepted` 和 `queued`；跳过测速中和已有完成结果的节点。 |
-| `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据；`storage_confirmations_by_data_set` 给出所列数据集上已停止的批次数量。 |
-| `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
+| `GET` | `/api/v1/wallet` | 钱包地址、余额、支付账户和 FWSS 批准状态。 |
+| `POST` | `/api/v1/wallet/fund` | 向支付账户存入 USDFC。请求体：`client_request_id`、`amount`。 |
+| `POST` | `/api/v1/wallet/withdraw` | 从支付账户取出 USDFC。请求体：`client_request_id`、`amount`。 |
+| `POST` | `/api/v1/wallet/approve` | 批准 FWSS。请求体只有 `client_request_id`。 |
+| `GET` | `/api/v1/wallet/operations` | 最近的钱包操作。 |
+| `GET` | `/api/v1/filecoin/readiness` | Filecoin 就绪检查。 |
+| `POST` | `/api/v1/filecoin/readiness/preflight` | 保存前检查 Filecoin 设置。 |
 
-存储提供方观察和替换候选返回 `upload_speed_testable`、可选的 `upload_speed_unavailable_reason`，并在已有结果时返回 `upload_speed_test`。测速资格不受存储桶替换资格限制。可选的 `upload_speed_test.last_success` 提供当前服务地址的最近成功测速，仅供参考；最新测速失败仍阻止新绑定。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`。每次在 30 秒内最多上传 32 MiB；窗口到期时，至少传输 8 MiB 才能估算速度。单次样本不保证实际对象上传速度。自动测速和重测见[节点选择](../configuration/model.md#节点选择)。
+`amount` 是以 USDFC 最小单位表示的十进制字符串。这些端点会发送链上交易，动用钱包资金。
 
-同一 URL 重测时，`state: "testing"` 一并返回上次完成的结果；保留的成功速度仍可用于选择。当前服务 URL 缺失或变化时，结果为 `stale`。失败测速提供 `retry_task_id`，用于任务 Retry 接口。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
+### 设置与 S3 用户
 
-汇总响应包含 `auto_scope`，分别列出 `trusted` 和 `other` 的 `total`、`succeeded`、`failed`、`testing`、`untested` 数量，以及 `selectable_providers` 和 `required_copies`。`ready` 表示可选可信节点都有已完成结果。`can_provision_default` 还会检查默认副本数，以及配置要求的锚定层级名单是否在有效期内。`can_test_remaining` 表示能否继续为未测节点排队。
-
-存储提供方健康检查失败时，该提供方的 `signal.last_error` 会说明原因：检查超时、无法连接、被重定向、返回 HTTP 错误状态，或收到的不是 PDP 服务的应答。
-
-两份名单独立采集。采集时间为空时成员资格未知；成功采集后的 `false` 表示未列入。采集结果在两倍配置刷新间隔内视为新鲜。仅标注已有 Registry 资料的节点。
-
-单节点刷新响应分别包含 `profile_result` 和 `health_result`，各自给出是否成功、尝试时间，以及成功的采集时间或错误。某一部分失败时保留该部分上次成功的数据和观测时间。
-
-## 设置和 S3 用户
-
-| Method | Path | 用途 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/settings` | 读取当前设置和元数据。 |
-| `PUT` | `/api/v1/settings` | 持久化设置变更。 |
-| `POST` | `/api/v1/settings/validate` | 验证设置请求内容，但不保存。 |
+| `GET` | `/api/v1/settings` | 已保存的设置、字段元数据，以及由环境变量设置的字段。 |
+| `PUT` | `/api/v1/settings` | 保存设置，重启后生效。 |
+| `POST` | `/api/v1/settings/validate` | 校验设置但不保存。 |
 | `GET` | `/api/v1/s3-users` | 列出 S3 用户。 |
 | `POST` | `/api/v1/s3-users` | 创建 S3 用户。 |
-| `PUT` | `/api/v1/s3-users/{accessKey}` | 更新 S3 用户名称或 role。 |
-| `POST` | `/api/v1/s3-users/{accessKey}/secret` | 轮换 S3 secret key。 |
+| `PUT` | `/api/v1/s3-users/{accessKey}` | 修改 S3 用户的名称或角色。 |
+| `POST` | `/api/v1/s3-users/{accessKey}/secret` | 轮换 secret key。 |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | 删除 S3 用户。 |
 
-`POST /api/v1/s3-users` 除 `role` 外可选填 `name`。`PUT /api/v1/s3-users/{accessKey}` 可只提交其中一个字段；省略 `name` 表示不改名，传入 `"name": ""` 表示清除名称。名称会去除首尾空白，最长 128 个 Unicode 字符，不能包含控制字符；非空名称必须唯一，区分大小写。列表、创建和更新响应包含 `name`。Access Key 仍是凭据和存储桶所有者的身份标识。
+`GET /api/v1/settings` 还返回 `runtime_filecoin_default_copies`，即当前进程使用的默认目标副本数；`config.filecoin.default_copies` 是下次重启后生效的已保存值。
 
-缓存设置在 `cache` 下提供 `eviction_policy`、`lru_high_watermark_percent` 和 `lru_low_watermark_percent`。有效策略为 `lru`、`after_upload` 和 `none`。水位必须满足 `0 <= low < high <= 100`，且只在 `lru` 策略下生效。
-
-完整运行时可用时，`GET /api/v1/settings` 还会返回 `runtime_filecoin_default_copies`，表示当前进程实际使用的值。`config.filecoin.default_copies` 仍表示已保存、下次重启后生效的值。
-
-保存设置后，重启 SynapS3，检查 `/healthz`，再读取设置以确认实际生效值。
-
-## 写请求示例
+`POST /api/v1/s3-users` 接受 `role`（`user`、`userplus`、`admin`；默认 `userplus`）和可选的 `name`。`PUT` 接受其中任一字段；`"name": ""` 清除名称。名称最多 128 个字符，不能包含控制字符，且不能重复（区分大小写）；重复时返回 `409`。创建和轮换的响应中包含 secret key，之后不再显示。
 
 ```bash
 curl -X POST http://127.0.0.1:9090/api/v1/s3-users \
   -u admin \
   -H 'Content-Type: application/json' \
-  -d '{"role":"user"}'
+  -d '{"role":"userplus"}'
 ```
 
-在 curl 的无回显提示中输入 Admin 密码。响应包含 access key、secret key 和 role。secret key 只显示一次；请保存到权限为 `0600` 的凭据文件，如果泄露则立即轮换。
+curl 会提示输入 Admin 密码。
