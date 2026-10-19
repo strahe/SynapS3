@@ -46,6 +46,22 @@ func newTestBackend(t *testing.T) *testBackend {
 	return newTestBackendWithOptions(t)
 }
 
+func reopenTestBackend(t *testing.T, tb *testBackend, opts ...backend.Option) {
+	t.Helper()
+	fsCache, err := cache.NewFilesystem(tb.cache.(*cache.Filesystem).RootDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("reopening cache: %v", err)
+	}
+	tb.repos = repository.NewRepositories(tb.db)
+	tb.cache = fsCache
+	gate, accessTracker := newBackendCacheAccess(tb.repos)
+	tb.gate = gate
+	tasks, messages := newBackendTaskRuntime(t, tb.repos)
+	tb.tasks = tasks
+	opts = append(opts, backend.WithTaskService(tasks), backend.WithCacheEvictionMessages(messages))
+	tb.backend = backend.New(tb.repos, fsCache, tb.storage, gate, accessTracker, slog.Default(), opts...)
+}
+
 func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBackend {
 	t.Helper()
 	db := testutil.NewTestDB(t)

@@ -172,10 +172,6 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 		return nil, fmt.Errorf("migrating systemtest database: %w", err)
 	}
 
-	iam := s3iam.NewService(repository.NewRepositories(database))
-	if err := iam.CreateAccount(auth.Account{Access: OwnerAccess, Secret: OwnerSecret, Role: auth.RoleUserPlus}); err != nil {
-		return nil, fmt.Errorf("creating systemtest S3 owner: %w", err)
-	}
 	configPath := filepath.Join(tempDir, "config.toml")
 	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
 		return nil, fmt.Errorf("creating systemtest settings file: %w", err)
@@ -200,7 +196,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 		},
 		UploadSpeedProbe: filecoin,
 		Filecoin: app.FilecoinServices{
-			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314, USDFCAddress: memoryUSDFCAddress.Hex(),
+			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314159, USDFCAddress: memoryUSDFCAddress.Hex(),
 			Storage: storageClient, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,
 			Terminator: filecoin, Epochs: filecoin, CommitNonces: filecoin, ParkedPieces: filecoin,
@@ -209,6 +205,11 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating systemtest runtime: %w", err)
+	}
+
+	iam := s3iam.NewService(repository.NewRepositories(database))
+	if err := iam.CreateAccount(auth.Account{Access: OwnerAccess, Secret: OwnerSecret, Role: auth.RoleUserPlus}); err != nil {
+		return nil, fmt.Errorf("creating systemtest S3 owner: %w", err)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)

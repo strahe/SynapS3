@@ -98,6 +98,9 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 		if bucket == nil {
 			return taskengine.Cancel("Bucket no longer exists", nil)
 		}
+		if !bucket.ProviderSelectionStrategy.Valid() {
+			return taskengine.Fail(errors.New("bucket has an unsupported provider selection strategy"), "invalid_provider_selection_strategy", nil)
+		}
 		// A ready bucket is still provisioned here after its replica target
 		// grows: readiness is decided by the data sets below, not by the status
 		// the bucket happened to have when this task was enqueued.

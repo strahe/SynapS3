@@ -403,3 +403,9 @@ var (
 func (s *StorageServiceAdapter) ConfigureProviderHTTPClient(allowPrivate bool) {
 	s.providerHTTP = NewProviderHTTPClient(0, allowPrivate)
 }
+
+func (s *StorageServiceAdapter) PDPVerifierAddress() common.Address { return s.verifier }
+
+func (c *dataSetTargetAdapter) ContextIdentity() storage.ContextIdentity {
+	return c.dataSet.ContextIdentity()
+}

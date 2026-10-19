@@ -63,7 +63,7 @@ func replacementBatchFixture(t *testing.T, count int, remoteSource bool, sizes .
 	}
 	if remoteSource {
 		clientID := testOnChainID(t, 7102)
-		if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 7103), ClientDataSetID: &clientID}); err != nil {
+		if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: testOnChainID(t, 7103), ClientDataSetID: &clientID}); err != nil {
 			t.Fatal(err)
 		}
 	} else {
@@ -80,7 +80,7 @@ func replacementBatchFixture(t *testing.T, count int, remoteSource bool, sizes .
 		t.Fatal(err)
 	}
 	clientID := testOnChainID(t, 7202)
-	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 7203), ClientDataSetID: &clientID}); err != nil {
+	if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 7203), ClientDataSetID: &clientID}); err != nil {
 		t.Fatal(err)
 	}
 	coordinator, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {

@@ -26,7 +26,7 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		}
 		row.Status, row.WaitReason, row.FailureReason = transition.Status, transition.WaitReason, transition.FailureReason
 		lastError := errtext.RedactPtr(transition.LastError)
-		row.LastError, row.StatusMessage, row.UpdatedAt = lastError, transition.StatusMessage, now
+		row.LastError, row.StatusMessage, row.UpdatedAt = lastError, errtext.RedactPtr(transition.StatusMessage), now
 		row.LeaseUntil = nil
 		if transition.ClearWorkStartedAt {
 			row.WorkStartedAt = nil

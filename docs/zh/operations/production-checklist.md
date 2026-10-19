@@ -56,18 +56,12 @@ synaps3 admin settings get
 | `admin.trusted_proxies` | 除非可信代理会清理不可信 forwarded headers，否则保持空。 |
 | `admin.auth.enabled` | 生产环境保持 `true`。 |
 | Admin password hash 和 `admin.auth.session_secret` | 必须存在；password hash 由 init/reset 生成，session secret 按密钥管理。 |
-| `filecoin.network` | 明确迁移到 `mainnet` 前保持 `calibration` |
+| `filecoin.network` | 必须与数据库绑定的 Filecoin 链一致；使用其他网络需要独立数据库。 |
 | `filecoin.allow_private_networks` | 除非存储提供方 URL 是可信私有端点，否则保持 `false` |
 | `cache.max_size_gb` | 按预计上传积压量规划 |
 | `logging.format` | Compose 设置为 `json`；内置默认值是 `text`。 |
 
 保存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效值。
-
-高风险设置需要显式确认：
-
-```bash
-synaps3 admin settings set filecoin.network=mainnet --yes
-```
 
 ## 监控
 

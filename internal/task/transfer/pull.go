@@ -102,6 +102,22 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 	if err != nil || (hasCheckpoint && checkpoint.AttemptID == "") {
 		return failPullOutcome(errors.Join(err, errors.New("pull checkpoint has no attempt identity")))
 	}
+	binding, err := h.CopyCoordinator.deps.Repositories.Contents.GetDataSetBindingByID(ctx, copyRow.StorageDataSetID)
+	if err != nil {
+		return retryTask(err, "storage_identity_load_failed")
+	}
+	identity, err := h.deps.Resolver.ExecutionIdentity(ctx, binding)
+	if err != nil {
+		if storagepipeline.IsExecutionIdentityError(err) {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+		return retryTask(err, "storage_identity_load_failed")
+	}
+	if hasCheckpoint {
+		if err := checkpoint.Match(identity); err != nil {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+	}
 	var attempt *storagepull.Attempt
 	if hasCheckpoint {
 		attempt, err = h.CopyCoordinator.deps.Repositories.Contents.GetPullAttempt(ctx, checkpoint.AttemptID, copyRow.ContentID, copyRow.StorageDataSetID)
@@ -126,6 +142,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 		}
 		if !hasCheckpoint {
 			checkpoint.AttemptID = attempt.AttemptID
+			checkpoint.ExecutionIdentity = identity
 			if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Contents.ReservePullRequest(ctx, pullReservation(input, execution.ID(), attempt))
 			}); err != nil {
@@ -210,7 +227,7 @@ func (h *PullHandler) runPull(ctx context.Context, execution taskengine.Executio
 			SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL,
 			ExtraDataHex: hex.EncodeToString(extra),
 		}
-		checkpoint = pullCheckpoint{AttemptID: attemptID}
+		checkpoint = pullCheckpoint{AttemptID: attemptID, ExecutionIdentity: identity}
 	}
 	if !mayPull && !checkpoint.Accepted {
 		return h.observePullPiece(ctx, execution, input, copyRow, target, attempt, pieceCID, false)

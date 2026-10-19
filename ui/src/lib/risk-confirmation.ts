@@ -89,7 +89,7 @@ export function collectSettingsRiskChanges(
     initial.filecoin.network,
     next.filecoin.network,
     'high',
-    'Switches the Filecoin network used for storage operations.'
+    "Changing a bound database's network prevents startup; use a separate database for another network."
   )
   addChanged(
     'filecoin.rpc_url',

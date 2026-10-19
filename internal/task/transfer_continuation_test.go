@@ -55,7 +55,7 @@ func TestCommittedSourceWakesPeerPullPlanWaitingForSource(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+		if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{
 			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); err != nil {
 			t.Fatal(err)

@@ -36,6 +36,8 @@ private_key = "0x..."
 
 Or manage the value through `SYNAPS3_FILECOIN_PRIVATE_KEY`; see [Environment Variables](./environment.md) for supported overrides.
 
+Each database is bound to one wallet address and Filecoin chain; a different wallet or network prevents startup. You can change the RPC endpoint when it serves the same chain.
+
 Keep private keys out of commits, container images, and shell history.
 
 Admin auth also requires a password hash and `admin.auth.session_secret` when `admin.auth.enabled = true`. `synaps3 init` creates both for new configs; use `synaps3 admin-auth reset-password --config <path>` when a password is missing or must be rotated. Password reset also rotates the session secret.
@@ -179,14 +181,8 @@ Eviction settings take effect after restart. Cache cleanup is asynchronous: a wr
 | `admin.auth.session_secret` | Signs Admin browser sessions. Treat as secret. |
 | `filecoin.private_key` | Controls wallet spending and storage operations. Treat as a secret. |
 | `database.dsn` | May contain database credentials. Treat it as a secret. |
-| `filecoin.network` | Moving to `mainnet` changes payment and storage environment. |
+| `filecoin.network` | Must match the database's Filecoin chain and the RPC endpoint. |
 | `filecoin.allow_private_networks` | Allows private-network provider URLs. Enable only for trusted private deployments. |
 | `cache.max_size_gb` | Too small blocks writes; too large can consume the host disk. |
 | `cache.lru_high_watermark_percent` | A high value leaves less headroom for writes while eviction catches up. |
 | `cache.lru_low_watermark_percent` | A low value removes more cached data during each LRU cycle. |
-
-High-risk settings may require explicit confirmation:
-
-```bash
-synaps3 admin settings set filecoin.network=mainnet --yes
-```

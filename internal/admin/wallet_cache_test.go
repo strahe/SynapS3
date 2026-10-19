@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/walletoperation"
 )
 
 func TestCachedWalletQuerier_UsesCachedValueUntilTTLExpires(t *testing.T) {
@@ -291,4 +293,8 @@ type testWalletQuerier struct {
 
 func (t *testWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.WalletInfo, error) {
 	return t.fn(ctx)
+}
+
+func (*testWalletQuerier) WalletIdentity() walletoperation.ExecutionIdentity {
+	return testutil.DefaultWalletExecutionIdentity()
 }

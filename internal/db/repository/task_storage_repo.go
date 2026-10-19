@@ -174,7 +174,8 @@ func (r *BunTaskRepo) AppendEvent(ctx context.Context, taskID int64, eventType s
 		return ErrInvalidInput
 	}
 	event := &model.TaskEvent{TaskID: taskID, Type: eventType, Details: details, CreatedAt: time.Now()}
-	if _, err := r.db.NewInsert().Model(event).Exec(ctx); isForeignKeyViolation(err) {
+	// Preserve JSON escapes verbatim, including visible NUL escapes in errors.
+	if _, err := r.db.NewInsert().Model(event).Value("details", "?::jsonb", string(details)).Exec(ctx); isForeignKeyViolation(err) {
 		return ErrNotFound
 	} else if err != nil {
 		return fmt.Errorf("appending task %d event: %w", taskID, err)

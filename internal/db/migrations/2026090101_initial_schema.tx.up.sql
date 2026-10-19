@@ -129,7 +129,6 @@ CREATE TABLE buckets (
   CONSTRAINT chk_buckets_explicit_copy_policy CHECK (minimum_durable_copies <= default_copies),
   CONSTRAINT chk_buckets_durability_generation CHECK (durability_generation >= 0),
   CONSTRAINT chk_buckets_status CHECK (status IN ('provisioning', 'ready')),
-  CHECK (provider_selection_strategy IN ('distribution', 'speed')),
   PRIMARY KEY (id),
   UNIQUE (name),
   FOREIGN KEY (owner_access_key) REFERENCES s3_accounts (access_key) ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -173,12 +172,38 @@ CREATE INDEX idx_objects_current_version ON objects (current_version_id) WHERE (
 
 --bun:split
 
+CREATE TABLE admin_sessions (
+  session_id_hash text NOT NULL,
+  created_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  CONSTRAINT chk_admin_sessions_hash CHECK (session_id_hash ~ '^[A-Za-z0-9_-]{43}$'),
+  CONSTRAINT chk_admin_sessions_expiry CHECK (expires_at > created_at),
+  PRIMARY KEY (session_id_hash)
+);
+CREATE INDEX idx_admin_sessions_expiry ON admin_sessions (expires_at);
+
+--bun:split
+
+CREATE TABLE deployment_identity (
+  id smallint NOT NULL,
+  payer text NOT NULL,
+  chain_id bigint NOT NULL,
+  created_at timestamptz NOT NULL,
+  CONSTRAINT chk_deployment_identity_singleton CHECK (id = 1),
+  CONSTRAINT chk_deployment_identity_payer CHECK (payer ~ '^0x[0-9a-f]{40}$' AND payer <> '0x0000000000000000000000000000000000000000'),
+  CONSTRAINT chk_deployment_identity_chain CHECK (chain_id > 0),
+  PRIMARY KEY (id)
+);
+
+--bun:split
+
 CREATE TABLE multipart_uploads (
   upload_id text NOT NULL,
   bucket_id bigint NOT NULL,
   key text COLLATE "C" NOT NULL,
   content_type text NOT NULL DEFAULT 'application/octet-stream',
   metadata jsonb NOT NULL DEFAULT '{}',
+  system_metadata jsonb NOT NULL DEFAULT '{}',
   status text NOT NULL DEFAULT 'initiated',
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL,
@@ -186,6 +211,7 @@ CREATE TABLE multipart_uploads (
   CONSTRAINT chk_multipart_uploads_identity CHECK (key <> '' AND upload_id <> ''),
   CONSTRAINT chk_multipart_uploads_status CHECK (status IN ('initiated', 'completing', 'completed', 'aborted')),
   CONSTRAINT chk_multipart_uploads_metadata_json CHECK (jsonb_typeof(metadata) = 'object'),
+  CONSTRAINT chk_multipart_uploads_system_metadata_json CHECK (jsonb_typeof(system_metadata) = 'object'),
   PRIMARY KEY (upload_id),
   FOREIGN KEY (bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );
@@ -581,6 +607,7 @@ CREATE TABLE object_versions (
   e_tag text NOT NULL,
   content_type text NOT NULL DEFAULT 'application/octet-stream',
   metadata jsonb NOT NULL DEFAULT '{}',
+  system_metadata jsonb NOT NULL DEFAULT '{}',
   multipart_upload_id text,
   is_delete_marker boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL,
@@ -591,6 +618,7 @@ CREATE TABLE object_versions (
   CONSTRAINT chk_object_versions_delete_marker_shape CHECK ((is_delete_marker = TRUE AND content_id IS NULL AND size = 0 AND e_tag = '' AND content_type = '') OR (is_delete_marker = FALSE AND content_id IS NOT NULL AND e_tag <> '')),
   CONSTRAINT fk_object_versions_object FOREIGN KEY (object_id, bucket_id, key) REFERENCES objects (id, bucket_id, key) ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT chk_object_versions_metadata_json CHECK (jsonb_typeof(metadata) = 'object'),
+  CONSTRAINT chk_object_versions_system_metadata_json CHECK (jsonb_typeof(system_metadata) = 'object'),
   PRIMARY KEY (version_id),
   FOREIGN KEY (multipart_upload_id, bucket_id, key) REFERENCES multipart_uploads (upload_id, bucket_id, key) ON UPDATE RESTRICT ON DELETE RESTRICT,
   FOREIGN KEY (content_id, bucket_id, size) REFERENCES storage_contents (id, bucket_id, content_size) ON UPDATE RESTRICT ON DELETE RESTRICT

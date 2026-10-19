@@ -1,10 +1,12 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -47,39 +49,23 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
-	_, target, content, bucket, err := copyContext(ctx, h.CopyCoordinator.deps.Repositories, h.deps.Resolver, copyRow)
+	binding, content, bucket, err := loadCopyContext(ctx, h.CopyCoordinator.deps.Repositories, copyRow)
 	if err != nil {
-		if !hasCheckpoint && copyRow.IngressStoreAttempt > 0 {
-			if synapse.IsProviderUnavailable(err) || errors.Is(err, storage.ErrDataSetUnavailable) {
-				return h.copyContextFailure(execution, input, copyRow, err, false)
-			}
-			return h.retryStoreNotStarted(execution, err)
-		}
 		return h.copyContextFailure(execution, input, copyRow, err, !hasCheckpoint)
 	}
-	if hasCheckpoint && !mayStore {
-		return h.recoverStore(ctx, execution, input, copyRow, target, checkpoint)
+	identity, err := h.deps.Resolver.ExecutionIdentity(ctx, binding)
+	if err != nil {
+		if storagepipeline.IsExecutionIdentityError(err) {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+		return retryTask(err, "store_context_load_failed")
 	}
-	if !mayStore {
-		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Storage transfer is ready", nil)
+	knownCID := ""
+	if content.PieceCID != nil {
+		knownCID = *content.PieceCID
 	}
-	if hasCheckpoint {
-		if err := validateStoreCheckpoint(checkpoint, copyRow.ContentSize); err != nil {
-			return taskengine.Fail(err, "invalid_checkpoint", nil)
-		}
-		pieceCID, err := cid.Parse(checkpoint.IntendedPieceCID)
-		if err != nil {
-			return taskengine.Fail(err, "invalid_checkpoint", nil)
-		}
-		state, checkErr := h.storePieceState(ctx, target, checkpoint, pieceCID)
-		if checkErr != nil || state == synapse.ParkedPieceProcessing {
-			return h.waitForStoreStatus(ctx, execution, checkpoint, state, checkErr)
-		}
-		if state == synapse.ParkedPieceReady {
-			return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
-		}
-		return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, true, nil)
-	}
+	adoptedCheckpoint := false
+
 	if !hasCheckpoint && copyRow.IngressStoreAttempt > 0 {
 		previous, err := h.CopyCoordinator.deps.Repositories.Tasks.PreviousStoreCheckpoints(ctx, copyRow.ID, execution.ID())
 		if err != nil {
@@ -98,17 +84,55 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 				return taskengine.Fail(err, "invalid_checkpoint", nil)
 			}
 			candidate.ObservationStartedAt = time.Time{}
-			if hasCheckpoint && checkpoint != candidate {
-				return taskengine.Fail(errors.New("previous Store checkpoints disagree"), "store_checkpoint_conflict", nil)
+			if hasCheckpoint {
+				if !storeCheckpointsAgree(checkpoint, candidate) {
+					return taskengine.Fail(errors.New("previous Store checkpoints disagree"), "store_checkpoint_conflict", nil)
+				}
+				if candidate.VerifiedChecksum == "" {
+					candidate.VerifiedChecksum = checkpoint.VerifiedChecksum
+				}
 			}
 			checkpoint, hasCheckpoint = candidate, true
+			adoptedCheckpoint = true
 		}
-		if hasCheckpoint {
-			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-				return h.retryStoreNotStarted(execution, err)
+	}
+	if hasCheckpoint {
+		if err := checkpoint.Match(identity); err != nil {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+		}
+		if err := validateStoreCheckpoint(checkpoint, copyRow.ContentSize); err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
+		}
+		if knownCID != "" && knownCID != checkpoint.IntendedPieceCID {
+			return h.storeEvidenceFailure(execution, checkpoint, errStoreIdentity, "store_identity_mismatch")
+		}
+		if checkpoint.VerifiedChecksum == "" {
+			body, _, err := h.openStoreBody(ctx, execution, copyRow, content, bucket, checkpoint.IntendedPieceCID)
+			if err != nil {
+				if errors.Is(err, errStoreIdentity) {
+					return h.storeEvidenceFailure(execution, checkpoint, err, "store_identity_mismatch")
+				}
+				if errors.Is(err, os.ErrNotExist) || h.deps.Cache == nil || h.deps.CacheGate == nil {
+					return h.storeEvidenceFailure(execution, checkpoint, errors.New("storage transfer has no verified cache evidence"), "store_identity_unverified")
+				}
+				return h.storeCacheFailure(execution, true, err)
 			}
+			if err := body.Close(); err != nil {
+				return h.storeCacheFailure(execution, true, err)
+			}
+			checkpoint.VerifiedChecksum = content.Checksum
+		}
+		if checkpoint.VerifiedChecksum != content.Checksum {
+			return h.storeEvidenceFailure(execution, checkpoint, errStoreIdentity, "store_identity_mismatch")
+		}
+		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+			return retryTask(err, "store_checkpoint_write_failed")
+		}
+		if adoptedCheckpoint {
 			return taskengine.Wait(model.TaskResumeModeRecover, "provider_confirmation", "Checking storage transfer", nil)
 		}
+	} else if !mayStore {
+		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Storage transfer is ready", nil)
 	}
 	if !hasCheckpoint && !copyRow.CommitSealed() {
 		backlogged, err := commitBacklogFull(ctx, h.CopyCoordinator.deps.Repositories, h.deps.CommitMaxBacklog, copyRow)
@@ -119,26 +143,46 @@ func (h *StoreHandler) runStore(ctx context.Context, execution taskengine.Execut
 			return waitForCommitBacklog()
 		}
 	}
-	if h.deps.Cache == nil || h.deps.CacheGate == nil {
-		if hasCheckpoint {
-			return taskengine.Fail(errors.New("cache reader is unavailable"), "store_cache_read_failed", nil)
+	var prepared *storeBody
+	var freshCID cid.Cid
+	if !hasCheckpoint {
+		prepared, freshCID, err = h.openStoreBody(ctx, execution, copyRow, content, bucket, knownCID)
+		if err != nil {
+			return h.storeBodyFailure(ctx, execution, input, copyRow, false, err)
 		}
-		return h.retryStoreNotStarted(execution, errors.New("cache reader is unavailable"))
+		defer func() { _ = prepared.Close() }()
 	}
-	err = ctx.Err()
-	if err == nil {
-		err = h.CopyCoordinator.deps.Repositories.Tasks.ValidateClaim(ctx, execution.ID(), execution.ClaimGeneration())
-	}
-	if err == nil {
-		err = ctx.Err()
-	}
+	target, err := h.deps.Resolver.OpenReadyDataSet(ctx, binding)
 	if err != nil {
-		if hasCheckpoint {
-			return retryTask(err, "store_checkpoint_write_failed")
+		if storagepipeline.IsExecutionIdentityError(err) {
+			return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
 		}
-		return h.retryStoreNotStarted(execution, err)
+		if !hasCheckpoint && copyRow.IngressStoreAttempt > 0 {
+			if synapse.IsProviderUnavailable(err) || errors.Is(err, storage.ErrDataSetUnavailable) {
+				return h.copyContextFailure(execution, input, copyRow, err, false)
+			}
+			return h.retryStoreNotStarted(execution, err)
+		}
+		return h.copyContextFailure(execution, input, copyRow, err, !hasCheckpoint)
 	}
-	return h.storePiece(ctx, execution, input, copyRow, target, content, bucket)
+	if hasCheckpoint && !mayStore {
+		return h.recoverStore(ctx, execution, input, copyRow, target, checkpoint)
+	}
+	if hasCheckpoint {
+		pieceCID, err := cid.Parse(checkpoint.IntendedPieceCID)
+		if err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
+		}
+		state, checkErr := h.storePieceState(ctx, target, checkpoint, pieceCID)
+		if checkErr != nil || state == synapse.ParkedPieceProcessing {
+			return h.waitForStoreStatus(ctx, execution, checkpoint, state, checkErr)
+		}
+		if state == synapse.ParkedPieceReady {
+			return h.finishPieceTransfer(execution, input, copyRow, target.PieceURL(pieceCID), pieceCID, "")
+		}
+		return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, true, nil)
+	}
+	return h.storePiece(ctx, execution, input, copyRow, target, content, bucket, identity, prepared, freshCID)
 }
 
 func (h *StoreHandler) storePiece(
@@ -149,14 +193,14 @@ func (h *StoreHandler) storePiece(
 	target synapse.DataSetTarget,
 	content *model.StorageContent,
 	bucket *model.Bucket,
+	identity storagepipeline.ExecutionIdentity,
+	body *storeBody,
+	pieceCID cid.Cid,
 ) taskengine.Result {
-	body, pieceCID, err := h.openStoreBody(ctx, execution, copyRow, content, bucket, "")
-	if err != nil {
-		return h.storeBodyFailure(ctx, execution, input, copyRow, false, err)
-	}
-	defer func() { _ = body.Close() }()
 	checkpoint := storeCheckpoint{
-		AttemptedAt: time.Now().UTC(), IntendedPieceCID: pieceCID.String(),
+		ExecutionIdentity: identity,
+		VerifiedChecksum:  content.Checksum,
+		AttemptedAt:       time.Now().UTC(), IntendedPieceCID: pieceCID.String(),
 		ProviderServiceURL: target.ServiceURL(), Stage: storeStageCreate,
 	}
 	if copyRow.IngressStoreAttempt > 0 {
@@ -176,6 +220,26 @@ func (h *StoreHandler) storePiece(
 		}
 	}
 	return h.executeStoreSession(ctx, execution, input, copyRow, target, content, bucket, checkpoint, false, body)
+}
+
+func storeCheckpointsAgree(first, second storeCheckpoint) bool {
+	if first.VerifiedChecksum == "" || second.VerifiedChecksum == "" {
+		first.VerifiedChecksum, second.VerifiedChecksum = "", ""
+	}
+	a, err := json.Marshal(first)
+	if err != nil {
+		return false
+	}
+	b, err := json.Marshal(second)
+	return err == nil && bytes.Equal(a, b)
+}
+
+func (h *StoreHandler) storeEvidenceFailure(execution taskengine.Execution, checkpoint storeCheckpoint, err error, reason string) taskengine.Result {
+	settlement, encodeErr := storeCheckpointSettlement(execution, checkpoint)
+	if encodeErr != nil {
+		return taskengine.Fail(encodeErr, "invalid_checkpoint", nil)
+	}
+	return taskengine.Fail(err, reason, settlement)
 }
 
 func (h *StoreHandler) recoverStore(

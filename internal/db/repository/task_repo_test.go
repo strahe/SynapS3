@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -227,6 +228,48 @@ func TestListKeepsCheckpointForRetryChecks(t *testing.T) {
 	if listed := page.Tasks[0]; !testutil.JSONEqual(listed.Checkpoint, []byte(`{"attempted":true}`)) || string(listed.Input) != `{}` {
 		t.Fatalf("listed checkpoint = %s, input = %s", listed.Checkpoint, listed.Input)
 	}
+}
+
+func TestTaskSettlementPersistsInvalidProviderText(t *testing.T) {
+	repos := repository.NewRepositories(testDB(t))
+	claimed := enqueueAndClaimTask(t, repos, "provider-text", time.Minute)
+	invalid := "provider\x00reply\xff '\\u0000'"
+	err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover,
+		AvailableAt: time.Now().Add(time.Minute), IncrementRetry: true,
+		LastError: &invalid, StatusMessage: &invalid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `provider\u0000reply\xff '\u0000'`
+	if row.Status != model.TaskStatusPending || row.RetryCount != 1 || row.LastError == nil || *row.LastError != want || row.StatusMessage == nil || *row.StatusMessage != want {
+		t.Fatalf("settled task = %#v", row)
+	}
+	events, err := repos.Tasks.ListEvents(t.Context(), claimed.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type != "retry_scheduled" {
+			continue
+		}
+		var details struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(event.Details, &details); err != nil {
+			t.Fatal(err)
+		}
+		if details.Error != want {
+			t.Fatalf("event error = %q, want %q", details.Error, want)
+		}
+		return
+	}
+	t.Fatal("retry event was not committed")
 }
 
 // TestAcknowledgeFailedMatchingDismissesTheSelectedBacklog checks that one bulk

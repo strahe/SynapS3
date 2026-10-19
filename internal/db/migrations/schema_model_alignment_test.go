@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/strahe/synaps3/internal/adminsession"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
@@ -51,6 +52,8 @@ func TestRuntimeModelsMatchCurrentSchema(t *testing.T) {
 
 func runtimePersistentModels() []any {
 	return []any{
+		(*adminsession.Session)(nil),
+		(*model.DeploymentIdentity)(nil),
 		(*model.Task)(nil),
 		(*model.TaskEvent)(nil),
 		(*model.TaskSchedule)(nil),

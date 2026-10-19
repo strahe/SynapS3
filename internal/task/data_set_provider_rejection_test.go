@@ -118,7 +118,7 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 				}
 				fields := map[string]any{
 					"attempted_at": time.Now().UTC().Add(-time.Hour), "client_data_set_id": clientID.String(),
-					"identity": testutil.DefaultContextIdentity, "sends": 1,
+					"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1,
 				}
 				if tc.priorRefusal {
 					fields["provider_rejection"] = map[string]any{"status_code": tc.status, "rejected_at": time.Now().UTC().Add(-time.Minute)}
@@ -269,7 +269,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			}
 			enqueueEnsure := func(id int64) *model.Task {
 				task, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
-					Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: id},
+					Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{ExecutionIdentity: testStorageExecutionIdentity(), DataSetID: id},
 				}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {
 					return repos.Contents.BindDataSetEnsureTask(ctx, id, task.ID)
 				})
@@ -289,7 +289,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			}
 			var targetEnsure *model.Task
 			if state == "already ready" {
-				if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: testOnChainID(t, 2002)}); err != nil {
+				if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: testOnChainID(t, 2002)}); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -299,7 +299,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 					if err := runtime.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: row.TargetDataSetID, TransactionID: "0xdead", ClientDataSetID: &clientID}); err != nil {
 						t.Fatal(err)
 					}
-					checkpoint, err := json.Marshal(map[string]any{"attempted_at": time.Now().UTC().Add(-time.Minute), "client_data_set_id": clientID.String(), "identity": testutil.DefaultContextIdentity, "sends": 1, "transaction_id": "0xdead"})
+					checkpoint, err := json.Marshal(map[string]any{"attempted_at": time.Now().UTC().Add(-time.Minute), "client_data_set_id": clientID.String(), "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1, "transaction_id": "0xdead"})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -475,7 +475,7 @@ func TestReadyLocalTargetSchedulesRequiredContentRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: testOnChainID(t, 2002)}); err != nil {
+	if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: row.TargetDataSetID, DataSetID: testOnChainID(t, 2002)}); err != nil {
 		t.Fatal(err)
 	}
 	coordinator, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeProviderReplacementCoordinate, Input: storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration}}, func(ctx context.Context, repos *repository.Repositories, task *model.Task, _ bool) error {

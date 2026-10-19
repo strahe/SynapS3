@@ -8,8 +8,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/walletoperation"
 )
 
 func TestNewRuntimeReportsAllMissingDependencies(t *testing.T) {
@@ -25,6 +29,60 @@ func TestNewRuntimeReportsAllMissingDependencies(t *testing.T) {
 		if !strings.Contains(err.Error(), dependency) {
 			t.Errorf("NewRuntime error = %q, missing dependency %q", err, dependency)
 		}
+	}
+}
+
+type identityStorage struct {
+	synapse.StorageClient
+	verifier common.Address
+}
+
+func (s identityStorage) PDPVerifierAddress() common.Address { return s.verifier }
+
+type identityWallet struct {
+	synapse.WalletOperator
+	identity walletoperation.ExecutionIdentity
+}
+
+func (w identityWallet) WalletIdentity() walletoperation.ExecutionIdentity { return w.identity }
+
+type identityWalletQuery struct {
+	synapse.WalletQuerier
+	identity walletoperation.ExecutionIdentity
+}
+
+func (w identityWalletQuery) WalletIdentity() walletoperation.ExecutionIdentity { return w.identity }
+
+func TestRuntimeRejectsInconsistentSigningServices(t *testing.T) {
+	for _, scenario := range []string{"valid", "declared network", "probe network", "record keeper", "PDP verifier", "payment contracts"} {
+		t.Run(scenario, func(t *testing.T) {
+			walletIdentity := testutil.DefaultWalletExecutionIdentity()
+			queryIdentity := testutil.DefaultWalletExecutionIdentity()
+			storage := identityStorage{StorageClient: &testutil.MockStorageClient{}, verifier: testutil.DefaultPDPVerifierAddress}
+			services := FilecoinServices{ChainID: uint64(testutil.DefaultContextIdentity.ChainID), Storage: storage}
+			network := "calibration"
+			switch scenario {
+			case "declared network":
+				network = "mainnet"
+			case "probe network":
+				services.ChainID = 314
+			case "record keeper":
+				walletIdentity.Identity.RecordKeeper = common.HexToAddress("0x00000000000000000000000000000000000000ee")
+				queryIdentity.Identity.RecordKeeper = walletIdentity.Identity.RecordKeeper
+			case "PDP verifier":
+				storage.verifier = common.Address{}
+				services.Storage = storage
+			case "payment contracts":
+				address := common.HexToAddress("0x00000000000000000000000000000000000000ee")
+				queryIdentity.Payments = &address
+			}
+			services.Wallet = identityWallet{identity: walletIdentity}
+			services.WalletQuery = identityWalletQuery{identity: queryIdentity}
+			err := validateFilecoinIdentity(network, services)
+			if (err == nil) != (scenario == "valid") {
+				t.Fatalf("runtime identity check = %v", err)
+			}
+		})
 	}
 }
 

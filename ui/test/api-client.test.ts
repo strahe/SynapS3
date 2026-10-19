@@ -364,7 +364,7 @@ test('object upload 401 notifies auth invalidation and clears csrf token', async
   assert.equal(calls[0]?.headers.get('X-SynapS3-CSRF'), null)
 })
 
-test('logout clears csrf token even when server logout fails', async () => {
+test('logout preserves csrf token when server logout fails', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ headers: Headers; method?: string }> = []
   globalThis.fetch = (async (_input, init) => {
@@ -391,7 +391,7 @@ test('logout clears csrf token even when server logout fails', async () => {
   }
 
   assert.equal(calls[0]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
-  assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), null)
+  assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
 })
 
 test('filecoin preflight sends csrf header and payload', async () => {
@@ -861,3 +861,75 @@ test('task list and statistics select work or history explicitly', async () => {
     '/api/v1/tasks/stats?scope=history',
   ])
 })
+
+for (const operation of ['getAuthSession', 'refreshAuthSession'] as const) {
+  for (const status of [200, 401]) {
+    test(`${operation} ignores a previous login's delayed ${status} response`, async () => {
+      const originalFetch = globalThis.fetch
+      const delayed = Promise.withResolvers<Response>()
+      const controller = new AbortController()
+      let signal: AbortSignal | null | undefined
+      let writeToken: string | null = null
+      let invalidations = 0
+      const unsubscribe = addAuthInvalidationListener(() => invalidations++)
+      const newSession = {
+        username: 'admin',
+        csrf_token: 'new-csrf',
+        expires_at: '2030-01-01T00:00:00Z',
+        refresh_after: '2029-01-01T00:00:00Z',
+      }
+      globalThis.fetch = (async (input, init) => {
+        const url = String(input)
+        if (url.endsWith('/auth/session') || url.endsWith('/auth/refresh')) {
+          signal = init?.signal
+          return delayed.promise
+        }
+        if (url.endsWith('/auth/login')) return new Response(JSON.stringify(newSession))
+        writeToken = new Headers(init?.headers).get('X-SynapS3-CSRF')
+        return new Response(JSON.stringify({}))
+      }) as typeof fetch
+      try {
+        setAdminCSRFToken('old-csrf')
+        const previous = api[operation]({ signal: controller.signal })
+        const rejected = assert.rejects(previous, { name: 'AbortError' })
+        await api.login({ username: 'admin', password: 'new-password' })
+        delayed.resolve(new Response(JSON.stringify({ ...newSession, csrf_token: 'old-response' }), { status }))
+        await rejected
+        await api.createBucket({ name: 'bucket', owner_access_key: 'owner' })
+        assert.equal(signal, controller.signal)
+        assert.equal(writeToken, 'new-csrf')
+        assert.equal(invalidations, 0)
+      } finally {
+        unsubscribe()
+        setAdminCSRFToken('')
+        globalThis.fetch = originalFetch
+      }
+    })
+  }
+}
+
+for (const status of [200, 401, 503]) {
+  test(`logout requires 204 and preserves authentication after ${status}`, async () => {
+    const originalFetch = globalThis.fetch
+    let token: string | null = null
+    let invalidations = 0
+    const unsubscribe = addAuthInvalidationListener(() => invalidations++)
+    globalThis.fetch = (async (input, init) => {
+      if (String(input).endsWith('/auth/logout'))
+        return new Response(JSON.stringify({ error: 'Sign out unavailable' }), { status })
+      token = new Headers(init?.headers).get('X-SynapS3-CSRF')
+      return new Response(JSON.stringify({}))
+    }) as typeof fetch
+    try {
+      setAdminCSRFToken('retained-token')
+      await assert.rejects(api.logout())
+      await api.createBucket({ name: 'bucket', owner_access_key: 'owner' })
+      assert.equal(token, 'retained-token')
+      assert.equal(invalidations, 0)
+    } finally {
+      unsubscribe()
+      setAdminCSRFToken('')
+      globalThis.fetch = originalFetch
+    }
+  })
+}

@@ -21,9 +21,26 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 		if _, err := db.Exec("UPDATE buckets SET provider_selection_strategy = 'speed' WHERE id = ?", bucketID); err != nil {
 			t.Fatal(err)
 		}
-		mustRejectStatement(t, db, `UPDATE buckets SET provider_selection_strategy = 'unknown' WHERE id = ?`, bucketID)
 		mustRejectStatement(t, db, `UPDATE buckets SET status = 'invalid' WHERE id = ?`, bucketID)
 		mustRejectStatement(t, db, `UPDATE bucket_replica_slots SET status = 'invalid' WHERE bucket_id = ? AND copy_index = 0`, bucketID)
+		sessionHash := strings.Repeat("A", 43)
+		if _, err := db.Exec(`INSERT INTO admin_sessions (session_id_hash, created_at, expires_at)
+			VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '1 hour')`, sessionHash); err != nil {
+			t.Fatalf("insert valid admin session: %v", err)
+		}
+		for _, invalidHash := range []string{"", "abc", strings.Repeat("!", 43)} {
+			mustRejectStatement(t, db, `UPDATE admin_sessions SET session_id_hash = ? WHERE session_id_hash = ?`, invalidHash, sessionHash)
+		}
+		mustRejectStatement(t, db, `UPDATE admin_sessions SET expires_at = created_at WHERE session_id_hash = ?`, sessionHash)
+		if _, err := db.Exec(`INSERT INTO deployment_identity (id, payer, chain_id, created_at)
+			VALUES (1, '0x00000000000000000000000000000000000000a1', 314159, CURRENT_TIMESTAMP)`); err != nil {
+			t.Fatalf("insert valid deployment identity: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE deployment_identity SET id = 2 WHERE id = 1`)
+		for _, invalidPayer := range []string{"payer", "0x0000000000000000000000000000000000000000", "0x00000000000000000000000000000000000000A1"} {
+			mustRejectStatement(t, db, `UPDATE deployment_identity SET payer = ? WHERE id = 1`, invalidPayer)
+		}
+		mustRejectStatement(t, db, `UPDATE deployment_identity SET chain_id = 0 WHERE id = 1`)
 
 		for _, checksum := range []string{
 			"",
@@ -107,6 +124,22 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 			 metadata, is_delete_marker, created_at, updated_at)
 			VALUES ('v-marker-with-content', 1, ?, 'failure-shape.txt', ?, 0, '',
 			 '', '{}', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID, contentID)
+		if _, err := db.Exec(`INSERT INTO object_versions
+			(version_id, object_id, bucket_id, key, size, e_tag, content_type, is_delete_marker, created_at, updated_at)
+			VALUES ('v-system-metadata', 1, ?, 'failure-shape.txt', 0, '', '', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID); err != nil {
+			t.Fatalf("insert version with default system metadata: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO multipart_uploads
+			(upload_id, bucket_id, key, created_at, updated_at)
+			VALUES ('system-metadata-upload', ?, 'multipart.txt', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID); err != nil {
+			t.Fatalf("insert upload with default system metadata: %v", err)
+		}
+		mustRejectRequiredColumn(t, db, `UPDATE object_versions SET system_metadata = NULL WHERE version_id = 'v-system-metadata'`)
+		mustRejectRequiredColumn(t, db, `UPDATE multipart_uploads SET system_metadata = NULL WHERE upload_id = 'system-metadata-upload'`)
+		for _, metadata := range []string{"null", "[]", `"value"`, "1"} {
+			mustRejectStatement(t, db, `UPDATE object_versions SET system_metadata = ?::jsonb WHERE version_id = 'v-system-metadata'`, metadata)
+			mustRejectStatement(t, db, `UPDATE multipart_uploads SET system_metadata = ?::jsonb WHERE upload_id = 'system-metadata-upload'`, metadata)
+		}
 
 		dataSetID := insertSchemaTestDataSet(t, db, bucketID, "cleanup-provider", 2, 1, false)
 		var cleanupID int64

@@ -621,7 +621,14 @@ func TestPullInvalidEvidenceNeverReachesProvider(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(`{"attempt_id":"existing-pull"}`)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+				checkpoint, err := json.Marshal(struct {
+					storagepipeline.ExecutionIdentity
+					AttemptID string `json:"attempt_id"`
+				}{testStorageExecutionIdentity(), "existing-pull"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -667,7 +674,7 @@ func seedSealedReplacementBatch(t *testing.T, runtime handlerTestRuntime, member
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", identity.CIDv2.String()).Where("id = ?", copyRow.ContentID).Exec(t.Context()); err != nil {
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", identity.CIDv2.String()).Set("checksum = ?", testutil.StorageChecksum(string(contentBytes))).Where("id = ?", copyRow.ContentID).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	copies := []*model.StorageCopy{copyRow}
@@ -795,7 +802,7 @@ func TestTransferPlanOnDrainingDataSet(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 990002)}); err != nil {
+			if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: replacement.TargetDataSetID, DataSetID: testOnChainID(t, 990002)}); err != nil {
 				t.Fatal(err)
 			}
 			if err := activateReplacement(t, runtime, replacement.ID); err != nil {
@@ -966,10 +973,15 @@ func TestSealedMemberWaitsForCommitAcrossConcurrentSchedulers(t *testing.T) {
 			if err != nil || commitClaim == nil || commitClaim.ID != *original.TaskID {
 				t.Fatalf("claim original Commit owner: %#v, %v", commitClaim, err)
 			}
-			ensure, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeStorageDataSetEnsure, Input: storagepipeline.DataSetInput{DataSetID: copyRow.StorageDataSetID}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
-				return repos.Contents.BindDataSetEnsureTask(ctx, copyRow.StorageDataSetID, row.ID)
-			})
+			binding, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), copyRow.StorageDataSetID)
+			if err != nil || binding.EnsureTaskID == nil {
+				t.Fatalf("ready data set has no creation owner: %#v %v", binding, err)
+			}
+			ensure, err := runtime.repos.Tasks.GetByID(t.Context(), *binding.EnsureTaskID)
 			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusPending).Set("finished_at = NULL").Set("resume_mode = ?", model.TaskResumeModeRecover).Set("available_at = ?", time.Now()).Where("id = ?", ensure.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			replacement := new(storagereplacement.Replacement)

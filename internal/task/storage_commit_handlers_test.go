@@ -288,7 +288,7 @@ func newRegistrationFixture(t *testing.T, n int, parked synapse.ParkedPieceCheck
 			if err != nil {
 				t.Fatalf("EnsureDataSetBinding: %v", err)
 			}
-			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+			if err := markTestDataSetReady(t, runtime, ctx, repository.MarkDataSetReadyInput{
 				ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 			}); err != nil {
 				t.Fatalf("MarkDataSetReady: %v", err)
@@ -1286,6 +1286,7 @@ func TestLostSendIsResentUnchangedOnceItsDelayPasses(t *testing.T) {
 			task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
 	var checkpoint struct {
+		storagepipeline.ExecutionIdentity
 		RequestID    string    `json:"request_id"`
 		Sends        int       `json:"sends"`
 		SentAt       time.Time `json:"sent_at"`

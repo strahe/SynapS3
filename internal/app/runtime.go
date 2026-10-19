@@ -26,6 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/providerselect"
 	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/strahe/synaps3/internal/s3iam"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/task"
@@ -122,6 +123,13 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	logger := opts.Logger
 	errtext.Configure(cfg.Filecoin.RPCURL, cfg.Filecoin.PrivateKey, cfg.Admin.Auth.SessionSecret, cfg.Admin.Auth.PasswordHash)
 	repos := repository.NewRepositories(opts.Database)
+	if err := validateFilecoinIdentity(cfg.Filecoin.Network, opts.Filecoin); err != nil {
+		return nil, err
+	}
+	identity := opts.Filecoin.Storage.ContextIdentity()
+	if _, err := repos.DeploymentIdentity.BindOrVerify(ctx, repository.BindDeploymentIdentityInput{Payer: identity.Payer.Hex(), ChainID: int64(identity.ChainID)}); err != nil {
+		return nil, fmt.Errorf("validating deployment identity: %w", err)
+	}
 	maxCacheBytes := int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024
 	localCache, err := cache.NewFilesystem(cfg.Cache.Dir, maxCacheBytes)
 	if err != nil {
@@ -638,4 +646,24 @@ func s3AccessLogger(logger *slog.Logger, cfg config.LoggingS3AccessConfig) s3log
 		return nil
 	}
 	return s3access.NewLogger(logger, cfg.Level)
+}
+
+func validateFilecoinIdentity(network string, services FilecoinServices) error {
+	identity := services.Storage.ContextIdentity()
+	if !storagepipeline.NewExecutionIdentity(identity, services.Storage.PDPVerifierAddress()).Complete() {
+		return errors.New("storage signing identity is incomplete")
+	}
+	if err := synapse.ValidateNetworkChainID(network, int64(identity.ChainID)); err != nil {
+		return err
+	}
+	if services.ChainID != uint64(identity.ChainID) {
+		return errors.New("filecoin services disagree on their network")
+	}
+	if err := services.Wallet.WalletIdentity().Match(services.WalletQuery.WalletIdentity()); err != nil {
+		return err
+	}
+	if *services.Wallet.WalletIdentity().Identity != identity {
+		return errors.New("filecoin services disagree on their wallet")
+	}
+	return nil
 }

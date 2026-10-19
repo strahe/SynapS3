@@ -18,7 +18,9 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/storagecleanup"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/synapse"
+	bindingtask "github.com/strahe/synaps3/internal/task/binding"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/storage"
 )
@@ -65,6 +67,7 @@ const (
 )
 
 type cleanupCheckpoint struct {
+	storagepipeline.ExecutionIdentity
 	CopyID          int64     `json:"copy_id"`
 	AttemptedAt     time.Time `json:"attempted_at"`
 	RetryOfTxHash   string    `json:"retry_of_tx_hash,omitempty"`
@@ -175,6 +178,25 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			hasCheckpoint = checkpoint.CopyID != 0
 			continue
 		}
+		binding, err := h.deps.Repositories.Contents.GetDataSetBindingByID(ctx, copyRow.StorageDataSetID)
+		if err != nil {
+			return retryTask(err, "storage_identity_load_failed")
+		}
+		identity, err := bindingtask.RecordedIdentity(ctx, h.deps.Repositories, binding)
+		if err == nil {
+			err = identity.Match(bindingtask.CurrentIdentity(h.deps.Storage))
+		}
+		if err != nil {
+			if storagepipeline.IsExecutionIdentityError(err) {
+				return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+			}
+			return retryTask(err, "storage_identity_load_failed")
+		}
+		if hasCheckpoint && checkpoint.CopyID == copyRow.ID {
+			if err := checkpoint.Match(identity); err != nil {
+				return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+			}
+		}
 		if _, err := execution.ObserveOperation(ctx, fmt.Sprintf("cleanup:%d", copyRow.ID)); err != nil {
 			return retryTask(err, "cleanup_observation_failed")
 		}
@@ -241,7 +263,7 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 		if err != nil {
 			return retryTask(err, "cleanup_context_failed")
 		}
-		checkpoint = cleanupCheckpoint{CopyID: copyRow.ID, AttemptedAt: time.Now().UTC(), RetryOfTxHash: previousHash}
+		checkpoint = cleanupCheckpoint{ExecutionIdentity: identity, CopyID: copyRow.ID, AttemptedAt: time.Now().UTC(), RetryOfTxHash: previousHash}
 		var settlement taskengine.Settlement
 		if retryingFailedCopy {
 			settlement = func(ctx context.Context, repos *repository.Repositories) error {

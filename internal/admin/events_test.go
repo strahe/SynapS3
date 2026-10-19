@@ -2,15 +2,106 @@ package admin
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestAdminEventsStopForInvalidatedSessions(t *testing.T) {
+	for _, condition := range []string{"logout", "expired", "database-unavailable"} {
+		t.Run(condition, func(t *testing.T) {
+			srv := newTestAuthServer(t, "admin-password")
+			srv.events = newAdminEventHub()
+			var clock atomic.Int64
+			clock.Store(time.Now().Unix())
+			srv.auth.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+			token, claims, err := srv.auth.newSession(t.Context(), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/v1/events", srv.handleAPIEvents)
+			server := httptest.NewServer(srv.withAdminAuth(mux))
+			defer server.Close()
+			client := server.Client()
+			client.Timeout = 3 * time.Second
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/api/v1/events", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: token})
+			response, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = response.Body.Close() }()
+			reader := bufio.NewReader(response.Body)
+			for range 2 {
+				if _, err := reader.ReadString('\n'); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch condition {
+			case "logout":
+				if err := srv.auth.deleteSession(t.Context(), claims); err != nil {
+					t.Fatal(err)
+				}
+			case "expired":
+				clock.Store(claims.ExpiresAt)
+			case "database-unavailable":
+				srv.auth.sessions = unavailableSessionStore{Store: srv.auth.sessions}
+			}
+			srv.events.Publish("wallet_operation_updated", map[string]any{"id": 1})
+			remaining, err := io.ReadAll(reader)
+			if err != nil || len(remaining) != 0 {
+				t.Fatalf("invalid session stream data=%q err=%v; want immediate EOF", remaining, err)
+			}
+		})
+	}
+}
+
+func TestAdminEventsBasicAuthDoesNotRequireBrowserSession(t *testing.T) {
+	srv := newTestAuthServer(t, "admin-password")
+	srv.events = newAdminEventHub()
+	srv.auth.sessions = unavailableSessionStore{Store: srv.auth.sessions}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/events", srv.handleAPIEvents)
+	server := httptest.NewServer(srv.withAdminAuth(mux))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("admin", "admin-password")
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reader := bufio.NewReader(response.Body)
+	for range 2 {
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.events.Publish("wallet_operation_updated", map[string]any{"id": 1})
+	line, err := reader.ReadString('\n')
+	if err != nil || line != "event: wallet_operation_updated\n" {
+		t.Fatalf("Basic Auth event=%q err=%v", line, err)
+	}
+}
 
 func TestAdminEventHubPublishesEnvelopeToSubscribers(t *testing.T) {
 	hub := newAdminEventHub()

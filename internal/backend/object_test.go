@@ -1337,12 +1337,18 @@ func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
 	body := validTestObjectBody("range-body")
 	put, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
 		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), Body: strings.NewReader(body),
-		Metadata: map[string]string{"custom": "first"},
+		Metadata:           map[string]string{"custom": "first", "_system": "user value", "cache_control": "user cache rule"},
+		CacheControl:       aws.String("max-age=3600"),
+		ContentDisposition: aws.String(`attachment; filename="first\u0000.txt"`),
+		ContentEncoding:    aws.String("aws-chunked, identity"),
+		ContentLanguage:    aws.String("en"),
+		Expires:            aws.String("Mon, 21 Oct 2030 07:28:00 GMT"),
 	})
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	putValidTestObject(t, tb, "range-bucket", "file.txt", "new version")
+	reopenTestBackend(t, tb, backend.WithTransferCounters(counters))
 	get, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), VersionId: &put.VersionID,
 		Range: aws.String("bytes=2-5"),
@@ -1357,12 +1363,22 @@ func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
 		get.LastModified == nil || get.Metadata["custom"] != "first" {
 		t.Fatalf("range output = %#v body=%q readErr=%v", get, data, readErr)
 	}
+	if aws.ToString(get.CacheControl) != "max-age=3600" || aws.ToString(get.ContentDisposition) != `attachment; filename="first\u0000.txt"` ||
+		aws.ToString(get.ContentEncoding) != "identity" || aws.ToString(get.ContentLanguage) != "en" ||
+		aws.ToString(get.ExpiresString) != "Mon, 21 Oct 2030 07:28:00 GMT" || get.Metadata["_system"] != "user value" || get.Metadata["cache_control"] != "user cache rule" || len(get.Metadata) != 3 {
+		t.Fatalf("range GET metadata = %#v", get)
+	}
 	wantBytes := uint64(len(data))
 	head, err := tb.backend.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), VersionId: &put.VersionID,
 	})
 	if err != nil || head.Metadata["custom"] != "first" {
 		t.Fatalf("HeadObject metadata = %#v, %v", head, err)
+	}
+	if aws.ToString(head.CacheControl) != "max-age=3600" || aws.ToString(head.ContentDisposition) != `attachment; filename="first\u0000.txt"` ||
+		aws.ToString(head.ContentEncoding) != "identity" || aws.ToString(head.ContentLanguage) != "en" ||
+		aws.ToString(head.ExpiresString) != "Mon, 21 Oct 2030 07:28:00 GMT" || head.Metadata["_system"] != "user value" || head.Metadata["cache_control"] != "user cache rule" || len(head.Metadata) != 3 {
+		t.Fatalf("HEAD metadata = %#v", head)
 	}
 	for _, tc := range []struct {
 		name, request, expected string
@@ -3126,39 +3142,64 @@ func TestCopyObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
 	t.Fatalf("copy upload task for object %d not found in %#v", dstObj.ObjectID, page.Tasks)
 }
 
-func TestCopyObject_MetadataReplace(t *testing.T) {
+func TestCopyObject_MetadataDirectives(t *testing.T) {
 	tb := newTestBackend(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedActiveBucket(t, tb, "mr-src")
 	seedActiveBucket(t, tb, "mr-dst")
-	putValidTestObject(t, tb, "mr-src", "file.txt", "data")
-
-	newCT := "application/json"
-	out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
-		Bucket:            aws.String("mr-dst"),
-		Key:               aws.String("file.json"),
-		CopySource:        aws.String("mr-src/file.txt"),
-		MetadataDirective: types.MetadataDirectiveReplace,
-		ContentType:       &newCT,
-		Metadata:          map[string]string{"custom": "value"},
+	wantSourceMetadata := model.ObjectSystemMetadata{
+		CacheControl: "max-age=3600", ContentDisposition: `attachment; filename="original\u0000.txt"`,
+		ContentEncoding: "identity", ContentLanguage: "en", Expires: "Mon, 21 Oct 2030 07:28:00 GMT",
+	}
+	source, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: aws.String("mr-src"), Key: aws.String("file.txt"), Body: strings.NewReader(validTestObjectBody("data")),
+		ContentType: aws.String("text/plain"), Metadata: map[string]string{"custom": "original"},
+		CacheControl: &wantSourceMetadata.CacheControl, ContentDisposition: &wantSourceMetadata.ContentDisposition,
+		ContentEncoding: &wantSourceMetadata.ContentEncoding, ContentLanguage: &wantSourceMetadata.ContentLanguage,
+		Expires: &wantSourceMetadata.Expires,
 	})
 	if err != nil {
-		t.Fatalf("CopyObject replace: %v", err)
+		t.Fatalf("PutObject source: %v", err)
 	}
-	if out.CopyObjectResult == nil {
-		t.Fatal("expected copy result")
+	for _, tc := range []struct {
+		name, bucket, key          string
+		directive                  types.MetadataDirective
+		wantType, wantUserMetadata string
+		wantSystemMetadata         model.ObjectSystemMetadata
+		contentEncoding            *string
+	}{
+		{"default copy", "mr-dst", "default.txt", "", "text/plain", "original", wantSourceMetadata, nil},
+		{"explicit copy", "mr-dst", "copied.txt", types.MetadataDirectiveCopy, "text/plain", "original", wantSourceMetadata, nil},
+		{"replace", "mr-dst", "file.json", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private"}, nil},
+		{"same key replace", "mr-src", "file.txt", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private"}, nil},
+		{"replace encoding", "mr-dst", "encoded.gz", types.MetadataDirectiveReplace, "application/json", "replacement", model.ObjectSystemMetadata{CacheControl: "private", ContentEncoding: "gzip"}, aws.String("gzip, AWS-CHUNKED")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
+				Bucket: &tc.bucket, Key: &tc.key, CopySource: aws.String("mr-src/file.txt?versionId=" + source.VersionID),
+				MetadataDirective: tc.directive, ContentType: aws.String("application/json"),
+				Metadata: map[string]string{"custom": "replacement"}, CacheControl: aws.String("private"),
+				ContentEncoding: tc.contentEncoding,
+			})
+			if err != nil || out.CopyObjectResult == nil || out.VersionId == nil || *out.VersionId == source.VersionID {
+				t.Fatalf("CopyObject = %#v, %v", out, err)
+			}
+			bucket, err := tb.repos.Buckets.GetByName(ctx, tc.bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, tc.key)
+			if err != nil || dst == nil {
+				t.Fatalf("copy destination = %#v, %v", dst, err)
+			}
+			if dst.ContentType != tc.wantType || dst.Metadata["custom"] != tc.wantUserMetadata || dst.SystemMetadata != tc.wantSystemMetadata {
+				t.Fatalf("copy metadata = type %q user %#v system %#v", dst.ContentType, dst.Metadata, dst.SystemMetadata)
+			}
+		})
 	}
-
-	dstBkt, _ := tb.repos.Buckets.GetByName(ctx, "mr-dst")
-	dstObj, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, dstBkt.ID, "file.json")
-	if dstObj == nil {
-		t.Fatal("destination object not found")
-	}
-	if dstObj.ContentType != "application/json" {
-		t.Errorf("content-type = %q, want application/json", dstObj.ContentType)
-	}
-	if dstObj.Metadata["custom"] != "value" {
-		t.Errorf("metadata[custom] = %q, want value", dstObj.Metadata["custom"])
+	original, err := tb.repos.Objects.GetVersionByID(ctx, source.VersionID)
+	if err != nil || original == nil || original.SystemMetadata != wantSourceMetadata || original.Metadata["custom"] != "original" {
+		t.Fatalf("source history = %#v, %v", original, err)
 	}
 }
 
@@ -3274,6 +3315,28 @@ func TestRestoreObjectVersionCreatesNewCurrentAndPreservesHistory(t *testing.T) 
 			},
 		},
 		{
+			name: "same data with different system metadata",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) setupResult {
+				put := func(cacheControl string) s3response.PutObjectOutput {
+					out, err := tb.backend.PutObject(t.Context(), s3response.PutObjectInput{
+						Bucket: &bucketName, Key: aws.String("file.txt"), Body: strings.NewReader(validTestObjectBody("same-data")),
+						CacheControl:       &cacheControl,
+						ContentDisposition: aws.String(`attachment; filename="restored\u0000.txt"`),
+					})
+					if err != nil {
+						t.Fatalf("PutObject: %v", err)
+					}
+					return out
+				}
+				source := put("max-age=3600")
+				current := put("private")
+				return setupResult{
+					sourceVersionID: source.VersionID, expectedCurrentVersionID: current.VersionID,
+					wantBody: validTestObjectBody("same-data"), historyVersionIDs: []string{source.VersionID, current.VersionID},
+				}
+			},
+		},
+		{
 			name: "data version hidden by delete marker",
 			setup: func(t *testing.T, tb *testBackend, bucketName string) setupResult {
 				source := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "hidden")
@@ -3348,6 +3411,9 @@ func TestRestoreObjectVersionCreatesNewCurrentAndPreservesHistory(t *testing.T) 
 			}
 			if !maps.Equal(current.Metadata, sourceBefore.Metadata) {
 				t.Fatalf("metadata = %#v, want %#v", current.Metadata, sourceBefore.Metadata)
+			}
+			if current.SystemMetadata != sourceBefore.SystemMetadata {
+				t.Fatalf("system metadata = %#v, want %#v", current.SystemMetadata, sourceBefore.SystemMetadata)
 			}
 
 			got, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucketName), Key: aws.String("file.txt")})

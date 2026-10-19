@@ -49,16 +49,17 @@ func AdminVisibility(status model.BucketStatus) bool {
 }
 
 type Result struct {
-	Body         io.ReadCloser
-	Size         int64
-	ETag         string
-	Checksum     string
-	VersionID    string
-	ContentType  string
-	LastModified time.Time
-	Metadata     map[string]string
-	Source       Source
-	CacheMiss    bool
+	Body           io.ReadCloser
+	Size           int64
+	ETag           string
+	Checksum       string
+	VersionID      string
+	ContentType    string
+	LastModified   time.Time
+	Metadata       map[string]string
+	SystemMetadata model.ObjectSystemMetadata
+	Source         Source
+	CacheMiss      bool
 }
 
 type Reader struct {
@@ -237,16 +238,17 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 
 func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source Source, cacheMiss bool) *Result {
 	return &Result{
-		Body:         body,
-		Size:         version.Size,
-		ETag:         version.ETag,
-		Checksum:     version.Checksum,
-		VersionID:    version.VersionID,
-		ContentType:  version.ContentType,
-		LastModified: version.CreatedAt,
-		Metadata:     maps.Clone(version.Metadata),
-		Source:       source,
-		CacheMiss:    cacheMiss,
+		Body:           body,
+		Size:           version.Size,
+		ETag:           version.ETag,
+		Checksum:       version.Checksum,
+		VersionID:      version.VersionID,
+		ContentType:    version.ContentType,
+		LastModified:   version.CreatedAt,
+		Metadata:       maps.Clone(version.Metadata),
+		SystemMetadata: version.SystemMetadata,
+		Source:         source,
+		CacheMiss:      cacheMiss,
 	}
 }
 

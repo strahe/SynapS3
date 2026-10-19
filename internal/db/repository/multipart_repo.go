@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -24,7 +25,12 @@ func (r *BunMultipartRepo) Create(ctx context.Context, upload *model.MultipartUp
 	if upload.Metadata == nil {
 		upload.Metadata = map[string]string{}
 	}
-	_, err := r.db.NewInsert().Model(upload).Exec(ctx)
+	metadata, err := json.Marshal(upload.SystemMetadata)
+	if err != nil {
+		return fmt.Errorf("encoding multipart system metadata: %w", err)
+	}
+	_, err = r.db.NewInsert().Model(upload).
+		Value("system_metadata", "?::jsonb", string(metadata)).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("inserting multipart upload: %w", err)
 	}

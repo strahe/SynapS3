@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/adminsession"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -167,8 +169,8 @@ func TestAdminAuthLoginSessionAndCSRF(t *testing.T) {
 	if tamperedRR.Code != http.StatusUnauthorized {
 		t.Fatalf("tampered session status = %d, want 401", tamperedRR.Code)
 	}
-	if cookies := tamperedRR.Result().Cookies(); len(cookies) != 1 || cookies[0].Name != adminSessionCookieName || cookies[0].MaxAge != -1 {
-		t.Fatalf("tampered session cookies = %#v, want cleared admin session", cookies)
+	if cookies := tamperedRR.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("unauthorized response cookies = %#v, want no Set-Cookie", cookies)
 	}
 
 	logoutNoSessionRR := httptest.NewRecorder()
@@ -212,8 +214,8 @@ func TestAdminAuthLoginSessionAndCSRF(t *testing.T) {
 	if revokedSessionRR.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked session status = %d, want 401", revokedSessionRR.Code)
 	}
-	if cookies := revokedSessionRR.Result().Cookies(); len(cookies) != 1 || cookies[0].Name != adminSessionCookieName || cookies[0].MaxAge != -1 {
-		t.Fatalf("revoked session cookies = %#v, want cleared admin session", cookies)
+	if cookies := revokedSessionRR.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("unauthorized response cookies = %#v, want no Set-Cookie", cookies)
 	}
 
 	revokedLogoutReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
@@ -221,8 +223,8 @@ func TestAdminAuthLoginSessionAndCSRF(t *testing.T) {
 	revokedLogoutReq.Header.Set(adminCSRFHeader, loginResp.CSRFToken)
 	revokedLogoutRR := httptest.NewRecorder()
 	handler.ServeHTTP(revokedLogoutRR, revokedLogoutReq)
-	if revokedLogoutRR.Code != http.StatusUnauthorized {
-		t.Fatalf("revoked logout status = %d, want 401", revokedLogoutRR.Code)
+	if revokedLogoutRR.Code != http.StatusNoContent {
+		t.Fatalf("repeated logout status = %d, want 204", revokedLogoutRR.Code)
 	}
 }
 
@@ -391,7 +393,7 @@ func TestAdminAuthRememberedSessionUsesLongerConfiguredTTL(t *testing.T) {
 	start := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
 	srv.auth.now = func() time.Time { return start }
 
-	_, claims, err := srv.auth.newSession(true)
+	_, claims, err := srv.auth.newSession(t.Context(), true)
 	if err != nil {
 		t.Fatalf("new remembered session: %v", err)
 	}
@@ -404,7 +406,7 @@ func TestAdminAuthRefreshRejectsExpiredSession(t *testing.T) {
 	srv := newTestAuthServer(t, "admin-password")
 	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
 	srv.auth.now = func() time.Time { return now }
-	token, claims, err := srv.auth.newSession(false)
+	token, claims, err := srv.auth.newSession(t.Context(), false)
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
@@ -421,48 +423,22 @@ func TestAdminAuthRefreshRejectsExpiredSession(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expired refresh status = %d, want 401", rr.Code)
 	}
-	if cookies := rr.Result().Cookies(); len(cookies) != 1 || cookies[0].MaxAge != -1 {
-		t.Fatalf("expired refresh cookies = %#v, want cleared session cookie", cookies)
+	if cookies := rr.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("unauthorized response cookies = %#v, want no Set-Cookie", cookies)
 	}
 }
 
-func TestAdminAuthRefreshBridgesLegacySessionFamily(t *testing.T) {
+func TestAdminAuthRejectsLegacySession(t *testing.T) {
 	srv := newTestAuthServer(t, "admin-password")
 	start := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
-	legacyClaims := authSessionClaims{
-		Username:  "admin",
-		IssuedAt:  start.Unix(),
-		ExpiresAt: start.Add(time.Hour).Unix(),
-		CSRFToken: "legacy-csrf-token",
-	}
-	legacyToken, err := srv.auth.signClaims(legacyClaims)
+	srv.auth.now = func() time.Time { return start.Add(adminSessionRefreshInterval) }
+	claims := authSessionClaims{Username: "admin", IssuedAt: start.Unix(), ExpiresAt: start.Add(time.Hour).Unix(), CSRFToken: "csrf"}
+	token, err := srv.auth.signClaims(claims)
 	if err != nil {
-		t.Fatalf("sign legacy claims: %v", err)
+		t.Fatal(err)
 	}
-
-	now := start.Add(adminSessionRefreshInterval)
-	srv.auth.now = func() time.Time { return now }
-	refreshedToken, refreshedClaims, ok, err := srv.auth.refreshSession(legacyToken)
-	if err != nil {
-		t.Fatalf("refresh legacy session: %v", err)
-	}
-	if !ok || refreshedToken == "" {
-		t.Fatalf("refresh legacy session = ok %t, token present %t; want both true", ok, refreshedToken != "")
-	}
-	if want := srv.auth.sessionTokenHash(legacyToken); refreshedClaims.SessionID != want {
-		t.Fatalf("legacy refresh session ID = %q, want token fingerprint %q", refreshedClaims.SessionID, want)
-	}
-	if refreshedClaims.Remember {
-		t.Fatal("legacy refresh enabled remember mode")
-	}
-	if !srv.auth.revokeSession(refreshedToken, refreshedClaims) {
-		t.Fatal("revoke refreshed legacy family = false, want true")
-	}
-	if !srv.auth.sessionRevoked(legacyToken, legacyClaims, now) {
-		t.Fatal("legacy token remained valid after its refreshed family was revoked")
-	}
-	if !srv.auth.sessionRevoked(refreshedToken, refreshedClaims, now) {
-		t.Fatal("refreshed legacy token remained valid after family revocation")
+	if _, _, ok, err := srv.auth.refreshSession(t.Context(), token); err != nil || ok {
+		t.Fatalf("legacy refresh valid=%t err=%v", ok, err)
 	}
 }
 
@@ -470,64 +446,40 @@ func TestAdminAuthRefreshAndLogoutAreAtomicallyOrdered(t *testing.T) {
 	srv := newTestAuthServer(t, "admin-password")
 	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
 	srv.auth.now = func() time.Time { return now }
-
-	for i := 0; i < 50; i++ {
-		issuedAt := now.Add(time.Duration(i) * time.Hour)
-		now = issuedAt
-		token, claims, err := srv.auth.newSession(false)
+	for range 25 {
+		token, claims, err := srv.auth.newSession(t.Context(), false)
 		if err != nil {
-			t.Fatalf("new session %d: %v", i, err)
+			t.Fatal(err)
 		}
-		now = issuedAt.Add(adminSessionRefreshInterval)
-
+		now = now.Add(adminSessionRefreshInterval)
 		var refreshedToken string
-		var refreshedClaims authSessionClaims
-		var refreshErr error
+		var refreshErr, logoutErr error
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			<-start
-			refreshedToken, refreshedClaims, _, refreshErr = srv.auth.refreshSession(token)
+			refreshedToken, _, _, refreshErr = srv.auth.refreshSession(t.Context(), token)
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			if !srv.auth.revokeSession(token, claims) {
-				t.Errorf("revoke session %d = false, want true", i)
-			}
+			logoutErr = srv.auth.deleteSession(t.Context(), claims)
 		}()
 		close(start)
 		wg.Wait()
-		if refreshErr != nil {
-			t.Fatalf("refresh session %d: %v", i, refreshErr)
+		if refreshErr != nil || logoutErr != nil {
+			t.Fatalf("refresh=%v logout=%v", refreshErr, logoutErr)
 		}
-		if refreshedToken != "" {
-			key := srv.auth.sessionRevocationKey(refreshedClaims.SessionID)
-			revokedUntil := srv.auth.revokedSessions[key]
-			refreshedExpiresAt := time.Unix(refreshedClaims.ExpiresAt, 0)
-			if revokedUntil.Before(refreshedExpiresAt) {
-				t.Fatalf(
-					"revoked session %d until %s, before refreshed expiry %s",
-					i,
-					revokedUntil,
-					refreshedExpiresAt,
-				)
-			}
-		}
-
-		for name, candidate := range map[string]string{
-			"original":  token,
-			"refreshed": refreshedToken,
-		} {
+		for _, candidate := range []string{token, refreshedToken} {
 			if candidate == "" {
 				continue
 			}
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
 			req.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: candidate})
-			if _, ok := srv.auth.sessionFromRequest(req); ok {
-				t.Fatalf("%s session %d remained valid after concurrent logout", name, i)
+			if _, ok, err := srv.auth.sessionFromRequest(req); err != nil || ok {
+				t.Fatalf("session valid after concurrent logout=%t err=%v", ok, err)
 			}
 		}
 	}
@@ -723,7 +675,7 @@ func TestAdminAuthFailureLimitLogoutAndExpiry(t *testing.T) {
 
 	start := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
 	srv.auth.now = func() time.Time { return start }
-	token, _, err := srv.auth.newSession(false)
+	token, _, err := srv.auth.newSession(t.Context(), false)
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
@@ -735,8 +687,8 @@ func TestAdminAuthFailureLimitLogoutAndExpiry(t *testing.T) {
 	if expiredRR.Code != http.StatusUnauthorized {
 		t.Fatalf("expired session status = %d, want 401", expiredRR.Code)
 	}
-	if cookies := expiredRR.Result().Cookies(); len(cookies) != 1 || cookies[0].Name != adminSessionCookieName || cookies[0].MaxAge != -1 {
-		t.Fatalf("expired session cookies = %#v, want cleared admin session", cookies)
+	if cookies := expiredRR.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("unauthorized response cookies = %#v, want no Set-Cookie", cookies)
 	}
 }
 
@@ -1130,63 +1082,6 @@ func TestLoginFailureLimiterRefusesNewKeysWhenAllEntriesAreActiveBlocks(t *testi
 	}
 }
 
-func TestRevokedSessionCleanupIsThrottled(t *testing.T) {
-	srv := newTestAuthServer(t, "admin-password")
-	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
-	token := "session-token"
-	claims := authSessionClaims{SessionID: "session-id"}
-	key := srv.auth.sessionRevocationKey(claims.SessionID)
-	srv.auth.revokedSessions = map[string]time.Time{
-		key:       now.Add(time.Hour),
-		"expired": now.Add(-time.Minute),
-	}
-	srv.auth.revokedNextCleanup = now.Add(time.Minute)
-
-	if !srv.auth.sessionRevoked(token, claims, now) {
-		t.Fatal("sessionRevoked() = false, want true")
-	}
-	if _, ok := srv.auth.revokedSessions["expired"]; !ok {
-		t.Fatal("expired unrelated revoked session was cleaned before next cleanup")
-	}
-
-	if !srv.auth.sessionRevoked(token, claims, now.Add(time.Minute)) {
-		t.Fatal("sessionRevoked() after cleanup = false, want true")
-	}
-	if _, ok := srv.auth.revokedSessions["expired"]; ok {
-		t.Fatal("expired revoked session was not cleaned after next cleanup")
-	}
-}
-
-func TestRevokedSessionMapRefusesNewSessionWhenBounded(t *testing.T) {
-	srv := newTestAuthServer(t, "admin-password")
-	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
-	srv.auth.now = func() time.Time { return now }
-	srv.auth.revokedSessions = map[string]time.Time{}
-	for i := 0; i < revokedSessionMaxItems; i++ {
-		srv.auth.revokedSessions[strconv.Itoa(i)] = now.Add(time.Duration(i+1) * time.Minute)
-	}
-	srv.auth.revokedNextCleanup = now.Add(time.Minute)
-
-	claims := authSessionClaims{
-		IssuedAt:  now.Unix(),
-		ExpiresAt: now.Add(2 * time.Hour).Unix(),
-		SessionID: "new-session",
-	}
-	if srv.auth.revokeSession("new-token", claims) {
-		t.Fatal("revokeSession() with a full active map = true, want false")
-	}
-	newKey := srv.auth.sessionRevocationKey(claims.SessionID)
-	if _, ok := srv.auth.revokedSessions[newKey]; ok {
-		t.Fatal("new revoked session was recorded when the map was full")
-	}
-	if _, ok := srv.auth.revokedSessions["0"]; !ok {
-		t.Fatal("active revoked session was evicted")
-	}
-	if len(srv.auth.revokedSessions) != revokedSessionMaxItems {
-		t.Fatalf("revoked sessions = %d, want %d", len(srv.auth.revokedSessions), revokedSessionMaxItems)
-	}
-}
-
 func TestAdminTrustedProxiesResolveForwardedClientIP(t *testing.T) {
 	srv := newTestAuthServer(t, "admin-password")
 	if err := srv.WithTrustedProxies([]string{"10.0.0.0/24"}); err != nil {
@@ -1255,7 +1150,7 @@ func newTestAuthServerWithCost(t *testing.T, password string, cost int) *Server 
 	if err != nil {
 		t.Fatalf("GenerateFromPassword: %v", err)
 	}
-	srv := &Server{logger: testLogger()}
+	srv := &Server{logger: testLogger(), repos: &repository.Repositories{AdminSessions: adminsession.NewMemoryStore()}}
 	if err := srv.WithAuthConfig(config.AdminAuthConfig{
 		Enabled:       true,
 		Username:      "admin",

@@ -8,9 +8,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synaps3/internal/errtext"
+	"github.com/strahe/synaps3/internal/walletoperation"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
+	"github.com/strahe/synapse-go/storage"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 type walletPayments interface {
@@ -177,4 +180,8 @@ func cloneBigInt(v *big.Int) *big.Int {
 		return nil
 	}
 	return new(big.Int).Set(v)
+}
+
+func (w *walletQuerier) WalletIdentity() walletoperation.ExecutionIdentity {
+	return walletoperation.NewExecutionIdentity(storage.ContextIdentity{Payer: w.address, ChainID: sdktypes.ChainID(w.chain.ChainID()), RecordKeeper: w.addrs.FWSS}, w.addrs.Payments, w.addrs.USDFC)
 }

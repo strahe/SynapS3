@@ -31,14 +31,12 @@ type EnsureDependencies struct {
 }
 
 type dataSetCreationCheckpoint struct {
+	storagepipeline.ExecutionIdentity
 	// AttemptedAt is when the latest create request was sent.
 	AttemptedAt     time.Time `json:"attempted_at"`
 	TransactionID   string    `json:"transaction_id,omitempty"`
 	StatusURL       string    `json:"status_url,omitempty"`
 	ClientDataSetID string    `json:"client_data_set_id,omitempty"`
-	// Identity is the payer, chain, and record keeper the request was signed
-	// for; a client data set ID is only unique within it.
-	Identity *storage.ContextIdentity `json:"identity,omitempty"`
 	// Sends counts admitted requests carrying ClientDataSetID.
 	Sends             int                       `json:"sends,omitempty"`
 	NextResendAt      time.Time                 `json:"next_resend_at,omitzero"`
@@ -155,15 +153,27 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 		}
 		return retryTask(err, "dataset_bucket_load_failed")
 	}
+	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[dataSetCreationCheckpoint](execution)
+	if err != nil {
+		return taskengine.Fail(err, "invalid_checkpoint", nil)
+	}
+	identity := input.ExecutionIdentity
+	if hasCheckpoint {
+		if identity.Present() {
+			if err := identity.Match(checkpoint.ExecutionIdentity); err != nil {
+				return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+			}
+		}
+		identity = checkpoint.ExecutionIdentity
+	}
+	if err := identity.Match(bindings.CurrentIdentity(h.deps.Storage)); err != nil {
+		return taskengine.Fail(err, storagepipeline.ExecutionIdentityFailure(err), nil)
+	}
 	provider, err := h.deps.Storage.OpenProviderTarget(ctx, binding.ProviderID.SDK(), storage.NewProviderContextOptions{
 		DataSetMetadata: map[string]string{"bucket": bucket.Name},
 	})
 	if err != nil {
 		return retryTask(err, "provider_unavailable")
-	}
-	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[dataSetCreationCheckpoint](execution)
-	if err != nil {
-		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
 	if hasCheckpoint {
 		// Whether or not its submission was recorded, a request is resolved only
@@ -189,15 +199,17 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 	if !mayCreate {
 		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Data set is ready to create", nil)
 	}
-	identity := provider.ContextIdentity()
-	if !contextIdentityComplete(identity) {
+	if provider.ContextIdentity() != *identity.Identity {
+		return taskengine.Fail(storagepipeline.ErrExecutionIdentityChanged, "storage_identity_changed", nil)
+	}
+	if !contextIdentityComplete(*identity.Identity) {
 		return taskengine.Fail(errors.New("storage signing identity is incomplete"), "dependency_unavailable", nil)
 	}
 	clientDataSetID, err := newClientDataSetID()
 	if err != nil {
 		return retryTask(err, "dataset_creation_not_started")
 	}
-	checkpoint = dataSetCreationCheckpoint{ClientDataSetID: clientDataSetID.String(), Identity: &identity}
+	checkpoint = dataSetCreationCheckpoint{ClientDataSetID: clientDataSetID.String(), ExecutionIdentity: identity}
 	return h.sendDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
 }
 

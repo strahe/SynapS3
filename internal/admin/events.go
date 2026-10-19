@@ -157,6 +157,9 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
+			if !s.eventSessionActive(r) {
+				return
+			}
 			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
 				return
 			}
@@ -165,10 +168,21 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			if !s.eventSessionActive(r) {
+				return
+			}
 			if _, err := fmt.Fprintf(w, "event: %s\nid: %d\ndata: %s\n\n", event.topic, event.seq, event.data); err != nil {
 				return
 			}
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *Server) eventSessionActive(r *http.Request) bool {
+	if s.auth == nil || r.Context().Value(adminBasicAuthContextKey{}) == true {
+		return true
+	}
+	_, active, err := s.auth.sessionFromRequest(r)
+	return err == nil && active
 }

@@ -6,10 +6,12 @@ import (
 )
 
 type Input struct {
+	ExecutionIdentity
 	OperationID int64 `json:"operation_id"`
 }
 
 type Checkpoint struct {
+	ExecutionIdentity
 	BroadcastAttempted bool   `json:"broadcast_attempted"`
 	TransactionHash    string `json:"transaction_hash,omitempty"`
 }

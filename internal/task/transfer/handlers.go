@@ -12,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -24,6 +25,7 @@ const (
 )
 
 type ReadyDataSetResolver interface {
+	ExecutionIdentity(context.Context, *model.StorageDataSet) (storagepipeline.ExecutionIdentity, error)
 	OpenReadyDataSet(context.Context, *model.StorageDataSet) (synapse.DataSetTarget, error)
 }
 
@@ -151,6 +153,8 @@ const (
 )
 
 type storeCheckpoint struct {
+	storagepipeline.ExecutionIdentity
+	VerifiedChecksum     string     `json:"verified_checksum,omitempty"`
 	AttemptedAt          time.Time  `json:"attempted_at"`
 	IntendedPieceCID     string     `json:"intended_piece_cid"`
 	ProviderServiceURL   string     `json:"provider_service_url"`
@@ -163,6 +167,7 @@ type storeCheckpoint struct {
 }
 
 type pullCheckpoint struct {
+	storagepipeline.ExecutionIdentity
 	AttemptID     string    `json:"attempt_id"`
 	Accepted      bool      `json:"accepted,omitempty"`
 	NextRequestAt time.Time `json:"next_request_at,omitzero"`

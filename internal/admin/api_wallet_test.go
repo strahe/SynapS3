@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/walletoperation"
 )
 
 type stubWalletQuerier struct {
@@ -321,4 +322,8 @@ func newWalletOperationTestServer(t *testing.T) (*Server, *repository.Repositori
 		info: &synapse.WalletInfo{Address: "0xabc"},
 	}, config.DefaultFilecoinCopies, testLogger()).WithTaskService(newAdminTestTaskService(t, repos))
 	return srv, repos
+}
+
+func (*stubWalletQuerier) WalletIdentity() walletoperation.ExecutionIdentity {
+	return testutil.DefaultWalletExecutionIdentity()
 }

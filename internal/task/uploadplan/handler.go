@@ -120,6 +120,9 @@ func (h *Handler) uploadPlanHandler() *taskengine.FuncHandler {
 		if bucket == nil {
 			return taskengine.Fail(repository.ErrNotFound, "upload_bucket_missing", nil)
 		}
+		if !bucket.ProviderSelectionStrategy.Valid() {
+			return taskengine.Fail(errors.New("bucket has an unsupported provider selection strategy"), "invalid_provider_selection_strategy", nil)
+		}
 		if upload.AcceptedAt != nil {
 			return taskengine.Complete("Replicas are ready", nil)
 		}

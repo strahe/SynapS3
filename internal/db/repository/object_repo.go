@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -1482,7 +1483,7 @@ func createRestoredVersionAndSetCurrent(ctx context.Context, db bun.IDB, version
 		version.UpdatedAt = now
 	}
 
-	if _, err := db.NewInsert().Model(version).Exec(ctx); err != nil {
+	if err := insertObjectVersion(ctx, db, version); err != nil {
 		return 0, fmt.Errorf("inserting restored object version: %w", err)
 	}
 	// Moving the pointer is the compare-and-set: it succeeds only while the
@@ -1524,7 +1525,7 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 		if version.UpdatedAt.IsZero() {
 			version.UpdatedAt = now
 		}
-		if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
+		if insertErr := insertObjectVersion(ctx, db, version); insertErr != nil {
 			return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
 		}
 		// The object is inserted with a null pointer because its version does
@@ -1553,7 +1554,7 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 	if version.UpdatedAt.IsZero() {
 		version.UpdatedAt = now
 	}
-	if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
+	if insertErr := insertObjectVersion(ctx, db, version); insertErr != nil {
 		return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
 	}
 	if _, updateErr := db.NewUpdate().
@@ -1767,11 +1768,22 @@ func restoreCurrentDeleteMarkerStack(ctx context.Context, db bun.IDB, bucketID i
 	return restoreTarget, nil
 }
 
+func insertObjectVersion(ctx context.Context, db bun.IDB, version *model.ObjectVersion) error {
+	metadata, err := json.Marshal(version.SystemMetadata)
+	if err != nil {
+		return fmt.Errorf("encoding object system metadata: %w", err)
+	}
+	_, err = db.NewInsert().Model(version).
+		Value("system_metadata", "?::jsonb", string(metadata)).Exec(ctx)
+	return err
+}
+
 func normalizeObjectVersion(version *model.ObjectVersion) {
 	if version.Metadata == nil {
 		version.Metadata = map[string]string{}
 	}
 	if version.IsDeleteMarker {
+		version.SystemMetadata = model.ObjectSystemMetadata{}
 		version.ContentID = nil
 		version.Size = 0
 		version.ETag = ""
@@ -1947,6 +1959,7 @@ func objectVersionMatchesVersion(current *model.ObjectVersion, version *model.Ob
 		*current.ContentID == *version.ContentID &&
 		current.ETag == version.ETag &&
 		current.ContentType == version.ContentType &&
+		current.SystemMetadata == version.SystemMetadata &&
 		maps.Equal(current.Metadata, version.Metadata)
 }
 
@@ -1965,6 +1978,7 @@ func restoreSourceAlreadyCurrent(source, current *model.ObjectVersion) bool {
 	return source.ContentID != nil && current.ContentID != nil &&
 		*source.ContentID == *current.ContentID &&
 		current.ContentType == source.ContentType &&
+		current.SystemMetadata == source.SystemMetadata &&
 		maps.Equal(current.Metadata, source.Metadata)
 }
 

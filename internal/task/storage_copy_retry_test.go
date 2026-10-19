@@ -82,7 +82,7 @@ func TestCopyRetryPullReachesCommittedWithFreshAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{ID: other.ID, DataSetID: testOnChainID(t, 99002)}); err != nil {
+	if err := markTestDataSetReady(t, runtime, t.Context(), repository.MarkDataSetReadyInput{ID: other.ID, DataSetID: testOnChainID(t, 99002)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(t.Context(), pipeline.upload.ID, []repository.UploadCopyBindingInput{{StorageDataSetID: other.ID, CopyIndex: 2, ProviderID: other.ProviderID, TransferMethod: model.StorageCopyTransferMethodPeerPull}}); err != nil {
@@ -364,7 +364,7 @@ func TestReadyAndPullFallbackTransfersReachCommitted(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", identity.CIDv2.String()).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).Set("piece_cid = ?", identity.CIDv2.String()).Set("checksum = ?", testutil.StorageChecksum(string(payload))).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 			version := &model.ObjectVersion{VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "fallback.bin", ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "fallback", ContentType: "application/octet-stream"}

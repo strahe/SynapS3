@@ -5,6 +5,7 @@ const BASE = '/api/v1'
 const csrfHeader = 'X-SynapS3-CSRF'
 
 let adminCSRFToken = ''
+let adminAuthEpoch = 0
 const authInvalidationListeners = new Set<() => void>()
 
 export class APIError extends Error {
@@ -42,11 +43,23 @@ export interface AuthSession {
 }
 
 export function setAdminCSRFToken(token: string) {
+  adminAuthEpoch++
   adminCSRFToken = token
 }
 
-function storeAuthSession(session: AuthSession) {
-  setAdminCSRFToken(session.csrf_token)
+export function getAdminAuthEpoch() {
+  return adminAuthEpoch
+}
+
+function checkAuthEpoch(epoch: number, signal?: AbortSignal | null) {
+  if (epoch !== adminAuthEpoch || signal?.aborted) {
+    throw new DOMException('Authentication changed', 'AbortError')
+  }
+}
+
+function storeAuthSession(session: AuthSession, epoch: number, signal?: AbortSignal | null) {
+  checkAuthEpoch(epoch, signal)
+  adminCSRFToken = session.csrf_token
   return session
 }
 
@@ -63,7 +76,12 @@ function notifyAuthInvalidated() {
   }
 }
 
-async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
+async function fetchJSON<T>(
+  path: string,
+  init?: RequestInit,
+  options?: { invalidateOnUnauthorized?: boolean; expectedStatus?: number }
+): Promise<T> {
+  const epoch = adminAuthEpoch
   const headers = new Headers(init?.headers)
   if (init?.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
@@ -78,12 +96,15 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
     credentials: 'same-origin',
     headers,
   })
-  if (res.status === 401) {
-    adminCSRFToken = ''
+  checkAuthEpoch(epoch, init?.signal)
+  if (res.status === 401 && options?.invalidateOnUnauthorized !== false) {
+    setAdminCSRFToken('')
     notifyAuthInvalidated()
   }
-  if (!res.ok) {
+  if (!res.ok || (options?.expectedStatus !== undefined && res.status !== options.expectedStatus)) {
+    const errorEpoch = adminAuthEpoch
     const body = await res.json().catch(() => ({}) as Record<string, unknown>)
+    checkAuthEpoch(errorEpoch, init?.signal)
     const errorBody = body as { error?: string; code?: string; fields?: SettingsFieldError[] }
     const fieldText = Array.isArray(errorBody.fields)
       ? errorBody.fields.map((field) => `${field.field}: ${field.message}`).join(', ')
@@ -95,7 +116,9 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
     )
   }
   if (res.status === 204) return undefined as T
-  return res.json() as Promise<T>
+  const data = (await res.json()) as T
+  checkAuthEpoch(epoch, init?.signal)
+  return data
 }
 
 type APIRequestOptions = Pick<RequestInit, 'signal'>
@@ -1207,21 +1230,36 @@ export interface FilecoinReadinessPreflightPayload {
 }
 
 export const api = {
-  getAuthSession: () => fetchJSON<AuthSession>('/auth/session').then(storeAuthSession),
-  login: (payload: { username: string; password: string; remember?: boolean }) =>
-    fetchJSON<AuthSession>('/auth/login', {
+  getAuthSession: (options?: APIRequestOptions) => {
+    const epoch = adminAuthEpoch
+    return fetchJSON<AuthSession>('/auth/session', options).then((session) =>
+      storeAuthSession(session, epoch, options?.signal)
+    )
+  },
+  login: (payload: { username: string; password: string; remember?: boolean }) => {
+    const epoch = ++adminAuthEpoch
+    return fetchJSON<AuthSession>('/auth/login', {
       method: 'POST',
       body: JSON.stringify(payload),
-    }).then(storeAuthSession),
-  refreshAuthSession: (options?: APIRequestOptions) =>
-    fetchJSON<AuthSession>('/auth/refresh', {
-      method: 'POST',
-      ...options,
-    }).then(storeAuthSession),
-  logout: () =>
-    fetchJSON<void>('/auth/logout', { method: 'POST' }).finally(() => {
+    }).then((session) => storeAuthSession(session, epoch))
+  },
+  refreshAuthSession: (options?: APIRequestOptions) => {
+    const epoch = adminAuthEpoch
+    return fetchJSON<AuthSession>('/auth/refresh', { method: 'POST', ...options }).then((session) =>
+      storeAuthSession(session, epoch, options?.signal)
+    )
+  },
+  logout: () => {
+    const epoch = ++adminAuthEpoch
+    return fetchJSON<void>(
+      '/auth/logout',
+      { method: 'POST' },
+      { expectedStatus: 204, invalidateOnUnauthorized: false }
+    ).then(() => {
+      checkAuthEpoch(epoch)
       setAdminCSRFToken('')
-    }),
+    })
+  },
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getMonitoring: (signal?: AbortSignal) => fetchJSON<MonitoringData>('/monitoring', { signal }),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
@@ -1305,6 +1343,7 @@ export const api = {
         reject(new Error(sizeError))
         return
       }
+      const epoch = adminAuthEpoch
       const xhr = new XMLHttpRequest()
       xhr.open(
         'POST',
@@ -1323,6 +1362,12 @@ export const api = {
         })
       }
       xhr.onload = () => {
+        try {
+          checkAuthEpoch(epoch)
+        } catch (error) {
+          reject(error)
+          return
+        }
         if (xhr.status === 401) {
           setAdminCSRFToken('')
           notifyAuthInvalidated()

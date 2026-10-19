@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/provider"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/walletoperation"
 	sdk "github.com/strahe/synapse-go"
 	sdkstorage "github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -328,7 +329,7 @@ func runServe(ctx context.Context, src config.Source) error {
 	}
 	storageClient := synapse.AdaptStorageService(client.Storage(), client.WarmStorage(), storageIdentity)
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain(), resolvedAddresses)
-	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC)
+	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC, walletoperation.NewExecutionIdentity(storageIdentity, resolvedAddresses.Payments, resolvedAddresses.USDFC))
 	filecoinReadiness := synapse.NewReadinessChecker(
 		synapse.ReadinessConfigFromFilecoinConfig(cfg.Filecoin),
 		synapse.AdaptReadinessClient(client),

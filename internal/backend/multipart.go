@@ -51,7 +51,14 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 		UploadID:    uploadID,
 		ContentType: stringOrDefault(input.ContentType, "application/octet-stream"),
 		Metadata:    meta,
-		Status:      model.MultipartStatusInitiated,
+		SystemMetadata: model.ObjectSystemMetadata{
+			CacheControl:       derefStr(input.CacheControl),
+			ContentDisposition: derefStr(input.ContentDisposition),
+			ContentEncoding:    storedContentEncoding(input.ContentEncoding),
+			ContentLanguage:    derefStr(input.ContentLanguage),
+			Expires:            derefStr(input.Expires),
+		},
+		Status: model.MultipartStatusInitiated,
 	}
 	if err := b.repos.Multiparts.Create(ctx, upload); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("creating multipart upload: %w", err)
@@ -355,6 +362,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 				ETag:              s3ETag,
 				ContentType:       upload.ContentType,
 				Metadata:          upload.Metadata,
+				SystemMetadata:    upload.SystemMetadata,
 				MultipartUploadID: &uploadID,
 				ContentID:         &content.ID,
 			}

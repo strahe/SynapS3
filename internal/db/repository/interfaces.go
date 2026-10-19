@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/strahe/synaps3/internal/adminsession"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
@@ -14,6 +15,9 @@ import (
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 )
+
+// AdminSessionRepository stores active browser sessions.
+type AdminSessionRepository interface{ adminsession.Store }
 
 // BucketRepository defines persistence operations for Bucket entities.
 type BucketRepository interface {

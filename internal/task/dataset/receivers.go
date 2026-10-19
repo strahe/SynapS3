@@ -11,13 +11,19 @@ import (
 	taskengine "github.com/strahe/synaps3/internal/worker"
 )
 
-type EnsureReceiverDependencies struct{ Scheduler *taskengine.Scheduler }
+type EnsureReceiverDependencies struct {
+	Scheduler *taskengine.Scheduler
+	Identity  storagepipeline.ExecutionIdentity
+}
 
 func NewEnsureDataSetReceiver(deps EnsureReceiverDependencies) (taskengine.MessageHandler, error) {
 	if deps.Scheduler == nil {
 		return nil, errors.New("data set ensure scheduler is required")
 	}
 	return func(ctx context.Context, tx *repository.Repositories, message taskengine.Message) error {
+		if !deps.Identity.Complete() {
+			return storagepipeline.ErrExecutionIdentityMissing
+		}
 		msg, ok := message.(storagepipeline.EnsureDataSet)
 		if !ok || msg.BindingID < 1 {
 			return repository.ErrInvalidInput
@@ -31,7 +37,7 @@ func NewEnsureDataSetReceiver(deps EnsureReceiverDependencies) (taskengine.Messa
 		}
 		taskRow, _, err := deps.Scheduler.EnqueueInTransaction(ctx, tx, taskengine.EnqueueRequest{
 			Type:  model.TaskTypeStorageDataSetEnsure,
-			Input: storagepipeline.DataSetInput{DataSetID: row.ID},
+			Input: storagepipeline.DataSetInput{DataSetID: row.ID, ExecutionIdentity: deps.Identity},
 		})
 		if err != nil {
 			return err

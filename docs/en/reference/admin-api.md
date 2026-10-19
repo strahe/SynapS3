@@ -32,7 +32,8 @@ Runtime metrics, buckets, objects, tasks, wallet operations, storage health, and
 | --- | --- |
 | `/healthz` | None. |
 | `/api/v1/auth/login`, `/api/v1/auth/session` | Login and session endpoints. Session returns `401` when no valid browser session exists. |
-| `/api/v1/auth/refresh`, `/api/v1/auth/logout` | Require a valid browser session and CSRF header; HTTP Basic auth is not accepted. |
+| `/api/v1/auth/refresh` | Unexpired browser session cookie and CSRF header; HTTP Basic auth is not accepted. |
+| `/api/v1/auth/logout` | Verifiable browser session cookie and CSRF header; an expired cookie is accepted. HTTP Basic auth is not accepted. |
 | `/api/v1/*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 | `/metrics` | Browser session cookie or HTTP Basic auth. |
 
@@ -44,7 +45,7 @@ The optional `remember` boolean in the login request defaults to `false`. A stan
 
 Login, session, and refresh responses contain `username`, `csrf_token`, `expires_at`, and `refresh_after`. Any client holding the valid session cookie and matching CSRF token can request renewal after `refresh_after`. The login has no absolute lifetime cap. If no client requests renewal, the token expires at `expires_at`.
 
-Refresh preserves the session lifetime, CSRF token, and login family. Logout revokes the whole family, including tokens issued before the latest refresh. Revocations are kept in memory; restarting SynapS3 clears them, although the browser cookie is still removed during a normal logout.
+Refresh preserves the session lifetime, CSRF token, and login family. Logout revokes the whole family, including refreshed tokens. Sessions and completed logouts survive normal-mode restarts; setup-mode sessions end on restart.
 
 ### CLI and Basic Auth
 
@@ -72,10 +73,10 @@ synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
 | --- | --- | --- |
 | `POST` | `/api/v1/auth/login` | Validate username and password, accept optional `remember`, set the browser cookie, and return the session. |
 | `GET` | `/api/v1/auth/session` | Return the current browser session. |
-| `POST` | `/api/v1/auth/refresh` | Require session and CSRF, then renew an eligible browser session. Early requests return the current session without changing the cookie. |
-| `POST` | `/api/v1/auth/logout` | Require session and CSRF, end the current browser session, and clear the cookie. |
+| `POST` | `/api/v1/auth/refresh` | Renew an eligible browser session. Early requests return the current session without changing the cookie. |
+| `POST` | `/api/v1/auth/logout` | Revoke the browser login and clear the cookie. `204` confirms success. |
 
-After logout or a `401` API response, the dashboard returns to the login page.
+Outside logout, an API `401` returns the dashboard to login. Retry failed logout requests. `503` and network errors preserve a cached session; initial verification failures show **Retry**.
 
 ## Security Headers
 
@@ -87,7 +88,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 
 | Area | Endpoints | Risk |
 | --- | --- | --- |
-| Settings | `PUT /api/v1/settings` | Changes can require restart or move the node to a different Filecoin network. Validate settings and Filecoin readiness before saving. |
+| Settings | `PUT /api/v1/settings` | Changes can require restart. The wallet and network must match the deployment; validate settings and Filecoin readiness before saving. |
 | Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
@@ -109,7 +110,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/v1/overview` | Dashboard summary. |
-| `GET` | `/api/v1/events` | Dashboard event stream. |
+| `GET` | `/api/v1/events` | Dashboard event stream. Cookie-authenticated streams close when the session expires, is revoked, or cannot be verified. Idle streams are checked every 15 seconds; verification takes at most 5 seconds. |
 | `GET` | `/api/v1/buckets` | List buckets. |
 | `POST` | `/api/v1/buckets` | Create a bucket. |
 | `GET` | `/api/v1/buckets/{name}` | Read bucket detail. |

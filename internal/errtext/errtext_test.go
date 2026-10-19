@@ -15,6 +15,11 @@ func TestRedact(t *testing.T) {
 		without []string
 	}{
 		{
+			name: "invalid database text is visible",
+			text: "provider\x00reply\xff",
+			want: `provider\u0000reply\xff`,
+		},
+		{
 			name: "provider reply and URL path are kept",
 			text: `pdp: POST https://sp.example/pdp/piece/pull: HTTP 409: dataset is terminated`,
 			want: `pdp: POST https://sp.example/pdp/piece/pull: HTTP 409: dataset is terminated`,
