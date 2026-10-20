@@ -278,24 +278,31 @@ type Observation struct {
 	// provider's receipt for them did not describe this request.
 	DropEvidence bool
 	Cause        error
+	Diagnostic   error
 }
 
 // Confirmation is the chain proof of a request with the submission evidence
 // that accompanied it.
 type Confirmation struct {
-	// TransactionID is the request's latest recorded submission, if any.
-	TransactionID string
-	// ConfirmedTransactionID is set only when the provider reported the
+	// TxHash is the request's latest recorded submission, if any.
+	TxHash string
+	// ConfirmedTxHash is set only when the provider reported the
 	// transaction that included the pieces. A request proven by its nonce alone
 	// may have landed in a different send.
-	ConfirmedTransactionID string
-	FirstPieceID           sdktypes.BigInt
+	ConfirmedTxHash string
+	FirstPieceID    sdktypes.BigInt
 }
 
 // Observe resolves a submitted request. The provider's receipt is only a hint:
 // a request is confirmed by its nonce record, and when the provider cannot
 // answer, disagrees, or rejects it, the chain decides.
-func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
+func (a *Advancer) Observe(ctx context.Context, c Commit) (observation Observation, observeErr error) {
+	var providerErr error
+	defer func() {
+		if observation.Kind != ObserveConfirmed {
+			observation.Diagnostic = errors.Join(providerErr, observation.Diagnostic)
+		}
+	}()
 	if context.Cause(ctx) != nil {
 		return Observation{Kind: ObservePending}, nil
 	}
@@ -307,6 +314,7 @@ func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
 	status, err := c.Target.GetCommitStatus(statusCtx, *req.StatusURL)
 	cancel()
 	if err != nil {
+		providerErr = fmt.Errorf("could not query provider %s commit status for request %s: %w", c.Target.ProviderID(), req.RequestID, err)
 		if context.Cause(ctx) != nil {
 			return Observation{Kind: ObservePending}, nil
 		}
@@ -332,7 +340,7 @@ func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
 	}
 	ref, bound := c.Target.DataSetRef()
 	if !bound || status.DataSet == nil || !status.DataSet.Equal(ref) || status.Kind != storage.CommitKindAddPieces ||
-		req.TransactionID == nil || status.TransactionID != *req.TransactionID {
+		req.TxHash == nil || status.TransactionID != *req.TxHash {
 		return a.unobserved(ctx, c, true)
 	}
 	switch status.State {
@@ -357,12 +365,9 @@ func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
 		switch proof.Outcome {
 		case ProofLanded:
 			confirmation := Confirmation{
-				TransactionID:          status.TransactionID,
-				ConfirmedTransactionID: status.TransactionID,
-				FirstPieceID:           proof.FirstPieceID,
-			}
-			if status.ConfirmedTransactionID != "" {
-				confirmation.ConfirmedTransactionID = status.ConfirmedTransactionID
+				TxHash:          status.TransactionID,
+				ConfirmedTxHash: status.ConfirmedTransactionID,
+				FirstPieceID:    proof.FirstPieceID,
 			}
 			return Observation{Kind: ObserveConfirmed, Confirmation: &confirmation}, nil
 		case ProofConflict:
@@ -384,7 +389,9 @@ func (a *Advancer) Observe(ctx context.Context, c Commit) (Observation, error) {
 func (a *Advancer) byProof(ctx context.Context, c Commit, fallback func() (Observation, error)) (Observation, error) {
 	proof, err := a.Prove(ctx, c)
 	if err != nil {
-		return fallback()
+		observation, fallbackErr := fallback()
+		observation.Diagnostic = errors.Join(observation.Diagnostic, fmt.Errorf("could not prove commit on chain: %w", err))
+		return observation, fallbackErr
 	}
 	switch proof.Outcome {
 	case ProofLanded:
@@ -418,6 +425,9 @@ func (a *Advancer) unobserved(ctx context.Context, c Commit, dropEvidence bool) 
 	}
 	req := c.Request
 	observation := Observation{Kind: ObserveResendDue, DropEvidence: dropEvidence}
+	if writable != nil {
+		observation.Diagnostic = fmt.Errorf("could not query data set writability: %w", writable)
+	}
 	// Like a provider still reporting pending, a request unregistered past the
 	// attention threshold is flagged while recovery keeps sending it.
 	if req.AttentionAt == nil && a.attentionDue(req) {
@@ -431,8 +441,8 @@ func (a *Advancer) unobserved(ctx context.Context, c Commit, dropEvidence bool) 
 // included the pieces may be another one, so none is confirmed.
 func (a *Advancer) confirmedByNonce(c Commit, proof Proof) Observation {
 	confirmation := Confirmation{FirstPieceID: proof.FirstPieceID}
-	if c.Request.TransactionID != nil {
-		confirmation.TransactionID = *c.Request.TransactionID
+	if c.Request.TxHash != nil {
+		confirmation.TxHash = *c.Request.TxHash
 	}
 	return Observation{Kind: ObserveConfirmed, Confirmation: &confirmation}
 }

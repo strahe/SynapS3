@@ -251,6 +251,8 @@ type StorageDataSetSummary struct {
 	ProviderID                    types.OnChainID            `bun:"provider_id"`
 	DataSetID                     *types.OnChainID           `bun:"data_set_id"`
 	ClientDataSetID               *types.OnChainID           `bun:"client_data_set_id"`
+	TxHash                        *string                    `bun:"tx_hash"`
+	ConfirmedTxHash               *string                    `bun:"confirmed_tx_hash"`
 	Status                        model.StorageDataSetStatus `bun:"status"`
 	CreatedByContentID            *int64                     `bun:"created_by_content_id"`
 	CommittedCopies               int64                      `bun:"committed_copies"`
@@ -355,13 +357,16 @@ type EnsureDataSetBindingInput struct {
 }
 
 type MarkDataSetCreatingInput struct {
+	ConfirmedTxHash string
 	ID              int64
-	TransactionID   string
+	TxHash          string
 	StatusURL       string
 	ClientDataSetID *types.OnChainID
 }
 
 type MarkDataSetReadyInput struct {
+	TxHash          string
+	ConfirmedTxHash string
 	ID              int64
 	DataSetID       types.OnChainID
 	ClientDataSetID *types.OnChainID
@@ -664,8 +669,9 @@ type StorageReplacementRepository interface {
 	MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error
 	FailForEngineTask(ctx context.Context, taskID int64, lastError string) error
 	BeginRetirement(ctx context.Context, replacementID int64) error
-	RecordTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
-	RecordAbandonedTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
+	BeginTerminationAttempt(ctx context.Context, input BeginTerminationAttemptInput) error
+	RecordTerminationEvidence(ctx context.Context, input RecordTerminationEvidenceInput) error
+	ListTerminationAttempts(ctx context.Context, replacementIDs []int64) ([]storagereplacement.TerminationAttempt, error)
 	CompleteAbandonedTargetTermination(ctx context.Context, replacementID int64) error
 	// EvaluateRetirementGate reports every blocker by name so the API and UI can
 	// explain why a source is still held.
@@ -748,10 +754,28 @@ type AttachReplacementTargetCopyInput struct {
 	ContentID     int64
 }
 
-type RecordTerminationEpochInput struct {
-	ReplacementID int64
-	TxHash        string
-	Epoch         int64
+type RecordTerminationEvidenceInput struct {
+	ReplacementID   int64
+	DataSetID       int64
+	Generation      int64
+	TaskID          int64
+	Role            storagereplacement.TerminationRole
+	AttemptNo       int64
+	TxHash          string
+	ConfirmedTxHash string
+	ReceiptStatus   *uint64
+	Epoch           *int64
+}
+
+type BeginTerminationAttemptInput struct {
+	ReplacementID     int64
+	DataSetID         int64
+	Generation        int64
+	TaskID            int64
+	Role              storagereplacement.TerminationRole
+	AttemptNo         int64
+	PreviousAttemptNo int64
+	AttemptedAt       time.Time
 }
 
 // RetirementGate reports each safety predicate separately so a recoverable

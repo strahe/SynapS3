@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
@@ -40,6 +41,7 @@ type CheckerOptions struct {
 	Concurrency    int
 	Now            func() time.Time
 	Logger         *slog.Logger
+	ErrorFormatter func(error) string
 }
 
 type Checker struct {
@@ -50,6 +52,7 @@ type Checker struct {
 	concurrency    int
 	now            func() time.Time
 	logger         *slog.Logger
+	errorFormatter func(error) string
 }
 
 func NewChecker(opts CheckerOptions) *Checker {
@@ -65,6 +68,10 @@ func NewChecker(opts CheckerOptions) *Checker {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
+	formatter := opts.ErrorFormatter
+	if formatter == nil {
+		formatter = errtext.Format
+	}
 	return &Checker{
 		providerSource: opts.ProviderSource,
 		providerHealth: opts.ProviderHealth,
@@ -73,6 +80,7 @@ func NewChecker(opts CheckerOptions) *Checker {
 		concurrency:    concurrency,
 		now:            now,
 		logger:         opts.Logger,
+		errorFormatter: formatter,
 	}
 }
 
@@ -97,7 +105,7 @@ func (c *Checker) CheckProviders(ctx context.Context, checkedAt time.Time, local
 		cancel()
 		if err != nil {
 			if c.logger != nil {
-				c.logger.Warn("observability provider registry list failed", "error", safeObservabilityError(err))
+				c.logger.Warn("observability provider registry list failed", "error", c.errorFormatter(err))
 			}
 			return nil, err
 		}
@@ -150,7 +158,7 @@ func (c *Checker) CheckProvider(ctx context.Context, checkedAt time.Time, id typ
 	provider, err := c.providerSource.LookupProvider(lookupCtx, id)
 	cancel()
 	if err != nil {
-		errText := safeObservabilityError(err)
+		errText := c.errorFormatter(err)
 		return ProviderState{ProviderID: id, Status: StatusUnknown, ReasonCodes: []ReasonCode{ReasonRegistryLookupFailed}, LastCheckedAt: checkedAt, LastError: &errText, Evidence: map[string]any{}}, nil
 	}
 	healthCtx, healthCancel := context.WithTimeout(ctx, boundedSingleTimeout(c.timeout))
@@ -252,7 +260,7 @@ func (c *Checker) CheckDataSets(ctx context.Context, checkedAt time.Time, localD
 			continue
 		}
 		if chainErr != nil {
-			errText := safeObservabilityError(chainErr)
+			errText := c.errorFormatter(chainErr)
 			state.Status = StatusUnknown
 			state.ReasonCodes = append(state.ReasonCodes, ReasonChainLookupFailed)
 			state.LastError = &errText
@@ -328,7 +336,7 @@ func (c *Checker) lookupMissingProviders(
 	})
 	if c.providerSource == nil {
 		for _, id := range missing {
-			providerErrors[id.String()] = safeObservabilityError(ErrProviderNotFound)
+			providerErrors[id.String()] = c.errorFormatter(ErrProviderNotFound)
 		}
 		return
 	}
@@ -363,14 +371,14 @@ func (c *Checker) lookupMissingProviders(
 
 	for result := range results {
 		if result.err != nil {
-			providerErrors[result.key] = safeObservabilityError(result.err)
+			providerErrors[result.key] = c.errorFormatter(result.err)
 			continue
 		}
 		providers[result.key] = result.provider
 	}
 
 	if err := lookupCtx.Err(); err != nil {
-		errText := safeObservabilityError(err)
+		errText := c.errorFormatter(err)
 		for _, id := range missing {
 			key := id.String()
 			if _, ok := providers[key]; ok {
@@ -452,6 +460,9 @@ func (c *Checker) checkProviderHealth(ctx context.Context, providers map[string]
 			defer wg.Done()
 			defer func() { <-sem }()
 			health := c.providerHealth(ctx, provider.ServiceURL, c.timeout)
+			if health.Detail != "" {
+				health.Detail = c.errorFormatter(errors.New(health.Detail))
+			}
 			mu.Lock()
 			out[key] = health
 			mu.Unlock()
@@ -487,13 +498,6 @@ func clampDuration(value, min, max time.Duration) time.Duration {
 		return max
 	}
 	return value
-}
-
-func safeObservabilityError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return errtext.Redact(err.Error())
 }
 
 func lessOnChainID(a, b types.OnChainID) bool {

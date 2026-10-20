@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/types"
 )
@@ -74,6 +76,34 @@ func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 	assertProviderState(t, state, StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
 	if state.LastError == nil || *state.LastError != "Health check returned HTTP 503" {
 		t.Fatalf("provider last error = %v, want the health check failure detail", state.LastError)
+	}
+}
+
+func TestCheckerAppliesScopedRedactionBeforeTruncatingDiagnostics(t *testing.T) {
+	for _, secret := range []string{"draft-secret-one", "draft-secret-two"} {
+		t.Run(secret, func(t *testing.T) {
+			t.Parallel()
+			raw := strings.Repeat("a", errtext.MaxBytes/2) + secret + strings.Repeat("z", errtext.MaxBytes)
+			checker := NewChecker(CheckerOptions{
+				ProviderSource: fakeProviderSource{
+					active:    []Provider{{ID: onChainID(t, "1"), Active: true, HasPDP: true, ServiceURL: "https://provider.test"}},
+					lookupErr: errors.New(raw),
+				},
+				ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth {
+					return ProviderHealth{Status: "unreachable", Detail: raw}
+				},
+				ErrorFormatter: errtext.New("https://draft-rpc.test/key", secret).Format,
+			})
+			states, err := checker.CheckProviders(t.Context(), time.Time{}, []LocalDataSet{{ProviderID: onChainID(t, "2")}})
+			if err != nil || len(states) != 2 {
+				t.Fatalf("providers = %v, %v", states, err)
+			}
+			for _, state := range states {
+				if state.LastError == nil || len(*state.LastError) > errtext.MaxBytes || strings.Contains(*state.LastError, "draft-secret-") || !strings.Contains(*state.LastError, "truncated:") {
+					t.Fatalf("unsafe or missing diagnostic: %v", state.LastError)
+				}
+			}
+		})
 	}
 }
 

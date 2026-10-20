@@ -318,9 +318,14 @@ function BatchDetails({ batch }: { batch: CommitBatchDetails }) {
               <CopyableValue label="Task ID" value={String(batch.task_id)} monospace />
             </DetailField>
           )}
-          {batch.transaction_id && (
-            <DetailField label="Transaction">
-              <CopyableValue label="Transaction" value={batch.transaction_id} monospace maxLength={32} />
+          {batch.tx_hash && (
+            <DetailField label="Submitted transaction">
+              <CopyableValue label="Submitted transaction" value={batch.tx_hash} monospace maxLength={32} />
+            </DetailField>
+          )}
+          {batch.confirmed_tx_hash && (
+            <DetailField label="Confirmed transaction">
+              <CopyableValue label="Confirmed transaction" value={batch.confirmed_tx_hash} monospace maxLength={32} />
             </DetailField>
           )}
         </DetailGrid>

@@ -113,8 +113,7 @@ func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input
 		return result.withError(PDPStatusMismatch, err.Error())
 	}
 	if errors.Is(err, pdp.ErrTxRejected) {
-		result.State = PDPStatusRejected
-		return result
+		return result.withError(PDPStatusRejected, dataSetCreationRejection(status, err).Error())
 	}
 	result.State = classifyCreationStatus(status.TxStatus, status.DataSetCreated)
 	return result

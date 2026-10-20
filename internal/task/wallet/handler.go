@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/walletoperation"
@@ -157,7 +158,7 @@ func (h *Handler) processWalletOperation(ctx context.Context, execution taskengi
 		var settlement taskengine.Settlement
 		if op.Status == model.WalletOperationStatusPending && op.BroadcastAttemptedAt == nil && op.TxHash == nil && len(op.SignedTransaction) == 0 && len(execution.Checkpoint()) == 0 {
 			settlement = func(ctx context.Context, repos *repository.Repositories) error {
-				return repos.WalletOperations.MarkFailed(ctx, op.ID, execution.ID(), err.Error())
+				return repos.WalletOperations.MarkFailed(ctx, op.ID, execution.ID(), errtext.Format(err))
 			}
 		}
 		return taskengine.Fail(err, "wallet_amount_invalid", settlement)
@@ -216,7 +217,7 @@ func (h *Handler) processWalletOperation(ctx context.Context, execution taskengi
 	receipt, receiptErr := h.deps.Receipts.TransactionReceipt(requestCtx, common.HexToHash(submission.TxHash))
 	cancel()
 	if receiptErr != nil && !errors.Is(receiptErr, ethereum.NotFound) {
-		return h.walletRetry(execution, op, synapse.SummarizedError(receiptErr), "transaction_confirmation")
+		return h.walletRetry(execution, op, receiptErr, "transaction_confirmation")
 	}
 	if receiptErr == nil && receipt != nil {
 		if receipt.TxHash != common.HexToHash(submission.TxHash) {
@@ -250,12 +251,12 @@ func (h *Handler) processWalletOperation(ctx context.Context, execution taskengi
 		return taskengine.Fail(replayErr, "wallet_evidence_conflict", nil)
 	}
 	if replayErr != nil && !errors.Is(replayErr, synapse.ErrWalletReplaySkipped) && !errors.Is(replayErr, synapse.ErrWalletReplayBroadcast) {
-		return h.walletRetry(execution, op, synapse.SummarizedError(replayErr), "wallet_replay_failed")
+		return h.walletRetry(execution, op, replayErr, "wallet_replay_failed")
 	}
 	var settlement taskengine.Settlement
 	if attempted && errors.Is(replayErr, synapse.ErrWalletReplayBroadcast) {
 		settlement = func(ctx context.Context, repos *repository.Repositories) error {
-			return repos.WalletOperations.RecordConfirmationError(ctx, op.ID, execution.ID(), replayErr.Error())
+			return repos.WalletOperations.RecordConfirmationError(ctx, op.ID, execution.ID(), errtext.Format(replayErr))
 		}
 	}
 	return h.walletObservation(execution, op, submission, settlement)
@@ -333,7 +334,7 @@ func (h *Handler) broadcastWalletOperation(ctx context.Context, execution tasken
 	checkpoint.TransactionHash = submission.TxHash
 	lastError := ""
 	if broadcastErr != nil {
-		lastError = broadcastErr.Error()
+		lastError = errtext.Format(broadcastErr)
 	}
 	persist := func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.WalletOperations.RecordSubmission(ctx, op.ID, execution.ID(), submission.TxHash, submission.SignedTransaction, lastError)
@@ -377,13 +378,13 @@ func (h *Handler) walletRetry(execution taskengine.Execution, op *model.WalletOp
 	}
 	return taskengine.RetryInMode(err, reason, model.TaskResumeModeRecover, nil).
 		WithRetrySettlements(func(ctx context.Context, repos *repository.Repositories, _ time.Time) error {
-			return repos.WalletOperations.RecordConfirmationError(ctx, op.ID, execution.ID(), err.Error())
+			return repos.WalletOperations.RecordConfirmationError(ctx, op.ID, execution.ID(), errtext.Format(err))
 		}, h.confirmationStopped(execution, op, err))
 }
 
 func (h *Handler) confirmationStopped(execution taskengine.Execution, op *model.WalletOperation, cause error) taskengine.Settlement {
 	return func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.WalletOperations.RecordConfirmationError(ctx, op.ID, execution.ID(), fmt.Sprintf("automatic wallet confirmation stopped after %d attempts: %v", execution.RetryCount()+1, cause))
+		return repos.WalletOperations.RecordConfirmationError(ctx, op.ID, execution.ID(), errtext.Format(fmt.Errorf("automatic wallet confirmation stopped after %d attempts: %w", execution.RetryCount()+1, cause)))
 	}
 }
 

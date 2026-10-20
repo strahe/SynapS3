@@ -16,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/walletoperation"
 	"github.com/strahe/synapse-go/storage"
@@ -241,6 +242,9 @@ func TestWalletReplayGuardsAndPreservesSignedBytes(t *testing.T) {
 		{name: "send echoes signed bytes", setup: func(r *walletReplayRequest, c *walletReplayRPC) {
 			c.sendErr = fmt.Errorf("RPC rejected %x", r.submission(t).SignedTransaction)
 		}, wantErr: ErrWalletReplayBroadcast, wantSend: true},
+		{name: "RPC data echoes signed bytes", setup: func(r *walletReplayRequest, c *walletReplayRPC) {
+			c.sendErr = cleanupRPCError{code: 3, data: "0x" + hex.EncodeToString(r.submission(t).SignedTransaction)}
+		}, wantErr: ErrWalletReplayBroadcast, wantSend: true},
 		{name: "receipt", setup: func(r *walletReplayRequest, c *walletReplayRPC) {
 			c.receiptErr = nil
 			c.receipt = &ethtypes.Receipt{TxHash: common.HexToHash(r.submission(t).TxHash)}
@@ -288,6 +292,9 @@ func TestWalletReplayGuardsAndPreservesSignedBytes(t *testing.T) {
 			}
 			if err != nil && strings.Contains(strings.ToLower(err.Error()), hex.EncodeToString(submission.SignedTransaction)) {
 				t.Fatal("error exposes signed transaction bytes")
+			}
+			if strings.Contains(strings.ToLower(errtext.Format(err)), hex.EncodeToString(submission.SignedTransaction)) {
+				t.Fatal("formatted RPC diagnostic exposes signed transaction bytes")
 			}
 			if tc.wantNoReads && client.readCalls != 0 {
 				t.Fatalf("read RPC %d times with invalid evidence", client.readCalls)

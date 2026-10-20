@@ -62,12 +62,14 @@ func (p *PDPBatchUploadProbe) Probe(ctx context.Context, serviceURL string) (pro
 	if err != nil {
 		return providerbenchmark.Measurement{}, err
 	}
+	if createResp.StatusCode != http.StatusCreated {
+		responseErr := readProviderHTTPError(createReq, createResp)
+		_ = createResp.Body.Close()
+		return providerbenchmark.Measurement{}, fmt.Errorf("could not create upload session: %w", responseErr)
+	}
 	_, _ = io.CopyN(io.Discard, createResp.Body, 1024)
 	_ = createResp.Body.Close()
 	cancelCreate()
-	if createResp.StatusCode != http.StatusCreated {
-		return providerbenchmark.Measurement{}, fmt.Errorf("upload session creation returned HTTP %d", createResp.StatusCode)
-	}
 	uuid, err := checkedUploadSessionID(createResp.Header.Get("Location"), createURL)
 	if err != nil {
 		return providerbenchmark.Measurement{}, err
@@ -95,10 +97,10 @@ func (p *PDPBatchUploadProbe) Probe(ctx context.Context, serviceURL string) (pro
 		return providerbenchmark.Measurement{}, err
 	}
 	defer func() { _ = putResp.Body.Close() }()
-	_, _ = io.CopyN(io.Discard, putResp.Body, 1024)
 	if putResp.StatusCode != http.StatusNoContent {
-		return providerbenchmark.Measurement{}, fmt.Errorf("upload sample returned HTTP %d", putResp.StatusCode)
+		return providerbenchmark.Measurement{}, fmt.Errorf("could not upload sample: %w", readProviderHTTPError(putReq, putResp))
 	}
+	_, _ = io.CopyN(io.Discard, putResp.Body, 1024)
 	return providerbenchmark.Measurement{Bytes: providerbenchmark.SampleBytes, Duration: duration}, nil
 }
 

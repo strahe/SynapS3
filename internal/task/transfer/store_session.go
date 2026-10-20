@@ -205,7 +205,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 				return h.storePublished(ctx, execution, &checkpoint)
 			}
 			if errors.Is(err, synapse.ErrStoreSessionMissing) {
-				return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, synapse.ErrStoreSessionMissing)
+				return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, err)
 			}
 			if !errors.Is(err, synapse.ErrStoreSessionIncomplete) {
 				return err
@@ -244,7 +244,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 		requestStarted = true
 		stored, err := target.UploadStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, body.storeContextReader, options)
 		if errors.Is(err, synapse.ErrStoreSessionMissing) {
-			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, synapse.ErrStoreSessionMissing)
+			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, err)
 		}
 		if errors.Is(err, synapse.ErrStoreSessionClaimed) {
 			checkpoint.UploadsIncomplete = claimable
@@ -268,7 +268,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 		requestStarted = true
 		err = target.FinalizeStoreSession(ctx, checkpoint.ProviderServiceURL, checkpoint.SessionID, pieceCID)
 		if errors.Is(err, synapse.ErrStoreSessionMissing) {
-			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, synapse.ErrStoreSessionMissing)
+			return h.storeSessionMissing(ctx, execution, target, &checkpoint, pieceCID, err)
 		}
 		if errors.Is(err, synapse.ErrStoreSessionIncomplete) {
 			return errStoreBusy
@@ -320,7 +320,7 @@ func (h *StoreHandler) executeStoreSession(ctx context.Context, execution tasken
 	}
 	var httpErr *pdp.HTTPError
 	if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusBadRequest || httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden || httpErr.StatusCode == http.StatusRequestEntityTooLarge || httpErr.StatusCode == http.StatusUnprocessableEntity) {
-		return taskengine.Fail(synapse.SummarizedError(err), "store_request_rejected", settlement)
+		return taskengine.Fail(err, "store_request_rejected", settlement)
 	}
 	if !requestStarted {
 		return retryStoreCheckpoint(execution, checkpoint, err, "store_checkpoint_write_failed")
@@ -346,7 +346,7 @@ func retryStoreCheckpoint(execution taskengine.Execution, checkpoint storeCheckp
 	if errors.Is(err, repository.ErrTaskIdentityContended) || errors.Is(err, repository.ErrRepositoryContended) {
 		return taskengine.Wait(model.TaskResumeModeRecover, "database_contention", "Waiting to continue", settlement)
 	}
-	return taskengine.RetryInMode(synapse.SummarizedError(err), reason, model.TaskResumeModeRecover, settlement)
+	return taskengine.RetryInMode(err, reason, model.TaskResumeModeRecover, settlement)
 }
 
 func (h *StoreHandler) storePublished(ctx context.Context, execution taskengine.Execution, checkpoint *storeCheckpoint) error {

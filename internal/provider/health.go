@@ -21,7 +21,7 @@ const defaultHealthConcurrency = 10
 
 // HealthResult is the outcome of one provider health probe. Status is
 // "reachable", "unreachable", or "n/a" (no service URL). Detail explains a
-// failed probe to operators and never includes the URL or response body.
+// failed probe to operators with a redacted diagnostic.
 type HealthResult struct {
 	Status string
 	Detail string
@@ -29,19 +29,24 @@ type HealthResult struct {
 
 // HealthChecker performs provider health probes with a reusable HTTP client.
 type HealthChecker struct {
-	client *http.Client
-	logger *slog.Logger
+	client         *http.Client
+	logger         *slog.Logger
+	errorFormatter func(error) string
 }
 
 // NewHealthChecker creates a provider health checker.
-func NewHealthChecker(client *http.Client) *HealthChecker {
+func NewHealthChecker(client *http.Client, formatters ...func(error) string) *HealthChecker {
 	if client == nil {
 		client = &http.Client{
 			// A PDP ping redirect indicates a misconfigured provider endpoint.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
 	}
-	return &HealthChecker{client: client, logger: slog.Default()}
+	formatter := errtext.Format
+	if len(formatters) > 0 && formatters[0] != nil {
+		formatter = formatters[0]
+	}
+	return &HealthChecker{client: client, logger: slog.Default(), errorFormatter: formatter}
 }
 
 // CheckHealth performs a PDP ping against the given service URL and returns
@@ -70,19 +75,14 @@ func (h *HealthChecker) Probe(ctx context.Context, serviceURL string, timeout ti
 	client, err := pdp.New(serviceURL, pdp.WithHTTPClient(h.client), pdp.WithMaxRetries(0))
 	if err != nil {
 		if h.logger != nil {
-			h.logger.Warn("failed to create PDP health client", "error", err)
+			h.logger.Warn("failed to create PDP health client", "error", h.errorFormatter(err))
 		}
-		return HealthResult{Status: "unreachable", Detail: "Service URL is invalid"}
+		return HealthResult{Status: "unreachable", Detail: h.errorFormatter(fmt.Errorf("service URL is invalid: %w", err))}
 	}
 	if err := client.Ping(ctx); err != nil {
-		return HealthResult{Status: "unreachable", Detail: pingFailureDetail(err)}
+		return HealthResult{Status: "unreachable", Detail: h.errorFormatter(fmt.Errorf("%s: %w", pingFailureSummary(err), err))}
 	}
 	return HealthResult{Status: "reachable"}
-}
-
-// pingFailureDetail classifies a failed PDP ping and keeps the redacted error.
-func pingFailureDetail(err error) string {
-	return pingFailureSummary(err) + ": " + errtext.Redact(err.Error())
 }
 
 func pingFailureSummary(err error) string {

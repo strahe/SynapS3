@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 
 	taskengine "github.com/strahe/synaps3/internal/worker"
@@ -747,7 +748,7 @@ func dependencyOwnerCurrent(ctx context.Context, repos *repository.Repositories,
 
 func (h *Handler) failReplacement(replacementID int64, err error, reason string) taskengine.Result {
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.Replacements.MarkFailed(ctx, replacementID, nil, err.Error())
+		return repos.Replacements.MarkFailed(ctx, replacementID, nil, errtext.Format(err))
 	})
 }
 

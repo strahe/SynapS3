@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"os"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synaps3/internal/types"
@@ -40,6 +39,12 @@ type ProviderDetail struct {
 	Location          string            `json:"location,omitempty"`
 	HealthStatus      string            `json:"health_status"`
 }
+
+// PartialListError reports provider lookups omitted from a partial result.
+type PartialListError struct{ Failures []error }
+
+func (e *PartialListError) Error() string   { return errors.Join(e.Failures...).Error() }
+func (e *PartialListError) Unwrap() []error { return e.Failures }
 
 // RegistryService wraps the synapse-go spregistry.Service for provider listing.
 type RegistryService struct {
@@ -111,7 +116,7 @@ func listAllProviders(ctx context.Context, reg *RegistryService) ([]ProviderDeta
 		return nil, fmt.Errorf("fetching provider count: %w", err)
 	}
 
-	var skipped int
+	var failures []error
 	if !count.IsUint64() || count.Sign() <= 0 {
 		return nil, fmt.Errorf("provider count invalid: %s", count.String())
 	}
@@ -126,24 +131,24 @@ func listAllProviders(ctx context.Context, reg *RegistryService) ([]ProviderDeta
 		p, err := reg.svc.GetPDPProvider(ctx, providerID)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return details, &PartialListError{Failures: append(failures, fmt.Errorf("could not read provider %s: %w", providerID.String(), errors.Join(err, ctx.Err())))}
 			}
 			if errors.Is(err, spregistry.ErrNotFound) {
 				detail, detailErr := providerInfoDetailWithFallback(ctx, reg, providerID, id)
 				if detailErr != nil {
-					skipped++
+					failures = append(failures, fmt.Errorf("could not read provider %s: %w", providerID.String(), detailErr))
 					continue
 				}
 				details = append(details, detail)
 				continue
 			}
-			skipped++
+			failures = append(failures, fmt.Errorf("could not read provider %s: %w", providerID.String(), err))
 			continue
 		}
 		if p == nil {
 			detail, detailErr := providerInfoDetailWithFallback(ctx, reg, providerID, id)
 			if detailErr != nil {
-				skipped++
+				failures = append(failures, fmt.Errorf("could not read provider %s: %w", providerID.String(), detailErr))
 				continue
 			}
 			details = append(details, detail)
@@ -151,14 +156,14 @@ func listAllProviders(ctx context.Context, reg *RegistryService) ([]ProviderDeta
 		}
 		detail, err := pdpProviderToDetailWithFallback(*p, id)
 		if err != nil {
-			skipped++
+			failures = append(failures, fmt.Errorf("could not decode provider %s: %w", providerID.String(), err))
 			continue
 		}
 		details = append(details, detail)
 	}
 
-	if skipped > 0 {
-		fmt.Fprintf(os.Stderr, "Warning: %d provider(s) skipped due to RPC errors\n", skipped)
+	if len(failures) > 0 {
+		return details, &PartialListError{Failures: failures}
 	}
 	return details, nil
 }

@@ -1031,49 +1031,82 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 func TestAdminStorageConfirmationCommands(t *testing.T) {
 	t.Setenv(configEnvVar, "")
 
-	t.Run("list", func(t *testing.T) {
-		var sawList bool
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/storage-confirmations":
-				sawList = true
-				if got := r.URL.Query().Get("status"); got != "needs_attention" {
-					t.Fatalf("status = %q, want needs_attention", got)
+	for _, format := range []string{"table", "json"} {
+		t.Run("list "+format, func(t *testing.T) {
+			var sawList bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/storage-confirmations":
+					sawList = true
+					if got := r.URL.Query().Get("status"); got != "needs_attention" {
+						t.Fatalf("status = %q, want needs_attention", got)
+					}
+					if got := r.URL.Query().Get("limit"); got != "25" {
+						t.Fatalf("limit = %q, want 25", got)
+					}
+					writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
+						"request_id": "request-1", "task_id": 12345,
+						"submit_error":    "provider returned HTTP 500:\n piece not found",
+						"data_set_row_id": 9, "provider_id": "provider-1", "data_set_id": "dataset-1",
+						"piece_count": 3, "piece_cids": []string{"bafy-piece-1", "bafy-piece-2", "bafy-piece-3"},
+						"tx_hash": "0xcommit", "confirmed_tx_hash": "0xreplacement", "reason_code": "confirmation_timeout",
+						"submitted_at": "2026-08-30T01:00:00Z", "attention_at": "2026-08-30T01:15:00Z",
+					}, {
+						"request_id": "request-2", "data_set_row_id": 10, "provider_id": "provider-2",
+						"piece_count": 1, "piece_cids": []string{"bafy-piece-4"},
+						"tx_hash": nil, "confirmed_tx_hash": nil, "reason_code": "provider_rejected",
+						"submitted_at": "2026-08-30T02:00:00Z", "attention_at": "2026-08-30T02:00:00Z",
+					}})
+				default:
+					t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 				}
-				if got := r.URL.Query().Get("limit"); got != "25" {
-					t.Fatalf("limit = %q, want 25", got)
-				}
-				writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
-					"request_id": "request-1", "task_id": 12345,
-					"submit_error":    "provider returned HTTP 500:\n piece not found",
-					"data_set_row_id": 9, "provider_id": "provider-1", "data_set_id": "dataset-1",
-					"piece_count": 3, "piece_cids": []string{"bafy-piece-1", "bafy-piece-2", "bafy-piece-3"},
-					"transaction_id": "0xcommit", "reason_code": "confirmation_timeout",
-					"submitted_at": "2026-08-30T01:00:00Z", "attention_at": "2026-08-30T01:15:00Z",
-				}})
-			default:
-				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
-			}
-		}))
-		defer ts.Close()
+			}))
+			defer ts.Close()
 
-		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "list", "--limit", "25"})
-		if err != nil {
-			t.Fatalf("storage-confirmation list: %v\n%s", err, out)
-		}
-		for _, want := range []string{
-			"REQUEST", "PIECES", "SUBMITTED AT", "TASK ID", "PROVIDER RESPONSE",
-			"request-1", "12345", "provider-1", "dataset-1", "0xcommit", "confirmation_timeout",
-			"2026-08-30T01:00:00Z", "2026-08-30T01:15:00Z", "provider returned HTTP 500: piece not found",
-		} {
-			if !strings.Contains(out, want) {
-				t.Fatalf("list output missing %q:\n%s", want, out)
+			args := []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "list", "--limit", "25"}
+			if format == "json" {
+				args = append(args, "--json")
 			}
-		}
-		if !sawList {
-			t.Fatal("list request was not sent")
-		}
-	})
+			out, err := runAdminCommand(t, args)
+			if err != nil {
+				t.Fatalf("storage-confirmation list: %v\n%s", err, out)
+			}
+			if format == "json" {
+				var rows []map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(out), &rows); err != nil {
+					t.Fatalf("decode list output: %v\n%s", err, out)
+				}
+				if len(rows) != 2 {
+					t.Fatalf("list returned %d rows, want 2", len(rows))
+				}
+				if string(rows[0]["tx_hash"]) != `"0xcommit"` || string(rows[0]["confirmed_tx_hash"]) != `"0xreplacement"` {
+					t.Fatalf("list lost transaction hashes: %s", out)
+				}
+				if string(rows[1]["tx_hash"]) != "null" || string(rows[1]["confirmed_tx_hash"]) != "null" {
+					t.Fatalf("unknown hashes must be explicit null: %s", out)
+				}
+				for _, row := range rows {
+					if _, ok := row["transaction_id"]; ok {
+						t.Fatalf("list returned transaction_id alias: %s", out)
+					}
+				}
+			} else {
+				for _, want := range []string{
+					"REQUEST", "PIECES", "SUBMITTED AT", "TASK ID", "PROVIDER RESPONSE",
+					"SUBMITTED TRANSACTION", "CONFIRMED TRANSACTION",
+					"request-1", "12345", "provider-1", "dataset-1", "0xcommit", "0xreplacement", "confirmation_timeout",
+					"2026-08-30T01:00:00Z", "2026-08-30T01:15:00Z", "provider returned HTTP 500: piece not found",
+				} {
+					if !strings.Contains(out, want) {
+						t.Fatalf("list output missing %q:\n%s", want, out)
+					}
+				}
+			}
+			if !sawList {
+				t.Fatal("list request was not sent")
+			}
+		})
+	}
 }
 
 func runAdminCommand(t *testing.T, args []string) (string, error) {

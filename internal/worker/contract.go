@@ -229,25 +229,42 @@ type Settlement func(context.Context, *repository.Repositories) error
 
 // Result is a closed set constructed through the helpers below.
 type Result struct {
-	kind              ResultKind
-	waitUntil         *time.Time
-	observationWait   bool
-	observationWindow *observationWindow
-	resumeMode        model.TaskResumeMode
-	waitReason        string
-	failureReason     string
-	err               error
-	message           string
-	settlement        Settlement
-	onRetry           RetrySettlement
-	onExhausted       Settlement
-	workStartedAt     *time.Time
+	kind                 ResultKind
+	waitUntil            *time.Time
+	observationWait      bool
+	observationWindow    *observationWindow
+	resumeMode           model.TaskResumeMode
+	waitReason           string
+	failureReason        string
+	err                  error
+	diagnostic           error
+	message              string
+	settlement           Settlement
+	contentionSettlement Settlement
+	onRetry              RetrySettlement
+	onExhausted          Settlement
+	workStartedAt        *time.Time
 }
 
 type observationWindow struct {
 	stageKey         string
 	timeoutErr       error
 	timeoutRetryMode model.TaskResumeMode
+}
+
+// WithDiagnostic preserves an observation failure without consuming a retry.
+// Only Wait results may carry a diagnostic.
+func (r Result) WithDiagnostic(err error) Result {
+	r.diagnostic = err
+	return r
+}
+
+// WithContentionSettlement retains only recovery evidence when database
+// contention defers the business result. It must not complete or fail the
+// operation or authorize another external effect.
+func (r Result) WithContentionSettlement(settlement Settlement) Result {
+	r.contentionSettlement = settlement
+	return r
 }
 
 // WithObservationWindow lets the engine retry an observation stage when its

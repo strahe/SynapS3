@@ -2,8 +2,9 @@ package synapse
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 
@@ -135,7 +136,7 @@ func TestWalletQuerier_FILGasBalanceErrorDoesNotHidePaymentAccount(t *testing.T)
 	}
 	pay.walletBalanceFunc = func(_ context.Context, token, _ common.Address) (*big.Int, error) {
 		if token == payments.ZeroAddress {
-			return nil, errors.New("fil rpc down")
+			return nil, fmt.Errorf("reading gas balance: %w", walletDiagnosticError{})
 		}
 		return big.NewInt(789), nil
 	}
@@ -150,10 +151,25 @@ func TestWalletQuerier_FILGasBalanceErrorDoesNotHidePaymentAccount(t *testing.T)
 	if info.PaymentAccount == nil {
 		t.Fatal("PaymentAccount = nil, want USDFC account")
 	}
-	if got := info.Errors["fil_gas_balance"]; got != "fil rpc down" {
-		t.Fatalf("fil_balance error = %q, want fil rpc down", got)
+	diagnostic := info.Errors["fil_gas_balance"]
+	for _, want := range []string{"reading gas balance", "fil rpc down", "RPC code: 3", "Revert data: 0xdeadbeef"} {
+		if !strings.Contains(diagnostic, want) {
+			t.Fatalf("fil_balance error = %q, want %q", diagnostic, want)
+		}
+	}
+	if strings.Contains(diagnostic, "wallet-secret") {
+		t.Fatalf("fil_balance error contains a URL secret: %q", diagnostic)
 	}
 }
+
+type walletDiagnosticError struct{}
+
+func (walletDiagnosticError) Error() string {
+	return "fil rpc down at https://node.example/rpc?token=wallet-secret"
+}
+
+func (walletDiagnosticError) ErrorCode() int { return 3 }
+func (walletDiagnosticError) ErrorData() any { return "0xdeadbeef" }
 
 func TestWalletQuerier_ZeroLockupRateHasNoActiveSpend(t *testing.T) {
 	addrs := chain.Calibration.Addresses()

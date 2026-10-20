@@ -57,7 +57,8 @@ type taskStorageConfirmation struct {
 	DataSetID        string                    `json:"data_set_id,omitempty"`
 	PieceCount       int                       `json:"piece_count"`
 	PieceCIDs        []string                  `json:"piece_cids"`
-	TransactionID    string                    `json:"transaction_id,omitempty"`
+	TxHash           *string                   `json:"tx_hash"`
+	ConfirmedTxHash  *string                   `json:"confirmed_tx_hash"`
 	SubmitError      string                    `json:"submit_error,omitempty"`
 	SubmittedAt      string                    `json:"submitted_at"`
 	AttentionAt      string                    `json:"attention_at"`
@@ -271,9 +272,9 @@ func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []mode
 			RequestID: record.RequestID, ReasonCode: string(record.Code),
 			ProviderID: record.ProviderID, DataSetID: record.DataSetID,
 			PieceCount: len(pieceCIDs), PieceCIDs: pieceCIDs,
-			TransactionID: record.TransactionID,
-			SubmitError:   record.SubmitError,
-			SubmittedAt:   record.SubmittedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
+			TxHash: record.TxHash, ConfirmedTxHash: record.ConfirmedTxHash,
+			SubmitError: record.SubmitError,
+			SubmittedAt: record.SubmittedAt.Format(time.RFC3339), AttentionAt: record.AttentionAt.Format(time.RFC3339),
 		}
 	}
 	return nil

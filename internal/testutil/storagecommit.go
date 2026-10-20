@@ -83,8 +83,8 @@ func CommitStorageCopy(t *testing.T, db bun.IDB, _ *repository.Repositories, inp
 	request := &storagecommit.Request{
 		RequestID: requestID, StorageDataSetID: copyRow.StorageDataSetID, Status: storagecommit.RequestStatusConfirmed,
 		PieceCount: 1, ExtraDataHex: &extra, SealedAt: &now, FirstSentAt: &now, Sends: 1,
-		SubmittedAt: &now, LastSentAt: &now, TransactionID: &transactionID, StatusURL: &statusURL,
-		FirstPieceID: &pieceID, ConfirmedTransactionID: &transactionID, ConfirmedAt: &now,
+		SubmittedAt: &now, LastSentAt: &now, TxHash: &transactionID, StatusURL: &statusURL,
+		FirstPieceID: &pieceID, ConfirmedTxHash: &transactionID, ConfirmedAt: &now,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := db.NewInsert().Model(request).Exec(ctx); err != nil {

@@ -50,7 +50,8 @@ func sameReplacementDataSet(a, b model.StorageDataSet) bool {
 	return a.ID == b.ID && a.BucketID == b.BucketID && a.CopyIndex == b.CopyIndex && a.Generation == b.Generation &&
 		a.IsCurrent == b.IsCurrent && a.Status == b.Status && a.ProviderID.Equal(b.ProviderID) &&
 		reflect.DeepEqual(a.DataSetID, b.DataSetID) && reflect.DeepEqual(a.ClientDataSetID, b.ClientDataSetID) &&
-		reflect.DeepEqual(a.EnsureTaskID, b.EnsureTaskID) && reflect.DeepEqual(a.CreateTransactionID, b.CreateTransactionID) &&
+		reflect.DeepEqual(a.EnsureTaskID, b.EnsureTaskID) && reflect.DeepEqual(a.TxHash, b.TxHash) &&
+		reflect.DeepEqual(a.ConfirmedTxHash, b.ConfirmedTxHash) &&
 		reflect.DeepEqual(a.CreateStatusURL, b.CreateStatusURL) && bytes.Equal(a.CreationRejection, b.CreationRejection)
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,7 +142,8 @@ func newRegistrationProvider(t *testing.T, providerID, dataSetID, clientID sdkty
 		ref, _ := p.target.DataSetRef()
 		return &storage.CommitStatus{
 			Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: tx,
-			DataSet: &ref, PieceIDs: p.landed[tx],
+			ConfirmedTransactionID: tx,
+			DataSet:                &ref, PieceIDs: p.landed[tx],
 		}, nil
 	}
 	return p
@@ -597,7 +599,7 @@ func (f registrationFixture) holdSubmissionSlots(t *testing.T) int64 {
 		}
 		if err := f.runtime.repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
 			CommitSendInput: repository.CommitSendInput{RequestID: requestID, TaskID: taskID, Sends: 1},
-			TransactionID:   fmt.Sprintf("0xheld-%d", i), StatusURL: fmt.Sprintf("https://provider.example/status/held-%d", i),
+			TxHash:          fmt.Sprintf("0xheld-%d", i), StatusURL: fmt.Sprintf("https://provider.example/status/held-%d", i),
 		}); err != nil {
 			t.Fatalf("record held submission: %v", err)
 		}
@@ -665,7 +667,7 @@ func TestReadyCommitQueueWakeAndFallbackDoNotConsumeRetries(t *testing.T) {
 			confirm := func() {
 				if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(t.Context(), repository.ConfirmCommitRequestInput{
 					RequestID: "held-0", TaskID: heldTaskID, FirstPieceID: testOnChainID(t, 50),
-					ConfirmedTransactionID: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
+					ConfirmedTxHash: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
 				}); err != nil {
 					t.Fatal(err)
 				}
@@ -791,7 +793,7 @@ func TestCachePressureCollectsWhileSubmissionSlotsAreFull(t *testing.T) {
 			}
 			if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
 				RequestID: "held-0", TaskID: heldTaskID, FirstPieceID: testOnChainID(t, 50),
-				ConfirmedTransactionID: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
+				ConfirmedTxHash: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -906,7 +908,7 @@ func TestCollectingCommitWaitsForSubmissionCapacity(t *testing.T) {
 			}
 			if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
 				RequestID: "held-0", TaskID: heldTaskID, FirstPieceID: testOnChainID(t, 50),
-				ConfirmedTransactionID: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
+				ConfirmedTxHash: "0xheld-0", RetrievalURLs: []string{"https://provider.example/retrieve/held-0"},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -979,7 +981,7 @@ func TestCollectingCommitFormsBatchesWhenSlotsOpen(t *testing.T) {
 		heldID := fmt.Sprintf("held-%d", batch)
 		if _, err := f.runtime.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
 			RequestID: heldID, TaskID: *f.request(t, heldID).TaskID, FirstPieceID: testOnChainID(t, int64(50+batch)),
-			ConfirmedTransactionID: "0x" + heldID, RetrievalURLs: []string{"https://provider.example/retrieve/" + heldID},
+			ConfirmedTxHash: "0x" + heldID, RetrievalURLs: []string{"https://provider.example/retrieve/" + heldID},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -1063,7 +1065,7 @@ func TestCommitRequestRegistersEveryMemberInOneSubmission(t *testing.T) {
 			t.Fatalf("member %d content = %#v, %v, want accepted", i, content, err)
 		}
 	}
-	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusConfirmed || request.ConfirmedTransactionID == nil {
+	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusConfirmed || request.ConfirmedTxHash == nil {
 		t.Fatalf("request = %#v", request)
 	}
 }
@@ -1147,14 +1149,15 @@ func TestDroppedMemberIsTransferredAgainBeforeTheRequestIsResent(t *testing.T) {
 }
 
 func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
-	for _, scenario := range []string{"refused", "unknown", "conflict", "proof unavailable"} {
+	for _, scenario := range []string{"refused", "unknown", "conflict", "proof unavailable", "status and proof unavailable"} {
 		t.Run(scenario, func(t *testing.T) {
 			parked := &droppedPieces{missing: map[string]bool{}}
 			f := newRegistrationFixture(t, 2, parked, 0)
 			f.provider.script = []sendOutcome{sendRefuse}
-			if scenario == "unknown" {
+			switch scenario {
+			case "status and proof unavailable", "unknown":
 				f.provider.script = []sendOutcome{sendLost, sendRefuse}
-			} else {
+			default:
 				parked.drop(f.pieceCID(t, f.copies[0]))
 			}
 			requestID, taskID := f.collect(t)
@@ -1163,7 +1166,7 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			parent = runOneStorageTask(t, f.runtime, parent, model.TaskStatusPending)
-			if scenario == "unknown" {
+			if scenario == "unknown" || scenario == "status and proof unavailable" {
 				parked.drop(f.pieceCID(t, f.copies[0]))
 				f.makeResendDue(t, requestID)
 				for range 2 {
@@ -1186,6 +1189,15 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 			switch scenario {
 			case "conflict":
 				f.provider.nonces.ConsumeRequest(extras[0], sdktypes.NewBigInt(9999), sdktypes.NewBigInt(1), sends[0])
+			case "status and proof unavailable":
+				if err := f.runtime.repos.Contents.RecordCommitSubmission(t.Context(), repository.CommitSubmissionInput{
+					CommitSendInput: repository.CommitSendInput{RequestID: requestID, TaskID: taskID, Sends: f.request(t, requestID).Sends},
+					TxHash:          "0xpending", StatusURL: "https://provider.example/status/0xpending",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				f.provider.statusDown = true
+				f.provider.nonces.Err = errors.New("chain unavailable eid=rpc-failure")
 			case "proof unavailable":
 				f.provider.nonces.Err = errors.New("chain unavailable")
 			}
@@ -1200,7 +1212,10 @@ func TestCommitBlockedMemberIsolationPreservesSubmissionEvidence(t *testing.T) {
 			case "proof unavailable":
 				want = model.TaskStatusPending
 			}
-			runOneStorageTask(t, f.runtime, parent, want)
+			settled := runOneStorageTask(t, f.runtime, parent, want)
+			if scenario == "status and proof unavailable" && (settled.LastError == nil || !strings.Contains(*settled.LastError, "503") || !strings.Contains(*settled.LastError, "eid=rpc-failure")) {
+				t.Fatalf("member recovery dropped query failures: %#v", settled)
+			}
 			bad, err = f.runtime.repos.Contents.GetUploadCopyByID(t.Context(), bad.ID)
 			if err != nil || bad.ActiveTaskID == nil || *bad.ActiveTaskID != owner {
 				t.Fatalf("blocked member lost its protected owner: %#v %v", bad, err)
@@ -1360,7 +1375,7 @@ func TestLostSendThatLandedIsConfirmedWithoutSendingAgain(t *testing.T) {
 	}
 	// The chain proved the pieces, but no reply named the transaction that
 	// carried them.
-	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusConfirmed || request.ConfirmedTransactionID != nil {
+	if request := f.request(t, requestID); request.Status != storagecommit.RequestStatusConfirmed || request.ConfirmedTxHash != nil {
 		t.Fatalf("request = %#v, want confirmed by its nonce", request)
 	}
 }
@@ -1373,10 +1388,13 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	cancel, done := runHandlerEngine(t, f.runtime)
 	defer func() { stopHandlerEngine(t, cancel, done) }()
 
-	waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
+	observed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
-			f.request(t, requestID).TransactionID != nil
+			f.request(t, requestID).TxHash != nil && task.LastError != nil
 	})
+	if observed.RetryCount != 0 || !strings.Contains(*observed.LastError, "unavailable") {
+		t.Fatalf("provider observation consumed retry or lost details: %#v", observed)
+	}
 	// Rewriting fixture history must not race with settlement of the same rows.
 	stopHandlerEngine(t, cancel, done)
 	// The provider accepted the request but its transaction never landed, and
@@ -1394,6 +1412,9 @@ func TestUnanswerableSubmissionIsSentAgainOnceFlagged(t *testing.T) {
 	}
 	cancel, done = runHandlerEngine(t, f.runtime)
 	completed := waitForCommitTask(t, f.runtime, taskID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	if completed.LastError != nil {
+		t.Fatalf("successful confirmation retained observation failure: %s", *completed.LastError)
+	}
 	if completed.WorkStartedAt == nil || !completed.WorkStartedAt.After(legacyStart) {
 		t.Fatalf("registration recovery start = %v, must be after the original submission %v", completed.WorkStartedAt, legacyStart)
 	}

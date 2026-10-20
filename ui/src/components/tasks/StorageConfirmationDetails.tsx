@@ -29,12 +29,15 @@ export function StorageConfirmationDetails({ confirmation }: { confirmation: Tas
           )}
         </dd>
       </div>
-      <DetailRow label="Transaction" value={confirmation.transaction_id} />
+      {confirmation.tx_hash && <DetailRow label="Submitted transaction" value={confirmation.tx_hash} />}
+      {confirmation.confirmed_tx_hash && (
+        <DetailRow label="Confirmed transaction" value={confirmation.confirmed_tx_hash} />
+      )}
     </dl>
   )
 }
 
-function DetailRow({ label, value }: { label: string; value: string | undefined }) {
+function DetailRow({ label, value }: { label: string; value: string | null | undefined }) {
   return (
     <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-2">
       <dt className="text-muted-foreground">{label}</dt>

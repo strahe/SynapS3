@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 							return nil, err
 						}
 						ref, err := storage.NewDataSetRef(providerID.SDK(), sdktypes.NewBigInt(1200), otherID)
-						return &storage.CreateDataSetResult{DataSet: ref}, err
+						return &storage.CreateDataSetResult{DataSet: ref, TransactionID: "0xsubmitted", ConfirmedTransactionID: "0xconfirmed"}, errors.Join(err, errors.New("provider response interrupted"))
 					}
 					if tc.pending {
 						transactionID := "0xpending"
@@ -186,7 +187,7 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 					t.Fatalf("automatic retries extended the confirmation window: runtime=%#v err=%v", operation, err)
 				}
 			}
-			if tc.failEvidence && (confirmations.Load() != 0 || binding.CreateTransactionID == nil || *binding.CreateTransactionID != "0xpending" || binding.CreateStatusURL == nil) {
+			if tc.failEvidence && (confirmations.Load() != 0 || binding.TxHash == nil || *binding.TxHash != "0xpending" || binding.CreateStatusURL == nil) {
 				t.Fatalf("submission facts lost at exhaustion: binding=%#v confirmations=%d", binding, confirmations.Load())
 			}
 			if !binding.IsCurrent || binding.EnsureTaskID == nil || binding.ClientDataSetID == nil || binding.ClientDataSetID.String() != sentID.Load().(string) || len(binding.CreationRejection) != 0 {
@@ -194,6 +195,9 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 			}
 			if binding.DataSetID != nil || binding.Status == model.StorageDataSetStatusReady {
 				t.Fatalf("unconfirmed creation became ready: %#v", binding)
+			}
+			if tc.wrongResult && (binding.TxHash == nil || *binding.TxHash != "0xsubmitted" || binding.ConfirmedTxHash == nil || *binding.ConfirmedTxHash != "0xconfirmed" || binding.LastError == nil || !strings.Contains(*binding.LastError, "provider response interrupted")) {
+				t.Fatalf("identity failure discarded creation facts: %#v", binding)
 			}
 			if _, local, err := runtime.repos.Replacements.SourceEligibility(t.Context(), binding.ID); err != nil || !local {
 				t.Fatalf("failed source eligibility: local=%v err=%v", local, err)
@@ -208,6 +212,269 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 			}
 			if _, _, err := runtime.repos.Replacements.SourceEligibility(t.Context(), binding.ID); err == nil {
 				t.Fatal("provider replacement allowed during manual retry")
+			}
+		})
+	}
+}
+
+func TestRejectedDataSetCreationKeepsEvidenceUntilANewSubmission(t *testing.T) {
+	const submitted, confirmed = "0xrejected", "0xrejected-confirmed"
+	const originalURL = "https://provider.example/rejected"
+	for _, tc := range []struct {
+		name                 string
+		initialConfirmedHash string
+		rejectionResult      *storage.CreateDataSetResult
+		nextSubmission       *storage.CreateDataSetSubmission
+		nextResult           *storage.CreateDataSetResult
+		nextDataSetID        uint64
+		nextError            error
+		wantTxHash           string
+		wantConfirmedHash    string
+		wantRejected         bool
+		wantTaskStatus       model.TaskStatus
+	}{
+		{
+			name:            "error without evidence",
+			rejectionResult: &storage.CreateDataSetResult{TransactionID: submitted, ConfirmedTransactionID: confirmed},
+			nextError:       errors.New("provider unavailable before a new submission"),
+			wantTxHash:      submitted, wantConfirmedHash: confirmed, wantRejected: true, wantTaskStatus: model.TaskStatusPending,
+		},
+		{
+			name: "rejected without result", initialConfirmedHash: confirmed,
+			nextError:  errors.New("provider unavailable before a new submission"),
+			wantTxHash: submitted, wantConfirmedHash: confirmed, wantRejected: true, wantTaskStatus: model.TaskStatusPending,
+		},
+		{
+			name:            "repeated submission",
+			rejectionResult: &storage.CreateDataSetResult{TransactionID: submitted, ConfirmedTransactionID: confirmed},
+			nextSubmission:  &storage.CreateDataSetSubmission{TransactionID: submitted, StatusURL: originalURL},
+			wantTxHash:      submitted, wantConfirmedHash: confirmed, wantRejected: true, wantTaskStatus: model.TaskStatusPending,
+		},
+		{
+			name:            "new submission",
+			rejectionResult: &storage.CreateDataSetResult{TransactionID: submitted, ConfirmedTransactionID: confirmed},
+			nextSubmission:  &storage.CreateDataSetSubmission{TransactionID: "0xnew", StatusURL: "https://provider.example/new"},
+			wantTxHash:      "0xnew", wantTaskStatus: model.TaskStatusPending,
+		},
+		{
+			name:            "new confirmed result",
+			rejectionResult: &storage.CreateDataSetResult{TransactionID: submitted, ConfirmedTransactionID: confirmed},
+			nextResult:      &storage.CreateDataSetResult{TransactionID: "0xnew", ConfirmedTransactionID: "0xnew-confirmed"}, nextDataSetID: 7001,
+			wantTxHash: "0xnew", wantConfirmedHash: "0xnew-confirmed", wantTaskStatus: model.TaskStatusCompleted,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sequence := storedObjectSequence.Add(1)
+			providerID, clientID := testOnChainID(t, 51000+sequence), testOnChainID(t, 61000+sequence)
+			if tc.nextDataSetID != 0 {
+				ref, err := storage.NewDataSetRef(providerID.SDK(), sdktypes.NewBigInt(tc.nextDataSetID), clientID.SDK())
+				if err != nil {
+					t.Fatal(err)
+				}
+				tc.nextResult.DataSet = ref
+			}
+			var creates atomic.Int64
+			target := &testutil.MockStorageTarget{
+				ProviderIDValue: providerID.SDK(),
+				WaitDataSetFunc: func(_ context.Context, statusURL string, id sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+					if !id.Equal(clientID.SDK()) {
+						t.Errorf("observation changed request identity: %s", id.String())
+					}
+					if statusURL != originalURL {
+						return nil, nil
+					}
+					return tc.rejectionResult, synapse.ErrProviderTransactionRejected
+				},
+				FindDataSetByClientIDFunc: func(_ context.Context, id sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+					if !id.Equal(clientID.SDK()) {
+						t.Errorf("lookup changed request identity: %s", id.String())
+					}
+					return storage.DataSetRef{}, false, nil
+				},
+				CreateDataSetFunc: func(ctx context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+					creates.Add(1)
+					if !options.ClientDataSetID.Equal(clientID.SDK()) {
+						t.Errorf("retry changed request identity: %s", options.ClientDataSetID.String())
+					}
+					if tc.nextSubmission != nil {
+						options.OnSubmitted(*tc.nextSubmission)
+						return nil, ctx.Err()
+					}
+					return tc.nextResult, tc.nextError
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+				return target, nil
+			}}, policy: cache.EvictionPolicyNone})
+			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("rejected-creation-%d", sequence))
+			initialEvidence := repository.MarkDataSetCreatingInput{
+				ID: fixture.binding.ID, TxHash: submitted, ConfirmedTxHash: tc.initialConfirmedHash, StatusURL: originalURL, ClientDataSetID: &clientID,
+			}
+			if err := runtime.repos.Contents.MarkDataSetCreating(t.Context(), initialEvidence); err != nil {
+				t.Fatal(err)
+			}
+			checkpointFields := map[string]any{
+				"attempted_at": time.Now().UTC().Add(-time.Hour), "client_data_set_id": clientID.String(), "sends": 1,
+				"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress,
+				"transaction_id": submitted, "status_url": originalURL,
+				"confirmed_tx_hash": tc.initialConfirmedHash,
+			}
+			checkpoint, err := json.Marshal(checkpointFields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = ?, resume_mode = ? WHERE id = ?", string(checkpoint), model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			pending := runOneStorageTask(t, runtime, fixture.ensureTask, model.TaskStatusPending)
+			assertPair := func(txHash, confirmedHash string) {
+				t.Helper()
+				current, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if current.TxHash == nil {
+					t.Errorf("ledger submitted hash is missing, want %q", txHash)
+				} else if *current.TxHash != txHash {
+					t.Errorf("ledger submitted hash = %q, want %q", *current.TxHash, txHash)
+				}
+				if confirmedHash == "" {
+					if current.ConfirmedTxHash != nil {
+						t.Errorf("ledger confirmed hash = %q, want nil", *current.ConfirmedTxHash)
+					}
+				} else if current.ConfirmedTxHash == nil {
+					t.Errorf("ledger confirmed hash is missing, want %q", confirmedHash)
+				} else if *current.ConfirmedTxHash != confirmedHash {
+					t.Errorf("ledger confirmed hash = %q, want %q", *current.ConfirmedTxHash, confirmedHash)
+				}
+			}
+			assertRecovery := func(txHash, confirmedHash string, rejected bool) {
+				t.Helper()
+				var stored struct {
+					TxHash          string `json:"transaction_id"`
+					ConfirmedTxHash string `json:"confirmed_tx_hash"`
+					Rejected        bool   `json:"transaction_rejected"`
+				}
+				if err := json.Unmarshal(pending.Checkpoint, &stored); err != nil {
+					t.Fatal(err)
+				}
+				if stored.TxHash != txHash {
+					t.Errorf("checkpoint submitted hash = %q, want %q", stored.TxHash, txHash)
+				}
+				if stored.ConfirmedTxHash != confirmedHash {
+					t.Errorf("checkpoint confirmed hash = %q, want %q", stored.ConfirmedTxHash, confirmedHash)
+				}
+				if stored.Rejected != rejected {
+					t.Errorf("checkpoint rejected = %t, want %t", stored.Rejected, rejected)
+				}
+			}
+			assertPair(submitted, confirmed)
+			assertRecovery(submitted, confirmed, true)
+			if creates.Load() != 0 || pending.RetryCount != 1 {
+				t.Fatalf("rejected observation sent requests=%d task=%#v", creates.Load(), pending)
+			}
+			wakeTask(t, runtime, pending.ID)
+			pending = runOneStorageTask(t, runtime, pending, model.TaskStatusPending)
+			if pending.ResumeMode != model.TaskResumeModeExecute {
+				t.Fatalf("retry was not admitted for execution: %#v", pending)
+			}
+			wakeTask(t, runtime, pending.ID)
+			pending = runOneStorageTask(t, runtime, pending, tc.wantTaskStatus)
+			if creates.Load() != 1 {
+				t.Fatalf("create requests=%d", creates.Load())
+			}
+			assertPair(tc.wantTxHash, tc.wantConfirmedHash)
+			if tc.wantTaskStatus == model.TaskStatusPending {
+				assertRecovery(tc.wantTxHash, tc.wantConfirmedHash, tc.wantRejected)
+			}
+			if tc.wantTaskStatus == model.TaskStatusCompleted {
+				current, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if current.Status != model.StorageDataSetStatusReady {
+					t.Errorf("data set status = %q, want %q", current.Status, model.StorageDataSetStatusReady)
+				}
+			}
+		})
+	}
+}
+
+func TestDataSetCreationPreservesEvidenceOnConflictingResults(t *testing.T) {
+	for _, source := range []string{"create result after callback", "confirmation observation", "confirmation identity mismatch"} {
+		t.Run(source, func(t *testing.T) {
+			sequence := storedObjectSequence.Add(1)
+			providerID, clientID := testOnChainID(t, 51000+sequence), testOnChainID(t, 61000+sequence)
+			const submitted, confirmed = "0xoriginal", "0xoriginal-confirmed"
+			const statusURL = "https://provider.example/original"
+			cause := errors.New("provider response stopped after confirmation")
+			var creates atomic.Int64
+			result := func(id sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+				txHash := "0xother"
+				if source == "confirmation identity mismatch" {
+					txHash, id = submitted, sdktypes.NewBigInt(9999)
+				}
+				ref, err := storage.NewDataSetRef(providerID.SDK(), sdktypes.NewBigInt(7001), id)
+				return &storage.CreateDataSetResult{TransactionID: txHash, ConfirmedTransactionID: "0xother-confirmed", DataSet: ref}, errors.Join(err, cause)
+			}
+			target := &testutil.MockStorageTarget{
+				ProviderIDValue: providerID.SDK(),
+				CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+					creates.Add(1)
+					options.OnSubmitted(storage.CreateDataSetSubmission{TransactionID: submitted, StatusURL: statusURL})
+					return result(*options.ClientDataSetID)
+				},
+				WaitDataSetFunc: func(_ context.Context, _ string, id sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+					return result(id)
+				},
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+				return target, nil
+			}}, policy: cache.EvictionPolicyNone})
+			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("creation-hash-conflict-%d", sequence))
+			expectedConfirmed, expectedCreates := "", int64(1)
+			if source != "create result after callback" {
+				expectedConfirmed, expectedCreates = confirmed, 0
+				initialConfirmed := confirmed
+				if source == "confirmation identity mismatch" {
+					initialConfirmed, expectedConfirmed = "", "0xother-confirmed"
+				}
+				if err := runtime.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{
+					ID: fixture.binding.ID, TxHash: submitted, ConfirmedTxHash: initialConfirmed, StatusURL: statusURL, ClientDataSetID: &clientID,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				checkpoint, err := json.Marshal(map[string]any{
+					"attempted_at": time.Now().UTC().Add(-time.Hour), "client_data_set_id": clientID.String(), "sends": 1,
+					"identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress,
+					"transaction_id": submitted, "confirmed_tx_hash": initialConfirmed, "status_url": statusURL,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewRaw("UPDATE tasks SET checkpoint_json = ?, resume_mode = ? WHERE id = ?", string(checkpoint), model.TaskResumeModeRecover, fixture.ensureTask.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			failed := runOneStorageTask(t, runtime, fixture.ensureTask, model.TaskStatusFailed)
+			current, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
+			if err != nil || current.TxHash == nil || *current.TxHash != submitted || expectedConfirmed == "" && current.ConfirmedTxHash != nil || expectedConfirmed != "" && (current.ConfirmedTxHash == nil || *current.ConfirmedTxHash != expectedConfirmed) || current.DataSetID != nil {
+				t.Fatalf("creation pair after conflicting result=%#v err=%v", current, err)
+			}
+			var recovery struct {
+				TxHash          string `json:"transaction_id"`
+				ConfirmedTxHash string `json:"confirmed_tx_hash"`
+			}
+			if err := json.Unmarshal(failed.Checkpoint, &recovery); err != nil || recovery.TxHash != submitted || recovery.ConfirmedTxHash != expectedConfirmed {
+				t.Fatalf("creation recovery after conflict=%#v err=%v", recovery, err)
+			}
+			if creates.Load() != expectedCreates || failed.FailureReason == nil || *failed.FailureReason != "dataset_identity_mismatch" {
+				t.Fatalf("creation conflict=%#v sends=%d", failed, creates.Load())
+			}
+			for _, diagnostic := range []*string{failed.LastError, current.LastError} {
+				if diagnostic == nil || !strings.Contains(*diagnostic, cause.Error()) || source != "confirmation identity mismatch" && (!strings.Contains(*diagnostic, submitted) || !strings.Contains(*diagnostic, "0xother")) {
+					t.Fatalf("creation conflict diagnostic=%v", diagnostic)
+				}
 			}
 		})
 	}
@@ -296,10 +563,11 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 				targetEnsure = enqueueEnsure(row.TargetDataSetID)
 				if state == "chain rejected" {
 					clientID := testOnChainID(t, 909)
-					if err := runtime.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: row.TargetDataSetID, TransactionID: "0xdead", ClientDataSetID: &clientID}); err != nil {
+					statusURL := "https://provider.example/pdp/data-sets/created/0xdead"
+					if err := runtime.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: row.TargetDataSetID, TxHash: "0xdead", StatusURL: statusURL, ClientDataSetID: &clientID}); err != nil {
 						t.Fatal(err)
 					}
-					checkpoint, err := json.Marshal(map[string]any{"attempted_at": time.Now().UTC().Add(-time.Minute), "client_data_set_id": clientID.String(), "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1, "transaction_id": "0xdead"})
+					checkpoint, err := json.Marshal(map[string]any{"attempted_at": time.Now().UTC().Add(-time.Minute), "client_data_set_id": clientID.String(), "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "sends": 1, "transaction_id": "0xdead", "status_url": statusURL})
 					if err != nil {
 						t.Fatal(err)
 					}

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,8 +28,9 @@ func TestObservationWindowUsesPersistedStageAndPolicy(t *testing.T) {
 	engine := &Engine{registry: registry}
 	now := time.Date(2026, time.October, 19, 1, 0, 0, 0, time.UTC)
 	timeout := errors.New("transaction still has no receipt after the observation window")
+	diagnostic := errors.New("provider returned HTTP 503: eid=receipt-unavailable")
 	managed := WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
-		WithObservationWindow("tx:one", timeout, model.TaskResumeModeExecute)
+		WithObservationWindow("tx:one", timeout, model.TaskResumeModeExecute).WithDiagnostic(diagnostic)
 	for _, tc := range []struct {
 		name      string
 		state     *model.TaskObservation
@@ -55,6 +58,9 @@ func TestObservationWindowUsesPersistedStageAndPolicy(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.wantRetry {
+				if result.diagnostic != nil || !errors.Is(result.err, diagnostic) {
+					t.Fatalf("timeout dropped diagnostic: %#v", result)
+				}
 				if result.kind != resultRetry || result.resumeMode != model.TaskResumeModeExecute || result.failureReason != "observation_window_expired" || result.waitReason != "" || !errors.Is(result.err, timeout) || patch != nil {
 					t.Fatalf("expired result=%#v patch=%#v", result, patch)
 				}
@@ -68,11 +74,13 @@ func TestObservationWindowUsesPersistedStageAndPolicy(t *testing.T) {
 		})
 	}
 	for name, result := range map[string]Result{
-		"ordinary wait":   Wait(model.TaskResumeModeRecover, "waiting", "Waiting", nil).WithObservationWindow("stage", timeout, model.TaskResumeModeRecover),
-		"empty stage":     managed.WithObservationWindow(" ", timeout, model.TaskResumeModeRecover),
-		"missing timeout": managed.WithObservationWindow("stage", nil, model.TaskResumeModeRecover),
-		"invalid mode":    managed.WithObservationWindow("stage", timeout, "invalid"),
-		"terminal result": Complete("Done", nil).WithObservationWindow("stage", timeout, model.TaskResumeModeRecover),
+		"ordinary wait":       Wait(model.TaskResumeModeRecover, "waiting", "Waiting", nil).WithObservationWindow("stage", timeout, model.TaskResumeModeRecover),
+		"empty stage":         managed.WithObservationWindow(" ", timeout, model.TaskResumeModeRecover),
+		"missing timeout":     managed.WithObservationWindow("stage", nil, model.TaskResumeModeRecover),
+		"invalid mode":        managed.WithObservationWindow("stage", timeout, "invalid"),
+		"terminal result":     Complete("Done", nil).WithObservationWindow("stage", timeout, model.TaskResumeModeRecover),
+		"complete diagnostic": Complete("Done", nil).WithDiagnostic(diagnostic),
+		"retry diagnostic":    Retry(timeout, "timeout", nil).WithDiagnostic(diagnostic),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if !errors.Is(validateResult(result, nil), ErrInvalidResult) {
@@ -93,7 +101,8 @@ func TestObservationWindowSettlementAndRetryAreAtomic(t *testing.T) {
 	definition.Policy.ObservationWindow = 5 * time.Minute
 	definition.Policy.ObservationInterval = 30 * time.Second
 	currentResult := WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
-		WithObservationWindow("tx:one", errors.New("receipt was not available within the observation window"), model.TaskResumeModeExecute)
+		WithObservationWindow("tx:one", errors.New("receipt was not available within the observation window"), model.TaskResumeModeExecute).
+		WithDiagnostic(repository.ErrRepositoryContended)
 	run := func(context.Context, Execution) Result { return currentResult }
 	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: run, recover: run}, nil)
 	row := enqueueTestTask(t, h, "observation")
@@ -111,7 +120,7 @@ func TestObservationWindowSettlementAndRetryAreAtomic(t *testing.T) {
 		return stored, runtime
 	}
 	stored, first := load()
-	if first.Observation == nil || stored.RetryCount != 0 {
+	if first.Observation == nil || stored.RetryCount != 0 || dereference(stored.LastError) != repository.ErrRepositoryContended.Error() || dereference(stored.WaitReason) != "confirmation" {
 		t.Fatalf("first wait=%#v runtime=%#v", stored, first)
 	}
 	// Rebuilding the engine exercises the durable clock rather than process memory.
@@ -130,8 +139,8 @@ func TestObservationWindowSettlementAndRetryAreAtomic(t *testing.T) {
 	}
 	currentResult = Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil)
 	h.engine.executeClaim(t.Context(), claim())
-	_, ordinary := load()
-	if !ordinary.Observation.StartedAt.Equal(first.Observation.StartedAt) {
+	stored, ordinary := load()
+	if stored.LastError != nil || !ordinary.Observation.StartedAt.Equal(first.Observation.StartedAt) {
 		t.Fatal("ordinary wait reset observation")
 	}
 	currentResult = WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
@@ -432,53 +441,106 @@ func TestCurrentPolicyPreservesScheduledOpportunity(t *testing.T) {
 func TestTaskContentionPreservesFinalOpportunityAndRecovery(t *testing.T) {
 	for _, cause := range []error{repository.ErrTaskIdentityContended, repository.ErrRepositoryContended} {
 		t.Run(cause.Error(), func(t *testing.T) {
-			limit := 0
-			settled := false
-			h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(context.Context, Execution) Result {
-				return Retry(cause, "temporary", func(context.Context, *repository.Repositories) error {
-					settled = true
-					return nil
+			for _, withEvidence := range []bool{false, true} {
+				t.Run(fmt.Sprintf("evidence=%t", withEvidence), func(t *testing.T) {
+					limit := 0
+					settled := false
+					retryHook := false
+					h := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true), execute: func(_ context.Context, execution Execution) Result {
+						result := Retry(cause, "temporary", func(context.Context, *repository.Repositories) error {
+							settled = true
+							return nil
+						}).WithRetrySettlements(func(context.Context, *repository.Repositories, time.Time) error {
+							retryHook = true
+							return nil
+						}, func(context.Context, *repository.Repositories) error {
+							retryHook = true
+							return nil
+						})
+						if withEvidence {
+							result = result.WithContentionSettlement(func(ctx context.Context, repos *repository.Repositories) error {
+								return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), json.RawMessage(`{"tx_hash":"0xsubmitted"}`))
+							})
+						}
+						return result
+					}}, nil)
+					row := enqueueTestTask(t, h, "contention")
+					before := time.Now()
+					h.engine.executeClaim(t.Context(), claimTestTask(t, h))
+					stored, err := h.repos.Tasks.GetByID(t.Context(), row.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if settled || retryHook || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover || stored.RetryCount != 0 || dereference(stored.WaitReason) != "database_contention" {
+						t.Fatalf("contention consumed or settled a business opportunity: %#v", stored)
+					}
+					if withEvidence {
+						var checkpoint struct {
+							TxHash string `json:"tx_hash"`
+						}
+						if err := json.Unmarshal(stored.Checkpoint, &checkpoint); err != nil {
+							t.Fatal(err)
+						}
+						if checkpoint.TxHash != "0xsubmitted" {
+							t.Fatalf("submitted hash = %q, want 0xsubmitted", checkpoint.TxHash)
+						}
+					}
+					if dereference(stored.LastError) != cause.Error() {
+						t.Fatalf("contention diagnostic = %q, want %q", dereference(stored.LastError), cause.Error())
+					}
+					if stored.AvailableAt.Before(before.Add(h.engine.config.PollInterval)) || stored.AvailableAt.After(time.Now().Add(h.engine.config.PollInterval)) {
+						t.Fatalf("contention wait did not use the poll interval: %s", stored.AvailableAt)
+					}
 				})
-			}}, nil)
-			row := enqueueTestTask(t, h, "contention")
-			before := time.Now()
-			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
-			stored, err := h.repos.Tasks.GetByID(t.Context(), row.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if settled || stored.Status != model.TaskStatusPending || stored.ResumeMode != model.TaskResumeModeRecover || stored.RetryCount != 0 || dereference(stored.WaitReason) != "database_contention" {
-				t.Fatalf("contention consumed or settled a business opportunity: %#v", stored)
-			}
-			if stored.AvailableAt.Before(before.Add(h.engine.config.PollInterval)) || stored.AvailableAt.After(time.Now().Add(h.engine.config.PollInterval)) {
-				t.Fatalf("contention wait did not use the poll interval: %s", stored.AvailableAt)
 			}
 		})
 	}
 }
 
 func TestInvocationTimeoutAllocatesRecoveryButPreservesObservedCompletion(t *testing.T) {
-	for _, completed := range []bool{false, true} {
-		t.Run(map[bool]string{false: "waiting", true: "completed"}[completed], func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		completed bool
+		contended bool
+	}{
+		{name: "waiting"},
+		{name: "completed", completed: true},
+		{name: "contended evidence", contended: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			old := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true)}, nil)
 			row := enqueueTestTask(t, old, "timeout")
 			definition := testDefinition(nil, true)
 			definition.Policy.InvocationTimeout = 10 * time.Millisecond
-			h := newTaskHarnessWithDB(t, old.db, scriptedHandler{definition: definition, execute: func(ctx context.Context, _ Execution) Result {
+			h := newTaskHarnessWithDB(t, old.db, scriptedHandler{definition: definition, execute: func(ctx context.Context, execution Execution) Result {
 				<-ctx.Done()
-				if completed {
+				if tc.completed {
 					return Complete("Done", nil)
 				}
-				return Wait(model.TaskResumeModeRecover, "observing", "Waiting", nil)
+				cause := errors.New("provider response eid=timeout")
+				if tc.contended {
+					cause = errors.Join(cause, repository.ErrRepositoryContended)
+				}
+				return Wait(model.TaskResumeModeRecover, "observing", "Waiting", nil).WithDiagnostic(cause).
+					WithContentionSettlement(func(ctx context.Context, repos *repository.Repositories) error {
+						return repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), json.RawMessage(`{"tx_hash":"0xsubmitted"}`))
+					})
 			}}, nil)
 			h.engine.executeClaim(t.Context(), claimTestTask(t, h))
 			stored, _ := h.repos.Tasks.GetByID(t.Context(), row.ID)
-			if completed {
+			if tc.completed {
 				if stored.Status != model.TaskStatusCompleted || stored.RetryCount != 0 {
 					t.Fatalf("observed completion: %#v", stored)
 				}
+			} else if tc.contended {
+				if stored.Status != model.TaskStatusPending || stored.RetryCount != 0 || dereference(stored.WaitReason) != "database_contention" || !bytes.Contains(stored.Checkpoint, []byte("0xsubmitted")) {
+					t.Fatalf("timeout discarded contended evidence: %#v", stored)
+				}
 			} else if stored.Status != model.TaskStatusPending || stored.RetryCount != 1 || dereference(stored.FailureReason) != "invocation_timeout" {
 				t.Fatalf("timeout recovery: %#v", stored)
+			}
+			if !tc.completed && !strings.Contains(dereference(stored.LastError), "eid=timeout") {
+				t.Fatalf("timeout lost provider diagnostic: %#v", stored)
 			}
 		})
 	}

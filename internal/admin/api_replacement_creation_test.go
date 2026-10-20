@@ -277,7 +277,7 @@ func TestFailedInitializationReplacementDoesNotCheckProviderAbsence(t *testing.T
 				}
 			}
 			if evidence == "transaction" {
-				if err := f.srv.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: f.source.ID, TransactionID: "0xcreate", StatusURL: "https://provider.example/status", ClientDataSetID: new(onChainIDValue("909"))}); err != nil {
+				if err := f.srv.repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: f.source.ID, TxHash: "0xcreate", StatusURL: "https://provider.example/status", ClientDataSetID: new(onChainIDValue("909"))}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -606,7 +606,7 @@ func TestFailedReplacementInitializationCanChangeProvider(t *testing.T) {
 				}
 			case "running parent with transaction":
 				parentStatus = model.TaskStatusRunning
-				if _, err := f.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("create_transaction_id = ?", "transaction-evidence").
+				if _, err := f.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("tx_hash = ?", "transaction-evidence").
 					Set("create_status_url = ?", "https://provider.invalid/status").Where("id = ?", target.ID).Exec(t.Context()); err != nil {
 					t.Fatal(err)
 				}
@@ -649,7 +649,7 @@ func TestFailedReplacementInitializationCanChangeProvider(t *testing.T) {
 			if stored.Status != wantStatus || stored.EnsureTaskID != nil || stored.IsCurrent || stored.ClientDataSetID == nil || !stored.ClientDataSetID.Equal(clientID) {
 				t.Fatalf("old target evidence/fence: %#v", stored)
 			}
-			if scenario == "running parent with transaction" && (stored.CreateTransactionID == nil || *stored.CreateTransactionID != "transaction-evidence" || stored.CreateStatusURL == nil) {
+			if scenario == "running parent with transaction" && (stored.TxHash == nil || *stored.TxHash != "transaction-evidence" || stored.CreateStatusURL == nil) {
 				t.Fatalf("submission evidence lost: %#v", stored)
 			}
 			old, err := f.srv.repos.Replacements.GetByID(t.Context(), row.ID)

@@ -31,6 +31,7 @@ type dataSetWriteReader interface {
 type StorageServiceAdapter struct {
 	service          *storage.Service
 	terminator       storageServiceTerminator
+	terminationChain terminationTransactionReader
 	dataSets         dataSetStateReader
 	writable         dataSetWriteReader
 	identity         storage.ContextIdentity
@@ -287,7 +288,17 @@ func (c *providerTargetAdapter) WaitForDataSetCreated(ctx context.Context, statu
 	defer cancel()
 	status, err := provider.GetDataSetCreationStatus(pollCtx, statusURL)
 	if errors.Is(err, pdp.ErrTxRejected) {
-		return nil, ErrProviderTransactionRejected
+		var result *storage.CreateDataSetResult
+		if status != nil {
+			result = &storage.CreateDataSetResult{}
+			if status.CreateMessageHash != (common.Hash{}) {
+				result.TransactionID = status.CreateMessageHash.Hex()
+			}
+			if status.ConfirmedTxHash != (common.Hash{}) {
+				result.ConfirmedTransactionID = status.ConfirmedTxHash.Hex()
+			}
+		}
+		return result, dataSetCreationRejection(status, err)
 	}
 	if err != nil {
 		return nil, NormalizeProviderOperationError(ctx, err)
@@ -408,4 +419,25 @@ func (s *StorageServiceAdapter) PDPVerifierAddress() common.Address { return s.v
 
 func (c *dataSetTargetAdapter) ContextIdentity() storage.ContextIdentity {
 	return c.dataSet.ContextIdentity()
+}
+
+func dataSetCreationRejection(status *pdp.CreateDataSetStatus, cause error) error {
+	if !errors.Is(cause, ErrProviderTransactionRejected) {
+		cause = errors.Join(ErrProviderTransactionRejected, cause)
+	}
+	if status == nil {
+		return cause
+	}
+	ok, dataSetID, confirmedHash := "unknown", "unknown", "unknown"
+	if status.OK != nil {
+		ok = fmt.Sprint(*status.OK)
+	}
+	if status.DataSetID != nil {
+		dataSetID = status.DataSetID.String()
+	}
+	if status.ConfirmedTxHash != (common.Hash{}) {
+		confirmedHash = status.ConfirmedTxHash.Hex()
+	}
+	return fmt.Errorf("data set creation tx_hash=%s confirmed_tx_hash=%s service=%q tx_status=%q data_set_created=%t ok=%s data_set_id=%s: %w",
+		status.CreateMessageHash.Hex(), confirmedHash, status.Service, status.TxStatus, status.DataSetCreated, ok, dataSetID, cause)
 }

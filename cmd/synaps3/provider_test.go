@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -11,7 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/types"
 )
 
-func TestProviderOutputJSONEncodesIDAsString(t *testing.T) {
+func TestProviderOutputJSONPreservesPartialResultsAndStringIDs(t *testing.T) {
 	id, err := types.ParseOnChainID("provider id", "18446744073709551616")
 	if err != nil {
 		t.Fatalf("ParseOnChainID: %v", err)
@@ -25,8 +27,10 @@ func TestProviderOutputJSONEncodesIDAsString(t *testing.T) {
 	os.Stdout = writeEnd
 	t.Cleanup(func() { os.Stdout = originalStdout })
 
-	if err := outputJSON([]provider.ProviderDetail{{ID: id, Name: "large-id-provider"}}); err != nil {
-		t.Fatalf("outputJSON: %v", err)
+	cause := errors.New("provider 2 lookup failed: RPC overloaded")
+	partial := &provider.PartialListError{Failures: []error{cause}}
+	if err := outputProviderList([]provider.ProviderDetail{{ID: id, Name: "large-id-provider"}}, partial, true); !errors.Is(err, cause) {
+		t.Fatalf("partial result did not return its error: %v", err)
 	}
 	if err := writeEnd.Close(); err != nil {
 		t.Fatalf("close stdout pipe: %v", err)
@@ -40,6 +44,10 @@ func TestProviderOutputJSONEncodesIDAsString(t *testing.T) {
 	}
 
 	out := buf.String()
+	var providers []provider.ProviderDetail
+	if err := json.Unmarshal(buf.Bytes(), &providers); err != nil || len(providers) != 1 {
+		t.Fatalf("partial result JSON = %q, error %v", out, err)
+	}
 	if !strings.Contains(out, `"id": "18446744073709551616"`) {
 		t.Fatalf("provider JSON = %s, want id as decimal string", out)
 	}

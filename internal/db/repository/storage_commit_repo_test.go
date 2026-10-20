@@ -478,13 +478,13 @@ func testCommitConfirmationCommitsMembersByPositionAndReplays(t *testing.T, f co
 	}
 	if err := f.repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
 		CommitSendInput: repository.CommitSendInput{RequestID: "batch", TaskID: taskID, Sends: 1},
-		TransactionID:   "0xtx", StatusURL: "https://provider.example/status/0xtx",
+		TxHash:          "0xtx", StatusURL: "https://provider.example/status/0xtx",
 	}); err != nil {
 		t.Fatalf("RecordCommitSubmission: %v", err)
 	}
 	confirm := func(first string) ([]model.StorageCopy, error) {
 		return f.repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
-			RequestID: "batch", TaskID: taskID, ConfirmedTransactionID: "0xtx", FirstPieceID: onChainID(t, first),
+			RequestID: "batch", TaskID: taskID, ConfirmedTxHash: "0xtx", FirstPieceID: onChainID(t, first),
 			RetrievalURLs: []string{"https://provider.example/piece/first", "https://provider.example/piece/second"},
 		})
 	}

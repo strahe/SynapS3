@@ -225,10 +225,13 @@ func (o *walletOperator) RebroadcastSignedTransaction(ctx context.Context, opera
 type walletTransactionError struct {
 	cause   error
 	message string
+	encoded string
 }
 
 func (e *walletTransactionError) Error() string { return e.message }
 func (e *walletTransactionError) Unwrap() error { return e.cause }
+
+func (e *walletTransactionError) SensitiveErrorValues() []string { return []string{e.encoded} }
 
 func redactSignedTransactionError(err error, raw []byte) error {
 	if err == nil || len(raw) == 0 {
@@ -237,8 +240,5 @@ func redactSignedTransactionError(err error, raw []byte) error {
 	message := err.Error()
 	encoded := hex.EncodeToString(raw)
 	message = regexp.MustCompile("(?i)(0x)?"+encoded).ReplaceAllString(message, "[signed transaction]")
-	if message == err.Error() {
-		return err
-	}
-	return &walletTransactionError{cause: err, message: message}
+	return &walletTransactionError{cause: err, message: message, encoded: encoded}
 }

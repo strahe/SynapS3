@@ -75,6 +75,7 @@ func runtimePersistentModels() []any {
 		(*model.StorageCleanupCopy)(nil),
 		(*storagereplacement.Replacement)(nil),
 		(*storagereplacement.Termination)(nil),
+		(*storagereplacement.TerminationAttempt)(nil),
 		(*storagereplacement.Item)(nil),
 		(*model.WalletOperation)(nil),
 		(*observability.CollectionState)(nil),

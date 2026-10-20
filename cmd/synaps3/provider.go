@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	kfile "github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/provider"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
@@ -69,12 +71,19 @@ func providerListCommand() *cli.Command {
 	}
 }
 
-func runProviderList(ctx context.Context, cmd *cli.Command) error {
+func runProviderList(ctx context.Context, cmd *cli.Command) (resultErr error) {
+	var redactor *errtext.Redactor
+	defer func() {
+		if resultErr != nil && redactor != nil {
+			resultErr = redactor.RedactError(resultErr)
+		}
+	}()
 	rpcURL, network, err := resolveRPCAndNetwork(cmd)
 	if err != nil {
 		return err
 	}
 
+	redactor = errtext.New(rpcURL)
 	_, _ = fmt.Fprintf(os.Stderr, "Querying %s network (%s)...\n", network, maskRPCURL(rpcURL))
 
 	c, err := parseChain(network)
@@ -109,9 +118,11 @@ func runProviderList(ctx context.Context, cmd *cli.Command) error {
 	healthCheck := !cmd.Bool("no-health")
 	healthTimeout := cmd.Duration("timeout")
 
-	providers, err := provider.ListProviders(ctx, reg, opts)
-	if err != nil {
-		return fmt.Errorf("listing providers: %w", err)
+	providers, listErr := provider.ListProviders(ctx, reg, opts)
+	if listErr != nil {
+		if _, ok := errors.AsType[*provider.PartialListError](listErr); !ok {
+			return fmt.Errorf("could not list providers: %w", listErr)
+		}
 	}
 
 	if healthCheck {
@@ -119,10 +130,23 @@ func runProviderList(ctx context.Context, cmd *cli.Command) error {
 		provider.CheckHealthBatch(ctx, providers, healthTimeout)
 	}
 
-	if cmd.Bool("json") {
-		return outputJSON(providers)
+	return outputProviderList(providers, listErr, cmd.Bool("json"))
+}
+
+func outputProviderList(providers []provider.ProviderDetail, listErr error, asJSON bool) error {
+	var err error
+	if asJSON {
+		err = outputJSON(providers)
+	} else {
+		err = outputTable(providers)
 	}
-	return outputTable(providers)
+	if err != nil {
+		return errors.Join(listErr, err)
+	}
+	if listErr != nil {
+		return fmt.Errorf("could not list all providers: %w", listErr)
+	}
+	return nil
 }
 
 // resolveRPCAndNetwork determines the RPC URL and network from CLI flags and config.

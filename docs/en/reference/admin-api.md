@@ -160,6 +160,10 @@ The candidate list (`replacement/providers`) includes every storage provider wit
 
 Data set entries in bucket responses include `replaceable`, `replacement_blocked_reason`, and `setup_error`. A replica can be replaced when its data set is ready or its setup task has failed.
 
+Replacement `source.termination` and `target.termination` include the latest transaction hashes, end `epoch`, and an `attempts` array of termination attempts. Each attempt's `receipt_status` is `0` for failed, `1` for succeeded, or `null` when unknown; `confirmed_tx_hash` identifies a mined transaction and does not imply successful execution.
+
+After a failed termination receipt, Retry checks the service and may submit a new paid transaction if it is still active. When the outcome is unknown, Retry only checks the recorded attempt.
+
 #### Replacement Status
 
 | `status` | Meaning |
@@ -197,7 +201,7 @@ To retry, pass `retry_task_id` to `POST /api/v1/tasks/{id}/retry`. The retry con
 | `POST` | `/api/v1/commit-batches/{id}/seal` | Request early submission of the next batch (**Submit next batch**). Empty body. |
 | `GET` | `/api/v1/storage-confirmations` | Batches that need attention. Accepts `status=needs_attention` and `limit`. |
 
-Each entry from `storage-confirmations` has `request_id`, `task_id`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, `transaction_id`, `submit_error` (the storage provider's reply), `reason_code`, `submitted_at`, and `attention_at`. A batch appears here when the storage provider rejected it or it is still unconfirmed 15 minutes after submission. Retry it with `POST /api/v1/tasks/{task_id}/retry`.
+Each entry from `storage-confirmations` has `request_id`, `task_id`, `provider_id`, `data_set_id`, `piece_count`, `piece_cids`, `tx_hash`, `confirmed_tx_hash`, `submit_error` (the storage provider's reply), `reason_code`, `submitted_at`, and `attention_at`. The `storage-confirmations` and `commit-batches` responses use `tx_hash` for the submitted transaction and `confirmed_tx_hash` for the transaction confirmed on chain; unknown hashes are `null`. A batch appears in `storage-confirmations` when the storage provider rejected it or it is still unconfirmed 15 minutes after submission. Retry it with `POST /api/v1/tasks/{task_id}/retry`.
 
 ### Tasks
 

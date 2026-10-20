@@ -612,126 +612,235 @@ func (r *BunStorageReplacementRepo) BeginRetirement(ctx context.Context, replace
 		func(q *bun.UpdateQuery) *bun.UpdateQuery { return q.Set("wait_reason = NULL") })
 }
 
-// RecordTerminationEpoch persists the end of term before the remote service is
-// treated as terminated, so a crash in between re-reads it instead of
-// terminating a second time.
-func (r *BunStorageReplacementRepo) RecordTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error {
-	if input.ReplacementID <= 0 {
-		return fmt.Errorf("recording replacement termination epoch: %w", ErrInvalidInput)
+// BeginTerminationAttempt admits one request for the current retirement owner.
+// A new attempt requires a reverted predecessor; repeating its admission is inert.
+func (r *BunStorageReplacementRepo) BeginTerminationAttempt(ctx context.Context, input BeginTerminationAttemptInput) error {
+	if input.AttemptNo <= 0 || input.PreviousAttemptNo < 0 || input.AttemptedAt.IsZero() {
+		return fmt.Errorf("admitting termination attempt: %w", ErrInvalidInput)
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		row, err := selectReplacementForTermination(ctx, db, input.ReplacementID,
-			storagereplacement.StatusRetiring,
-			storagereplacement.StatusWaiting,
-			storagereplacement.StatusCleanupAttention)
+		termination, err := authorizeTerminationEvidence(ctx, db, RecordTerminationEvidenceInput{
+			ReplacementID: input.ReplacementID, DataSetID: input.DataSetID, Generation: input.Generation,
+			TaskID: input.TaskID, Role: input.Role,
+		})
 		if err != nil {
-			return fmt.Errorf("recording replacement termination epoch: %w", err)
+			return err
 		}
-		termination := &storagereplacement.Termination{
-			ReplacementID:   row.ID,
-			Role:            storagereplacement.TerminationRoleSource,
-			SourceDataSetID: &row.SourceDataSetID,
-			TxHash:          nullableString(input.TxHash),
-			Epoch:           input.Epoch,
+		if termination.Epoch != nil {
+			return ErrConflict
 		}
-		if _, err := db.NewInsert().Model(termination).Exec(ctx); err != nil {
-			if isUniqueViolation(err) {
-				return fmt.Errorf("recording replacement termination epoch: %w", ErrConflict)
+		previous, err := latestTerminationAttempt(ctx, db, termination.ID)
+		if err != nil {
+			return err
+		}
+		if previous != nil && previous.AttemptNo == input.AttemptNo {
+			if previous.TaskID == nil || *previous.TaskID != input.TaskID {
+				return ErrConflict
 			}
-			return fmt.Errorf("recording replacement termination epoch: %w", err)
+			return nil
 		}
-		return nil
+		if previous == nil {
+			if input.AttemptNo != 1 || input.PreviousAttemptNo != 0 {
+				return ErrConflict
+			}
+		} else if input.PreviousAttemptNo != previous.AttemptNo || input.AttemptNo != previous.AttemptNo+1 ||
+			previous.ReceiptStatus == nil || *previous.ReceiptStatus != 0 ||
+			(previous.TaskID != nil && *previous.TaskID == input.TaskID) {
+			return ErrConflict
+		}
+		attempt := &storagereplacement.TerminationAttempt{
+			TerminationID: termination.ID, AttemptNo: input.AttemptNo,
+			TaskID: &input.TaskID, AttemptedAt: &input.AttemptedAt,
+		}
+		_, err = db.NewInsert().Model(attempt).Exec(ctx)
+		return err
 	})
 }
 
-// RecordAbandonedTerminationEpoch persists termination of a superseded target
-// before waiting for its end epoch. A restarted worker observes this value
-// instead of paying for another termination transaction.
-func (r *BunStorageReplacementRepo) RecordAbandonedTerminationEpoch(
-	ctx context.Context,
-	input RecordTerminationEpochInput,
-) error {
-	if input.ReplacementID <= 0 || input.Epoch < 0 {
-		return fmt.Errorf("recording abandoned target termination epoch: %w", ErrInvalidInput)
+// RecordTerminationEvidence preserves each attempt's immutable transaction pair
+// and receipt outcome. The service epoch is independent of any failed attempt.
+func (r *BunStorageReplacementRepo) RecordTerminationEvidence(ctx context.Context, input RecordTerminationEvidenceInput) error {
+	if input.AttemptNo < 0 || (input.AttemptNo == 0 && input.TxHash == "" && input.ConfirmedTxHash == "" && input.ReceiptStatus == nil && input.Epoch == nil) ||
+		(input.Epoch != nil && *input.Epoch < 0) || (input.ReceiptStatus != nil && *input.ReceiptStatus > 1) {
+		return fmt.Errorf("recording termination evidence: %w", ErrInvalidInput)
 	}
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		row, err := selectReplacementForTermination(ctx, db, input.ReplacementID, storagereplacement.StatusSuperseded)
+		termination, err := authorizeTerminationEvidence(ctx, db, input)
 		if err != nil {
-			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+			return err
 		}
-		termination := &storagereplacement.Termination{
-			ReplacementID:            row.ID,
-			Role:                     storagereplacement.TerminationRoleAbandonedTarget,
-			AbandonedTargetDataSetID: &row.TargetDataSetID,
-			TxHash:                   nullableString(input.TxHash),
-			Epoch:                    input.Epoch,
+		if termination.Epoch != nil && input.Epoch != nil && *termination.Epoch != *input.Epoch {
+			return fmt.Errorf("termination epoch conflicts with the recorded result: %w", ErrConflict)
 		}
-		result, err := db.NewInsert().Model(termination).
-			On("CONFLICT (replacement_id, role) DO NOTHING").Exec(ctx)
+		attempt, err := latestTerminationAttempt(ctx, db, termination.ID)
 		if err != nil {
-			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+			return err
 		}
-		inserted, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("reading abandoned target termination insertion: %w", err)
+		hasTransaction := input.TxHash != "" || input.ConfirmedTxHash != "" || input.ReceiptStatus != nil
+		if input.AttemptNo > 0 && (attempt == nil || input.AttemptNo != attempt.AttemptNo) {
+			return ErrConflict
 		}
-		if inserted == 1 {
+		if hasTransaction {
+			if attempt == nil {
+				// An observed transaction without admission metadata is retained as
+				// evidence without attributing its submission to the observing task.
+				attempt = &storagereplacement.TerminationAttempt{TerminationID: termination.ID, AttemptNo: 1}
+			}
+			if err := mergeTerminationAttempt(ctx, db, attempt, input); err != nil {
+				return err
+			}
+		}
+		if input.Epoch == nil || termination.Epoch != nil {
 			return nil
 		}
-		// A crash after the transaction was paid for replays with the same
-		// epoch; anything else is a genuine conflict.
-		existing := new(storagereplacement.Termination)
-		if err := db.NewSelect().Model(existing).
-			Where("replacement_id = ? AND role = ?", row.ID, storagereplacement.TerminationRoleAbandonedTarget).
-			Scan(ctx); err != nil {
-			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
-		}
-		if existing.Epoch == input.Epoch {
-			return nil
-		}
-		return fmt.Errorf("recording abandoned target termination epoch: %w", ErrConflict)
+		_, err = db.NewUpdate().Model((*storagereplacement.Termination)(nil)).
+			Set("epoch = ?", input.Epoch).Set("updated_at = ?", time.Now().UTC()).Where("id = ?", termination.ID).Exec(ctx)
+		return err
 	})
 }
 
-// selectReplacementForTermination reads the replacement a termination is about
-// to be recorded against, refusing any status that has no term to end.
-func selectReplacementForTermination(
-	ctx context.Context,
-	db bun.IDB,
-	replacementID int64,
-	statuses ...storagereplacement.Status,
-) (*storagereplacement.Replacement, error) {
-	row := new(storagereplacement.Replacement)
-	err := db.NewSelect().
-		Model(row).
-		Where("id = ?", replacementID).
-		Where("status IN (?)", bun.List(statuses)).
-		Scan(ctx)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrConflict
+func authorizeTerminationEvidence(ctx context.Context, db bun.IDB, input RecordTerminationEvidenceInput) (*storagereplacement.Termination, error) {
+	if input.ReplacementID <= 0 || input.DataSetID <= 0 || input.Generation <= 0 || input.TaskID <= 0 {
+		return nil, fmt.Errorf("authorizing termination evidence: %w", ErrInvalidInput)
 	}
+	row, err := lockReplacementByID(ctx, db, input.ReplacementID)
 	if err != nil {
 		return nil, err
 	}
-	return row, nil
+	var sourceID, abandonedID *int64
+	switch input.Role {
+	case storagereplacement.TerminationRoleSource:
+		if input.DataSetID != row.SourceDataSetID || (row.Status != storagereplacement.StatusRetiring && row.Status != storagereplacement.StatusWaiting && row.Status != storagereplacement.StatusCleanupAttention) {
+			return nil, ErrConflict
+		}
+		sourceID = &row.SourceDataSetID
+	case storagereplacement.TerminationRoleAbandonedTarget:
+		if input.DataSetID != row.TargetDataSetID || row.Status != storagereplacement.StatusSuperseded {
+			return nil, ErrConflict
+		}
+		abandonedID = &row.TargetDataSetID
+	default:
+		return nil, ErrInvalidInput
+	}
+	if err := lockReplacementDataSets(ctx, db, input.DataSetID); err != nil {
+		return nil, err
+	}
+	if _, err := (&BunStorageContentRepo{db: db}).AuthorizeDataSetRetirementTask(ctx, input.DataSetID, input.Generation, input.TaskID); err != nil {
+		return nil, err
+	}
+	termination := new(storagereplacement.Termination)
+	err = db.NewSelect().Model(termination).Where("replacement_id = ? AND role = ?", input.ReplacementID, input.Role).For("NO KEY UPDATE").Scan(ctx)
+	if err == nil {
+		return termination, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	termination.ReplacementID, termination.Role = input.ReplacementID, input.Role
+	termination.SourceDataSetID, termination.AbandonedTargetDataSetID = sourceID, abandonedID
+	_, err = db.NewInsert().Model(termination).Returning("id").Exec(ctx)
+	return termination, err
 }
 
-// withReplacementTerminations projects the end of term recorded for each of a
-// replacement's two data sets. The rows live in storage_data_set_terminations,
-// so a replacement carries no repeated column group of its own.
+func latestTerminationAttempt(ctx context.Context, db bun.IDB, terminationID int64) (*storagereplacement.TerminationAttempt, error) {
+	attempt := new(storagereplacement.TerminationAttempt)
+	err := db.NewSelect().Model(attempt).ColumnExpr("storage_data_set_termination_attempt.*").
+		Where("termination_id = ?", terminationID).OrderExpr("attempt_no DESC").Limit(1).For("NO KEY UPDATE").Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return attempt, err
+}
+
+func mergeTerminationAttempt(ctx context.Context, db bun.IDB, attempt *storagereplacement.TerminationAttempt, input RecordTerminationEvidenceInput) error {
+	if (attempt.TxHash != nil && input.TxHash != "" && *attempt.TxHash != input.TxHash) ||
+		(attempt.ConfirmedTxHash != nil && input.ConfirmedTxHash != "" && *attempt.ConfirmedTxHash != input.ConfirmedTxHash) ||
+		(attempt.ReceiptStatus != nil && input.ReceiptStatus != nil && *attempt.ReceiptStatus != *input.ReceiptStatus) {
+		return fmt.Errorf("termination attempt evidence conflicts with the recorded result: %w", ErrConflict)
+	}
+	var hashes []string
+	if input.TxHash != "" {
+		hashes = append(hashes, input.TxHash)
+	}
+	if input.ConfirmedTxHash != "" {
+		hashes = append(hashes, input.ConfirmedTxHash)
+	}
+	if len(hashes) > 0 {
+		reused, err := db.NewSelect().Model((*storagereplacement.TerminationAttempt)(nil)).
+			Where("termination_id = ? AND id <> ?", attempt.TerminationID, attempt.ID).
+			Where("(tx_hash IN (?) OR confirmed_tx_hash IN (?))", bun.List(hashes), bun.List(hashes)).Exists(ctx)
+		if err != nil {
+			return err
+		}
+		if reused {
+			return fmt.Errorf("termination transaction belongs to another attempt: %w", ErrConflict)
+		}
+	}
+	changed := false
+	if attempt.TxHash == nil && input.TxHash != "" {
+		attempt.TxHash, changed = &input.TxHash, true
+	}
+	if attempt.ConfirmedTxHash == nil && input.ConfirmedTxHash != "" {
+		attempt.ConfirmedTxHash, changed = &input.ConfirmedTxHash, true
+	}
+	if input.ReceiptStatus != nil && attempt.ConfirmedTxHash == nil {
+		return fmt.Errorf("termination receipt has no confirmed transaction hash: %w", ErrInvalidInput)
+	}
+	if attempt.ReceiptStatus == nil && input.ReceiptStatus != nil {
+		attempt.ReceiptStatus, changed = input.ReceiptStatus, true
+	}
+	if attempt.ID == 0 {
+		_, err := db.NewInsert().Model(attempt).Exec(ctx)
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	_, err := db.NewUpdate().Model((*storagereplacement.TerminationAttempt)(nil)).
+		Set("tx_hash = ?", attempt.TxHash).Set("confirmed_tx_hash = ?", attempt.ConfirmedTxHash).
+		Set("receipt_status = ?", attempt.ReceiptStatus).Set("updated_at = ?", time.Now().UTC()).Where("id = ?", attempt.ID).Exec(ctx)
+	return err
+}
+
+func (r *BunStorageReplacementRepo) ListTerminationAttempts(ctx context.Context, replacementIDs []int64) ([]storagereplacement.TerminationAttempt, error) {
+	attempts := make([]storagereplacement.TerminationAttempt, 0)
+	if len(replacementIDs) == 0 {
+		return attempts, nil
+	}
+	err := r.db.NewSelect().Model(&attempts).ColumnExpr("storage_data_set_termination_attempt.*").
+		ColumnExpr("termination.replacement_id").ColumnExpr("termination.role").
+		Join("JOIN storage_data_set_terminations AS termination ON termination.id = storage_data_set_termination_attempt.termination_id").
+		Where("termination.replacement_id IN (?)", bun.List(replacementIDs)).
+		OrderExpr("termination.replacement_id, termination.role, storage_data_set_termination_attempt.attempt_no").Scan(ctx)
+	return attempts, err
+}
+
+// withReplacementTerminations projects the service epoch and latest attempt.
 func withReplacementTerminations(q *bun.SelectQuery) *bun.SelectQuery {
 	return q.
 		ColumnExpr("storage_replacement.*").
-		ColumnExpr("source_termination.tx_hash AS termination_tx_hash").
+		ColumnExpr("COALESCE(source_attempt.attempt_no, 0) AS termination_attempt_no").
+		ColumnExpr("source_attempt.tx_hash AS termination_tx_hash").
+		ColumnExpr("source_attempt.confirmed_tx_hash AS termination_confirmed_tx_hash").
+		ColumnExpr("source_attempt.receipt_status AS termination_receipt_status").
 		ColumnExpr("source_termination.epoch AS termination_epoch").
-		ColumnExpr("abandoned_termination.tx_hash AS abandoned_termination_tx_hash").
+		ColumnExpr("COALESCE(abandoned_attempt.attempt_no, 0) AS abandoned_termination_attempt_no").
+		ColumnExpr("abandoned_attempt.tx_hash AS abandoned_termination_tx_hash").
+		ColumnExpr("abandoned_attempt.confirmed_tx_hash AS abandoned_termination_confirmed_tx_hash").
+		ColumnExpr("abandoned_attempt.receipt_status AS abandoned_termination_receipt_status").
 		ColumnExpr("abandoned_termination.epoch AS abandoned_termination_epoch").
 		Join("LEFT JOIN storage_data_set_terminations AS source_termination"+
 			" ON source_termination.replacement_id = storage_replacement.id AND source_termination.role = ?",
 			storagereplacement.TerminationRoleSource).
+		Join("LEFT JOIN LATERAL (SELECT attempt_no, tx_hash, confirmed_tx_hash, receipt_status"+
+			" FROM storage_data_set_termination_attempts WHERE termination_id = source_termination.id"+
+			" ORDER BY attempt_no DESC LIMIT 1) AS source_attempt ON TRUE").
 		Join("LEFT JOIN storage_data_set_terminations AS abandoned_termination"+
 			" ON abandoned_termination.replacement_id = storage_replacement.id AND abandoned_termination.role = ?",
-			storagereplacement.TerminationRoleAbandonedTarget)
+			storagereplacement.TerminationRoleAbandonedTarget).
+		Join("LEFT JOIN LATERAL (SELECT attempt_no, tx_hash, confirmed_tx_hash, receipt_status" +
+			" FROM storage_data_set_termination_attempts WHERE termination_id = abandoned_termination.id" +
+			" ORDER BY attempt_no DESC LIMIT 1) AS abandoned_attempt ON TRUE")
 }
 
 func (r *BunStorageReplacementRepo) GetByID(ctx context.Context, id int64) (*storagereplacement.Replacement, error) {
@@ -924,24 +1033,33 @@ func lockReplacementByID(ctx context.Context, db bun.IDB, replacementID int64) (
 	return row, nil
 }
 
-// loadReplacementTerminations fills in the termination projection for a
-// replacement read without the join.
+// loadReplacementTerminations fills the same projection for locked replacements.
 func loadReplacementTerminations(ctx context.Context, db bun.IDB, row *storagereplacement.Replacement) error {
-	var terminations []storagereplacement.Termination
-	if err := db.NewSelect().
-		Model(&terminations).
-		Where("replacement_id = ?", row.ID).
-		Scan(ctx); err != nil {
+	var terminations []struct {
+		Role            storagereplacement.TerminationRole
+		Epoch           *int64
+		AttemptNo       int64
+		TxHash          *string
+		ConfirmedTxHash *string
+		ReceiptStatus   *uint64
+	}
+	if err := db.NewSelect().TableExpr("storage_data_set_terminations AS termination").
+		ColumnExpr("termination.role, termination.epoch, COALESCE(attempt.attempt_no, 0) AS attempt_no").
+		ColumnExpr("attempt.tx_hash, attempt.confirmed_tx_hash, attempt.receipt_status").
+		Join("LEFT JOIN LATERAL (SELECT attempt_no, tx_hash, confirmed_tx_hash, receipt_status"+
+			" FROM storage_data_set_termination_attempts WHERE termination_id = termination.id"+
+			" ORDER BY attempt_no DESC LIMIT 1) AS attempt ON TRUE").
+		Where("termination.replacement_id = ?", row.ID).Scan(ctx, &terminations); err != nil {
 		return fmt.Errorf("loading provider replacement terminations: %w", err)
 	}
-	for i := range terminations {
-		termination := &terminations[i]
-		epoch := termination.Epoch
+	for _, termination := range terminations {
 		switch termination.Role {
 		case storagereplacement.TerminationRoleSource:
-			row.TerminationTxHash, row.TerminationEpoch = termination.TxHash, &epoch
+			row.TerminationAttemptNo, row.TerminationReceiptStatus = termination.AttemptNo, termination.ReceiptStatus
+			row.TerminationTxHash, row.TerminationConfirmedTxHash, row.TerminationEpoch = termination.TxHash, termination.ConfirmedTxHash, termination.Epoch
 		case storagereplacement.TerminationRoleAbandonedTarget:
-			row.AbandonedTerminationTxHash, row.AbandonedTerminationEpoch = termination.TxHash, &epoch
+			row.AbandonedTerminationAttemptNo, row.AbandonedTerminationReceiptStatus = termination.AttemptNo, termination.ReceiptStatus
+			row.AbandonedTerminationTxHash, row.AbandonedTerminationConfirmedTxHash, row.AbandonedTerminationEpoch = termination.TxHash, termination.ConfirmedTxHash, termination.Epoch
 		}
 	}
 	return nil
