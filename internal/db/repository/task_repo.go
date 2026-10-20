@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -290,11 +291,16 @@ func (r *BunTaskRepo) ValidateClaim(ctx context.Context, id, generation int64) e
 }
 
 func validTaskTransition(transition TaskTransition) bool {
+	if patch := transition.Observation; patch != nil && patch.State != nil && (strings.TrimSpace(patch.State.Key) == "" || patch.State.StartedAt.IsZero()) {
+		return false
+	}
 	switch transition.Status {
 	case model.TaskStatusPending:
 		return !transition.AvailableAt.IsZero() && (transition.ResumeMode == model.TaskResumeModeExecute || transition.ResumeMode == model.TaskResumeModeRecover)
 	case model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled:
 		return transition.ResumeMode == model.TaskResumeModeExecute || transition.ResumeMode == model.TaskResumeModeRecover
+	case model.TaskStatusRunning:
+		return false
 	default:
 		return false
 	}

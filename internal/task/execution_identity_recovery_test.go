@@ -113,7 +113,10 @@ func TestAcceptedWalletRequestRecoveryKeepsUnsentIdentityInInput(t *testing.T) {
 			var broadcasts atomic.Int64
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{wallet: testWalletOperator{
 				identity: identity,
-				fund:     func(context.Context, *big.Int) (string, error) { broadcasts.Add(1); return "", nil },
+				fund: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+					broadcasts.Add(1)
+					return synapse.WalletSubmission{}, nil
+				},
 			}})
 			operation, row := seedWalletTask(t, runtime, "accepted-before-restart")
 			var input walletoperation.Input

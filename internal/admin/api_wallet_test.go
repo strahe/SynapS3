@@ -110,12 +110,14 @@ func TestHandleAPIWalletOperation_RejectsUnsafeOrInvalidRequests(t *testing.T) {
 		body        string
 		contentType string
 		wantStatus  int
+		wantError   string
 	}{
 		{name: "non json", body: `{"client_request_id":"a","amount":"1"}`, contentType: "text/plain", wantStatus: http.StatusBadRequest},
 		{name: "empty amount", body: `{"client_request_id":"a","amount":""}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
 		{name: "zero amount", body: `{"client_request_id":"a","amount":"0"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
 		{name: "negative amount", body: `{"client_request_id":"a","amount":"-1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
 		{name: "decimal amount", body: `{"client_request_id":"a","amount":"1.1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "amount overflow", body: `{"client_request_id":"a","amount":"115792089237316195423570985008687907853269984665640564039457584007913129639936"}`, contentType: "application/json", wantStatus: http.StatusBadRequest, wantError: "amount is too large"},
 	}
 
 	for _, op := range walletOperationAPIHandlers() {
@@ -131,6 +133,12 @@ func TestHandleAPIWalletOperation_RejectsUnsafeOrInvalidRequests(t *testing.T) {
 					op.handler(srv, rr, req)
 					if rr.Code != tt.wantStatus {
 						t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+					}
+					if tt.wantError != "" {
+						var body map[string]string
+						if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil || body["error"] != tt.wantError {
+							t.Fatalf("error response = %s, want %q: %v", rr.Body.String(), tt.wantError, err)
+						}
 					}
 				})
 			}
@@ -158,16 +166,20 @@ func TestHandleAPIWalletOperation_IsIdempotentByClientRequestID(t *testing.T) {
 				return resp.Operation, rr.Code
 			}
 
-			first, status := create(t, "100")
+			const maximum = "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+			first, status := create(t, maximum)
 			if status != http.StatusAccepted {
 				t.Fatalf("first status = %d, want 202", status)
 			}
-			second, status := create(t, "100")
+			second, status := create(t, maximum)
 			if status != http.StatusAccepted {
 				t.Fatalf("second status = %d, want 202", status)
 			}
 			if first.ID == 0 || second.ID != first.ID {
 				t.Fatalf("idempotent ID = %d then %d, want same non-zero ID", first.ID, second.ID)
+			}
+			if first.Amount != maximum || second.Amount != maximum {
+				t.Fatalf("amount = %q then %q, want maximum", first.Amount, second.Amount)
 			}
 			if first.Type != string(op.operationType) || second.Type != string(op.operationType) {
 				t.Fatalf("operation types = %q then %q, want %q", first.Type, second.Type, op.operationType)

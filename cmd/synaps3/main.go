@@ -329,7 +329,6 @@ func runServe(ctx context.Context, src config.Source) error {
 	}
 	storageClient := synapse.AdaptStorageService(client.Storage(), client.WarmStorage(), storageIdentity)
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain(), resolvedAddresses)
-	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC, walletoperation.NewExecutionIdentity(storageIdentity, resolvedAddresses.Payments, resolvedAddresses.USDFC))
 	filecoinReadiness := synapse.NewReadinessChecker(
 		synapse.ReadinessConfigFromFilecoinConfig(cfg.Filecoin),
 		synapse.AdaptReadinessClient(client),
@@ -341,6 +340,8 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
 	}
 	defer walletReceiptClient.Close()
+	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC,
+		walletoperation.NewExecutionIdentity(storageIdentity, resolvedAddresses.Payments, resolvedAddresses.USDFC), walletReceiptClient)
 	approvedCatalog, err := synapse.NewApprovedProviderCatalog(walletReceiptClient, client.WarmStorage().ViewAddress())
 	if err != nil {
 		return fmt.Errorf("configuring approved provider catalog: %w", err)

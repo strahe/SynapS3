@@ -531,6 +531,9 @@ func parseUSDFCAmount(raw string) (*big.Int, error) {
 	if amount.Sign() <= 0 {
 		return nil, fmt.Errorf("amount must be greater than 0")
 	}
+	if amount.BitLen() > 256 {
+		return nil, fmt.Errorf("amount is too large")
+	}
 	return amount, nil
 }
 
@@ -577,15 +580,12 @@ func runWalletDeposit(ctx context.Context, cfg *config.Config, amount *big.Int, 
 	defer func() { _ = client.Close() }()
 
 	res, err := client.Payments().FundSync(ctx, amount, payments.WithWait(timeout))
-	result := walletDepositResult{}
+	submission, err := synapse.WalletSubmissionFromWriteResult(res, err, "depositing USDFC")
+	result := walletDepositResult{TxHash: submission.TxHash}
 	if res != nil {
-		result.TxHash = res.Hash.Hex()
 		result.Confirmed = res.Receipt != nil && res.Receipt.Status == 1
 	}
-	if err != nil {
-		return result, fmt.Errorf("depositing USDFC: %w", err)
-	}
-	return result, nil
+	return result, err
 }
 
 func runWalletApprove(ctx context.Context, cfg *config.Config, timeout time.Duration) (walletApproveResult, error) {
@@ -607,14 +607,12 @@ func runWalletApprove(ctx context.Context, cfg *config.Config, timeout time.Dura
 		result.AlreadyApproved = true
 		return result, nil
 	}
+	submission, err := synapse.WalletSubmissionFromWriteResult(res, err, "approving FWSS")
+	result.TxHash = submission.TxHash
 	if res != nil {
-		result.TxHash = res.Hash.Hex()
 		result.Confirmed = res.Receipt != nil && res.Receipt.Status == 1
 	}
-	if err != nil {
-		return result, fmt.Errorf("approving FWSS: %w", err)
-	}
-	return result, nil
+	return result, err
 }
 
 func writeWalletDepositResult(cmd *cli.Command, result walletDepositResult) error {

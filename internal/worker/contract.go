@@ -229,18 +229,32 @@ type Settlement func(context.Context, *repository.Repositories) error
 
 // Result is a closed set constructed through the helpers below.
 type Result struct {
-	kind            ResultKind
-	waitUntil       *time.Time
-	observationWait bool
-	resumeMode      model.TaskResumeMode
-	waitReason      string
-	failureReason   string
-	err             error
-	message         string
-	settlement      Settlement
-	onRetry         RetrySettlement
-	onExhausted     Settlement
-	workStartedAt   *time.Time
+	kind              ResultKind
+	waitUntil         *time.Time
+	observationWait   bool
+	observationWindow *observationWindow
+	resumeMode        model.TaskResumeMode
+	waitReason        string
+	failureReason     string
+	err               error
+	message           string
+	settlement        Settlement
+	onRetry           RetrySettlement
+	onExhausted       Settlement
+	workStartedAt     *time.Time
+}
+
+type observationWindow struct {
+	stageKey         string
+	timeoutErr       error
+	timeoutRetryMode model.TaskResumeMode
+}
+
+// WithObservationWindow lets the engine retry an observation stage when its
+// policy window expires. The same stage retains its start across claims.
+func (r Result) WithObservationWindow(stageKey string, timeoutErr error, timeoutRetryMode model.TaskResumeMode) Result {
+	r.observationWindow = &observationWindow{stageKey: stageKey, timeoutErr: timeoutErr, timeoutRetryMode: timeoutRetryMode}
+	return r
 }
 
 // WithWorkStartedAt carries observed operation timing into fenced settlement.

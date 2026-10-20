@@ -111,11 +111,18 @@ type Task struct {
 	SupersededAt    *time.Time `bun:",nullzero"`
 }
 
-// TaskRuntime is durable admission evidence, independent of diagnostic events.
+// TaskRuntime holds durable engine state, independent of diagnostic events.
 type TaskRuntime struct {
-	OperationKey        string     `json:"operation_key,omitempty"`
-	OperationStartedAt  *time.Time `json:"operation_started_at,omitempty"`
-	LastAdmittedAttempt int        `json:"last_admitted_attempt,omitempty"`
+	OperationKey        string           `json:"operation_key,omitempty"`
+	OperationStartedAt  *time.Time       `json:"operation_started_at,omitempty"`
+	LastAdmittedAttempt int              `json:"last_admitted_attempt,omitempty"`
+	Observation         *TaskObservation `json:"observation,omitempty"`
+}
+
+// TaskObservation identifies one policy-managed observation window.
+type TaskObservation struct {
+	Key       string    `json:"key"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 // TaskEvent is a diagnostic entry of one task round. Its ID orders the

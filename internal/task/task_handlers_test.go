@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
@@ -229,22 +231,34 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 
 type testWalletOperator struct {
 	identity walletoperation.ExecutionIdentity
-	fund     func(context.Context, *big.Int) (string, error)
+	fund     func(context.Context, *big.Int) (synapse.WalletSubmission, error)
+	withdraw func(context.Context, *big.Int) (synapse.WalletSubmission, error)
+	replay   func(context.Context, model.WalletOperationType, *big.Int, synapse.WalletSubmission) error
 }
 
-func (o testWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string, error) {
+func (o testWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (synapse.WalletSubmission, error) {
 	if o.fund == nil {
-		return "", errors.New("unexpected fund request")
+		return synapse.WalletSubmission{}, errors.New("unexpected fund request")
 	}
 	return o.fund(ctx, amount)
 }
 
-func (testWalletOperator) WithdrawUSDFC(context.Context, *big.Int) (string, error) {
-	return "", errors.New("unexpected withdraw request")
+func (o testWalletOperator) WithdrawUSDFC(ctx context.Context, amount *big.Int) (synapse.WalletSubmission, error) {
+	if o.withdraw != nil {
+		return o.withdraw(ctx, amount)
+	}
+	return synapse.WalletSubmission{}, errors.New("unexpected withdraw request")
 }
 
-func (testWalletOperator) ApproveFWSS(context.Context) (string, error) {
-	return "", errors.New("unexpected approval request")
+func (testWalletOperator) ApproveFWSS(context.Context) (synapse.WalletSubmission, error) {
+	return synapse.WalletSubmission{}, errors.New("unexpected approval request")
+}
+
+func (o testWalletOperator) RebroadcastSignedTransaction(ctx context.Context, operationType model.WalletOperationType, amount *big.Int, submission synapse.WalletSubmission, _ time.Duration) error {
+	if o.replay == nil {
+		return errors.New("unexpected wallet replay")
+	}
+	return o.replay(ctx, operationType, amount, submission)
 }
 
 type testReceiptChecker struct {
@@ -4199,19 +4213,19 @@ func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 	var broadcasts, observations atomic.Int64
 	transactionHash := "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		wallet: testWalletOperator{fund: func(_ context.Context, amount *big.Int) (string, error) {
+		wallet: testWalletOperator{fund: func(_ context.Context, amount *big.Int) (synapse.WalletSubmission, error) {
 			broadcasts.Add(1)
 			if amount.String() != "100" {
 				t.Fatalf("wallet amount = %s, want 100", amount)
 			}
-			return transactionHash, nil
+			return synapse.WalletSubmission{TxHash: transactionHash}, nil
 		}},
 		receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
 			observations.Add(1)
 			if hash != common.HexToHash(transactionHash) {
 				t.Fatalf("receipt hash = %s, want %s", hash, transactionHash)
 			}
-			return &ethtypes.Receipt{Status: ethtypes.ReceiptStatusSuccessful}, nil
+			return &ethtypes.Receipt{Status: ethtypes.ReceiptStatusSuccessful, TxHash: hash}, nil
 		}},
 	})
 	var operation *model.WalletOperation
@@ -4269,10 +4283,10 @@ func TestWalletBroadcastHasIndependentDeadline(t *testing.T) {
 	var broadcasts atomic.Int64
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		walletBroadcastTimeout: 20 * time.Millisecond,
-		wallet: testWalletOperator{fund: func(ctx context.Context, _ *big.Int) (string, error) {
+		wallet: testWalletOperator{fund: func(ctx context.Context, _ *big.Int) (synapse.WalletSubmission, error) {
 			broadcasts.Add(1)
 			<-ctx.Done()
-			return "", context.Cause(ctx)
+			return synapse.WalletSubmission{}, context.Cause(ctx)
 		}},
 	})
 	operation, taskRow := seedWalletTask(t, runtime, "wallet-broadcast-timeout")
@@ -4299,9 +4313,9 @@ func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 	var broadcasts atomic.Int64
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		maxAttempts: taskTestMaxAttempts(&limit),
-		wallet: testWalletOperator{fund: func(context.Context, *big.Int) (string, error) {
+		wallet: testWalletOperator{fund: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
 			broadcasts.Add(1)
-			return "", errors.New("unexpected wallet broadcast")
+			return synapse.WalletSubmission{}, errors.New("unexpected wallet broadcast")
 		}},
 	})
 	operation, taskRow := seedWalletTask(t, runtime, "wallet-admission-failure")
@@ -4358,6 +4372,13 @@ func TestWalletReceiptLookupHasIndependentDeadline(t *testing.T) {
 	if err := runtime.repos.WalletOperations.MarkSubmitted(t.Context(), operation.ID, taskRow.ID, transactionHash); err != nil {
 		t.Fatalf("mark wallet submitted: %v", err)
 	}
+	checkpoint, err := json.Marshal(walletoperation.Checkpoint{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), BroadcastAttempted: true, TransactionHash: transactionHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	runtime.repos.Tasks = limited
 	cancel, done := runHandlerEngine(t, runtime)
@@ -4374,21 +4395,382 @@ func TestWalletReceiptLookupHasIndependentDeadline(t *testing.T) {
 	}
 }
 
+func TestWalletRecoveryRequiresConsistentTransactionEvidence(t *testing.T) {
+	transactionHash := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").Hex()
+	for _, scenario := range []string{"missing checkpoint", "conflicting checkpoint", "checkpoint only", "checkpoint only retry", "wrong receipt hash", "wrong receipt status"} {
+		t.Run(scenario, func(t *testing.T) {
+			var observations atomic.Int64
+			var operationID int64
+			var runtime handlerTestRuntime
+			runtime = newHandlerTestRuntime(t, handlerRuntimeOptions{
+				wallet: testWalletOperator{},
+				receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
+					observations.Add(1)
+					stored, err := runtime.repos.WalletOperations.GetByID(t.Context(), operationID)
+					if err != nil || stored.TxHash == nil || *stored.TxHash != transactionHash || stored.Status != model.WalletOperationStatusSubmitted {
+						t.Errorf("RPC observed before transaction was recorded: %#v %v", stored, err)
+					}
+					if scenario == "wrong receipt hash" {
+						hash = common.HexToHash("0x9999")
+					}
+					status := uint64(ethtypes.ReceiptStatusSuccessful)
+					if scenario == "wrong receipt status" {
+						status = 2
+					}
+					return &ethtypes.Receipt{TxHash: hash, Status: status}, nil
+				}},
+			})
+			operation, row := seedWalletTask(t, runtime, scenario)
+			operationID = operation.ID
+			if err := runtime.repos.WalletOperations.MarkBroadcastAttempted(t.Context(), operation.ID, row.ID); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(scenario, "checkpoint only") {
+				if err := runtime.repos.WalletOperations.MarkSubmitted(t.Context(), operation.ID, row.ID, transactionHash); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario != "missing checkpoint" {
+				hash := transactionHash
+				if scenario == "conflicting checkpoint" {
+					hash = common.HexToHash("0x9999").Hex()
+				}
+				checkpoint, err := json.Marshal(walletoperation.Checkpoint{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), BroadcastAttempted: true, TransactionHash: hash})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "checkpoint only retry" {
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+					Set("failure_reason = ?", "handler_panic").Set("last_error = ?", "interrupted handler").Set("finished_at = ?", time.Now()).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				row, err = runtime.service.Retry(t.Context(), row.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := model.TaskStatusFailed
+			if strings.HasPrefix(scenario, "checkpoint only") {
+				want = model.TaskStatusCompleted
+			}
+			finished := runOneStorageTask(t, runtime, row, want)
+			stored, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(scenario, "checkpoint only") {
+				if observations.Load() != 1 || stored.Status != model.WalletOperationStatusConfirmed || stored.TaskID != nil {
+					t.Fatalf("checkpoint recovery did not confirm original transaction: %#v", stored)
+				}
+				return
+			}
+			wantObservations := int64(0)
+			if scenario == "wrong receipt hash" || scenario == "wrong receipt status" {
+				wantObservations = 1
+			}
+			if observations.Load() != wantObservations || finished.FailureReason == nil || *finished.FailureReason != "wallet_evidence_conflict" || stored.TaskID == nil || *stored.TaskID != row.ID || stored.Status != model.WalletOperationStatusSubmitted {
+				t.Fatalf("conflicting transaction evidence was not retained: task=%#v operation=%#v observations=%d", finished, stored, observations.Load())
+			}
+		})
+	}
+}
+
+func TestWalletRetryRejectsUnverifiableTransactionEvidence(t *testing.T) {
+	transactionHash := common.HexToHash("0x1234").Hex()
+	for _, scenario := range []string{"missing hash", "conflicting identity", "conflicting hash", "invalid signed transaction", "invalid checkpoint"} {
+		t.Run(scenario, func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{wallet: testWalletOperator{}})
+			operation, row := seedWalletTask(t, runtime, scenario)
+			if err := runtime.repos.WalletOperations.MarkBroadcastAttempted(t.Context(), operation.ID, row.ID); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := walletoperation.Checkpoint{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), BroadcastAttempted: true}
+			if scenario != "missing hash" {
+				checkpoint.TransactionHash = transactionHash
+				var raw []byte
+				if scenario == "invalid signed transaction" {
+					raw = []byte{1, 2, 3}
+				}
+				if err := runtime.repos.WalletOperations.RecordSubmission(t.Context(), operation.ID, row.ID, transactionHash, raw, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch scenario {
+			case "conflicting identity":
+				identity := *checkpoint.Identity
+				identity.Payer = common.HexToAddress("0x9999")
+				checkpoint.Identity = &identity
+			case "conflicting hash":
+				checkpoint.TransactionHash = common.HexToHash("0x9999").Hex()
+			}
+			var err error
+			row.Checkpoint, err = json.Marshal(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "invalid checkpoint" {
+				row.Checkpoint = json.RawMessage(`{"broadcast_attempted":"invalid"}`)
+			}
+			row.Status = model.TaskStatusFailed
+			row.FailureReason = new("handler_panic")
+			if err := runtime.service.InspectRetry(t.Context(), row); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("unverifiable evidence should reject Retry: %v", err)
+			}
+			if retryable, err := runtime.service.RetryableContext(t.Context(), row); err != nil || retryable {
+				t.Fatalf("unverifiable evidence should be unavailable without a server error: retryable=%v err=%v", retryable, err)
+			}
+		})
+	}
+}
+
+func TestWalletInvalidAmountSettlesOnlyBeforeBroadcast(t *testing.T) {
+	for _, scenario := range []string{"no broadcast evidence", "checkpoint only", "broadcast attempted", "submitted transaction"} {
+		t.Run(scenario, func(t *testing.T) {
+			var broadcasts atomic.Int64
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{wallet: testWalletOperator{
+				fund: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+					broadcasts.Add(1)
+					return synapse.WalletSubmission{}, errors.New("unexpected broadcast")
+				},
+			}})
+			operation, row := seedWalletTask(t, runtime, scenario)
+			amount := new(big.Int).Lsh(big.NewInt(1), 256).String()
+			if _, err := runtime.db.NewUpdate().Model((*model.WalletOperation)(nil)).Set("amount = ?", amount).Where("id = ?", operation.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "broadcast attempted" || scenario == "submitted transaction" {
+				if err := runtime.repos.WalletOperations.MarkBroadcastAttempted(t.Context(), operation.ID, row.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "checkpoint only" {
+				checkpoint, err := json.Marshal(walletoperation.Checkpoint{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), BroadcastAttempted: true, TransactionHash: common.HexToHash("0x1234").Hex()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "submitted transaction" {
+				if err := runtime.repos.WalletOperations.RecordSubmission(t.Context(), operation.ID, row.ID, common.HexToHash("0x1234").Hex(), []byte{1, 2, 3}, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			finished := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			stored, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if broadcasts.Load() != 0 || finished.FailureReason == nil || *finished.FailureReason != "wallet_amount_invalid" {
+				t.Fatalf("invalid amount invoked wallet or failed incorrectly: broadcasts=%d task=%#v", broadcasts.Load(), finished)
+			}
+			if scenario == "no broadcast evidence" {
+				if stored.Status != model.WalletOperationStatusFailed || stored.TaskID != nil || stored.CompletedAt == nil {
+					t.Fatalf("unsent invalid operation remains unresolved: %#v", stored)
+				}
+				if err := runtime.service.InspectRetry(t.Context(), finished); !errors.Is(err, repository.ErrConflict) {
+					t.Fatalf("invalid amount should not allow another wallet attempt: %v", err)
+				}
+				return
+			}
+			wantStatus := model.WalletOperationStatusPending
+			if scenario == "submitted transaction" {
+				wantStatus = model.WalletOperationStatusSubmitted
+			}
+			if stored.Status != wantStatus || stored.TaskID == nil || *stored.TaskID != row.ID || stored.CompletedAt != nil {
+				t.Fatalf("unresolved broadcast evidence was discarded: %#v", stored)
+			}
+		})
+	}
+}
+
+func TestWalletInvalidBroadcastEvidencePreservesCandidateHash(t *testing.T) {
+	transactionHash := common.HexToHash("0x1234").Hex()
+	raw := bytes.Repeat([]byte{0x82}, 32)
+	for _, scenario := range []string{"invalid returned submission", "adapter rejected evidence"} {
+		t.Run(scenario, func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{wallet: testWalletOperator{
+				fund: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+					var err error
+					if scenario == "adapter rejected evidence" {
+						err = fmt.Errorf("%w: transaction mismatch", synapse.ErrWalletReplayInvalidEvidence)
+					}
+					return synapse.WalletSubmission{TxHash: transactionHash, SignedTransaction: raw}, err
+				},
+			}})
+			operation, row := seedWalletTask(t, runtime, scenario)
+			finished := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			if finished.FailureReason == nil || *finished.FailureReason != "wallet_evidence_conflict" || finished.LastError == nil || !strings.Contains(*finished.LastError, transactionHash) || strings.Contains(*finished.LastError, hex.EncodeToString(raw)) {
+				t.Fatalf("conflicting submission should retain only its candidate hash in diagnostics: %#v", finished)
+			}
+			stored, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+			if err != nil || stored.Status != model.WalletOperationStatusPending || stored.TaskID == nil || *stored.TaskID != row.ID || stored.BroadcastAttemptedAt == nil || stored.TxHash != nil || len(stored.SignedTransaction) != 0 {
+				t.Fatalf("conflicting submission was accepted or its owner lost: %#v %v", stored, err)
+			}
+			var checkpoint walletoperation.Checkpoint
+			if err := json.Unmarshal(finished.Checkpoint, &checkpoint); err != nil || checkpoint.TransactionHash != "" {
+				t.Fatalf("conflicting submission entered checkpoint: %#v %v", checkpoint, err)
+			}
+		})
+	}
+}
+
+func TestWalletSignedTransactionObservationAndManualRetry(t *testing.T) {
+	key, err := crypto.HexToECDSA(strings.Repeat("01", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := testutil.DefaultWalletExecutionIdentity()
+	contextIdentity := *identity.Identity
+	contextIdentity.Payer = crypto.PubkeyToAddress(key.PublicKey)
+	identity.Identity = &contextIdentity
+	contract, err := abi.JSON(strings.NewReader(`[{"type":"function","name":"withdraw","inputs":[{"type":"address"},{"type":"uint256"}]}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := contract.Pack("withdraw", *identity.USDFC, big.NewInt(100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainID := identity.Identity.ChainID.BigInt()
+	tx, err := ethtypes.SignNewTx(key, ethtypes.LatestSignerForChainID(chainID), &ethtypes.DynamicFeeTx{
+		ChainID: chainID, Nonce: 7, To: identity.Payments, Value: new(big.Int), Gas: 100000,
+		GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(2), Data: data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := synapse.WalletSubmission{TxHash: tx.Hash().Hex(), SignedTransaction: raw}
+	var broadcasts, replays atomic.Int64
+	var confirmed atomic.Bool
+	attempts := 2
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		maxAttempts: &attempts,
+		wallet: testWalletOperator{
+			identity: identity,
+			withdraw: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+				broadcasts.Add(1)
+				return submission, errors.New("broadcast connection lost")
+			},
+			replay: func(_ context.Context, operationType model.WalletOperationType, amount *big.Int, got synapse.WalletSubmission) error {
+				replays.Add(1)
+				if operationType != model.WalletOperationTypeWithdraw || amount.Cmp(big.NewInt(100)) != 0 || got.TxHash != submission.TxHash || !bytes.Equal(got.SignedTransaction, raw) {
+					t.Errorf("replayed transaction or request differs")
+				}
+				return fmt.Errorf("%w: connection lost", synapse.ErrWalletReplayBroadcast)
+			},
+		},
+		receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
+			if confirmed.Load() {
+				return &ethtypes.Receipt{TxHash: hash, Status: ethtypes.ReceiptStatusSuccessful}, nil
+			}
+			return nil, ethereum.NotFound
+		}},
+	})
+	operation, row := seedWalletTaskWithIdentity(t, runtime, "signed-observation", model.WalletOperationTypeWithdraw, identity)
+	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+	if row.RetryCount != 0 || row.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("first signed submission consumed an attempt: %#v", row)
+	}
+	stored, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || stored.Status != model.WalletOperationStatusSubmitted || !bytes.Equal(stored.SignedTransaction, raw) || stored.LastError == nil {
+		t.Fatalf("signed broadcast evidence not preserved: %#v %v", stored, err)
+	}
+	firstRuntime := bytes.Clone(row.Runtime)
+	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, false), model.TaskStatusPending)
+	if row.RetryCount != 0 || replays.Load() != 0 || !testutil.JSONEqual(row.Runtime, firstRuntime) {
+		t.Fatalf("restart observation consumed budget, replayed, or reset its clock: %#v", row)
+	}
+	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, true), model.TaskStatusPending)
+	if row.RetryCount != 1 || row.ResumeMode != model.TaskResumeModeExecute || replays.Load() != 0 {
+		t.Fatalf("expired observation did not schedule native execute retry: %#v", row)
+	}
+	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, false), model.TaskStatusPending)
+	if row.RetryCount != 1 || replays.Load() != 1 || row.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("replay did not enter a fresh free observation: %#v replays=%d", row, replays.Load())
+	}
+	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, true), model.TaskStatusFailed)
+	if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" {
+		t.Fatalf("exhausted transaction task: %#v", row)
+	}
+	stored, err = runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || stored.Status != model.WalletOperationStatusSubmitted || stored.TaskID == nil || *stored.TaskID != row.ID || !bytes.Equal(stored.SignedTransaction, raw) || stored.LastError == nil || !strings.Contains(*stored.LastError, "after 2 attempts") {
+		t.Fatalf("exhaustion discarded transaction evidence or owner: %#v %v", stored, err)
+	}
+	confirmed.Store(true)
+	next, err := runtime.service.Retry(t.Context(), row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nextRuntime model.TaskRuntime
+	if err := json.Unmarshal(next.Runtime, &nextRuntime); err != nil || nextRuntime.Observation != nil || nextRuntime.OperationKey != "" || next.RetryCount != 0 {
+		t.Fatalf("manual retry did not reset runtime and budget: %#v %v", next, err)
+	}
+	runOneStorageTask(t, runtime, next, model.TaskStatusCompleted)
+	stored, err = runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || stored.Status != model.WalletOperationStatusConfirmed || stored.TaskID != nil || !bytes.Equal(stored.SignedTransaction, raw) || broadcasts.Load() != 1 || replays.Load() != 1 {
+		t.Fatalf("manual retry did not settle the original transaction: %#v %v broadcasts=%d replays=%d", stored, err, broadcasts.Load(), replays.Load())
+	}
+	source, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || source.Status != model.TaskStatusFailed || source.RetryCount != row.RetryCount || !bytes.Equal(source.Checkpoint, row.Checkpoint) {
+		t.Fatalf("manual retry rewrote its source: %#v %v", source, err)
+	}
+}
+
+func readyWalletTask(t *testing.T, runtime handlerTestRuntime, row *model.Task, expire bool) *model.Task {
+	t.Helper()
+	query := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", row.ID)
+	if expire {
+		var state model.TaskRuntime
+		if err := json.Unmarshal(row.Runtime, &state); err != nil || state.Observation == nil {
+			t.Fatalf("observation state missing: %s %v", row.Runtime, err)
+		}
+		state.Observation.StartedAt = time.Now().Add(-10 * time.Minute)
+		raw, err := json.Marshal(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query = query.Set("runtime_json = ?", json.RawMessage(raw))
+	}
+	if _, err := query.Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := runtime.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ready
+}
+
 func seedWalletTask(t *testing.T, runtime handlerTestRuntime, requestID string) (*model.WalletOperation, *model.Task) {
+	return seedWalletTaskWithIdentity(t, runtime, requestID, model.WalletOperationTypeFund, testutil.DefaultWalletExecutionIdentity())
+}
+
+func seedWalletTaskWithIdentity(t *testing.T, runtime handlerTestRuntime, requestID string, operationType model.WalletOperationType, identity walletoperation.ExecutionIdentity) (*model.WalletOperation, *model.Task) {
 	t.Helper()
 	var operation *model.WalletOperation
 	var taskRow *model.Task
 	if err := runtime.repos.WithTx(t.Context(), func(repos *repository.Repositories) error {
 		var err error
 		operation, _, err = repos.WalletOperations.CreateOrGet(t.Context(), repository.CreateWalletOperationInput{
-			Type: model.WalletOperationTypeFund, ClientRequestID: requestID, Amount: "100",
+			Type: operationType, ClientRequestID: requestID, Amount: "100",
 		})
 		if err != nil {
 			return err
 		}
 		taskRow, _, err = runtime.service.EnqueueInTransaction(t.Context(), repos, taskengine.EnqueueRequest{
 			Type:  model.TaskTypeWalletOperation,
-			Input: walletoperation.Input{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), OperationID: operation.ID},
+			Input: walletoperation.Input{ExecutionIdentity: identity, OperationID: operation.ID},
 		})
 		if err != nil {
 			return err

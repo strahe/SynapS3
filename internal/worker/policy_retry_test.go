@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,219 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
+
+func TestObservationWindowUsesPersistedStageAndPolicy(t *testing.T) {
+	definition := testDefinition(nil, true)
+	definition.Policy.ObservationWindow = 5 * time.Minute
+	definition.Policy.ObservationInterval = 30 * time.Second
+	registry := NewRegistry()
+	if err := registry.Register(scriptedHandler{definition: definition}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{registry: registry}
+	now := time.Date(2026, time.October, 19, 1, 0, 0, 0, time.UTC)
+	timeout := errors.New("transaction still has no receipt after the observation window")
+	managed := WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
+		WithObservationWindow("tx:one", timeout, model.TaskResumeModeExecute)
+	for _, tc := range []struct {
+		name      string
+		state     *model.TaskObservation
+		result    Result
+		wantStart time.Time
+		wantNext  time.Time
+		wantRetry bool
+	}{
+		{"first wait", nil, managed, now, now.Add(30 * time.Second), false},
+		{"same stage", &model.TaskObservation{Key: "tx:one", StartedAt: now.Add(-time.Minute)}, managed, now.Add(-time.Minute), now.Add(30 * time.Second), false},
+		{"deadline bounds poll", &model.TaskObservation{Key: "tx:one", StartedAt: now.Add(-5*time.Minute + time.Second)}, managed, now.Add(-5*time.Minute + time.Second), now.Add(time.Second), false},
+		{"deadline expires", &model.TaskObservation{Key: "tx:one", StartedAt: now.Add(-5 * time.Minute)}, managed, time.Time{}, time.Time{}, true},
+		{"new stage", &model.TaskObservation{Key: "tx:other", StartedAt: now.Add(-time.Hour)}, managed, now, now.Add(30 * time.Second), false},
+		{"legacy wait", &model.TaskObservation{Key: "tx:one", StartedAt: now.Add(-time.Hour)}, WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil), time.Time{}, time.Time{}, false},
+		{"completion wins", &model.TaskObservation{Key: "tx:one", StartedAt: now.Add(-time.Hour)}, Complete("Confirmed", nil), time.Time{}, time.Time{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(model.TaskRuntime{Observation: tc.state})
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := &model.Task{Type: testTaskType, Runtime: raw}
+			result, patch, err := engine.observationResult(row, tc.result, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantRetry {
+				if result.kind != resultRetry || result.resumeMode != model.TaskResumeModeExecute || result.failureReason != "observation_window_expired" || result.waitReason != "" || !errors.Is(result.err, timeout) || patch != nil {
+					t.Fatalf("expired result=%#v patch=%#v", result, patch)
+				}
+			} else if tc.wantStart.IsZero() {
+				if patch != nil || result.kind != tc.result.kind {
+					t.Fatalf("unmanaged result=%#v patch=%#v", result, patch)
+				}
+			} else if patch == nil || patch.State == nil || !patch.State.StartedAt.Equal(tc.wantStart) || result.waitUntil == nil || !result.waitUntil.Equal(tc.wantNext) {
+				t.Fatalf("observation result=%#v patch=%#v", result, patch)
+			}
+		})
+	}
+	for name, result := range map[string]Result{
+		"ordinary wait":   Wait(model.TaskResumeModeRecover, "waiting", "Waiting", nil).WithObservationWindow("stage", timeout, model.TaskResumeModeRecover),
+		"empty stage":     managed.WithObservationWindow(" ", timeout, model.TaskResumeModeRecover),
+		"missing timeout": managed.WithObservationWindow("stage", nil, model.TaskResumeModeRecover),
+		"invalid mode":    managed.WithObservationWindow("stage", timeout, "invalid"),
+		"terminal result": Complete("Done", nil).WithObservationWindow("stage", timeout, model.TaskResumeModeRecover),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !errors.Is(validateResult(result, nil), ErrInvalidResult) {
+				t.Fatal("invalid observation contract accepted")
+			}
+		})
+	}
+	absolute := managed
+	absolute.waitUntil = &now
+	if !errors.Is(validateResult(absolute, nil), ErrInvalidResult) {
+		t.Fatal("absolute and managed deadlines accepted together")
+	}
+}
+
+func TestObservationWindowSettlementAndRetryAreAtomic(t *testing.T) {
+	limit := 1
+	definition := testDefinition(&limit, true)
+	definition.Policy.ObservationWindow = 5 * time.Minute
+	definition.Policy.ObservationInterval = 30 * time.Second
+	currentResult := WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
+		WithObservationWindow("tx:one", errors.New("receipt was not available within the observation window"), model.TaskResumeModeExecute)
+	run := func(context.Context, Execution) Result { return currentResult }
+	h := newTaskHarness(t, scriptedHandler{definition: definition, execute: run, recover: run}, nil)
+	row := enqueueTestTask(t, h, "observation")
+	h.engine.executeClaim(t.Context(), claimTestTask(t, h))
+	load := func() (*model.Task, model.TaskRuntime) {
+		t.Helper()
+		stored, err := h.repos.Tasks.GetByID(t.Context(), row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var runtime model.TaskRuntime
+		if err := json.Unmarshal(stored.Runtime, &runtime); err != nil {
+			t.Fatal(err)
+		}
+		return stored, runtime
+	}
+	stored, first := load()
+	if first.Observation == nil || stored.RetryCount != 0 {
+		t.Fatalf("first wait=%#v runtime=%#v", stored, first)
+	}
+	// Rebuilding the engine exercises the durable clock rather than process memory.
+	h = newTaskHarnessWithDB(t, h.db, scriptedHandler{definition: definition, execute: run, recover: run}, nil)
+	claim := func() *model.Task {
+		t.Helper()
+		if _, err := h.repos.Tasks.WakePending(t.Context(), []int64{row.ID}); err != nil {
+			t.Fatal(err)
+		}
+		return claimTestTask(t, h)
+	}
+	h.engine.executeClaim(t.Context(), claim())
+	stored, repeated := load()
+	if stored.RetryCount != 0 || !repeated.Observation.StartedAt.Equal(first.Observation.StartedAt) {
+		t.Fatalf("repeated observation=%#v runtime=%#v", stored, repeated)
+	}
+	currentResult = Wait(model.TaskResumeModeRecover, "dependency", "Waiting", nil)
+	h.engine.executeClaim(t.Context(), claim())
+	_, ordinary := load()
+	if !ordinary.Observation.StartedAt.Equal(first.Observation.StartedAt) {
+		t.Fatal("ordinary wait reset observation")
+	}
+	currentResult = WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
+		WithObservationWindow("tx:two", errors.New("transaction remains unconfirmed after five minutes"), model.TaskResumeModeExecute)
+	h.engine.executeClaim(t.Context(), claim())
+	_, nextStage := load()
+	if nextStage.Observation.Key != "tx:two" || !nextStage.Observation.StartedAt.After(first.Observation.StartedAt) {
+		t.Fatalf("new stage=%#v", nextStage)
+	}
+	claimed := claim()
+	checkpoint := json.RawMessage(`{"transaction_hash":"one"}`)
+	if err := h.repos.Tasks.WriteCheckpoint(t.Context(), row.ID, claimed.ClaimGeneration, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	setExpired := func() {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{"observation": model.TaskObservation{Key: "tx:two", StartedAt: time.Now().Add(-6 * time.Minute)}, "future": map[string]int{"value": 7}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.db.NewUpdate().Model((*model.Task)(nil)).Set("runtime_json = runtime_json || ?::jsonb", json.RawMessage(raw)).Where("id = ?", row.ID).Exec(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setExpired()
+	currentResult = currentResult.WithWorkStartedAt(time.Now().Add(-time.Minute)).WithRetrySettlements(
+		func(ctx context.Context, repos *repository.Repositories, _ time.Time) error {
+			if _, err := repos.Tasks.ObserveOperation(ctx, row.ID, claimed.ClaimGeneration, "send:one"); err != nil {
+				return err
+			}
+			return repos.Tasks.AppendEvent(ctx, row.ID, "observation_retry", nil)
+		},
+		func(ctx context.Context, repos *repository.Repositories) error {
+			return repos.Tasks.AppendEvent(ctx, row.ID, "observation_exhausted", nil)
+		},
+	)
+	currentResult.settlement = func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.Tasks.AppendEvent(ctx, row.ID, "observation_common", nil)
+	}
+	before, _ := load()
+	restore := testutil.FailWrites(t, h.db, "task_events", "INSERT", "NEW.type = 'retry_scheduled'", "injected observation event failure")
+	h.engine.settlementRetryDelays = []time.Duration{0, 0}
+	if err := h.engine.commitResult(t.Context(), claimed, currentResult); err == nil {
+		t.Fatal("event failure committed observation timeout")
+	}
+	rolledBack, _ := load()
+	if rolledBack.RetryCount != 0 || rolledBack.Status != model.TaskStatusRunning || !bytes.Equal(before.Runtime, rolledBack.Runtime) || rolledBack.WorkStartedAt != nil {
+		t.Fatalf("partial timeout commit=%#v", rolledBack)
+	}
+	restore()
+	if err := h.engine.commitResult(t.Context(), claimed, currentResult); err != nil {
+		t.Fatal(err)
+	}
+	stored, retried := load()
+	if stored.RetryCount != 1 || stored.ResumeMode != model.TaskResumeModeExecute || retried.Observation != nil || retried.OperationKey != "send:one" || stored.WorkStartedAt == nil {
+		t.Fatalf("retry settlement=%#v runtime=%#v", stored, retried)
+	}
+	if !bytes.Contains(stored.Runtime, []byte(`"future"`)) {
+		t.Fatal("observation settlement dropped unknown runtime fields")
+	}
+	currentResult.onRetry = nil
+	claimed = claim()
+	h.engine.executeClaim(t.Context(), claimed)
+	stored, fresh := load()
+	if fresh.Observation == nil || stored.RetryCount != 1 || !fresh.Observation.StartedAt.After(first.Observation.StartedAt) {
+		t.Fatal("new attempt did not start a fresh observation window")
+	}
+	claimed = claim()
+	setExpired()
+	if err := h.engine.commitResult(t.Context(), claimed, currentResult); err != nil {
+		t.Fatal(err)
+	}
+	stored, exhausted := load()
+	if stored.Status != model.TaskStatusFailed || stored.RetryCount != 1 || dereference(stored.FailureReason) != "attempts_exhausted" || exhausted.Observation != nil || exhausted.OperationKey != "send:one" {
+		t.Fatalf("exhausted=%#v runtime=%#v", stored, exhausted)
+	}
+	events, err := h.repos.Tasks.ListEvents(t.Context(), row.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := make(map[string]int)
+	for _, event := range events {
+		counts[event.Type]++
+	}
+	if counts["retry_scheduled"] != 1 || counts["observation_retry"] != 1 || counts["observation_exhausted"] != 1 || counts["observation_common"] != 3 {
+		t.Fatalf("committed events=%v", counts)
+	}
+	next, err := h.service.Retry(t.Context(), row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.RetryCount != 0 || string(next.Runtime) != "{}" || !testutil.JSONEqual(next.Checkpoint, checkpoint) {
+		t.Fatalf("manual successor=%#v", next)
+	}
+}
 
 func TestRetryUsesCurrentPolicy(t *testing.T) {
 	old := newTaskHarness(t, scriptedHandler{definition: testDefinition(nil, true), execute: func(context.Context, Execution) Result {

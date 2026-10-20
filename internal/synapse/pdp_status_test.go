@@ -1,6 +1,7 @@
 package synapse
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/piece"
 )
 
@@ -65,7 +67,7 @@ func TestPDPStatusCheckerRejectsMismatchedParkedPiece(t *testing.T) {
 	defer server.Close()
 
 	checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
-	if _, err := checker.FindParkedPiece(t.Context(), server.URL, want.CIDv2); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+	if _, err := checker.FindParkedPiece(t.Context(), server.URL, want.CIDv2); !errors.Is(err, pdp.ErrInvalidStatus) {
 		t.Fatalf("mismatched parked-piece error = %v", err)
 	}
 }

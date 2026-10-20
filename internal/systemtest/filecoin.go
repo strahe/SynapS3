@@ -22,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
@@ -995,16 +996,20 @@ func (m *MemoryFilecoin) GetWalletInfo(context.Context) (*synapse.WalletInfo, er
 	}, nil
 }
 
-func (m *MemoryFilecoin) FundUSDFC(context.Context, *big.Int) (string, error) {
-	return "memory-fund", nil
+func (m *MemoryFilecoin) FundUSDFC(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+	return synapse.WalletSubmission{TxHash: common.HexToHash("0x1").Hex()}, nil
 }
 
-func (m *MemoryFilecoin) WithdrawUSDFC(context.Context, *big.Int) (string, error) {
-	return "memory-withdraw", nil
+func (m *MemoryFilecoin) WithdrawUSDFC(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+	return synapse.WalletSubmission{TxHash: common.HexToHash("0x2").Hex()}, nil
 }
 
-func (m *MemoryFilecoin) ApproveFWSS(context.Context) (string, error) {
-	return "memory-approve", nil
+func (m *MemoryFilecoin) ApproveFWSS(context.Context) (synapse.WalletSubmission, error) {
+	return synapse.WalletSubmission{TxHash: common.HexToHash("0x3").Hex()}, nil
+}
+
+func (m *MemoryFilecoin) RebroadcastSignedTransaction(context.Context, model.WalletOperationType, *big.Int, synapse.WalletSubmission, time.Duration) error {
+	return synapse.ErrWalletReplaySkipped
 }
 
 func (m *MemoryFilecoin) TransactionReceipt(context.Context, common.Hash) (*ethtypes.Receipt, error) {

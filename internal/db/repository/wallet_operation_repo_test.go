@@ -1,9 +1,11 @@
 package repository_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"testing"
 	"time"
@@ -40,15 +42,73 @@ func TestWalletOperationRepoValidatesAmounts(t *testing.T) {
 	}); err != nil || !created || op.Amount != "0" {
 		t.Fatalf("approve operation=%#v created=%t err=%v", op, created, err)
 	}
+	maximum := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	if _, created, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+		Type: model.WalletOperationTypeFund, ClientRequestID: "maximum", Amount: maximum.String(),
+	}); err != nil || !created {
+		t.Fatalf("maximum amount created=%t err=%v", created, err)
+	}
 	for _, input := range []repository.CreateWalletOperationInput{
 		{Type: model.WalletOperationTypeFund, ClientRequestID: "zero", Amount: "0"},
 		{Type: model.WalletOperationTypeWithdraw, ClientRequestID: "negative", Amount: "-1"},
 		{Type: model.WalletOperationTypeApprove, ClientRequestID: "approve-positive", Amount: "1"},
 		{Type: model.WalletOperationType("other"), ClientRequestID: "unknown", Amount: "1"},
+		{Type: model.WalletOperationTypeFund, ClientRequestID: "overflow", Amount: maximum.Add(maximum, big.NewInt(1)).String()},
 	} {
 		if _, _, err := repos.WalletOperations.CreateOrGet(ctx, input); !errors.Is(err, repository.ErrWalletOperationInvalidAmount) {
 			t.Errorf("CreateOrGet(%#v) error=%v", input, err)
 		}
+	}
+}
+
+func TestWalletOperationRepoPreservesSubmissionEvidence(t *testing.T) {
+	repos := repository.NewRepositories(testDB(t))
+	ctx := t.Context()
+	op := createWalletOperation(t, repos, model.WalletOperationTypeFund, "signed", "100")
+	taskID := createWalletTask(t, repos, op.ID, "signed")
+	if err := repos.WalletOperations.BindTask(ctx, op.ID, taskID); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte{0x02, 0x00, 0xff}
+	if err := repos.WalletOperations.RecordSubmission(ctx, op.ID, taskID, "tx-one", raw, "send timeout"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("submission without broadcast evidence: %v", err)
+	}
+	if err := repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, taskID); err != nil {
+		t.Fatal(err)
+	}
+	for _, submission := range []struct {
+		hash string
+		raw  []byte
+	}{
+		{"tx-one", nil}, {"tx-one", raw}, {"tx-one", bytes.Clone(raw)}, {"tx-one", nil},
+	} {
+		if err := repos.WalletOperations.RecordSubmission(ctx, op.ID, taskID, submission.hash, submission.raw, "send timeout"); err != nil {
+			t.Fatalf("record submission: %v", err)
+		}
+	}
+	for _, submission := range []struct {
+		taskID int64
+		hash   string
+		raw    []byte
+	}{
+		{taskID + 1, "tx-one", raw}, {taskID, "tx-two", raw}, {taskID, "tx-one", []byte{3}},
+	} {
+		if err := repos.WalletOperations.RecordSubmission(ctx, op.ID, submission.taskID, submission.hash, submission.raw, "overwrite"); !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("conflicting submission: %v", err)
+		}
+	}
+	injected := errors.New("rollback")
+	if err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		if err := txRepos.WalletOperations.RecordConfirmationError(ctx, op.ID, taskID, "temporary"); err != nil {
+			return err
+		}
+		return injected
+	}); !errors.Is(err, injected) {
+		t.Fatal(err)
+	}
+	stored, err := repos.WalletOperations.GetByID(ctx, op.ID)
+	if err != nil || stored.Status != model.WalletOperationStatusSubmitted || !bytes.Equal(stored.SignedTransaction, raw) || stored.TxHash == nil || *stored.TxHash != "tx-one" || stored.LastError == nil || *stored.LastError != "send timeout" {
+		t.Fatalf("submission evidence changed: %#v err=%v", stored, err)
 	}
 }
 

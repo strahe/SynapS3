@@ -28,6 +28,7 @@ export function walletOperationTypeLabel(type: WalletOperationType) {
 }
 
 export function walletOperationStatusLabel(status: WalletOperationStatus) {
+  if (status === 'submitted') return 'Awaiting confirmation'
   return enumLabel(status) || 'Unknown'
 }
 

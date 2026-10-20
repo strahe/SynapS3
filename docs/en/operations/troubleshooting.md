@@ -95,14 +95,16 @@ Fix the cause first: RPC connectivity, storage provider reachability, wallet fun
 | **Upload data** | **Retry** checks whether the storage provider already has the data and uploads it again only if it is missing. |
 | **Replace provider** | Recover from the bucket's **Storage** tab. |
 | **Commit batch** | Restore the dependency, then **Retry**. SynapS3 checks the chain before it resubmits the batch. `synaps3 admin storage-confirmation list` lists batches that need attention. |
-| **Wallet operation** | **Retry** is offered only if the transaction was never broadcast, or it stopped on an internal error. If a broadcast may have gone out without a recorded transaction, the operation cannot be retried; check the wallet on chain. |
+| **Wallet operation** | **Retry** continues the recorded transaction or starts an operation that was never broadcast. If a broadcast may have gone out without a recorded transaction, check the wallet on chain; the operation cannot be retried. |
 | **Clean up deleted data** | If removing a remote replica is still unconfirmed after 24 hours, **Retry** checks the chain and may submit another paid removal request. The earlier request can still succeed. |
 
 For a failed replica, use **Retry** on the **Tasks** page or in the object's **Provenance** dialog. The replica is complete when it shows **Stored**.
 
 After you review a failure, select **Acknowledge** or run `synaps3 admin task acknowledge <id>` to move it to **Closed**. Acknowledging does not change its result or whether it can be retried. To clear many failures, open **Open**, filter by **Failed** and optionally **Operation**, and select **Acknowledge all**; or run `synaps3 admin task acknowledge --type <type> --yes`. Failures recorded after you confirm stay open.
 
-## Wallet Funding Fails
+## Wallet Operations
+
+**Awaiting confirmation** means the transaction is recorded but its outcome is unresolved, even if the RPC rejected the broadcast. SynapS3 checks every 30 seconds; five minutes without a receipt consumes one retry. It can resend the same signed transaction when available, without creating another payment. If automatic confirmation stops, use **Retry** on the **Tasks** page to continue the same transaction. A stopped task does not cancel a transaction on chain.
 
 Check the balances and FWSS approval on the **Wallet** page, or with:
 

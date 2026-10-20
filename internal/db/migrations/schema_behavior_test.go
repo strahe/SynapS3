@@ -68,6 +68,17 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 		mustRejectStatement(t, db, `INSERT INTO wallet_operations
 			(type, client_request_id, amount, status, submitted_at, created_at, updated_at)
 			VALUES ('fund', 'submitted-without-hash', '1', 'submitted', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+		for name, values := range map[string]string{
+			"empty signed transaction":           `decode('', 'hex'), 'tx', CURRENT_TIMESTAMP`,
+			"signed transaction without hash":    `decode('02ff', 'hex'), NULL, CURRENT_TIMESTAMP`,
+			"signed transaction without attempt": `decode('02ff', 'hex'), 'tx', NULL`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				mustRejectStatement(t, db, `INSERT INTO wallet_operations
+					(type, client_request_id, amount, signed_transaction, tx_hash, broadcast_attempted_at, created_at, updated_at)
+					VALUES ('fund', 'invalid-signed', '1', `+values+`, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+			})
+		}
 		if _, err := db.Exec(`INSERT INTO wallet_operations
 			(type, client_request_id, amount, status, tx_hash, submitted_at, created_at, updated_at)
 			VALUES ('fund', 'submitted-complete', '1', 'submitted', 'tx-complete', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {

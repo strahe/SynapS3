@@ -212,7 +212,11 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if opType != model.WalletOperationTypeApprove && !validBaseUnitAmount(amount) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "amount must be a positive integer string in USDFC base units"})
+		message := "amount must be a positive integer string in USDFC base units"
+		if value, ok := new(big.Int).SetString(amount, 10); ok && value.Sign() > 0 && value.BitLen() > 256 {
+			message = "amount is too large"
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
 		return
 	}
 
@@ -323,7 +327,8 @@ func validBaseUnitAmount(amount string) bool {
 			return false
 		}
 	}
-	return true
+	value, ok := new(big.Int).SetString(amount, 10)
+	return ok && value.BitLen() <= 256
 }
 
 func walletOperationToDTO(op *model.WalletOperation) walletOperationDTO {

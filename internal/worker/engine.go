@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -357,7 +358,11 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 		// authorize a failed settlement of an unresolved external effect.
 		result = Wait(model.TaskResumeModeRecover, "database_contention", "Waiting to continue", nil)
 	}
-	if err := validateResult(result, claimed); err != nil {
+	resultErr := validateResult(result, claimed)
+	if result.observationWindow != nil && definition.Policy.ObservationWindow <= 0 {
+		resultErr = ErrInvalidResult
+	}
+	if err := resultErr; err != nil {
 		logger.Error("task handler returned an invalid result", "error", err)
 		stopLeaseRenewal()
 		if e.failClaim(parent, claimed, failureInvalidResult, err) != nil {
@@ -421,6 +426,11 @@ func invokeHandler(ctx context.Context, handler Handler, execution Execution) (r
 }
 
 func validateResult(result Result, _ *model.Task) error {
+	if window := result.observationWindow; window != nil {
+		if result.kind != resultWait || !result.observationWait || result.waitUntil != nil || strings.TrimSpace(window.stageKey) == "" || window.timeoutErr == nil || (window.timeoutRetryMode != model.TaskResumeModeExecute && window.timeoutRetryMode != model.TaskResumeModeRecover) {
+			return ErrInvalidResult
+		}
+	}
 	switch result.kind {
 	case resultComplete:
 		return nil
@@ -441,6 +451,8 @@ func validateResult(result Result, _ *model.Task) error {
 			return ErrInvalidResult
 		}
 		return nil
+	case resultInvalid:
+		return ErrInvalidResult
 	default:
 		return ErrInvalidResult
 	}
@@ -472,21 +484,28 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 			if err != nil {
 				return err
 			}
-			transition = e.transitionFor(current, result)
-			if result.kind == resultRetry {
-				if transition.IncrementRetry && result.onRetry != nil {
-					if err := result.onRetry(settlementCtx, txRepos, transition.AvailableAt); err != nil {
+			effective, observation, err := e.observationResult(current, result, time.Now())
+			if err != nil {
+				return err
+			}
+			transition = e.transitionFor(current, effective)
+			if observation != nil && transition.Observation == nil {
+				transition.Observation = observation
+			}
+			if effective.kind == resultRetry {
+				if transition.IncrementRetry && effective.onRetry != nil {
+					if err := effective.onRetry(settlementCtx, txRepos, transition.AvailableAt); err != nil {
 						return err
 					}
 				}
-				if !transition.IncrementRetry && result.onExhausted != nil {
-					if err := invokeSettlement(settlementCtx, result.onExhausted, txRepos); err != nil {
+				if !transition.IncrementRetry && effective.onExhausted != nil {
+					if err := invokeSettlement(settlementCtx, effective.onExhausted, txRepos); err != nil {
 						return err
 					}
 				}
 			}
-			if result.settlement != nil {
-				if err := invokeSettlement(settlementCtx, result.settlement, txRepos); err != nil {
+			if effective.settlement != nil {
+				if err := invokeSettlement(settlementCtx, effective.settlement, txRepos); err != nil {
 					return err
 				}
 			}
@@ -505,6 +524,42 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 		}
 	}
 	return lastErr
+}
+
+func (e *Engine) observationResult(current *model.Task, result Result, now time.Time) (Result, *repository.TaskObservationPatch, error) {
+	window := result.observationWindow
+	if window == nil {
+		return result, nil, nil
+	}
+	var runtime model.TaskRuntime
+	if err := json.Unmarshal(current.Runtime, &runtime); err != nil {
+		return Result{}, nil, fmt.Errorf("decoding task observation: %w", err)
+	}
+	state := runtime.Observation
+	if state != nil && (state.Key == "" || state.StartedAt.IsZero()) {
+		return Result{}, nil, fmt.Errorf("invalid task observation state: %w", repository.ErrInvalidInput)
+	}
+	if state == nil || state.Key != window.stageKey {
+		state = &model.TaskObservation{Key: window.stageKey, StartedAt: now.UTC()}
+	}
+	definition, _ := e.registry.Definition(current.Type)
+	deadline := state.StartedAt.Add(definition.Policy.ObservationWindow)
+	if !now.Before(deadline) {
+		result.kind = resultRetry
+		result.resumeMode = window.timeoutRetryMode
+		result.err = window.timeoutErr
+		result.failureReason = "observation_window_expired"
+		result.waitReason = ""
+		result.message = ""
+		result.observationWindow = nil
+		return result, nil, nil
+	}
+	next := now.Add(definition.Policy.ObservationInterval)
+	if deadline.Before(next) {
+		next = deadline
+	}
+	result.waitUntil = &next
+	return result, &repository.TaskObservationPatch{State: state}, nil
 }
 
 func (e *Engine) notifyTaskSettled(claimed *model.Task, transition repository.TaskTransition) {
@@ -599,6 +654,11 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.Status = model.TaskStatusFailed
 	case resultCancel:
 		transition.Status = model.TaskStatusCancelled
+	case resultInvalid:
+		return transition
+	}
+	if transition.IncrementRetry || transition.Status != model.TaskStatusPending {
+		transition.Observation = &repository.TaskObservationPatch{}
 	}
 	return transition
 }

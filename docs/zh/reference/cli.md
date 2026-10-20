@@ -38,7 +38,7 @@ synaps3 wallet approve
 | `deposit` | 向支付账户存入 USDFC。输出 `Transaction: <hash>` 和 `Status: confirmed`。 |
 | `approve` | 批准 FWSS 从支付账户扣款。输出 `Transaction: <hash>` 和 `Status: confirmed`，或 `FWSS approval: already approved`。 |
 
-所有钱包命令都支持 `--json`。`deposit` 和 `approve` 最多等待 `--timeout`（默认 `5m`）获取交易回执；超时则输出 `Status: submitted`。
+所有钱包命令都支持 `--json`。`deposit` 和 `approve` 最多等待 `--timeout`（默认 `5m`）获取交易回执；超时则输出 `Status: submitted`。广播报错时，有交易 hash 就会输出，并以错误状态退出；再次付款前，先到链上核对该交易。
 
 ## 存储提供方命令
 

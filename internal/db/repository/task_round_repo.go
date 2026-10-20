@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -89,8 +88,10 @@ func (r *BunTaskRepo) updateOperation(ctx context.Context, id, generation int64,
 		}
 		for _, key := range []string{"operation_key", "operation_started_at", "last_admitted_attempt"} {
 			delete(fields, key)
+			if value, ok := changed[key]; ok {
+				fields[key] = value
+			}
 		}
-		maps.Copy(fields, changed)
 		raw, err := json.Marshal(fields)
 		if err != nil {
 			return err

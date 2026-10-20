@@ -828,6 +828,7 @@ type TaskScheduleRepository interface {
 }
 
 type TaskTransition struct {
+	Observation        *TaskObservationPatch
 	WorkStartedAt      *time.Time
 	ClearWorkStartedAt bool
 	Status             model.TaskStatus
@@ -838,6 +839,11 @@ type TaskTransition struct {
 	LastError          *string
 	StatusMessage      *string
 	IncrementRetry     bool
+}
+
+// TaskObservationPatch changes only the observation state. A nil State clears it.
+type TaskObservationPatch struct {
+	State *model.TaskObservation
 }
 
 // TaskAcknowledgeFilter selects the failures one bulk confirmation covers. The
@@ -886,6 +892,8 @@ type WalletOperationRepository interface {
 	TransferTaskOwner(ctx context.Context, id, oldTaskID, newTaskID int64) error
 	MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error
 	MarkSubmitted(ctx context.Context, id, taskID int64, txHash string) error
+	RecordSubmission(ctx context.Context, id, taskID int64, txHash string, signedTransaction []byte, lastError string) error
+	RecordConfirmationError(ctx context.Context, id, taskID int64, lastError string) error
 	MarkConfirmed(ctx context.Context, id, taskID int64, txHash string) error
 	MarkConfirmedWithoutTransaction(ctx context.Context, id, taskID int64) error
 	MarkFailed(ctx context.Context, id, taskID int64, lastError string) error

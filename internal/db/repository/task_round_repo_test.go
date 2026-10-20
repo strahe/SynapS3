@@ -21,6 +21,14 @@ func assertTaskOperationAdmissionAndRollback(t *testing.T, db *bun.DB) {
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
 	row := enqueueAndClaimTask(t, repos, "effect-admission", time.Minute)
+	observation := &model.TaskObservation{Key: "receipt", StartedAt: time.Now().UTC().Truncate(time.Microsecond)}
+	initial, err := json.Marshal(map[string]any{"observation": observation, "future": map[string]int{"value": 7}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("runtime_json = ?", json.RawMessage(initial)).Where("id = ?", row.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
 	observed, err := repos.Tasks.ObserveOperation(ctx, row.ID, row.ClaimGeneration, "upload")
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +66,9 @@ func assertTaskOperationAdmissionAndRollback(t *testing.T, db *bun.DB) {
 	if err := repos.Tasks.AdmitEffect(ctx, row.ID, recovered.ClaimGeneration, "upload", json.RawMessage(`{"resubmitted":true}`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := repos.Tasks.Settle(ctx, row.ID, row.ClaimGeneration, repository.TaskTransition{Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover, AvailableAt: time.Now(), Observation: &repository.TaskObservationPatch{}}); !errors.Is(err, repository.ErrTaskLeaseLost) {
+		t.Fatalf("stale observation settlement=%v", err)
+	}
 	if err := repos.Tasks.ResolveOperation(ctx, row.ID, recovered.ClaimGeneration, "upload"); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +88,17 @@ func assertTaskOperationAdmissionAndRollback(t *testing.T, db *bun.DB) {
 	stored, err := repos.Tasks.GetByID(ctx, row.ID)
 	if err != nil || stored.RetryCount != 1 {
 		t.Fatalf("effects changed retry budget: %#v,%v", stored, err)
+	}
+	var runtime model.TaskRuntime
+	if err := json.Unmarshal(stored.Runtime, &runtime); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(stored.Runtime, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Observation == nil || runtime.Observation.Key != observation.Key || !runtime.Observation.StartedAt.Equal(observation.StartedAt) || fields["future"] == nil || runtime.OperationKey != "other" {
+		t.Fatalf("operation updates overwrote independent runtime state: %s", stored.Runtime)
 	}
 }
 
