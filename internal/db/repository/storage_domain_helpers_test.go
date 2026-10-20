@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -249,7 +250,7 @@ func TestAuthorizeReplacementWaitsForUnknownCreation(t *testing.T) {
 		t.Fatalf("Authorize(pending source) error = %v, want ErrSourceOutcomeUnknown", err)
 	}
 	if err := repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-		ID: source.ID, TransactionID: "0xcreate",
+		ID: source.ID, TxHash: "0xcreate",
 	}); err != nil {
 		t.Fatalf("MarkDataSetCreating: %v", err)
 	}
@@ -553,7 +554,7 @@ func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing
 
 	clientID := onChainID(t, "9001")
 	if err := repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-		ID: source.ID, TransactionID: "0xcreate", StatusURL: "https://provider.example/status", ClientDataSetID: &clientID,
+		ID: source.ID, TxHash: "0xcreate", StatusURL: "https://provider.example/status", ClientDataSetID: &clientID,
 	}); err != nil {
 		t.Fatalf("MarkDataSetCreating(drained source): %v", err)
 	}
@@ -568,7 +569,7 @@ func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing
 	}
 	if drained.Status != model.StorageDataSetStatusDraining || drained.IsCurrent ||
 		drained.DataSetID == nil || !drained.DataSetID.Equal(onChainID(t, "1001")) ||
-		drained.CreateTransactionID == nil || *drained.CreateTransactionID != "0xcreate" {
+		drained.TxHash == nil || *drained.TxHash != "0xcreate" {
 		t.Fatalf("drained source = %#v, want it draining with its creation recorded", drained)
 	}
 	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
@@ -578,7 +579,7 @@ func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing
 	}
 	// The target owns the slot now, and a creation step cannot move it back.
 	if err := repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-		ID: replacement.TargetDataSetID, TransactionID: "0xlate",
+		ID: replacement.TargetDataSetID, TxHash: "0xlate",
 	}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("MarkDataSetCreating(ready target) error = %v, want ErrConflict", err)
 	}
@@ -789,70 +790,104 @@ func TestCopyFailureFlagsContentOnlyWhenNoCopyCanServeIt(t *testing.T) {
 	}
 }
 
+func terminationTestInput(t *testing.T, repos *repository.Repositories, replacement *storagereplacement.Replacement, role storagereplacement.TerminationRole) repository.RecordTerminationEvidenceInput {
+	t.Helper()
+	dataSetID := replacement.SourceDataSetID
+	if role == storagereplacement.TerminationRoleAbandonedTarget {
+		dataSetID = replacement.TargetDataSetID
+	}
+	generation, err := repos.Contents.NextDataSetRetirementGeneration(t.Context(), dataSetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(storagereplacement.RetireInput{ReplacementID: replacement.ID, DataSetID: dataSetID, Generation: generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err := repos.Tasks.Enqueue(t.Context(), repositoryTestTask(&model.Task{Type: model.TaskTypeStorageDataSetRetire, InputVersion: 1, Input: raw, SubjectType: "storage_data_set", SubjectKey: strconv.FormatInt(dataSetID, 10)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Contents.BindDataSetRetirementTask(t.Context(), dataSetID, generation, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	return repository.RecordTerminationEvidenceInput{ReplacementID: replacement.ID, DataSetID: dataSetID, Generation: generation, TaskID: task.ID, Role: role}
+}
+
 func TestAbandonedTerminationEpochReplayPreservesEvidence(t *testing.T) {
 	for _, transactional := range []bool{false, true} {
-		name := "pool"
-		if transactional {
-			name = "transaction"
-		}
-		t.Run(name, func(t *testing.T) {
+		t.Run(fmt.Sprintf("transaction=%t", transactional), func(t *testing.T) {
 			db := testDB(t)
 			repos := repository.NewRepositories(db)
 			ctx := t.Context()
 			bucket := seedBucket(t, db, "abandoned-termination-replay")
-			source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-				BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
-			})
+			source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0})
 			if err != nil {
 				t.Fatal(err)
 			}
 			markSourceReady(t, repos, source.ID)
 			replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
-				BucketID: bucket.ID, SourceDataSetID: source.ID,
-				SelectionMode:    storagereplacement.SelectionModeManual,
+				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 				TargetProviderID: onChainID(t, "202"), ClientRequestID: "abandoned-replay",
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
-				Set("status = ?", storagereplacement.StatusSuperseded).
-				Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+			if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).Set("status = ?", storagereplacement.StatusSuperseded).Where("id = ?", replacement.ID).Exec(ctx); err != nil {
 				t.Fatal(err)
 			}
-			input := repository.RecordTerminationEpochInput{ReplacementID: replacement.ID, TxHash: "0xoriginal", Epoch: 0}
-			if err := repos.Replacements.RecordAbandonedTerminationEpoch(ctx, input); err != nil {
+			input := terminationTestInput(t, repos, replacement, storagereplacement.TerminationRoleAbandonedTarget)
+			input.TxHash = "0xoriginal"
+			if err := repos.Replacements.RecordTerminationEvidence(ctx, input); err != nil {
+				t.Fatal(err)
+			}
+			conflictingSubmission := input
+			conflictingSubmission.TxHash = "0xother"
+			if err := repos.Replacements.RecordTerminationEvidence(ctx, conflictingSubmission); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("conflicting pending submission error = %v", err)
+			}
+			stored, err := repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil || stored.AbandonedTerminationEpoch != nil || stored.AbandonedTerminationTxHash == nil || *stored.AbandonedTerminationTxHash != "0xoriginal" {
+				t.Fatalf("pending termination = %#v, err=%v", stored, err)
+			}
+			if err := repos.Replacements.CompleteAbandonedTargetTermination(ctx, replacement.ID); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("pending completion error = %v", err)
+			}
+			input.Epoch, input.ConfirmedTxHash = new(int64(0)), "0xconfirmed"
+			if err := repos.Replacements.RecordTerminationEvidence(ctx, input); err != nil {
 				t.Fatal(err)
 			}
 			var original storagereplacement.Termination
-			if err := db.NewSelect().Model(&original).
-				Where("replacement_id = ? AND role = ?", replacement.ID, storagereplacement.TerminationRoleAbandonedTarget).
-				Scan(ctx); err != nil {
+			if err := db.NewSelect().Model(&original).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil {
 				t.Fatal(err)
 			}
+			originalAttempts, err := repos.Replacements.ListTerminationAttempts(ctx, []int64{replacement.ID})
+			if err != nil || len(originalAttempts) != 1 {
+				t.Fatalf("attempt history = %#v, err=%v", originalAttempts, err)
+			}
+			if originalAttempts[0].TaskID != nil || originalAttempts[0].AttemptedAt != nil || originalAttempts[0].ReceiptStatus != nil {
+				t.Fatalf("observed transaction has inferred submission metadata: %#v", originalAttempts[0])
+			}
 			replay := func(txRepos *repository.Repositories) error {
-				for _, hash := range []string{"0xreplayed", ""} {
-					input.TxHash = hash
-					if err := txRepos.Replacements.RecordAbandonedTerminationEpoch(ctx, input); err != nil {
-						return fmt.Errorf("same-epoch replay: %w", err)
+				if err := txRepos.Replacements.RecordTerminationEvidence(ctx, input); err != nil {
+					return err
+				}
+				for _, mutate := range []func(*repository.RecordTerminationEvidenceInput){
+					func(in *repository.RecordTerminationEvidenceInput) { in.Epoch = new(int64(1)) },
+					func(in *repository.RecordTerminationEvidenceInput) { in.ConfirmedTxHash = "0xconflicting" },
+					func(in *repository.RecordTerminationEvidenceInput) { in.TaskID++ },
+					func(in *repository.RecordTerminationEvidenceInput) { in.Generation++ },
+				} {
+					conflict := input
+					mutate(&conflict)
+					if err := txRepos.Replacements.RecordTerminationEvidence(ctx, conflict); !errors.Is(err, repository.ErrConflict) {
+						return fmt.Errorf("conflict returned %v", err)
 					}
-				}
-				input.Epoch = 1
-				if err := txRepos.Replacements.RecordAbandonedTerminationEpoch(ctx, input); !errors.Is(err, repository.ErrConflict) {
-					return fmt.Errorf("different-epoch replay returned %v, want ErrConflict", err)
-				}
-				stored, err := txRepos.Replacements.GetByID(ctx, replacement.ID)
-				if err != nil {
-					return fmt.Errorf("read after conflict: %w", err)
-				}
-				if stored == nil || stored.AbandonedTerminationEpoch == nil || *stored.AbandonedTerminationEpoch != 0 ||
-					stored.AbandonedTerminationTxHash == nil || *stored.AbandonedTerminationTxHash != "0xoriginal" {
-					return fmt.Errorf("replayed projection = %#v, want original evidence", stored)
 				}
 				return nil
 			}
 			if transactional {
-				err = repos.WithTx(ctx, func(txRepos *repository.Repositories) error { return replay(txRepos) })
+				err = repos.WithTx(ctx, replay)
 			} else {
 				err = replay(repos)
 			}
@@ -863,11 +898,16 @@ func TestAbandonedTerminationEpochReplayPreservesEvidence(t *testing.T) {
 			if err := db.NewSelect().Model(&ledger).Where("replacement_id = ?", replacement.ID).Scan(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if len(ledger) != 1 || ledger[0].ID != original.ID || ledger[0].Epoch != original.Epoch ||
-				ledger[0].TxHash == nil || *ledger[0].TxHash != *original.TxHash ||
-				ledger[0].AbandonedTargetDataSetID == nil || *ledger[0].AbandonedTargetDataSetID != replacement.TargetDataSetID ||
-				!ledger[0].CreatedAt.Equal(original.CreatedAt) || !ledger[0].UpdatedAt.Equal(original.UpdatedAt) {
-				t.Fatalf("ledger after replay = %#v, want one unchanged termination %#v", ledger, original)
+			if len(ledger) != 1 || ledger[0].ID != original.ID || ledger[0].Epoch == nil || *ledger[0].Epoch != 0 || !ledger[0].UpdatedAt.Equal(original.UpdatedAt) {
+				t.Fatalf("ledger = %#v, want unchanged confirmed termination %#v", ledger, original)
+			}
+			attempts, err := repos.Replacements.ListTerminationAttempts(ctx, []int64{replacement.ID})
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("attempt history = %#v, err=%v", attempts, err)
+			}
+			if attempts[0].ID != originalAttempts[0].ID || attempts[0].TxHash == nil || *attempts[0].TxHash != "0xoriginal" ||
+				attempts[0].ConfirmedTxHash == nil || *attempts[0].ConfirmedTxHash != "0xconfirmed" || !attempts[0].UpdatedAt.Equal(originalAttempts[0].UpdatedAt) {
+				t.Fatalf("attempt = %#v, want unchanged evidence %#v", attempts[0], originalAttempts[0])
 			}
 		})
 	}
@@ -899,21 +939,35 @@ func TestRecordedTerminationEpochIsVisibleToTheRetirementGate(t *testing.T) {
 		Exec(t.Context()); err != nil {
 		t.Fatalf("move replacement to retiring: %v", err)
 	}
-	if err := repos.Replacements.RecordTerminationEpoch(t.Context(), repository.RecordTerminationEpochInput{
-		ReplacementID: replacement.ID, TxHash: "0xterminate", Epoch: 84,
-	}); err != nil {
-		t.Fatalf("RecordTerminationEpoch: %v", err)
+	input := terminationTestInput(t, repos, replacement, storagereplacement.TerminationRoleSource)
+	input.TxHash = "0xterminate"
+	if err := repos.Replacements.RecordTerminationEvidence(t.Context(), input); err != nil {
+		t.Fatal(err)
 	}
-	// Recording twice would pay for a second termination transaction.
-	if err := repos.Replacements.RecordTerminationEpoch(t.Context(), repository.RecordTerminationEpochInput{
-		ReplacementID: replacement.ID, TxHash: "0xterminate-again", Epoch: 85,
-	}); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("second RecordTerminationEpoch error = %v, want ErrConflict", err)
+	pendingHead := int64(90)
+	pendingGate, err := repos.Replacements.EvaluateRetirementGate(t.Context(), replacement.ID, &pendingHead)
+	if err != nil || pendingGate.EpochReached || pendingGate.TerminationEpoch != nil {
+		t.Fatalf("pending gate = %#v err=%v", pendingGate, err)
+	}
+	input.ConfirmedTxHash, input.ReceiptStatus = "0xreverted", new(uint64(0))
+	if err := repos.Replacements.RecordTerminationEvidence(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	input.Epoch = new(int64(84))
+	if err := repos.Replacements.RecordTerminationEvidence(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	input.Epoch = new(int64(85))
+	if err := repos.Replacements.RecordTerminationEvidence(t.Context(), input); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("conflicting epoch error = %v", err)
 	}
 
 	stored, err := repos.Replacements.GetByID(t.Context(), replacement.ID)
 	if err != nil || stored == nil || stored.TerminationEpoch == nil || *stored.TerminationEpoch != 84 {
 		t.Fatalf("stored replacement = %#v err=%v, want termination epoch 84", stored, err)
+	}
+	if stored.TerminationReceiptStatus == nil || *stored.TerminationReceiptStatus != 0 || stored.TerminationConfirmedTxHash == nil || *stored.TerminationConfirmedTxHash != "0xreverted" {
+		t.Fatalf("independently observed epoch changed the failed receipt: %#v", stored)
 	}
 	observed := int64(90)
 	gate, err := repos.Replacements.EvaluateRetirementGate(t.Context(), replacement.ID, &observed)
@@ -928,6 +982,135 @@ func TestRecordedTerminationEpochIsVisibleToTheRetirementGate(t *testing.T) {
 	}
 }
 
-// A failed generation must give up the replica slot it was holding. While it
-// kept is_current, bucket provisioning saw a current failed binding, suspended
-// on it every minute, and nothing in the system could ever clear it.
+func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := seedBucket(t, db, "termination-attempts")
+	source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	markSourceReady(t, repos, source.ID)
+	replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: onChainID(t, "202"), ClientRequestID: "termination-attempts",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).Set("status = ?", storagereplacement.StatusSuperseded).Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	evidence := terminationTestInput(t, repos, replacement, storagereplacement.TerminationRoleAbandonedTarget)
+	evidence.AttemptNo = 1
+	admission := repository.BeginTerminationAttemptInput{
+		ReplacementID: evidence.ReplacementID, DataSetID: evidence.DataSetID, Generation: evidence.Generation,
+		TaskID: evidence.TaskID, Role: evidence.Role, AttemptNo: 1, AttemptedAt: time.Now().UTC(),
+	}
+	start := make(chan struct{})
+	admitted := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			admitted <- repos.Replacements.BeginTerminationAttempt(ctx, admission)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-admitted; err != nil {
+			t.Fatalf("admit first request: %v", err)
+		}
+	}
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+		t.Fatalf("settle an admitted request without a returned hash: %v", err)
+	}
+	evidence.TxHash = "0xoriginal"
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+	previousTaskID := evidence.TaskID
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+		Set("finished_at = ?", time.Now().UTC()).Where("id = ?", previousTaskID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	previousTask, err := repos.Tasks.GetByID(ctx, previousTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := repositorySuccessor(t, repos, previousTask)
+	if err := repos.Contents.TransferRetireTaskOwner(ctx, evidence.DataSetID, evidence.Generation, previousTaskID, next.ID); err != nil {
+		t.Fatal(err)
+	}
+	admission.TaskID, admission.PreviousAttemptNo, admission.AttemptNo = next.ID, 1, 2
+	if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("admit another request before a failed receipt: %v", err)
+	}
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("record from a superseded owner: %v", err)
+	}
+	evidence.TaskID, evidence.ConfirmedTxHash, evidence.ReceiptStatus = next.ID, "0xreverted", new(uint64(0))
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+		t.Fatalf("retain reverted receipt: %v", err)
+	}
+	for range 2 {
+		if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); err != nil {
+			t.Fatalf("admit authorized successor request: %v", err)
+		}
+	}
+	stored, err := repos.Replacements.GetByID(ctx, replacement.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.AbandonedTerminationAttemptNo != 2 || stored.AbandonedTerminationTxHash != nil || stored.AbandonedTerminationConfirmedTxHash != nil || stored.AbandonedTerminationReceiptStatus != nil {
+		t.Fatalf("latest attempt projection = %#v, want the new admitted request without inherited evidence", stored)
+	}
+	evidence.AttemptNo, evidence.ConfirmedTxHash, evidence.ReceiptStatus = 2, "", nil
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("reusing a predecessor transaction: %v", err)
+	}
+	evidence.TxHash, evidence.ConfirmedTxHash, evidence.ReceiptStatus = "0xnext", "0xnext-confirmed", new(uint64(1))
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+	conflict := evidence
+	conflict.ReceiptStatus = new(uint64(0))
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, conflict); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("conflicting receipt outcome: %v", err)
+	}
+	evidence.Epoch = new(int64(84))
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := repos.Replacements.ListTerminationAttempts(ctx, []int64{replacement.ID})
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempt history = %#v, err=%v", attempts, err)
+	}
+	if attempts[0].AttemptNo != 1 || attempts[0].TxHash == nil || *attempts[0].TxHash != "0xoriginal" ||
+		attempts[0].ConfirmedTxHash == nil || *attempts[0].ConfirmedTxHash != "0xreverted" || attempts[0].ReceiptStatus == nil || *attempts[0].ReceiptStatus != 0 {
+		t.Fatalf("reverted request evidence = %#v", attempts[0])
+	}
+	if attempts[0].TaskID == nil || *attempts[0].TaskID != previousTaskID {
+		t.Fatalf("first admission owner = %v, want %d", attempts[0].TaskID, previousTaskID)
+	}
+	if attempts[1].AttemptNo != 2 || attempts[1].TxHash == nil || *attempts[1].TxHash != "0xnext" ||
+		attempts[1].ConfirmedTxHash == nil || *attempts[1].ConfirmedTxHash != "0xnext-confirmed" || attempts[1].ReceiptStatus == nil || *attempts[1].ReceiptStatus != 1 {
+		t.Fatalf("successful request evidence = %#v", attempts[1])
+	}
+	if attempts[1].ReplacementID != replacement.ID || attempts[1].Role != evidence.Role {
+		t.Fatalf("history subject = %#v", attempts[1])
+	}
+	if empty, err := repos.Replacements.ListTerminationAttempts(ctx, []int64{replacement.ID + 100}); err != nil || len(empty) != 0 {
+		t.Fatalf("unrelated replacement history = %#v, err=%v", empty, err)
+	}
+	stored, err = repos.Replacements.GetByID(ctx, replacement.ID)
+	if err != nil || stored.AbandonedTerminationEpoch == nil || *stored.AbandonedTerminationEpoch != 84 || stored.AbandonedTerminationReceiptStatus == nil || *stored.AbandonedTerminationReceiptStatus != 1 {
+		t.Fatalf("completed termination = %#v, err=%v", stored, err)
+	}
+	admission.PreviousAttemptNo, admission.AttemptNo = 2, 3
+	if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("admit a request after service termination: %v", err)
+	}
+}

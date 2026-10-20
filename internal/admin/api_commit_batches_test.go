@@ -106,6 +106,13 @@ func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 		}
 	}
 	rr = request(http.MethodGet, "/api/v1/commit-batches/c", nil)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["tx_hash"]) != "null" || string(fields["confirmed_tx_hash"]) != "null" || fields["transaction_id"] != nil {
+		t.Fatalf("transaction fields = %s", rr.Body.String())
+	}
 	var detail commitBatchDetailResponse
 	decodeJSON(t, rr, &detail)
 	if rr.Code != 200 || len(detail.Members) != 1 || detail.Members[0].ContentID != copyRow.ContentID || detail.Members[0].PieceCID != "piece-c" || detail.Members[0].Size == nil || *detail.Members[0].Size != 10 || detail.Members[0].File == nil || detail.Members[0].File.Key != "c-alias" || detail.Members[0].File.Source != "current" || detail.Members[0].File.OtherVersions != 1 {
@@ -168,5 +175,19 @@ func TestAPICommitBatchesPagingAndSealIntent(t *testing.T) {
 	}
 	if rr := request(http.MethodPost, "/api/v1/commit-batches/b/seal", nil); rr.Code != 409 {
 		t.Fatalf("stopped request = %d: %s", rr.Code, rr.Body.String())
+	}
+	if err := f.repos.Contents.BeginCommitSubmission(t.Context(), repository.BeginCommitSubmissionInput{RequestID: "c", TaskID: owner}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.RecordCommitSubmission(t.Context(), repository.CommitSubmissionInput{RequestID: "c", TaskID: owner, Sends: 1, TxHash: "0xsubmitted", StatusURL: "https://provider.example/status/0xsubmitted"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.repos.Contents.ConfirmCommitRequest(t.Context(), repository.ConfirmCommitRequestInput{RequestID: "c", TaskID: owner, FirstPieceID: onChainIDValue("77"), ConfirmedTxHash: "0xconfirmed", RetrievalURLs: []string{"https://provider.example/piece-c"}}); err != nil {
+		t.Fatal(err)
+	}
+	rr = request(http.MethodGet, "/api/v1/commit-batches/c", nil)
+	decodeJSON(t, rr, &detail)
+	if rr.Code != http.StatusOK || detail.TxHash == nil || *detail.TxHash != "0xsubmitted" || detail.ConfirmedTxHash == nil || *detail.ConfirmedTxHash != "0xconfirmed" {
+		t.Fatalf("transaction detail = %#v (%d)", detail, rr.Code)
 	}
 }

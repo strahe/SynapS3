@@ -340,6 +340,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
 	}
 	defer walletReceiptClient.Close()
+	storageClient.ConfigureTerminationChain(walletReceiptClient)
 	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC,
 		walletoperation.NewExecutionIdentity(storageIdentity, resolvedAddresses.Payments, resolvedAddresses.USDFC), walletReceiptClient)
 	approvedCatalog, err := synapse.NewApprovedProviderCatalog(walletReceiptClient, client.WarmStorage().ViewAddress())

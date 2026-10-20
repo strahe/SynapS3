@@ -108,7 +108,8 @@ type StorageDataSet struct {
 	DataSetID            *types.OnChainID     `bun:"type:text"`
 	ClientDataSetID      *types.OnChainID     `bun:"type:text"`
 	Status               StorageDataSetStatus `bun:"type:text,notnull,default:'pending'"`
-	CreateTransactionID  *string              `bun:"type:text,nullzero"`
+	TxHash               *string              `bun:"type:text,nullzero"`
+	ConfirmedTxHash      *string              `bun:"type:text,nullzero"`
 	CreateStatusURL      *string              `bun:"type:text,nullzero"`
 	CreatedByContentID   *int64               `bun:",nullzero"`
 	LastError            *string              `bun:"type:text,nullzero"`
@@ -164,15 +165,15 @@ type StorageCopy struct {
 
 	// The copy's commit request is projected by repository reads. These fields
 	// are not columns on the copy table.
-	CommitState                  *string    `bun:",scanonly"`
-	CommitTaskID                 *int64     `bun:",scanonly"`
-	CommitPieceCount             *int       `bun:",scanonly"`
-	CommitSentAt                 *time.Time `bun:",scanonly"`
-	CommitTransactionID          *string    `bun:",scanonly"`
-	CommitSubmitError            *string    `bun:",scanonly"`
-	CommitConfirmedTransactionID *string    `bun:",scanonly"`
-	CommitAttentionCode          *string    `bun:",scanonly"`
-	CommitAttentionAt            *time.Time `bun:",scanonly"`
+	CommitState           *string    `bun:",scanonly"`
+	CommitTaskID          *int64     `bun:",scanonly"`
+	CommitPieceCount      *int       `bun:",scanonly"`
+	CommitSentAt          *time.Time `bun:",scanonly"`
+	CommitTxHash          *string    `bun:",scanonly"`
+	CommitSubmitError     *string    `bun:",scanonly"`
+	CommitConfirmedTxHash *string    `bun:",scanonly"`
+	CommitAttentionCode   *string    `bun:",scanonly"`
+	CommitAttentionAt     *time.Time `bun:",scanonly"`
 
 	Content    *StorageContent `bun:"rel:belongs-to,join:content_id=id"`
 	StorageSet *StorageDataSet `bun:"rel:belongs-to,join:storage_data_set_id=id"`

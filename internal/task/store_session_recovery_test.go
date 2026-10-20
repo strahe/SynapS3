@@ -163,7 +163,7 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 					URL     string    `json:"provider_service_url"`
 					Started time.Time `json:"observation_started_at"`
 				}
-				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.URL != originalURL || !evidence.Started.IsZero() || row.FailureReason == nil || *row.FailureReason != "store_resend_required" || row.LastError == nil || *row.LastError != "provider returned HTTP 409: Data has already been uploaded" {
+				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.URL != originalURL || !evidence.Started.IsZero() || row.FailureReason == nil || *row.FailureReason != "store_resend_required" || row.LastError == nil || (!strings.Contains(*row.LastError, "HTTP 409: Data has already been uploaded") || !strings.Contains(*row.LastError, synapse.ErrStoreSessionClaimed.Error())) {
 					t.Fatalf("busy recovery lost session or HTTP evidence: checkpoint=%+v task=%+v err=%v", evidence, row, err)
 				}
 				for retry := 1; retry <= 3; retry++ {
@@ -195,7 +195,7 @@ func TestStoreSessionRecoveryPreservesOriginalRequest(t *testing.T) {
 				if incomplete {
 					stage, reason = "expired", "provider_confirmation"
 				}
-				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.Stage != stage || evidence.Incomplete != incomplete || !evidence.Started.IsZero() || row.RetryCount != 2 || row.FailureReason == nil || *row.FailureReason != reason || row.LastError == nil || *row.LastError != "provider returned HTTP 409: Data has already been uploaded" || creates.Load() != 0 || uploads.Load() != 2 {
+				if err := json.Unmarshal(row.Checkpoint, &evidence); err != nil || evidence.Session != original || evidence.Stage != stage || evidence.Incomplete != incomplete || !evidence.Started.IsZero() || row.RetryCount != 2 || row.FailureReason == nil || *row.FailureReason != reason || row.LastError == nil || (!strings.Contains(*row.LastError, "HTTP 409: Data has already been uploaded") || !strings.Contains(*row.LastError, synapse.ErrStoreSessionClaimed.Error())) || creates.Load() != 0 || uploads.Load() != 2 {
 					t.Fatalf("claimed upload ignored completion evidence: checkpoint=%+v task=%+v create=%d uploads=%d err=%v", evidence, row, creates.Load(), uploads.Load(), err)
 				}
 				if !incomplete {

@@ -845,13 +845,70 @@ func TestReplacementResponseShowsBoundRetirementFailureWithoutChangingDomainEvid
 			if err := f.srv.repos.Contents.BindDataSetRetirementTask(ctx, dataSetID, 1, retirement.ID); err != nil {
 				t.Fatal(err)
 			}
-			evidence := repository.RecordTerminationEpochInput{ReplacementID: row.ID, Epoch: 123, TxHash: "0xtermination"}
+			role := storagereplacement.TerminationRoleSource
 			if abandoned {
-				err = f.srv.repos.Replacements.RecordAbandonedTerminationEpoch(ctx, evidence)
-			} else {
-				err = f.srv.repos.Replacements.RecordTerminationEpoch(ctx, evidence)
+				role = storagereplacement.TerminationRoleAbandonedTarget
 			}
+			evidence := repository.RecordTerminationEvidenceInput{
+				ReplacementID: row.ID, DataSetID: dataSetID, Generation: 1, TaskID: retirement.ID, Role: role,
+				AttemptNo: 1, TxHash: "0xtermination",
+			}
+			if err := f.srv.repos.Replacements.BeginTerminationAttempt(ctx, repository.BeginTerminationAttemptInput{
+				ReplacementID: row.ID, DataSetID: dataSetID, Generation: 1, TaskID: retirement.ID, Role: role,
+				AttemptNo: 1, AttemptedAt: time.Now().UTC(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err = f.srv.repos.Replacements.RecordTerminationEvidence(ctx, evidence)
 			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := f.srv.repos.Replacements.GetByID(ctx, row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pendingResponse, err := f.srv.providerReplacementResponse(ctx, f.bucket.Name, pending)
+			if err != nil {
+				t.Fatal(err)
+			}
+			termination := pendingResponse.Source.Termination
+			if abandoned {
+				termination = pendingResponse.Target.Termination
+			}
+			if termination == nil || termination.TxHash == nil || *termination.TxHash != evidence.TxHash || termination.ConfirmedTxHash != nil || termination.Epoch != nil {
+				t.Fatalf("pending termination = %#v", termination)
+			}
+			if termination.AttemptNo == nil || *termination.AttemptNo != 1 || termination.ReceiptStatus != nil || len(termination.Attempts) != 1 {
+				t.Fatalf("pending termination attempts = %#v", termination)
+			}
+			evidence.ConfirmedTxHash, evidence.ReceiptStatus = "0xfailed-termination", new(uint64(0))
+			if err := f.srv.repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.srv.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+				Set("failure_reason = ?", "termination_confirmation_failed").Set("last_error = ?", "Termination transaction failed").
+				Set("checkpoint_json = ?", json.RawMessage(`{"attempt_no":1,"transaction_hash":"0xtermination","confirmed_tx_hash":"0xfailed-termination","receipt_status":0}`)).
+				Set("finished_at = ?", time.Now()).Where("id = ?", retirement.ID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			retirement, err = f.srv.taskService.Retry(ctx, retirement.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.srv.repos.Replacements.BeginTerminationAttempt(ctx, repository.BeginTerminationAttemptInput{
+				ReplacementID: row.ID, DataSetID: dataSetID, Generation: 1, TaskID: retirement.ID, Role: role,
+				PreviousAttemptNo: 1, AttemptNo: 2, AttemptedAt: time.Now().UTC(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			evidence.AttemptNo, evidence.TaskID, evidence.TxHash = 2, retirement.ID, "0xretry-termination"
+			evidence.ConfirmedTxHash, evidence.ReceiptStatus = "", nil
+			if err := f.srv.repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+				t.Fatal(err)
+			}
+			evidence.Epoch, evidence.ConfirmedTxHash = new(int64(123)), "0xconfirmed-termination"
+			evidence.ReceiptStatus = new(uint64(1))
+			if err := f.srv.repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
 				t.Fatal(err)
 			}
 			if tc.cleanupAttention {
@@ -879,15 +936,51 @@ func TestReplacementResponseShowsBoundRetirementFailureWithoutChangingDomainEvid
 			if response.Status != wantStatus || !response.RetirementAttention || !response.Retryable || response.RetryTaskID == nil || *response.RetryTaskID != retirement.ID || response.LastError == nil || *response.LastError != "Could not check retirement" {
 				t.Fatalf("retirement response = %#v", response)
 			}
+			termination = response.Source.Termination
+			if abandoned {
+				termination = response.Target.Termination
+			}
+			if termination == nil || termination.TxHash == nil || *termination.TxHash != evidence.TxHash || termination.ConfirmedTxHash == nil || *termination.ConfirmedTxHash != evidence.ConfirmedTxHash || termination.Epoch == nil || *termination.Epoch != *evidence.Epoch {
+				t.Fatalf("confirmed termination = %#v", termination)
+			}
+			if termination.AttemptNo == nil || *termination.AttemptNo != 2 || termination.ReceiptStatus == nil || *termination.ReceiptStatus != 1 {
+				t.Fatalf("latest termination outcome = %#v", termination)
+			}
+			if len(termination.Attempts) != 2 {
+				t.Fatalf("termination history has %d attempts, want 2", len(termination.Attempts))
+			}
+			failedAttempt, confirmedAttempt := termination.Attempts[0], termination.Attempts[1]
+			if failedAttempt.AttemptNo != 1 || failedAttempt.TxHash == nil || *failedAttempt.TxHash != "0xtermination" || failedAttempt.ConfirmedTxHash == nil || *failedAttempt.ConfirmedTxHash != "0xfailed-termination" {
+				t.Fatalf("failed transaction hashes = %#v", failedAttempt)
+			}
+			if failedAttempt.ReceiptStatus == nil || *failedAttempt.ReceiptStatus != 0 || failedAttempt.TaskID == nil || failedAttempt.AttemptedAt == nil {
+				t.Fatalf("failed transaction context = %#v", failedAttempt)
+			}
+			if confirmedAttempt.AttemptNo != 2 || confirmedAttempt.ReceiptStatus == nil || *confirmedAttempt.ReceiptStatus != 1 || confirmedAttempt.TaskID == nil || *confirmedAttempt.TaskID != retirement.ID {
+				t.Fatalf("confirmed transaction context = %#v", confirmedAttempt)
+			}
+			listed := f.srv.bucketReplacementResponses(ctx, f.bucket.Name, f.bucket.ID)
+			var listedTermination *replacementTerminationResponse
+			for _, replacement := range listed {
+				if replacement.ID == row.ID {
+					listedTermination = replacement.Source.Termination
+					if abandoned {
+						listedTermination = replacement.Target.Termination
+					}
+				}
+			}
+			if listedTermination == nil || len(listedTermination.Attempts) != 2 || listedTermination.Attempts[0].ReceiptStatus == nil || *listedTermination.Attempts[0].ReceiptStatus != 0 {
+				t.Fatalf("bucket response lost failed transaction: %#v", listedTermination)
+			}
 			after, err := f.srv.repos.Replacements.GetByID(ctx, row.ID)
 			if err != nil || after.Status != before.Status || after.LastError != nil && (before.LastError == nil || *after.LastError != *before.LastError) {
 				t.Fatalf("presentation changed replacement: before=%#v after=%#v err=%v", before, after, err)
 			}
 			if abandoned {
-				if after.AbandonedTerminationEpoch == nil || *after.AbandonedTerminationEpoch != evidence.Epoch {
+				if after.AbandonedTerminationEpoch == nil || *after.AbandonedTerminationEpoch != *evidence.Epoch {
 					t.Fatalf("lost target termination evidence: %#v", after)
 				}
-			} else if after.TerminationEpoch == nil || *after.TerminationEpoch != evidence.Epoch {
+			} else if after.TerminationEpoch == nil || *after.TerminationEpoch != *evidence.Epoch {
 				t.Fatalf("lost source termination evidence: %#v", after)
 			}
 			retryPath := "/api/v1/tasks/" + strconv.FormatInt(*response.RetryTaskID, 10) + "/retry"
@@ -908,8 +1001,8 @@ func TestReplacementResponseShowsBoundRetirementFailureWithoutChangingDomainEvid
 			if err != nil || after.Status != before.Status || before.LastError != nil && (after.LastError == nil || *after.LastError != *before.LastError) {
 				t.Fatalf("Retry changed replacement identity: %#v %v", after, err)
 			}
-			if !abandoned && (after.TerminationEpoch == nil || *after.TerminationEpoch != evidence.Epoch) ||
-				abandoned && (after.AbandonedTerminationEpoch == nil || *after.AbandonedTerminationEpoch != evidence.Epoch) {
+			if !abandoned && (after.TerminationEpoch == nil || *after.TerminationEpoch != *evidence.Epoch) ||
+				abandoned && (after.AbandonedTerminationEpoch == nil || *after.AbandonedTerminationEpoch != *evidence.Epoch) {
 				t.Fatalf("Retry changed termination evidence: %#v", after)
 			}
 			response, err = f.srv.providerReplacementResponse(ctx, f.bucket.Name, after)

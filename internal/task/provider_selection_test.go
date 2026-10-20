@@ -1097,7 +1097,24 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			if err := runtime.repos.Replacements.BeginRetirement(ctx, replacement.ID); err != nil {
 				t.Fatal(err)
 			}
-			if err := runtime.repos.Replacements.RecordTerminationEpoch(ctx, repository.RecordTerminationEpochInput{ReplacementID: replacement.ID, Epoch: 100}); err != nil {
+			generation, err := runtime.repos.Contents.NextDataSetRetirementGeneration(ctx, replacement.SourceDataSetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			retirement, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
+				Type:  model.TaskTypeStorageDataSetRetire,
+				Input: storagereplacement.RetireInput{ReplacementID: replacement.ID, DataSetID: replacement.SourceDataSetID, Generation: generation},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Contents.BindDataSetRetirementTask(ctx, replacement.SourceDataSetID, generation, retirement.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.repos.Replacements.RecordTerminationEvidence(ctx, repository.RecordTerminationEvidenceInput{
+				ReplacementID: replacement.ID, DataSetID: replacement.SourceDataSetID, Generation: generation, TaskID: retirement.ID,
+				Role: storagereplacement.TerminationRoleSource, Epoch: new(int64(100)),
+			}); err != nil {
 				t.Fatal(err)
 			}
 			if err := runtime.repos.Replacements.CompleteRetirement(ctx, replacement.ID, 100); err != nil {

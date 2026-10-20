@@ -43,7 +43,8 @@ type commitBatchResponse struct {
 	TaskStatus         *model.TaskStatus           `json:"task_status"`
 	StatusMessage      *string                     `json:"status_message"`
 	LastError          *string                     `json:"last_error"`
-	TransactionID      *string                     `json:"transaction_id"`
+	TxHash             *string                     `json:"tx_hash"`
+	ConfirmedTxHash    *string                     `json:"confirmed_tx_hash"`
 	Task               *taskListItem               `json:"task,omitempty"`
 }
 
@@ -92,7 +93,7 @@ func (s *Server) commitBatchResponse(row *repository.CommitBatch) commitBatchRes
 		MemberCount: row.MemberCount, MaxPieces: maxPieces, TotalBytes: row.TotalBytes, OldestReadyAt: row.OldestReadyAt,
 		CollectionDeadline: deadline, SealRequestedAt: row.SealRequestedAt, SealedAt: row.SealedAt, SubmittedAt: row.SubmittedAt,
 		ConfirmedAt: row.ConfirmedAt, CreatedAt: row.CreatedAt, CanSeal: canSeal, TaskID: row.TaskID, TaskStatus: row.TaskStatus,
-		StatusMessage: row.TaskMessage, LastError: lastError, TransactionID: row.TransactionID,
+		StatusMessage: row.TaskMessage, LastError: lastError, TxHash: row.TxHash, ConfirmedTxHash: row.ConfirmedTxHash,
 	}
 }
 

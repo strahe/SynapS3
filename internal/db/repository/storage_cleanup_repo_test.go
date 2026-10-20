@@ -359,13 +359,13 @@ func TestStorageCleanupSnapshotsEveryCommittedCopy(t *testing.T) {
 	}
 	if err := repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
 		CommitSendInput: repository.CommitSendInput{RequestID: requestID, TaskID: taskID, Sends: 1},
-		TransactionID:   "tx-late-copy", StatusURL: "https://provider.example/status/late-copy",
+		TxHash:          "tx-late-copy", StatusURL: "https://provider.example/status/late-copy",
 	}); err != nil {
 		t.Fatalf("RecordCommitSubmission: %v", err)
 	}
 	secondPieceID := onChainID(t, "902")
 	members, err := repos.Contents.ConfirmCommitRequest(ctx, repository.ConfirmCommitRequestInput{
-		RequestID: requestID, TaskID: taskID, ConfirmedTransactionID: "tx-late-copy",
+		RequestID: requestID, TaskID: taskID, ConfirmedTxHash: "tx-late-copy",
 		FirstPieceID: secondPieceID, RetrievalURLs: []string{"https://provider.example/second-piece"},
 	})
 	if err != nil || len(members) != 1 || members[0].ID != secondCopy.ID {

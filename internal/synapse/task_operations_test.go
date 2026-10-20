@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/iotest"
@@ -170,7 +171,7 @@ func TestTaskStoreSessionErrorsPreserveHTTPStatus(t *testing.T) {
 				t.Fatalf("fully read request was reported as truncated: %v", got)
 			}
 			httpErr, ok := errors.AsType[*pdp.HTTPError](got)
-			if !ok || httpErr.StatusCode != tc.status {
+			if !ok || httpErr.StatusCode != tc.status || !strings.Contains(httpErr.Body, "provider response") {
 				t.Fatalf("HTTP classification = %#v, %v", httpErr, got)
 			}
 			mu.Lock()
@@ -456,7 +457,8 @@ func TestTaskStoreSessionEarlyResponseStopsBodyRead(t *testing.T) {
 func TestTaskDataSetObservationUsesOneStatusRequest(t *testing.T) {
 	t.Parallel()
 	hash := common.HexToHash("0x1234")
-	for _, state := range []string{"pending", "confirmed", "unavailable"} {
+	confirmedHash := common.HexToHash("0x5678")
+	for _, state := range []string{"pending", "confirmed", "confirmed rejected", "failed", "reorged", "unavailable"} {
 		t.Run(state, func(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -470,7 +472,10 @@ func TestTaskDataSetObservationUsesOneStatusRequest(t *testing.T) {
 				}
 				body := map[string]any{"createMessageHash": hash.Hex(), "txStatus": state, "dataSetCreated": state == "confirmed"}
 				if state == "confirmed" {
-					body["dataSetId"], body["ok"] = 202, true
+					body["dataSetId"], body["ok"], body["confirmedTxHash"] = 202, true, confirmedHash.Hex()
+				}
+				if state == "confirmed rejected" {
+					body["txStatus"], body["ok"], body["confirmedTxHash"] = "confirmed", false, confirmedHash.Hex()
 				}
 				if err := json.NewEncoder(w).Encode(body); err != nil {
 					t.Error(err)
@@ -490,6 +495,19 @@ func TestTaskDataSetObservationUsesOneStatusRequest(t *testing.T) {
 			if state == "unavailable" {
 				if err == nil {
 					t.Fatal("provider error was lost")
+				}
+				return
+			}
+			if state == "failed" || state == "reorged" || state == "confirmed rejected" {
+				txStatus := state
+				if state == "confirmed rejected" {
+					txStatus = "confirmed"
+				}
+				if !errors.Is(err, ErrProviderTransactionRejected) || !strings.Contains(err.Error(), "tx_status="+fmt.Sprintf("%q", txStatus)) || result == nil || result.TransactionID != hash.Hex() {
+					t.Fatalf("rejected observation result=%#v err=%v", result, err)
+				}
+				if state == "confirmed rejected" && result.ConfirmedTransactionID != confirmedHash.Hex() {
+					t.Fatalf("rejected confirmation hash=%s", result.ConfirmedTransactionID)
 				}
 				return
 			}

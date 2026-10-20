@@ -31,6 +31,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
@@ -274,9 +275,13 @@ type testServiceTerminator struct {
 	notPaidFor atomic.Bool
 }
 
-func (t *testServiceTerminator) TerminateService(context.Context, sdktypes.BigInt) (*synapse.TerminationResult, error) {
+func (t *testServiceTerminator) TerminateService(_ context.Context, _ sdktypes.BigInt, onSubmitted func(string) error) (*synapse.TerminationResult, error) {
 	t.calls.Add(1)
-	return t.result, t.err
+	err := t.err
+	if t.result != nil && t.result.TxHash != "" && onSubmitted != nil {
+		err = errors.Join(err, onSubmitted(t.result.TxHash))
+	}
+	return t.result, err
 }
 
 func (t *testServiceTerminator) VerifyServicePayer(context.Context, sdktypes.BigInt) error {
@@ -1776,14 +1781,14 @@ func TestStorageCleanupManualRetryCheckpointFailureDoesNotSend(t *testing.T) {
 	}
 }
 
-func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
+func TestStorageCleanupSubmissionWriteFailureRetainsReturnedHash(t *testing.T) {
 	var deleteCalls atomic.Int64
-	newHash := common.HexToHash("0x2")
+	hash := common.HexToHash("0x2")
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 			return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 				deleteCalls.Add(1)
-				return &sdktypes.WriteResult{Hash: newHash}, nil
+				return &sdktypes.WriteResult{Hash: hash}, nil
 			}}, nil
 		}},
 		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
@@ -1792,45 +1797,81 @@ func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
 	})
 	ctx := t.Context()
 	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	submissionContention(t, &runtime, model.TaskTypeStorageCleanup, "storage_cleanup_copies", "UPDATE OF status", "OLD.status = 'pending' AND NEW.status = 'delete_scheduled'")
+	storedTask := runStorageTaskClaims(t, runtime, taskRow, model.TaskStatusPending, 1, 3*handlerTestLeaseDuration)
 	copyRow := new(model.StorageCleanupCopy)
 	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
-		t.Fatalf("load cleanup copy: %v", err)
+		t.Fatal(err)
 	}
-	testutil.FailWrites(t, runtime.db, "storage_cleanup_copies", "UPDATE OF status", "OLD.status = 'pending' AND NEW.status = 'delete_scheduled'", "injected cleanup hash failure")
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
+	if deleteCalls.Load() != 1 || copyRow.DeleteTxHash == nil || *copyRow.DeleteTxHash != hash.Hex() || copyRow.Status != model.StorageCleanupCopyStatusDeleteScheduled || !strings.Contains(string(storedTask.Checkpoint), hash.Hex()) {
+		t.Fatalf("cleanup evidence = %#v checkpoint=%s deleteCalls=%d", copyRow, storedTask.Checkpoint, deleteCalls.Load())
+	}
+	if storedTask.RetryCount != 0 || storedTask.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("cleanup contention consumed a business opportunity: %#v", storedTask)
+	}
+	wakeTask(t, runtime, storedTask.ID)
+	storedTask = runOneStorageTask(t, runtime, storedTask, model.TaskStatusPending)
+	if deleteCalls.Load() != 1 || storedTask.RetryCount != 0 {
+		t.Fatalf("cleanup recovery repeated DELETE: task=%#v calls=%d", storedTask, deleteCalls.Load())
+	}
+}
+
+func TestStorageCleanupPersistentEvidenceFailureRecoversWithoutResending(t *testing.T) {
+	var deleteCalls atomic.Int64
+	hash := common.HexToHash("0x2")
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				deleteCalls.Add(1)
+				return &sdktypes.WriteResult{Hash: hash}, nil
+			}}, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
+		},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	if _, err := runtime.db.ExecContext(ctx, "CREATE SEQUENCE cleanup_persistent_fault"); err != nil {
+		t.Fatal(err)
+	}
+	testutil.FailWrites(t, runtime.db, "storage_cleanup_copies", "UPDATE OF status", "OLD.status = 'pending' AND NEW.status = 'delete_scheduled' AND nextval('cleanup_persistent_fault') > 0", "injected cleanup evidence failure")
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
 	runtime.repos.Tasks = limited
 	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	first := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	defer func() { stopHandlerEngine(t, cancel, done) }()
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		var failures int64
+		if err := runtime.db.NewRaw("SELECT last_value FROM cleanup_persistent_fault").Scan(ctx, &failures); err != nil {
+			t.Fatal(err)
+		}
+		return failures >= 2 && limited.claims.Load() == 1 && task.Status == model.TaskStatusRunning && deleteCalls.Load() == 1
 	})
-	if len(first.Checkpoint) == 0 || deleteCalls.Load() != 1 {
-		t.Fatalf("unrecorded request task = %#v, delete calls = %d", first, deleteCalls.Load())
+	stopHandlerEngine(t, cancel, done)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
-		t.Fatalf("reload cleanup copy: %v", err)
+	if copyRow.DeleteTxHash != nil {
+		t.Fatalf("failed settlement committed partial evidence: %#v", copyRow)
 	}
-	if copyRow.Status != model.StorageCleanupCopyStatusPending || copyRow.DeleteTxHash != nil {
-		t.Fatalf("unrecorded request ledger = %#v", copyRow)
+	stopped, err := runtime.repos.Tasks.GetByID(ctx, taskRow.ID)
+	if err != nil || stopped == nil || strings.Contains(string(stopped.Checkpoint), hash.Hex()) {
+		t.Fatalf("failed settlement committed checkpoint without ledger: %#v error=%v", stopped, err)
 	}
-	agedCheckpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "attempted_at": time.Now().Add(-25 * time.Hour)})
+	checkpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "identity": testutil.DefaultContextIdentity, "pdp_verifier": testutil.DefaultPDPVerifierAddress, "attempted_at": time.Now().Add(-25 * time.Hour)})
 	if err != nil {
-		t.Fatalf("encode aged checkpoint: %v", err)
+		t.Fatal(err)
 	}
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("checkpoint_json = ?", json.RawMessage(agedCheckpoint)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
-		t.Fatalf("age cleanup checkpoint: %v", err)
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("checkpoint_json = ?", json.RawMessage(checkpoint)).Set("lease_until = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
 	}
 	ageHandlerOperation(t, runtime, taskRow.ID, 25*time.Hour)
-	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
-		t.Fatalf("advance cleanup poll: %v", err)
-	}
-	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 2 && task.Status == model.TaskStatusFailed
-	})
+	limited.maximum = 2
+	cancel, done = runHandlerEngine(t, runtime)
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
 	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !handlerTaskRetryable(t, runtime, failed) || deleteCalls.Load() != 1 {
-		t.Fatalf("unrecorded hash outcome = %#v, delete calls = %d", failed, deleteCalls.Load())
+		t.Fatalf("unsafe recovery after evidence loss: %#v deleteCalls=%d", failed, deleteCalls.Load())
 	}
 }
 
@@ -3032,7 +3073,7 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 		fmt.Errorf("provider 2: GET https://provider.example/pdp/ping?token=secret-token: %w: provider.example resolves to 198.18.0.1", storage.ErrPrivateNetwork),
 	)}
 	fundingErr := &synapse.ProviderUnavailableError{Cause: fmt.Errorf(
-		"reading upload costs: Post https://rpc.example/v1/secret-key?token=secret-token: %w", context.DeadlineExceeded,
+		"reading upload costs: Post https://secret-user:secret-key@rpc.example/v1/rpc?token=secret-token: %w", context.DeadlineExceeded,
 	)}
 	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
 		for _, phase := range []struct {
@@ -3119,7 +3160,7 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 				waiting := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 					return task.Status == model.TaskStatusPending && task.ClaimGeneration == 1 && task.LastError != nil
 				})
-				wantError := synapse.ErrorSummary(phase.err)
+				wantError := errtext.Format(phase.err)
 				if waiting.LastError == nil || *waiting.LastError != wantError {
 					t.Fatalf("waiting task last_error = %v, want %q", waiting.LastError, wantError)
 				}
@@ -3145,7 +3186,7 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 				if strings.Contains(wantError, "secret") || strings.Contains(string(logged), "secret") {
 					t.Fatal("waiting task or log exposed endpoint credentials")
 				}
-				if phase.reason == "providers" && !strings.Contains(wantError, "provider.example resolves to 198.18.0.1") {
+				if phase.reason == "providers" && (!strings.Contains(wantError, "https://provider.example/pdp/ping") || !strings.Contains(wantError, "provider.example resolves to 198.18.0.1")) {
 					t.Fatal("waiting task omitted the blocked provider address")
 				}
 				wakeTask(t, runtime, taskRow.ID)
@@ -3158,7 +3199,7 @@ func TestStoragePlanningFailuresConsumeBudgetAndKeepSanitizedErrors(t *testing.T
 				}
 				dependencyStage.Store(1)
 				wakeTask(t, runtime, taskRow.ID)
-				wantChangedError := synapse.ErrorSummary(changedErr)
+				wantChangedError := errtext.Format(changedErr)
 				waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 					return task.ClaimGeneration == 3 && task.Status == model.TaskStatusPending && task.LastError != nil && *task.LastError == wantChangedError
 				})
@@ -3288,7 +3329,7 @@ func TestDataSetCreationDoesNotRequireMetadataDiscovery(t *testing.T) {
 		CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 			createCalls.Add(1)
 			ref, err := storage.NewDataSetRef(providerID.SDK(), dataSetID.SDK(), *options.ClientDataSetID)
-			return &storage.CreateDataSetResult{DataSet: ref}, err
+			return &storage.CreateDataSetResult{DataSet: ref, TransactionID: "0xsubmitted", ConfirmedTransactionID: "0xconfirmed"}, errors.Join(err, errors.New("provider response ended after confirmation"))
 		},
 	}
 	storageClient := &testutil.MockStorageClient{
@@ -3308,6 +3349,9 @@ func TestDataSetCreationDoesNotRequireMetadataDiscovery(t *testing.T) {
 	binding, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
 	if err != nil || binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || !binding.DataSetID.Equal(dataSetID) || binding.ClientDataSetID == nil || binding.ClientDataSetID.IsZero() {
 		t.Fatalf("created data set = %#v err=%v", binding, err)
+	}
+	if binding.TxHash == nil || *binding.TxHash != "0xsubmitted" || binding.ConfirmedTxHash == nil || *binding.ConfirmedTxHash != "0xconfirmed" {
+		t.Fatalf("creation evidence=%#v", binding)
 	}
 	if createCalls.Load() != 1 || discoveryCalls.Load() != 0 {
 		t.Fatalf("creation calls=%d metadata discovery calls=%d", createCalls.Load(), discoveryCalls.Load())
@@ -3365,7 +3409,7 @@ func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
 		t.Fatalf("data set admission task = %#v", failed)
 	}
 	stored, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), binding.ID)
-	if err != nil || stored.Status != model.StorageDataSetStatusPending || stored.CreateTransactionID != nil || stored.CreateStatusURL != nil {
+	if err != nil || stored.Status != model.StorageDataSetStatusPending || stored.TxHash != nil || stored.CreateStatusURL != nil {
 		t.Fatalf("data set after admission failure = %#v, err=%v", stored, err)
 	}
 	if createCalls.Load() != 0 {
@@ -4621,6 +4665,12 @@ func TestWalletInvalidBroadcastEvidencePreservesCandidateHash(t *testing.T) {
 	}
 }
 
+type walletRPCDiagnosticError string
+
+func (e walletRPCDiagnosticError) Error() string { return string(e) }
+func (walletRPCDiagnosticError) ErrorCode() int  { return 3 }
+func (walletRPCDiagnosticError) ErrorData() any  { return "0xdeadbeef" }
+
 func TestWalletSignedTransactionObservationAndManualRetry(t *testing.T) {
 	key, err := crypto.HexToECDSA(strings.Repeat("01", 32))
 	if err != nil {
@@ -4660,14 +4710,14 @@ func TestWalletSignedTransactionObservationAndManualRetry(t *testing.T) {
 			identity: identity,
 			withdraw: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
 				broadcasts.Add(1)
-				return submission, errors.New("broadcast connection lost")
+				return submission, &sdktypes.BroadcastError{Transaction: tx, Cause: walletRPCDiagnosticError("execution reverted during broadcast: https://rpc.example/broadcast?token=private-token")}
 			},
 			replay: func(_ context.Context, operationType model.WalletOperationType, amount *big.Int, got synapse.WalletSubmission) error {
 				replays.Add(1)
 				if operationType != model.WalletOperationTypeWithdraw || amount.Cmp(big.NewInt(100)) != 0 || got.TxHash != submission.TxHash || !bytes.Equal(got.SignedTransaction, raw) {
 					t.Errorf("replayed transaction or request differs")
 				}
-				return fmt.Errorf("%w: connection lost", synapse.ErrWalletReplayBroadcast)
+				return fmt.Errorf("%w: %w", synapse.ErrWalletReplayBroadcast, walletRPCDiagnosticError("execution reverted during replay: https://rpc.example/broadcast?token=private-token"))
 			},
 		},
 		receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
@@ -4686,6 +4736,14 @@ func TestWalletSignedTransactionObservationAndManualRetry(t *testing.T) {
 	if err != nil || stored.Status != model.WalletOperationStatusSubmitted || !bytes.Equal(stored.SignedTransaction, raw) || stored.LastError == nil {
 		t.Fatalf("signed broadcast evidence not preserved: %#v %v", stored, err)
 	}
+	for _, want := range []string{"execution reverted during broadcast", "RPC code: 3", "Revert data: 0xdeadbeef"} {
+		if !strings.Contains(*stored.LastError, want) {
+			t.Errorf("broadcast diagnostic = %q, missing %q", *stored.LastError, want)
+		}
+	}
+	if strings.Contains(*stored.LastError, "private-token") {
+		t.Fatalf("broadcast diagnostic exposed URL secret: %q", *stored.LastError)
+	}
 	firstRuntime := bytes.Clone(row.Runtime)
 	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, false), model.TaskStatusPending)
 	if row.RetryCount != 0 || replays.Load() != 0 || !testutil.JSONEqual(row.Runtime, firstRuntime) {
@@ -4698,6 +4756,18 @@ func TestWalletSignedTransactionObservationAndManualRetry(t *testing.T) {
 	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, false), model.TaskStatusPending)
 	if row.RetryCount != 1 || replays.Load() != 1 || row.ResumeMode != model.TaskResumeModeRecover {
 		t.Fatalf("replay did not enter a fresh free observation: %#v replays=%d", row, replays.Load())
+	}
+	stored, err = runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || stored.LastError == nil {
+		t.Fatalf("replay diagnostic was not persisted: %#v %v", stored, err)
+	}
+	for _, want := range []string{"execution reverted during replay", "RPC code: 3", "Revert data: 0xdeadbeef"} {
+		if !strings.Contains(*stored.LastError, want) {
+			t.Errorf("replay diagnostic = %q, missing %q", *stored.LastError, want)
+		}
+	}
+	if strings.Contains(*stored.LastError, "private-token") {
+		t.Fatalf("replay diagnostic exposed URL secret: %q", *stored.LastError)
 	}
 	row = runOneStorageTask(t, runtime, readyWalletTask(t, runtime, row, true), model.TaskStatusFailed)
 	if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" {
@@ -5870,8 +5940,12 @@ type sequencedTerminator struct {
 	respond func(call int64) (*synapse.TerminationResult, error)
 }
 
-func (s *sequencedTerminator) TerminateService(context.Context, sdktypes.BigInt) (*synapse.TerminationResult, error) {
-	return s.respond(s.calls.Add(1))
+func (s *sequencedTerminator) TerminateService(_ context.Context, _ sdktypes.BigInt, onSubmitted func(string) error) (*synapse.TerminationResult, error) {
+	result, err := s.respond(s.calls.Add(1))
+	if result != nil && result.TxHash != "" && onSubmitted != nil {
+		err = errors.Join(err, onSubmitted(result.TxHash))
+	}
+	return result, err
 }
 
 func (s *sequencedTerminator) ContextIdentity() storage.ContextIdentity {
@@ -5943,37 +6017,38 @@ func seedAbandonedTargetRetirement(t *testing.T, runtime handlerTestRuntime, seq
 	return first, taskRow
 }
 
-// A termination whose outcome was not observed is not given up on. The next
-// request goes out only after the adapter has read the chain, so it cannot end
-// the service twice.
-func TestRetirementWithUnobservedTerminationTriesAgain(t *testing.T) {
-	terminator := &sequencedTerminator{respond: func(call int64) (*synapse.TerminationResult, error) {
-		if call == 1 {
-			return nil, errors.New("provider relay failed after submitting")
-		}
-		return &synapse.TerminationResult{TxHash: "0xretired", EndEpoch: 84}, nil
-	}}
+func TestRetirementWithUnknownSubmissionDoesNotResend(t *testing.T) {
+	terminator := &observingRetirementTerminator{testServiceTerminator: testServiceTerminator{err: context.DeadlineExceeded}}
+	budget := 2
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		terminator: terminator, epochs: testEpochReader{epoch: 90},
-		retireOnly: true,
+		terminator: terminator, epochs: testEpochReader{epoch: 90}, retireOnly: true, maxAttempts: &budget,
 	})
-	replacement, taskRow := seedAbandonedTargetRetirement(t, runtime, storedObjectSequence.Add(1))
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return terminator.calls.Load() == 1 && task.Status == model.TaskStatusPending && task.RetryCount == 1 && task.ResumeMode == model.TaskResumeModeRecover
-	})
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return terminator.calls.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
-	})
-	wakeTask(t, runtime, taskRow.ID)
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusCompleted
-	})
-	stored, err := runtime.repos.Replacements.GetByID(t.Context(), replacement.ID)
-	if err != nil || stored.AbandonedTerminationEpoch == nil || *stored.AbandonedTerminationEpoch != 84 || terminator.calls.Load() != 2 {
-		t.Fatalf("replacement = %#v err=%v after %d requests, want the returned end epoch recorded", stored, err, terminator.calls.Load())
+	replacement, row := seedAbandonedTargetRetirement(t, runtime, storedObjectSequence.Add(1))
+	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+	if row.RetryCount != 1 || terminator.calls.Load() != 1 {
+		t.Fatalf("unknown submission did not retain its observation budget: task=%#v sends=%d", row, terminator.calls.Load())
+	}
+	row = expireRetirementObservation(t, runtime, row)
+	row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+	if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" || terminator.calls.Load() != 1 {
+		t.Fatalf("unknown submission was resent after its observation window: task=%#v sends=%d", row, terminator.calls.Load())
+	}
+	attempts, err := runtime.repos.Replacements.ListTerminationAttempts(t.Context(), []int64{replacement.ID})
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("unknown submission lost its admitted attempt: %#v err=%v", attempts, err)
+	}
+	attempt := attempts[0]
+	if attempt.TaskID == nil || *attempt.TaskID != row.ID || attempt.AttemptedAt == nil || attempt.TxHash != nil || attempt.ConfirmedTxHash != nil || attempt.ReceiptStatus != nil {
+		t.Fatalf("unknown submission evidence was fabricated or discarded: %#v", attempt)
+	}
+	next, err := runtime.service.Retry(t.Context(), row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+	if terminator.calls.Load() != 1 {
+		t.Fatalf("manual recovery resent an unknown transaction: %d sends", terminator.calls.Load())
 	}
 }
 
@@ -6076,7 +6151,7 @@ func TestRetirementStopsWhenTheSigningIdentityChanged(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			terminator := &testServiceTerminator{identity: movedIdentity, result: &synapse.TerminationResult{TxHash: "0xretire", EndEpoch: 84}}
+			terminator := &testServiceTerminator{identity: movedIdentity, result: &synapse.TerminationResult{TxHash: "0xretire", EndEpoch: new(int64(84))}}
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 				terminator: terminator, epochs: testEpochReader{epoch: 90},
 				retireOnly: true,
@@ -6127,7 +6202,7 @@ func TestRetirementStopsOnADataSetAnotherWalletPaysFor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			terminator := &testServiceTerminator{result: &synapse.TerminationResult{TxHash: "0xretire", EndEpoch: 84}}
+			terminator := &testServiceTerminator{result: &synapse.TerminationResult{TxHash: "0xretire", EndEpoch: new(int64(84))}}
 			terminator.notPaidFor.Store(true)
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 				terminator: terminator, epochs: testEpochReader{epoch: 90},
@@ -6198,8 +6273,8 @@ func TestRetirementStopsOnADataSetAnotherWalletPaysFor(t *testing.T) {
 	}
 }
 
-func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *testing.T) {
-	terminator := &testServiceTerminator{result: &synapse.TerminationResult{TxHash: "0xretire", EndEpoch: 84}}
+func TestRetirementSubmissionWriteFailureRetainsReturnedEvidence(t *testing.T) {
+	terminator := &testServiceTerminator{result: &synapse.TerminationResult{TxHash: "0xretire", EndEpoch: new(int64(84))}}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		terminator: terminator,
 		epochs:     testEpochReader{epoch: 80},
@@ -6270,36 +6345,18 @@ func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *t
 	if err := runtime.repos.Contents.BindDataSetRetirementTask(ctx, target.ID, generation, retirementTask.ID); err != nil {
 		t.Fatalf("bind retirement task: %v", err)
 	}
-	restoreFailRetirementEvidence := testutil.FailWrites(t, runtime.db, "storage_data_set_terminations", "INSERT", "NEW.role = 'abandoned_target'", "injected retirement evidence failure")
-
+	if _, err := runtime.db.ExecContext(ctx, "CREATE SEQUENCE retirement_evidence_fault"); err != nil {
+		t.Fatal(err)
+	}
+	testutil.FailWrites(t, runtime.db, "storage_data_set_terminations", "INSERT", "NEW.role = 'abandoned_target' AND nextval('retirement_evidence_fault') = 1", "injected retirement evidence failure")
 	cancel, done := runHandlerEngine(t, runtime)
-	waitForTask(t, runtime.repos, retirementTask.ID, func(task *model.Task) bool {
-		return strings.Contains(string(task.Checkpoint), `"termination_epoch": 84`)
-	})
-	stopHandlerEngine(t, cancel, done)
-
-	storedTask, err := runtime.repos.Tasks.GetByID(ctx, retirementTask.ID)
-	if err != nil || storedTask == nil || storedTask.Status != model.TaskStatusRunning || storedTask.ResumeMode != model.TaskResumeModeRecover {
-		t.Fatalf("retirement task after failed settlement = %#v err=%v", storedTask, err)
-	}
-	first, err = runtime.repos.Replacements.GetByID(ctx, first.ID)
-	if err != nil || first == nil || first.AbandonedTerminationEpoch != nil {
-		t.Fatalf("retirement evidence unexpectedly settled = %#v err=%v", first, err)
-	}
-	restoreFailRetirementEvidence()
-	if _, err := runtime.db.NewRaw(`UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), retirementTask.ID).Exec(ctx); err != nil {
-		t.Fatalf("expire retirement task lease: %v", err)
-	}
-
-	cancel, done = runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, retirementTask.ID, func(task *model.Task) bool {
+	stored := waitForTask(t, runtime.repos, retirementTask.ID, func(task *model.Task) bool {
 		first, err = runtime.repos.Replacements.GetByID(ctx, first.ID)
-		return err == nil && first != nil && first.AbandonedTerminationEpoch != nil &&
-			*first.AbandonedTerminationEpoch == 84 && task.Status == model.TaskStatusPending
+		return err == nil && first != nil && first.AbandonedTerminationEpoch != nil && *first.AbandonedTerminationEpoch == 84 && task.Status == model.TaskStatusPending
 	})
-	if terminator.calls.Load() != 1 {
-		t.Fatalf("retirement termination calls = %d, want 1", terminator.calls.Load())
+	if terminator.calls.Load() != 1 || first.AbandonedTerminationTxHash == nil || *first.AbandonedTerminationTxHash != "0xretire" || !strings.Contains(string(stored.Checkpoint), `"transaction_hash": "0xretire"`) {
+		t.Fatalf("termination calls=%d evidence=%#v checkpoint=%s", terminator.calls.Load(), first, stored.Checkpoint)
 	}
 }
 
@@ -6507,7 +6564,7 @@ func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *test
 	// waiting on that submission.
 	clientDataSetID := testOnChainID(t, 27000+sequence)
 	if err := runtime.repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-		ID: binding.ID, TransactionID: "0xrejected", StatusURL: "https://provider.example/status",
+		ID: binding.ID, TxHash: "0xrejected", StatusURL: "https://provider.example/status",
 		ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("MarkDataSetCreating: %v", err)
@@ -6546,8 +6603,8 @@ func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *test
 	if err != nil || ended == nil || ended.Status != model.StorageDataSetStatusCreating || ended.EnsureTaskID == nil || *ended.EnsureTaskID != failed.ID || !ended.IsCurrent || ended.ClientDataSetID == nil || !ended.ClientDataSetID.Equal(clientDataSetID) {
 		t.Fatalf("rejected generation = %#v err=%v, want its request and current owner preserved", ended, err)
 	}
-	if ended.CreateTransactionID != nil || ended.CreateStatusURL != nil {
-		t.Fatalf("rejected submission remains active: %#v", ended)
+	if ended.TxHash == nil || *ended.TxHash != "0xrejected" || ended.CreateStatusURL == nil || *ended.CreateStatusURL != "https://provider.example/status" {
+		t.Fatalf("rejected submission evidence was lost: %#v", ended)
 	}
 	events, err := runtime.repos.Tasks.ListEvents(ctx, failed.ID, 0, 128)
 	if err != nil {
@@ -6559,8 +6616,12 @@ func TestDataSetEnsurePreservesTheFailedGenerationWhenCreationIsRejected(t *test
 			preserved = true
 		}
 	}
-	if !preserved || strings.Contains(string(failed.Checkpoint), `"transaction_id"`) {
-		t.Fatalf("rejected submission evidence not preserved before clearing: checkpoint=%s events=%v", failed.Checkpoint, events)
+	var recovery struct {
+		TxHash   string `json:"transaction_id"`
+		Rejected bool   `json:"transaction_rejected"`
+	}
+	if err := json.Unmarshal(failed.Checkpoint, &recovery); err != nil || !preserved || recovery.TxHash != "0xrejected" || !recovery.Rejected {
+		t.Fatalf("rejected submission recovery=%#v err=%v events=%v", recovery, err, events)
 	}
 	if _, local, err := runtime.repos.Replacements.SourceEligibility(ctx, ended.ID); err != nil || !local {
 		t.Fatalf("failed source eligibility = %v, %v", local, err)
@@ -6763,7 +6824,7 @@ func TestDataSetCreationRecoveryRecordsIndependentRoundStart(t *testing.T) {
 					if !ready.Load() {
 						return nil, errors.New("submission status is temporarily unavailable")
 					}
-					return &storage.CreateDataSetResult{DataSet: ref}, nil
+					return &storage.CreateDataSetResult{DataSet: ref, TransactionID: "0xsubmitted", ConfirmedTransactionID: "0xconfirmed"}, nil
 				},
 			}
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
@@ -6778,7 +6839,7 @@ func TestDataSetCreationRecoveryRecordsIndependentRoundStart(t *testing.T) {
 			fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("restore-start-%d", sequence))
 			const transactionID, statusURL = "0xsubmitted", "https://provider.example/status"
 			if err := runtime.repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-				ID: fixture.binding.ID, TransactionID: transactionID, StatusURL: statusURL, ClientDataSetID: &clientID,
+				ID: fixture.binding.ID, TxHash: transactionID, StatusURL: statusURL, ClientDataSetID: &clientID,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -6833,6 +6894,10 @@ func TestDataSetCreationRecoveryRecordsIndependentRoundStart(t *testing.T) {
 				return row.Status == model.TaskStatusCompleted
 			})
 			assertStart(completed)
+			stored, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
+			if err != nil || stored.TxHash == nil || *stored.TxHash != "0xsubmitted" || stored.ConfirmedTxHash == nil || *stored.ConfirmedTxHash != "0xconfirmed" {
+				t.Fatalf("creation evidence=%#v error=%v", stored, err)
+			}
 			if sends.Load() != 0 {
 				t.Fatalf("recovery sent %d duplicate create requests", sends.Load())
 			}
@@ -6927,7 +6992,7 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 			if tt.submission {
 				const transactionID, statusURL = "0xsubmitted", "https://provider.example/status"
 				if err := runtime.repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-					ID: fixture.binding.ID, TransactionID: transactionID, StatusURL: statusURL, ClientDataSetID: &clientID,
+					ID: fixture.binding.ID, TxHash: transactionID, StatusURL: statusURL, ClientDataSetID: &clientID,
 				}); err != nil {
 					t.Fatalf("mark creating: %v", err)
 				}
@@ -7106,7 +7171,7 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 	ctx := t.Context()
 	fixture := seedDataSetEnsure(t, runtime, providerID, fmt.Sprintf("dropped-submission-%d", sequence))
 	if err := runtime.repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-		ID: fixture.binding.ID, TransactionID: "0xdead", StatusURL: "https://provider.example/status",
+		ID: fixture.binding.ID, TxHash: "0xdead", StatusURL: "https://provider.example/status",
 		ClientDataSetID: &clientID,
 	}); err != nil {
 		t.Fatalf("mark creating: %v", err)
@@ -7128,18 +7193,20 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 		t.Fatalf("resume in recovery: %v", err)
 	}
 
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
-	waitForTask(t, runtime.repos, fixture.ensureTask.ID, func(task *model.Task) bool {
-		return lookups.Load() > 0 && task.Status == model.TaskStatusPending && task.RetryCount > 0 && !strings.Contains(string(task.Checkpoint), `"transaction_id"`)
-	})
+	pending := runOneStorageTask(t, runtime, fixture.ensureTask, model.TaskStatusPending)
+	if lookups.Load() != 1 || pending.RetryCount != 1 {
+		t.Fatalf("rejected lookup: task=%#v lookups=%d", pending, lookups.Load())
+	}
 	kept, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, fixture.binding.ID)
-	if err != nil || kept.Status != model.StorageDataSetStatusCreating || kept.EnsureTaskID == nil {
+	if err != nil || kept.Status != model.StorageDataSetStatusCreating || kept.EnsureTaskID == nil || kept.TxHash == nil || *kept.TxHash != "0xdead" {
 		t.Fatalf("generation = %#v err=%v, want it kept with its creation fence", kept, err)
 	}
-	stored, err := runtime.repos.Tasks.GetByID(ctx, fixture.ensureTask.ID)
-	if err != nil || stored == nil || strings.Contains(string(stored.Checkpoint), `"transaction_id"`) {
-		t.Fatalf("task = %#v err=%v, want the rejected submission dropped from its checkpoint", stored, err)
+	var recovery struct {
+		TxHash   string `json:"transaction_id"`
+		Rejected bool   `json:"transaction_rejected"`
+	}
+	if err := json.Unmarshal(pending.Checkpoint, &recovery); err != nil || recovery.TxHash != "0xdead" || !recovery.Rejected {
+		t.Fatalf("rejected submission = %#v err=%v", recovery, err)
 	}
 }
 
@@ -7216,4 +7283,125 @@ func (*testServiceTerminator) PDPVerifierAddress() common.Address {
 
 func (*sequencedTerminator) PDPVerifierAddress() common.Address {
 	return testutil.DefaultPDPVerifierAddress
+}
+
+func TestDataSetCreationRetainsPartialResultOnError(t *testing.T) {
+	for _, tt := range []struct {
+		name              string
+		callbackOnly      bool
+		found             bool
+		wantConfirmedHash string
+	}{
+		{name: "partial result resolved", found: true, wantConfirmedHash: "0xconfirmed"},
+		{name: "partial result not visible", wantConfirmedHash: "0xconfirmed"},
+		{name: "submission callback resolved", callbackOnly: true, found: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			providerID := testOnChainID(t, 90101)
+			dataSetID := sdktypes.NewBigInt(90102)
+			cause := errors.New("provider confirmation response has no data set identity")
+			var creates, lookups, statusPolls atomic.Int64
+			provider := &testutil.MockStorageTarget{
+				ProviderIDValue: providerID.SDK(),
+				CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+					creates.Add(1)
+					if tt.callbackOnly {
+						options.OnSubmitted(storage.CreateDataSetSubmission{TransactionID: "0xsubmitted"})
+						return nil, cause
+					}
+					return &storage.CreateDataSetResult{TransactionID: "0xsubmitted", ConfirmedTransactionID: tt.wantConfirmedHash}, cause
+				},
+				FindDataSetByClientIDFunc: func(_ context.Context, clientID sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+					lookups.Add(1)
+					if !tt.found {
+						return storage.DataSetRef{}, false, nil
+					}
+					ref, err := storage.NewDataSetRef(providerID.SDK(), dataSetID, clientID)
+					return ref, err == nil, err
+				},
+				WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+					statusPolls.Add(1)
+					return nil, errors.New("cannot poll without a status URL")
+				},
+			}
+			budget := 2
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+				return provider, nil
+			}}, policy: cache.EvictionPolicyNone, maxAttempts: &budget})
+			fixture := seedDataSetEnsure(t, runtime, providerID, "partial-creation-result")
+			waiting := runOneStorageTask(t, runtime, fixture.ensureTask, model.TaskStatusPending)
+			row, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.Status != model.StorageDataSetStatusCreating || row.DataSetID != nil {
+				t.Fatalf("partial result marked data set ready: %#v", row)
+			}
+			if row.TxHash == nil || *row.TxHash != "0xsubmitted" {
+				t.Fatalf("submitted hash = %v, want 0xsubmitted", row.TxHash)
+			}
+			confirmedHash := ""
+			if row.ConfirmedTxHash != nil {
+				confirmedHash = *row.ConfirmedTxHash
+			}
+			if got := confirmedHash; got != tt.wantConfirmedHash {
+				t.Fatalf("confirmed hash = %q, want %q", got, tt.wantConfirmedHash)
+			}
+			if row.LastError == nil || *row.LastError != cause.Error() {
+				t.Fatalf("creation error = %v, want %q", row.LastError, cause)
+			}
+
+			var checkpoint map[string]any
+			if err := json.Unmarshal(waiting.Checkpoint, &checkpoint); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint["next_resend_at"] = time.Now().UTC().Add(-time.Hour)
+			encoded, err := json.Marshal(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("checkpoint_json = ?", json.RawMessage(encoded)).
+				Set("resume_mode = ?", model.TaskResumeModeExecute).
+				Where("id = ?", waiting.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if tt.found {
+				runOneStorageTask(t, runtime, waiting, model.TaskStatusCompleted)
+			} else {
+				waiting = runOneStorageTask(t, runtime, waiting, model.TaskStatusPending)
+				if waiting.RetryCount != 1 {
+					t.Fatalf("observation consumed a retry: %d", waiting.RetryCount)
+				}
+				waiting = setDataSetConfirmationStart(t, runtime, waiting, time.Now().UTC().Add(-31*time.Minute))
+				failed := runOneStorageTask(t, runtime, waiting, model.TaskStatusFailed)
+				if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" {
+					t.Fatalf("unresolved transaction did not exhaust its budget: %#v", failed)
+				}
+			}
+			row, err = runtime.repos.Contents.GetDataSetBindingByID(t.Context(), fixture.binding.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.found && (row.Status != model.StorageDataSetStatusReady || row.DataSetID == nil || row.DataSetID.String() != dataSetID.String()) {
+				t.Fatalf("client ID lookup did not resolve data set: %#v", row)
+			}
+			confirmedHash = ""
+			if row.ConfirmedTxHash != nil {
+				confirmedHash = *row.ConfirmedTxHash
+			}
+			if row.TxHash == nil || *row.TxHash != "0xsubmitted" || confirmedHash != tt.wantConfirmedHash {
+				t.Fatalf("recovery lost transaction hashes: %#v", row)
+			}
+			if lookups.Load() == 0 {
+				t.Fatal("recovery did not query the client data set ID")
+			}
+			if creates.Load() != 1 {
+				t.Fatalf("recovery submitted %d create requests, want 1", creates.Load())
+			}
+			if statusPolls.Load() != 0 {
+				t.Fatalf("polled a missing status URL %d times", statusPolls.Load())
+			}
+		})
+	}
 }

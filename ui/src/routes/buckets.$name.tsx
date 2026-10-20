@@ -66,6 +66,7 @@ import { RelativeTime } from '@/components/app/RelativeTime'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { RowActionItem, RowActionsMenu } from '@/components/app/RowActionsMenu'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
+import { TransactionHashes } from '@/components/app/TransactionHashes'
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
 import { WarmStoragePriceDetails } from '@/components/app/WarmStoragePriceDetails'
 import { BucketOwnerDialog } from '@/components/buckets/BucketOwnerDialog'
@@ -684,6 +685,12 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 </TableCell>
                 <TableCell className="px-3 text-muted-foreground">
                   <OptionalCopyableValue label="Data set ID" value={copy.data_set_id} />
+                  {(copy.tx_hash || copy.confirmed_tx_hash) && (
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-xs">Transactions</summary>
+                      <TransactionHashes txHash={copy.tx_hash} confirmedTxHash={copy.confirmed_tx_hash} />
+                    </details>
+                  )}
                 </TableCell>
                 <TableCell className="px-3 text-muted-foreground">
                   <OptionalCopyableValue label="Piece ID" value={copy.piece_id} maxLength={24} />
@@ -1974,6 +1981,49 @@ function ProviderReplacementProgressCard({
         </StatusBadge>
       </div>
       <ReplacementProgressView progress={replacement.progress} />
+      {[
+        { label: 'Source termination', data: replacement.source.termination },
+        { label: 'Target termination', data: replacement.target.termination },
+      ].map(
+        ({ label, data }) =>
+          data &&
+          (data.tx_hash || data.confirmed_tx_hash || data.epoch !== null || data.attempts.length > 0) && (
+            <details key={label}>
+              <summary className="cursor-pointer text-xs">{label}</summary>
+              {data.attempts.length > 0 ? (
+                <div className="mt-2 flex flex-col gap-3">
+                  {data.attempts.map((attempt) => (
+                    <div key={attempt.id} className="flex min-w-0 flex-col gap-2">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span>Transaction {attempt.attempt_no}</span>
+                        <StatusBadge
+                          tone={
+                            attempt.receipt_status === 0
+                              ? 'danger'
+                              : attempt.receipt_status === 1
+                                ? 'success'
+                                : 'neutral'
+                          }
+                        >
+                          {attempt.receipt_status === 0
+                            ? 'Failed'
+                            : attempt.receipt_status === 1
+                              ? 'Succeeded'
+                              : 'Outcome unknown'}
+                        </StatusBadge>
+                        {attempt.attempted_at && <RelativeTime value={attempt.attempted_at} />}
+                      </div>
+                      <TransactionHashes txHash={attempt.tx_hash} confirmedTxHash={attempt.confirmed_tx_hash} />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <TransactionHashes txHash={data.tx_hash} confirmedTxHash={data.confirmed_tx_hash} />
+              )}
+              {data.epoch !== null && <div className="mt-1 text-xs text-muted-foreground">End epoch {data.epoch}</div>}
+            </details>
+          )
+      )}
       {nextStep && <div className="text-sm text-muted-foreground">{nextStep}</div>}
       {replacement.last_error && (
         <div>
@@ -2217,6 +2267,12 @@ function BucketStorageDataSets({
                         </TableCell>
                         <TableCell className="overflow-hidden px-4">
                           <DataSetStorageHealthCell dataSet={dataSet} />
+                          {(dataSet.tx_hash || dataSet.confirmed_tx_hash) && (
+                            <details className="mt-2">
+                              <summary className="cursor-pointer text-xs">Creation transactions</summary>
+                              <TransactionHashes txHash={dataSet.tx_hash} confirmedTxHash={dataSet.confirmed_tx_hash} />
+                            </details>
+                          )}
                           {dataSetSetupMessage(dataSet) && (
                             <p
                               className="mt-1 truncate text-xs text-muted-foreground"

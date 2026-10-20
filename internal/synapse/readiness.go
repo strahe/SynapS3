@@ -53,6 +53,7 @@ type ReadinessCheck struct {
 }
 
 type ReadinessResult struct {
+	redactor      *errtext.Redactor
 	Status        ReadinessStatus   `json:"status"`
 	Mode          ReadinessMode     `json:"mode"`
 	CheckedAt     time.Time         `json:"checked_at"`
@@ -146,6 +147,7 @@ func WithReadinessTimeout(timeout time.Duration) ReadinessCheckerOption {
 
 func (c *ReadinessChecker) CheckRuntime(ctx context.Context) ReadinessResult {
 	result := newReadinessResult(ReadinessModeRuntime)
+	result.redactor = errtext.New(c.cfg.RPCURL, c.cfg.PrivateKey)
 	c.checkClient(ctx, c.cfg, c.runtime, &result, true)
 	result.finish()
 	return result
@@ -154,6 +156,7 @@ func (c *ReadinessChecker) CheckRuntime(ctx context.Context) ReadinessResult {
 func (c *ReadinessChecker) CheckDraft(ctx context.Context, cfg ReadinessConfig) ReadinessResult {
 	cfg = normalizedReadinessConfig(cfg)
 	result := newReadinessResult(ReadinessModeDraft)
+	result.redactor = errtext.New(cfg.RPCURL, cfg.PrivateKey, c.cfg.PrivateKey)
 	if !validateReadinessConfig(cfg, &result) {
 		result.finish()
 		return result
@@ -175,7 +178,7 @@ func (c *ReadinessChecker) CheckDraft(ctx context.Context, cfg ReadinessConfig) 
 	}
 	defer func() {
 		if err := client.Close(); err != nil && c.logger != nil {
-			c.logger.Warn("failed to close Filecoin readiness client", "error", err)
+			c.logger.Warn("failed to close Filecoin readiness client", "error", result.redactor.Format(err))
 		}
 	}()
 
@@ -325,6 +328,9 @@ func (c *ReadinessChecker) checkStorage(
 	}
 
 	inventory, err := client.ProviderInventory(ctx, cfg)
+	for id, detail := range inventory.PartialErrors {
+		c.addPartialError(result, "provider:"+id, errors.New(detail))
+	}
 	if err != nil {
 		c.addPartialError(result, "provider_inventory", err)
 		result.unknown("providers", "Storage providers could not be checked.")
@@ -531,19 +537,23 @@ func (r *ReadinessResult) addPartialError(field string, err error) {
 	if r.PartialErrors == nil {
 		r.PartialErrors = make(map[string]string)
 	}
-	r.PartialErrors[field] = errtext.Redact(err.Error())
+	if r.redactor != nil {
+		r.PartialErrors[field] = r.redactor.Format(err)
+	} else {
+		r.PartialErrors[field] = errtext.Format(err)
+	}
 }
 
 func (c *ReadinessChecker) addPartialError(result *ReadinessResult, field string, err error) {
+	result.addPartialError(field, err)
 	if c != nil && c.logger != nil && err != nil && !errors.Is(err, context.Canceled) {
 		c.logger.Debug(
 			"filecoin readiness probe failed",
 			"check", field,
-			"error", errtext.Redact(err.Error()),
+			"error", result.PartialErrors[field],
 			"error_type", fmt.Sprintf("%T", err),
 		)
 	}
-	result.addPartialError(field, err)
 }
 
 func (r *ReadinessResult) finish() {

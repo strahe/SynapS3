@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -15,6 +17,7 @@ type fakeRegistryProviderSource struct {
 	count     *big.Int
 	pdp       map[string]spregistry.PDPProvider
 	providers map[string]spregistry.ProviderInfo
+	pdpErrors map[string]error
 }
 
 func (f *fakeRegistryProviderSource) GetPDPProviders(context.Context, bool, sdktypes.ListOptions) (*spregistry.PaginatedPDPProviders, error) {
@@ -26,6 +29,9 @@ func (f *fakeRegistryProviderSource) GetProviderCount(context.Context) (*big.Int
 }
 
 func (f *fakeRegistryProviderSource) GetPDPProvider(_ context.Context, providerID sdktypes.BigInt) (*spregistry.PDPProvider, error) {
+	if err := f.pdpErrors[providerID.String()]; err != nil {
+		return nil, err
+	}
 	p, ok := f.pdp[providerID.String()]
 	if !ok {
 		return nil, fmt.Errorf("missing PDP product: %w", spregistry.ErrNotFound)
@@ -194,6 +200,22 @@ func TestLookupProviderFallsBackWhenPDPProductMissing(t *testing.T) {
 	}
 	if got.ID.String() != "7" || got.Name != "Fallback" || got.Active || got.HasPDP {
 		t.Fatalf("LookupProvider = %+v, want inactive provider 7", got)
+	}
+}
+
+func TestListAllProvidersReturnsPartialResultsAndProviderFailures(t *testing.T) {
+	one, two := errors.New("RPC overloaded"), errors.New("execution reverted")
+	reg := &RegistryService{svc: &fakeRegistryProviderSource{
+		count:     big.NewInt(3),
+		pdp:       map[string]spregistry.PDPProvider{"1": newTestPDPProvider(1, "Alpha", true, "https://alpha.example.com")},
+		pdpErrors: map[string]error{"2": one, "3": two},
+	}}
+	got, err := listAllProviders(t.Context(), reg)
+	if len(got) != 1 || got[0].ID.String() != "1" || !errors.Is(err, one) || !errors.Is(err, two) {
+		t.Fatalf("partial list = %#v, %v", got, err)
+	}
+	if partial, ok := errors.AsType[*PartialListError](err); !ok || len(partial.Failures) != 2 || !strings.Contains(err.Error(), "provider 2") || !strings.Contains(err.Error(), "provider 3") {
+		t.Fatalf("provider diagnostics = %v", err)
 	}
 }
 

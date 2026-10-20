@@ -8,9 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
+	"github.com/strahe/synapse-go/pdp"
 )
 
 func TestPDPBatchUploadProbeUploadsSampleWithoutFinalizing(t *testing.T) {
@@ -83,10 +86,11 @@ func TestPDPBatchUploadProbeRejectsFailedPutWithoutFollowingRedirect(t *testing.
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Location", "/redirect-target")
 		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = io.WriteString(w, "provider upload disabled; eid=request-42")
 	}))
 	defer server.Close()
 	probe := NewPDPBatchUploadProbe(true)
-	if _, err := probe.Probe(t.Context(), server.URL); err == nil || !strings.Contains(err.Error(), "HTTP 307") {
+	if _, err := probe.Probe(t.Context(), server.URL); err == nil || !strings.Contains(err.Error(), "HTTP 307") || !strings.Contains(err.Error(), "eid=request-42") {
 		t.Fatalf("redirected PUT = %v", err)
 	}
 	if len(requests) != 2 || requests[0] != "POST /pdp/piece/uploads" || requests[1] != "PUT /pdp/piece/uploads/123e4567-e89b-12d3-a456-426614174000" {
@@ -95,6 +99,32 @@ func TestPDPBatchUploadProbeRejectsFailedPutWithoutFollowingRedirect(t *testing.
 }
 
 type uploadProbeTransport func(*http.Request) (*http.Response, error)
+
+func TestProviderHTTPErrorRetainsStatusAndIncompleteBody(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  io.Reader
+		want  string
+		cause error
+	}{
+		{name: "response body", body: strings.NewReader("provider disabled; eid=request-42"), want: "eid=request-42"},
+		{name: "read failure", body: io.MultiReader(strings.NewReader("eid=request-43\n"), iotest.ErrReader(io.ErrUnexpectedEOF)), want: "could not read complete provider response", cause: io.ErrUnexpectedEOF},
+		{name: "body limit", body: strings.NewReader(strings.Repeat("a", providerErrorResponseLimit+1)), want: "remaining body not read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "https://provider.test/pdp/piece/uploads", nil)
+			err := readProviderHTTPError(req, &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(tc.body)})
+			httpErr, ok := errors.AsType[*pdp.HTTPError](err)
+			got := errtext.Format(err)
+			if !ok || httpErr.StatusCode != http.StatusServiceUnavailable || !strings.Contains(got, tc.want) || !strings.Contains(got, "POST https://provider.test/pdp/piece/uploads") || len(got) > errtext.MaxBytes {
+				t.Fatalf("provider diagnostic = %s", got)
+			}
+			if tc.cause != nil && (!errors.Is(err, tc.cause) || !strings.Contains(got, "eid=request-43")) {
+				t.Fatalf("partial response cause lost: %v", err)
+			}
+		})
+	}
+}
 
 func (f uploadProbeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 

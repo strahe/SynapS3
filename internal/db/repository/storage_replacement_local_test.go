@@ -156,7 +156,7 @@ func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 					t.Fatal(err)
 				}
 			case "transaction":
-				if err := repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: source.ID, TransactionID: "0xcreate"}); err != nil {
+				if err := repos.Contents.MarkDataSetCreating(t.Context(), repository.MarkDataSetCreatingInput{ID: source.ID, TxHash: "0xcreate"}); err != nil {
 					t.Fatal(err)
 				}
 			case "version", "identity":

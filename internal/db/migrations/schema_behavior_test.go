@@ -54,7 +54,7 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 				VALUES (?, 1, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID, checksum)
 		}
 		mustRejectStatement(t, db, `INSERT INTO storage_data_sets
-			(bucket_id, provider_id, copy_index, generation, is_current, create_transaction_id, created_at, updated_at)
+			(bucket_id, provider_id, copy_index, generation, is_current, tx_hash, created_at, updated_at)
 			VALUES (?, 'provider', 0, 1, FALSE, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketID)
 		mustRejectStatement(t, db, `INSERT INTO wallet_operations
 			(type, client_request_id, amount, created_at, updated_at)
@@ -270,9 +270,9 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 			t.Fatalf("submit request: %v", err)
 		}
 		// A receipt names its transaction and its status together.
-		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET transaction_id = '0xown' WHERE request_id = 'request-a'`)
+		mustRejectStatement(t, db, `UPDATE storage_commit_requests SET tx_hash = '0xown' WHERE request_id = 'request-a'`)
 		if _, err := db.Exec(`UPDATE storage_commit_requests
-			SET transaction_id = '0xown', status_url = 'https://provider.example/status/own',
+			SET tx_hash = '0xown', status_url = 'https://provider.example/status/own',
 			    attention_code = 'confirmation_timeout', attention_at = CURRENT_TIMESTAMP
 			WHERE request_id = 'request-a'`); err != nil {
 			t.Fatalf("record submission evidence and attention: %v", err)
@@ -694,12 +694,45 @@ func TestCurrentSchemaTerminationBelongsToItsReplacementRole(t *testing.T) {
 			(replacement_id, role, source_data_set_id, epoch, created_at, updated_at)
 			VALUES (?, 'source', ?, 84, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, target)
 
-		if _, err := db.Exec(`INSERT INTO storage_data_set_terminations
+		mustRejectStatement(t, db, `INSERT INTO storage_data_set_terminations
 			(replacement_id, role, source_data_set_id, epoch, created_at, updated_at)
-			VALUES (?, 'source', ?, 84, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, source); err != nil {
-			t.Fatalf("insert source termination: %v", err)
+			VALUES (?, 'source', ?, -1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, source)
+		var terminationID int64
+		if err := db.QueryRow(`INSERT INTO storage_data_set_terminations
+			(replacement_id, role, source_data_set_id, created_at, updated_at)
+			VALUES (?, 'source', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`, replacementID, source).Scan(&terminationID); err != nil {
+			t.Fatalf("insert pending source termination: %v", err)
 		}
-		// One end of term per role: a second would mean paying twice.
+		mustRejectStatement(t, db, `INSERT INTO storage_data_set_termination_attempts
+			(termination_id, attempt_no, created_at, updated_at)
+			VALUES (?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, terminationID)
+		var attemptID int64
+		if err := db.QueryRow(`INSERT INTO storage_data_set_termination_attempts
+			(termination_id, attempt_no, tx_hash, created_at, updated_at)
+			VALUES (?, 1, 'submitted', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`, terminationID).Scan(&attemptID); err != nil {
+			t.Fatalf("insert observed transaction: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE storage_data_set_termination_attempts SET confirmed_tx_hash = '' WHERE id = ?`, attemptID)
+		mustRejectStatement(t, db, `UPDATE storage_data_set_termination_attempts SET receipt_status = 0 WHERE id = ?`, attemptID)
+		mustRejectStatement(t, db, `UPDATE storage_data_set_termination_attempts SET receipt_status = 2 WHERE id = ?`, attemptID)
+		mustRejectStatement(t, db, `INSERT INTO storage_data_set_termination_attempts
+			(termination_id, attempt_no, tx_hash, created_at, updated_at)
+			VALUES (?, 2, 'another', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, terminationID)
+		if _, err := db.Exec(`UPDATE storage_data_set_termination_attempts SET confirmed_tx_hash = 'reverted', receipt_status = 0 WHERE id = ?`, attemptID); err != nil {
+			t.Fatal(err)
+		}
+		taskID := insertSchemaTestTask(t, db, "termination-retry")
+		if _, err := db.Exec(`INSERT INTO storage_data_set_termination_attempts
+			(termination_id, attempt_no, task_id, attempted_at, created_at, updated_at)
+			VALUES (?, 2, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, terminationID, taskID); err != nil {
+			t.Fatalf("admit attempt after a reverted receipt: %v", err)
+		}
+		mustRejectStatement(t, db, `UPDATE storage_data_set_termination_attempts SET attempt_no = 0 WHERE id = ?`, attemptID)
+		mustRejectStatement(t, db, `UPDATE storage_data_set_termination_attempts SET termination_id = 0 WHERE id = ?`, attemptID)
+		mustRejectStatement(t, db, `UPDATE storage_data_sets SET confirmed_tx_hash = '' WHERE id = ?`, source)
+		if _, err := db.Exec(`UPDATE storage_data_set_terminations SET epoch = 84 WHERE id = ?`, terminationID); err != nil {
+			t.Fatal(err)
+		}
 		mustRejectStatement(t, db, `INSERT INTO storage_data_set_terminations
 			(replacement_id, role, source_data_set_id, epoch, created_at, updated_at)
 			VALUES (?, 'source', ?, 90, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, source)

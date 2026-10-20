@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/storagecleanup"
@@ -289,11 +290,27 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			}
 			return deleteErr
 		})
+		settlement = nil
 		if txHash != "" {
 			checkpoint.TransactionHash = txHash
-			err = errors.Join(err, execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+			persist := func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, txHash)
-			}))
+			}
+			if recordErr := execution.WriteCheckpointWith(ctx, checkpoint, persist); recordErr != nil {
+				err = errors.Join(err, recordErr)
+				raw, encodeErr := json.Marshal(checkpoint)
+				if encodeErr != nil {
+					return taskengine.Fail(encodeErr, "invalid_checkpoint", nil)
+				}
+				settlement = func(ctx context.Context, repos *repository.Repositories) error {
+					if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), raw); err != nil {
+						return err
+					}
+					return persist(ctx, repos)
+				}
+			} else {
+				settlement = nil
+			}
 		}
 		if err != nil {
 			if !attempted {
@@ -302,9 +319,9 @@ func (h *Handler) runStorageCleanup(ctx context.Context, execution taskengine.Ex
 			if ctx.Err() == nil {
 				h.deps.Logger.Warn("remote cleanup request failed",
 					"task_id", execution.ID(), "cleanup_copy_id", copyRow.ID, "provider_id", copyRow.ProviderID,
-					"error", synapse.ErrorSummary(err))
+					"error", errtext.Format(err))
 			}
-			return taskengine.RetryInMode(synapse.SummarizedError(err), "provider_confirmation", model.TaskResumeModeRecover, nil)
+			return taskengine.RetryInMode(err, "provider_confirmation", model.TaskResumeModeRecover, settlement).WithContentionSettlement(settlement)
 		}
 		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}

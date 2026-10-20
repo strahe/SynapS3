@@ -12,7 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -24,9 +26,10 @@ type terminatorCall struct {
 }
 
 type stubStorageServiceTerminator struct {
-	calls   []terminatorCall
-	results []*storage.TerminateServiceResult
-	errors  []error
+	calls         []terminatorCall
+	results       []*storage.TerminateServiceResult
+	errors        []error
+	submittedHash common.Hash
 }
 
 func (s *stubStorageServiceTerminator) TerminateService(
@@ -36,6 +39,9 @@ func (s *stubStorageServiceTerminator) TerminateService(
 ) (*storage.TerminateServiceResult, error) {
 	s.calls = append(s.calls, terminatorCall{opts: opts})
 	index := len(s.calls) - 1
+	if s.submittedHash != (common.Hash{}) && opts.OnSubmitted != nil {
+		opts.OnSubmitted(s.submittedHash)
+	}
 	var result *storage.TerminateServiceResult
 	if index < len(s.results) {
 		result = s.results[index]
@@ -75,11 +81,11 @@ func TestStorageServiceAdapterTerminationFallsBackToDirect(t *testing.T) {
 		errors:  []error{errors.New("provider relay failed"), nil},
 	}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
-	got, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
+	got, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
 	if err != nil {
 		t.Fatalf("TerminateService: %v", err)
 	}
-	if got == nil || got.EndEpoch != 84 {
+	if got == nil || (got.EndEpoch == nil || *got.EndEpoch != 84) {
 		t.Fatalf("result = %#v, want end epoch 84", got)
 	}
 	if len(stub.calls) != 2 || stub.calls[0].opts.SkipProvider || !stub.calls[1].opts.SkipProvider {
@@ -96,11 +102,11 @@ func TestStorageServiceAdapterTerminationFallsBackAfterProviderSubTimeout(t *tes
 		errors:  []error{context.DeadlineExceeded, nil},
 	}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
-	got, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
+	got, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
 	if err != nil {
 		t.Fatalf("TerminateService: %v", err)
 	}
-	if got == nil || got.EndEpoch != 91 {
+	if got == nil || (got.EndEpoch == nil || *got.EndEpoch != 91) {
 		t.Fatalf("result = %#v, want end epoch 91", got)
 	}
 	if len(stub.calls) != 2 || !stub.calls[1].opts.SkipProvider {
@@ -111,7 +117,7 @@ func TestStorageServiceAdapterTerminationFallsBackAfterProviderSubTimeout(t *tes
 func TestStorageServiceAdapterTerminationDoesNotDuplicatePendingRelay(t *testing.T) {
 	stub := &stubStorageServiceTerminator{errors: []error{&pdp.TerminateServicePendingError{Message: "queued"}}}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
-	_, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
+	_, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
 	if !IsProviderUnavailable(err) {
 		t.Fatalf("error = %T %v, want dependency wait", err, err)
 	}
@@ -125,7 +131,7 @@ func TestStorageServiceAdapterTerminationHonorsCallerCancellation(t *testing.T) 
 	cancel()
 	stub := &stubStorageServiceTerminator{errors: []error{context.Canceled}}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
-	_, err := adapter.TerminateService(ctx, sdktypes.NewBigInt(42))
+	_, err := adapter.TerminateService(ctx, sdktypes.NewBigInt(42), nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context cancellation", err)
 	}
@@ -140,7 +146,7 @@ func TestStorageServiceAdapterTerminationPreservesDirectFailure(t *testing.T) {
 		errors: []error{errors.New("provider unavailable"), directErr},
 	}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
-	_, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
+	_, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
 	if !errors.Is(err, directErr) || !strings.Contains(err.Error(), "provider unavailable") {
 		t.Fatalf("error = %v, want both provider and direct evidence", err)
 	}
@@ -151,7 +157,7 @@ func TestStorageServiceAdapterTerminationPreservesDirectFailure(t *testing.T) {
 func TestStorageServiceAdapterTerminationReportsPaymentDebtWithoutFallback(t *testing.T) {
 	stub := &stubStorageServiceTerminator{errors: []error{&storage.TerminateServiceDebtError{Shortfall: big.NewInt(1)}}}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
-	_, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
+	_, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
 	if !IsTerminationBlocked(err) {
 		t.Fatalf("error = %T %v, want a blocked termination", err, err)
 	}
@@ -181,8 +187,8 @@ func TestStorageServiceAdapterTerminationReadsTheChainBeforeSending(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			stub := &stubStorageServiceTerminator{errors: tt.errs}
 			adapter := &StorageServiceAdapter{terminator: stub, dataSets: &stubDataSetStateReader{endEpochs: tt.endEpochs}}
-			got, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
-			if err != nil || got == nil || got.EndEpoch != tt.wantEpoch {
+			got, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
+			if err != nil || got == nil || (got.EndEpoch == nil || *got.EndEpoch != tt.wantEpoch) {
 				t.Fatalf("result = %#v err=%v, want recorded end epoch %d", got, err, tt.wantEpoch)
 			}
 			if len(stub.calls) != tt.wantCalls {
@@ -195,7 +201,7 @@ func TestStorageServiceAdapterTerminationReadsTheChainBeforeSending(t *testing.T
 func TestStorageServiceAdapterTerminationRefusesToSendWhileStateIsUnknown(t *testing.T) {
 	stub := &stubStorageServiceTerminator{}
 	adapter := &StorageServiceAdapter{terminator: stub, dataSets: &stubDataSetStateReader{err: errors.New("rpc unavailable")}}
-	if _, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42)); err == nil {
+	if _, err := adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil); err == nil {
 		t.Fatal("termination succeeded without knowing the service state")
 	}
 	if len(stub.calls) != 0 {
@@ -233,7 +239,7 @@ func TestStorageServiceAdapterTerminationRefusesADataSetItDoesNotPayFor(t *testi
 			if refused != errors.Is(err, ErrServicePaidByAnother) || (!refused && err != nil) {
 				t.Fatalf("VerifyServicePayer err = %v, want refused=%v", err, refused)
 			}
-			_, err = adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42))
+			_, err = adapter.TerminateService(context.Background(), sdktypes.NewBigInt(42), nil)
 			if refused && (!errors.Is(err, ErrServicePaidByAnother) || !strings.Contains(err.Error(), theirs.Hex())) {
 				t.Fatalf("err = %v, want a refusal naming the paying wallet", err)
 			}
@@ -323,7 +329,7 @@ func TestTerminationObservationSeparatesProviderOutagesFromBackpressure(t *testi
 			if tt.cancel {
 				cancel()
 			}
-			ended, pending, err := adapter.ObserveTermination(ctx, sdktypes.NewBigInt(42))
+			ended, pending, err := adapter.ObserveTermination(ctx, sdktypes.NewBigInt(42), TerminationResult{})
 			if ended != nil || pending != tt.wantPending || (err != nil) != tt.wantError || errors.Is(err, ErrTerminationObservationUnavailable) != tt.wantFallback {
 				t.Fatalf("observation = %#v, pending=%t, err=%v; want pending=%t, error=%t, fallback=%t", ended, pending, err, tt.wantPending, tt.wantError, tt.wantFallback)
 			}
@@ -349,7 +355,7 @@ func TestTerminationObservationKeepsChainAndPayerFailuresOutOfFallback(t *testin
 				t.Fatal("provider read must follow a live payer-checked chain record")
 				return nil, errors.New("unexpected provider read")
 			}, tt.chain)
-			ended, pending, err := adapter.ObserveTermination(t.Context(), sdktypes.NewBigInt(42))
+			ended, pending, err := adapter.ObserveTermination(t.Context(), sdktypes.NewBigInt(42), TerminationResult{})
 			if pending || (ended != nil) != tt.wantEnded || (err != nil) != tt.wantError || errors.Is(err, ErrTerminationObservationUnavailable) {
 				t.Fatalf("observation = %#v, pending=%t, err=%v", ended, pending, err)
 			}
@@ -453,6 +459,157 @@ func TestChainEpochReaderRefusesToGuess(t *testing.T) {
 			}
 			if epoch != 0 {
 				t.Fatalf("epoch = %d on failure, want 0", epoch)
+			}
+		})
+	}
+}
+
+func TestStorageServiceAdapterTerminationRetainsSubmittedEvidence(t *testing.T) {
+	original, confirmed := common.HexToHash("0x123"), common.HexToHash("0x456")
+	writeErr := errors.New("could not record submitted transaction")
+	for _, tc := range []struct {
+		name                   string
+		callbackErr, remoteErr error
+		confirmed              bool
+		direct                 bool
+	}{
+		{name: "receipt timeout", remoteErr: context.DeadlineExceeded},
+		{name: "submission persistence failure", callbackErr: writeErr, remoteErr: context.Canceled},
+		{name: "replacement confirmed", confirmed: true},
+		{name: "direct receipt timeout", direct: true, remoteErr: context.DeadlineExceeded},
+		{name: "direct persistence failure", direct: true, callbackErr: writeErr, remoteErr: context.Canceled},
+		{name: "direct confirmed", direct: true, confirmed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubStorageServiceTerminator{submittedHash: original, errors: []error{tc.remoteErr}}
+			if tc.confirmed {
+				stub.results = []*storage.TerminateServiceResult{{TxHash: &original, ConfirmedTxHash: &confirmed, EndEpoch: 84}}
+			}
+			adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			calls := 0
+			terminate := adapter.TerminateService
+			if tc.direct {
+				terminate = adapter.TerminateServiceDirect
+			}
+			got, err := terminate(ctx, sdktypes.NewBigInt(42), func(hash string) error {
+				calls++
+				if hash != original.Hex() {
+					t.Fatalf("submitted hash = %s", hash)
+				}
+				return tc.callbackErr
+			})
+			if calls != 1 || len(stub.calls) != 1 || ctx.Err() != nil || got == nil || got.TxHash != original.Hex() {
+				t.Fatalf("result=%#v error=%v callbacks=%d requests=%d", got, err, calls, len(stub.calls))
+			}
+			if stub.calls[0].opts.SkipProvider != tc.direct {
+				t.Fatalf("SkipProvider = %t, want %t", stub.calls[0].opts.SkipProvider, tc.direct)
+			}
+			if tc.confirmed {
+				if err != nil || got.ConfirmedTxHash != confirmed.Hex() || got.EndEpoch == nil || *got.EndEpoch != 84 || got.ReceiptStatus == nil || *got.ReceiptStatus != ethtypes.ReceiptStatusSuccessful {
+					t.Fatalf("confirmed evidence=%#v error=%v", got, err)
+				}
+			} else if err == nil || got.EndEpoch != nil || (tc.callbackErr != nil && !errors.Is(err, writeErr)) {
+				t.Fatalf("pending evidence=%#v error=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestTerminationObservationPreservesProviderHashesWithoutConfirmingEpoch(t *testing.T) {
+	original, confirmed := common.HexToHash("0x123"), common.HexToHash("0x456")
+	adapter := terminationObserver(t, func(r *http.Request) (*http.Response, error) {
+		body := fmt.Sprintf(`{"terminationTxHash":%q,"confirmedTxHash":%q,"fwssTerminated":true,"serviceTerminationEpoch":84}`, original.Hex(), confirmed.Hex())
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}, Request: r}, nil
+	}, &stubDataSetStateReader{payer: common.HexToAddress("0x1001")})
+	got, pending, err := adapter.ObserveTermination(t.Context(), sdktypes.NewBigInt(42), TerminationResult{})
+	if err != nil || !pending || got == nil || got.TxHash != original.Hex() || got.ConfirmedTxHash != confirmed.Hex() || got.EndEpoch != nil {
+		t.Fatalf("observation=%#v pending=%t error=%v", got, pending, err)
+	}
+}
+
+type terminationChainStub struct {
+	receipt    *ethtypes.Receipt
+	receiptErr error
+	tx         *ethtypes.Transaction
+	txErr      error
+	pending    bool
+	queried    []common.Hash
+}
+
+func (c *terminationChainStub) TransactionReceipt(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
+	c.queried = append(c.queried, hash)
+	return c.receipt, c.receiptErr
+}
+
+func (c *terminationChainStub) TransactionByHash(_ context.Context, hash common.Hash) (*ethtypes.Transaction, bool, error) {
+	c.queried = append(c.queried, hash)
+	return c.tx, c.pending, c.txErr
+}
+
+func TestTerminationObservationChecksSavedTransactionWithoutInferringAnEpoch(t *testing.T) {
+	tx := ethtypes.NewTx(&ethtypes.LegacyTx{Nonce: 7})
+	original, replacement := tx.Hash(), common.HexToHash("0x456")
+	rpcErr := errors.New("receipt RPC unavailable")
+	for _, tc := range []struct {
+		name           string
+		providerStatus int
+		providerBody   string
+		chain          terminationChainStub
+		epochs         []int64
+		wantHash       common.Hash
+		wantConfirmed  common.Hash
+		wantErr        error
+		wantEpoch      bool
+		direct         bool
+		wantReceipt    *uint64
+	}{
+		{name: "provider missing and RPC failed", providerStatus: 404, chain: terminationChainStub{receiptErr: rpcErr}, wantHash: original, wantErr: rpcErr},
+		{name: "transaction not found", providerStatus: 404, chain: terminationChainStub{receiptErr: ethereum.NotFound, txErr: ethereum.NotFound}, wantHash: original, wantErr: ethereum.NotFound},
+		{name: "original pending", providerStatus: 503, chain: terminationChainStub{receiptErr: ethereum.NotFound, tx: tx, pending: true}, wantHash: original},
+		{name: "failed receipt", providerStatus: 404, chain: terminationChainStub{receipt: &ethtypes.Receipt{TxHash: original, Status: ethtypes.ReceiptStatusFailed}}, wantHash: original, wantConfirmed: original, wantErr: ErrTerminationTransactionFailed, wantReceipt: new(uint64(0))},
+		{name: "replacement receipt without epoch", providerStatus: 200, providerBody: fmt.Sprintf(`{"terminationTxHash":%q,"confirmedTxHash":%q}`, original.Hex(), replacement.Hex()), chain: terminationChainStub{receipt: &ethtypes.Receipt{TxHash: replacement, Status: ethtypes.ReceiptStatusSuccessful}}, wantHash: replacement, wantConfirmed: replacement, wantReceipt: new(uint64(1))},
+		{name: "replacement receipt and verified epoch", providerStatus: 200, providerBody: fmt.Sprintf(`{"terminationTxHash":%q,"confirmedTxHash":%q}`, original.Hex(), replacement.Hex()), chain: terminationChainStub{receipt: &ethtypes.Receipt{TxHash: replacement, Status: ethtypes.ReceiptStatusSuccessful}}, epochs: []int64{0, 84}, wantHash: replacement, wantConfirmed: replacement, wantEpoch: true, wantReceipt: new(uint64(1))},
+		{name: "direct pending ignores preceding provider request", direct: true, providerStatus: 200, providerBody: fmt.Sprintf(`{"terminationTxHash":%q}`, replacement.Hex()), chain: terminationChainStub{receiptErr: ethereum.NotFound, tx: tx, pending: true}, wantHash: original},
+		{name: "direct confirmed ignores preceding provider request", direct: true, providerStatus: 200, providerBody: fmt.Sprintf(`{"terminationTxHash":%q}`, replacement.Hex()), chain: terminationChainStub{receipt: &ethtypes.Receipt{TxHash: original, Status: ethtypes.ReceiptStatusSuccessful}}, epochs: []int64{0, 84}, wantHash: original, wantConfirmed: original, wantEpoch: true, wantReceipt: new(uint64(1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := terminationObserver(t, func(req *http.Request) (*http.Response, error) {
+				if tc.direct {
+					t.Fatal("direct attempt consulted the provider's preceding request")
+				}
+				return &http.Response{StatusCode: tc.providerStatus, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.providerBody)), Request: req}, nil
+			}, &stubDataSetStateReader{endEpochs: tc.epochs, payer: common.HexToAddress("0x1001")})
+			adapter.ConfigureTerminationChain(&tc.chain)
+			observe := adapter.ObserveTermination
+			if tc.direct {
+				observe = adapter.ObserveTerminationDirect
+			}
+			got, pending, err := observe(t.Context(), sdktypes.NewBigInt(42), TerminationResult{TxHash: original.Hex()})
+			if got == nil || got.TxHash != original.Hex() || (got.EndEpoch != nil) != tc.wantEpoch || pending == tc.wantEpoch || (tc.wantErr != nil && !errors.Is(err, tc.wantErr)) {
+				t.Fatalf("observation=%#v pending=%t error=%v", got, pending, err)
+			}
+			if tc.wantConfirmed == (common.Hash{}) && got.ConfirmedTxHash != "" || tc.wantConfirmed != (common.Hash{}) && got.ConfirmedTxHash != tc.wantConfirmed.Hex() {
+				t.Fatalf("confirmed hash=%q, want %s", got.ConfirmedTxHash, tc.wantConfirmed)
+			}
+			if tc.wantReceipt == nil {
+				if got.ReceiptStatus != nil {
+					t.Fatalf("receipt status = %d, want unknown", *got.ReceiptStatus)
+				}
+			} else if got.ReceiptStatus == nil || *got.ReceiptStatus != *tc.wantReceipt {
+				t.Fatalf("receipt status = %v, want %d", got.ReceiptStatus, *tc.wantReceipt)
+			}
+			if len(tc.chain.queried) == 0 || tc.chain.queried[0] != tc.wantHash {
+				t.Fatalf("queried hashes=%v, want %s", tc.chain.queried, tc.wantHash)
+			}
+			if tc.wantEpoch && (*got.EndEpoch != 84 || err != nil) {
+				t.Fatalf("confirmed result=%#v error=%v", got, err)
+			}
+			if !tc.wantEpoch && !tc.direct {
+				if httpErr, ok := errors.AsType[*pdp.HTTPError](err); (tc.providerStatus >= 400) && (!ok || httpErr.StatusCode != tc.providerStatus) {
+					t.Fatalf("provider diagnostic missing from error: %v", err)
+				}
 			}
 		})
 	}

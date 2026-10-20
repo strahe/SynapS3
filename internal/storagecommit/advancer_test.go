@@ -66,7 +66,7 @@ func (c *commitCase) land(firstPieceID uint64, pieces []cid.Cid) {
 
 func (c *commitCase) receipt(state storage.CommitState, pieceIDs ...uint64) {
 	tx, statusURL := "0xtx", "https://provider.example/status/0xtx"
-	c.request.TransactionID, c.request.StatusURL = &tx, &statusURL
+	c.request.TxHash, c.request.StatusURL = &tx, &statusURL
 	ref, _ := c.target.DataSetRef()
 	ids := make([]sdktypes.BigInt, len(pieceIDs))
 	for i, id := range pieceIDs {
@@ -75,7 +75,8 @@ func (c *commitCase) receipt(state storage.CommitState, pieceIDs ...uint64) {
 	c.target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
 		return &storage.CommitStatus{
 			Kind: storage.CommitKindAddPieces, State: state, TransactionID: tx,
-			DataSet: &ref, PieceIDs: ids,
+			ConfirmedTransactionID: "0xconfirmed",
+			DataSet:                &ref, PieceIDs: ids,
 		}, nil
 	}
 }
@@ -124,8 +125,18 @@ func TestObserveConfirmsOnlyWhatTheChainProves(t *testing.T) {
 	c.land(40, c.pieces)
 	observation, err = c.advancer().Observe(ctx, c.commit())
 	if err != nil || observation.Kind != storagecommit.ObserveConfirmed ||
-		observation.Confirmation.FirstPieceID.String() != "40" || observation.Confirmation.ConfirmedTransactionID != "0xtx" {
+		observation.Confirmation.FirstPieceID.String() != "40" || observation.Confirmation.ConfirmedTxHash != "0xconfirmed" {
 		t.Fatalf("proven receipt = %#v, %v", observation, err)
+	}
+	getStatus := c.target.GetCommitStatusFunc
+	c.target.GetCommitStatusFunc = func(ctx context.Context, url string) (*storage.CommitStatus, error) {
+		status, err := getStatus(ctx, url)
+		status.ConfirmedTransactionID = ""
+		return status, err
+	}
+	observation, err = c.advancer().Observe(ctx, c.commit())
+	if err != nil || observation.Kind != storagecommit.ObserveConfirmed || observation.Confirmation.ConfirmedTxHash != "" {
+		t.Fatalf("unknown confirmed hash = %#v, %v", observation, err)
 	}
 
 	c = newCommitCase(t, 2)
@@ -174,13 +185,22 @@ func TestObserveResendsOnceAnUnreadableProviderNeedsAttention(t *testing.T) {
 	ctx := t.Context()
 	c := newCommitCase(t, 1)
 	c.receipt(storage.CommitStatePending)
+	providerErr := &pdp.HTTPError{StatusCode: 503, Body: "unavailable eid=receipt-unavailable"}
 	c.target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
-		return nil, &pdp.HTTPError{StatusCode: 503, Body: "unavailable"}
+		return nil, providerErr
 	}
 	observation, err := c.advancer().Observe(ctx, c.commit())
 	if err != nil || observation.Kind != storagecommit.ObservePending || observation.Attention != "" {
 		t.Fatalf("recent submission = %#v, %v, want to wait for the provider", observation, err)
 	}
+	rpcErr := errors.New("rpc unavailable")
+	c.nonces.Err = rpcErr
+	observation, err = c.advancer().Observe(ctx, c.commit())
+	if err != nil || observation.Kind != storagecommit.ObservePending || observation.Cause != nil ||
+		!errors.Is(observation.Diagnostic, providerErr) || !errors.Is(observation.Diagnostic, rpcErr) {
+		t.Fatalf("fallback lost errors or changed retry policy: %#v, %v", observation, err)
+	}
+	c.nonces.Err = nil
 	c.sentAt(c.now.Add(-20 * time.Minute))
 	observation, err = c.advancer().Observe(ctx, c.commit())
 	if err != nil || observation.Kind != storagecommit.ObservePending || observation.Attention != storagecommit.AttentionConfirmationTimeout {
@@ -200,7 +220,7 @@ func TestObserveResendsOnceAnUnreadableProviderNeedsAttention(t *testing.T) {
 	}
 	c.nonces.Err = nil
 	c.land(40, c.pieces)
-	if observation, err := c.advancer().Observe(ctx, c.commit()); err != nil || observation.Kind != storagecommit.ObserveConfirmed {
+	if observation, err := c.advancer().Observe(ctx, c.commit()); err != nil || observation.Kind != storagecommit.ObserveConfirmed || observation.Diagnostic != nil {
 		t.Fatalf("landed request = %#v, %v, want confirmed", observation, err)
 	}
 }

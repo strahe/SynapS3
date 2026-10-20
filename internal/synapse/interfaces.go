@@ -100,7 +100,7 @@ type ParkedPieceChecker interface {
 // have both passed.
 type ServiceTerminator interface {
 	PDPVerifierAddress() common.Address
-	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, error)
+	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*TerminationResult, error)
 	// VerifyServicePayer reads the data set's record and fails with
 	// ErrServicePaidByAnother when this wallet does not pay for it; any other
 	// error means the record could not be read. It sends nothing, so a caller can
@@ -112,12 +112,13 @@ type ServiceTerminator interface {
 	ContextIdentity() storage.ContextIdentity
 }
 
-// TerminationResult records what the chain agreed to. EndEpoch is the epoch at
-// which the service actually stops, which is why retirement waits for the chain
-// to reach it rather than trusting the call returning.
+// TerminationResult retains submission evidence and the verified service end,
+// when known. A submitted transaction does not establish its end epoch.
 type TerminationResult struct {
-	TxHash   string
-	EndEpoch int64
+	TxHash          string
+	ConfirmedTxHash string
+	ReceiptStatus   *uint64
+	EndEpoch        *int64
 }
 
 // ChainEpochReader observes the chain head. Replacement uses it to decide when

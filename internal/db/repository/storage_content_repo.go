@@ -259,9 +259,9 @@ func (r *BunStorageContentRepo) ListCopies(ctx context.Context, contentID int64)
 			commit_request.task_id AS commit_task_id,
 			commit_request.piece_count AS commit_piece_count,
 			commit_request.first_sent_at AS commit_sent_at,
-			commit_request.transaction_id AS commit_transaction_id,
+			commit_request.tx_hash AS commit_tx_hash,
 			commit_request.submit_error AS commit_submit_error,
-			commit_request.confirmed_transaction_id AS commit_confirmed_transaction_id,
+			commit_request.confirmed_tx_hash AS commit_confirmed_tx_hash,
 			commit_request.attention_code AS commit_attention_code,
 			commit_request.attention_at AS commit_attention_at
 		FROM storage_copies AS storage_copy
@@ -621,6 +621,8 @@ func (r *BunStorageContentRepo) ListDataSetSummaries(ctx context.Context, bucket
 			storage_data_set.provider_id,
 			storage_data_set.data_set_id,
 			storage_data_set.client_data_set_id,
+			storage_data_set.tx_hash,
+			storage_data_set.confirmed_tx_hash,
 			storage_data_set.status,
 			storage_data_set.created_by_content_id,
 			COALESCE(copy_stats.committed_copies, 0) AS committed_copies,
@@ -762,11 +764,9 @@ func (r *BunStorageContentRepo) RecordDataSetCreationError(ctx context.Context, 
 // request is still recorded so the data set it creates can be resolved.
 func (r *BunStorageContentRepo) MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	query := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = CASE WHEN status = ? THEN status ELSE ? END", model.StorageDataSetStatusDraining, model.StorageDataSetStatusCreating).
-		Set("create_transaction_id = ?", nullableString(input.TransactionID)).
-		Set("create_status_url = ?", nullableString(input.StatusURL)).
 		Set("client_data_set_id = ?", input.ClientDataSetID).
 		Set("last_error = CASE WHEN status = ? THEN last_error ELSE NULL END", model.StorageDataSetStatusDraining).
 		Set("updated_at = ?", now).
@@ -775,12 +775,30 @@ func (r *BunStorageContentRepo) MarkDataSetCreating(ctx context.Context, input M
 			model.StorageDataSetStatusPending,
 			model.StorageDataSetStatusCreating,
 			model.StorageDataSetStatusDraining,
-		})).
-		Exec(ctx)
+		}))
+	query = withDataSetCreationEvidence(query, input.TxHash, input.ConfirmedTxHash, input.StatusURL)
+	res, err := query.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set creating: %w", err)
 	}
 	return requireDataSetStatusUpdate(ctx, r.db, input.ID, res, "marking storage data set creating")
+}
+
+func withDataSetCreationEvidence(query *bun.UpdateQuery, txHash, confirmedTxHash, statusURL string) *bun.UpdateQuery {
+	if txHash != "" {
+		query = query.Set("tx_hash = ?", txHash).
+			Set("confirmed_tx_hash = CASE WHEN tx_hash IS DISTINCT FROM ? THEN ? ELSE COALESCE(?, confirmed_tx_hash) END", txHash, nullableString(confirmedTxHash), nullableString(confirmedTxHash)).
+			Set("create_status_url = CASE WHEN tx_hash IS DISTINCT FROM ? THEN ? ELSE COALESCE(?, create_status_url) END", txHash, nullableString(statusURL), nullableString(statusURL))
+	} else if statusURL != "" {
+		query = query.Set("create_status_url = ?", statusURL)
+	}
+	if confirmedTxHash != "" && txHash == "" {
+		query = query.Set("confirmed_tx_hash = ?", confirmedTxHash).
+			Where("confirmed_tx_hash IS NULL OR confirmed_tx_hash = ?", confirmedTxHash)
+	} else if confirmedTxHash != "" {
+		query = query.Where("(tx_hash IS DISTINCT FROM ? OR confirmed_tx_hash IS NULL OR confirmed_tx_hash = ?)", txHash, confirmedTxHash)
+	}
+	return query
 }
 
 func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id, ensureTaskID int64, clientDataSetID types.OnChainID) error {
@@ -805,7 +823,7 @@ func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id, e
 
 func (r *BunStorageContentRepo) MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		return markDataSetReady(ctx, db, input.ID, input.DataSetID, input.ClientDataSetID)
+		return markDataSetReady(ctx, db, input)
 	})
 }
 
@@ -1744,7 +1762,8 @@ func lockCurrentDataSetBinding(ctx context.Context, db bun.IDB, id int64) (*mode
 // generation that already left its slot never becomes ready again. One that
 // replacement drained while its creation was in flight stays draining but
 // still records the data set, so the service it created can be found and ended.
-func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types.OnChainID, clientDataSetID *types.OnChainID) error {
+func markDataSetReady(ctx context.Context, db bun.IDB, input MarkDataSetReadyInput) error {
+	id, dataSetID, clientDataSetID := input.ID, input.DataSetID, input.ClientDataSetID
 	if dataSetID.IsZero() {
 		return fmt.Errorf("dataSetID is required: %w", ErrInvalidInput)
 	}
@@ -1791,6 +1810,7 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types
 		// carrying a different one is never written over it.
 		query = query.Where("(client_data_set_id IS NULL OR client_data_set_id = '' OR client_data_set_id = ?)", clientDataSetID)
 	}
+	query = withDataSetCreationEvidence(query, input.TxHash, input.ConfirmedTxHash, "")
 	res, err := query.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set ready: %w", err)

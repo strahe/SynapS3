@@ -158,7 +158,7 @@ func (h *Handler) bucketProvisionHandler() *taskengine.FuncHandler {
 			if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
 				return h.waitForStorageDependency(ctx, execution, "providers", "Waiting for storage providers", err)
 			}
-			return taskengine.Retry(synapse.SummarizedError(err), "storage_selection_failed", settlement)
+			return taskengine.Retry(err, "storage_selection_failed", settlement)
 		}
 		if len(selected) < required {
 			return taskengine.WaitForObservation(model.TaskResumeModeExecute, "providers", "Waiting for storage providers", nil)
@@ -277,14 +277,14 @@ func (h *Handler) waitForStorageDependency(ctx context.Context, execution tasken
 }
 
 func (h *Handler) logStorageDependencyFailure(ctx context.Context, execution taskengine.Execution, reason string, err error) error {
-	summary := synapse.SummarizedError(err)
+	summary := errtext.Format(err)
 	level := slog.LevelWarn
-	if execution.LastError() == errtext.Redact(summary.Error()) {
+	if execution.LastError() == summary {
 		level = slog.LevelDebug
 	}
 	h.deps.Logger.Log(ctx, level, "storage task waiting for dependency",
 		"task_id", execution.ID(), "task_type", execution.Type(), "wait_reason", reason, "error", summary)
-	return summary
+	return err
 }
 
 func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {

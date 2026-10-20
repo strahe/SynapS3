@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 )
 
@@ -345,7 +346,8 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	}
 	if invocationCtx.Err() != nil && parent.Err() == nil && leaseSafe.Load() && (result.kind == resultWait || result.kind == resultInvalid) {
 		// Preserve observed terminal results and evidence returned by the handler.
-		result = Retry(invocationCtx.Err(), "invocation_timeout", result.settlement).WithRetrySettlements(result.onRetry, result.onExhausted)
+		result = Retry(errors.Join(invocationCtx.Err(), result.diagnostic), "invocation_timeout", result.settlement).
+			WithRetrySettlements(result.onRetry, result.onExhausted).WithContentionSettlement(result.contentionSettlement)
 	}
 	if parent.Err() != nil || !leaseSafe.Load() {
 		logger.Warn("task result discarded because the lease is uncertain")
@@ -356,7 +358,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if errors.Is(result.err, repository.ErrTaskIdentityContended) || errors.Is(result.err, repository.ErrRepositoryContended) {
 		// Database contention cannot allocate another business opportunity or
 		// authorize a failed settlement of an unresolved external effect.
-		result = Wait(model.TaskResumeModeRecover, "database_contention", "Waiting to continue", nil)
+		result = Wait(model.TaskResumeModeRecover, "database_contention", "Waiting to continue", result.contentionSettlement).WithDiagnostic(result.err)
 	}
 	resultErr := validateResult(result, claimed)
 	if result.observationWindow != nil && definition.Policy.ObservationWindow <= 0 {
@@ -426,6 +428,9 @@ func invokeHandler(ctx context.Context, handler Handler, execution Execution) (r
 }
 
 func validateResult(result Result, _ *model.Task) error {
+	if result.diagnostic != nil && result.kind != resultWait {
+		return ErrInvalidResult
+	}
 	if window := result.observationWindow; window != nil {
 		if result.kind != resultWait || !result.observationWait || result.waitUntil != nil || strings.TrimSpace(window.stageKey) == "" || window.timeoutErr == nil || (window.timeoutRetryMode != model.TaskResumeModeExecute && window.timeoutRetryMode != model.TaskResumeModeRecover) {
 			return ErrInvalidResult
@@ -461,6 +466,7 @@ func validateResult(result Result, _ *model.Task) error {
 func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result Result) error {
 	var transition repository.TaskTransition
 	var lastErr error
+	var diagnosticChanged bool
 	for _, delay := range e.settlementRetryDelays {
 		if delay > 0 {
 			if err := e.waitSettlementRetry(ctx, claimed, delay); err != nil {
@@ -489,6 +495,7 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 				return err
 			}
 			transition = e.transitionFor(current, effective)
+			diagnosticChanged = effective.kind == resultWait && transition.LastError != nil && dereference(current.LastError) != *transition.LastError
 			if observation != nil && transition.Observation == nil {
 				transition.Observation = observation
 			}
@@ -516,6 +523,10 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 		})
 		cancel()
 		if lastErr == nil {
+			if diagnosticChanged {
+				e.logger.Warn("task observation failed", "task_id", claimed.ID, "task_type", claimed.Type,
+					"subject_type", claimed.SubjectType, "subject_key", claimed.SubjectKey, "error", *transition.LastError)
+			}
 			e.notifyTaskSettled(claimed, transition)
 			return nil
 		}
@@ -547,7 +558,8 @@ func (e *Engine) observationResult(current *model.Task, result Result, now time.
 	if !now.Before(deadline) {
 		result.kind = resultRetry
 		result.resumeMode = window.timeoutRetryMode
-		result.err = window.timeoutErr
+		result.err = errors.Join(window.timeoutErr, result.diagnostic)
+		result.diagnostic = nil
 		result.failureReason = "observation_window_expired"
 		result.waitReason = ""
 		result.message = ""
@@ -622,6 +634,7 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.Status = model.TaskStatusCompleted
 	case resultWait:
 		transition.Status = model.TaskStatusPending
+		transition.LastError = errorPointer(result.diagnostic)
 		transition.ResumeMode = result.resumeMode
 		definition, _ := e.registry.Definition(claimed.Type)
 		interval := e.config.PollInterval
@@ -840,6 +853,6 @@ func errorPointer(err error) *string {
 	if err == nil {
 		return nil
 	}
-	message := err.Error()
+	message := errtext.Format(err)
 	return &message
 }

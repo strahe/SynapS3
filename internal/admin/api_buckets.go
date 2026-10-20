@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/objectkey"
@@ -103,6 +104,8 @@ type bucketDetailResponse struct {
 }
 
 type storageDataSetSummaryResponse struct {
+	TxHash                        *string                   `json:"tx_hash"`
+	ConfirmedTxHash               *string                   `json:"confirmed_tx_hash"`
 	ID                            int64                     `json:"id"`
 	BucketID                      int64                     `json:"bucket_id"`
 	BucketName                    string                    `json:"bucket_name,omitempty"`
@@ -744,6 +747,8 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			UploadSpeedUnavailableReason:  speedUnavailableReason,
 			DataSetID:                     onChainIDStringPtr(summary.DataSetID),
 			ClientDataSetID:               onChainIDStringPtr(summary.ClientDataSetID),
+			TxHash:                        summary.TxHash,
+			ConfirmedTxHash:               summary.ConfirmedTxHash,
 			Status:                        string(summary.Status),
 			CreatedByContentID:            summary.CreatedByContentID,
 			CommittedCopies:               summary.CommittedCopies,
@@ -907,6 +912,8 @@ type objectProvenanceResponse struct {
 }
 
 type objectProvenanceCopyResponse struct {
+	TxHash                 *string                   `json:"tx_hash"`
+	ConfirmedTxHash        *string                   `json:"confirmed_tx_hash"`
 	CopyID                 int64                     `json:"copy_id"`
 	LastError              *string                   `json:"last_error,omitempty"`
 	Retryable              bool                      `json:"retryable"`
@@ -2019,6 +2026,8 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			AttentionCode:    copyRow.CommitAttentionCode,
 			AttentionAt:      attentionAt,
 			SubmitError:      copyRow.CommitSubmitError,
+			TxHash:           copyRow.CommitTxHash,
+			ConfirmedTxHash:  copyRow.CommitConfirmedTxHash,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -2176,8 +2185,9 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 		case errors.Is(err, objectreader.ErrNoSuchBucket), errors.Is(err, objectreader.ErrNoSuchKey), errors.Is(err, objectreader.ErrNoSuchVersion):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "object not found"})
 		default:
-			s.logger.Error("api: failed to open object download", "error", err, "bucket", bucketName, "key", key)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			detail := errtext.Redact("Could not download object: " + errtext.Format(err))
+			s.logger.Error("api: failed to open object download", "error", detail, "bucket", bucketName, "key", key)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": detail})
 		}
 		return
 	}

@@ -1007,18 +1007,19 @@ type adminTaskStatusCount struct {
 }
 
 type adminStorageConfirmationAttention struct {
-	RequestID     string   `json:"request_id"`
-	TaskID        *int64   `json:"task_id,omitempty"`
-	DataSetRowID  int64    `json:"data_set_row_id"`
-	ProviderID    string   `json:"provider_id"`
-	DataSetID     string   `json:"data_set_id,omitempty"`
-	PieceCount    int      `json:"piece_count"`
-	PieceCIDs     []string `json:"piece_cids"`
-	TransactionID string   `json:"transaction_id,omitempty"`
-	SubmitError   string   `json:"submit_error,omitempty"`
-	ReasonCode    string   `json:"reason_code"`
-	SubmittedAt   string   `json:"submitted_at"`
-	AttentionAt   string   `json:"attention_at"`
+	RequestID       string   `json:"request_id"`
+	TaskID          *int64   `json:"task_id,omitempty"`
+	DataSetRowID    int64    `json:"data_set_row_id"`
+	ProviderID      string   `json:"provider_id"`
+	DataSetID       string   `json:"data_set_id,omitempty"`
+	PieceCount      int      `json:"piece_count"`
+	PieceCIDs       []string `json:"piece_cids"`
+	TxHash          *string  `json:"tx_hash"`
+	ConfirmedTxHash *string  `json:"confirmed_tx_hash"`
+	SubmitError     string   `json:"submit_error,omitempty"`
+	ReasonCode      string   `json:"reason_code"`
+	SubmittedAt     string   `json:"submitted_at"`
+	AttentionAt     string   `json:"attention_at"`
 }
 
 type adminSettingKind int
@@ -1529,7 +1530,7 @@ func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {
 
 func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStorageConfirmationAttention) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "REQUEST\tTASK ID\tPROVIDER\tDATA SET\tPIECES\tTRANSACTION\tREASON\tSUBMITTED AT\tATTENTION AT\tPROVIDER RESPONSE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "REQUEST\tTASK ID\tPROVIDER\tDATA SET\tPIECES\tSUBMITTED TRANSACTION\tCONFIRMED TRANSACTION\tREASON\tSUBMITTED AT\tATTENTION AT\tPROVIDER RESPONSE"); err != nil {
 		return err
 	}
 	for _, confirmation := range confirmations {
@@ -1537,15 +1538,23 @@ func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStora
 		if confirmation.TaskID != nil {
 			taskID = strconv.FormatInt(*confirmation.TaskID, 10)
 		}
+		var txHash, confirmedTxHash string
+		if confirmation.TxHash != nil {
+			txHash = *confirmation.TxHash
+		}
+		if confirmation.ConfirmedTxHash != nil {
+			confirmedTxHash = *confirmation.ConfirmedTxHash
+		}
 		if _, err := fmt.Fprintf(
 			tw,
-			"%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			confirmation.RequestID,
 			taskID,
 			confirmation.ProviderID,
 			confirmation.DataSetID,
 			confirmation.PieceCount,
-			confirmation.TransactionID,
+			txHash,
+			confirmedTxHash,
 			confirmation.ReasonCode,
 			confirmation.SubmittedAt,
 			confirmation.AttentionAt,

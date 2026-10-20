@@ -49,37 +49,36 @@ func (s RequestStatus) Valid() bool {
 // be on chain without a known outcome.
 const MaxSubmittedRequestsPerDataSet = 4
 
-// Request is the ledger of one signed add-pieces request: the data set it
-// names, every send of it, and its outcome. It outlives the copies it
-// registers.
+// Request records one signed add-pieces authorization and its submission and
+// confirmation evidence. It outlives the copies it registers.
 type Request struct {
 	bun.BaseModel `bun:"table:storage_commit_requests,alias:commit_request"`
 
-	RequestID              string             `bun:"request_id,type:text,pk"`
-	StorageDataSetID       int64              `bun:"storage_data_set_id,notnull"`
-	Status                 RequestStatus      `bun:"status,type:text,notnull"`
-	TaskID                 *int64             `bun:"task_id,nullzero"`
-	PieceCount             int                `bun:"piece_count,type:integer,notnull"`
-	ExtraDataHex           *string            `bun:"extra_data_hex,type:text,nullzero"`
-	SealedAt               *time.Time         `bun:"sealed_at,nullzero"`
-	FirstSentAt            *time.Time         `bun:"first_sent_at,nullzero"`
-	Sends                  int                `bun:"sends,type:integer,notnull"`
-	SubmittedAt            *time.Time         `bun:"submitted_at,nullzero"`
-	LastSentAt             *time.Time         `bun:"last_sent_at,nullzero"`
-	TransactionID          *string            `bun:"transaction_id,type:text,nullzero"`
-	StatusURL              *string            `bun:"status_url,type:text,nullzero"`
-	SubmitError            *string            `bun:"submit_error,type:text,nullzero"`
-	Refusals               int                `bun:"refusals,type:integer,notnull"`
-	RetryAt                *time.Time         `bun:"retry_at,nullzero"`
-	FirstPieceID           *idtypes.OnChainID `bun:"first_piece_id,type:text"`
-	ConfirmedTransactionID *string            `bun:"confirmed_transaction_id,type:text,nullzero"`
-	ConfirmedAt            *time.Time         `bun:"confirmed_at,nullzero"`
-	LastError              *string            `bun:"last_error,type:text,nullzero"`
-	AttentionCode          *string            `bun:"attention_code,type:text,nullzero"`
-	AttentionAt            *time.Time         `bun:"attention_at,nullzero"`
-	CreatedAt              time.Time          `bun:"created_at,nullzero,notnull"`
-	UpdatedAt              time.Time          `bun:"updated_at,nullzero,notnull"`
-	SealRequestedAt        *time.Time         `bun:"seal_requested_at,nullzero"`
+	RequestID        string             `bun:"request_id,type:text,pk"`
+	StorageDataSetID int64              `bun:"storage_data_set_id,notnull"`
+	Status           RequestStatus      `bun:"status,type:text,notnull"`
+	TaskID           *int64             `bun:"task_id,nullzero"`
+	PieceCount       int                `bun:"piece_count,type:integer,notnull"`
+	ExtraDataHex     *string            `bun:"extra_data_hex,type:text,nullzero"`
+	SealedAt         *time.Time         `bun:"sealed_at,nullzero"`
+	FirstSentAt      *time.Time         `bun:"first_sent_at,nullzero"`
+	Sends            int                `bun:"sends,type:integer,notnull"`
+	SubmittedAt      *time.Time         `bun:"submitted_at,nullzero"`
+	LastSentAt       *time.Time         `bun:"last_sent_at,nullzero"`
+	TxHash           *string            `bun:"tx_hash,type:text,nullzero"`
+	StatusURL        *string            `bun:"status_url,type:text,nullzero"`
+	SubmitError      *string            `bun:"submit_error,type:text,nullzero"`
+	Refusals         int                `bun:"refusals,type:integer,notnull"`
+	RetryAt          *time.Time         `bun:"retry_at,nullzero"`
+	FirstPieceID     *idtypes.OnChainID `bun:"first_piece_id,type:text"`
+	ConfirmedTxHash  *string            `bun:"confirmed_tx_hash,type:text,nullzero"`
+	ConfirmedAt      *time.Time         `bun:"confirmed_at,nullzero"`
+	LastError        *string            `bun:"last_error,type:text,nullzero"`
+	AttentionCode    *string            `bun:"attention_code,type:text,nullzero"`
+	AttentionAt      *time.Time         `bun:"attention_at,nullzero"`
+	CreatedAt        time.Time          `bun:"created_at,nullzero,notnull"`
+	UpdatedAt        time.Time          `bun:"updated_at,nullzero,notnull"`
+	SealRequestedAt  *time.Time         `bun:"seal_requested_at,nullzero"`
 }
 
 var _ bun.BeforeAppendModelHook = (*Request)(nil)

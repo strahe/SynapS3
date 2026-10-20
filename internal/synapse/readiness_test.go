@@ -320,6 +320,9 @@ func TestReadinessUsesTierAndHealthForRuntimeAndDraft(t *testing.T) {
 					inventory.Selection.Admission.TrustedIDs = nil
 				}
 				inventory.Selection.Candidates[0].Healthy = scenario.healthy
+				if !scenario.healthy {
+					inventory.PartialErrors = map[string]string{"1": "provider check failed; eid=readiness-42"}
+				}
 				client.inventory = &inventory
 				checker := NewReadinessChecker(cfg, client, WithReadinessClientFactory(func(_ context.Context, got ReadinessConfig) (ReadinessClient, error) {
 					if got.AnchorProviderTier != cfg.AnchorProviderTier {
@@ -332,6 +335,9 @@ func TestReadinessUsesTierAndHealthForRuntimeAndDraft(t *testing.T) {
 					result = checker.CheckDraft(t.Context(), cfg)
 				} else {
 					result = checker.CheckRuntime(t.Context())
+				}
+				if !scenario.healthy && !strings.Contains(result.PartialErrors["provider:1"], "eid=readiness-42") {
+					t.Fatalf("provider readiness diagnostic lost: %#v", result.PartialErrors)
 				}
 				requireCheckStatus(t, result.Checks, "providers", scenario.want)
 				if scenario.want == ReadinessStatusReady && len(client.storage.costRefs) != 1 {

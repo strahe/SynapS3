@@ -29,6 +29,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/s3iam"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	"github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -1226,6 +1227,11 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDataSetSummaries: %v", err)
 	}
+	if _, err := srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("tx_hash = ?", "0xdataset-submitted").Set("confirmed_tx_hash = ?", "0xdataset-confirmed").
+		Where("id = ?", summaries[0].ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
 	checkedAt := time.Now().UTC()
 	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
 		{
@@ -1270,8 +1276,12 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		t.Fatalf("Unmarshal raw: %v", err)
 	}
-	if len(raw.DataSets) == 0 {
-		t.Fatal("raw data_sets is empty")
+	if len(raw.DataSets) != 2 {
+		t.Fatalf("raw data_sets length = %d, want 2", len(raw.DataSets))
+	}
+	if string(raw.DataSets[0]["tx_hash"]) != `"0xdataset-submitted"` || string(raw.DataSets[0]["confirmed_tx_hash"]) != `"0xdataset-confirmed"` ||
+		string(raw.DataSets[1]["tx_hash"]) != "null" || string(raw.DataSets[1]["confirmed_tx_hash"]) != "null" {
+		t.Fatalf("dataset transaction fields = %s", payload)
 	}
 	if _, ok := raw.DataSets[0]["avail"+"ability"]; ok {
 		t.Fatalf("legacy data set field is present: %s", payload)
@@ -3907,6 +3917,16 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://ingress.example/piece"},
 		{ProviderID: onChainID(t, "102"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://peer.example/piece"},
 	})
+	copyRow, err := repos.Contents.GetUploadCopy(ctx, content.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := fmt.Sprintf("request-%d-%d", content.ID, copyRow.ID)
+	if _, err := srv.db.NewUpdate().Model((*storagecommit.Request)(nil)).
+		Set("tx_hash = ?", "0xcommit-submitted").Set("confirmed_tx_hash = ?", "0xcommit-confirmed").
+		Where("request_id = ?", requestID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		ContentID: content.ID,
 		BucketID:  bucket.ID,
@@ -3939,6 +3959,8 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 		SuccessCopies   int               `json:"success_copies"`
 		CopyHealth      apiCopyHealthBody `json:"copy_health"`
 		Copies          []struct {
+			TxHash           *string                   `json:"tx_hash"`
+			ConfirmedTxHash  *string                   `json:"confirmed_tx_hash"`
 			CopyIndex        int                       `json:"copy_index"`
 			Status           string                    `json:"status"`
 			Health           apiCopyHealthBody         `json:"health"`
@@ -3961,8 +3983,23 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			return provenanceBody{}, resp.StatusCode
 		}
+		payload, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw struct {
+			Copies []map[string]json.RawMessage `json:"copies"`
+		}
+		if err := json.Unmarshal(payload, &raw); err != nil {
+			t.Fatal(err)
+		}
+		for _, copy := range raw.Copies {
+			if copy["tx_hash"] == nil || copy["confirmed_tx_hash"] == nil || copy["transaction_id"] != nil {
+				t.Fatalf("copy transaction shape = %s", payload)
+			}
+		}
 		var body provenanceBody
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		if err := json.Unmarshal(payload, &body); err != nil {
 			t.Fatalf("Decode provenance: %v", err)
 		}
 		return body, resp.StatusCode
@@ -3983,6 +4020,17 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	}
 	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || detail.Copies[0].TransferMethod != string(model.StorageCopyTransferMethodIngress) || detail.Copies[1].TransferMethod != string(model.StorageCopyTransferMethodPeerPull) {
 		t.Fatalf("copies = %#v, want provider scoped copy provenance", detail.Copies)
+	}
+	if detail.Copies[0].TxHash == nil || *detail.Copies[0].TxHash != "0xcommit-submitted" || detail.Copies[0].ConfirmedTxHash == nil || *detail.Copies[0].ConfirmedTxHash != "0xcommit-confirmed" {
+		t.Fatalf("copy transaction fields = %#v", detail.Copies[0])
+	}
+	if _, err := srv.db.NewUpdate().Model((*storagecommit.Request)(nil)).
+		Set("tx_hash = NULL").Set("confirmed_tx_hash = NULL").Set("status_url = NULL").Where("request_id = ?", requestID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unknown, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK || unknown.Copies[0].TxHash != nil || unknown.Copies[0].ConfirmedTxHash != nil {
+		t.Fatalf("unknown copy transactions = %#v (%d)", unknown, statusCode)
 	}
 	if detail.Copies[0].IsNewDataSet || detail.Copies[1].IsNewDataSet {
 		t.Fatalf("copies = %#v, want reused data sets derived from the earlier content", detail.Copies)
@@ -5335,6 +5383,35 @@ func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 	}
 	if !rr.deadlines[0].IsZero() {
 		t.Fatalf("write deadline = %v, want zero deadline", rr.deadlines[0])
+	}
+}
+
+func TestAPIBucketObjectDownload_PreservesRedactedFailure(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	bucket := &model.Bucket{Name: "failed-download-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(t.Context(), bucket); err != nil {
+		t.Fatal(err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "report.txt", 11, "etag", "checksum", "text/plain", model.ObjectStateCached)
+	mockCache := &testutil.MockCache{
+		GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, errors.New("GET https://user:password@provider.example/piece/17?token=secret#private: HTTP 503 eid=download-17 storage unavailable")
+		},
+	}
+	srv.objectReader = objectreader.New(repos, mockCache, nil, srv.cacheGate, srv.cacheAccessTracker, testLogger())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/failed-download-bucket/objects/download?key=report.txt", nil)
+	req.SetPathValue("name", bucket.Name)
+	rr := httptest.NewRecorder()
+	srv.handleAPIDownloadObject(rr, req)
+	var body map[string]string
+	decodeJSON(t, rr, &body)
+	if rr.Code != http.StatusInternalServerError || !strings.Contains(body["error"], "Could not download object") || !strings.Contains(body["error"], "https://provider.example/piece/17") || !strings.Contains(body["error"], "HTTP 503 eid=download-17 storage unavailable") {
+		t.Fatalf("download failure = %d %s", rr.Code, rr.Body.String())
+	}
+	for _, secret := range []string{"password", "token=secret", "#private"} {
+		if strings.Contains(body["error"], secret) {
+			t.Fatalf("download failure exposes %q: %s", secret, rr.Body.String())
+		}
 	}
 }
 

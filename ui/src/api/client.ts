@@ -307,6 +307,8 @@ export interface BucketItem {
 }
 
 export interface StorageDataSetSummary {
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
   id: number
   bucket_id: number
   bucket_name?: string
@@ -422,7 +424,29 @@ export type ProviderReplacementStatus =
   | 'completed'
   | 'superseded'
 
+export interface ProviderReplacementTermination {
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
+  receipt_status: 0 | 1 | null
+  attempt_no: number | null
+  epoch: number | null
+  attempts: ProviderReplacementTerminationAttempt[]
+}
+
+export interface ProviderReplacementTerminationAttempt {
+  id: number
+  attempt_no: number
+  task_id: number | null
+  attempted_at: string | null
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
+  receipt_status: 0 | 1 | null
+}
+
 export interface ProviderReplacementDataSet {
+  termination: ProviderReplacementTermination | null
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
   id: number
   generation: number
   is_current: boolean
@@ -743,6 +767,8 @@ export interface ProviderIdentity {
 }
 
 export interface ObjectProvenanceCopy {
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
   copy_id: number
   last_error?: string
   retryable: boolean
@@ -802,7 +828,8 @@ export interface CommitBatch {
   task_status: TaskItem['status'] | null
   status_message: string | null
   last_error: string | null
-  transaction_id: string | null
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
   task?: TaskItem
 }
 
@@ -943,7 +970,8 @@ export interface TaskStorageConfirmation {
   data_set_id?: string
   piece_count: number
   piece_cids: string[]
-  transaction_id?: string
+  tx_hash: string | null
+  confirmed_tx_hash: string | null
   submit_error?: string
   submitted_at: string
   attention_at: string

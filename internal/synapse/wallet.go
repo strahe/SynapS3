@@ -63,7 +63,7 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 
 	setErr := func(field string, err error) {
 		mu.Lock()
-		info.Errors[field] = errtext.Redact(err.Error())
+		info.Errors[field] = errtext.Format(err)
 		mu.Unlock()
 	}
 

@@ -516,7 +516,7 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 	}
 	fixture.repos.Contents = &commitAttentionTaskRepo{StorageContentRepository: fixture.repos.Contents, records: []storagecommit.AttentionRecord{{
 		RequestID: "request-447", TaskID: &stopped.ID, ProviderID: "32", DataSetID: "39911", PieceCIDs: []string{"piece-1"},
-		TransactionID: "0xcommit", SubmitError: "provider returned HTTP 500: piece not found",
+		TxHash: new("0xcommit"), ConfirmedTxHash: new("0xconfirmed"), SubmitError: "provider returned HTTP 500: piece not found",
 		Code: storagecommit.AttentionSubmissionMismatch, SubmittedAt: now.Add(-6 * time.Second), AttentionAt: now,
 	}}}
 
@@ -533,7 +533,7 @@ func TestAPITasksShowStoppedStorageConfirmation(t *testing.T) {
 		confirmation.SubmitError != "provider returned HTTP 500: piece not found" ||
 		confirmation.ProviderID != "32" || confirmation.DataSetID != "39911" ||
 		confirmation.ProviderIdentity == nil || confirmation.ProviderIdentity.Name != "North" || page.Tasks[0].ProviderIdentity != nil ||
-		confirmation.PieceCount != 1 || confirmation.PieceCIDs[0] != "piece-1" || confirmation.TransactionID != "0xcommit" {
+		confirmation.PieceCount != 1 || confirmation.PieceCIDs[0] != "piece-1" || confirmation.TxHash == nil || *confirmation.TxHash != "0xcommit" || confirmation.ConfirmedTxHash == nil || *confirmation.ConfirmedTxHash != "0xconfirmed" {
 		t.Fatalf("confirmation = %#v, want the confirmation with the provider reply", confirmation)
 	}
 	path := "/api/v1/tasks/" + strconv.FormatInt(stopped.ID, 10)

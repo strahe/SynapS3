@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -145,20 +144,11 @@ func (c *dataSetTargetAdapter) storeSessionRequest(req *http.Request, success in
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, pdp.MaxControlResponseBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(body) > pdp.MaxControlResponseBytes {
-		return nil, errors.New("upload session response exceeds the provider response limit")
-	}
 	if resp.StatusCode == success {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, providerErrorResponseLimit))
 		return resp, nil
 	}
-	httpErr := &pdp.HTTPError{
-		Method: req.Method, URL: req.URL.String(), StatusCode: resp.StatusCode,
-		Body: strings.TrimSpace(string(body)),
-	}
+	httpErr := readProviderHTTPError(req, resp)
 	if resp.StatusCode == http.StatusNotFound && conflict != nil {
 		return nil, errors.Join(ErrStoreSessionMissing, httpErr)
 	}

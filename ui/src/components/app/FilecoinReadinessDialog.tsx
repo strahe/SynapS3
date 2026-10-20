@@ -1,4 +1,5 @@
 import type { FilecoinReadinessCheck, FilecoinReadinessData } from '@/api/client'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -57,6 +58,14 @@ export function FilecoinReadinessDialog({
                   ))}
                 </div>
               )}
+              {Object.entries(data.partial_errors ?? {}).map(([field, detail]) => (
+                <div key={field} className="flex min-w-0 flex-col gap-1 rounded-md border p-3 text-sm">
+                  <div className="font-medium">
+                    {field.startsWith('provider:') ? `Provider ${field.slice('provider:'.length)}` : 'Check details'}
+                  </div>
+                  <CopyableValue label="Error details" value={detail} maxLength={120} className="w-full" />
+                </div>
+              ))}
             </div>
           </>
         )}

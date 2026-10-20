@@ -39,13 +39,18 @@ type Replacement struct {
 	CreatedAt           time.Time `bun:",nullzero,notnull"`
 	UpdatedAt           time.Time `bun:",nullzero,notnull"`
 
-	// The termination fields below are projected from storage_data_set_terminations
-	// on read. A termination is a ledger row, so a third kind of termination adds
-	// a row rather than another repeated column group here.
-	TerminationTxHash          *string `bun:",scanonly"`
-	TerminationEpoch           *int64  `bun:",scanonly"`
-	AbandonedTerminationTxHash *string `bun:",scanonly"`
-	AbandonedTerminationEpoch  *int64  `bun:",scanonly"`
+	// The current transaction is projected from the latest attempt; the epoch
+	// belongs to the service and can be observed independently of that attempt.
+	TerminationAttemptNo                int64   `bun:",scanonly"`
+	TerminationTxHash                   *string `bun:",scanonly"`
+	TerminationConfirmedTxHash          *string `bun:",scanonly"`
+	TerminationReceiptStatus            *uint64 `bun:",scanonly"`
+	TerminationEpoch                    *int64  `bun:",scanonly"`
+	AbandonedTerminationAttemptNo       int64   `bun:",scanonly"`
+	AbandonedTerminationTxHash          *string `bun:",scanonly"`
+	AbandonedTerminationConfirmedTxHash *string `bun:",scanonly"`
+	AbandonedTerminationReceiptStatus   *uint64 `bun:",scanonly"`
+	AbandonedTerminationEpoch           *int64  `bun:",scanonly"`
 }
 
 // TerminationRole names which of a replacement's two data sets a termination
@@ -58,9 +63,7 @@ const (
 	TerminationRoleAbandonedTarget TerminationRole = "abandoned_target"
 )
 
-// Termination records the end of term paid for on one data set. It is written
-// before the remote service is treated as terminated, so a crash in between
-// re-reads it instead of paying for a second termination.
+// Termination records the service's end epoch independently of transaction attempts.
 type Termination struct {
 	bun.BaseModel `bun:"table:storage_data_set_terminations,alias:storage_data_set_termination"`
 
@@ -72,10 +75,29 @@ type Termination struct {
 	// row cannot name a data set the replacement never held in that role.
 	SourceDataSetID          *int64    `bun:",nullzero"`
 	AbandonedTargetDataSetID *int64    `bun:",nullzero"`
-	TxHash                   *string   `bun:"type:text,nullzero"`
-	Epoch                    int64     `bun:",notnull"`
+	Epoch                    *int64    `bun:"type:bigint,nullzero"`
 	CreatedAt                time.Time `bun:",nullzero,notnull"`
 	UpdatedAt                time.Time `bun:",nullzero,notnull"`
+}
+
+// TerminationAttempt permanently retains one admitted termination request and
+// its receipt. A reverted receipt permits a separately authorized attempt.
+type TerminationAttempt struct {
+	bun.BaseModel `bun:"table:storage_data_set_termination_attempts,alias:storage_data_set_termination_attempt"`
+
+	ID              int64      `bun:",pk,autoincrement,identity"`
+	TerminationID   int64      `bun:",notnull"`
+	AttemptNo       int64      `bun:",notnull"`
+	TaskID          *int64     `bun:",nullzero"`
+	AttemptedAt     *time.Time `bun:",nullzero"`
+	TxHash          *string    `bun:"type:text,nullzero"`
+	ConfirmedTxHash *string    `bun:"type:text,nullzero"`
+	ReceiptStatus   *uint64    `bun:"type:smallint"`
+	CreatedAt       time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt       time.Time  `bun:",nullzero,notnull"`
+
+	ReplacementID int64           `bun:",scanonly"`
+	Role          TerminationRole `bun:",scanonly"`
 }
 
 // Item is one unit of migration work. Items are keyed by storage upload, not by
@@ -161,6 +183,20 @@ func (t *Termination) BeforeAppendModel(_ context.Context, query bun.Query) erro
 	}
 	if t.UpdatedAt.IsZero() {
 		t.UpdatedAt = now
+	}
+	return nil
+}
+
+func (a *TerminationAttempt) BeforeAppendModel(_ context.Context, query bun.Query) error {
+	if _, ok := query.(*bun.InsertQuery); !ok {
+		return nil
+	}
+	now := time.Now().UTC()
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = now
+	}
+	if a.UpdatedAt.IsZero() {
+		a.UpdatedAt = now
 	}
 	return nil
 }

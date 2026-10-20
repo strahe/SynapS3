@@ -392,7 +392,7 @@ func (r *BunStorageContentRepo) BeginCommitSubmission(ctx context.Context, input
 			Set("submitted_at = ?", now).
 			Set("last_sent_at = ?", now).
 			Set("retry_at = NULL").
-			Set("transaction_id = NULL").
+			Set("tx_hash = NULL").
 			Set("status_url = NULL").
 			Set("updated_at = ?", now).
 			Where("request_id = ? AND task_id = ? AND status = ?", input.RequestID, input.TaskID, storagecommit.RequestStatusReady).
@@ -438,22 +438,22 @@ func (r *BunStorageContentRepo) RecordCommitResend(ctx context.Context, input Co
 // CommitSubmissionInput is the provider's receipt for one send.
 type CommitSubmissionInput struct {
 	CommitSendInput
-	TransactionID string
-	StatusURL     string
+	TxHash    string
+	StatusURL string
 }
 
 // RecordCommitSubmission keeps the receipt of the latest send. The first
 // receipt answers whatever attention an unacknowledged send was flagged with.
 func (r *BunStorageContentRepo) RecordCommitSubmission(ctx context.Context, input CommitSubmissionInput) error {
-	if input.RequestID == "" || input.TaskID <= 0 || input.Sends < 1 || input.TransactionID == "" || input.StatusURL == "" {
+	if input.RequestID == "" || input.TaskID <= 0 || input.Sends < 1 || input.TxHash == "" || input.StatusURL == "" {
 		return fmt.Errorf("recording storage commit submission: %w", ErrInvalidInput)
 	}
 	now := commitInputTime(input.Now)
 	res, err := r.db.NewUpdate().
 		Model((*storagecommit.Request)(nil)).
-		Set("attention_code = CASE WHEN transaction_id IS NULL THEN NULL ELSE attention_code END").
-		Set("attention_at = CASE WHEN transaction_id IS NULL THEN NULL ELSE attention_at END").
-		Set("transaction_id = ?", input.TransactionID).
+		Set("attention_code = CASE WHEN tx_hash IS NULL THEN NULL ELSE attention_code END").
+		Set("attention_at = CASE WHEN tx_hash IS NULL THEN NULL ELSE attention_at END").
+		Set("tx_hash = ?", input.TxHash).
 		Set("status_url = ?", input.StatusURL).
 		Set("updated_at = ?", now).
 		Where("request_id = ? AND task_id = ? AND status = ?", input.RequestID, input.TaskID, storagecommit.RequestStatusSubmitted).
@@ -507,7 +507,7 @@ func (r *BunStorageContentRepo) ReturnCommitRequestToReady(ctx context.Context, 
 		if err != nil {
 			return err
 		}
-		if request.Sends != 1 || request.TransactionID != nil {
+		if request.Sends != 1 || request.TxHash != nil {
 			return ErrConflict
 		}
 		q := db.NewUpdate().
@@ -515,7 +515,7 @@ func (r *BunStorageContentRepo) ReturnCommitRequestToReady(ctx context.Context, 
 			Set("status = ?", storagecommit.RequestStatusReady).
 			Set("sends = 0").
 			Set("submitted_at = NULL").
-			Set("transaction_id = NULL").
+			Set("tx_hash = NULL").
 			Set("status_url = NULL").
 			Set("attention_code = NULL").
 			Set("attention_at = NULL").
@@ -548,7 +548,7 @@ func (r *BunStorageContentRepo) DropCommitEvidence(ctx context.Context, requestI
 	}
 	res, err := r.db.NewUpdate().
 		Model((*storagecommit.Request)(nil)).
-		Set("transaction_id = NULL").
+		Set("tx_hash = NULL").
 		Set("status_url = NULL").
 		Set("last_error = ?", errtext.Redact(lastError)).
 		Set("updated_at = ?", commitInputTime(now)).
@@ -576,10 +576,10 @@ func (r *BunStorageContentRepo) MarkCommitRequestAttention(ctx context.Context, 
 
 // ConfirmCommitRequestInput settles a request the chain proved.
 type ConfirmCommitRequestInput struct {
-	RequestID              string
-	TaskID                 int64
-	ConfirmedTransactionID string
-	FirstPieceID           idtypes.OnChainID
+	RequestID       string
+	TaskID          int64
+	ConfirmedTxHash string
+	FirstPieceID    idtypes.OnChainID
 	// RetrievalURLs are the members' retrieval URLs in position order.
 	RetrievalURLs []string
 	Now           time.Time
@@ -645,8 +645,8 @@ func (r *BunStorageContentRepo) ConfirmCommitRequest(ctx context.Context, input 
 			Set("attention_at = NULL").
 			Set("updated_at = ?", now).
 			Where("request_id = ? AND task_id = ? AND status = ?", input.RequestID, input.TaskID, request.Status)
-		if input.ConfirmedTransactionID != "" {
-			q = q.Set("confirmed_transaction_id = ?", input.ConfirmedTransactionID).Where("transaction_id IS NOT NULL")
+		if input.ConfirmedTxHash != "" {
+			q = q.Set("confirmed_tx_hash = ?", input.ConfirmedTxHash).Where("tx_hash IS NOT NULL")
 		}
 		res, err := q.Exec(ctx)
 		if err := requireCommitRows(res, err, "confirming storage commit request"); err != nil {
@@ -1089,9 +1089,9 @@ func projectCommitRequest(q *bun.SelectQuery, copyAlias string) {
 		ColumnExpr("commit_request.task_id AS commit_task_id").
 		ColumnExpr("commit_request.piece_count AS commit_piece_count").
 		ColumnExpr("commit_request.first_sent_at AS commit_sent_at").
-		ColumnExpr("commit_request.transaction_id AS commit_transaction_id").
+		ColumnExpr("commit_request.tx_hash AS commit_tx_hash").
 		ColumnExpr("commit_request.submit_error AS commit_submit_error").
-		ColumnExpr("commit_request.confirmed_transaction_id AS commit_confirmed_transaction_id").
+		ColumnExpr("commit_request.confirmed_tx_hash AS commit_confirmed_tx_hash").
 		ColumnExpr("commit_request.attention_code AS commit_attention_code").
 		ColumnExpr("commit_request.attention_at AS commit_attention_at").
 		Join("LEFT JOIN storage_commit_requests AS commit_request ON commit_request.request_id = " + copyAlias + ".commit_request_id")
@@ -1249,7 +1249,8 @@ func commitAttentionQuery(db bun.IDB) *bun.SelectQuery {
 		ColumnExpr("commit_request.storage_data_set_id AS data_set_row_id").
 		ColumnExpr("CAST(storage_data_set.provider_id AS TEXT) AS provider_id").
 		ColumnExpr("COALESCE(CAST(storage_data_set.data_set_id AS TEXT), '') AS data_set_id").
-		ColumnExpr("COALESCE(commit_request.transaction_id, '') AS transaction_id").
+		ColumnExpr("commit_request.tx_hash").
+		ColumnExpr("commit_request.confirmed_tx_hash").
 		ColumnExpr("COALESCE(commit_request.submit_error, '') AS submit_error").
 		ColumnExpr("commit_request.attention_code").
 		ColumnExpr("commit_request.submitted_at").
@@ -1261,16 +1262,17 @@ func commitAttentionQuery(db bun.IDB) *bun.SelectQuery {
 
 func (r *BunStorageContentRepo) scanCommitAttention(ctx context.Context, q *bun.SelectQuery) ([]storagecommit.AttentionRecord, error) {
 	type attentionRow struct {
-		RequestID     string    `bun:"request_id"`
-		TaskID        *int64    `bun:"task_id"`
-		DataSetRowID  int64     `bun:"data_set_row_id"`
-		ProviderID    string    `bun:"provider_id"`
-		DataSetID     string    `bun:"data_set_id"`
-		TransactionID string    `bun:"transaction_id"`
-		SubmitError   string    `bun:"submit_error"`
-		Code          string    `bun:"attention_code"`
-		SubmittedAt   time.Time `bun:"submitted_at"`
-		AttentionAt   time.Time `bun:"attention_at"`
+		RequestID       string    `bun:"request_id"`
+		TaskID          *int64    `bun:"task_id"`
+		DataSetRowID    int64     `bun:"data_set_row_id"`
+		ProviderID      string    `bun:"provider_id"`
+		DataSetID       string    `bun:"data_set_id"`
+		TxHash          *string   `bun:"tx_hash"`
+		ConfirmedTxHash *string   `bun:"confirmed_tx_hash"`
+		SubmitError     string    `bun:"submit_error"`
+		Code            string    `bun:"attention_code"`
+		SubmittedAt     time.Time `bun:"submitted_at"`
+		AttentionAt     time.Time `bun:"attention_at"`
 	}
 	var rows []attentionRow
 	if err := q.Scan(ctx, &rows); err != nil {
@@ -1299,7 +1301,7 @@ func (r *BunStorageContentRepo) scanCommitAttention(ctx context.Context, q *bun.
 		out = append(out, storagecommit.AttentionRecord{
 			RequestID: row.RequestID, TaskID: row.TaskID, DataSetRowID: row.DataSetRowID,
 			ProviderID: row.ProviderID, DataSetID: row.DataSetID, PieceCIDs: pieceCIDs[row.RequestID],
-			TransactionID: row.TransactionID, SubmitError: row.SubmitError,
+			TxHash: row.TxHash, ConfirmedTxHash: row.ConfirmedTxHash, SubmitError: row.SubmitError,
 			Code: storagecommit.AttentionCode(row.Code), SubmittedAt: row.SubmittedAt, AttentionAt: row.AttentionAt,
 		})
 	}

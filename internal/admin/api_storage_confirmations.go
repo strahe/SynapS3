@@ -7,18 +7,19 @@ import (
 )
 
 type storageConfirmationAttentionResponse struct {
-	RequestID     string    `json:"request_id"`
-	TaskID        *int64    `json:"task_id,omitempty"`
-	DataSetRowID  int64     `json:"data_set_row_id"`
-	ProviderID    string    `json:"provider_id"`
-	DataSetID     string    `json:"data_set_id,omitempty"`
-	PieceCount    int       `json:"piece_count"`
-	PieceCIDs     []string  `json:"piece_cids"`
-	TransactionID string    `json:"transaction_id,omitempty"`
-	SubmitError   string    `json:"submit_error,omitempty"`
-	ReasonCode    string    `json:"reason_code"`
-	SubmittedAt   time.Time `json:"submitted_at"`
-	AttentionAt   time.Time `json:"attention_at"`
+	RequestID       string    `json:"request_id"`
+	TaskID          *int64    `json:"task_id,omitempty"`
+	DataSetRowID    int64     `json:"data_set_row_id"`
+	ProviderID      string    `json:"provider_id"`
+	DataSetID       string    `json:"data_set_id,omitempty"`
+	PieceCount      int       `json:"piece_count"`
+	PieceCIDs       []string  `json:"piece_cids"`
+	TxHash          *string   `json:"tx_hash"`
+	ConfirmedTxHash *string   `json:"confirmed_tx_hash"`
+	SubmitError     string    `json:"submit_error,omitempty"`
+	ReasonCode      string    `json:"reason_code"`
+	SubmittedAt     time.Time `json:"submitted_at"`
+	AttentionAt     time.Time `json:"attention_at"`
 }
 
 func (s *Server) handleAPIListStorageConfirmations(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +51,7 @@ func (s *Server) handleAPIListStorageConfirmations(w http.ResponseWriter, r *htt
 		response = append(response, storageConfirmationAttentionResponse{
 			RequestID: record.RequestID, TaskID: record.TaskID, DataSetRowID: record.DataSetRowID,
 			ProviderID: record.ProviderID, DataSetID: record.DataSetID,
-			PieceCount: len(pieceCIDs), PieceCIDs: pieceCIDs, TransactionID: record.TransactionID,
+			PieceCount: len(pieceCIDs), PieceCIDs: pieceCIDs, TxHash: record.TxHash, ConfirmedTxHash: record.ConfirmedTxHash,
 			SubmitError: record.SubmitError, ReasonCode: string(record.Code),
 			SubmittedAt: record.SubmittedAt, AttentionAt: record.AttentionAt,
 		})

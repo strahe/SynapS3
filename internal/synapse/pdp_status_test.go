@@ -121,8 +121,8 @@ func TestPDPStatusCheckerClassifiesSDKRejectedCreationStatuses(t *testing.T) {
 				TransactionID: testCreateDataSetTxHash,
 			})
 
-			if got.State != PDPStatusRejected || got.Error != "" {
-				t.Fatalf("status = %#v, want rejected without checker error", got)
+			if got.State != PDPStatusRejected || !strings.Contains(got.Error, "tx_status="+fmt.Sprintf("%q", got.TxStatus)) || !strings.Contains(got.Error, testCreateDataSetTxHash) {
+				t.Fatalf("status = %#v, want rejected with provider status", got)
 			}
 		})
 	}

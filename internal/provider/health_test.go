@@ -112,7 +112,7 @@ func TestCheckHealthLogsClientConstructionError(t *testing.T) {
 
 	got := checker.Probe(context.Background(), "ftp://provider.example", time.Second)
 
-	if got.Status != "unreachable" || got.Detail != "Service URL is invalid" {
+	if got.Status != "unreachable" || !detailMatches(got.Detail, "service URL is invalid") || !strings.Contains(got.Detail, "unsupported scheme") {
 		t.Fatalf("probe = %+v, want unreachable with invalid URL detail", got)
 	}
 	if !strings.Contains(logs.String(), "failed to create PDP health client") {

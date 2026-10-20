@@ -91,14 +91,36 @@ type replacementProgressResponse struct {
 	NextRetryAt         *string `json:"next_retry_at,omitempty"`
 }
 
+type replacementTerminationResponse struct {
+	TxHash          *string                                 `json:"tx_hash"`
+	ConfirmedTxHash *string                                 `json:"confirmed_tx_hash"`
+	ReceiptStatus   *uint64                                 `json:"receipt_status"`
+	AttemptNo       *int64                                  `json:"attempt_no"`
+	Epoch           *int64                                  `json:"epoch"`
+	Attempts        []replacementTerminationAttemptResponse `json:"attempts"`
+}
+
+type replacementTerminationAttemptResponse struct {
+	ID              int64      `json:"id"`
+	AttemptNo       int64      `json:"attempt_no"`
+	TaskID          *int64     `json:"task_id"`
+	AttemptedAt     *time.Time `json:"attempted_at"`
+	TxHash          *string    `json:"tx_hash"`
+	ConfirmedTxHash *string    `json:"confirmed_tx_hash"`
+	ReceiptStatus   *uint64    `json:"receipt_status"`
+}
+
 type replacementDataSetResponse struct {
-	ID               int64                     `json:"id"`
-	Generation       int64                     `json:"generation"`
-	IsCurrent        bool                      `json:"is_current"`
-	Status           string                    `json:"status"`
-	ProviderID       string                    `json:"provider_id"`
-	DataSetID        *string                   `json:"data_set_id"`
-	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
+	TxHash           *string                         `json:"tx_hash"`
+	ConfirmedTxHash  *string                         `json:"confirmed_tx_hash"`
+	Termination      *replacementTerminationResponse `json:"termination"`
+	ID               int64                           `json:"id"`
+	Generation       int64                           `json:"generation"`
+	IsCurrent        bool                            `json:"is_current"`
+	Status           string                          `json:"status"`
+	ProviderID       string                          `json:"provider_id"`
+	DataSetID        *string                         `json:"data_set_id"`
+	ProviderIdentity *providerIdentityResponse       `json:"provider_identity,omitempty"`
 }
 
 // handleAPIStartDataSetReplacement is the only entry point that authorizes a
@@ -614,7 +636,11 @@ func (s *Server) providerReplacementResponse(ctx context.Context, bucketName str
 	if !ok {
 		return providerReplacementResponse{}, fmt.Errorf("provider replacement %d progress: %w", row.ID, repository.ErrNotFound)
 	}
-	return s.providerReplacementResponseWithProgress(ctx, bucketName, row, progress)
+	attempts, err := s.repos.Replacements.ListTerminationAttempts(ctx, []int64{row.ID})
+	if err != nil {
+		return providerReplacementResponse{}, err
+	}
+	return s.providerReplacementResponseWithProgress(ctx, bucketName, row, progress, attempts)
 }
 
 func (s *Server) providerReplacementResponseWithProgress(
@@ -622,6 +648,7 @@ func (s *Server) providerReplacementResponseWithProgress(
 	bucketName string,
 	row *storagereplacement.Replacement,
 	progress storagereplacement.ProgressSnapshot,
+	attempts []storagereplacement.TerminationAttempt,
 ) (providerReplacementResponse, error) {
 	source, err := s.repos.Contents.GetDataSetBindingByID(ctx, row.SourceDataSetID)
 	if err != nil {
@@ -680,6 +707,8 @@ func (s *Server) providerReplacementResponseWithProgress(
 		CreatedAt:        row.CreatedAt,
 		UpdatedAt:        row.UpdatedAt,
 	}
+	response.Source.Termination = replacementTerminationView(row, storagereplacement.TerminationRoleSource, attempts)
+	response.Target.Termination = replacementTerminationView(row, storagereplacement.TerminationRoleAbandonedTarget, attempts)
 	if progress.NextRetryAt != nil {
 		value := progress.NextRetryAt.Format(time.RFC3339)
 		response.Progress.NextRetryAt = &value
@@ -711,6 +740,41 @@ func (s *Server) providerReplacementResponseWithProgress(
 	return response, nil
 }
 
+func replacementTerminationView(row *storagereplacement.Replacement, role storagereplacement.TerminationRole, attempts []storagereplacement.TerminationAttempt) *replacementTerminationResponse {
+	result := &replacementTerminationResponse{
+		TxHash: row.TerminationTxHash, ConfirmedTxHash: row.TerminationConfirmedTxHash,
+		ReceiptStatus: row.TerminationReceiptStatus, Epoch: row.TerminationEpoch,
+		Attempts: make([]replacementTerminationAttemptResponse, 0),
+	}
+	attemptNo := row.TerminationAttemptNo
+	if role == storagereplacement.TerminationRoleAbandonedTarget {
+		result.TxHash, result.ConfirmedTxHash = row.AbandonedTerminationTxHash, row.AbandonedTerminationConfirmedTxHash
+		result.ReceiptStatus, result.Epoch = row.AbandonedTerminationReceiptStatus, row.AbandonedTerminationEpoch
+		attemptNo = row.AbandonedTerminationAttemptNo
+	}
+	if attemptNo > 0 {
+		result.AttemptNo = new(attemptNo)
+	}
+	for _, attempt := range attempts {
+		if attempt.Role != role {
+			continue
+		}
+		result.Attempts = append(result.Attempts, replacementTerminationAttemptResponse{
+			ID: attempt.ID, AttemptNo: attempt.AttemptNo, TaskID: attempt.TaskID, AttemptedAt: attempt.AttemptedAt,
+			TxHash: attempt.TxHash, ConfirmedTxHash: attempt.ConfirmedTxHash, ReceiptStatus: attempt.ReceiptStatus,
+		})
+		if result.AttemptNo == nil || attempt.AttemptNo >= *result.AttemptNo {
+			result.AttemptNo = new(attempt.AttemptNo)
+			result.TxHash, result.ConfirmedTxHash = attempt.TxHash, attempt.ConfirmedTxHash
+			result.ReceiptStatus = attempt.ReceiptStatus
+		}
+	}
+	if result.AttemptNo == nil && result.TxHash == nil && result.ConfirmedTxHash == nil && result.Epoch == nil && len(result.Attempts) == 0 {
+		return nil
+	}
+	return result
+}
+
 func replacementProviderIDs(sets ...*model.StorageDataSet) []idtypes.OnChainID {
 	ids := make([]idtypes.OnChainID, 0, len(sets))
 	for _, set := range sets {
@@ -726,12 +790,14 @@ func replacementDataSetView(set *model.StorageDataSet, identities map[string]*pr
 		return replacementDataSetResponse{}
 	}
 	view := replacementDataSetResponse{
-		ID:         set.ID,
-		Generation: set.Generation,
-		IsCurrent:  set.IsCurrent,
-		Status:     string(set.Status),
-		ProviderID: set.ProviderID.String(),
-		DataSetID:  onChainIDStringPtr(set.DataSetID),
+		ID:              set.ID,
+		Generation:      set.Generation,
+		IsCurrent:       set.IsCurrent,
+		Status:          string(set.Status),
+		ProviderID:      set.ProviderID.String(),
+		DataSetID:       onChainIDStringPtr(set.DataSetID),
+		TxHash:          set.TxHash,
+		ConfirmedTxHash: set.ConfirmedTxHash,
 	}
 	if identity, ok := identities[set.ProviderID.String()]; ok {
 		view.ProviderIdentity = identity
@@ -757,13 +823,22 @@ func (s *Server) bucketReplacementResponses(ctx context.Context, bucketName stri
 		s.logger.Error("api: failed to load provider replacement progress", "error", err, "bucketID", bucketID)
 		return nil
 	}
+	attempts, err := s.repos.Replacements.ListTerminationAttempts(ctx, replacementIDs)
+	if err != nil {
+		s.logger.Error("api: failed to load termination transactions", "error", err, "bucketID", bucketID)
+		return nil
+	}
+	attemptsByReplacement := make(map[int64][]storagereplacement.TerminationAttempt, len(rows))
+	for _, attempt := range attempts {
+		attemptsByReplacement[attempt.ReplacementID] = append(attemptsByReplacement[attempt.ReplacementID], attempt)
+	}
 	out := make([]providerReplacementResponse, 0, len(rows))
 	for i := range rows {
 		progress, ok := progresses[rows[i].ID]
 		if !ok {
 			continue
 		}
-		response, err := s.providerReplacementResponseWithProgress(ctx, bucketName, &rows[i], progress)
+		response, err := s.providerReplacementResponseWithProgress(ctx, bucketName, &rows[i], progress, attemptsByReplacement[rows[i].ID])
 		if err != nil {
 			s.logger.Error("api: failed to build replacement response", "error", err, "replacementID", rows[i].ID)
 			continue

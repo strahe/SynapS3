@@ -520,9 +520,13 @@ func (m *MockServiceTerminator) ContextIdentity() storage.ContextIdentity {
 	return DefaultContextIdentity
 }
 
-func (m *MockServiceTerminator) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*synapse.TerminationResult, error) {
+func (m *MockServiceTerminator) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*synapse.TerminationResult, error) {
 	if m.TerminateServiceFunc != nil {
-		return m.TerminateServiceFunc(ctx, dataSetID)
+		result, err := m.TerminateServiceFunc(ctx, dataSetID)
+		if result != nil && result.TxHash != "" && onSubmitted != nil {
+			err = errors.Join(err, onSubmitted(result.TxHash))
+		}
+		return result, err
 	}
 	return nil, errors.New("MockServiceTerminator.TerminateService not configured")
 }

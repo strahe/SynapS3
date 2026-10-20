@@ -26,6 +26,7 @@ func TestAPIStorageConfirmationsList(t *testing.T) {
 	repo := &storageConfirmationAPIRepo{records: []storagecommit.AttentionRecord{{
 		RequestID: "request-1", DataSetRowID: 9,
 		ProviderID: "provider-1", DataSetID: "dataset-1", PieceCIDs: []string{"piece-1", "piece-2"},
+		TxHash: new("0xsubmitted"), ConfirmedTxHash: new("0xconfirmed"),
 		SubmitError: "provider returned HTTP 500: piece not found",
 		Code:        storagecommit.AttentionConfirmationTimeout, SubmittedAt: now.Add(-time.Second), AttentionAt: now,
 	}}}
@@ -43,6 +44,7 @@ func TestAPIStorageConfirmationsList(t *testing.T) {
 		t.Fatalf("decode list: %v", err)
 	}
 	if len(listed) != 1 || listed[0].RequestID != "request-1" || listed[0].ReasonCode != "confirmation_timeout" ||
+		listed[0].TxHash == nil || *listed[0].TxHash != "0xsubmitted" || listed[0].ConfirmedTxHash == nil || *listed[0].ConfirmedTxHash != "0xconfirmed" ||
 		listed[0].PieceCount != 2 || listed[0].SubmitError != "provider returned HTTP 500: piece not found" {
 		t.Fatalf("listed = %#v", listed)
 	}

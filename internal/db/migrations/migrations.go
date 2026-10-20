@@ -56,6 +56,7 @@ var initialSchemaTables2026090101 = []string{
 	"storage_commit_requests",
 	"storage_contents",
 	"storage_copies",
+	"storage_data_set_termination_attempts",
 	"storage_data_set_terminations",
 	"storage_data_sets",
 	"storage_pull_attempts",

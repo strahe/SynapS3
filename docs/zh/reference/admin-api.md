@@ -160,6 +160,10 @@ description: 查询 SynapS3 Admin API 的认证方式、端点、请求字段和
 
 存储桶响应中的数据集条目包含 `replaceable`、`replacement_blocked_reason` 和 `setup_error`。副本的数据集已就绪，或其创建任务已失败时，可以替换该副本。
 
+替换记录的 `source.termination` 和 `target.termination` 包含最新交易哈希、终止 `epoch`，以及记录各次终止尝试的 `attempts` 数组。各次尝试的 `receipt_status` 为 `0`（失败）、`1`（成功）或 `null`（未知）；`confirmed_tx_hash` 表示已上链的交易，不代表执行成功。
+
+终止交易回执失败后，Retry 会先检查服务；如果服务仍未终止，可能提交一笔新的付费交易。结果未知时，Retry 只检查已记录的尝试。
+
 #### 替换状态
 
 | `status` | 含义 |
@@ -197,7 +201,7 @@ description: 查询 SynapS3 Admin API 的认证方式、端点、请求字段和
 | `POST` | `/api/v1/commit-batches/{id}/seal` | 请求提前提交下一批（**Submit next batch**）。请求体为空。 |
 | `GET` | `/api/v1/storage-confirmations` | 需要处理的批次。接受 `status=needs_attention` 和 `limit`。 |
 
-`storage-confirmations` 的每个条目包含 `request_id`、`task_id`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、`transaction_id`、`submit_error`（存储提供方的回复）、`reason_code`、`submitted_at` 和 `attention_at`。存储提供方拒绝批次，或批次提交 15 分钟后仍未确认时，会出现在这里。用 `POST /api/v1/tasks/{task_id}/retry` 重试。
+`storage-confirmations` 的每个条目包含 `request_id`、`task_id`、`provider_id`、`data_set_id`、`piece_count`、`piece_cids`、`tx_hash`、`confirmed_tx_hash`、`submit_error`（存储提供方的回复）、`reason_code`、`submitted_at` 和 `attention_at`。`storage-confirmations` 和 `commit-batches` 响应中的 `tx_hash` 表示提交交易的 hash，`confirmed_tx_hash` 表示链上确认交易的 hash；未知值为 `null`。存储提供方拒绝批次，或批次提交 15 分钟后仍未确认时，会出现在 `storage-confirmations` 中。用 `POST /api/v1/tasks/{task_id}/retry` 重试。
 
 ### 任务
 

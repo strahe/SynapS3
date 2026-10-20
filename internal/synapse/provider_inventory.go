@@ -7,6 +7,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/provider"
 	"github.com/strahe/synaps3/internal/providerselect"
@@ -15,17 +16,20 @@ import (
 )
 
 type ProviderInventory struct {
-	Selection providerselect.Inventory
-	Providers map[string]storage.Provider
+	Selection     providerselect.Inventory
+	Providers     map[string]storage.Provider
+	PartialErrors map[string]string
 }
 
 func (c *sdkReadinessClient) ProviderInventory(ctx context.Context, cfg ReadinessConfig) (ProviderInventory, error) {
 	in := ProviderInventory{Selection: providerselect.Inventory{Admission: providerselect.Admission{Tier: providerselect.Tier(cfg.AnchorProviderTier)}}, Providers: make(map[string]storage.Provider)}
 	healthClient := NewProviderHTTPClient(cfg.ProviderTimeout, cfg.AllowPrivateNetworks)
 	defer healthClient.CloseIdleConnections()
+	formatter := errtext.New(cfg.RPCURL, cfg.PrivateKey).Format
 	checker := observability.NewChecker(observability.CheckerOptions{
 		ProviderSource: observability.NewRegistryProviderSource(provider.NewRegistryService(c.client.SPRegistry())),
-		ProviderHealth: provider.NewHealthChecker(healthClient).Probe,
+		ProviderHealth: provider.NewHealthChecker(healthClient, formatter).Probe,
+		ErrorFormatter: formatter,
 		Timeout:        cfg.ProviderTimeout, Concurrency: cfg.ProviderConcurrency,
 	})
 	states, err := checker.CheckProviders(ctx, time.Now().UTC(), nil)
@@ -33,6 +37,12 @@ func (c *sdkReadinessClient) ProviderInventory(ctx context.Context, cfg Readines
 		return in, err
 	}
 	for _, state := range states {
+		if state.LastError != nil {
+			if in.PartialErrors == nil {
+				in.PartialErrors = make(map[string]string)
+			}
+			in.PartialErrors[state.ProviderID.String()] = *state.LastError
+		}
 		p := state.Profile
 		candidate := providerselect.Candidate{
 			ID: state.ProviderID, Active: state.Active != nil && *state.Active,
