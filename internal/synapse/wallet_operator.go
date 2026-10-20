@@ -22,38 +22,57 @@ type walletOperator struct {
 	payments walletPaymentOperator
 	usdfc    common.Address
 	identity walletoperation.ExecutionIdentity
+	replay   WalletReplayClient
 }
 
-func NewWalletOperator(paySvc *payments.Service, usdfc common.Address, identity walletoperation.ExecutionIdentity) WalletOperator {
-	return &walletOperator{payments: paySvc, usdfc: usdfc, identity: identity}
+func NewWalletOperator(paySvc *payments.Service, usdfc common.Address, identity walletoperation.ExecutionIdentity, replay WalletReplayClient) WalletOperator {
+	return &walletOperator{payments: paySvc, usdfc: usdfc, identity: identity, replay: replay}
 }
 
 func (o *walletOperator) WalletIdentity() walletoperation.ExecutionIdentity { return o.identity }
 
-func (o *walletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string, error) {
+func (o *walletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (WalletSubmission, error) {
 	res, err := o.payments.Fund(ctx, amount)
-	return writeResultHash(res, err, "fund USDFC")
+	return WalletSubmissionFromWriteResult(res, err, "fund USDFC")
 }
 
-func (o *walletOperator) WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error) {
+func (o *walletOperator) WithdrawUSDFC(ctx context.Context, amount *big.Int) (WalletSubmission, error) {
 	res, err := o.payments.Withdraw(ctx, o.usdfc, amount)
-	return writeResultHash(res, err, "withdraw USDFC")
+	return WalletSubmissionFromWriteResult(res, err, "withdraw USDFC")
 }
 
-func (o *walletOperator) ApproveFWSS(ctx context.Context) (string, error) {
+func (o *walletOperator) ApproveFWSS(ctx context.Context) (WalletSubmission, error) {
 	res, err := o.payments.Fund(ctx, big.NewInt(0))
-	return writeResultHash(res, err, "approve FWSS")
+	return WalletSubmissionFromWriteResult(res, err, "approve FWSS")
 }
 
-func writeResultHash(res *sdktypes.WriteResult, err error, action string) (string, error) {
+// WalletSubmissionFromWriteResult retains broadcast evidence and its error chain
+// while keeping signed transaction bytes out of error messages.
+func WalletSubmissionFromWriteResult(res *sdktypes.WriteResult, err error, action string) (WalletSubmission, error) {
+	var submission WalletSubmission
+	if res != nil && res.Hash != (common.Hash{}) {
+		submission.TxHash = res.Hash.Hex()
+	}
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", action, err)
+		if broadcast, ok := errors.AsType[*sdktypes.BroadcastError](err); ok && broadcast != nil && broadcast.Transaction != nil {
+			raw, marshalErr := broadcast.Transaction.MarshalBinary()
+			if marshalErr != nil {
+				return submission, fmt.Errorf("%s: %w", action, errors.Join(err, marshalErr))
+			}
+			if submission.TxHash != "" && submission.TxHash != broadcast.Transaction.Hash().Hex() {
+				return WalletSubmission{}, fmt.Errorf("%s: result hash %s, signed transaction hash %s: %w", action, submission.TxHash, broadcast.Transaction.Hash().Hex(), errors.Join(redactSignedTransactionError(err, raw), ErrWalletReplayInvalidEvidence))
+			}
+			submission.TxHash = broadcast.Transaction.Hash().Hex()
+			submission.SignedTransaction = raw
+			err = redactSignedTransactionError(err, raw)
+		}
+		return submission, fmt.Errorf("%s: %w", action, err)
 	}
 	if res == nil {
-		return "", fmt.Errorf("%s: %w", action, errors.New("missing transaction result"))
+		return submission, fmt.Errorf("%s: %w", action, errors.New("missing transaction result"))
 	}
 	if res.Hash == (common.Hash{}) {
-		return "", fmt.Errorf("%s: %w", action, errors.New("missing transaction hash"))
+		return submission, fmt.Errorf("%s: %w", action, errors.New("missing transaction hash"))
 	}
-	return res.Hash.Hex(), nil
+	return submission, nil
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/walletoperation"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
@@ -134,9 +135,16 @@ type WalletQuerier interface {
 // WalletOperator broadcasts wallet payment transactions.
 type WalletOperator interface {
 	WalletIdentity() walletoperation.ExecutionIdentity
-	FundUSDFC(ctx context.Context, amount *big.Int) (string, error)
-	WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error)
-	ApproveFWSS(ctx context.Context) (string, error)
+	FundUSDFC(ctx context.Context, amount *big.Int) (WalletSubmission, error)
+	WithdrawUSDFC(ctx context.Context, amount *big.Int) (WalletSubmission, error)
+	ApproveFWSS(ctx context.Context) (WalletSubmission, error)
+	RebroadcastSignedTransaction(ctx context.Context, operationType model.WalletOperationType, amount *big.Int, submission WalletSubmission, observationTimeout time.Duration) error
+}
+
+// WalletSubmission identifies one signed transaction, including when sending fails.
+type WalletSubmission struct {
+	TxHash            string
+	SignedTransaction []byte
 }
 
 // WalletInfo holds a snapshot of the wallet's on-chain state.

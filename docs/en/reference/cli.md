@@ -38,7 +38,7 @@ synaps3 wallet approve
 | `deposit` | Deposits USDFC into the payment account. Prints `Transaction: <hash>` and `Status: confirmed`. |
 | `approve` | Approves FWSS to spend from the payment account. Prints `Transaction: <hash>` and `Status: confirmed`, or `FWSS approval: already approved`. |
 
-All wallet commands accept `--json`. `deposit` and `approve` wait up to `--timeout` (default `5m`) for the receipt; if it does not arrive in time, they print `Status: submitted`.
+All wallet commands accept `--json`. `deposit` and `approve` wait up to `--timeout` (default `5m`) for the receipt; if it does not arrive in time, they print `Status: submitted`. A failed broadcast also prints the transaction hash when available and exits with an error; check that transaction on chain before submitting another payment.
 
 ## Provider Commands
 

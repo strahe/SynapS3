@@ -95,14 +95,16 @@ synaps3 admin task retry 42
 | **Upload data** | **Retry** 先检查存储提供方是否已有该数据，缺失时才重新上传。 |
 | **Replace provider** | 在存储桶的 **Storage** 标签页恢复。 |
 | **Commit batch** | 恢复依赖后点击 **Retry**。SynapS3 会先查询链上状态再重新提交批次。`synaps3 admin storage-confirmation list` 列出需要处理的批次。 |
-| **Wallet operation** | 只有交易从未广播，或因内部错误停止时，才提供 **Retry**。如果交易可能已广播但没有记录，该操作不能重试；请到链上核对钱包。 |
+| **Wallet operation** | **Retry** 继续处理已记录的同一笔交易，或启动从未广播的操作。如果交易可能已广播但没有记录，请到链上核对钱包；该操作不能重试。 |
 | **Clean up deleted data** | 删除远端副本超过 24 小时仍未确认时，**Retry** 会查询链上状态，并可能再提交一次付费删除请求。之前的请求仍可能成功。 |
 
 副本失败时，在 **Tasks** 页面或对象的 **Provenance** 对话框中点击 **Retry**。副本显示 **Stored** 即表示完成。
 
 确认过的失败，点击 **Acknowledge** 或运行 `synaps3 admin task acknowledge <id>`，即可移到 **Closed**。确认不会改变任务结果，也不影响能否重试。失败较多时，在 **Open** 中筛选 **Failed**，按需再筛选 **Operation**，然后点击 **Acknowledge all**；或者运行 `synaps3 admin task acknowledge --type <type> --yes`。确认之后才记录的失败仍保留在 **Open** 中。
 
-## 钱包充值失败
+## 钱包操作
+
+**Awaiting confirmation** 表示交易已记录、结果尚未确定，包括 RPC 拒绝广播的情况。SynapS3 每 30 秒查询一次，五分钟内没有回执才消耗一次重试。持有完整签名交易时，可以重发同一笔交易，不产生另一笔付款。自动确认停止后，在 **Tasks** 页面点击 **Retry** 继续处理同一笔交易。任务停止不会取消链上交易。
 
 在 **Wallet** 页面查看余额和 FWSS 批准状态，或者运行：
 

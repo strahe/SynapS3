@@ -24,6 +24,24 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		if row == nil || row.Status != model.TaskStatusRunning || row.ClaimGeneration != generation || row.LeaseUntil == nil || !row.LeaseUntil.After(now) {
 			return ErrTaskLeaseLost
 		}
+		if patch := transition.Observation; patch != nil {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(row.Runtime, &fields); err != nil || fields == nil {
+				return ErrInvalidInput
+			}
+			delete(fields, "observation")
+			if patch.State != nil {
+				encoded, err := json.Marshal(patch.State)
+				if err != nil {
+					return err
+				}
+				fields["observation"] = encoded
+			}
+			row.Runtime, err = json.Marshal(fields)
+			if err != nil {
+				return err
+			}
+		}
 		row.Status, row.WaitReason, row.FailureReason = transition.Status, transition.WaitReason, transition.FailureReason
 		lastError := errtext.RedactPtr(transition.LastError)
 		row.LastError, row.StatusMessage, row.UpdatedAt = lastError, errtext.RedactPtr(transition.StatusMessage), now
@@ -42,7 +60,7 @@ func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transiti
 		} else {
 			row.FinishedAt = &now
 		}
-		result, err := db.NewUpdate().Model(row).Column("status", "wait_reason", "failure_reason", "last_error", "status_message", "updated_at", "lease_until", "work_started_at", "retry_count", "resume_mode", "available_at", "finished_at").Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
+		result, err := db.NewUpdate().Model(row).Column("status", "wait_reason", "failure_reason", "last_error", "status_message", "updated_at", "lease_until", "work_started_at", "retry_count", "resume_mode", "available_at", "finished_at", "runtime_json").Where("id = ? AND status = ? AND claim_generation = ? AND lease_until > ?", id, model.TaskStatusRunning, generation, now).Exec(ctx)
 		if err != nil {
 			return err
 		}

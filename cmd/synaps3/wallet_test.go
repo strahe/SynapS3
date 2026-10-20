@@ -352,6 +352,14 @@ func TestWalletDepositParsesDecimalAmountAndUsesConfig(t *testing.T) {
 	if !strings.Contains(out, `"confirmed": true`) {
 		t.Fatalf("output = %s, want confirmed JSON", out)
 	}
+	const maximum = "115792089237316195423570985008687907853269984665640564039457.584007913129639935"
+	out, err = runWalletCommand(t, []string{"synaps3", "--config", cfgPath, "wallet", "deposit", maximum})
+	if err != nil {
+		t.Fatalf("wallet deposit maximum: %v\n%s", err, out)
+	}
+	if gotAmount.BitLen() != 256 || gotAmount.String() != "115792089237316195423570985008687907853269984665640564039457584007913129639935" {
+		t.Fatalf("amount = %v, want maximum uint256", gotAmount)
+	}
 }
 
 func TestWalletDepositTextOutputShowsConfirmedTransaction(t *testing.T) {
@@ -382,13 +390,17 @@ func TestWalletDepositHelpMentionsConfiguredPrivateKey(t *testing.T) {
 }
 
 func TestWalletDepositRejectsInvalidAmounts(t *testing.T) {
-	for _, amount := range []string{"0", "-1", "1.1234567890123456789", "1e3"} {
+	const overflow = "115792089237316195423570985008687907853269984665640564039457.584007913129639936"
+	for _, amount := range []string{"0", "-1", "1.1234567890123456789", "1e3", overflow} {
 		out, err := runWalletCommand(t, []string{"synaps3", "wallet", "deposit", amount})
 		if err == nil {
 			t.Fatalf("wallet deposit %q succeeded, output:\n%s", amount, out)
 		}
 		if !strings.Contains(err.Error(), "amount") && !strings.Contains(err.Error(), "USDFC") {
 			t.Fatalf("amount %q error = %v, want amount validation", amount, err)
+		}
+		if amount == overflow && err.Error() != "amount is too large" {
+			t.Fatalf("overflow error = %v, want amount is too large", err)
 		}
 	}
 }

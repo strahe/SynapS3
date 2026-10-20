@@ -866,6 +866,10 @@ func TestEnginePanicAndInvalidResultFailClosed(t *testing.T) {
 		{name: "retry without reason", execute: func(context.Context, Execution) Result {
 			return Retry(errors.New("temporary"), "", nil)
 		}, wantReason: "invalid_result"},
+		{name: "observation without policy window", execute: func(context.Context, Execution) Result {
+			return WaitForObservation(model.TaskResumeModeRecover, "confirmation", "Waiting", nil).
+				WithObservationWindow("stage", errors.New("confirmation window expired"), model.TaskResumeModeRecover)
+		}, wantReason: "invalid_result"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

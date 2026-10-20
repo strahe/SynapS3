@@ -34,6 +34,7 @@ type WalletOperation struct {
 	Amount               string                `bun:"type:text,notnull"`
 	Status               WalletOperationStatus `bun:"type:text,notnull,default:'pending'"`
 	TxHash               *string               `bun:"type:text,nullzero"`
+	SignedTransaction    []byte                `bun:"type:bytea,nullzero" json:"-"`
 	LastError            *string               `bun:"type:text,nullzero"`
 	BroadcastAttemptedAt *time.Time            `bun:",nullzero"`
 	TaskID               *int64                `bun:",nullzero"`

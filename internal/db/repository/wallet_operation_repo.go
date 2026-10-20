@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"time"
 
@@ -117,7 +118,12 @@ func (r *BunWalletOperationRepo) MarkBroadcastAttempted(ctx context.Context, id,
 }
 
 func (r *BunWalletOperationRepo) MarkSubmitted(ctx context.Context, id, taskID int64, txHash string) error {
-	if txHash == "" {
+	return r.RecordSubmission(ctx, id, taskID, txHash, nil, "")
+}
+
+// RecordSubmission only fills missing transaction evidence or repeats it unchanged.
+func (r *BunWalletOperationRepo) RecordSubmission(ctx context.Context, id, taskID int64, txHash string, signedTransaction []byte, lastError string) error {
+	if txHash == "" || (signedTransaction != nil && len(signedTransaction) == 0) {
 		return ErrInvalidInput
 	}
 	now := time.Now()
@@ -125,13 +131,29 @@ func (r *BunWalletOperationRepo) MarkSubmitted(ctx context.Context, id, taskID i
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusSubmitted).
 		Set("tx_hash = ?", txHash).
+		Set("signed_transaction = COALESCE(signed_transaction, ?)", signedTransaction).
+		Set("last_error = COALESCE(NULLIF(?, ''), last_error)", errtext.Redact(lastError)).
 		Set("submitted_at = COALESCE(submitted_at, ?)", now).
 		Set("updated_at = ?", now).
 		Where("id = ? AND task_id = ?", id, taskID).
 		Where("status IN (?, ?)", model.WalletOperationStatusPending, model.WalletOperationStatusSubmitted).
 		Where("tx_hash IS NULL OR tx_hash = ?", txHash).
+		Where("?::bytea IS NULL OR broadcast_attempted_at IS NOT NULL", signedTransaction).
+		Where("?::bytea IS NULL OR signed_transaction IS NULL OR signed_transaction = ?", signedTransaction, signedTransaction).
 		Exec(ctx)
 	return requireRows(res, err, "marking wallet operation submitted")
+}
+
+func (r *BunWalletOperationRepo) RecordConfirmationError(ctx context.Context, id, taskID int64, lastError string) error {
+	if lastError == "" {
+		return ErrInvalidInput
+	}
+	res, err := r.db.NewUpdate().Model((*model.WalletOperation)(nil)).
+		Set("last_error = ?", errtext.Redact(lastError)).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND task_id = ? AND status = ?", id, taskID, model.WalletOperationStatusSubmitted).
+		Exec(ctx)
+	return requireRows(res, err, "recording wallet confirmation error")
 }
 
 func (r *BunWalletOperationRepo) MarkConfirmed(ctx context.Context, id, taskID int64, txHash string) error {
@@ -257,7 +279,8 @@ func validWalletOperationAmount(opType model.WalletOperationType, amount string)
 			return false
 		}
 	}
-	return true
+	value, ok := new(big.Int).SetString(amount, 10)
+	return ok && value.BitLen() <= 256
 }
 
 func requireRows(res sql.Result, err error, action string) error {

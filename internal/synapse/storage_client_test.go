@@ -18,7 +18,6 @@ import (
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
-	"github.com/strahe/synapse-go/warmstorage"
 )
 
 func TestStorageServiceAdapterDownloadCountsConsumedPayload(t *testing.T) {
@@ -36,6 +35,7 @@ func TestStorageServiceAdapterDownloadCountsConsumedPayload(t *testing.T) {
 		name        string
 		corrupt     bool
 		truncated   bool
+		oversized   bool
 		chunked     bool
 		maximum     int64
 		readBytes   int64
@@ -45,7 +45,8 @@ func TestStorageServiceAdapterDownloadCountsConsumedPayload(t *testing.T) {
 	}{
 		{name: "complete", wantBytes: 512},
 		{name: "CID mismatch", corrupt: true, wantBytes: 512, wantReadErr: true},
-		{name: "truncated", truncated: true, wantBytes: 512, wantReadErr: true},
+		{name: "truncated", truncated: true, wantBytes: 256, wantReadErr: true},
+		{name: "declared CID limit", oversized: true, wantOpenErr: true},
 		{name: "streamed limit", chunked: true, maximum: 256, wantBytes: 256, wantReadErr: true},
 		{name: "declared limit", maximum: 256, wantOpenErr: true},
 		{name: "early close", readBytes: 64, wantBytes: 64},
@@ -56,12 +57,16 @@ func TestStorageServiceAdapterDownloadCountsConsumedPayload(t *testing.T) {
 					w.(http.Flusher).Flush()
 				} else {
 					length := len(payload)
-					if tc.truncated {
+					if tc.oversized {
 						length++
 					}
 					w.Header().Set("Content-Length", strconv.Itoa(length))
 				}
-				_, _ = w.Write(payload)
+				body := payload
+				if tc.truncated {
+					body = body[:len(body)/2]
+				}
+				_, _ = w.Write(body)
 			}))
 			defer server.Close()
 			service, err := storage.New(storage.Options{HTTPClient: server.Client(), DownloadMaxBytes: tc.maximum})
@@ -362,12 +367,10 @@ func (f *staticDataSetFinder) FindDataSets(_ context.Context, payer common.Addre
 
 func dataSetDetails(dataSetID, clientDataSetID, providerID uint64, live, managed, active bool, endEpoch sdktypes.Epoch, metadata map[string]string) *storage.DataSetDetails {
 	return &storage.DataSetDetails{
-		DataSetInfo: warmstorage.DataSetInfo{
-			DataSetID:       sdktypes.NewBigInt(dataSetID),
-			ClientDataSetID: sdktypes.NewBigInt(clientDataSetID),
-			ProviderID:      sdktypes.NewBigInt(providerID),
-			PDPEndEpoch:     endEpoch,
-		},
+		DataSetID:       sdktypes.NewBigInt(dataSetID),
+		ClientDataSetID: sdktypes.NewBigInt(clientDataSetID),
+		ProviderID:      sdktypes.NewBigInt(providerID),
+		PDPEndEpoch:     endEpoch,
 		IsLive:          live,
 		IsManaged:       managed,
 		HasActivePieces: active,

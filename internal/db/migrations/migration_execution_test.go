@@ -1,9 +1,11 @@
 package migrations
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -71,6 +73,12 @@ func TestMigrationsPreserveDataOnRepeatAndMarkerRecovery(t *testing.T) {
 	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		id := insertSchemaTestTask(t, db, "marker-survivor")
+		signed := []byte{0x02, 0x00, 0xff}
+		if _, err := db.ExecContext(ctx, `INSERT INTO wallet_operations
+			(type, client_request_id, amount, status, tx_hash, signed_transaction, broadcast_attempted_at, submitted_at, created_at, updated_at)
+			VALUES ('fund', 'signed-survivor', '1', 'submitted', 'tx-survivor', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, signed); err != nil {
+			t.Fatal(err)
+		}
 		before := appliedSchemaState(t, db)
 		migrator := NewMigrator(db)
 		for _, repairMarker := range []bool{false, true} {
@@ -101,6 +109,10 @@ func TestMigrationsPreserveDataOnRepeatAndMarkerRecovery(t *testing.T) {
 			}
 			if key != "marker-survivor" {
 				t.Fatalf("repeat migration changed task key to %q", key)
+			}
+			var persisted []byte
+			if err := db.NewRaw(`SELECT signed_transaction FROM wallet_operations WHERE client_request_id = 'signed-survivor'`).Scan(ctx, &persisted); err != nil || !bytes.Equal(persisted, signed) {
+				t.Fatalf("repeat migration changed signed transaction: %v", err)
 			}
 			if after := appliedSchemaState(t, db); !slices.Equal(before, after) {
 				t.Fatalf("repeat migration changed the application schema (repairMarker=%t)", repairMarker)
@@ -166,8 +178,8 @@ func TestBaselineRollbackIsRefusedUnchanged(t *testing.T) {
 		id := insertSchemaTestTask(t, db, "rollback-survivor")
 		before := appliedSchemaState(t, db)
 		migrator := NewMigrator(db)
-		if _, err := migrator.Rollback(ctx); err == nil {
-			t.Fatal("baseline rollback succeeded")
+		if _, err := migrator.Rollback(ctx); err == nil || !strings.Contains(err.Error(), InitialSchemaName+": down: the initial schema cannot be rolled back") {
+			t.Fatalf("baseline rollback error = %v", err)
 		}
 		assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))
 		var key string
