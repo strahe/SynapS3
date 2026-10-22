@@ -66,11 +66,11 @@ func (s *StorageServiceAdapter) ConfigureCleanupChain(chain cleanupChainCaller) 
 	return nil
 }
 
-func (s *StorageServiceAdapter) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error) {
+func (s *StorageServiceAdapter) DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (CleanupPiecesState, error) {
 	if s.cleanup == nil {
-		return CleanupPieceState{}, errors.New("cleanup chain reader is unavailable")
+		return CleanupPiecesState{}, errors.New("cleanup chain reader is unavailable")
 	}
-	return s.cleanup.ObserveCleanupPiece(ctx, dataSetID, pieceID)
+	return s.cleanup.ObserveCleanupPieces(ctx, dataSetID, pieceIDs)
 }
 
 // ContextIdentity reports the payer, chain, and record keeper this service
@@ -267,7 +267,7 @@ func newProviderTargetAdapter(provider *storage.ProviderContext) *providerTarget
 	if provider == nil {
 		return nil
 	}
-	return &providerTargetAdapter{storageTargetAdapter: storageTargetAdapter{inner: provider}, provider: provider}
+	return &providerTargetAdapter{inner: provider, provider: provider}
 }
 
 func (c *providerTargetAdapter) CreateDataSet(ctx context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
@@ -348,7 +348,7 @@ func newDataSetTargetAdapter(dataSet *storage.DataSetContext, writable dataSetWr
 	if dataSet == nil {
 		return nil
 	}
-	return &dataSetTargetAdapter{storageTargetAdapter: storageTargetAdapter{inner: dataSet}, dataSet: dataSet, writable: writable}
+	return &dataSetTargetAdapter{inner: dataSet, dataSet: dataSet, writable: writable}
 }
 
 func (c *dataSetTargetAdapter) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {

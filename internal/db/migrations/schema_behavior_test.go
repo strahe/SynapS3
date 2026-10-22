@@ -192,6 +192,7 @@ func TestCurrentSchemaConstraintsRejectInvalidWrites(t *testing.T) {
 
 func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 	withMigratedDB(t, func(t *testing.T, db *bun.DB) {
+		assertRemovalSchemaContracts(t, db)
 		bucketA := insertSchemaTestBucket(t, db, "identity-a")
 		bucketB := insertSchemaTestBucket(t, db, "identity-b")
 		contentA := insertSchemaTestContent(t, db, bucketA, "upload-a")
@@ -471,6 +472,54 @@ func TestCurrentSchemaStorageIdentityAndLedgerConstraints(t *testing.T) {
 		}
 		mustRejectStatement(t, db, `UPDATE buckets SET durability_task_id = ? WHERE id = ?`, taskID, bucketB)
 	})
+}
+
+func assertRemovalSchemaContracts(t *testing.T, db *bun.DB) {
+	t.Helper()
+	bucket := insertSchemaTestBucket(t, db, "removal-schema")
+	content := insertSchemaTestContent(t, db, bucket, "removal-content")
+	dataSet := insertSchemaTestDataSet(t, db, bucket, "991", 0, 1, true)
+	otherDataSet := insertSchemaTestDataSet(t, db, bucket, "992", 0, 2, false)
+	taskID := insertSchemaTestTask(t, db, "removal-schema-task")
+	otherTask := insertSchemaTestTask(t, db, "removal-schema-other-task")
+	if _, err := db.Exec(`INSERT INTO storage_removal_requests
+		(request_id, storage_data_set_id, status, task_id, created_at, updated_at)
+		VALUES ('removal-schema', ?, 'collecting', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, dataSet, taskID); err != nil {
+		t.Fatal(err)
+	}
+	mustRejectStatement(t, db, `INSERT INTO storage_removal_requests
+		(request_id, storage_data_set_id, status, task_id, created_at, updated_at)
+		VALUES ('removal-schema-duplicate', ?, 'collecting', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, dataSet, otherTask)
+	var copyID int64
+	if err := db.NewRaw(`INSERT INTO storage_cleanup_copies
+		(content_id, bucket_id, storage_data_set_id, copy_index, provider_id, piece_id, piece_cid, checksum, status, created_at, updated_at)
+		VALUES (?, ?, ?, 0, '991', '990', 'removal-piece', 'removal-checksum', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`, content, bucket, dataSet).Scan(t.Context(), &copyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE storage_cleanup_copies SET removal_request_id = 'removal-schema' WHERE id = ?`, copyID); err != nil {
+		t.Fatal(err)
+	}
+	mustRejectStatement(t, db, `UPDATE storage_cleanup_copies SET storage_data_set_id = ?, provider_id = '992' WHERE id = ?`, otherDataSet, copyID)
+	mustRejectStatement(t, db, `UPDATE storage_cleanup_copies SET status = 'failed' WHERE id = ?`, copyID)
+	mustRejectStatement(t, db, `UPDATE storage_removal_requests SET status = 'queued', sealed_at = CURRENT_TIMESTAMP, queued_at = CURRENT_TIMESTAMP WHERE request_id = 'removal-schema'`)
+	if _, err := db.Exec(`UPDATE storage_removal_requests SET status = 'submitted', sealed_at = CURRENT_TIMESTAMP WHERE request_id = 'removal-schema'`); err != nil {
+		t.Fatal(err)
+	}
+	mustRejectStatement(t, db, `INSERT INTO storage_removal_sends (request_id, send_no, created_at, updated_at) VALUES ('removal-schema', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	if _, err := db.Exec(`INSERT INTO storage_removal_sends
+		(request_id, send_no, task_id, attempted_at, created_at, updated_at)
+		VALUES ('removal-schema', 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	mustRejectStatement(t, db, `UPDATE storage_removal_sends SET receipt_status = 0 WHERE request_id = 'removal-schema'`)
+	if _, err := db.Exec(`UPDATE storage_removal_sends SET tx_hash = 'retained-hash' WHERE request_id = 'removal-schema'`); err != nil {
+		t.Fatal(err)
+	}
+	mustRejectStatement(t, db, `UPDATE storage_removal_sends SET refused_at = CURRENT_TIMESTAMP WHERE request_id = 'removal-schema'`)
+	if _, err := db.Exec(`INSERT INTO storage_removal_send_pieces (request_id, send_no, cleanup_copy_id, piece_id, created_at) VALUES ('removal-schema', 1, ?, '990', CURRENT_TIMESTAMP)`, copyID); err != nil {
+		t.Fatal(err)
+	}
+	mustRejectStatement(t, db, `DELETE FROM storage_cleanup_copies WHERE id = ?`, copyID)
 }
 
 func TestCurrentSchemaFailedIngressAllowsOneReplacementIngress(t *testing.T) {

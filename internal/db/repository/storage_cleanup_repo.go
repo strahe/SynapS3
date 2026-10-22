@@ -78,91 +78,11 @@ func (r *BunStorageCleanupRepo) AuthorizeTask(ctx context.Context, contentID, ge
 	if err := r.db.NewSelect().
 		Model(&copies).
 		Where("content_id = ?", contentID).
-		OrderExpr("copy_index ASC").
+		OrderExpr("copy_index ASC, id ASC").
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing storage cleanup copies: %w", err)
 	}
 	return copies, nil
-}
-
-func (r *BunStorageCleanupRepo) MarkCopyRemoved(ctx context.Context, id int64) error {
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusRemoved).
-		Set("removed_at = COALESCE(removed_at, ?)", now).
-		Set("last_error = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status IN (?)", bun.List([]model.StorageCleanupCopyStatus{
-			model.StorageCleanupCopyStatusPending,
-			model.StorageCleanupCopyStatusDeleteScheduled,
-			model.StorageCleanupCopyStatusFailed,
-		})).
-		Exec(ctx)
-	if err := storageCleanupCopyTransitionResult(ctx, r.db, res, err, id, model.StorageCleanupCopyStatusRemoved, "", "marking storage cleanup copy removed"); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (r *BunStorageCleanupRepo) MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error {
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusDeleteScheduled).
-		Set("delete_tx_hash = ?", txHash).
-		Set("scheduled_at = COALESCE(scheduled_at, ?)", now).
-		Set("last_error = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status = ?", model.StorageCleanupCopyStatusPending).
-		Exec(ctx)
-	return storageCleanupCopyTransitionResult(
-		ctx, r.db, res, err, id, model.StorageCleanupCopyStatusDeleteScheduled, txHash,
-		"marking storage cleanup copy scheduled",
-	)
-}
-
-// BeginFailedCopyRetry resets the failed ledger row in the same transaction
-// that checkpoints the new external request.
-func (r *BunStorageCleanupRepo) BeginFailedCopyRetry(ctx context.Context, id int64, oldHash string) error {
-	now := time.Now()
-	query := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusPending).
-		Set("delete_tx_hash = NULL").
-		Set("scheduled_at = NULL").
-		Set("last_error = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status = ?", model.StorageCleanupCopyStatusFailed)
-	if oldHash == "" {
-		query = query.Where("delete_tx_hash IS NULL")
-	} else {
-		query = query.Where("delete_tx_hash = ?", oldHash)
-	}
-	result, err := query.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("beginning failed storage cleanup retry: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return fmt.Errorf("beginning failed storage cleanup retry: %w", ErrConflict)
-	}
-	return nil
-}
-
-func (r *BunStorageCleanupRepo) MarkCopyFailed(ctx context.Context, id int64, message string) error {
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusFailed).
-		Set("last_error = ?", errtext.Redact(message)).
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Exec(ctx)
-	return storageCleanupCopyUpdateResult(res, err, "marking storage cleanup copy failed")
 }
 
 func (r *BunStorageCleanupRepo) MarkCopyUnsupported(ctx context.Context, id int64, message string) error {
@@ -178,36 +98,58 @@ func (r *BunStorageCleanupRepo) MarkCopyUnsupported(ctx context.Context, id int6
 }
 
 func (r *BunStorageCleanupRepo) UploadHasObjectReferences(ctx context.Context, contentID int64) (bool, error) {
-	return uploadHasObjectReferences(ctx, r.db, contentID)
+	referenced, err := uploadReferencedContentIDs(ctx, r.db, []int64{contentID})
+	return len(referenced) > 0, err
 }
 
-func uploadHasObjectReferences(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
-	var row struct {
-		Count int `bun:"count"`
+func uploadReferencedContentIDs(ctx context.Context, db bun.IDB, contentIDs []int64) ([]int64, error) {
+	if len(contentIDs) == 0 {
+		return nil, nil
 	}
-	err := db.NewRaw(`SELECT COUNT(DISTINCT object_version.version_id) AS count
+	var referenced []int64
+	err := db.NewRaw(`SELECT DISTINCT storage_content.id
 		FROM storage_contents AS storage_content
 		JOIN object_versions AS object_version
 		  ON `+objectVersionReferencesStorageContentSQL("object_version", "storage_content")+`
-		WHERE storage_content.id = ?
-		  AND object_version.is_delete_marker = ?`, contentID, false).
-		Scan(ctx, &row)
+		WHERE storage_content.id IN (?)
+		  AND object_version.is_delete_marker = ?`, bun.List(contentIDs), false).
+		Scan(ctx, &referenced)
 	if err != nil {
-		return false, fmt.Errorf("checking storage cleanup object references: %w", err)
+		return nil, fmt.Errorf("checking storage cleanup object references: %w", err)
 	}
-	return row.Count > 0, nil
+	return referenced, nil
 }
 
 func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, contentID int64) (bool, error) {
-	var row struct {
-		Count int `bun:"count"`
+	referenced, err := cleanupReferencedContentIDs(ctx, r.db, []int64{contentID})
+	return len(referenced) > 0, err
+}
+
+func unreferencedContentIDs(contentIDs, referenced []int64) []int64 {
+	known := make(map[int64]bool, len(referenced))
+	for _, id := range referenced {
+		known[id] = true
 	}
-	err := r.db.NewRaw(`SELECT COUNT(DISTINCT object_version.version_id) AS count
+	remaining := make([]int64, 0, len(contentIDs))
+	for _, id := range contentIDs {
+		if !known[id] {
+			remaining = append(remaining, id)
+		}
+	}
+	return remaining
+}
+
+func cleanupReferencedContentIDs(ctx context.Context, db bun.IDB, contentIDs []int64) ([]int64, error) {
+	if len(contentIDs) == 0 {
+		return nil, nil
+	}
+	var referenced []int64
+	err := db.NewRaw(`SELECT DISTINCT cleanup_copy.content_id
 		FROM storage_cleanup_copies AS cleanup_copy
 		JOIN storage_copies AS storage_copy
 		  ON storage_copy.status = ?
 		 AND (
-			storage_copy.content_id = ?
+			storage_copy.content_id = cleanup_copy.content_id
 			OR (
 				cleanup_copy.provider_id IS NOT NULL AND cleanup_copy.provider_id <> ''
 				AND cleanup_copy.data_set_id IS NOT NULL AND cleanup_copy.data_set_id <> ''
@@ -220,27 +162,28 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 		JOIN storage_contents AS referenced_upload ON referenced_upload.id = storage_copy.content_id
 		JOIN object_versions AS object_version
 		  ON `+objectVersionReferencesStorageContentSQL("object_version", "referenced_upload")+`
-		WHERE cleanup_copy.content_id = ?
+		WHERE cleanup_copy.content_id IN (?)
 		  AND object_version.is_delete_marker = FALSE
 		  AND (
-			storage_copy.content_id = ?
+			storage_copy.content_id = cleanup_copy.content_id
 			OR storage_data_set.data_set_id = cleanup_copy.data_set_id
 		  )`,
-		model.StorageCopyStatusCommitted, contentID, contentID, contentID,
-	).Scan(ctx, &row)
+		model.StorageCopyStatusCommitted, bun.List(contentIDs),
+	).Scan(ctx, &referenced)
 	if err != nil {
-		return false, fmt.Errorf("checking storage cleanup task references: %w", err)
+		return nil, fmt.Errorf("checking storage cleanup task references: %w", err)
 	}
-	if row.Count > 0 {
-		return true, nil
+	remaining := unreferencedContentIDs(contentIDs, referenced)
+	if len(remaining) == 0 {
+		return referenced, nil
 	}
-	row.Count = 0
-	err = r.db.NewRaw(`SELECT COUNT(DISTINCT active_content.id) AS count
+	var active []int64
+	err = db.NewRaw(`SELECT DISTINCT cleanup_copy.content_id
 		FROM storage_cleanup_copies AS cleanup_copy
 		JOIN storage_copies AS storage_copy
 		  ON storage_copy.status = ?
 		 AND (
-			storage_copy.content_id = ?
+			storage_copy.content_id = cleanup_copy.content_id
 			OR (
 				cleanup_copy.provider_id IS NOT NULL AND cleanup_copy.provider_id <> ''
 				AND cleanup_copy.data_set_id IS NOT NULL AND cleanup_copy.data_set_id <> ''
@@ -251,19 +194,19 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 		 )
 		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
 		JOIN storage_contents AS active_content ON active_content.id = storage_copy.content_id
-		WHERE cleanup_copy.content_id = ?
+		WHERE cleanup_copy.content_id IN (?)
 		  AND active_content.id <> cleanup_copy.content_id
 		  AND active_content.accepted_at IS NULL
 		  AND (
-			storage_copy.content_id = ?
+			storage_copy.content_id = cleanup_copy.content_id
 			OR storage_data_set.data_set_id = cleanup_copy.data_set_id
 		  )`,
-		model.StorageCopyStatusCommitted, contentID, contentID, contentID,
-	).Scan(ctx, &row)
+		model.StorageCopyStatusCommitted, bun.List(remaining),
+	).Scan(ctx, &active)
 	if err != nil {
-		return false, fmt.Errorf("checking storage cleanup active upload references: %w", err)
+		return nil, fmt.Errorf("checking storage cleanup active upload references: %w", err)
 	}
-	return row.Count > 0, nil
+	return append(referenced, active...), nil
 }
 
 // FinalizeContent deletes the current-state rows of content whose remote
@@ -361,44 +304,4 @@ func storageCleanupCopyUpdateResult(res sql.Result, err error, op string) error 
 		return fmt.Errorf("%s: %w", op, ErrNotFound)
 	}
 	return nil
-}
-
-func storageCleanupCopyTransitionResult(
-	ctx context.Context,
-	db bun.IDB,
-	res sql.Result,
-	err error,
-	id int64,
-	idempotentStatus model.StorageCleanupCopyStatus,
-	idempotentTxHash string,
-	op string,
-) error {
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 1 {
-		return nil
-	}
-	var current struct {
-		Status       model.StorageCleanupCopyStatus `bun:"status"`
-		DeleteTxHash *string                        `bun:"delete_tx_hash"`
-	}
-	err = db.NewSelect().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Column("status", "delete_tx_hash").
-		Where("id = ?", id).
-		Scan(ctx, &current)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%s: %w", op, ErrNotFound)
-	}
-	if err != nil {
-		return fmt.Errorf("%s: checking current state: %w", op, err)
-	}
-	if current.Status == idempotentStatus &&
-		(idempotentStatus != model.StorageCleanupCopyStatusDeleteScheduled ||
-			(current.DeleteTxHash != nil && *current.DeleteTxHash == idempotentTxHash)) {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", op, ErrConflict)
 }

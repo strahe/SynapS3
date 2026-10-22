@@ -52,6 +52,7 @@ type StorageCleanupCopy struct {
 	Checksum         string                   `bun:"type:text,notnull"`
 	RetrievalURL     *string                  `bun:"type:text,nullzero"`
 	Status           StorageCleanupCopyStatus `bun:"type:text,notnull,default:'pending'"`
+	RemovalRequestID *string                  `bun:"removal_request_id,type:text,nullzero"`
 	DeleteTxHash     *string                  `bun:"type:text,nullzero"`
 	LastError        *string                  `bun:"type:text,nullzero"`
 	ScheduledAt      *time.Time               `bun:",nullzero"`

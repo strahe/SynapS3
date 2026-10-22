@@ -37,6 +37,7 @@ func TestClosedLifecycleEnumsMatchAppliedChecks(t *testing.T) {
 		{directory: "model", typeName: "WalletOperationStatus", table: "wallet_operations", constraint: "chk_wallet_operations_status"},
 		{directory: "providerbenchmark", typeName: "State", table: "provider_upload_speed_tests", constraint: "chk_provider_upload_speed_tests_state"},
 		{directory: "storagecommit", typeName: "RequestStatus", table: "storage_commit_requests", constraint: "chk_storage_commit_requests_status"},
+		{directory: "storageremoval", typeName: "RequestStatus", table: "storage_removal_requests", constraint: "chk_storage_removal_requests_status"},
 		{directory: "storagepull", typeName: "AttemptStatus", table: "storage_pull_attempts", constraint: "chk_storage_pull_attempts_status"},
 		{directory: "storagereplacement", typeName: "Status", table: "storage_replacements", constraint: "chk_storage_replacements_status"},
 		{directory: "storagereplacement", typeName: "SelectionMode", table: "storage_replacements", constraint: "chk_storage_replacements_selection_mode"},

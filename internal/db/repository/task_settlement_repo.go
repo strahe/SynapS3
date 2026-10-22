@@ -105,6 +105,13 @@ func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64) error {
 		if held {
 			return ErrConflict
 		}
+		held, err = db.NewSelect().TableExpr("storage_removal_requests").Where("task_id = ?", id).Exists(ctx)
+		if err != nil {
+			return err
+		}
+		if held {
+			return ErrConflict
+		}
 		if row.AcknowledgedAt != nil {
 			return nil
 		}
@@ -136,7 +143,7 @@ func (r *BunTaskRepo) AcknowledgeFailedForSubject(ctx context.Context, subjectTy
 		return 0, ErrInvalidInput
 	}
 	return r.acknowledgeQuery(ctx, func(q *bun.SelectQuery) *bun.SelectQuery {
-		return q.Where("task.status = ? AND task.subject_type = ? AND task.subject_key = ?", model.TaskStatusFailed, subjectType, subjectKey).Where("NOT " + awaitingCommitReviewSQL)
+		return q.Where("task.status = ? AND task.subject_type = ? AND task.subject_key = ?", model.TaskStatusFailed, subjectType, subjectKey).Where("NOT " + awaitingCommitReviewSQL).Where("NOT " + holdsRemovalRequestSQL)
 	})
 }
 

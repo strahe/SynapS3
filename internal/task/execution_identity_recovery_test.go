@@ -237,13 +237,13 @@ func TestCleanupResolvesEachCopiesOwnCreationIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	failed := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
-	if failed.FailureReason == nil || *failed.FailureReason != "storage_identity_changed" || observations.Load() != 1 {
+	if failed.FailureReason == nil || *failed.FailureReason != "storage_identity_changed" || observations.Load() != 0 {
 		t.Fatalf("cleanup reused the first copy's identity: task=%#v observations=%d", failed, observations.Load())
 	}
 	if err := runtime.db.NewSelect().Model(&copies).Where("content_id = ?", content.ID).Order("copy_index").Scan(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if copies[0].Status != model.StorageCleanupCopyStatusRemoved || copies[1].Status != model.StorageCleanupCopyStatusPending {
+	if copies[0].Status != model.StorageCleanupCopyStatusPending || copies[1].Status != model.StorageCleanupCopyStatusPending {
 		t.Fatalf("copy cleanup facts=%#v", copies)
 	}
 }

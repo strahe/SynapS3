@@ -87,6 +87,7 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories, overr
 		model.TaskTypeCacheEvict,
 		model.TaskTypeCacheReconcileDurability,
 		model.TaskTypeStorageCleanup,
+		model.TaskTypeStorageRemoval,
 		model.TaskTypeStorageDataSetRetire,
 		model.TaskTypeWalletOperation,
 		model.TaskTypeObservabilityRefresh,

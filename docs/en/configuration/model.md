@@ -76,6 +76,8 @@ Keep the configuration file, `.env`, and other credential files at mode `0600`, 
 | `worker.tasks.upload_concurrency` | `4` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
+| `worker.tasks.removal_max_pieces` | `100` |
+| `worker.tasks.removal_max_wait` | `30m` |
 | `worker.tasks.commit_max_backlog` | `256` |
 | `worker.tasks.commit_seal_on_cache_pressure` | `false` |
 | `logging.level` | `info` |
@@ -95,6 +97,7 @@ Keep the configuration file, `.env`, and other credential files at mode `0600`, 
 - `cache.eviction_policy`: `lru`, `after_upload`, `none`.
 - `cache.lru_low_watermark_percent` and `cache.lru_high_watermark_percent`: `0 <= low < high <= 100`.
 - `worker.tasks.commit_max_pieces`: `1` through `200`. `commit_max_wait`: `0s` through `30m`. `commit_max_backlog`: at least `commit_max_pieces`.
+- `worker.tasks.removal_max_pieces`: `1` through `200`. `removal_max_wait`: `0s` through `30m`.
 - `server.max_requests`: at most `server.max_connections`. `database.max_idle_conns`: at most `database.max_open_conns`.
 - `logging.level`: `debug`, `info`, `warn`, `error`. `logging.format`: `json`, `text`.
 - `admin.trusted_proxies`: IP addresses or CIDR ranges.
@@ -132,16 +135,18 @@ Watermarks apply only to `lru`. Removal runs in the background; a write does not
 
 ## Batches
 
-SynapS3 adds uploaded pieces to their data set on chain in batches, one transaction per batch. The **Batches** page lists them.
+SynapS3 adds uploaded pieces to their data set on chain in batches, one transaction per batch. The **Batches** page lists them. Removal batches appear on **Tasks**.
 
 | Field | Settings label | Effect |
 | --- | --- | --- |
 | `worker.tasks.commit_max_pieces` | **Batch size** | Maximum pieces per transaction. |
 | `worker.tasks.commit_max_wait` | **Batch wait** | Maximum time the oldest piece waits for its batch to fill. `0s` submits without waiting. |
+| `worker.tasks.removal_max_pieces` | **Removal batch size** | Maximum pieces per removal transaction. |
+| `worker.tasks.removal_max_wait` | **Removal batch wait** | Maximum time to collect pieces for removal. `0s` skips the collection delay. |
 | `worker.tasks.commit_max_backlog` | **Batch backlog** | When this many transferred pieces wait for one data set, new uploads and replicas to that data set wait. |
 | `worker.tasks.commit_seal_on_cache_pressure` | **Submit batches early to free cache space** | Submits batches early when automatic cache cleanup cannot free enough space. Has no effect with `cache.eviction_policy = none`. |
 
-A batch is submitted when it reaches the batch size, when its oldest piece reaches the batch wait, when the data set stops accepting data, or when you select **Submit next batch** on the **Batches** page. Each data set has at most four submitted batches awaiting confirmation; later batches wait.
+A commit batch is submitted when it reaches the batch size, when its oldest piece reaches the batch wait, when the data set stops accepting data, or when you select **Submit next batch** on the **Batches** page. Each data set has at most four submitted batches awaiting confirmation; later batches wait.
 
 Pieces waiting for submission stay in the local cache. A longer batch wait delays cache release and replicas that copy from the first replica. Smaller batches mean more transactions and higher fees.
 

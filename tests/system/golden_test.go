@@ -167,6 +167,30 @@ func TestSystemGoldenPath(t *testing.T) {
 		return providerRaw + "\n" + dataSetRaw,
 			providers.Summary.Available == systemtest.MemoryFilecoinProviders && dataSets.Summary.Available == 3, nil
 	})
+	if _, err := s3Client.DeleteObject(t.Context(), &awss3.DeleteObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), VersionId: aws.String(object.VersionID),
+	}); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	e2e.Eventually(t, t.Context(), 15*time.Second, "three removal batches and content cleanup complete", func(ctx context.Context) (string, bool, error) {
+		var batches, cleanups e2e.TaskListResponse
+		batchRaw, err := admin.GetJSON(ctx, "/api/v1/tasks?scope=history&type=storage_removal&limit=100", &batches)
+		if err != nil {
+			return batchRaw, false, err
+		}
+		cleanupRaw, err := admin.GetJSON(ctx, "/api/v1/tasks?scope=history&type=storage_cleanup&limit=100", &cleanups)
+		if err != nil {
+			return batchRaw + "\n" + cleanupRaw, false, err
+		}
+		completed := 0
+		for _, batch := range batches.Tasks {
+			if batch.Status == "completed" {
+				completed++
+			}
+		}
+		contentComplete := len(cleanups.Tasks) == 1 && cleanups.Tasks[0].Status == "completed"
+		return batchRaw + "\n" + cleanupRaw, completed == 3 && contentComplete, nil
+	})
 
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

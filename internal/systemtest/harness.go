@@ -146,6 +146,8 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 		// production wait for stragglers.
 		CommitMaxWait:    time.Second,
 		CommitMaxBacklog: config.DefaultCommitMaxBacklog,
+		RemovalMaxPieces: config.DefaultRemovalMaxPieces,
+		RemovalMaxWait:   time.Second,
 	}
 	if len(options) > 0 && options[0].CommitMaxWait != nil {
 		cfg.Worker.Tasks.CommitMaxWait = *options[0].CommitMaxWait
@@ -203,7 +205,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string, opti
 			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314159, USDFCAddress: memoryUSDFCAddress.Hex(),
 			Storage: storageClient, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,
-			Terminator: filecoin, Epochs: filecoin, CommitNonces: filecoin, ParkedPieces: filecoin,
+			Terminator: filecoin, Epochs: filecoin, CommitNonces: filecoin, ParkedPieces: filecoin, RemovalChain: filecoin,
 		},
 		S3Addresses: []string{socketPath}, ShutdownTimeout: 5 * time.Second,
 	})

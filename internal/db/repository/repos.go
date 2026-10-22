@@ -19,6 +19,7 @@ type Repositories struct {
 	Contents            StorageContentRepository
 	Replacements        StorageReplacementRepository
 	StorageCleanup      StorageCleanupRepository
+	StorageRemoval      StorageRemovalRepository
 	Tasks               TaskRepository
 	TaskSchedules       TaskScheduleRepository
 	CacheEvictions      CacheEvictionRepository
@@ -41,6 +42,7 @@ func NewRepositories(db bun.IDB) *Repositories {
 		Contents:            &BunStorageContentRepo{db: db},
 		Replacements:        &BunStorageReplacementRepo{db: db},
 		StorageCleanup:      &BunStorageCleanupRepo{db: db},
+		StorageRemoval:      &BunStorageRemovalRepo{db: db},
 		Tasks:               &BunTaskRepo{db: db},
 		TaskSchedules:       &BunTaskScheduleRepo{db: db},
 		CacheEvictions:      &BunCacheEvictionRepo{db: db},

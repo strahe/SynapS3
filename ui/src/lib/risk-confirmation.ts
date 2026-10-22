@@ -189,6 +189,16 @@ export function collectSettingsRiskChanges(
     )
   }
 
+  if (next.worker.tasks.removal_max_pieces > initial.worker.tasks.removal_max_pieces) {
+    addChanged(
+      'worker.tasks.removal_max_pieces',
+      initial.worker.tasks.removal_max_pieces,
+      next.worker.tasks.removal_max_pieces,
+      'medium',
+      'Groups more removals in each transaction; providers may refuse requests that are too large.'
+    )
+  }
+
   return changes
 }
 

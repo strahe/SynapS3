@@ -18,6 +18,7 @@ import (
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepull"
+	"github.com/strahe/synaps3/internal/storageremoval"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
@@ -68,6 +69,9 @@ func runtimePersistentModels() []any {
 		(*model.StorageCopy)(nil),
 		(*storagecommit.Request)(nil),
 		(*storagecommit.RequestPiece)(nil),
+		(*storageremoval.Request)(nil),
+		(*storageremoval.Send)(nil),
+		(*storageremoval.SendPiece)(nil),
 		(*storagepull.Attempt)(nil),
 		(*model.ObjectVersion)(nil),
 		(*model.ObjectCache)(nil),

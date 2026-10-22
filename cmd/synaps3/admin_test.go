@@ -632,6 +632,8 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 			"cache.lru_high_watermark_percent",
 			"cache.lru_low_watermark_percent",
 			"worker.tasks.concurrency",
+			"worker.tasks.removal_max_pieces",
+			"worker.tasks.removal_max_wait",
 			"Logging",
 		} {
 			if !strings.Contains(out, want) {
@@ -657,6 +659,15 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 			}
 			if value == nil {
 				t.Fatalf("adminSettingsFieldValue(%q) returned nil", field)
+			}
+		}
+		for field, want := range map[string]any{
+			"worker.tasks.removal_max_pieces": 100,
+			"worker.tasks.removal_max_wait":   "30m0s",
+		} {
+			value, err := adminSettingsFieldValue(settings, field)
+			if err != nil || value != want {
+				t.Fatalf("adminSettingsFieldValue(%q) = %#v, %v; want %#v", field, value, err, want)
 			}
 		}
 	})
@@ -783,6 +794,12 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 				if tasks["upload_concurrency"] != float64(6) {
 					t.Fatalf("worker.tasks.upload_concurrency = %#v, want 6", tasks["upload_concurrency"])
 				}
+				if tasks["removal_max_pieces"] != float64(150) {
+					t.Fatalf("worker.tasks.removal_max_pieces = %#v, want 150", tasks["removal_max_pieces"])
+				}
+				if tasks["removal_max_wait"] != "10m" {
+					t.Fatalf("worker.tasks.removal_max_wait = %#v, want 10m", tasks["removal_max_wait"])
+				}
 				filecoin := body["filecoin"].(map[string]any)
 				if filecoin["with_cdn"] != true {
 					t.Fatalf("filecoin.with_cdn = %#v, want true", filecoin["with_cdn"])
@@ -810,6 +827,7 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 			"settings", "set", "cache.max_size_gb=8", "cache.lru_high_watermark_percent=85",
 			"cache.lru_low_watermark_percent=70", "worker.tasks.poll_interval=9s",
 			"worker.tasks.upload_concurrency=6",
+			"worker.tasks.removal_max_pieces=150", "worker.tasks.removal_max_wait=10m",
 			"filecoin.with_cdn=true", "logging.level=debug",
 			"logging.s3_access.enabled=false", "logging.s3_access.level=debug",
 		})
@@ -1172,6 +1190,8 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 					"commit_max_pieces":  32,
 					"commit_max_wait":    "30s",
 					"commit_max_backlog": 256,
+					"removal_max_pieces": 100,
+					"removal_max_wait":   "30m0s",
 				},
 			},
 			"logging": map[string]any{

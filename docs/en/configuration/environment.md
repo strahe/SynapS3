@@ -45,6 +45,8 @@ Environment variables override values in the configuration file. A field set thi
 | `SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY` | `worker.tasks.upload_concurrency` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES` | `worker.tasks.commit_max_pieces` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT` | `worker.tasks.commit_max_wait` |
+| `SYNAPS3_WORKER_TASKS_REMOVAL_MAX_PIECES` | `worker.tasks.removal_max_pieces` |
+| `SYNAPS3_WORKER_TASKS_REMOVAL_MAX_WAIT` | `worker.tasks.removal_max_wait` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE` | `worker.tasks.commit_seal_on_cache_pressure` |
 | `SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG` | `worker.tasks.commit_max_backlog` |
 | `SYNAPS3_LOGGING_LEVEL` | `logging.level` |

@@ -103,6 +103,8 @@ const tabFields = {
     'worker.tasks.upload_concurrency',
     'worker.tasks.commit_max_pieces',
     'worker.tasks.commit_max_wait',
+    'worker.tasks.removal_max_pieces',
+    'worker.tasks.removal_max_wait',
     'worker.tasks.commit_seal_on_cache_pressure',
     'worker.tasks.commit_max_backlog',
   ],
@@ -1039,6 +1041,22 @@ function TaskWorkerSection({
           data={data}
           errors={errors}
           onChange={(next) => onChange({ ...value, commit_max_wait: next })}
+        />
+        <NumberField
+          label="Removal batch size"
+          field="worker.tasks.removal_max_pieces"
+          value={value.removal_max_pieces}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, removal_max_pieces: next })}
+        />
+        <TextField
+          label="Removal batch wait"
+          field="worker.tasks.removal_max_wait"
+          value={value.removal_max_wait}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, removal_max_wait: next })}
         />
         <NumberField
           label="Batch backlog"

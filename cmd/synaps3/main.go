@@ -355,6 +355,8 @@ func runServe(ctx context.Context, src config.Source) error {
 	if err != nil {
 		return fmt.Errorf("configuring storage confirmation checks: %w", err)
 	}
+	epochs := synapse.NewChainEpochReader(walletReceiptClient)
+	removalChain := synapse.NewRemovalChainReader(client.WarmStorage(), client.Payments(), storageIdentity, epochs)
 
 	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
 		Config:   cfg,
@@ -375,8 +377,9 @@ func runServe(ctx context.Context, src config.Source) error {
 			Terminator:        storageClient,
 			// The epoch comes from the same node that reports wallet receipts,
 			// so replacement adds no new RPC connection.
-			Epochs:       synapse.NewChainEpochReader(walletReceiptClient),
+			Epochs:       epochs,
 			CommitNonces: commitNonces,
+			RemovalChain: removalChain,
 		},
 		ProviderIdentity: admin.NewProviderIdentityResolver(cfg.Filecoin.RPCURL, logger),
 		Logger:           logger,

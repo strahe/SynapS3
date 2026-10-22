@@ -61,6 +61,7 @@ func TestRuntimeRefusesMarkedBaselineWithoutDeploymentIdentity(t *testing.T) {
 		Terminator:    &testutil.MockServiceTerminator{},
 		Epochs:        &testutil.MockChainEpochReader{},
 		CommitNonces:  struct{ synapse.CommitNonceReader }{},
+		RemovalChain:  struct{ synapse.RemovalChainReader }{},
 	}
 	runtime, err := NewRuntime(t.Context(), RuntimeOptions{
 		Config: cfg, Database: database, Settings: &admin.SettingsService{}, Filecoin: services,

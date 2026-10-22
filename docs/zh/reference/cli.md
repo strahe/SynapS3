@@ -126,6 +126,7 @@ synaps3 admin storage-confirmation list
 | `cache_reconcile_durability` | **Recheck cache release** |
 | `cache_capacity_reconcile` | **Manage cache capacity** |
 | `storage_cleanup` | **Clean up deleted data** |
+| `storage_removal` | **Remove batch** |
 | `storage_dataset_retire` | **Terminate data set** |
 | `wallet_operation` | **Wallet operation** |
 | `provider_upload_speed_test` | **Test upload speed** |

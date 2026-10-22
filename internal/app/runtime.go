@@ -74,6 +74,7 @@ type FilecoinServices struct {
 	// provider never confirmed.
 	CommitNonces synapse.CommitNonceReader
 	ParkedPieces synapse.ParkedPieceChecker
+	RemovalChain synapse.RemovalChainReader
 }
 
 // RuntimeOptions configures the application composition root. Database,
@@ -178,6 +179,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		Receipts:                      opts.Filecoin.Receipts,
 		Terminator:                    opts.Filecoin.Terminator,
 		Epochs:                        opts.Filecoin.Epochs,
+		RemovalChain:                  opts.Filecoin.RemovalChain,
 		Observability:                 observabilityService,
 		UploadSpeedProbe:              uploadSpeedProbe,
 		UploadSpeedTestAutoScope:      cfg.Filecoin.UploadSpeedTest.AutoScope,
@@ -196,6 +198,8 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		CommitMaxWait:                 cfg.Worker.Tasks.CommitMaxWait,
 		CommitMaxBacklog:              cfg.Worker.Tasks.CommitMaxBacklog,
 		CommitSealOnCachePressure:     cfg.Worker.Tasks.CommitSealOnCachePressure,
+		RemovalMaxPieces:              cfg.Worker.Tasks.RemovalMaxPieces,
+		RemovalMaxWait:                cfg.Worker.Tasks.RemovalMaxWait,
 		LegacyPieceStorageIDLimit:     synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network),
 		Logger:                        logger,
 	})
@@ -413,6 +417,7 @@ func validateOptions(opts RuntimeOptions) error {
 		{name: "filecoin service terminator", value: opts.Filecoin.Terminator},
 		{name: "filecoin chain epochs", value: opts.Filecoin.Epochs},
 		{name: "filecoin commit nonces", value: opts.Filecoin.CommitNonces},
+		{name: "filecoin removal chain", value: opts.Filecoin.RemovalChain},
 	}
 	for _, dependency := range dependencies {
 		if isNil(dependency.value) {

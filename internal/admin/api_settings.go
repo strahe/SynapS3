@@ -291,6 +291,8 @@ func applyTaskWorkerUpdate(
 	setInt("worker.tasks.upload_concurrency", &target.UploadConcurrency, req.UploadConcurrency)
 	setInt("worker.tasks.commit_max_pieces", &target.CommitMaxPieces, req.CommitMaxPieces)
 	setDuration("worker.tasks.commit_max_wait", &target.CommitMaxWait, req.CommitMaxWait)
+	setInt("worker.tasks.removal_max_pieces", &target.RemovalMaxPieces, req.RemovalMaxPieces)
+	setDuration("worker.tasks.removal_max_wait", &target.RemovalMaxWait, req.RemovalMaxWait)
 	setInt("worker.tasks.commit_max_backlog", &target.CommitMaxBacklog, req.CommitMaxBacklog)
 	setBool("worker.tasks.commit_seal_on_cache_pressure", &target.CommitSealOnCachePressure, req.CommitSealOnCachePressure)
 }
@@ -431,6 +433,8 @@ type settingsTaskWorkerConfig struct {
 	UploadConcurrency         int    `json:"upload_concurrency"`
 	CommitMaxPieces           int    `json:"commit_max_pieces"`
 	CommitMaxWait             string `json:"commit_max_wait"`
+	RemovalMaxPieces          int    `json:"removal_max_pieces"`
+	RemovalMaxWait            string `json:"removal_max_wait"`
 	CommitMaxBacklog          int    `json:"commit_max_backlog"`
 	CommitSealOnCachePressure bool   `json:"commit_seal_on_cache_pressure"`
 }
@@ -547,6 +551,8 @@ type settingsTaskWorkerUpdate struct {
 	UploadConcurrency         *int    `json:"upload_concurrency,omitempty"`
 	CommitMaxPieces           *int    `json:"commit_max_pieces,omitempty"`
 	CommitMaxWait             *string `json:"commit_max_wait,omitempty"`
+	RemovalMaxPieces          *int    `json:"removal_max_pieces,omitempty"`
+	RemovalMaxWait            *string `json:"removal_max_wait,omitempty"`
 	CommitMaxBacklog          *int    `json:"commit_max_backlog,omitempty"`
 	CommitSealOnCachePressure *bool   `json:"commit_seal_on_cache_pressure,omitempty"`
 }
@@ -623,6 +629,8 @@ func toSettingsTaskWorkerConfig(cfg config.TaskWorkerConfig) settingsTaskWorkerC
 		UploadConcurrency:         cfg.UploadConcurrency,
 		CommitMaxPieces:           cfg.CommitMaxPieces,
 		CommitMaxWait:             cfg.CommitMaxWait.String(),
+		RemovalMaxPieces:          cfg.RemovalMaxPieces,
+		RemovalMaxWait:            cfg.RemovalMaxWait.String(),
 		CommitMaxBacklog:          cfg.CommitMaxBacklog,
 		CommitSealOnCachePressure: cfg.CommitSealOnCachePressure,
 	}
@@ -682,6 +690,8 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"worker.tasks.upload_concurrency":            {},
 		"worker.tasks.commit_max_pieces":             {},
 		"worker.tasks.commit_max_wait":               {},
+		"worker.tasks.removal_max_pieces":            {},
+		"worker.tasks.removal_max_wait":              {},
 		"worker.tasks.commit_max_backlog":            {},
 		"worker.tasks.commit_seal_on_cache_pressure": {},
 		"logging.level":                              {},

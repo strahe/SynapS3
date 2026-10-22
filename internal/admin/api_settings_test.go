@@ -468,7 +468,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 			"lru_high_watermark_percent":86,
 			"lru_low_watermark_percent":71
 		},
-		"worker":{"tasks":{"poll_interval":"9s","concurrency":2,"upload_concurrency":4}},
+		"worker":{"tasks":{"poll_interval":"9s","concurrency":2,"upload_concurrency":4,"removal_max_pieces":150,"removal_max_wait":"5m"}},
 		"logging":{"format":"text","s3_access":{"enabled":false,"level":"debug"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -493,6 +493,8 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 		resp.Config.Cache.LRULowWatermarkPercent != 71 ||
 		resp.Config.Worker.Tasks.Concurrency != 2 ||
 		resp.Config.Worker.Tasks.UploadConcurrency != 4 ||
+		resp.Config.Worker.Tasks.RemovalMaxPieces != 150 ||
+		resp.Config.Worker.Tasks.RemovalMaxWait != "5m0s" ||
 		resp.Config.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("updated config = %#v", resp.Config)
 	}
@@ -503,6 +505,9 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Server.Port != ":8088" {
 		t.Fatalf("saved server.port = %q, want :8088", loaded.Server.Port)
+	}
+	if loaded.Worker.Tasks.RemovalMaxPieces != 150 || loaded.Worker.Tasks.RemovalMaxWait != 5*time.Minute {
+		t.Fatalf("saved removal settings = %d/%s, want 150/5m", loaded.Worker.Tasks.RemovalMaxPieces, loaded.Worker.Tasks.RemovalMaxWait)
 	}
 	if loaded.Worker.Tasks.PollInterval.String() != "9s" {
 		t.Fatalf("saved worker.tasks.poll_interval = %s, want 9s", loaded.Worker.Tasks.PollInterval)
@@ -783,6 +788,8 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "upload concurrency", envName: "SYNAPS3_WORKER_TASKS_UPLOAD_CONCURRENCY", payload: `{"worker":{"tasks":{"upload_concurrency":2}}}`, field: "worker.tasks.upload_concurrency"},
 		{name: "commit max pieces", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_PIECES", payload: `{"worker":{"tasks":{"commit_max_pieces":16}}}`, field: "worker.tasks.commit_max_pieces"},
 		{name: "commit max wait", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_WAIT", payload: `{"worker":{"tasks":{"commit_max_wait":"5s"}}}`, field: "worker.tasks.commit_max_wait"},
+		{name: "removal max pieces", envName: "SYNAPS3_WORKER_TASKS_REMOVAL_MAX_PIECES", payload: `{"worker":{"tasks":{"removal_max_pieces":150}}}`, field: "worker.tasks.removal_max_pieces"},
+		{name: "removal max wait", envName: "SYNAPS3_WORKER_TASKS_REMOVAL_MAX_WAIT", payload: `{"worker":{"tasks":{"removal_max_wait":"5m"}}}`, field: "worker.tasks.removal_max_wait"},
 		{name: "pressure sealing", envName: "SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", payload: `{"worker":{"tasks":{"commit_seal_on_cache_pressure":true}}}`, field: "worker.tasks.commit_seal_on_cache_pressure", envValue: "false"},
 		{name: "commit max backlog", envName: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", payload: `{"worker":{"tasks":{"commit_max_backlog":64}}}`, field: "worker.tasks.commit_max_backlog"},
 		{name: "logging level", envName: "SYNAPS3_LOGGING_LEVEL", payload: `{"logging":{"level":"debug"}}`, field: "logging.level"},

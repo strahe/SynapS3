@@ -31,6 +31,14 @@ type CleanupPieceState struct {
 	BlockNumber uint64
 }
 
+// CleanupPiecesState contains one block's observations, keyed by decimal piece ID.
+type CleanupPiecesState struct {
+	Pieces          map[string]CleanupPieceStatus
+	QueueLength     int
+	BlockNumber     uint64
+	VerifierVersion string
+}
+
 type cleanupChainCaller interface {
 	BlockNumber(context.Context) (uint64, error)
 	CallContract(context.Context, ethereum.CallMsg, *big.Int) ([]byte, error)
@@ -53,11 +61,12 @@ func newCleanupPieceReader(chain cleanupChainCaller, verifier common.Address) (*
 	return &cleanupPieceReader{chain: chain, verifier: verifier, abi: contractABI}, nil
 }
 
-func (r *cleanupPieceReader) ObserveCleanupPiece(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error) {
+func (r *cleanupPieceReader) ObserveCleanupPieces(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (CleanupPiecesState, error) {
 	height, err := r.chain.BlockNumber(ctx)
 	if err != nil {
-		return CleanupPieceState{}, fmt.Errorf("reading cleanup chain head: %w", err)
+		return CleanupPiecesState{}, fmt.Errorf("reading cleanup chain head: %w", err)
 	}
+	state := CleanupPiecesState{Pieces: make(map[string]CleanupPieceStatus, len(pieceIDs)), BlockNumber: height}
 	block := new(big.Int).SetUint64(height)
 	call := func(method string, args ...any) ([]any, error) {
 		input, err := r.abi.Pack(method, args...)
@@ -70,64 +79,83 @@ func (r *cleanupPieceReader) ObserveCleanupPiece(ctx context.Context, dataSetID,
 		}
 		return r.abi.Unpack(method, output)
 	}
-	dataSetResult, err := call("dataSetLive", dataSetID.Big())
+	versionResult, err := call("VERSION")
 	if err != nil {
-		return CleanupPieceState{}, fmt.Errorf("reading cleanup data set state: %w", err)
+		return state, fmt.Errorf("reading cleanup verifier version: %w", err)
 	}
-	dataSetLive, ok := dataSetResult[0].(bool)
+	version, ok := versionResult[0].(string)
+	if !ok || version == "" {
+		return state, fmt.Errorf("invalid cleanup verifier version")
+	}
+	state.VerifierVersion = version
+	liveResult, err := call("dataSetLive", dataSetID.Big())
+	if err != nil {
+		return state, fmt.Errorf("reading cleanup data set state: %w", err)
+	}
+	dataSetLive, ok := liveResult[0].(bool)
 	if !ok {
-		return CleanupPieceState{}, fmt.Errorf("invalid cleanup data set state")
+		return state, fmt.Errorf("invalid cleanup data set state")
 	}
 	if !dataSetLive {
-		versionResult, err := call("VERSION")
-		if err != nil {
-			return CleanupPieceState{}, fmt.Errorf("reading cleanup verifier version: %w", err)
-		}
-		if version, ok := versionResult[0].(string); !ok || (version != "3.4.0" && version != "3.5.0") {
-			return CleanupPieceState{}, fmt.Errorf("unsupported cleanup verifier version: %v", versionResult[0])
+		if version != "3.4.0" && version != "3.5.0" {
+			return state, fmt.Errorf("unsupported cleanup verifier version: %s", version)
 		}
 		epochResult, err := call("getNextChallengeEpoch", dataSetID.Big())
+		status := CleanupPieceDataSetCleanup
 		if err != nil {
 			notFound := r.abi.Errors["DataSetNotFound"].ID
-			if data, ok := ethclient.RevertErrorData(err); ok && bytes.Equal(data, notFound[:4]) {
-				// Historical storage slots can remain after the registration ends.
-				return CleanupPieceState{Status: CleanupPieceRemoved, BlockNumber: height}, nil
+			if data, ok := ethclient.RevertErrorData(err); !ok || !bytes.Equal(data, notFound[:4]) {
+				return state, fmt.Errorf("reading cleanup data set phase: %w", err)
 			}
-			return CleanupPieceState{}, fmt.Errorf("reading cleanup data set phase: %w", err)
+			status = CleanupPieceRemoved
+		} else {
+			epoch, ok := epochResult[0].(*big.Int)
+			// A deleted data set retains its piece slots until batched cleanup finishes.
+			if !ok || epoch.BitLen() != 256 || epoch.Cmp(new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))) != 0 {
+				return state, fmt.Errorf("inconsistent cleanup data set phase: %v", epochResult[0])
+			}
 		}
-		epoch, ok := epochResult[0].(*big.Int)
-		// PDP 3.4.0 and 3.5.0 retain data-set storage during batched cleanup;
-		// only the uint256 sentinel identifies this phase, never a termination epoch.
-		if !ok || epoch.BitLen() != 256 || epoch.Cmp(new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))) != 0 {
-			return CleanupPieceState{}, fmt.Errorf("inconsistent cleanup data set phase: %v", epochResult[0])
+		for _, id := range pieceIDs {
+			state.Pieces[id.String()] = status
 		}
-		return CleanupPieceState{Status: CleanupPieceDataSetCleanup, BlockNumber: height}, nil
-	}
-	liveResult, err := call("pieceLive", dataSetID.Big(), pieceID.Big())
-	if err != nil {
-		return CleanupPieceState{}, fmt.Errorf("reading cleanup piece state: %w", err)
-	}
-	live, ok := liveResult[0].(bool)
-	if !ok {
-		return CleanupPieceState{}, fmt.Errorf("invalid cleanup piece state")
-	}
-	state := CleanupPieceState{Status: CleanupPiecePresent, BlockNumber: height}
-	if !live {
-		state.Status = CleanupPieceRemoved
 		return state, nil
 	}
 	queueResult, err := call("getScheduledRemovals", dataSetID.Big())
 	if err != nil {
-		return CleanupPieceState{}, fmt.Errorf("reading scheduled cleanup: %w", err)
+		return state, fmt.Errorf("reading scheduled cleanup: %w", err)
 	}
-	ids, ok := queueResult[0].([]*big.Int)
+	queued, ok := queueResult[0].([]*big.Int)
 	if !ok {
-		return CleanupPieceState{}, fmt.Errorf("invalid scheduled cleanup state")
+		return state, fmt.Errorf("invalid scheduled cleanup state")
 	}
-	for _, id := range ids {
-		if id.Cmp(pieceID.Big()) == 0 {
-			state.Status = CleanupPieceScheduled
-			break
+	state.QueueLength = len(queued)
+	queue := make(map[string]struct{}, len(queued))
+	for _, id := range queued {
+		if id == nil {
+			return state, fmt.Errorf("invalid scheduled cleanup piece")
+		}
+		queue[id.String()] = struct{}{}
+	}
+	for _, id := range pieceIDs {
+		key := id.String()
+		if _, observed := state.Pieces[key]; observed {
+			continue
+		}
+		if _, found := queue[key]; found {
+			state.Pieces[key] = CleanupPieceScheduled
+			continue
+		}
+		pieceResult, err := call("pieceLive", dataSetID.Big(), id.Big())
+		if err != nil {
+			return state, fmt.Errorf("reading cleanup piece %s: %w", id, err)
+		}
+		live, ok := pieceResult[0].(bool)
+		if !ok {
+			return state, fmt.Errorf("invalid cleanup piece state")
+		}
+		state.Pieces[key] = CleanupPieceRemoved
+		if live {
+			state.Pieces[key] = CleanupPiecePresent
 		}
 	}
 	return state, nil

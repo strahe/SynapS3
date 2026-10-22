@@ -76,6 +76,8 @@ synaps3 admin settings get
 | `worker.tasks.upload_concurrency` | `4` |
 | `worker.tasks.commit_max_pieces` | `32` |
 | `worker.tasks.commit_max_wait` | `30m` |
+| `worker.tasks.removal_max_pieces` | `100` |
+| `worker.tasks.removal_max_wait` | `30m` |
 | `worker.tasks.commit_max_backlog` | `256` |
 | `worker.tasks.commit_seal_on_cache_pressure` | `false` |
 | `logging.level` | `info` |
@@ -95,6 +97,7 @@ synaps3 admin settings get
 - `cache.eviction_policy`：`lru`、`after_upload`、`none`。
 - `cache.lru_low_watermark_percent` 和 `cache.lru_high_watermark_percent`：`0 <= low < high <= 100`。
 - `worker.tasks.commit_max_pieces`：`1` 到 `200`。`commit_max_wait`：`0s` 到 `30m`。`commit_max_backlog`：不小于 `commit_max_pieces`。
+- `worker.tasks.removal_max_pieces`：`1` 到 `200`。`removal_max_wait`：`0s` 到 `30m`。
 - `server.max_requests` 不大于 `server.max_connections`；`database.max_idle_conns` 不大于 `database.max_open_conns`。
 - `logging.level`：`debug`、`info`、`warn`、`error`。`logging.format`：`json`、`text`。
 - `admin.trusted_proxies`：IP 地址或 CIDR 网段。
@@ -132,16 +135,18 @@ SynapS3 进程必须能读取这两个文件。不启用原生 TLS 时，生产 
 
 ## 批次
 
-SynapS3 把上传的 piece 按批次加入链上数据集，每个批次一笔交易。**Batches** 页面列出这些批次。
+SynapS3 把上传的 piece 按批次加入链上数据集，每个批次一笔交易。**Batches** 页面列出这些批次。删除批次显示在 **Tasks** 页面。
 
 | 字段 | Settings 标签 | 作用 |
 | --- | --- | --- |
 | `worker.tasks.commit_max_pieces` | **Batch size** | 每笔交易最多包含的 piece 数。 |
 | `worker.tasks.commit_max_wait` | **Batch wait** | 最早的 piece 等待批次凑满的最长时间。`0s` 表示不等待，直接提交。 |
+| `worker.tasks.removal_max_pieces` | **Removal batch size** | 每笔删除交易最多包含的 piece 数。 |
+| `worker.tasks.removal_max_wait` | **Removal batch wait** | 收集待删除 piece 的最长等待时间。`0s` 表示不等待。 |
 | `worker.tasks.commit_max_backlog` | **Batch backlog** | 某个数据集等待提交的已传输 piece 达到该数量时，发往该数据集的新上传和新副本会等待。 |
 | `worker.tasks.commit_seal_on_cache_pressure` | **Submit batches early to free cache space** | 自动缓存清理释放不出足够空间时，提前提交批次。`cache.eviction_policy = none` 时无效。 |
 
-满足以下任一条件时提交批次：达到批次大小；最早的 piece 等到批次等待时间；数据集不再接收数据；在 **Batches** 页面点击 **Submit next batch**。每个数据集最多有四个已提交、待确认的批次，之后的批次排队等待。
+上传注册批次满足以下任一条件时提交：达到批次大小；最早的 piece 等到批次等待时间；数据集不再接收数据；在 **Batches** 页面点击 **Submit next batch**。每个数据集最多有四个已提交、待确认的批次，之后的批次排队等待。
 
 等待提交的 piece 保留在本地缓存中。批次等待时间越长，缓存释放和从首个副本复制的其他副本就越晚。批次越小，交易越多，费用越高。
 
