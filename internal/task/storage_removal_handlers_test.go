@@ -655,8 +655,13 @@ func TestRemovalRevertedReceiptRequiresManualRetryWithPreservedEvidence(t *testi
 					t.Fatalf("failed historical receipt was treated as unconfirmed: task=%#v request=%#v", f.row, f.request)
 				}
 				evidence := f.sends(t)
-				if calls.Load() != 3 || len(evidence) != 3 || evidence[1].UnsentAt == nil || evidence[2].UnsentAt == nil || evidence[0].ReceiptStatus == nil || *evidence[0].ReceiptStatus != 0 {
+				if calls.Load() != int64(1+maxAttempts) || len(evidence) != 1+maxAttempts || f.row.RetryCount != maxAttempts-1 || evidence[0].TxHash == nil || *evidence[0].TxHash != hash.Hex() || evidence[0].ReceiptStatus == nil || *evidence[0].ReceiptStatus != 0 {
 					t.Fatalf("retry exhausted without preserving send outcomes: %#v, sends=%d", evidence, calls.Load())
+				}
+				for _, send := range evidence[1:] {
+					if send.UnsentAt == nil || send.TaskID == nil || *send.TaskID != f.row.ID {
+						t.Fatalf("retry lost its unsent evidence or ownership: %#v", send)
+					}
 				}
 				return
 			}
