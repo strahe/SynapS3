@@ -15,6 +15,7 @@ func TestRegisteredTaskConcurrencyDefaults(t *testing.T) {
 		model.TaskTypeStorageCommit:           4,
 		model.TaskTypeStorageDataSetEnsure:    2,
 		model.TaskTypeStorageCleanup:          2,
+		model.TaskTypeStorageRemoval:          4,
 		model.TaskTypeStorageDataSetRetire:    1,
 		model.TaskTypeWalletOperation:         1,
 		model.TaskTypeProviderUploadSpeedTest: 1,

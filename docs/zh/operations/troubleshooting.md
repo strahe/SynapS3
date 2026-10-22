@@ -96,7 +96,8 @@ synaps3 admin task retry 42
 | **Replace provider** | 在存储桶的 **Storage** 标签页恢复。 |
 | **Commit batch** | 恢复依赖后点击 **Retry**。SynapS3 会先查询链上状态再重新提交批次。`synaps3 admin storage-confirmation list` 列出需要处理的批次。 |
 | **Wallet operation** | **Retry** 继续处理已记录的同一笔交易，或启动从未广播的操作。如果交易可能已广播但没有记录，请到链上核对钱包；该操作不能重试。 |
-| **Clean up deleted data** | 删除远端副本超过 24 小时仍未确认时，**Retry** 会查询链上状态，并可能再提交一次付费删除请求。之前的请求仍可能成功。 |
+| **Remove batch** | **Retry** 会查询链上状态，并可能再提交一次付费删除请求。之前的请求仍可能成功。 |
+| **Clean up deleted data** | **Retry** 会重试失败的副本并继续清理。 |
 
 副本失败时，在 **Tasks** 页面或对象的 **Provenance** 对话框中点击 **Retry**。副本显示 **Stored** 即表示完成。
 

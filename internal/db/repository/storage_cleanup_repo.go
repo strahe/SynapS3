@@ -78,7 +78,7 @@ func (r *BunStorageCleanupRepo) AuthorizeTask(ctx context.Context, contentID, ge
 	if err := r.db.NewSelect().
 		Model(&copies).
 		Where("content_id = ?", contentID).
-		OrderExpr("copy_index ASC").
+		OrderExpr("copy_index ASC, id ASC").
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing storage cleanup copies: %w", err)
 	}
@@ -104,65 +104,6 @@ func (r *BunStorageCleanupRepo) MarkCopyRemoved(ctx context.Context, id int64) e
 		return err
 	}
 	return nil
-}
-
-func (r *BunStorageCleanupRepo) MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error {
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusDeleteScheduled).
-		Set("delete_tx_hash = ?", txHash).
-		Set("scheduled_at = COALESCE(scheduled_at, ?)", now).
-		Set("last_error = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status = ?", model.StorageCleanupCopyStatusPending).
-		Exec(ctx)
-	return storageCleanupCopyTransitionResult(
-		ctx, r.db, res, err, id, model.StorageCleanupCopyStatusDeleteScheduled, txHash,
-		"marking storage cleanup copy scheduled",
-	)
-}
-
-// BeginFailedCopyRetry resets the failed ledger row in the same transaction
-// that checkpoints the new external request.
-func (r *BunStorageCleanupRepo) BeginFailedCopyRetry(ctx context.Context, id int64, oldHash string) error {
-	now := time.Now()
-	query := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusPending).
-		Set("delete_tx_hash = NULL").
-		Set("scheduled_at = NULL").
-		Set("last_error = NULL").
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status = ?", model.StorageCleanupCopyStatusFailed)
-	if oldHash == "" {
-		query = query.Where("delete_tx_hash IS NULL")
-	} else {
-		query = query.Where("delete_tx_hash = ?", oldHash)
-	}
-	result, err := query.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("beginning failed storage cleanup retry: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return fmt.Errorf("beginning failed storage cleanup retry: %w", ErrConflict)
-	}
-	return nil
-}
-
-func (r *BunStorageCleanupRepo) MarkCopyFailed(ctx context.Context, id int64, message string) error {
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Set("status = ?", model.StorageCleanupCopyStatusFailed).
-		Set("last_error = ?", errtext.Redact(message)).
-		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Exec(ctx)
-	return storageCleanupCopyUpdateResult(res, err, "marking storage cleanup copy failed")
 }
 
 func (r *BunStorageCleanupRepo) MarkCopyUnsupported(ctx context.Context, id int64, message string) error {
@@ -199,10 +140,14 @@ func uploadHasObjectReferences(ctx context.Context, db bun.IDB, contentID int64)
 }
 
 func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, contentID int64) (bool, error) {
+	return cleanupHasObjectReferences(ctx, r.db, contentID)
+}
+
+func cleanupHasObjectReferences(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
 	var row struct {
 		Count int `bun:"count"`
 	}
-	err := r.db.NewRaw(`SELECT COUNT(DISTINCT object_version.version_id) AS count
+	err := db.NewRaw(`SELECT COUNT(DISTINCT object_version.version_id) AS count
 		FROM storage_cleanup_copies AS cleanup_copy
 		JOIN storage_copies AS storage_copy
 		  ON storage_copy.status = ?
@@ -235,7 +180,7 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 		return true, nil
 	}
 	row.Count = 0
-	err = r.db.NewRaw(`SELECT COUNT(DISTINCT active_content.id) AS count
+	err = db.NewRaw(`SELECT COUNT(DISTINCT active_content.id) AS count
 		FROM storage_cleanup_copies AS cleanup_copy
 		JOIN storage_copies AS storage_copy
 		  ON storage_copy.status = ?

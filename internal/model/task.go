@@ -25,6 +25,7 @@ const (
 	TaskTypeCacheEvict                    TaskType = "cache_evict"
 	TaskTypeCacheReconcileDurability      TaskType = "cache_reconcile_durability"
 	TaskTypeStorageCleanup                TaskType = "storage_cleanup"
+	TaskTypeStorageRemoval                TaskType = "storage_removal"
 	TaskTypeStorageDataSetRetire          TaskType = "storage_dataset_retire"
 	TaskTypeWalletOperation               TaskType = "wallet_operation"
 	TaskTypeObservabilityRefresh          TaskType = "observability_refresh"
@@ -37,9 +38,10 @@ const (
 // with these subjects derive them from the task input, so the subject always
 // names the row the input names.
 const (
-	TaskSubjectStorageContent       = "storage_content"
-	TaskSubjectStorageCopy          = "storage_copy"
-	TaskSubjectStorageCommitRequest = "storage_commit_request"
+	TaskSubjectStorageContent        = "storage_content"
+	TaskSubjectStorageCopy           = "storage_copy"
+	TaskSubjectStorageCommitRequest  = "storage_commit_request"
+	TaskSubjectStorageRemovalRequest = "storage_removal_request"
 )
 
 // RecurringSystemTaskTypes returns the scheduled maintenance task types.

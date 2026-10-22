@@ -8,6 +8,7 @@ import { DetailHeader } from '@/components/app/DetailPanel'
 import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
 import { RelativeTime } from '@/components/app/RelativeTime'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { RemovalBatchDetails } from '@/components/tasks/RemovalBatchDetails'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -245,6 +246,7 @@ export function TaskDetailsSheet({
                           </div>
                         ))}
                       </dl>
+                      {task.removal_batch && <RemovalBatchDetails batch={task.removal_batch} />}
                       {policy && (
                         <>
                           <Separator />

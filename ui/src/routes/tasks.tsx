@@ -18,6 +18,7 @@ import {
 import { PageHeader, RefreshButton } from '@/components/app/PageHeader'
 import { EmptyState, PageError } from '@/components/app/PageState'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { RemovalBatchDetails, removalAttentionLabel } from '@/components/tasks/RemovalBatchDetails'
 import { RetryButton } from '@/components/tasks/RetryButton'
 import { StorageConfirmationDetails } from '@/components/tasks/StorageConfirmationDetails'
 import { TaskDetailsSheet } from '@/components/tasks/TaskDetailsSheet'
@@ -45,6 +46,7 @@ const taskOperations = [
   { value: 'storage_store', label: taskOperationLabel('storage_store') },
   { value: 'storage_pull', label: taskOperationLabel('storage_pull') },
   { value: 'storage_commit', label: taskOperationLabel('storage_commit') },
+  { value: 'storage_removal', label: taskOperationLabel('storage_removal') },
   { value: 'provider_replacement_coordinate', label: taskOperationLabel('provider_replacement_coordinate') },
   { value: 'cache_evict', label: taskOperationLabel('cache_evict') },
   { value: 'cache_reconcile_durability', label: taskOperationLabel('cache_reconcile_durability') },
@@ -518,6 +520,21 @@ function TaskDetails({ task }: { task: TaskItem }) {
             <summary className="cursor-pointer text-muted-foreground">Batch details</summary>
             <div className="mt-2">
               <StorageConfirmationDetails confirmation={confirmation} />
+            </div>
+          </details>
+        </>
+      )}
+      {task.removal_batch && (
+        <>
+          {task.removal_batch.attention_code && (
+            <span className="text-sm text-status-warning">
+              {removalAttentionLabel(task.removal_batch.attention_code)}
+            </span>
+          )}
+          <details className="text-sm">
+            <summary className="cursor-pointer text-muted-foreground">Removal details</summary>
+            <div className="mt-2">
+              <RemovalBatchDetails batch={task.removal_batch} />
             </div>
           </details>
         </>

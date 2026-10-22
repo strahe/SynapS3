@@ -503,109 +503,47 @@ func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositor
 }
 
 func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	bucket := seedBucket(t, db, "cleanup-transitions")
-	contentID := seedContent(t, repos, bucket.ID, "cleanup-transitions", 10)
-	providerID := onChainID(t, "701")
-	binding, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
-		BucketID: bucket.ID, ProviderID: providerID, CopyIndex: 0, CreatedByContentID: contentID,
-	})
-	if err != nil {
-		t.Fatalf("EnsureDataSetBinding: %v", err)
+	f := newRemovalFixture(t, 3)
+	ctx := t.Context()
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := f.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("status = ?", model.StorageCleanupCopyStatusFailed).
+		Set("delete_tx_hash = ?", "retained-hash").Set("scheduled_at = ?", at).
+		Set("last_error = ?", "confirmed rejected").Where("id = ?", f.rows[0].ID).Exec(ctx); err != nil {
+		t.Fatal(err)
 	}
-	insertCopy := func(piece int64) *model.StorageCleanupCopy {
-		t.Helper()
-		row := &model.StorageCleanupCopy{
-			ContentID: contentID, BucketID: bucket.ID, CopyIndex: 0, ProviderID: providerID,
-			StorageDataSetID: binding.ID, PieceID: onChainID(t, strconv.FormatInt(piece, 10)), PieceCID: "piece-cid",
-			Checksum: "cleanup-transitions-checksum", Status: model.StorageCleanupCopyStatusPending,
-		}
-		if _, err := db.NewInsert().Model(row).Exec(t.Context()); err != nil {
-			t.Fatalf("insert cleanup copy: %v", err)
-		}
-		return row
+	if err := f.repos.StorageCleanup.ReauthorizeFailedCopies(ctx, f.rows[0].ContentID, 1, f.owners[0]+1); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("reauthorize stale owner = %v, want ErrConflict", err)
 	}
-
-	scheduled := insertCopy(801)
-	if err := repos.StorageCleanup.MarkCopyDeleteScheduled(t.Context(), scheduled.ID, "0xtx"); err != nil {
-		t.Fatalf("MarkCopyDeleteScheduled: %v", err)
+	if err := f.repos.StorageCleanup.ReauthorizeFailedCopies(ctx, f.rows[0].ContentID, 1, f.owners[0]); err != nil {
+		t.Fatal(err)
 	}
-	first := new(model.StorageCleanupCopy)
-	if err := db.NewSelect().Model(first).Where("id = ?", scheduled.ID).Scan(t.Context()); err != nil {
-		t.Fatalf("load scheduled copy: %v", err)
-	}
-	if err := repos.StorageCleanup.MarkCopyDeleteScheduled(t.Context(), scheduled.ID, "0xtx"); err != nil {
-		t.Fatalf("idempotent MarkCopyDeleteScheduled: %v", err)
-	}
-	replayed := new(model.StorageCleanupCopy)
-	if err := db.NewSelect().Model(replayed).Where("id = ?", scheduled.ID).Scan(t.Context()); err != nil {
-		t.Fatalf("reload scheduled copy: %v", err)
-	}
-	if first.ScheduledAt == nil || replayed.ScheduledAt == nil || !first.ScheduledAt.Equal(*replayed.ScheduledAt) {
-		t.Fatalf("scheduled_at changed across replay: %v -> %v", first.ScheduledAt, replayed.ScheduledAt)
-	}
-	if err := repos.StorageCleanup.MarkCopyDeleteScheduled(t.Context(), scheduled.ID, "0xother"); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("changed scheduling evidence = %v, want ErrConflict", err)
-	}
-	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), scheduled.ID, "0xtx"); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("retry live request = %v, want ErrConflict", err)
-	}
-	if err := repos.StorageCleanup.MarkCopyFailed(t.Context(), scheduled.ID, "confirmed rejected"); err != nil {
-		t.Fatalf("mark rejected request failed: %v", err)
-	}
-	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), scheduled.ID, "0xwrong"); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("retry wrong transaction = %v, want ErrConflict", err)
-	}
-	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), scheduled.ID, "0xtx"); err != nil {
-		t.Fatalf("begin rejected transaction retry: %v", err)
+	if err := f.repos.StorageCleanup.ReauthorizeFailedCopies(ctx, f.rows[0].ContentID, 1, f.owners[0]); err != nil {
+		t.Fatalf("reauthorize replay = %v", err)
 	}
 	retrying := new(model.StorageCleanupCopy)
-	if err := db.NewSelect().Model(retrying).Where("id = ?", scheduled.ID).Scan(t.Context()); err != nil {
-		t.Fatalf("reload retrying copy: %v", err)
+	if err := f.db.NewSelect().Model(retrying).Where("id = ?", f.rows[0].ID).Scan(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if retrying.Status != model.StorageCleanupCopyStatusPending || retrying.DeleteTxHash != nil || retrying.LastError != nil || retrying.ScheduledAt != nil {
-		t.Fatalf("retrying cleanup request = %#v", retrying)
+	if retrying.Status != model.StorageCleanupCopyStatusPending || retrying.DeleteTxHash == nil || *retrying.DeleteTxHash != "retained-hash" || retrying.LastError == nil || *retrying.LastError != "confirmed rejected" || retrying.ScheduledAt == nil || !retrying.ScheduledAt.Equal(at) {
+		t.Fatalf("reauthorized copy lost evidence: %#v", retrying)
 	}
-	if err := repos.StorageCleanup.MarkCopyDeleteScheduled(t.Context(), scheduled.ID, "0xretry"); err != nil {
-		t.Fatalf("schedule retry: %v", err)
+	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[0].ID); err != nil {
+		t.Fatal(err)
 	}
-	replaced := new(model.StorageCleanupCopy)
-	if err := db.NewSelect().Model(replaced).Where("id = ?", scheduled.ID).Scan(t.Context()); err != nil {
-		t.Fatalf("reload retried copy: %v", err)
+	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[0].ID); err != nil {
+		t.Fatalf("removed replay = %v", err)
 	}
-	if replaced.Status != model.StorageCleanupCopyStatusDeleteScheduled || replaced.DeleteTxHash == nil || *replaced.DeleteTxHash != "0xretry" || replaced.ScheduledAt == nil || replaced.ScheduledAt.Before(*first.ScheduledAt) {
-		t.Fatalf("rescheduled cleanup request = %#v", replaced)
+	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[1].ID); err != nil {
+		t.Fatalf("remove pending = %v", err)
 	}
-	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), scheduled.ID); err != nil {
-		t.Fatalf("MarkCopyRemoved(scheduled): %v", err)
+	if err := f.repos.StorageCleanup.MarkCopyUnsupported(ctx, f.rows[2].ID, "unsupported"); err != nil {
+		t.Fatal(err)
 	}
-	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), scheduled.ID); err != nil {
-		t.Fatalf("idempotent MarkCopyRemoved: %v", err)
+	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[2].ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("remove unsupported = %v, want ErrConflict", err)
 	}
-
-	failed := insertCopy(802)
-	if err := repos.StorageCleanup.MarkCopyFailed(t.Context(), failed.ID, "unknown outcome"); err != nil {
-		t.Fatalf("MarkCopyFailed: %v", err)
-	}
-	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), failed.ID, "old hash"); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("retry hashless copy with wrong hash = %v, want ErrConflict", err)
-	}
-	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), failed.ID, ""); err != nil {
-		t.Fatalf("retry hashless copy: %v", err)
-	}
-	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), failed.ID); err != nil {
-		t.Fatalf("MarkCopyRemoved(failed): %v", err)
-	}
-
-	unsupported := insertCopy(803)
-	if err := repos.StorageCleanup.MarkCopyUnsupported(t.Context(), unsupported.ID, "unsupported"); err != nil {
-		t.Fatalf("MarkCopyUnsupported: %v", err)
-	}
-	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), unsupported.ID); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("MarkCopyRemoved(unsupported) = %v, want ErrConflict", err)
-	}
-	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), 999999); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("MarkCopyRemoved(missing) = %v, want ErrNotFound", err)
+	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, 999999); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("remove missing = %v, want ErrNotFound", err)
 	}
 }

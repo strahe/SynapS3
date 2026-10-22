@@ -172,6 +172,27 @@ func ClassifyCommitRejection(err error) CommitRejection {
 	return CommitRejectedByProvider
 }
 
+type RemovalRejection uint8
+
+const (
+	RemovalNotRejected RemovalRejection = iota
+	RemovalRejectedPieceNotFound
+	RemovalRejectedByProvider
+)
+
+// ClassifyRemovalRejection retains the distinction between an explicit refusal
+// and an uncertain send. A refusal does not revoke an exposed removal signature.
+func ClassifyRemovalRejection(err error) RemovalRejection {
+	httpErr, ok := errors.AsType[*pdp.HTTPError](err)
+	if !ok || httpErr.StatusCode < http.StatusBadRequest || httpErr.StatusCode >= http.StatusInternalServerError {
+		return RemovalNotRejected
+	}
+	if httpErr.StatusCode == http.StatusNotFound {
+		return RemovalRejectedPieceNotFound
+	}
+	return RemovalRejectedByProvider
+}
+
 func providerOperationUnavailable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false

@@ -403,6 +403,11 @@ const awaitingCommitReviewSQL = `EXISTS (
    AND review_request.attention_at IS NOT NULL
 )`
 
+const holdsRemovalRequestSQL = `EXISTS (
+ SELECT 1 FROM storage_removal_requests AS held_removal
+ WHERE held_removal.task_id = ?TableAlias.id
+)`
+
 // acknowledgeFailedMatching selects the failures one bulk dismissal covers. The
 // preview and the dismissal itself share it, so the number an operator confirms
 // is the number that is dismissed.
@@ -412,6 +417,7 @@ func acknowledgeFailedMatching(filter TaskAcknowledgeFilter) func(bun.QueryBuild
 			Where("status = ?", model.TaskStatusFailed).
 			Where("finished_at IS NOT NULL AND finished_at <= ?", filter.FailedBefore).
 			Where("NOT " + awaitingCommitReviewSQL)
+		query = query.Where("NOT " + holdsRemovalRequestSQL)
 		if filter.Type != "" {
 			query = query.Where("type = ?", filter.Type)
 		}

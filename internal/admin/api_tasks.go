@@ -45,6 +45,7 @@ type taskListItem struct {
 
 	ProviderIdentity    *providerIdentityResponse `json:"provider_identity,omitempty"`
 	StorageConfirmation *taskStorageConfirmation  `json:"storage_confirmation,omitempty"`
+	RemovalBatch        *taskRemovalBatch         `json:"removal_batch,omitempty"`
 }
 
 // taskStorageConfirmation describes the storage registration a Confirm
@@ -176,6 +177,7 @@ func validTaskType(taskType model.TaskType) bool {
 		model.TaskTypeCacheEvict,
 		model.TaskTypeCacheReconcileDurability,
 		model.TaskTypeStorageCleanup,
+		model.TaskTypeStorageRemoval,
 		model.TaskTypeStorageDataSetRetire,
 		model.TaskTypeWalletOperation,
 		model.TaskTypeObservabilityRefresh,
@@ -238,6 +240,9 @@ func (s *Server) taskPolicy(row *model.Task) (taskengine.ExecutionPolicy, bool) 
 
 // Unresolved storage attention blocks acknowledgement on every task view.
 func (s *Server) attachTaskStorageConfirmations(ctx context.Context, rows []model.Task, items []taskListItem) error {
+	if err := s.attachTaskRemovalBatches(ctx, rows, items); err != nil {
+		return err
+	}
 	var commitTaskIDs []int64
 	for i := range rows {
 		if rows[i].Type == model.TaskTypeStorageCommit {
@@ -320,6 +325,8 @@ func taskOperationLabel(taskType model.TaskType) string {
 		return "Release cache"
 	case model.TaskTypeCacheReconcileDurability:
 		return "Recheck cache release"
+	case model.TaskTypeStorageRemoval:
+		return "Remove batch"
 	case model.TaskTypeStorageCleanup:
 		return "Clean up deleted data"
 	case model.TaskTypeStorageDataSetRetire:

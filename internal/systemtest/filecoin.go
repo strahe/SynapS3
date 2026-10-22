@@ -12,6 +12,7 @@ import (
 	"io"
 	"maps"
 	"math/big"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	appTypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synaps3/internal/walletoperation"
 	sdkcosts "github.com/strahe/synapse-go/costs"
+	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -38,12 +40,15 @@ import (
 var errInvalidFilecoinSequence = errors.New("memory filecoin: invalid operation sequence")
 
 type memoryDataSet struct {
-	id       sdktypes.BigInt
-	clientID sdktypes.BigInt
-	provider sdktypes.BigInt
-	metadata map[string]string
-	withCDN  bool
-	pieces   map[string]cid.Cid
+	id               sdktypes.BigInt
+	clientID         sdktypes.BigInt
+	provider         sdktypes.BigInt
+	metadata         map[string]string
+	withCDN          bool
+	pieces           map[string]cid.Cid
+	removals         map[string]struct{}
+	removalsObserved bool
+	cleanup          bool
 }
 
 type memoryAuthorization struct {
@@ -77,6 +82,9 @@ type MemoryFilecoin struct {
 	nextStoreSession uint64
 	nextDataSet      map[string]uint64
 	nextPiece        uint64
+	nextRemoval      uint64
+	removalFees      uint64
+	removalReceipts  map[common.Hash]*ethtypes.Receipt
 	// terminated records the epoch at which each data set's service ends, and
 	// epoch is the observed chain head. Tests advance the head to prove that
 	// retirement waits for the chain rather than for the call returning.
@@ -116,6 +124,8 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 		nextStoreSession:       1,
 		nextDataSet:            make(map[string]uint64),
 		nextPiece:              1,
+		nextRemoval:            1,
+		removalReceipts:        make(map[common.Hash]*ethtypes.Receipt),
 		terminated:             make(map[string]int64),
 		epoch:                  1000,
 	}
@@ -304,15 +314,15 @@ func canonicalMemoryDataSetMetadata(metadata map[string]string, withCDN bool) ma
 
 func (m *MemoryFilecoin) newProviderTarget(providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) *memoryProviderTarget {
 	return &memoryProviderTarget{
-		memoryTarget: memoryTarget{filecoin: m, provider: providerID.Copy(), withCDN: withCDN},
-		metadata:     canonicalMemoryDataSetMetadata(metadata, withCDN),
+		filecoin: m, provider: providerID.Copy(), withCDN: withCDN,
+		metadata: canonicalMemoryDataSetMetadata(metadata, withCDN),
 	}
 }
 
 func (m *MemoryFilecoin) newDataSetTarget(ref storage.DataSetRef, withCDN bool) *memoryDataSetTarget {
 	return &memoryDataSetTarget{
-		memoryTarget: memoryTarget{filecoin: m, provider: ref.ProviderID(), withCDN: withCDN},
-		ref:          ref,
+		filecoin: m, provider: ref.ProviderID(), withCDN: withCDN,
+		ref: ref,
 	}
 }
 
@@ -841,6 +851,10 @@ func pieceCIDs(pieces []storage.PieceInput) []cid.Cid {
 }
 
 func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+	return c.DeletePiecesByID(ctx, []sdktypes.BigInt{pieceID})
+}
+
+func (c *memoryDataSetTarget) DeletePiecesByID(ctx context.Context, pieceIDs []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -854,38 +868,127 @@ func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdkty
 	if dataSet == nil {
 		return nil, fmt.Errorf("memory filecoin: unknown dataset %s", dataSetID.String())
 	}
-	pieceCID, found := dataSet.pieces[pieceID.String()]
-	if !found {
-		return nil, fmt.Errorf("memory filecoin: unknown piece ID %s", pieceID.String())
+	if _, terminated := c.filecoin.terminated[dataSetID.String()]; terminated || dataSet.cleanup {
+		return nil, &pdp.HTTPError{StatusCode: http.StatusInternalServerError, Body: "data set service has ended"}
 	}
-	delete(dataSet.pieces, pieceID.String())
-	stillRegistered := false
-	for _, other := range dataSet.pieces {
-		if other.Equals(pieceCID) {
-			stillRegistered = true
-			break
+	requested := make(map[string]struct{}, len(pieceIDs))
+	for _, id := range pieceIDs {
+		key := id.String()
+		if _, found := dataSet.pieces[key]; !found {
+			return nil, &pdp.HTTPError{StatusCode: http.StatusInternalServerError, Body: "piece is not live"}
 		}
+		if _, queued := dataSet.removals[key]; queued {
+			return nil, &pdp.HTTPError{StatusCode: http.StatusInternalServerError, Body: "piece is already queued"}
+		}
+		requested[key] = struct{}{}
 	}
-	if !stillRegistered {
-		delete(c.filecoin.pieces[pieceCID.String()].committedDataSets, dataSetID.String())
+	if len(requested) == 0 || len(dataSet.removals)+len(requested) > 2000 {
+		return nil, &pdp.HTTPError{StatusCode: http.StatusInternalServerError, Body: "invalid removal queue capacity"}
 	}
-	return &sdktypes.WriteResult{Hash: common.HexToHash(pieceID.String())}, nil
+	if dataSet.removals == nil {
+		dataSet.removals = make(map[string]struct{})
+	}
+	maps.Copy(dataSet.removals, requested)
+	dataSet.removalsObserved = false
+	c.filecoin.removalFees++
+	hash := common.BigToHash(new(big.Int).SetUint64(c.filecoin.nextRemoval))
+	c.filecoin.nextRemoval++
+	c.filecoin.epoch++
+	c.filecoin.removalReceipts[hash] = &ethtypes.Receipt{
+		TxHash: hash, Status: ethtypes.ReceiptStatusSuccessful, BlockNumber: big.NewInt(c.filecoin.epoch),
+		BlockHash: common.BigToHash(big.NewInt(c.filecoin.epoch)),
+	}
+	return &sdktypes.WriteResult{Hash: hash}, nil
 }
 
 func (m *MemoryFilecoin) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+	states, err := m.DeletionStates(ctx, dataSetID, []sdktypes.BigInt{pieceID})
+	return synapse.CleanupPieceState{Status: states.Pieces[pieceID.String()], BlockNumber: states.BlockNumber}, err
+}
+
+func (m *MemoryFilecoin) DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.CleanupPiecesState, error) {
 	if err := ctx.Err(); err != nil {
-		return synapse.CleanupPieceState{}, err
+		return synapse.CleanupPiecesState{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dataSet := m.dataSets[dataSetID.String()]
+	if dataSet != nil && dataSet.removalsObserved && !dataSet.cleanup {
+		for id := range dataSet.removals {
+			pieceCID := dataSet.pieces[id]
+			delete(dataSet.pieces, id)
+			stillRegistered := false
+			for _, other := range dataSet.pieces {
+				if other.Equals(pieceCID) {
+					stillRegistered = true
+					break
+				}
+			}
+			if !stillRegistered && m.pieces[pieceCID.String()] != nil {
+				delete(m.pieces[pieceCID.String()].committedDataSets, dataSetID.String())
+			}
+		}
+		clear(dataSet.removals)
+		dataSet.removalsObserved = false
+		m.epoch++
+	}
+	state := synapse.CleanupPiecesState{Pieces: make(map[string]synapse.CleanupPieceStatus, len(pieceIDs)), BlockNumber: uint64(m.epoch), VerifierVersion: "3.5.0"}
+	if dataSet != nil {
+		state.QueueLength = len(dataSet.removals)
+		dataSet.removalsObserved = len(dataSet.removals) != 0
+	}
+	for _, id := range pieceIDs {
+		status := synapse.CleanupPieceRemoved
+		if dataSet != nil {
+			if _, found := dataSet.pieces[id.String()]; found {
+				status = synapse.CleanupPiecePresent
+			}
+			if _, queued := dataSet.removals[id.String()]; queued {
+				status = synapse.CleanupPieceScheduled
+			}
+			if dataSet.cleanup {
+				status = synapse.CleanupPieceDataSetCleanup
+			}
+		}
+		state.Pieces[id.String()] = status
+	}
+	return state, nil
+}
+
+func (m *MemoryFilecoin) ProviderPiecesKnown(ctx context.Context, serviceURL string, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.ProviderPiecesState, error) {
+	if err := ctx.Err(); err != nil {
+		return synapse.ProviderPiecesState{}, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	result := synapse.ProviderPiecesState{Errors: make(map[string]error)}
 	dataSet := m.dataSets[dataSetID.String()]
-	if dataSet == nil {
-		return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved, BlockNumber: uint64(m.epoch)}, nil
+	for _, id := range pieceIDs {
+		if dataSet != nil && serviceURL == fmt.Sprintf("https://provider-%s.system.invalid", dataSet.provider) {
+			if _, found := dataSet.pieces[id.String()]; found {
+				result.Known = append(result.Known, id)
+				continue
+			}
+		}
+		result.Unknown = append(result.Unknown, id)
 	}
-	if _, found := dataSet.pieces[pieceID.String()]; found {
-		return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: uint64(m.epoch)}, nil
+	return result, nil
+}
+
+func (m *MemoryFilecoin) Preflight(ctx context.Context, dataSetID sdktypes.BigInt) (synapse.RemovalPreflight, error) {
+	if err := ctx.Err(); err != nil {
+		return synapse.RemovalPreflight{}, err
 	}
-	return synapse.CleanupPieceState{Status: synapse.CleanupPieceRemoved, BlockNumber: uint64(m.epoch)}, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return synapse.RemovalPreflight{
+		DataSetMissing: m.dataSets[dataSetID.String()] == nil,
+		EndEpoch:       m.terminated[dataSetID.String()], ReserveTopUp: new(big.Int),
+	}, nil
+}
+
+func (m *MemoryFilecoin) ProvingConfig(ctx context.Context) (synapse.RemovalProvingConfig, error) {
+	return synapse.RemovalProvingConfig{MaxProvingPeriod: 240, ChallengeWindow: 20}, ctx.Err()
 }
 
 func (c *memoryDataSetTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
@@ -1020,7 +1123,17 @@ func (m *MemoryFilecoin) RebroadcastSignedTransaction(context.Context, model.Wal
 	return synapse.ErrWalletReplaySkipped
 }
 
-func (m *MemoryFilecoin) TransactionReceipt(context.Context, common.Hash) (*ethtypes.Receipt, error) {
+func (m *MemoryFilecoin) TransactionReceipt(ctx context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if receipt := m.removalReceipts[hash]; receipt != nil {
+		copy := *receipt
+		copy.BlockNumber = new(big.Int).Set(receipt.BlockNumber)
+		return &copy, nil
+	}
 	return nil, ethereum.NotFound
 }
 
@@ -1112,6 +1225,7 @@ var (
 	_ synapse.ProviderTarget       = (*memoryProviderTarget)(nil)
 	_ synapse.DataSetTarget        = (*memoryDataSetTarget)(nil)
 	_ synapse.CleanupContext       = (*memoryDataSetTarget)(nil)
+	_ synapse.RemovalChainReader   = (*MemoryFilecoin)(nil)
 )
 
 func (m *MemoryFilecoin) PDPVerifierAddress() common.Address {

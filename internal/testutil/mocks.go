@@ -38,6 +38,34 @@ type MockStorageClient struct {
 	FindMatchingDataSetFunc func(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
 	OpenCleanupContextFunc  func(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.CleanupContext, error)
 	DeletionStateFunc       func(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error)
+	DeletionStatesFunc      func(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.CleanupPiecesState, error)
+	ProviderPiecesKnownFunc func(ctx context.Context, serviceURL string, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.ProviderPiecesState, error)
+}
+
+func (m *MockStorageClient) DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.CleanupPiecesState, error) {
+	if m.DeletionStatesFunc != nil {
+		return m.DeletionStatesFunc(ctx, dataSetID, pieceIDs)
+	}
+	result := synapse.CleanupPiecesState{Pieces: make(map[string]synapse.CleanupPieceStatus), VerifierVersion: "3.5.0"}
+	for _, id := range pieceIDs {
+		state, err := m.DeletionState(ctx, dataSetID, id)
+		if err != nil {
+			return result, err
+		}
+		result.Pieces[id.String()] = state.Status
+		result.BlockNumber = state.BlockNumber
+		if state.Status == synapse.CleanupPieceScheduled {
+			result.QueueLength++
+		}
+	}
+	return result, nil
+}
+
+func (m *MockStorageClient) ProviderPiecesKnown(ctx context.Context, serviceURL string, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.ProviderPiecesState, error) {
+	if m.ProviderPiecesKnownFunc == nil {
+		return synapse.ProviderPiecesState{}, errors.New("MockStorageClient.ProviderPiecesKnown was not configured")
+	}
+	return m.ProviderPiecesKnownFunc(ctx, serviceURL, dataSetID, pieceIDs)
 }
 
 func (m *MockStorageClient) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {

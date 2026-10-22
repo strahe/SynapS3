@@ -168,6 +168,96 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	if !bytes.Equal(got, content) {
 		t.Fatal("downloaded content differs from stored content")
 	}
+	for _, target := range contexts {
+		ref, _ := target.DataSetRef()
+		dataSetID := ref.DataSetID()
+		var ids []sdktypes.BigInt
+		for key := range filecoin.dataSets[dataSetID.String()].pieces {
+			id, err := sdktypes.ParseBigInt(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, id)
+		}
+		cleanup, err := filecoin.OpenCleanupContext(ctx, dataSetID, storage.NewDataSetContextOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		submission, err := cleanup.DeletePiecesByID(ctx, append(ids, ids[0]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filecoin.TransactionReceipt(ctx, submission.Hash); err != nil {
+			t.Fatalf("removal receipt: %v", err)
+		}
+		if _, err := cleanup.DeletePiecesByID(ctx, ids); err == nil {
+			t.Fatal("duplicate queued removal succeeded")
+		}
+		queued, err := filecoin.DeletionStates(ctx, dataSetID, ids)
+		if err != nil || queued.QueueLength != len(ids) {
+			t.Fatalf("queued removal = %#v, err=%v", queued, err)
+		}
+		for _, status := range queued.Pieces {
+			if status != synapse.CleanupPieceScheduled {
+				t.Fatalf("pending deletion state = %s", status)
+			}
+		}
+		removed, err := filecoin.DeletionStates(ctx, dataSetID, ids)
+		if err != nil || removed.QueueLength != 0 || removed.BlockNumber <= queued.BlockNumber {
+			t.Fatalf("completed removal = %#v, err=%v", removed, err)
+		}
+		for _, status := range removed.Pieces {
+			if status != synapse.CleanupPieceRemoved {
+				t.Fatalf("completed deletion state = %s", status)
+			}
+		}
+		if _, err := cleanup.DeletePiecesByID(ctx, ids); err == nil {
+			t.Fatal("duplicate completed removal succeeded")
+		}
+	}
+	if filecoin.removalFees != uint64(len(contexts)) {
+		t.Fatalf("removal fees = %d, want %d", filecoin.removalFees, len(contexts))
+	}
+	if _, err := filecoin.Download(ctx, stored.PieceCID, nil); !errors.Is(err, errInvalidFilecoinSequence) {
+		t.Fatalf("download after removal = %v", err)
+	}
+}
+
+func TestMemoryFilecoinRemovalBatchRejectsAtomicallyAndRetainsCleanup(t *testing.T) {
+	t.Parallel()
+	filecoin := NewMemoryFilecoin()
+	dataSetID, providerID := sdktypes.NewBigInt(11), sdktypes.NewBigInt(101)
+	identity, err := piece.CalculateFromBytes(bytes.Repeat([]byte("removal"), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSet := &memoryDataSet{
+		id: dataSetID, clientID: sdktypes.NewBigInt(51), provider: providerID,
+		pieces: map[string]cid.Cid{"7": identity.CIDv2, "8": identity.CIDv2},
+	}
+	filecoin.dataSets[dataSetID.String()] = dataSet
+	target, err := filecoin.OpenCleanupContext(t.Context(), dataSetID, storage.NewDataSetContextOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.DeletePiecesByID(t.Context(), []sdktypes.BigInt{sdktypes.NewBigInt(7), sdktypes.NewBigInt(99)}); err == nil {
+		t.Fatal("batch with an absent member succeeded")
+	}
+	if len(dataSet.removals) != 0 || len(dataSet.pieces) != 2 || filecoin.removalFees != 0 {
+		t.Fatalf("failed batch changed state: queue=%v pieces=%v fees=%d", dataSet.removals, dataSet.pieces, filecoin.removalFees)
+	}
+	dataSet.cleanup = true
+	for range 2 {
+		state, err := filecoin.DeletionStates(t.Context(), dataSetID, []sdktypes.BigInt{sdktypes.NewBigInt(7)})
+		if err != nil || state.Pieces["7"] != synapse.CleanupPieceDataSetCleanup || len(dataSet.pieces) != 2 {
+			t.Fatalf("cleanup phase = %#v, err=%v", state, err)
+		}
+	}
+	delete(filecoin.dataSets, dataSetID.String())
+	state, err := filecoin.DeletionStates(t.Context(), dataSetID, []sdktypes.BigInt{sdktypes.NewBigInt(7)})
+	if err != nil || state.Pieces["7"] != synapse.CleanupPieceRemoved {
+		t.Fatalf("removed data set = %#v, err=%v", state, err)
+	}
 }
 
 func TestMemoryFilecoinFindMatchingDataSetRequiresExactMetadata(t *testing.T) {

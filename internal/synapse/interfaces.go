@@ -60,6 +60,7 @@ type DataSetTarget interface {
 // CleanupContext abstracts the SDK operations needed to remove PDP pieces.
 type CleanupContext interface {
 	DeletePieceByID(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error)
+	DeletePiecesByID(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error)
 }
 
 // StorageClient abstracts the synapse-go storage service for download plus
@@ -77,6 +78,8 @@ type StorageClient interface {
 	// DeletionState reads exact piece or data-set cleanup evidence at one block.
 	// Removed data sets require the caller's recorded creation identity.
 	DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error)
+	DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (CleanupPiecesState, error)
+	ProviderPiecesKnown(ctx context.Context, serviceURL string, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (ProviderPiecesState, error)
 }
 
 // ParkedPieceState describes the provider-local state of a content-addressed

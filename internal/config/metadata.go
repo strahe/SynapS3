@@ -210,6 +210,14 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Label: "Submit batches early to free cache space", Description: "Submit batches early when automatic cache cleanup cannot free enough space. May increase transaction costs. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_SEAL_ON_CACHE_PRESSURE", Editable: true,
 	},
+	"worker.tasks.removal_max_pieces": {
+		Label: "Removal batch size", Description: "Maximum pieces scheduled for removal in one transaction. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_REMOVAL_MAX_PIECES", Editable: true,
+	},
+	"worker.tasks.removal_max_wait": {
+		Label: "Removal batch wait", Description: "Time to collect pieces for removal; 0s skips the collection delay. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_REMOVAL_MAX_WAIT", Editable: true,
+	},
 	"worker.tasks.commit_max_backlog": {
 		Label: "Batch backlog", Description: "Transferred pieces per data set that may wait for an unsubmitted batch before new uploads and replicas to that data set wait. Restart required.",
 		Env: "SYNAPS3_WORKER_TASKS_COMMIT_MAX_BACKLOG", Editable: true,

@@ -36,6 +36,10 @@ const (
 	DefaultCommitMaxWait    = 30 * time.Minute
 	MaxCommitMaxWait        = 30 * time.Minute
 	DefaultCommitMaxBacklog = 256
+	DefaultRemovalMaxPieces = 100
+	MaxRemovalMaxPieces     = 200
+	DefaultRemovalMaxWait   = 30 * time.Minute
+	MaxRemovalMaxWait       = 30 * time.Minute
 )
 
 type Config struct {
@@ -115,6 +119,8 @@ type TaskWorkerConfig struct {
 	UploadConcurrency         int           `koanf:"upload_concurrency"`
 	CommitMaxPieces           int           `koanf:"commit_max_pieces"`
 	CommitMaxWait             time.Duration `koanf:"commit_max_wait"`
+	RemovalMaxPieces          int           `koanf:"removal_max_pieces"`
+	RemovalMaxWait            time.Duration `koanf:"removal_max_wait"`
 	CommitMaxBacklog          int           `koanf:"commit_max_backlog"`
 	CommitSealOnCachePressure bool          `koanf:"commit_seal_on_cache_pressure"`
 }
@@ -215,6 +221,8 @@ func defaultConfig() *Config {
 				UploadConcurrency:         DefaultUploadConcurrency,
 				CommitMaxPieces:           DefaultCommitMaxPieces,
 				CommitMaxWait:             DefaultCommitMaxWait,
+				RemovalMaxPieces:          DefaultRemovalMaxPieces,
+				RemovalMaxWait:            DefaultRemovalMaxWait,
 				CommitMaxBacklog:          DefaultCommitMaxBacklog,
 				CommitSealOnCachePressure: false,
 			},
@@ -533,6 +541,12 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if tasks.CommitMaxWait < 0 || tasks.CommitMaxWait > MaxCommitMaxWait {
 		add("worker.tasks.commit_max_wait", fmt.Sprintf("must be between 0s and %s, got %s", MaxCommitMaxWait, tasks.CommitMaxWait))
+	}
+	if tasks.RemovalMaxPieces < 1 || tasks.RemovalMaxPieces > MaxRemovalMaxPieces {
+		add("worker.tasks.removal_max_pieces", fmt.Sprintf("must be between 1 and %d, got %d", MaxRemovalMaxPieces, tasks.RemovalMaxPieces))
+	}
+	if tasks.RemovalMaxWait < 0 || tasks.RemovalMaxWait > MaxRemovalMaxWait {
+		add("worker.tasks.removal_max_wait", fmt.Sprintf("must be between 0s and %s, got %s", MaxRemovalMaxWait, tasks.RemovalMaxWait))
 	}
 	if tasks.CommitMaxBacklog < tasks.CommitMaxPieces {
 		add("worker.tasks.commit_max_backlog", fmt.Sprintf("must be >= worker.tasks.commit_max_pieces (%d), got %d", tasks.CommitMaxPieces, tasks.CommitMaxBacklog))

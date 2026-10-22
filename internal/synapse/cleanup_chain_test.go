@@ -75,10 +75,17 @@ func TestCleanupPieceReaderUsesExactPieceAndOneBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	address := common.HexToAddress("0x0000000000000000000000000000000000000001")
-	chain := &cleanupChainStub{t: t, abi: contractABI, address: address, dataSetLive: true, live: map[int64]bool{7: true, 8: true}, queue: []*big.Int{big.NewInt(8)}}
+	chain := &cleanupChainStub{t: t, abi: contractABI, address: address, dataSetLive: true, version: "3.5.0", live: map[int64]bool{7: true, 8: true}, queue: []*big.Int{big.NewInt(8)}}
 	reader, err := newCleanupPieceReader(chain, address)
 	if err != nil {
 		t.Fatal(err)
+	}
+	states, err := reader.ObserveCleanupPieces(t.Context(), sdktypes.NewBigInt(11), []sdktypes.BigInt{
+		sdktypes.NewBigInt(7), sdktypes.NewBigInt(8), sdktypes.NewBigInt(9), sdktypes.NewBigInt(8),
+	})
+	if err != nil || states.Pieces["7"] != CleanupPiecePresent || states.Pieces["8"] != CleanupPieceScheduled || states.Pieces["9"] != CleanupPieceRemoved ||
+		len(states.Pieces) != 3 || states.QueueLength != 1 || states.BlockNumber != 42 || states.VerifierVersion != "3.5.0" || chain.calls != 5 {
+		t.Fatalf("batch state = %#v, calls=%d, err=%v", states, chain.calls, err)
 	}
 	state, err := reader.ObserveCleanupPiece(t.Context(), sdktypes.NewBigInt(11), sdktypes.NewBigInt(7))
 	if err != nil || state.Status != CleanupPiecePresent || state.BlockNumber != 42 {
@@ -91,7 +98,7 @@ func TestCleanupPieceReaderUsesExactPieceAndOneBlock(t *testing.T) {
 	chain.live[7] = false
 	chain.calls = 0
 	state, err = reader.ObserveCleanupPiece(t.Context(), sdktypes.NewBigInt(11), sdktypes.NewBigInt(7))
-	if err != nil || state.Status != CleanupPieceRemoved || chain.calls != 2 {
+	if err != nil || state.Status != CleanupPieceRemoved || chain.calls != 4 {
 		t.Fatalf("removed piece = %#v, calls=%d, err=%v", state, chain.calls, err)
 	}
 }

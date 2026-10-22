@@ -10,10 +10,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/strahe/synaps3/internal/testpg"
 )
 
 func TestHarnessStopsAllComponentsWhenS3ServerFails(t *testing.T) {
 	t.Parallel()
+	testpg.DSN(t)
 	// Database setup has a separate budget from the runtime's five-second shutdown guard.
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()

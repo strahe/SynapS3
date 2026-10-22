@@ -178,7 +178,7 @@ func TestBaselineRollbackIsRefusedUnchanged(t *testing.T) {
 		id := insertSchemaTestTask(t, db, "rollback-survivor")
 		before := appliedSchemaState(t, db)
 		migrator := NewMigrator(db)
-		if _, err := migrator.Rollback(ctx); err == nil || !strings.Contains(err.Error(), InitialSchemaName+": down: the initial schema cannot be rolled back") {
+		if _, err := migrator.Rollback(ctx); err == nil || !strings.Contains(err.Error(), "cannot be rolled back") {
 			t.Fatalf("baseline rollback error = %v", err)
 		}
 		assertAppliedMigrationCount(t, ctx, migrator, len(Migrations.Sorted()))

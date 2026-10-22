@@ -32,6 +32,9 @@ func (s *Server) attachTaskProviderIdentities(ctx context.Context, items []taskL
 		if item.SubjectType == "provider" {
 			rawIDs = append(rawIDs, item.SubjectKey)
 		}
+		if item.RemovalBatch != nil {
+			rawIDs = append(rawIDs, item.RemovalBatch.ProviderID)
+		}
 		if item.StorageConfirmation != nil {
 			rawIDs = append(rawIDs, item.StorageConfirmation.ProviderID)
 		}
@@ -44,6 +47,9 @@ func (s *Server) attachTaskProviderIdentities(ctx context.Context, items []taskL
 	for i := range items {
 		if items[i].SubjectType == "provider" {
 			items[i].ProviderIdentity = identities[items[i].SubjectKey]
+		}
+		if batch := items[i].RemovalBatch; batch != nil {
+			batch.ProviderIdentity = identities[batch.ProviderID]
 		}
 		if confirmation := items[i].StorageConfirmation; confirmation != nil {
 			confirmation.ProviderIdentity = identities[confirmation.ProviderID]

@@ -25,6 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/task/commit"
 	"github.com/strahe/synaps3/internal/task/dataset"
 	providertask "github.com/strahe/synaps3/internal/task/provider"
+	"github.com/strahe/synaps3/internal/task/removal"
 	"github.com/strahe/synaps3/internal/task/replacement"
 	"github.com/strahe/synaps3/internal/task/transfer"
 	"github.com/strahe/synaps3/internal/task/uploadplan"
@@ -50,6 +51,7 @@ type Dependencies struct {
 	WalletReceiptTimeout          time.Duration
 	Terminator                    synapse.ServiceTerminator
 	Epochs                        synapse.ChainEpochReader
+	RemovalChain                  synapse.RemovalChainReader
 	Observability                 *observability.Service
 	UploadSpeedProbe              providerbenchmark.UploadProbe
 	UploadSpeedTestAutoScope      string
@@ -71,6 +73,8 @@ type Dependencies struct {
 	CommitMaxWait             time.Duration
 	CommitMaxBacklog          int
 	CommitSealOnCachePressure bool
+	RemovalMaxPieces          int
+	RemovalMaxWait            time.Duration
 	// LegacyPieceStorageIDLimit is the first data set ID of the deployment's
 	// compact piece layout; zero applies no legacy piece limit.
 	LegacyPieceStorageIDLimit uint64
@@ -103,6 +107,12 @@ func normalizeDependencies(deps Dependencies) (Dependencies, error) {
 	}
 	if deps.CommitMaxPieces < 1 || deps.CommitMaxWait < 0 || deps.CommitMaxBacklog < deps.CommitMaxPieces {
 		return deps, errors.New("batch limits are invalid")
+	}
+	if deps.RemovalMaxPieces == 0 {
+		deps.RemovalMaxPieces = config.DefaultRemovalMaxPieces
+	}
+	if deps.RemovalMaxPieces < 1 || deps.RemovalMaxPieces > config.MaxRemovalMaxPieces || deps.RemovalMaxWait < 0 || deps.RemovalMaxWait > config.MaxRemovalMaxWait {
+		return deps, errors.New("removal batch limits are invalid")
 	}
 	if deps.AnchorProviderTier == "" {
 		deps.AnchorProviderTier = providerselect.TierApproved
@@ -138,6 +148,10 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	commitScheduler, err := service.Scheduler("commit", model.TaskTypeStorageCommit, model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull)
 	if err != nil {
 		return points, fmt.Errorf("creating commit scheduler: %w", err)
+	}
+	cleanupScheduler, err := service.Scheduler("cleanup", model.TaskTypeStorageRemoval)
+	if err != nil {
+		return points, fmt.Errorf("creating cleanup scheduler: %w", err)
 	}
 	cacheScheduler, err := service.Scheduler("cache", model.TaskTypeCacheCapacityReconcile, model.TaskTypeCacheEvict, model.TaskTypeCacheReconcileDurability)
 	if err != nil {
@@ -258,9 +272,13 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing replacementHandler: %w", err)
 	}
-	cleanupHandler, err := cleanup.NewHandler(cleanup.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Receipts: deps.Receipts, WalletReceiptTimeout: deps.WalletReceiptTimeout, Cache: deps.Cache, CacheGate: deps.CacheGate, CacheTracker: deps.CacheTracker, Logger: deps.Logger})
+	cleanupHandler, err := cleanup.NewHandler(cleanup.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Scheduler: cleanupScheduler, Cache: deps.Cache, CacheGate: deps.CacheGate, CacheTracker: deps.CacheTracker, Logger: deps.Logger})
 	if err != nil {
 		return points, fmt.Errorf("constructing cleanupHandler: %w", err)
+	}
+	removalHandler, err := removal.NewHandler(removal.Dependencies{Repositories: deps.Repositories, Storage: deps.Storage, Receipts: deps.Receipts, RemovalChain: deps.RemovalChain, Epochs: deps.Epochs, MaxPieces: deps.RemovalMaxPieces, MaxWait: deps.RemovalMaxWait, ReceiptTimeout: deps.WalletReceiptTimeout, Logger: deps.Logger})
+	if err != nil {
+		return points, fmt.Errorf("constructing removalHandler: %w", err)
 	}
 	walletHandler, err := wallet.NewHandler(wallet.Dependencies{Repositories: deps.Repositories, Wallet: deps.Wallet, Receipts: deps.Receipts, WalletBroadcastTimeout: deps.WalletBroadcastTimeout, WalletReceiptTimeout: deps.WalletReceiptTimeout})
 	if err != nil {
@@ -282,7 +300,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing speed: %w", err)
 	}
-	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
+	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, removalHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
 		if deps.DecorateTaskHandler != nil {
 			handler = deps.DecorateTaskHandler(handler)
 		}

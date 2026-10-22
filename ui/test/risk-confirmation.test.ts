@@ -32,6 +32,7 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'worker.tasks.upload_concurrency': meta('Upload Concurrency'),
   'worker.tasks.commit_max_pieces': meta('Batch size'),
   'worker.tasks.commit_max_wait': meta('Batch wait'),
+  'worker.tasks.removal_max_pieces': meta('Removal batch size'),
   'worker.tasks.commit_max_backlog': meta('Batch backlog'),
 }
 
@@ -77,6 +78,8 @@ function baseConfig(): SettingsEditableConfig {
         upload_concurrency: 4,
         commit_max_pieces: 32,
         commit_max_wait: '30s',
+        removal_max_pieces: 100,
+        removal_max_wait: '30m',
         commit_seal_on_cache_pressure: false,
         commit_max_backlog: 256,
       },
@@ -157,6 +160,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.worker.tasks.lease_duration = '2m0s'
   next.worker.tasks.upload_concurrency = 6
   next.worker.tasks.commit_max_pieces = 64
+  next.worker.tasks.removal_max_pieces = 200
 
   const changes = collectSettingsRiskChanges(initial, next, {}, metadata)
 
@@ -188,6 +192,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['worker.tasks.lease_duration', 'Recovery Lease Duration', '5m0s', '2m0s', 'medium'],
       ['worker.tasks.upload_concurrency', 'Upload Concurrency', '4', '6', 'medium'],
       ['worker.tasks.commit_max_pieces', 'Batch size', '32', '64', 'medium'],
+      ['worker.tasks.removal_max_pieces', 'Removal batch size', '100', '200', 'medium'],
     ]
   )
   assert.deepEqual([...new Set(changes.map(classifySettingsRisk))], ['review'])

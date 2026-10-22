@@ -24,7 +24,7 @@ func TestNewRuntimeReportsAllMissingDependencies(t *testing.T) {
 	}
 	for _, dependency := range []string{
 		"config", "database", "settings", "logger", "filecoin storage", "filecoin wallet query",
-		"filecoin wallet operator", "filecoin receipts", "filecoin readiness", "filecoin observability",
+		"filecoin wallet operator", "filecoin receipts", "filecoin readiness", "filecoin observability", "filecoin removal chain",
 	} {
 		if !strings.Contains(err.Error(), dependency) {
 			t.Errorf("NewRuntime error = %q, missing dependency %q", err, dependency)

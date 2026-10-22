@@ -877,6 +877,20 @@ export interface TaskItem {
   created_at: string
   updated_at: string
   storage_confirmation?: TaskStorageConfirmation
+  removal_batch?: TaskRemovalBatch
+}
+
+export interface TaskRemovalBatch {
+  request_id: string
+  status: string
+  attention_code?: string
+  attention_at?: string
+  provider_id: string
+  provider_identity?: ProviderIdentity
+  data_set_id?: string
+  piece_count: number
+  tx_hash?: string
+  last_error?: string
 }
 
 export interface TaskPolicy {
@@ -1183,6 +1197,8 @@ export interface SettingsTaskWorkerConfig {
   upload_concurrency: number
   commit_max_pieces: number
   commit_max_wait: string
+  removal_max_pieces: number
+  removal_max_wait: string
   commit_max_backlog: number
   commit_seal_on_cache_pressure: boolean
 }

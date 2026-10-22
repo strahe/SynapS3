@@ -11,6 +11,7 @@ import (
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepull"
+	"github.com/strahe/synaps3/internal/storageremoval"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
@@ -338,15 +339,42 @@ type StorageCleanupRepository interface {
 	TransferTaskOwner(ctx context.Context, contentID, generation, oldTaskID, newTaskID int64) error
 	AuthorizeTask(ctx context.Context, contentID, generation, taskID int64) ([]model.StorageCleanupCopy, error)
 	MarkCopyRemoved(ctx context.Context, id int64) error
-	MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error
-	BeginFailedCopyRetry(ctx context.Context, id int64, oldHash string) error
-	MarkCopyFailed(ctx context.Context, id int64, message string) error
 	MarkCopyUnsupported(ctx context.Context, id int64, message string) error
 	UploadHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
 	CleanupHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
 	// FinalizeContent deletes a cleaned-up content's current-state rows: its
 	// cache record, its copies, and the content row. Ledgers keep theirs.
 	FinalizeContent(ctx context.Context, contentID, generation, taskID int64) error
+	ReauthorizeFailedCopies(ctx context.Context, contentID, generation, taskID int64) error
+}
+
+type StorageRemovalRepository interface {
+	GetRemovalRequest(context.Context, string) (*storageremoval.Request, error)
+	ListRemovalMembers(context.Context, string) ([]model.StorageCleanupCopy, error)
+	LatestExposedSend(context.Context, string) (*storageremoval.Send, error)
+	LatestPossiblyAcceptedSend(context.Context, string) (*storageremoval.Send, error)
+	ListRemovalSends(context.Context, string) ([]storageremoval.Send, error)
+	ListRemovalSendPieces(context.Context, string, int) ([]storageremoval.SendPiece, error)
+	ListRemovalBatchesForTasks(context.Context, []int64) ([]storageremoval.TaskBatch, error)
+	JoinOrCreateCollecting(context.Context, JoinRemovalInput) (*storageremoval.Request, error)
+	SealRemovalRequest(context.Context, SealRemovalInput) error
+	DetachMembers(context.Context, RemovalMembersInput) error
+	MarkMembersRemoved(context.Context, RemovalMembersInput) error
+	MarkMemberFailed(context.Context, RemovalMembersInput) error
+	AdmitRemovalSend(context.Context, AdmitRemovalSendInput) error
+	RecordSendSubmission(context.Context, RemovalSendEvidenceInput) error
+	RecordSendRefused(context.Context, RemovalSendEvidenceInput) error
+	RecordSendUnsent(context.Context, RemovalSendEvidenceInput) error
+	RecordSendReceipt(context.Context, RemovalSendEvidenceInput) error
+	MarkRemovalReverted(context.Context, RemovalRequestInput) error
+	MarkRemovalQueued(context.Context, RemovalQueuedInput) error
+	MarkQueuedWithoutSend(context.Context, RemovalQueuedInput) error
+	SettleRemovalRequest(context.Context, RemovalRequestInput) error
+	AbandonRemovalRequest(context.Context, RemovalRequestInput) error
+	SetRemovalAttention(context.Context, RemovalAttentionInput) error
+	ClearRemovalAttention(context.Context, RemovalRequestInput) error
+	TransferRemovalTaskOwner(context.Context, string, int64, int64) error
+	AdoptLegacyCleanupCopy(context.Context, AdoptLegacyCleanupCopyInput) (*storageremoval.Request, error)
 }
 
 type EnsureDataSetBindingInput struct {

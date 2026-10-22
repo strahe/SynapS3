@@ -16,7 +16,7 @@ func TestProductionRegistrationClosesAllTaskDependencies(t *testing.T) {
 		model.TaskTypeProviderUploadSpeedTest, model.TaskTypeWalletOperation,
 		model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageDataSetRetire, model.TaskTypeStorageCommit,
 		model.TaskTypeBucketProvision, model.TaskTypeUploadPlan, model.TaskTypeProviderReplacementCoordinate,
-		model.TaskTypeStorageCleanup,
+		model.TaskTypeStorageCleanup, model.TaskTypeStorageRemoval,
 	}
 	got := runtime.registry.Types()
 	slices.Sort(want)

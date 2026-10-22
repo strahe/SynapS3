@@ -311,6 +311,22 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
+			name: "worker removal max pieces", field: "worker.tasks.removal_max_pieces",
+			mutate: func(cfg *Config) { cfg.Worker.Tasks.RemovalMaxPieces = MaxRemovalMaxPieces + 1 },
+		},
+		{
+			name: "worker removal pieces zero", field: "worker.tasks.removal_max_pieces",
+			mutate: func(cfg *Config) { cfg.Worker.Tasks.RemovalMaxPieces = 0 },
+		},
+		{
+			name: "worker removal max wait negative", field: "worker.tasks.removal_max_wait",
+			mutate: func(cfg *Config) { cfg.Worker.Tasks.RemovalMaxWait = -time.Second },
+		},
+		{
+			name: "worker removal max wait", field: "worker.tasks.removal_max_wait",
+			mutate: func(cfg *Config) { cfg.Worker.Tasks.RemovalMaxWait = MaxRemovalMaxWait + time.Second },
+		},
+		{
 			name:  "worker commit max pieces",
 			field: "worker.tasks.commit_max_pieces",
 			mutate: func(cfg *Config) {

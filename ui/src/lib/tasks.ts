@@ -21,6 +21,7 @@ export const taskOperationLabels: Record<string, string> = {
   storage_store: 'Upload data',
   storage_pull: 'Replicate data',
   storage_commit: 'Commit batch',
+  storage_removal: 'Remove batch',
   provider_replacement_coordinate: 'Replace provider',
   cache_evict: 'Release cache',
   cache_reconcile_durability: 'Recheck cache release',
@@ -53,6 +54,7 @@ export function taskSubjectLabel(task: Pick<TaskItem, 'subject_type' | 'subject_
   if (task.subject_type === 'system') return 'System'
   if (!task.subject_type || !task.subject_key) return '—'
   if (task.subject_type === 'storage_commit_request') return 'Batch'
+  if (task.subject_type === 'storage_removal_request') return 'Removal batch'
   if (task.subject_type === 'provider') return providerDisplayName(task.subject_key, task.provider_identity?.name)
   return `${subjectLabels[task.subject_type] ?? 'Resource'} #${task.subject_key}`
 }

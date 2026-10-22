@@ -38,6 +38,8 @@ function baseConfig(): SettingsEditableConfig {
         upload_concurrency: 4,
         commit_max_pieces: 32,
         commit_max_wait: '30s',
+        removal_max_pieces: 100,
+        removal_max_wait: '30m',
         commit_seal_on_cache_pressure: false,
         commit_max_backlog: 256,
       },
@@ -171,6 +173,8 @@ test('settings payload includes the unified task engine settings', () => {
     upload_concurrency: 6,
     commit_max_pieces: 16,
     commit_max_wait: '5s',
+    removal_max_pieces: 100,
+    removal_max_wait: '30m',
     commit_seal_on_cache_pressure: true,
     commit_max_backlog: 64,
   }
@@ -184,6 +188,8 @@ test('settings payload includes the unified task engine settings', () => {
     upload_concurrency: 6,
     commit_max_pieces: 16,
     commit_max_wait: '5s',
+    removal_max_pieces: 100,
+    removal_max_wait: '30m',
     commit_seal_on_cache_pressure: true,
     commit_max_backlog: 64,
   })

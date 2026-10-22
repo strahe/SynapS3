@@ -103,9 +103,10 @@ func initialize() {
 // Register connection cleanup after calling it so connections close before the schema.
 func SchemaDSN(t *testing.T) string {
 	t.Helper()
+	base := DSN(t)
 	ctx, cancel := context.WithTimeout(t.Context(), cleanupTimeout)
 	defer cancel()
-	dsn, drop, err := CreateSchema(ctx, DSN(t))
+	dsn, drop, err := CreateSchema(ctx, base)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -96,7 +96,8 @@ Fix the cause first: RPC connectivity, storage provider reachability, wallet fun
 | **Replace provider** | Recover from the bucket's **Storage** tab. |
 | **Commit batch** | Restore the dependency, then **Retry**. SynapS3 checks the chain before it resubmits the batch. `synaps3 admin storage-confirmation list` lists batches that need attention. |
 | **Wallet operation** | **Retry** continues the recorded transaction or starts an operation that was never broadcast. If a broadcast may have gone out without a recorded transaction, check the wallet on chain; the operation cannot be retried. |
-| **Clean up deleted data** | If removing a remote replica is still unconfirmed after 24 hours, **Retry** checks the chain and may submit another paid removal request. The earlier request can still succeed. |
+| **Remove batch** | **Retry** checks the chain and may submit another paid removal request. An earlier request can still succeed. |
+| **Clean up deleted data** | **Retry** retries failed replicas and continues cleanup. |
 
 For a failed replica, use **Retry** on the **Tasks** page or in the object's **Provenance** dialog. The replica is complete when it shows **Stored**.
 
