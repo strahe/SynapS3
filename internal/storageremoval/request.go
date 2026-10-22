@@ -119,9 +119,10 @@ func (p *SendPiece) BeforeAppendModel(_ context.Context, query bun.Query) error 
 	return nil
 }
 
-// TaskBatch is the operator-facing projection of a task's current batch.
+// TaskBatch projects a task's removal batch and current ownership.
 type TaskBatch struct {
 	TaskID        int64              `bun:"task_id"`
+	OwnsRequest   bool               `bun:"owns_request"`
 	RequestID     string             `bun:"request_id"`
 	Status        RequestStatus      `bun:"status"`
 	AttentionCode *string            `bun:"attention_code"`

@@ -36,7 +36,7 @@ func (r *BunStorageRemovalRepo) ListRemovalMembers(ctx context.Context, id strin
 	return rows, err
 }
 
-func (r *BunStorageRemovalRepo) ListRemovalSendPieces(ctx context.Context, id string, sendNo int) ([]storageremoval.SendPiece, error) {
+func (r *BunStorageRemovalRepo) listRemovalSendPieces(ctx context.Context, id string, sendNo int) ([]storageremoval.SendPiece, error) {
 	var rows []storageremoval.SendPiece
 	err := r.db.NewSelect().Model(&rows).Where("request_id = ? AND send_no = ?", id, sendNo).OrderExpr("cleanup_copy_id ASC").Scan(ctx)
 	return rows, err
@@ -51,15 +51,15 @@ func (r *BunStorageRemovalRepo) latestSend(ctx context.Context, id, condition st
 	if err != nil {
 		return nil, err
 	}
-	row.Pieces, err = r.ListRemovalSendPieces(ctx, id, row.SendNo)
+	row.Pieces, err = r.listRemovalSendPieces(ctx, id, row.SendNo)
 	return row, err
 }
 
-func (r *BunStorageRemovalRepo) LatestExposedSend(ctx context.Context, id string) (*storageremoval.Send, error) {
+func (r *BunStorageRemovalRepo) latestExposedSend(ctx context.Context, id string) (*storageremoval.Send, error) {
 	return r.latestSend(ctx, id, "unsent_at IS NULL")
 }
 
-func (r *BunStorageRemovalRepo) LatestPossiblyAcceptedSend(ctx context.Context, id string) (*storageremoval.Send, error) {
+func (r *BunStorageRemovalRepo) latestPossiblyAcceptedSend(ctx context.Context, id string) (*storageremoval.Send, error) {
 	return r.latestSend(ctx, id, "unsent_at IS NULL AND refused_at IS NULL")
 }
 
@@ -69,7 +69,7 @@ func (r *BunStorageRemovalRepo) ListRemovalSends(ctx context.Context, id string)
 		return nil, err
 	}
 	for i := range rows {
-		pieces, err := r.ListRemovalSendPieces(ctx, id, rows[i].SendNo)
+		pieces, err := r.listRemovalSendPieces(ctx, id, rows[i].SendNo)
 		if err != nil {
 			return nil, err
 		}
@@ -83,14 +83,16 @@ func (r *BunStorageRemovalRepo) ListRemovalBatchesForTasks(ctx context.Context, 
 		return nil, nil
 	}
 	var rows []storageremoval.TaskBatch
-	err := r.db.NewRaw(`SELECT request.task_id, request.request_id, request.status,
+	err := r.db.NewRaw(`SELECT task.id AS task_id, COALESCE(request.task_id = task.id, FALSE) AS owns_request,
+		request.request_id, request.status,
 		request.attention_code, request.attention_at, request.last_error,
 		data_set.provider_id, data_set.data_set_id,
 		(SELECT COUNT(*) FROM storage_cleanup_copies AS member WHERE member.removal_request_id = request.request_id) AS piece_count,
 		(SELECT tx_hash FROM storage_removal_sends AS evidence WHERE evidence.request_id = request.request_id AND tx_hash IS NOT NULL ORDER BY send_no DESC LIMIT 1) AS tx_hash
-		FROM storage_removal_requests AS request
+		FROM tasks AS task
+		JOIN storage_removal_requests AS request ON request.request_id = task.subject_key
 		JOIN storage_data_sets AS data_set ON data_set.id = request.storage_data_set_id
-		WHERE request.task_id IN (?)`, bun.List(ids)).Scan(ctx, &rows)
+		WHERE task.id IN (?) AND task.subject_type = ?`, bun.List(ids), model.TaskSubjectStorageRemovalRequest).Scan(ctx, &rows)
 	return rows, err
 }
 
@@ -104,7 +106,7 @@ func removalTime(now time.Time) time.Time {
 func removalIDs(ids []int64) []int64 { return slices.Compact(slices.Sorted(slices.Values(ids))) }
 
 // All member-content locks precede the data set and request locks. A joining
-// content discovered after the snapshot makes this transaction retry its read.
+// content discovered after the snapshot returns ErrConflict for the caller to reread.
 func (r *BunStorageRemovalRepo) owned(ctx context.Context, id string, taskID int64, statuses []storageremoval.RequestStatus, fn func(bun.IDB, *storageremoval.Request, []model.StorageCleanupCopy) error) error {
 	if id == "" || taskID <= 0 {
 		return ErrInvalidInput
@@ -234,12 +236,25 @@ func (r *BunStorageRemovalRepo) JoinOrCreateCollecting(ctx context.Context, inpu
 	return request, err
 }
 
-func removalReferences(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
-	referenced, err := uploadHasObjectReferences(ctx, db, contentID)
-	if err != nil || referenced {
-		return referenced, err
+func removalReferences(ctx context.Context, db bun.IDB, members []model.StorageCleanupCopy) (map[int64]bool, error) {
+	contentIDs := make([]int64, 0, len(members))
+	for _, member := range members {
+		contentIDs = append(contentIDs, member.ContentID)
 	}
-	return cleanupHasObjectReferences(ctx, db, contentID)
+	contentIDs = removalIDs(contentIDs)
+	direct, err := uploadReferencedContentIDs(ctx, db, contentIDs)
+	if err != nil {
+		return nil, err
+	}
+	shared, err := cleanupReferencedContentIDs(ctx, db, unreferencedContentIDs(contentIDs, direct))
+	if err != nil {
+		return nil, err
+	}
+	referenced := make(map[int64]bool, len(direct)+len(shared))
+	for _, id := range append(direct, shared...) {
+		referenced[id] = true
+	}
+	return referenced, nil
 }
 
 func (r *BunStorageRemovalRepo) SealRemovalRequest(ctx context.Context, input SealRemovalInput) error {
@@ -247,14 +262,14 @@ func (r *BunStorageRemovalRepo) SealRemovalRequest(ctx context.Context, input Se
 		return ErrInvalidInput
 	}
 	return r.owned(ctx, input.RequestID, input.TaskID, []storageremoval.RequestStatus{storageremoval.RequestStatusCollecting}, func(db bun.IDB, request *storageremoval.Request, members []model.StorageCleanupCopy) error {
+		referenced, err := removalReferences(ctx, db, members)
+		if err != nil {
+			return err
+		}
 		kept := 0
 		var dropped []model.StorageCleanupCopy
 		for _, row := range members {
-			referenced, err := removalReferences(ctx, db, row.ContentID)
-			if err != nil {
-				return err
-			}
-			if referenced || kept >= input.MaxPieces {
+			if referenced[row.ContentID] || kept >= input.MaxPieces {
 				dropped = append(dropped, row)
 			} else {
 				kept++
@@ -293,7 +308,7 @@ func detachRemovalMembers(ctx context.Context, db bun.IDB, members []model.Stora
 func (r *BunStorageRemovalRepo) changeMembers(ctx context.Context, input RemovalMembersInput, status model.StorageCleanupCopyStatus, detach bool) error {
 	return r.owned(ctx, input.RequestID, input.TaskID, nil, func(db bun.IDB, request *storageremoval.Request, members []model.StorageCleanupCopy) error {
 		tx := &BunStorageRemovalRepo{db: db}
-		accepted, err := tx.LatestPossiblyAcceptedSend(ctx, input.RequestID)
+		accepted, err := tx.latestPossiblyAcceptedSend(ctx, input.RequestID)
 		if err != nil {
 			return err
 		}
@@ -359,7 +374,7 @@ func (r *BunStorageRemovalRepo) MarkMemberFailed(ctx context.Context, input Remo
 }
 
 func (r *BunStorageRemovalRepo) AdmitRemovalSend(ctx context.Context, input AdmitRemovalSendInput) error {
-	if input.SendNo <= 0 || len(input.CopyIDs) == 0 || input.QueueLength < 0 || input.QueueLength > 2000 || input.SnapshotBlock > math.MaxInt64 {
+	if input.SendNo <= 0 || len(input.CopyIDs) == 0 || input.QueueLength < 0 || input.QueueLength > storageremoval.MaxEnqueuedRemovals || input.SnapshotBlock > math.MaxInt64 {
 		return ErrInvalidInput
 	}
 	return r.owned(ctx, input.RequestID, input.TaskID, []storageremoval.RequestStatus{storageremoval.RequestStatusReady, storageremoval.RequestStatusSubmitted}, func(db bun.IDB, request *storageremoval.Request, members []model.StorageCleanupCopy) error {
@@ -371,11 +386,11 @@ func (r *BunStorageRemovalRepo) AdmitRemovalSend(ctx context.Context, input Admi
 		if input.SendNo != latest+1 {
 			return ErrConflict
 		}
-		exposed, err := tx.LatestExposedSend(ctx, input.RequestID)
+		exposed, err := tx.latestExposedSend(ctx, input.RequestID)
 		if err != nil {
 			return err
 		}
-		accepted, err := tx.LatestPossiblyAcceptedSend(ctx, input.RequestID)
+		accepted, err := tx.latestPossiblyAcceptedSend(ctx, input.RequestID)
 		if err != nil {
 			return err
 		}
@@ -398,14 +413,12 @@ func (r *BunStorageRemovalRepo) AdmitRemovalSend(ctx context.Context, input Admi
 			}
 		}
 		if accepted == nil {
-			for _, row := range members {
-				referenced, err := removalReferences(ctx, db, row.ContentID)
-				if err != nil {
-					return err
-				}
-				if referenced {
-					return ErrConflict
-				}
+			referenced, err := removalReferences(ctx, db, members)
+			if err != nil {
+				return err
+			}
+			if len(referenced) > 0 {
+				return ErrConflict
 			}
 		}
 		var inFlight int
@@ -417,7 +430,7 @@ func (r *BunStorageRemovalRepo) AdmitRemovalSend(ctx context.Context, input Admi
 			AND (batch.status = 'submitted' OR (batch.status = 'queued' AND batch.queued_block > ?))`, request.StorageDataSetID, request.RequestID, int64(input.SnapshotBlock)).Scan(ctx, &inFlight); err != nil {
 			return err
 		}
-		if input.QueueLength+inFlight+len(selected) > 2000 {
+		if input.QueueLength+inFlight+len(selected) > storageremoval.MaxEnqueuedRemovals {
 			return ErrNoRemovalRoom
 		}
 		now := removalTime(input.AttemptedAt)
@@ -493,7 +506,7 @@ func (r *BunStorageRemovalRepo) sendEvidence(ctx context.Context, input RemovalS
 		}
 		old := request.Status
 		if kind == "refused" || kind == "unsent" {
-			accepted, err := (&BunStorageRemovalRepo{db: db}).LatestPossiblyAcceptedSend(ctx, input.RequestID)
+			accepted, err := (&BunStorageRemovalRepo{db: db}).latestPossiblyAcceptedSend(ctx, input.RequestID)
 			if err != nil {
 				return err
 			}
@@ -597,7 +610,7 @@ func (r *BunStorageRemovalRepo) SettleRemovalRequest(ctx context.Context, input 
 
 func (r *BunStorageRemovalRepo) AbandonRemovalRequest(ctx context.Context, input RemovalRequestInput) error {
 	return r.owned(ctx, input.RequestID, input.TaskID, []storageremoval.RequestStatus{storageremoval.RequestStatusCollecting, storageremoval.RequestStatusReady}, func(db bun.IDB, request *storageremoval.Request, members []model.StorageCleanupCopy) error {
-		accepted, err := (&BunStorageRemovalRepo{db: db}).LatestPossiblyAcceptedSend(ctx, input.RequestID)
+		accepted, err := (&BunStorageRemovalRepo{db: db}).latestPossiblyAcceptedSend(ctx, input.RequestID)
 		if err != nil {
 			return err
 		}

@@ -53,7 +53,7 @@ SynapS3 returns `503 SlowDown` for several conditions. The error message names t
 | --- | --- | --- |
 | `The bucket is still being prepared. Please retry shortly.` | The bucket's data sets are not ready yet. | Check the bucket's status and preparation message in the dashboard, and the speed-test notice on the **Storage** page. Retry when the bucket is **Ready**. |
 | `The local cache is full. Please retry later.` | The write does not fit in the cache. | See [Cache Full](#cache-full). |
-| `The same data is still being removed after an earlier delete. Please retry shortly.` | You deleted the last version holding these bytes, and SynapS3 is still removing the remote replicas. | Retry after a few minutes. The upload is then stored as new data. |
+| `The same data is still being removed after an earlier delete. Please retry shortly.` | You deleted the last version holding these bytes, and SynapS3 is still removing the remote replicas. | Retry after cleanup finishes. The wait includes **Removal batch wait**. |
 | Any other message | More than `server.max_requests` requests are in flight. | Retry with backoff, or raise `server.max_requests`. |
 
 S3 clients retry `SlowDown` a few times by default and may give up before the condition clears; retry the operation later.

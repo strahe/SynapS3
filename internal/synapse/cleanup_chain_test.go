@@ -87,19 +87,11 @@ func TestCleanupPieceReaderUsesExactPieceAndOneBlock(t *testing.T) {
 		len(states.Pieces) != 3 || states.QueueLength != 1 || states.BlockNumber != 42 || states.VerifierVersion != "3.5.0" || chain.calls != 5 {
 		t.Fatalf("batch state = %#v, calls=%d, err=%v", states, chain.calls, err)
 	}
-	state, err := reader.ObserveCleanupPiece(t.Context(), sdktypes.NewBigInt(11), sdktypes.NewBigInt(7))
-	if err != nil || state.Status != CleanupPiecePresent || state.BlockNumber != 42 {
-		t.Fatalf("piece 7 = %#v, err=%v", state, err)
-	}
-	state, err = reader.ObserveCleanupPiece(t.Context(), sdktypes.NewBigInt(11), sdktypes.NewBigInt(8))
-	if err != nil || state.Status != CleanupPieceScheduled || state.BlockNumber != 42 {
-		t.Fatalf("piece 8 = %#v, err=%v", state, err)
-	}
 	chain.live[7] = false
 	chain.calls = 0
-	state, err = reader.ObserveCleanupPiece(t.Context(), sdktypes.NewBigInt(11), sdktypes.NewBigInt(7))
-	if err != nil || state.Status != CleanupPieceRemoved || chain.calls != 4 {
-		t.Fatalf("removed piece = %#v, calls=%d, err=%v", state, chain.calls, err)
+	states, err = reader.ObserveCleanupPieces(t.Context(), sdktypes.NewBigInt(11), []sdktypes.BigInt{sdktypes.NewBigInt(7)})
+	if err != nil || states.Pieces["7"] != CleanupPieceRemoved || states.BlockNumber != 42 || chain.calls != 4 {
+		t.Fatalf("removed piece = %#v, calls=%d, err=%v", states, chain.calls, err)
 	}
 }
 
@@ -143,15 +135,15 @@ func TestCleanupPieceReaderRequiresVerifiedInactiveDataSetEvidence(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			state, err := reader.ObserveCleanupPiece(t.Context(), sdktypes.NewBigInt(11), sdktypes.NewBigInt(7))
+			states, err := reader.ObserveCleanupPieces(t.Context(), sdktypes.NewBigInt(11), []sdktypes.BigInt{sdktypes.NewBigInt(7)})
 			if tt.want == "" {
-				if err == nil || state.Status != "" {
-					t.Fatalf("unconfirmed data set = %#v, err=%v", state, err)
+				if err == nil || states.Pieces["7"] != "" {
+					t.Fatalf("unconfirmed data set = %#v, err=%v", states, err)
 				}
 				return
 			}
-			if err != nil || state.Status != tt.want || state.BlockNumber != 42 || chain.calls != 3 {
-				t.Fatalf("data set state = %#v, calls=%d, err=%v", state, chain.calls, err)
+			if err != nil || states.Pieces["7"] != tt.want || states.BlockNumber != 42 || chain.calls != 3 {
+				t.Fatalf("data set state = %#v, calls=%d, err=%v", states, chain.calls, err)
 			}
 		})
 	}

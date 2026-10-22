@@ -850,10 +850,6 @@ func pieceCIDs(pieces []storage.PieceInput) []cid.Cid {
 	return out
 }
 
-func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdktypes.BigInt) (*sdktypes.WriteResult, error) {
-	return c.DeletePiecesByID(ctx, []sdktypes.BigInt{pieceID})
-}
-
 func (c *memoryDataSetTarget) DeletePiecesByID(ctx context.Context, pieceIDs []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -899,11 +895,6 @@ func (c *memoryDataSetTarget) DeletePiecesByID(ctx context.Context, pieceIDs []s
 		BlockHash: common.BigToHash(big.NewInt(c.filecoin.epoch)),
 	}
 	return &sdktypes.WriteResult{Hash: hash}, nil
-}
-
-func (m *MemoryFilecoin) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-	states, err := m.DeletionStates(ctx, dataSetID, []sdktypes.BigInt{pieceID})
-	return synapse.CleanupPieceState{Status: states.Pieces[pieceID.String()], BlockNumber: states.BlockNumber}, err
 }
 
 func (m *MemoryFilecoin) DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (synapse.CleanupPiecesState, error) {

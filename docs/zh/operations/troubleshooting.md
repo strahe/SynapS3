@@ -53,7 +53,7 @@ synaps3 admin task stats
 | --- | --- | --- |
 | `The bucket is still being prepared. Please retry shortly.` | 存储桶的数据集尚未就绪。 | 在仪表盘查看存储桶的状态和准备信息，以及 **Storage** 页面的测速提示。存储桶变为 **Ready** 后重试。 |
 | `The local cache is full. Please retry later.` | 缓存放不下这次写入。 | 见[缓存已满](#缓存已满)。 |
-| `The same data is still being removed after an earlier delete. Please retry shortly.` | 你删除了持有这些字节的最后一个版本，SynapS3 仍在删除远端副本。 | 几分钟后重试。届时这次上传会作为新数据保存。 |
+| `The same data is still being removed after an earlier delete. Please retry shortly.` | 你删除了持有这些字节的最后一个版本，SynapS3 仍在删除远端副本。 | 清理完成后重试，等待时间包含 **Removal batch wait**。 |
 | 其他消息 | 同时处理的请求超过 `server.max_requests`。 | 退避后重试，或调高 `server.max_requests`。 |
 
 S3 客户端默认只对 `SlowDown` 重试几次，可能在问题消除前就放弃；请稍后重新执行该操作。

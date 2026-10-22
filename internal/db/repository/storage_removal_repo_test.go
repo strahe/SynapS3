@@ -120,6 +120,86 @@ func TestRemovalCollectingMembershipIsConcurrentAndBounded(t *testing.T) {
 	}
 }
 
+func TestRemovalReferenceChecksAreBatched(t *testing.T) {
+	var sealQueries, admissionQueries int
+	for _, count := range []int{1, 8} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			f := newRemovalFixture(t, count+2)
+			request := f.join(t, 0)
+			for i := 1; i < len(f.rows); i++ {
+				f.join(t, i)
+			}
+			reference := func(index int) *model.ObjectVersion {
+				t.Helper()
+				object := &model.Object{BucketID: f.bucket.ID, Key: fmt.Sprintf("reference-%d", index)}
+				if _, err := f.db.NewInsert().Model(object).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				version := newObjectVersion(f.bucket.ID, object.Key, model.NewVersionID(), 10)
+				version.ObjectID, version.ContentID = object.ID, &f.rows[index].ContentID
+				if _, err := f.db.NewInsert().Model(version).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				return version
+			}
+			reference(0)
+			for _, owner := range []int64{f.owners[0], f.owners[count+1]} {
+				if _, err := f.db.NewUpdate().Model((*model.Task)(nil)).Set("wait_reason = ?", "removal_pending").Set("available_at = ?", time.Now().Add(time.Hour)).Where("id = ?", owner).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			capture := new(postgresQueryCapture)
+			testutil.AddQueryHook(f.db, capture)
+			if err := f.repos.StorageRemoval.SealRemovalRequest(t.Context(), repository.SealRemovalInput{RequestID: request.RequestID, TaskID: *request.TaskID, MaxPieces: count}); err != nil {
+				t.Fatal(err)
+			}
+			if count == 1 {
+				sealQueries = len(capture.queries)
+			} else if len(capture.queries) != sealQueries {
+				t.Fatalf("sealing query count grew with members: got %d, want %d", len(capture.queries), sealQueries)
+			}
+			members, err := f.repos.StorageRemoval.ListRemovalMembers(t.Context(), request.RequestID)
+			if err != nil || len(members) != count {
+				t.Fatalf("sealed members = %#v, %v", members, err)
+			}
+			var copyIDs []int64
+			for i, member := range members {
+				if member.ID != f.rows[i+1].ID {
+					t.Fatalf("sealed member %d = %d, want %d", i, member.ID, f.rows[i+1].ID)
+				}
+				copyIDs = append(copyIDs, member.ID)
+			}
+			for _, owner := range []int64{f.owners[0], f.owners[count+1]} {
+				woken, err := f.repos.Tasks.GetByID(t.Context(), owner)
+				if err != nil || woken.AvailableAt.After(time.Now()) {
+					t.Fatalf("detached content task was not woken: %#v, %v", woken, err)
+				}
+			}
+			version := reference(count)
+			admit := repository.AdmitRemovalSendInput{RequestID: request.RequestID, TaskID: *request.TaskID, SendNo: 1, CopyIDs: copyIDs, SnapshotBlock: 100}
+			if err := f.repos.StorageRemoval.AdmitRemovalSend(t.Context(), admit); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("referenced member admitted: %v", err)
+			}
+			sends, err := f.repos.StorageRemoval.ListRemovalSends(t.Context(), request.RequestID)
+			if err != nil || len(sends) != 0 {
+				t.Fatalf("rejected admission wrote send evidence: %#v, %v", sends, err)
+			}
+			if _, err := f.db.NewDelete().Model(version).WherePK().Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			capture.reset()
+			if err := f.repos.StorageRemoval.AdmitRemovalSend(t.Context(), admit); err != nil {
+				t.Fatal(err)
+			}
+			if count == 1 {
+				admissionQueries = len(capture.queries)
+			} else if len(capture.queries) != admissionQueries {
+				t.Fatalf("admission query count grew with members: got %d, want %d", len(capture.queries), admissionQueries)
+			}
+		})
+	}
+}
+
 func TestRemovalSendLedgerPreservesEvidenceAndAuthorization(t *testing.T) {
 	f := newRemovalFixture(t, 3)
 	request := f.join(t, 0)
@@ -383,6 +463,45 @@ func TestRemovalLegacyAdoptionSeparatesOldHashAndUnknownRetry(t *testing.T) {
 	}
 }
 
+func TestRemovalTaskBatchesRemainVisibleAfterRelease(t *testing.T) {
+	for _, status := range []storageremoval.RequestStatus{storageremoval.RequestStatusSettled, storageremoval.RequestStatusAbandoned} {
+		t.Run(string(status), func(t *testing.T) {
+			f := newRemovalFixture(t, 1)
+			request := f.join(t, 0)
+			taskID := *request.TaskID
+			if err := f.repos.StorageRemoval.SealRemovalRequest(t.Context(), repository.SealRemovalInput{RequestID: request.RequestID, TaskID: taskID, MaxPieces: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if status == storageremoval.RequestStatusSettled {
+				if err := f.repos.StorageRemoval.AdmitRemovalSend(t.Context(), repository.AdmitRemovalSendInput{RequestID: request.RequestID, TaskID: taskID, SendNo: 1, CopyIDs: []int64{f.rows[0].ID}, AttemptedAt: time.Now()}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.repos.StorageRemoval.RecordSendSubmission(t.Context(), repository.RemovalSendEvidenceInput{RequestID: request.RequestID, TaskID: taskID, SendNo: 1, TxHash: "preserved-hash"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.repos.StorageRemoval.MarkRemovalQueued(t.Context(), repository.RemovalQueuedInput{RequestID: request.RequestID, TaskID: taskID, QueuedAt: time.Now(), QueuedBlock: 100}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.repos.StorageRemoval.MarkMembersRemoved(t.Context(), repository.RemovalMembersInput{RequestID: request.RequestID, TaskID: taskID, CopyIDs: []int64{f.rows[0].ID}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.repos.StorageRemoval.SettleRemovalRequest(t.Context(), repository.RemovalRequestInput{RequestID: request.RequestID, TaskID: taskID}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := f.repos.StorageRemoval.AbandonRemovalRequest(t.Context(), repository.RemovalRequestInput{RequestID: request.RequestID, TaskID: taskID, Message: "No removal needed"}); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := f.repos.StorageRemoval.ListRemovalBatchesForTasks(t.Context(), []int64{taskID, f.owners[0]})
+			if err != nil || len(rows) != 1 || rows[0].TaskID != taskID || rows[0].RequestID != request.RequestID || rows[0].Status != status || rows[0].OwnsRequest {
+				t.Fatalf("released task batch = %#v, %v", rows, err)
+			}
+			if status == storageremoval.RequestStatusSettled && (rows[0].PieceCount != 1 || rows[0].TxHash == nil || *rows[0].TxHash != "preserved-hash") {
+				t.Fatalf("settled batch lost removal evidence: %#v", rows[0])
+			}
+		})
+	}
+}
+
 func TestRemovalOwnerCannotBeAcknowledged(t *testing.T) {
 	f := newRemovalFixture(t, 1)
 	request := f.join(t, 0)
@@ -441,6 +560,15 @@ func TestRemovalRetryTransfersOwnershipAndKeepsSendEvidence(t *testing.T) {
 	sends, err := f.repos.StorageRemoval.ListRemovalSends(t.Context(), id)
 	if err != nil || len(sends) != 1 || sends[0].TaskID == nil || *sends[0].TaskID != originalTaskID || sends[0].TxHash == nil || *sends[0].TxHash != "preserved-hash" {
 		t.Fatalf("retry altered send provenance: %#v, %v", sends, err)
+	}
+	batches, err := f.repos.StorageRemoval.ListRemovalBatchesForTasks(t.Context(), []int64{originalTaskID, successor.ID})
+	if err != nil || len(batches) != 2 {
+		t.Fatalf("retry task batches = %#v, %v", batches, err)
+	}
+	for _, batch := range batches {
+		if batch.RequestID != id || batch.OwnsRequest != (batch.TaskID == successor.ID) || batch.TxHash == nil || *batch.TxHash != "preserved-hash" {
+			t.Fatalf("retry batch lost ownership or evidence: %#v", batch)
+		}
 	}
 	if err := f.repos.StorageRemoval.SetRemovalAttention(t.Context(), repository.RemovalAttentionInput{RequestID: id, TaskID: originalTaskID, Code: storageremoval.AttentionProviderUnreachable}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("superseded owner wrote attention: %v", err)

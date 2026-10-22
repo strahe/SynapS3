@@ -48,7 +48,10 @@ func (m *MockStorageClient) DeletionStates(ctx context.Context, dataSetID sdktyp
 	}
 	result := synapse.CleanupPiecesState{Pieces: make(map[string]synapse.CleanupPieceStatus), VerifierVersion: "3.5.0"}
 	for _, id := range pieceIDs {
-		state, err := m.DeletionState(ctx, dataSetID, id)
+		if m.DeletionStateFunc == nil {
+			return result, errors.New("MockStorageClient.DeletionStates was not configured")
+		}
+		state, err := m.DeletionStateFunc(ctx, dataSetID, id)
 		if err != nil {
 			return result, err
 		}
@@ -66,13 +69,6 @@ func (m *MockStorageClient) ProviderPiecesKnown(ctx context.Context, serviceURL 
 		return synapse.ProviderPiecesState{}, errors.New("MockStorageClient.ProviderPiecesKnown was not configured")
 	}
 	return m.ProviderPiecesKnownFunc(ctx, serviceURL, dataSetID, pieceIDs)
-}
-
-func (m *MockStorageClient) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-	if m.DeletionStateFunc == nil {
-		return synapse.CleanupPieceState{}, errors.New("MockStorageClient.DeletionState was not configured")
-	}
-	return m.DeletionStateFunc(ctx, dataSetID, pieceID)
 }
 
 // OpenTargetOptions lets worker tests configure one callback for both

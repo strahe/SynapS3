@@ -336,6 +336,75 @@ func TestRemovalObservationErrorsPreserveAttemptBudget(t *testing.T) {
 	}
 }
 
+func TestRemovalObservationErrorsAfterRetryPreserveAttemptBudget(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		refused bool
+		source  string
+	}{
+		{name: "refused_chain", refused: true, source: "chain"},
+		{name: "submitted_chain", source: "chain"},
+		{name: "submitted_preflight", source: "preflight"},
+		{name: "refused_context", refused: true, source: "context"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var broken atomic.Bool
+			var calls atomic.Int64
+			f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {
+				options.deletionState = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					if scenario.source == "chain" && broken.Load() {
+						return synapse.CleanupPieceState{}, errors.New("chain unavailable")
+					}
+					return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
+				}
+				options.removalChain = testRemovalChain{preflight: func(context.Context, sdktypes.BigInt) (synapse.RemovalPreflight, error) {
+					if scenario.source == "preflight" && broken.Load() {
+						return synapse.RemovalPreflight{}, errors.New("preflight unavailable")
+					}
+					return synapse.RemovalPreflight{}, nil
+				}}
+				options.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					if scenario.source == "context" && broken.Load() {
+						return nil, errors.New("cleanup context unavailable")
+					}
+					return testCleanupContext{deletePieces: func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+						if calls.Add(1) == 1 && scenario.refused {
+							return nil, &pdp.HTTPError{StatusCode: 400, Body: "request rejected"}
+						}
+						return &sdktypes.WriteResult{Hash: common.HexToHash("0x1")}, nil
+					}}, nil
+				}
+			})
+			f.send(t)
+			if !scenario.refused {
+				ageRemovalSend(t, f)
+				f.step(t, model.TaskStatusPending)
+			}
+			if f.row.RetryCount != 1 || f.row.ResumeMode != model.TaskResumeModeExecute || calls.Load() != 1 {
+				t.Fatalf("retry did not prepare the second attempt: task=%#v sends=%d", f.row, calls.Load())
+			}
+			broken.Store(true)
+			f.step(t, model.TaskStatusPending)
+			if f.row.RetryCount != 1 || f.row.ResumeMode != model.TaskResumeModeRecover || calls.Load() != 1 || len(f.sends(t)) != 1 || f.row.LastError == nil || !strings.Contains(*f.row.LastError, "unavailable") {
+				t.Fatalf("failed observation spent the prepared attempt: task=%#v sends=%d", f.row, calls.Load())
+			}
+			broken.Store(false)
+			f.step(t, model.TaskStatusPending)
+			if f.row.RetryCount != 1 || f.row.ResumeMode != model.TaskResumeModeExecute || calls.Load() != 1 || len(f.sends(t)) != 1 {
+				t.Fatalf("recovery skipped an unadmitted attempt: task=%#v sends=%d", f.row, calls.Load())
+			}
+			f.step(t, model.TaskStatusPending)
+			var runtime model.TaskRuntime
+			if err := json.Unmarshal(f.row.Runtime, &runtime); err != nil {
+				t.Fatal(err)
+			}
+			if f.row.RetryCount != 1 || calls.Load() != 2 || len(f.sends(t)) != 2 || runtime.LastAdmittedAttempt != 2 {
+				t.Fatalf("second send did not use the prepared attempt: task=%#v sends=%d runtime=%#v", f.row, calls.Load(), runtime)
+			}
+		})
+	}
+}
+
 func TestRemovalMissingServiceRecordCanRecover(t *testing.T) {
 	for _, status := range []storageremoval.RequestStatus{storageremoval.RequestStatusReady, storageremoval.RequestStatusSubmitted} {
 		t.Run(string(status), func(t *testing.T) {
@@ -530,100 +599,162 @@ func TestRemovalStopsBeforeSendingForUnsafeConditions(t *testing.T) {
 }
 
 func TestRemovalRevertedReceiptRequiresManualRetryWithPreservedEvidence(t *testing.T) {
-	var calls atomic.Int64
-	var removed atomic.Bool
-	hash := common.HexToHash("0x11")
-	f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {
-		options.deletionState = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			status := synapse.CleanupPiecePresent
-			if removed.Load() {
-				status = synapse.CleanupPieceRemoved
+	for _, outcome := range []string{"accepted", "unsent"} {
+		t.Run(outcome, func(t *testing.T) {
+			maxAttempts := 3
+			var calls atomic.Int64
+			var removed atomic.Bool
+			hash := common.HexToHash("0x11")
+			f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {
+				options.maxAttempts = &maxAttempts
+				options.deletionState = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					status := synapse.CleanupPiecePresent
+					if removed.Load() {
+						status = synapse.CleanupPieceRemoved
+					}
+					return synapse.CleanupPieceState{Status: status, BlockNumber: 100}, nil
+				}
+				options.receipts = testReceiptChecker{check: func(_ context.Context, tx common.Hash) (*ethtypes.Receipt, error) {
+					return &ethtypes.Receipt{TxHash: tx, Status: ethtypes.ReceiptStatusFailed, BlockNumber: big.NewInt(90), BlockHash: common.HexToHash("0x10")}, nil
+				}}
+				options.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					return testCleanupContext{deletePieces: func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+						if calls.Add(1) > 1 && outcome == "unsent" {
+							return nil, storage.ErrInvalidArgument
+						}
+						return &sdktypes.WriteResult{Hash: hash}, nil
+					}}, nil
+				}
+			})
+			f.send(t)
+			f.step(t, model.TaskStatusFailed)
+			first := f.sends(t)
+			if f.row.FailureReason == nil || *f.row.FailureReason != "transaction_reverted" || len(first) != 1 || first[0].ReceiptStatus == nil || *first[0].ReceiptStatus != 0 || f.request.AttentionCode == nil || calls.Load() != 1 {
+				t.Fatalf("reverted removal = %#v, %#v", f.row, first)
 			}
-			return synapse.CleanupPieceState{Status: status, BlockNumber: 100}, nil
-		}
-		options.receipts = testReceiptChecker{check: func(_ context.Context, tx common.Hash) (*ethtypes.Receipt, error) {
-			return &ethtypes.Receipt{TxHash: tx, Status: ethtypes.ReceiptStatusFailed, BlockNumber: big.NewInt(90), BlockHash: common.HexToHash("0x10")}, nil
-		}}
-		options.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
-			return testCleanupContext{deletePieces: func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
-				calls.Add(1)
-				return &sdktypes.WriteResult{Hash: hash}, nil
-			}}, nil
-		}
-	})
-	f.send(t)
-	f.step(t, model.TaskStatusFailed)
-	first := f.sends(t)
-	if f.row.FailureReason == nil || *f.row.FailureReason != "transaction_reverted" || len(first) != 1 || first[0].ReceiptStatus == nil || *first[0].ReceiptStatus != 0 || f.request.AttentionCode == nil || calls.Load() != 1 {
-		t.Fatalf("reverted removal = %#v, %#v", f.row, first)
-	}
-	f.retry(t)
-	f.step(t, model.TaskStatusPending)
-	if calls.Load() != 1 {
-		t.Fatalf("recover mode sent another deletion: %d", calls.Load())
-	}
-	ageRemovalSend(t, f)
-	f.send(t)
-	second := f.sends(t)
-	if len(second) != 2 || second[0].TxHash == nil || *second[0].TxHash != hash.Hex() || second[0].ReceiptStatus == nil || *second[0].ReceiptStatus != 0 || f.request.AttentionCode != nil {
-		t.Fatalf("manual retry lost receipt or stop marker: %#v, %#v", f.request, second)
-	}
-	removed.Store(true)
-	for range 4 {
-		f.advance(t)
-		if f.row.Status == model.TaskStatusCompleted {
-			break
-		}
-	}
-	if f.row.Status != model.TaskStatusCompleted || calls.Load() != 2 {
-		t.Fatalf("retried removal did not finish: %#v, sends=%d", f.row, calls.Load())
+			f.retry(t)
+			f.step(t, model.TaskStatusPending)
+			if calls.Load() != 1 {
+				t.Fatalf("recover mode sent another deletion: %d", calls.Load())
+			}
+			ageRemovalSend(t, f)
+			f.send(t)
+			second := f.sends(t)
+			if len(second) != 2 || second[0].TxHash == nil || *second[0].TxHash != hash.Hex() || second[0].ReceiptStatus == nil || *second[0].ReceiptStatus != 0 || f.request.AttentionCode != nil {
+				t.Fatalf("manual retry lost receipt or stop marker: %#v, %#v", f.request, second)
+			}
+			if outcome == "unsent" {
+				for range 8 {
+					ageRemovalSend(t, f)
+					f.advance(t)
+					if f.row.Status == model.TaskStatusFailed {
+						break
+					}
+				}
+				if f.row.Status != model.TaskStatusFailed || f.row.FailureReason == nil || *f.row.FailureReason != "attempts_exhausted" || f.request.AttentionCode == nil || *f.request.AttentionCode != string(storageremoval.AttentionProviderUnreachable) {
+					t.Fatalf("failed historical receipt was treated as unconfirmed: task=%#v request=%#v", f.row, f.request)
+				}
+				evidence := f.sends(t)
+				if calls.Load() != 3 || len(evidence) != 3 || evidence[1].UnsentAt == nil || evidence[2].UnsentAt == nil || evidence[0].ReceiptStatus == nil || *evidence[0].ReceiptStatus != 0 {
+					t.Fatalf("retry exhausted without preserving send outcomes: %#v, sends=%d", evidence, calls.Load())
+				}
+				return
+			}
+			removed.Store(true)
+			for range 4 {
+				f.advance(t)
+				if f.row.Status == model.TaskStatusCompleted {
+					break
+				}
+			}
+			if f.row.Status != model.TaskStatusCompleted || calls.Load() != 2 {
+				t.Fatalf("retried removal did not finish: %#v, sends=%d", f.row, calls.Load())
+			}
+		})
 	}
 }
 
-func TestRemovalUnknownSendBudgetRetainsBatchAndCanResumeAfterManualRetry(t *testing.T) {
-	maxAttempts := 2
-	var calls atomic.Int64
-	var removed atomic.Bool
-	f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {
-		options.maxAttempts = &maxAttempts
-		options.deletionState = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
-			status := synapse.CleanupPiecePresent
-			if removed.Load() {
-				status = synapse.CleanupPieceRemoved
+func TestRemovalSendBudgetRetainsBatchAndCanResumeAfterManualRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		first     string
+		remaining string
+		status    storageremoval.RequestStatus
+		attention storageremoval.AttentionCode
+	}{
+		{name: "unknown", first: "unknown", remaining: "unknown", status: storageremoval.RequestStatusSubmitted, attention: storageremoval.AttentionConfirmationTimeout},
+		{name: "hash", first: "hash", remaining: "hash", status: storageremoval.RequestStatusSubmitted, attention: storageremoval.AttentionConfirmationTimeout},
+		{name: "unknown then refused", first: "unknown", remaining: "refused", status: storageremoval.RequestStatusSubmitted, attention: storageremoval.AttentionConfirmationTimeout},
+		{name: "unsent", first: "unsent", remaining: "unsent", status: storageremoval.RequestStatusReady, attention: storageremoval.AttentionProviderUnreachable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			maxAttempts := 2
+			var calls atomic.Int64
+			var removed atomic.Bool
+			f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {
+				options.maxAttempts = &maxAttempts
+				options.deletionState = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					status := synapse.CleanupPiecePresent
+					if removed.Load() {
+						status = synapse.CleanupPieceRemoved
+					}
+					return synapse.CleanupPieceState{Status: status, BlockNumber: 100}, nil
+				}
+				options.receipts = testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
+					return nil, ethereum.NotFound
+				}}
+				options.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					return testCleanupContext{deletePieces: func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+						call := calls.Add(1)
+						outcome := tc.remaining
+						if call == 1 {
+							outcome = tc.first
+						}
+						switch outcome {
+						case "hash":
+							return &sdktypes.WriteResult{Hash: common.BigToHash(big.NewInt(call))}, nil
+						case "refused":
+							return nil, &pdp.HTTPError{StatusCode: 400, Body: "removal refused"}
+						case "unsent":
+							return nil, storage.ErrInvalidArgument
+						default:
+							return nil, removalUnknownError()
+						}
+					}}, nil
+				}
+			})
+			f.send(t)
+			for range 8 {
+				ageRemovalSend(t, f)
+				f.advance(t)
+				if f.row.Status == model.TaskStatusFailed {
+					break
+				}
 			}
-			return synapse.CleanupPieceState{Status: status, BlockNumber: 100}, nil
-		}
-		options.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
-			return testCleanupContext{deletePieces: func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
-				calls.Add(1)
-				return nil, removalUnknownError()
-			}}, nil
-		}
-	})
-	f.send(t)
-	for range 8 {
-		ageRemovalSend(t, f)
-		f.advance(t)
-		if f.row.Status == model.TaskStatusFailed {
-			break
-		}
-	}
-	if f.row.Status != model.TaskStatusFailed || f.row.FailureReason == nil || *f.row.FailureReason != "attempts_exhausted" || calls.Load() != 2 || len(f.sends(t)) != 2 || f.request.Status != storageremoval.RequestStatusSubmitted || f.request.TaskID == nil || *f.request.TaskID != f.row.ID {
-		t.Fatalf("removal exceeded its send budget or lost evidence: task=%#v request=%#v sends=%d", f.row, f.request, calls.Load())
-	}
-	if err := f.runtime.repos.Tasks.AcknowledgeFailed(t.Context(), f.row.ID); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("held removal acknowledgement = %v", err)
-	}
-	f.retry(t)
-	removed.Store(true)
-	for range 4 {
-		f.advance(t)
-		if f.row.Status == model.TaskStatusCompleted {
-			break
-		}
-	}
-	if f.row.Status != model.TaskStatusCompleted || calls.Load() != 2 || len(f.sends(t)) != 2 {
-		t.Fatalf("empty-runtime retry replayed a confirmed removal: %#v, sends=%d", f.row, calls.Load())
+			if f.row.Status != model.TaskStatusFailed || f.row.FailureReason == nil || *f.row.FailureReason != "attempts_exhausted" || calls.Load() != 2 || len(f.sends(t)) != 2 || f.request.Status != tc.status || f.request.TaskID == nil || *f.request.TaskID != f.row.ID {
+				t.Fatalf("removal exceeded its send budget or lost evidence: task=%#v request=%#v sends=%d", f.row, f.request, calls.Load())
+			}
+			if f.request.AttentionCode == nil || *f.request.AttentionCode != string(tc.attention) {
+				t.Fatalf("exhausted removal diagnostic = %#v, want %s", f.request, tc.attention)
+			}
+			if err := f.runtime.repos.Tasks.AcknowledgeFailed(t.Context(), f.row.ID); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("held removal acknowledgement = %v", err)
+			}
+			if tc.name != "unknown" {
+				return
+			}
+			f.retry(t)
+			removed.Store(true)
+			for range 4 {
+				f.advance(t)
+				if f.row.Status == model.TaskStatusCompleted {
+					break
+				}
+			}
+			if f.row.Status != model.TaskStatusCompleted || calls.Load() != 2 || len(f.sends(t)) != 2 {
+				t.Fatalf("empty-runtime retry replayed a confirmed removal: %#v, sends=%d", f.row, calls.Load())
+			}
+		})
 	}
 }
 
@@ -738,7 +869,7 @@ func TestRemoval404PartitionsOnlyUnacceptedBatchAndCountsEverySend(t *testing.T)
 		options.storage.ProviderPiecesKnownFunc = func(_ context.Context, _ string, _ sdktypes.BigInt, ids []sdktypes.BigInt) (synapse.ProviderPiecesState, error) {
 			switch lookups.Add(1) {
 			case 1:
-				return synapse.ProviderPiecesState{}, errors.New("Could not read the provider's pieces")
+				return synapse.ProviderPiecesState{}, context.DeadlineExceeded
 			case 2:
 				return synapse.ProviderPiecesState{Known: ids[:1], Errors: map[string]error{
 					ids[1].String(): &pdp.HTTPError{StatusCode: 503, Body: "provider busy at https://user:password@provider.example/pdp/check?token=private#fragment"},
@@ -752,8 +883,11 @@ func TestRemoval404PartitionsOnlyUnacceptedBatchAndCountsEverySend(t *testing.T)
 		}
 	})
 	f.send(t)
-	if calls.Load() != 1 || lookups.Load() != 1 || f.row.RetryCount != 0 || f.row.LastError == nil || !strings.Contains(*f.row.LastError, "Could not read the provider's pieces") {
+	if calls.Load() != 1 || lookups.Load() != 1 || f.row.RetryCount != 0 || f.row.LastError == nil || !strings.Contains(*f.row.LastError, context.DeadlineExceeded.Error()) {
 		t.Fatalf("failed piece lookup consumed a send attempt: task=%#v calls=%d lookups=%d", f.row, calls.Load(), lookups.Load())
+	}
+	if members, err := f.runtime.repos.StorageRemoval.ListRemovalMembers(t.Context(), f.request.RequestID); err != nil || len(members) != 3 {
+		t.Fatalf("piece lookup timeout changed batch members: %#v, %v", members, err)
 	}
 	f.step(t, model.TaskStatusPending)
 	if calls.Load() != 1 || lookups.Load() != 2 || f.row.RetryCount != 0 || f.row.LastError == nil {

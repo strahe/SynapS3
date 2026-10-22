@@ -61,14 +61,6 @@ func newCleanupPieceReader(chain cleanupChainCaller, verifier common.Address) (*
 	return &cleanupPieceReader{chain: chain, verifier: verifier, abi: contractABI}, nil
 }
 
-func (r *cleanupPieceReader) ObserveCleanupPiece(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error) {
-	states, err := r.ObserveCleanupPieces(ctx, dataSetID, []sdktypes.BigInt{pieceID})
-	if err != nil {
-		return CleanupPieceState{}, err
-	}
-	return CleanupPieceState{Status: states.Pieces[pieceID.String()], BlockNumber: states.BlockNumber}, nil
-}
-
 func (r *cleanupPieceReader) ObserveCleanupPieces(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (CleanupPiecesState, error) {
 	height, err := r.chain.BlockNumber(ctx)
 	if err != nil {

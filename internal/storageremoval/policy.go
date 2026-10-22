@@ -2,7 +2,6 @@ package storageremoval
 
 import (
 	"errors"
-	"math/big"
 	"slices"
 	"strings"
 	"time"
@@ -20,22 +19,6 @@ func NextSendSet(previous, candidate []int64) ([]int64, error) {
 		}
 	}
 	return result, nil
-}
-
-type QueueReservation struct {
-	Count int
-	// Nil identifies a submitted batch whose sends may still reach the queue.
-	QueuedBlock *uint64
-}
-
-func QueueRoom(snapshotLen int, snapshotBlock uint64, reservations []QueueReservation) int {
-	room := MaxEnqueuedRemovals - max(0, snapshotLen)
-	for _, reservation := range reservations {
-		if reservation.QueuedBlock == nil || *reservation.QueuedBlock > snapshotBlock {
-			room -= max(0, reservation.Count)
-		}
-	}
-	return max(0, room)
 }
 
 type FailedReceiptClass int
@@ -76,23 +59,6 @@ func ConfirmationTimeoutStart(firstAttempted, workStarted time.Time) time.Time {
 	return firstAttempted
 }
 
-func RemovalStalledAfter(period, window time.Duration) time.Duration   { return 2*period + window }
-func CleanupStalledAt(endAt time.Time, period time.Duration) time.Time { return endAt.Add(2 * period) }
-
-// ReserveTopUp returns the additional reserve required by the rail's threshold.
-func ReserveTopUp(reserve, pending, threshold, target *big.Int) *big.Int {
-	if reserve == nil || pending == nil || threshold == nil || target == nil {
-		return new(big.Int)
-	}
-	minimum := new(big.Int).Add(pending, threshold)
-	if reserve.Cmp(minimum) >= 0 {
-		return new(big.Int)
-	}
-	needed := new(big.Int).Sub(new(big.Int).Add(pending, target), reserve)
-	if needed.Sign() < 0 {
-		return new(big.Int)
-	}
-	return needed
-}
+func RemovalStalledAfter(period, window time.Duration) time.Duration { return 2*period + window }
 
 func AutoResendSupported(version string) bool { return strings.TrimSpace(version) == "3.5.0" }

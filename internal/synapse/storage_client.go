@@ -66,13 +66,6 @@ func (s *StorageServiceAdapter) ConfigureCleanupChain(chain cleanupChainCaller) 
 	return nil
 }
 
-func (s *StorageServiceAdapter) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error) {
-	if s.cleanup == nil {
-		return CleanupPieceState{}, errors.New("cleanup chain reader is unavailable")
-	}
-	return s.cleanup.ObserveCleanupPiece(ctx, dataSetID, pieceID)
-}
-
 func (s *StorageServiceAdapter) DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (CleanupPiecesState, error) {
 	if s.cleanup == nil {
 		return CleanupPiecesState{}, errors.New("cleanup chain reader is unavailable")

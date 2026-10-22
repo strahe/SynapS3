@@ -56,7 +56,9 @@ func (s *Server) attachTaskRemovalBatches(ctx context.Context, rows []model.Task
 			message := errtext.Format(errors.New(*record.LastError))
 			batch.LastError = &message
 		}
-		items[i].Acknowledgeable = false
+		if record.OwnsRequest {
+			items[i].Acknowledgeable = false
+		}
 		items[i].RemovalBatch = batch
 	}
 	return nil

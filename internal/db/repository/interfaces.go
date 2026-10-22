@@ -338,7 +338,6 @@ type StorageCleanupRepository interface {
 	BindTask(ctx context.Context, contentID, generation, taskID int64) error
 	TransferTaskOwner(ctx context.Context, contentID, generation, oldTaskID, newTaskID int64) error
 	AuthorizeTask(ctx context.Context, contentID, generation, taskID int64) ([]model.StorageCleanupCopy, error)
-	MarkCopyRemoved(ctx context.Context, id int64) error
 	MarkCopyUnsupported(ctx context.Context, id int64, message string) error
 	UploadHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
 	CleanupHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
@@ -351,10 +350,7 @@ type StorageCleanupRepository interface {
 type StorageRemovalRepository interface {
 	GetRemovalRequest(context.Context, string) (*storageremoval.Request, error)
 	ListRemovalMembers(context.Context, string) ([]model.StorageCleanupCopy, error)
-	LatestExposedSend(context.Context, string) (*storageremoval.Send, error)
-	LatestPossiblyAcceptedSend(context.Context, string) (*storageremoval.Send, error)
 	ListRemovalSends(context.Context, string) ([]storageremoval.Send, error)
-	ListRemovalSendPieces(context.Context, string, int) ([]storageremoval.SendPiece, error)
 	ListRemovalBatchesForTasks(context.Context, []int64) ([]storageremoval.TaskBatch, error)
 	JoinOrCreateCollecting(context.Context, JoinRemovalInput) (*storageremoval.Request, error)
 	SealRemovalRequest(context.Context, SealRemovalInput) error

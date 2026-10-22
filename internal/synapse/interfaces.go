@@ -59,7 +59,6 @@ type DataSetTarget interface {
 
 // CleanupContext abstracts the SDK operations needed to remove PDP pieces.
 type CleanupContext interface {
-	DeletePieceByID(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error)
 	DeletePiecesByID(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error)
 }
 
@@ -75,9 +74,8 @@ type StorageClient interface {
 	OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (DataSetTarget, error)
 	FindMatchingDataSet(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
 	OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error)
-	// DeletionState reads exact piece or data-set cleanup evidence at one block.
+	// DeletionStates reads exact piece or data-set cleanup evidence at one block.
 	// Removed data sets require the caller's recorded creation identity.
-	DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error)
 	DeletionStates(ctx context.Context, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (CleanupPiecesState, error)
 	ProviderPiecesKnown(ctx context.Context, serviceURL string, dataSetID sdktypes.BigInt, pieceIDs []sdktypes.BigInt) (ProviderPiecesState, error)
 }

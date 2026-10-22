@@ -856,10 +856,6 @@ type testCleanupContext struct {
 	deletePieces func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error)
 }
 
-func (c testCleanupContext) DeletePieceByID(ctx context.Context, pieceID sdktypes.BigInt) (*sdktypes.WriteResult, error) {
-	return c.deletePiece(ctx, pieceID)
-}
-
 func (c testCleanupContext) DeletePiecesByID(ctx context.Context, pieceIDs []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 	if c.deletePieces != nil {
 		return c.deletePieces(ctx, pieceIDs)

@@ -25,6 +25,8 @@ func (s *StorageServiceAdapter) ProviderPiecesKnown(ctx context.Context, service
 	if err != nil || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return ProviderPiecesState{}, errors.New("invalid provider service URL")
 	}
+	ctx, cancel := context.WithTimeout(ctx, storeControlTimeout)
+	defer cancel()
 	base = cloneUploadBaseURL(base)
 	client := s.providerHTTP
 	if client == nil {

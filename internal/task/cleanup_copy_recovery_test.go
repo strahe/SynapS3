@@ -8,10 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storageremoval"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
@@ -111,28 +115,75 @@ func TestCleanupEnqueuesHealthyCopiesBeforeFailAndReauthorizesOnRetry(t *testing
 }
 
 func TestCleanupRetryPreservesPaidEvidenceAndAdoptsIt(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
-	content, source := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusFailed)
-	hash := common.HexToHash("0x555").Hex()
-	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).Set("delete_tx_hash = ?", hash).Set("last_error = ?", "unconfirmed removal").Where("content_id = ?", content.ID).Exec(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	source = runOneStorageTask(t, runtime, source, model.TaskStatusFailed)
-	next, err := runtime.service.Retry(t.Context(), source.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runOneStorageTask(t, runtime, next, model.TaskStatusPending)
-	var copyRow model.StorageCleanupCopy
-	if err := runtime.db.NewSelect().Model(&copyRow).Where("content_id = ?", content.ID).Scan(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if copyRow.DeleteTxHash == nil || *copyRow.DeleteTxHash != hash || copyRow.RemovalRequestID == nil || copyRow.LastError == nil || *copyRow.LastError != "unconfirmed removal" {
-		t.Fatalf("manual retry cleared paid evidence: %#v", copyRow)
-	}
-	sends, err := runtime.repos.StorageRemoval.ListRemovalSends(t.Context(), *copyRow.RemovalRequestID)
-	if err != nil || len(sends) != 1 || sends[0].TxHash == nil || *sends[0].TxHash != hash {
-		t.Fatalf("manual retry did not adopt paid evidence: %#v, %v", sends, err)
+	for _, scheduled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("scheduled=%t", scheduled), func(t *testing.T) {
+			var calls atomic.Int64
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					return testCleanupContext{deletePieces: func(context.Context, []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+						calls.Add(1)
+						return nil, removalUnknownError()
+					}}, nil
+				}},
+				deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					return synapse.CleanupPieceState{Status: synapse.CleanupPiecePresent, BlockNumber: 100}, nil
+				},
+				receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
+					return nil, ethereum.NotFound
+				}},
+			})
+			content, source := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusFailed)
+			hash := common.HexToHash("0x555").Hex()
+			var scheduledAt *time.Time
+			if scheduled {
+				at := time.Now().UTC().Truncate(time.Microsecond)
+				scheduledAt = &at
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).Set("delete_tx_hash = ?", hash).Set("scheduled_at = ?", scheduledAt).Set("last_error = ?", "unconfirmed removal").Where("content_id = ?", content.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			source = runOneStorageTask(t, runtime, source, model.TaskStatusFailed)
+			next, err := runtime.service.Retry(t.Context(), source.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+			var copyRow model.StorageCleanupCopy
+			if err := runtime.db.NewSelect().Model(&copyRow).Where("content_id = ?", content.ID).Scan(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if copyRow.DeleteTxHash == nil || *copyRow.DeleteTxHash != hash || copyRow.RemovalRequestID == nil || copyRow.LastError == nil || *copyRow.LastError != "unconfirmed removal" {
+				t.Fatalf("manual retry cleared paid evidence: %#v", copyRow)
+			}
+			sends, err := runtime.repos.StorageRemoval.ListRemovalSends(t.Context(), *copyRow.RemovalRequestID)
+			if err != nil || len(sends) != 1 || sends[0].TxHash == nil || *sends[0].TxHash != hash || sends[0].AttemptedAt != nil {
+				t.Fatalf("manual retry did not adopt paid evidence: %#v, %v", sends, err)
+			}
+			request, err := runtime.repos.StorageRemoval.GetRemovalRequest(t.Context(), *copyRow.RemovalRequestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scheduledAt != nil && (request.SealedAt == nil || !request.SealedAt.Equal(*scheduledAt)) {
+				t.Fatalf("adoption lost scheduling time: %#v", request)
+			}
+			row, err := runtime.repos.Tasks.GetByID(t.Context(), *request.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := &removalFixture{runtime: runtime, request: request, row: row}
+			f.step(t, model.TaskStatusPending)
+			if calls.Load() != 0 || f.row.RetryCount != 0 || len(f.sends(t)) != 1 {
+				t.Fatalf("hash-only evidence resent before policy deadline: task=%#v calls=%d", f.row, calls.Load())
+			}
+			if _, err := runtime.db.NewUpdate().Model((*storageremoval.Request)(nil)).Set("sealed_at = ?", time.Now().Add(-time.Hour)).Where("request_id = ?", request.RequestID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			f.send(t)
+			sends = f.sends(t)
+			if calls.Load() != 1 || len(sends) != 2 || sends[0].AttemptedAt != nil || sends[0].TxHash == nil || *sends[0].TxHash != hash || f.row.RetryCount != 0 {
+				t.Fatalf("hash-only recovery changed evidence or spent an unused attempt: task=%#v sends=%#v calls=%d", f.row, sends, calls.Load())
+			}
+		})
 	}
 }
 

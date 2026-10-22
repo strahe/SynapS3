@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/strahe/synapse-go/pdp"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -67,6 +70,42 @@ func TestProviderPiecesKnownAllNotFoundRetainsFallbackEvidence(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || len(result.Unknown) != 0 {
 		t.Fatalf("interrupted observation = %#v, err=%v", result, err)
 	}
+}
+
+func TestProviderPiecesKnownBoundsTotalObservationTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		adapter := &StorageServiceAdapter{providerHTTP: &http.Client{Transport: uploadProbeTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			switch calls {
+			case 1:
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"pieceId":7}`))}, nil
+			case 2:
+				time.Sleep(storeControlTimeout / 2)
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("database unavailable"))}, nil
+			default:
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			}
+		})}}
+		started := time.Now()
+		result, err := adapter.ProviderPiecesKnown(t.Context(), "https://provider.test", sdktypes.NewBigInt(11), []sdktypes.BigInt{
+			sdktypes.NewBigInt(7), sdktypes.NewBigInt(8), sdktypes.NewBigInt(9), sdktypes.NewBigInt(10),
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) != storeControlTimeout || calls != 3 {
+			t.Fatalf("observation elapsed=%s calls=%d err=%v", time.Since(started), calls, err)
+		}
+		if len(result.Known) != 1 || result.Known[0].String() != "7" || len(result.Unknown) != 0 || len(result.Errors) != 2 {
+			t.Fatalf("partial observations = %#v", result)
+		}
+		var responseErr *pdp.HTTPError
+		if !errors.As(result.Errors["8"], &responseErr) || responseErr.StatusCode != http.StatusServiceUnavailable || !strings.Contains(responseErr.Body, "database unavailable") {
+			t.Fatalf("provider diagnostic = %v", result.Errors["8"])
+		}
+		if !errors.Is(result.Errors["9"], context.DeadlineExceeded) {
+			t.Fatalf("interrupted piece diagnostic = %v", result.Errors["9"])
+		}
+	})
 }
 
 func TestClassifyRemovalRejection(t *testing.T) {

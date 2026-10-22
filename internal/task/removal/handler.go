@@ -289,8 +289,12 @@ func (h *Handler) execute(ctx context.Context, execution taskengine.Execution) t
 	}
 	if len(r.sends) > 0 && request.Status == storageremoval.RequestStatusSubmitted {
 		latest := r.sends[len(r.sends)-1]
-		if latest.AttemptedAt != nil {
-			deadline, err := execution.ResendAt(*latest.AttemptedAt, len(r.sends))
+		attemptedAt := latest.AttemptedAt
+		if attemptedAt == nil {
+			attemptedAt = request.SealedAt
+		}
+		if attemptedAt != nil {
+			deadline, err := execution.ResendAt(*attemptedAt, len(r.sends))
 			if err != nil {
 				return taskengine.Fail(err, "removal_policy_invalid", nil)
 			}
@@ -298,14 +302,6 @@ func (h *Handler) execute(ctx context.Context, execution taskengine.Execution) t
 				return h.confirmationWait(ctx, r)
 			}
 		}
-		if execution.Mode() != model.TaskResumeModeExecute {
-			return h.retrySend(r, errors.New("removal not confirmed yet; sending again"), nil)
-		}
-	} else if execution.Mode() != model.TaskResumeModeExecute {
-		if len(r.sends) > 0 {
-			return h.retrySend(r, errors.New("sending removal again"), nil)
-		}
-		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Remote removal is ready", nil)
 	}
 	row, err := h.deps.Repositories.Tasks.GetByID(ctx, execution.ID())
 	if err != nil {
@@ -317,6 +313,9 @@ func (h *Handler) execute(ctx context.Context, execution taskengine.Execution) t
 	}
 	if runtime.OperationKey == "removal:"+input.RequestID && runtime.LastAdmittedAttempt >= row.RetryCount+1 {
 		return h.retrySend(r, errors.New("sending removal again"), nil)
+	}
+	if execution.Mode() != model.TaskResumeModeExecute {
+		return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Remote removal is ready", nil)
 	}
 	return h.send(ctx, r)
 }
@@ -609,7 +608,15 @@ func (h *Handler) retrySend(r run, err error, settlement taskengine.Settlement) 
 				return err
 			}
 		}
-		return repos.StorageRemoval.SetRemovalAttention(ctx, repository.RemovalAttentionInput{RequestID: r.input.RequestID, TaskID: r.execution.ID(), Code: storageremoval.AttentionProviderUnreachable, Message: errtext.Format(err)})
+		sends, readErr := repos.StorageRemoval.ListRemovalSends(ctx, r.input.RequestID)
+		if readErr != nil {
+			return readErr
+		}
+		code := storageremoval.AttentionProviderUnreachable
+		if slices.ContainsFunc(sends, storageremoval.Send.InFlight) {
+			code = storageremoval.AttentionConfirmationTimeout
+		}
+		return repos.StorageRemoval.SetRemovalAttention(ctx, repository.RemovalAttentionInput{RequestID: r.input.RequestID, TaskID: r.execution.ID(), Code: code, Message: errtext.Format(err)})
 	})
 }
 

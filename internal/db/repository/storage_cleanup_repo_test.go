@@ -502,8 +502,8 @@ func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositor
 	return db, repos, version, secondCopy
 }
 
-func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {
-	f := newRemovalFixture(t, 3)
+func TestStorageCleanupReauthorizationIsGuardedAndPreservesEvidence(t *testing.T) {
+	f := newRemovalFixture(t, 1)
 	ctx := t.Context()
 	at := time.Now().UTC().Truncate(time.Microsecond)
 	if _, err := f.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
@@ -527,23 +527,5 @@ func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {
 	}
 	if retrying.Status != model.StorageCleanupCopyStatusPending || retrying.DeleteTxHash == nil || *retrying.DeleteTxHash != "retained-hash" || retrying.LastError == nil || *retrying.LastError != "confirmed rejected" || retrying.ScheduledAt == nil || !retrying.ScheduledAt.Equal(at) {
 		t.Fatalf("reauthorized copy lost evidence: %#v", retrying)
-	}
-	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[0].ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[0].ID); err != nil {
-		t.Fatalf("removed replay = %v", err)
-	}
-	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[1].ID); err != nil {
-		t.Fatalf("remove pending = %v", err)
-	}
-	if err := f.repos.StorageCleanup.MarkCopyUnsupported(ctx, f.rows[2].ID, "unsupported"); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, f.rows[2].ID); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("remove unsupported = %v, want ErrConflict", err)
-	}
-	if err := f.repos.StorageCleanup.MarkCopyRemoved(ctx, 999999); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("remove missing = %v, want ErrNotFound", err)
 	}
 }
