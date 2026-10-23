@@ -78,6 +78,7 @@ type handlerTestRuntime struct {
 	testMaxAttempts       *int
 	testDependencyRetries *int
 	testBackoff           *taskengine.BackoffPolicy
+	settlementRetryWait   func(context.Context, int64, int64, time.Duration) error
 	schedules             []taskengine.ScheduleDefinition
 }
 
@@ -113,6 +114,7 @@ type handlerRuntimeOptions struct {
 	maxAttempts               *int
 	dependencyRetries         *int
 	testBackoff               *taskengine.BackoffPolicy
+	settlementRetryWait       func(context.Context, int64, int64, time.Duration) error
 	leaseDuration             time.Duration
 	observabilityChecker      observability.RefreshChecker
 	retireOnly                bool
@@ -221,6 +223,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
+		SettlementRetryWait: options.settlementRetryWait,
 	}, repos, registry, slog.Default())
 	if err != nil {
 		t.Fatalf("new task engine: %v", err)
@@ -229,9 +232,11 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		db: db, repos: repos, cache: cacheStore, gate: gate, tracker: tracker,
 		storage: storageClient, ready: ready, entryPoints: entryPoints, registry: registry, service: service, retries: retries, engine: engine, testMaxAttempts: options.maxAttempts,
 		testBackoff: options.testBackoff, testDependencyRetries: options.dependencyRetries,
+		settlementRetryWait: options.settlementRetryWait,
 	}
 	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{
 		Concurrency: concurrency, PollInterval: handlerTestPollInterval, LeaseDuration: leaseDuration,
+		SettlementRetryWait: options.settlementRetryWait,
 	}, repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatalf("new task engine with test policies: %v", err)

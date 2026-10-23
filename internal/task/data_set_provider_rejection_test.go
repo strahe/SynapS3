@@ -49,6 +49,7 @@ func TestDataSetCreationErrorsUseFiniteBudgetAndPreserveRequest(t *testing.T) {
 		{name: "success belongs to another request", wrongResult: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			sequence := storedObjectSequence.Add(1)
 			providerID := testOnChainID(t, 51000+sequence)
 			var creates atomic.Int64

@@ -65,7 +65,8 @@ func TestCacheCapacityCompletionPreservesDemandUntilArchiveCommits(t *testing.T)
 	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyAfterUpload} {
 		t.Run(string(policy), func(t *testing.T) {
 			checkpoint := json.RawMessage(`{"cycle_active":true,"refused_write_bytes":20}`)
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: policy, maxBytes: 100, highPercent: 90, lowPercent: 60, commitSealOnCachePressure: policy == cache.EvictionPolicyAfterUpload})
+			retries := newSettlementRetryController()
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{settlementRetryWait: retries.wait, policy: policy, maxBytes: 100, highPercent: 90, lowPercent: 60, commitSealOnCachePressure: policy == cache.EvictionPolicyAfterUpload})
 			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
 				t.Fatal(err)
@@ -83,11 +84,13 @@ func TestCacheCapacityCompletionPreservesDemandUntilArchiveCommits(t *testing.T)
 			case <-time.After(3 * time.Second):
 				t.Fatal("capacity completion did not reach the archive fault")
 			}
+			allowRetry := retries.next(t, planner.ID, planner.ClaimGeneration+1, time.Second)
 			current, err := runtime.repos.Tasks.GetByID(t.Context(), planner.ID)
 			if err != nil || current.Status != model.TaskStatusRunning || !testutil.JSONEqual(current.Checkpoint, checkpoint) {
 				t.Fatalf("uncommitted completion lost demand: %#v, err=%v", current, err)
 			}
 			restoreRejectCapacityArchive()
+			allowRetry()
 			completed := waitForTask(t, runtime.repos, planner.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted })
 			var cp struct {
 				CycleActive       bool  `json:"cycle_active"`
@@ -109,7 +112,8 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 		{"disabled", cache.EvictionPolicyNone},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			runtime := newScheduledCapacityRuntime(t, handlerRuntimeOptions{policy: tc.policy, maxBytes: 100, highPercent: 90, lowPercent: 60})
+			retries := newSettlementRetryController()
+			runtime := newScheduledCapacityRuntime(t, handlerRuntimeOptions{settlementRetryWait: retries.wait, policy: tc.policy, maxBytes: 100, highPercent: 90, lowPercent: 60})
 			const key = "capacity-policy"
 			source, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {
@@ -139,11 +143,13 @@ func TestCacheCapacityHealthyCycleClearsPreviousFailureOnce(t *testing.T) {
 			if err != nil || unsettled == nil || unsettled.Status != model.TaskStatusRunning || !strings.Contains(string(unsettled.Checkpoint), `"previous_cycle_failed": true`) {
 				t.Fatalf("uncommitted healthy completion lost failure evidence: %#v, err=%v", unsettled, err)
 			}
+			allowRetry := retries.next(t, unsettled.ID, unsettled.ClaimGeneration, time.Second)
 			previous, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
 			if err != nil || previous == nil || previous.Status != model.TaskStatusFailed || previous.SupersededAt != nil {
 				t.Fatalf("uncommitted healthy completion hid the previous failure: %#v, err=%v", previous, err)
 			}
 			restoreRejectHealthyCapacityArchive()
+			allowRetry()
 			waitForTask(t, runtime.repos, source.ID, func(row *model.Task) bool { return row.SupersededAt != nil })
 			completed, err := runtime.repos.Tasks.GetByIdentity(t.Context(), model.TaskTypeCacheCapacityReconcile, "system", "cache-capacity", 2)
 			if err != nil || completed == nil || completed.Status != model.TaskStatusCompleted || strings.Contains(string(completed.Checkpoint), "previous_cycle_failed") {
@@ -297,7 +303,7 @@ func newScheduledCapacityRuntime(t *testing.T, options handlerRuntimeOptions) ha
 	}
 	runtime.registry, runtime.service = registry, service
 	runtime.schedules = []taskengine.ScheduleDefinition{schedule}
-	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
+	runtime.engine, err = taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, SettlementRetryWait: options.settlementRetryWait}, runtime.repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,10 +343,10 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 				if err := runtime.repos.CacheEvictions.BindEvictionTask(t.Context(), *version.ContentID, reservation.Generation, source.ID); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "test_eviction_failed").Set("finished_at = ?", time.Now()).Where("id = ?", source.ID).Exec(t.Context()); err != nil {
-					t.Fatal(err)
-				}
 				failures = append(failures, source.ID)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).Set("failure_reason = ?", "test_eviction_failed").Set("finished_at = ?", time.Now()).Where("id IN (?)", bun.List(failures)).Exec(t.Context()); err != nil {
+				t.Fatal(err)
 			}
 			planner, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{Type: model.TaskTypeCacheCapacityReconcile, Input: taskengine.CycleInput{Cycle: 1}})
 			if err != nil {

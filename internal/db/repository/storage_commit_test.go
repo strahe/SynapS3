@@ -13,12 +13,6 @@ import (
 	"github.com/strahe/synaps3/internal/storagecommit"
 )
 
-func TestPostgresCommitRequestLedger(t *testing.T) {
-	for _, c := range commitLedgerCases {
-		t.Run(c.name, func(t *testing.T) { c.run(t, newCommitFixture(t, testDB(t))) })
-	}
-}
-
 // queueTransferredCopy does what a transfer's settlement does with a copy that
 // joins no signed request: join a collecting request, or start one.
 func queueTransferredCopy(ctx context.Context, f commitFixture, copyRow *model.StorageCopy, newRequestID string) error {

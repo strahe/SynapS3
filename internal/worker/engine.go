@@ -22,6 +22,9 @@ type EngineConfig struct {
 	PollInterval  time.Duration
 	LeaseDuration time.Duration
 	OnTaskSettled func(*model.Task, repository.TaskTransition)
+	// SettlementRetryWait overrides waiting after the claim's lease is renewed.
+	// A nil callback uses lease-preserving waits with the engine's retry schedule.
+	SettlementRetryWait func(context.Context, int64, int64, time.Duration) error
 }
 
 // Engine is the only task claimant and lease owner.
@@ -589,6 +592,9 @@ func (e *Engine) notifyTaskSettled(claimed *model.Task, transition repository.Ta
 func (e *Engine) waitSettlementRetry(ctx context.Context, claimed *model.Task, delay time.Duration) error {
 	if _, err := e.repos.Tasks.RenewLease(ctx, claimed.ID, claimed.ClaimGeneration, e.config.LeaseDuration); err != nil {
 		return err
+	}
+	if e.config.SettlementRetryWait != nil {
+		return e.config.SettlementRetryWait(ctx, claimed.ID, claimed.ClaimGeneration, delay)
 	}
 	deadline := time.Now().Add(delay)
 	interval := minDuration(30*time.Second, e.config.LeaseDuration/3)

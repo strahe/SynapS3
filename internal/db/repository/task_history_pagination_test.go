@@ -51,7 +51,7 @@ func TestTaskIdentityLookupUsesIdentityIndex(t *testing.T) {
 	if _, err := db.NewInsert().Model(&live).Exec(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(t.Context(), "ANALYZE"); err != nil {
+	if _, err := db.ExecContext(t.Context(), "ANALYZE tasks"); err != nil {
 		t.Fatal(err)
 	}
 	capture := new(taskHistoryQueries)

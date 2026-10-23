@@ -148,6 +148,7 @@ func TestProviderSelectionShortagesWaitWithoutConsumingBudget(t *testing.T) {
 	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
 		for _, scenario := range []string{"approved", "endorsed", "none", "existing trusted", "inactive", "missing PDP", "ordinary shortage", "speed tests"} {
 			t.Run(string(taskType)+"/"+scenario, func(t *testing.T) {
+				t.Parallel()
 				tier := providerselect.TierApproved
 				switch scenario {
 				case "endorsed":
@@ -835,6 +836,7 @@ func TestBucketProvisionDistinguishesMissingTierFromReadFailure(t *testing.T) {
 }
 
 func TestBucketProvisionReplansWhenAnotherBindingTakesTheSlot(t *testing.T) {
+	retries := newSettlementRetryController()
 	var runtime handlerTestRuntime
 	var bucket *model.Bucket
 	selectedID, competingID := sdktypes.NewBigInt(202), sdktypes.NewBigInt(303)
@@ -852,6 +854,7 @@ func TestBucketProvisionReplansWhenAnotherBindingTakesTheSlot(t *testing.T) {
 	}}
 	runtime = newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: client, providerTier: providerselect.TierNone,
+		settlementRetryWait: retries.wait,
 	})
 	seedProviderSelection(t, runtime, selectedID)
 	bucket = &model.Bucket{Name: "conflicting-slot", Status: model.BucketStatusProvisioning, DefaultCopies: 1, MinimumDurableCopies: 1}
@@ -868,6 +871,7 @@ func TestBucketProvisionReplansWhenAnotherBindingTakesTheSlot(t *testing.T) {
 	}
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
+	retries.allowRetries(t, row.ID, row.ClaimGeneration+1)
 	waitForTask(t, runtime.repos, row.ID, func(row *model.Task) bool { return row.Status == model.TaskStatusCompleted }, 15*time.Second)
 	stopHandlerEngine(t, cancel, done)
 	bindings, err := runtime.repos.Contents.ListDataSetBindings(ctx, bucket.ID)
@@ -951,6 +955,7 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 	for _, taskType := range []model.TaskType{model.TaskTypeBucketProvision, model.TaskTypeUploadPlan} {
 		t.Run(string(taskType), func(t *testing.T) {
 			t.Parallel()
+			retries := newSettlementRetryController()
 			ctx := t.Context()
 			trustedID, selectedID, replacementID := testOnChainID(t, 101), testOnChainID(t, 202), testOnChainID(t, 303)
 			var runtime handlerTestRuntime
@@ -958,7 +963,8 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			var source *model.StorageDataSet
 			var authorized atomic.Bool
 			runtime = newHandlerTestRuntime(t, handlerRuntimeOptions{
-				providerTier: providerselect.TierApproved,
+				providerTier:        providerselect.TierApproved,
+				settlementRetryWait: retries.wait,
 
 				storage: &testutil.MockStorageClient{
 					OpenProviderTargetFunc: func(_ context.Context, id sdktypes.BigInt, _ storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
@@ -1034,7 +1040,9 @@ func TestWorkerBindingSelectionRechecksUnfinishedReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			replanned := runStorageTaskClaims(t, runtime, row, model.TaskStatusPending, 2, 15*time.Second)
+			replanned := runStorageTaskClaimsAfterStart(t, runtime, row, model.TaskStatusPending, 2, func() {
+				retries.allowRetries(t, row.ID, row.ClaimGeneration+1)
+			}, 15*time.Second)
 			if replanned.ClaimGeneration != 2 || replanned.WaitReason == nil || *replanned.WaitReason != "providers" || replanned.RetryCount != 0 || replanned.LastError != nil {
 				t.Fatalf("task did not wait after replanning: %#v", replanned)
 			}
