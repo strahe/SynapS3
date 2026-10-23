@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +30,21 @@ import (
 // parallel stay well below the server's connection limit.
 const testDBMaxOpenConns = 8
 
+var testDBTemplate = sync.OnceValues(func() (*testpg.Template, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	return testpg.NewTemplate(ctx, func(ctx context.Context, config *pgx.ConnConfig) (result error) {
+		db := bun.NewDB(stdlib.OpenDB(*config), pgdialect.New())
+		defer func() { result = errors.Join(result, db.Close()) }()
+		migrator := migrations.NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			return err
+		}
+		_, err := migrator.Migrate(ctx)
+		return err
+	})
+})
+
 // StorageChecksum turns a readable fixture identity into the canonical
 // lowercase SHA-256 representation required by storage_contents.
 func StorageChecksum(identity string) string {
@@ -40,13 +57,19 @@ func StorageChecksum(identity string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// NewTestDB creates a private PostgreSQL schema with all migrations applied.
-// The connections close and the schema is dropped when the test completes.
+// NewTestDB clones this process's migrated template into a private database.
+// Its connections close and the database is dropped when the test completes.
 func NewTestDB(t *testing.T) *bun.DB {
 	t.Helper()
-	config, err := pgx.ParseConfig(testpg.SchemaDSN(t))
+	template, err := testDBTemplate()
 	if err != nil {
-		t.Fatalf("parse PostgreSQL DSN: %v", err)
+		t.Fatalf("initialize PostgreSQL test template: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	config, drop, err := template.Clone(ctx)
+	if err != nil {
+		t.Fatalf("clone PostgreSQL test database: %v", err)
 	}
 	sqldb := stdlib.OpenDB(*config)
 	sqldb.SetMaxOpenConns(testDBMaxOpenConns)
@@ -55,15 +78,12 @@ func NewTestDB(t *testing.T) *bun.DB {
 		if err := db.Close(); err != nil {
 			t.Errorf("close PostgreSQL test database: %v", err)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := drop(ctx); err != nil {
+			t.Errorf("drop PostgreSQL test database: %v", err)
+		}
 	})
-	ctx := context.Background()
-	migrator := migrations.NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
 	return db
 }
 

@@ -741,18 +741,26 @@ func runOneStorageTask(t *testing.T, runtime handlerTestRuntime, row *model.Task
 
 func runStorageTaskClaims(t *testing.T, runtime handlerTestRuntime, row *model.Task, status model.TaskStatus, claims int64, timeout ...time.Duration) *model.Task {
 	t.Helper()
+	return runStorageTaskClaimsAfterStart(t, runtime, row, status, claims, nil, timeout...)
+}
+
+func runStorageTaskClaimsAfterStart(t *testing.T, runtime handlerTestRuntime, row *model.Task, status model.TaskStatus, claims int64, afterStart func(), timeout ...time.Duration) *model.Task {
+	t.Helper()
 	var excluded []int64
 	if err := runtime.db.NewSelect().Model((*model.Task)(nil)).Column("id").Where("id <> ?", row.ID).Scan(t.Context(), &excluded); err != nil {
 		t.Fatal(err)
 	}
 	repos := *runtime.repos
 	repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: claims, excludedTaskIDs: excluded}
-	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration}, &repos, handlerExecutionRegistry(t, runtime), slog.Default())
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration, SettlementRetryWait: runtime.settlementRetryWait}, &repos, handlerExecutionRegistry(t, runtime), slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancel, done := runEngine(t, engine)
 	defer stopHandlerEngine(t, cancel, done)
+	if afterStart != nil {
+		afterStart()
+	}
 	return waitForTask(t, runtime.repos, row.ID, func(current *model.Task) bool {
 		return current.ClaimGeneration >= row.ClaimGeneration+claims && current.Status == status
 	}, timeout...)

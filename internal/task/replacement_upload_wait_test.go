@@ -39,7 +39,12 @@ func (r *activateAfterUploadSelection) SourceEligibility(ctx context.Context, id
 func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 	for _, stage := range []string{"after suspension", "before suspension settlement", "failed replacement"} {
 		t.Run(stage, func(t *testing.T) {
-			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{OpenDataSetTargetFunc: func(_ context.Context, id sdktypes.BigInt, _ storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+			var retryWait func(context.Context, int64, int64, time.Duration) error
+			retries := newSettlementRetryController()
+			if stage == "before suspension settlement" {
+				retryWait = retries.wait
+			}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{settlementRetryWait: retryWait, storage: &testutil.MockStorageClient{OpenDataSetTargetFunc: func(_ context.Context, id sdktypes.BigInt, _ storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
 				return &testutil.MockStorageTarget{ProviderIDValue: sdktypes.NewBigInt(202), DataSetIDValue: &id, ClientDataSetIDValue: sdktypes.NewBigInt(909)}, nil
 			}}})
 			ctx := t.Context()
@@ -88,6 +93,9 @@ func TestUploadPlansResumeWhenLocalReplacementTakesTheSlot(t *testing.T) {
 			}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer func() { stopHandlerEngine(t, cancel, done) }()
+			if stage == "before suspension settlement" {
+				retries.allowRetries(t, upload.ID, upload.ClaimGeneration+1)
+			}
 			if stage == "failed replacement" {
 				waiting := waitForTask(t, runtime.repos, upload.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusPending && task.WaitReason != nil })
 				if *waiting.WaitReason != "replacement" || waiting.StatusMessage == nil || *waiting.StatusMessage != "Storage replacement needs attention. Check it on the bucket page." {

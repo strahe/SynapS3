@@ -33,8 +33,12 @@ class GoCacheKeyTest(unittest.TestCase):
             "Makefile": "test:\n\tgo test -trimpath ./...\n",
             ".github/actions/setup-go/action.yml": "name: Setup\n",
             ".github/actions/save-go-cache/action.yml": "name: Save\n",
+            ".github/actions/s3-compatibility/action.yml": "name: S3\n",
+            ".github/actions/docs-build/action.yml": "name: Docs\n",
             ".github/workflows/ci.yml": "name: CI\n",
             ".github/workflows/s3-compatibility.yml": "name: S3 Compatibility\n",
+            ".github/workflows/docker.yml": "name: Docker\n",
+            "scripts/ci_plan.py": "# CI execution\n",
             "scripts/go_cache_key.py": "# cache identity\n",
             "README.md": "Project documentation\n",
         }
@@ -76,9 +80,10 @@ class GoCacheKeyTest(unittest.TestCase):
             "cmd/server/main.go", "internal/db/migrations/001.sql",
             "internal/server/testdata/example.bin", "tests/systemtest/fixture.json",
             "ui/embed.go", "Makefile", ".github/actions/setup-go/action.yml",
-            ".github/actions/save-go-cache/action.yml", ".github/workflows/ci.yml",
-            ".github/workflows/s3-compatibility.yml",
-            "scripts/go_cache_key.py",
+            ".github/actions/save-go-cache/action.yml", ".github/actions/s3-compatibility/action.yml",
+            ".github/actions/docs-build/action.yml", ".github/workflows/ci.yml",
+            ".github/workflows/s3-compatibility.yml", ".github/workflows/docker.yml",
+            "scripts/ci_plan.py", "scripts/go_cache_key.py",
         ):
             with self.subTest(path=relative):
                 original = self.keys()
@@ -113,6 +118,18 @@ class GoCacheKeyTest(unittest.TestCase):
         self.assertNotEqual(verify_prefixes[0], system_prefixes[0])
         self.assertEqual(verify_prefixes[1], system_prefixes[1])
         self.assertEqual(verify["modules-primary-key"], system["modules-primary-key"])
+
+    def test_cache_paths_preserve_identity_and_default_race_path(self):
+        normal = self.keys(writer="verify")
+        race = self.keys(profile="race", writer="race")
+        alternate = dict(self.go_env, GOCACHE="/cache/normal-snapshot", GOMODCACHE="/cache/shared-modules")
+        moved = self.keys(go_env=alternate)
+        self.assertEqual(moved["build-primary-key"], normal["build-primary-key"])
+        self.assertEqual(moved["build-restore-keys"], normal["build-restore-keys"])
+        self.assertEqual(moved["modules-primary-key"], normal["modules-primary-key"])
+        self.assertEqual(normal["gocache"], race["gocache"])
+        self.assertEqual(normal["gomodcache"], race["gomodcache"])
+        self.assertEqual(race["build-primary-key"].split("-")[-2], "race")
 
     def test_environment_and_race_cannot_restore_normal_host_archives(self):
         normal = self.keys()

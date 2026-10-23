@@ -1,11 +1,9 @@
-// Package testpg provides isolated PostgreSQL schemas for tests and the
-// system-test server.
+// Package testpg provides isolated PostgreSQL schemas and migrated template
+// databases for tests and the system-test server.
 package testpg
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -32,12 +30,12 @@ var (
 	closeErr  error
 )
 
-// Main runs a package's tests and then terminates the container this process
-// started. Call it from TestMain.
+// Main runs a package's tests, cleans up this process's registered databases
+// and schemas, then terminates its own container. Call it from TestMain.
 func Main(m *testing.M) {
 	code := m.Run()
 	if err := Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "clean up PostgreSQL test container: %v\n", err)
+		fmt.Fprintf(os.Stderr, "clean up PostgreSQL test resources: %v\n", err)
 		code = 1
 	}
 	os.Exit(code)
@@ -56,17 +54,22 @@ func DSN(t *testing.T) string {
 // BaseDSN returns SYNAPS3_POSTGRES_TEST_DSN when set; otherwise it starts one
 // PostgreSQL container per process.
 func BaseDSN() (string, error) {
-	startOnce.Do(initialize)
+	return BaseDSNContext(context.Background())
+}
+
+// BaseDSNContext initializes this process's PostgreSQL service within ctx.
+func BaseDSNContext(ctx context.Context) (string, error) {
+	startOnce.Do(func() { initialize(ctx) })
 	return baseDSN, startErr
 }
 
-func initialize() {
+func initialize(parent context.Context) {
 	defer func() {
 		if cause := recover(); cause != nil {
 			startErr = fmt.Errorf("start PostgreSQL: %v", cause)
 		}
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
 	baseDSN = os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
 	if baseDSN == "" {
@@ -85,7 +88,7 @@ func initialize() {
 			return
 		}
 	}
-	config, err := pgx.ParseConfig(baseDSN)
+	config, err := parseTestConfig(baseDSN)
 	if err != nil {
 		startErr = err
 		return
@@ -124,30 +127,30 @@ func SchemaDSN(t *testing.T) string {
 // and returns a DSN whose connections use it. Close every connection to the
 // returned DSN before calling drop.
 func CreateSchema(ctx context.Context, dsn string) (string, func(context.Context) error, error) {
-	config, err := pgx.ParseConfig(dsn)
+	config, err := parseTestConfig(dsn)
 	if err != nil {
 		return "", nil, fmt.Errorf("parse PostgreSQL DSN: %w", err)
 	}
 	admin := stdlib.OpenDB(*config)
 	admin.SetMaxOpenConns(1)
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
+	schema, err := newResourceName('s')
+	if err != nil {
 		return "", nil, errors.Join(fmt.Errorf("generate PostgreSQL schema name: %w", err), admin.Close())
 	}
-	schema := "test_" + hex.EncodeToString(random[:])
 	name := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+name); err != nil {
-		return "", nil, errors.Join(fmt.Errorf("create PostgreSQL test schema: %w", err), admin.Close())
-	}
-	drop := func(ctx context.Context) error {
-		var dropErr error
-		if _, err := admin.ExecContext(ctx, "DROP SCHEMA "+name+" CASCADE"); err != nil {
-			dropErr = fmt.Errorf("drop PostgreSQL test schema: %w", err)
+	drop := registerResource(schema, func(ctx context.Context) error {
+		if _, err := admin.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+name+" CASCADE"); err != nil {
+			return fmt.Errorf("drop PostgreSQL test schema: %w", err)
 		}
 		if err := admin.Close(); err != nil {
-			dropErr = errors.Join(dropErr, fmt.Errorf("close PostgreSQL schema connection: %w", err))
+			return fmt.Errorf("close PostgreSQL schema connection: %w", err)
 		}
-		return dropErr
+		return nil
+	})
+	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+name); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		return "", nil, errors.Join(fmt.Errorf("create PostgreSQL test schema: %w", err), drop(cleanupCtx))
 	}
 	return withSchema(dsn, schema), drop, nil
 }
@@ -163,13 +166,17 @@ func withSchema(dsn, schema string) string {
 	return dsn + " search_path=" + schema
 }
 
-// Close terminates only the container created by this process. Call after m.Run.
+// Close cleans up this process's registered databases and schemas, then
+// terminates only the container it created. Call after m.Run.
 func Close() error {
 	closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		closeErr = closeResources(ctx)
 		if container != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			defer cancel()
-			closeErr = container.Terminate(ctx)
+			containerCtx, containerCancel := context.WithTimeout(context.Background(), cleanupTimeout)
+			defer containerCancel()
+			closeErr = errors.Join(closeErr, container.Terminate(containerCtx))
 		}
 	})
 	return closeErr

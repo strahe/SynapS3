@@ -369,6 +369,7 @@ func TestStoreSessionCheckpointFailureStopsNextRequest(t *testing.T) {
 func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 	for _, unknown := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unknown=%t", unknown), func(t *testing.T) {
+			t.Parallel()
 			payload := strings.Repeat("o", 128)
 			parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
 				if unknown {
@@ -419,6 +420,7 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 	}
 	for _, outcome := range []string{"unknown", "processing", "contention", "canceled invocation", "canceled settlement rollback"} {
 		t.Run("resubmission/"+outcome, func(t *testing.T) {
+			t.Parallel()
 			payload := strings.Repeat("o", 128)
 			var state atomic.Value
 			state.Store(synapse.ParkedPieceMissing)
@@ -523,6 +525,7 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 				runtime.registry = registry
 			}
 			if outcome == "canceled settlement rollback" {
+				retries := newSettlementRetryController()
 				var excluded []int64
 				if err := runtime.db.NewSelect().Model((*model.Task)(nil)).Column("id").Where("id <> ?", row.ID).Scan(t.Context(), &excluded); err != nil {
 					t.Fatal(err)
@@ -531,6 +534,7 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 				repos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1, excludedTaskIDs: excluded}
 				engine, err := taskengine.NewEngine(taskengine.EngineConfig{
 					Concurrency: 1, PollInterval: handlerTestPollInterval, LeaseDuration: handlerTestLeaseDuration,
+					SettlementRetryWait: retries.wait,
 				}, &repos, handlerExecutionRegistry(t, runtime), slog.Default())
 				if err != nil {
 					t.Fatal(err)
@@ -544,6 +548,7 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 				}()
 				cancel, done := runEngine(t, engine)
 				defer stopHandlerEngine(t, cancel, done)
+				retries.allowRetries(t, row.ID, row.ClaimGeneration+1)
 				row = waitForTask(t, runtime.repos, row.ID, func(current *model.Task) bool {
 					return current.Status == model.TaskStatusRunning && current.ResumeMode == model.TaskResumeModeRecover && current.LeaseUntil != nil && current.LeaseUntil.Before(time.Now().Add(2*handlerTestPollInterval))
 				}, 3*handlerTestLeaseDuration)

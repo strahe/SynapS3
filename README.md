@@ -71,7 +71,7 @@ Clients must use path-style addressing. Objects must be 127 to 1,065,353,216 byt
 
 Server-side encryption is not supported; requests with customer-provided keys (SSE-C) return `501 NotImplemented`.
 
-Details are in the [S3 Compatibility reference](https://synaps3.strahe.com/en/reference/s3-compatibility.html). Per-operation and client results are in the [S3 Compatibility workflow runs on main](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml?query=branch%3Amain).
+Details are in the [S3 Compatibility reference](https://synaps3.strahe.com/en/reference/s3-compatibility.html). Per-operation and client results appear under **S3 Compatibility** on the **Summary** page of [CI runs on main](https://github.com/strahe/SynapS3/actions/workflows/ci.yml?query=branch%3Amain).
 
 ## License
 

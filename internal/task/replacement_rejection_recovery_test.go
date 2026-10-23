@@ -48,7 +48,8 @@ func (r *observeTargetAfterCoordinatorRead) GetDataSetBindingByID(ctx context.Co
 }
 
 func TestCoordinatorDiscardsStaleFailureAfterDataSetReady(t *testing.T) {
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
+	retries := newSettlementRetryController()
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{settlementRetryWait: retries.wait})
 	row, target, coordinator, input := seedFailedInitializationReplacement(t, runtime)
 	wrapper := &observeTargetAfterCoordinatorRead{
 		StorageContentRepository: runtime.repos.Contents, repos: runtime.repos, ready: runtime.ready,
@@ -65,6 +66,7 @@ func TestCoordinatorDiscardsStaleFailureAfterDataSetReady(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("coordinator did not read the refused target")
 	}
+	retries.allowRetries(t, coordinator.ID, coordinator.ClaimGeneration+1)
 	completed := waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed || task.Status == model.TaskStatusCompleted
 	}, 15*time.Second)

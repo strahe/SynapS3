@@ -1,6 +1,9 @@
 name: Set up Go
 description: Install Go and resolve environment-aware cache keys without restoring or saving caches.
 inputs:
+  install-go:
+    description: Install Go before resolving cache keys.
+    default: 'true'
   profile:
     description: Compiled package profile (normal or race).
     default: normal
@@ -36,6 +39,7 @@ runs:
   using: composite
   steps:
     - uses: actions/setup-go@v6
+      if: inputs.install-go == 'true'
       with:
         go-version-file: go.mod
         cache: false

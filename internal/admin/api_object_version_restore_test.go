@@ -99,7 +99,7 @@ func TestAPIObjectVersionRestoreRejectsInvalidRequests(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, _ := newBucketAPITestServer(t)
+			srv := &Server{logger: testLogger()}
 			restorer := &recordingObjectVersionRestorer{}
 			srv.WithObjectVersionRestorer(restorer)
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/restore-api-bucket/objects/versions/restore", strings.NewReader(tt.body))
@@ -141,7 +141,7 @@ func TestAPIObjectVersionRestoreMapsErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, _ := newBucketAPITestServer(t)
+			srv := &Server{logger: testLogger()}
 			srv.WithObjectVersionRestorer(&recordingObjectVersionRestorer{err: tt.err})
 			req := httptest.NewRequest(
 				http.MethodPost,

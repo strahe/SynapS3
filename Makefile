@@ -6,6 +6,7 @@ PKG      := ./cmd/synaps3
 GOFLAGS  := -trimpath
 GO_TEST_PACKAGE_PARALLELISM ?=
 GO_TEST_P := $(if $(GO_TEST_PACKAGE_PARALLELISM),-p $(GO_TEST_PACKAGE_PARALLELISM))
+GO_TEST_PARALLELISM ?= 2
 CGO_ENABLED := 1
 CGO      := CGO_ENABLED=$(CGO_ENABLED)
 
@@ -56,7 +57,7 @@ build-integration-server:
 test: test-fast
 
 test-fast:
-	$(CGO) go test $(GOFLAGS) $(GO_TEST_P) -count=1 ./cmd/... ./internal/...
+	$(CGO) go run $(GOFLAGS) ./internal/testpg/cmd/testrun -- $(GOFLAGS) $(or $(GO_TEST_P),-p 3) -parallel $(GO_TEST_PARALLELISM) -count=1 ./cmd/... ./internal/...
 
 test-race:
 	$(CGO) go test $(GOFLAGS) $(GO_TEST_P) -race -tags dev -count=1 $(RACE_PACKAGES)

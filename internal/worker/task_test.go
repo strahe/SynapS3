@@ -1397,6 +1397,70 @@ func TestEngineRenewsLeaseWhileSettlementIsRetried(t *testing.T) {
 	}
 }
 
+func TestEngineSettlementRetryWaitPreservesTransactions(t *testing.T) {
+	var harness taskHarness
+	var claimed *model.Task
+	var counting *countingRenewRepository
+	settlements, retries := 0, 0
+	checkpoint := json.RawMessage(`{"settled":true}`)
+	config := EngineConfig{
+		Concurrency: 1, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second,
+		SettlementRetryWait: func(ctx context.Context, id, generation int64, delay time.Duration) error {
+			retries++
+			if id != claimed.ID || generation != claimed.ClaimGeneration || delay != time.Second<<uint(retries-1) {
+				t.Fatalf("settlement retry %d = task %d generation %d delay %s", retries, id, generation, delay)
+			}
+			if got := counting.renewals.Load(); got != int64(2*retries) {
+				t.Fatalf("lease renewals before retry %d = %d", retries, got)
+			}
+			stored, err := harness.repos.Tasks.GetByID(ctx, id)
+			if err != nil || stored.Status != model.TaskStatusRunning || testutil.JSONEqual(stored.Checkpoint, checkpoint) {
+				t.Fatalf("failed settlement escaped rollback: task=%#v err=%v", stored, err)
+			}
+			return nil
+		},
+	}
+	harness = newTaskHarness(t, scriptedHandler{
+		definition: testDefinition(nil, true),
+		execute: func(_ context.Context, execution Execution) Result {
+			return Complete("settled", func(ctx context.Context, repos *repository.Repositories) error {
+				settlements++
+				if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), checkpoint); err != nil {
+					return err
+				}
+				if settlements < 4 {
+					return errors.New("injected settlement failure")
+				}
+				return nil
+			})
+		},
+	}, &config)
+	row := enqueueTestTask(t, harness, "controlled-settlement")
+	claimed = claimTestTask(t, harness)
+	counting = &countingRenewRepository{TaskRepository: harness.repos.Tasks}
+	harness.repos.Tasks = counting
+	harness.engine.executeClaim(t.Context(), claimed)
+	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || stored.Status != model.TaskStatusCompleted || !testutil.JSONEqual(stored.Checkpoint, checkpoint) || settlements != 4 || retries != 3 {
+		t.Fatalf("controlled settlement: task=%#v settlements=%d retries=%d err=%v", stored, settlements, retries, err)
+	}
+}
+
+func TestEngineSettlementRetryWaitRequiresLease(t *testing.T) {
+	called := false
+	engine := &Engine{
+		config: EngineConfig{LeaseDuration: 5 * time.Second, SettlementRetryWait: func(context.Context, int64, int64, time.Duration) error {
+			called = true
+			return nil
+		}},
+		repos: &repository.Repositories{Tasks: renewFailureRepository{}},
+	}
+	err := engine.waitSettlementRetry(t.Context(), &model.Task{ID: 1, ClaimGeneration: 2}, time.Second)
+	if err == nil || called {
+		t.Fatalf("failed renewal entered settlement wait: called=%t err=%v", called, err)
+	}
+}
+
 func TestEngineConfirmsLeaseBeforeSettlement(t *testing.T) {
 	limit := 5
 	var settlements atomic.Int64
