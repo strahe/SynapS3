@@ -1,0 +1,89 @@
+name: Package
+
+on:
+  workflow_call:
+    outputs:
+      plan:
+        description: Complete CI selection plan.
+        value: ${{ jobs.package.outputs.plan }}
+      source-sha:
+        description: Exact checked-out source commit.
+        value: ${{ jobs.package.outputs.source-sha }}
+      verified:
+        description: Whether every selected package check passed.
+        value: ${{ jobs.package.outputs.verified }}
+      docs-built:
+        description: Whether selected documentation was built successfully.
+        value: ${{ jobs.package.outputs.docs-built }}
+
+permissions:
+  contents: read
+
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
+
+jobs:
+  package:
+    name: image, docs, and deployment
+    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    outputs:
+      plan: ${{ steps.results.outputs.plan }}
+      source-sha: ${{ steps.results.outputs.source-sha }}
+      verified: ${{ steps.results.outputs.verified }}
+      docs-built: ${{ steps.docs.outcome == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Select package checks
+        id: plan
+        uses: ./.github/actions/ci-plan
+
+      - name: Build PR image
+        id: image
+        if: ${{ !cancelled() && steps.plan.outputs.docker_image == 'true' && github.event_name == 'pull_request' }}
+        uses: ./.github/actions/docker-image
+        with:
+          arch: amd64
+          read-only-go-cache: 'true'
+
+      - name: Build documentation
+        id: docs
+        if: ${{ !cancelled() && steps.plan.outputs.docs == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
+        env:
+          VITEPRESS_SITE_URL: ${{ vars.VITEPRESS_SITE_URL }}
+          VITEPRESS_BASE: ${{ vars.VITEPRESS_BASE }}
+          VITEPRESS_GTAG_ID: ${{ vars.VITEPRESS_GTAG_ID }}
+        uses: ./.github/actions/docs-build
+
+      - name: Upload Pages artifact
+        if: ${{ !cancelled() && steps.docs.outcome == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SKIP_DOCS_DEPLOY != 'true' }}
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/.vitepress/dist
+
+      - name: Validate Docker entrypoint
+        id: entrypoint
+        if: ${{ !cancelled() && steps.plan.outputs.docker_deployment == 'true' }}
+        env:
+          SYNAPS3_REQUIRE_DOCKER_DAEMON: '1'
+        run: make test-docker-entrypoint
+
+      - name: Validate Docker deployment
+        id: deployment
+        if: ${{ !cancelled() && steps.plan.outputs.docker_deployment == 'true' }}
+        env:
+          SYNAPS3_REQUIRE_DOCKER_DAEMON: '1'
+        run: make test-docker-deployment
+
+      - name: Report executed checks
+        id: results
+        if: ${{ always() && steps.plan.outcome == 'success' }}
+        env:
+          CI_PLAN: ${{ steps.plan.outputs.plan }}
+          CI_CHECKS: >-
+            {"docker_image":"${{ steps.image.outcome }}","docs":"${{ steps.docs.outcome }}","docker_entrypoint":"${{ steps.entrypoint.outcome }}","docker_deployment":"${{ steps.deployment.outcome }}"}
+        run: python3 scripts/ci_plan.py record --worker package

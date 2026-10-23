@@ -2,8 +2,7 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
 
 permissions:
@@ -14,40 +13,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  changes:
+  verify:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    timeout-minutes: 20
     outputs:
-      verify: ${{ steps.plan.outputs.verify }}
-      go_tests: ${{ steps.plan.outputs.go_tests }}
-      race: ${{ steps.plan.outputs.race }}
-      system: ${{ steps.plan.outputs.system }}
-      s3_compatibility: ${{ steps.plan.outputs.s3_compatibility }}
-      modules_writer: ${{ steps.plan.outputs.modules_writer }}
-      plan: ${{ steps.plan.outputs.plan }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
-
-      - name: Validate CI selection rules
-        env:
-          PYTHONDONTWRITEBYTECODE: '1'
-        run: |
-          python3 -m unittest discover -s scripts -p 'test_ci_plan.py'
-          python3 -m unittest discover -s scripts -p 'test_go_cache_key.py'
-
-      - name: Select checks
-        id: plan
-        uses: ./.github/actions/ci-plan
-
-  system:
-    needs: changes
-    if: needs.changes.outputs.system == 'true'
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 25
-    services: &postgres-service
+      plan: ${{ steps.results.outputs.plan }}
+      source-sha: ${{ steps.results.outputs.source-sha }}
+      verified: ${{ steps.results.outputs.verified }}
+    services:
       postgres:
         image: postgres:18
         env:
@@ -61,21 +34,49 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env: &postgres-env
+    env:
       GOTOOLCHAIN: auto
+      CGO_ENABLED: '1'
+      GO_TEST_PACKAGE_PARALLELISM: '2'
       SYNAPS3_POSTGRES_TEST_DSN: postgres://postgres:postgres@localhost:5432/synaps3_test?sslmode=disable
     steps:
-      - name: Checkout
-        id: checkout
+      - &checkout
+        name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - &plan
+        name: Select checks
+        id: plan
+        uses: ./.github/actions/ci-plan
+
+
+      - name: Set up pnpm
+        if: steps.plan.outputs.verify == 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
+
+      - name: Set up Node
+        id: node
+        if: steps.plan.outputs.verify == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
 
       - name: Set up Go
         id: go
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && (steps.plan.outputs.verify == 'true' || steps.plan.outputs.system == 'true' || steps.plan.outputs.race == 'true' || steps.plan.outputs.s3_compatibility == 'true') }}
         uses: ./.github/actions/setup-go
+        with:
+          production-ui: ${{ steps.plan.outputs.verify }}
+          node-version: ${{ steps.node.outputs.node-version || '22' }}
 
-      - &restore-go-modules
-        name: Restore Go modules
+      - name: Restore Go modules
         id: modules_cache
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         uses: actions/cache/restore@v5
         timeout-minutes: 1
         continue-on-error: true
@@ -85,9 +86,9 @@ jobs:
           path: ${{ steps.go.outputs.gomodcache }}
           key: ${{ steps.go.outputs.modules-primary-key }}
 
-      - &restore-go-build
-        name: Restore compiled Go packages
+      - name: Restore compiled Go packages
         id: build_cache
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         uses: actions/cache/restore@v5
         timeout-minutes: 1
         continue-on-error: true
@@ -98,162 +99,189 @@ jobs:
           key: ${{ steps.go.outputs.build-primary-key }}
           restore-keys: ${{ steps.go.outputs.build-restore-keys }}
 
-      - &download-go-modules
-        name: Complete Go module cache
+      - name: Complete Go module cache
         id: modules
-        if: needs.changes.outputs.modules_writer == github.job && steps.modules_cache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.plan.outputs.modules_writer == github.job && steps.modules_cache.outputs.cache-hit != 'true' }}
         timeout-minutes: 2
         continue-on-error: true
         run: go mod download
 
-      - name: Test system runtime
-        id: system
-        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
-        run: make test-system
-
-      - name: Save Go caches
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.system.outcome == 'success' || steps.system.outcome == 'failure') }}
-        uses: ./.github/actions/save-go-cache
-        timeout-minutes: 2
-        continue-on-error: true
-        with: &save-go-cache
-          gocache: ${{ steps.go.outputs.gocache }}
-          gomodcache: ${{ steps.go.outputs.gomodcache }}
-          build-primary-key: ${{ steps.go.outputs.build-primary-key }}
-          modules-primary-key: ${{ steps.go.outputs.modules-primary-key }}
-          build-cache-hit: ${{ steps.build_cache.outputs.cache-hit }}
-          modules-cache-hit: ${{ steps.modules_cache.outputs.cache-hit }}
-          modules-ready: ${{ steps.modules_cache.outputs.cache-hit == 'true' || steps.modules.outcome == 'success' }}
-          module-writer: ${{ needs.changes.outputs.modules_writer == github.job }}
-
-  s3_compatibility:
-    needs: changes
-    if: github.event_name == 'pull_request' && needs.changes.outputs.s3_compatibility == 'true'
-    uses: ./.github/workflows/s3-compatibility.yml
-    with:
-      plan: ${{ needs.changes.outputs.plan }}
-
-  verify:
-    needs: changes
-    if: needs.changes.outputs.verify == 'true'
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: ${{ needs.changes.outputs.go_tests == 'true' && 'postgres:18' || '' }}
-        env:
-          POSTGRES_DB: synaps3_test
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d synaps3_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env: *postgres-env
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11.1.2
-
-      - name: Set up Node
-        id: node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: ui/pnpm-lock.yaml
-
-      - name: Set up Go
-        id: go
-        uses: ./.github/actions/setup-go
-        with:
-          production-ui: true
-          node-version: ${{ steps.node.outputs.node-version }}
-
-      - *restore-go-modules
-      - *restore-go-build
-      - *download-go-modules
 
       - name: Install golangci-lint
+        id: lint_tool
+        if: ${{ !cancelled() && steps.plan.outputs.verify == 'true' && steps.go.outcome == 'success' }}
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.15.0
           install-only: true
 
-      - name: Verify code and build
-        id: code
-        run: |
-          make ui-build
-          golangci-lint config verify
-          golangci-lint fmt --diff
-          CGO_ENABLED=1 golangci-lint run
-          make build-go
+      - name: Build production UI
+        id: ui
+        if: ${{ !cancelled() && steps.plan.outputs.verify == 'true' && steps.node.outcome == 'success' }}
+        run: make ui-build
 
-      - name: Test Go packages
-        id: tests
-        if: ${{ !cancelled() && steps.code.outcome == 'success' && needs.changes.outputs.go_tests == 'true' }}
-        run: make test GO_TEST_PACKAGE_PARALLELISM=2
+      - name: Validate lint configuration
+        id: lint_config
+        if: ${{ !cancelled() && steps.plan.outputs.verify == 'true' && steps.lint_tool.outcome == 'success' }}
+        run: golangci-lint config verify
 
-      - name: Save Go caches
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.code.outcome == 'success' || steps.code.outcome == 'failure') }}
+      - name: Check formatting
+        id: fmt
+        if: ${{ !cancelled() && steps.plan.outputs.verify == 'true' && steps.lint_tool.outcome == 'success' }}
+        run: golangci-lint fmt --diff
+
+      - name: Test all Go packages
+        id: ordinary
+        if: ${{ !cancelled() && steps.plan.outputs.go_tests == 'true' && steps.go.outcome == 'success' && steps.ui.outcome == 'success' }}
+        run: python3 scripts/ci_plan.py test --worker verify
+
+      - name: Lint Go packages
+        id: lint
+        if: ${{ !cancelled() && steps.plan.outputs.verify == 'true' && steps.lint_tool.outcome == 'success' && steps.ui.outcome == 'success' }}
+        env:
+          GOFLAGS: -trimpath
+        run: golangci-lint run
+
+      - name: Build production server
+        id: build
+        if: ${{ !cancelled() && steps.plan.outputs.verify == 'true' && steps.go.outcome == 'success' && steps.ui.outcome == 'success' }}
+        run: make build-go
+
+      - name: Test S3 compatibility
+        id: s3
+        if: ${{ !cancelled() && steps.plan.outputs.s3_compatibility == 'true' && steps.go.outcome == 'success' }}
+        uses: ./.github/actions/s3-compatibility
+        with:
+          source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Test system runtime
+        id: system
+        if: ${{ !cancelled() && steps.plan.outputs.system == 'true' && steps.go.outcome == 'success' }}
+        run: make test-system
+
+      - name: Save normal Go caches
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         uses: ./.github/actions/save-go-cache
         timeout-minutes: 2
         continue-on-error: true
-        with: *save-go-cache
+        with:
+          gocache: ${{ steps.go.outputs.gocache }}
+          gomodcache: ${{ steps.go.outputs.gomodcache }}
+          build-primary-key: ${{ steps.go.outputs.build-primary-key }}
+          modules-primary-key: ${{ steps.go.outputs.modules-primary-key }}
+          build-cache-hit: ${{ steps.build_cache.outputs.cache-hit }}
+          build-cache-restored: ${{ steps.build_cache.outputs.cache-matched-key != '' }}
+          build-cache-policy: pr-read-only
+          modules-cache-hit: ${{ steps.modules_cache.outputs.cache-hit }}
+          modules-ready: ${{ steps.modules_cache.outputs.cache-hit == 'true' || steps.modules.outcome == 'success' }}
+          module-writer: ${{ steps.plan.outputs.modules_writer == github.job }}
 
-  race:
-    needs: changes
-    if: needs.changes.outputs.race == 'true'
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 8
-    services: *postgres-service
-    env: *postgres-env
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Isolate normal and race cache snapshots
+        id: rotate_cache
+        if: ${{ !cancelled() && steps.plan.outputs.race == 'true' && steps.go.outcome == 'success' }}
+        env:
+          NORMAL_GOCACHE: ${{ steps.go.outputs.gocache }}
+        run: |
+          test -n "$NORMAL_GOCACHE"
+          test "$NORMAL_GOCACHE" != /
+          if [ -d "$NORMAL_GOCACHE" ]; then
+            snapshot=$(mktemp -d "$RUNNER_TEMP/normal-go-cache.XXXXXX")
+            mv "$NORMAL_GOCACHE" "$snapshot/cache"
+          fi
+          mkdir -p "$NORMAL_GOCACHE"
 
-      - name: Set up Go
-        id: go
+      - name: Resolve race cache keys
+        id: race_go
+        if: ${{ !cancelled() && steps.rotate_cache.outcome == 'success' }}
         uses: ./.github/actions/setup-go
         with:
+          install-go: 'false'
           profile: race
+          writer: race
 
-      - *restore-go-modules
-      - *restore-go-build
-      - *download-go-modules
+      - name: Restore compiled race packages
+        id: race_cache
+        if: ${{ !cancelled() && steps.race_go.outcome == 'success' }}
+        uses: actions/cache/restore@v5
+        timeout-minutes: 1
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+        with:
+          path: ${{ steps.race_go.outputs.gocache }}
+          key: ${{ steps.race_go.outputs.build-primary-key }}
+          restore-keys: ${{ steps.race_go.outputs.build-restore-keys }}
 
       - name: Test shared-memory concurrency
-        id: tests
+        id: race
+        if: ${{ !cancelled() && steps.race_go.outcome == 'success' }}
         run: make test-race-ci
 
-      - name: Save Go caches
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+      - name: Save race Go cache
+        if: ${{ !cancelled() && steps.race_go.outcome == 'success' }}
         uses: ./.github/actions/save-go-cache
         timeout-minutes: 2
         continue-on-error: true
-        with: *save-go-cache
+        with:
+          gocache: ${{ steps.race_go.outputs.gocache }}
+          gomodcache: ${{ steps.race_go.outputs.gomodcache }}
+          build-primary-key: ${{ steps.race_go.outputs.build-primary-key }}
+          modules-primary-key: ${{ steps.race_go.outputs.modules-primary-key }}
+          build-cache-hit: ${{ steps.race_cache.outputs.cache-hit }}
+          build-cache-restored: ${{ steps.race_cache.outputs.cache-matched-key != '' }}
+          build-cache-policy: pr-read-only
+          modules-cache-hit: ${{ steps.modules_cache.outputs.cache-hit }}
+          modules-ready: ${{ steps.modules_cache.outputs.cache-hit == 'true' || steps.modules.outcome == 'success' }}
+          module-writer: 'false'
+
+      - name: Report executed checks
+        id: results
+        if: ${{ always() && steps.plan.outcome == 'success' }}
+        env:
+          CI_PLAN: ${{ steps.plan.outputs.plan }}
+          CI_CHECKS: >-
+            {"lint_config":"${{ steps.lint_config.outcome }}","fmt":"${{ steps.fmt.outcome }}","lint":"${{ steps.lint.outcome }}","build":"${{ steps.build.outcome }}","go_tests":"${{ steps.ordinary.outcome }}","s3_compatibility":"${{ steps.s3.outcome }}","race":"${{ steps.race.outcome }}","system":"${{ steps.system.outcome }}"}
+        run: python3 scripts/ci_plan.py record --worker verify
+
+  package:
+    uses: ./.github/workflows/package.yml
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+
+  deploy-docs:
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.package.outputs.docs-built == 'true' && vars.SKIP_DOCS_DEPLOY != 'true'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/docs.yml
 
   check:
-    needs: [changes, verify, race, system, s3_compatibility]
+    needs: [verify, package, publish]
     if: ${{ always() }}
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - *checkout
+      - *plan
 
-      - name: Require all checks to pass
+      - name: Validate CI selection and cache rules
         env:
-          CI_PLAN: ${{ needs.changes.outputs.plan }}
-          CI_RESULTS: ${{ toJSON(needs) }}
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
-          python3 scripts/ci_plan.py check --plan "$CI_PLAN" --results "$CI_RESULTS"
+          python3 -m unittest discover -s scripts -p 'test_ci_plan.py'
+          python3 -m unittest discover -s scripts -p 'test_go_cache_key.py'
+
+      - name: Require all selected checks to pass
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' }}
+        env:
+          CI_PLAN: ${{ steps.plan.outputs.plan }}
+          CI_RESULTS: ${{ toJSON(needs) }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 scripts/ci_plan.py check --plan "$CI_PLAN" --results "$CI_RESULTS" --sha "$GITHUB_SHA"

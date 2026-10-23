@@ -80,8 +80,8 @@ class RoutingTest(unittest.TestCase):
         plan = ci_plan.plan_for_paths(["docs/index.md", "ui/src/main.tsx"])
         self.assertEqual({flag for flag in ci_plan.FLAGS if plan[flag]}, {"docs", "verify", "docker_image"})
         self.assertEqual(plan["modules_writer"], "verify")
-        self.assertEqual(ci_plan.plan_for_paths(["tests/system/main_test.go"])["modules_writer"], "system")
-        self.assertEqual(ci_plan.plan_for_paths(["tests/system/s3_matrix_test.go"])["modules_writer"], "")
+        self.assertEqual(ci_plan.plan_for_paths(["tests/system/main_test.go"])["modules_writer"], "verify")
+        self.assertEqual(ci_plan.plan_for_paths(["tests/system/s3_matrix_test.go"])["modules_writer"], "verify")
         self.assertEqual(ci_plan.plan_for_paths(["docs/index.md"])["modules_writer"], "")
         self.assertFalse(any(ci_plan.plan_for_paths([])[flag] for flag in ci_plan.FLAGS))
 
@@ -203,44 +203,142 @@ class DiffTest(unittest.TestCase):
             self.assertEqual(plan, ci_plan.plan_for_paths(["docs/en/new.md"]))
 
 
+MODULE = "example.test/synaps3"
+SOURCE_SHA = "1" * 40
+PACKAGES = [
+    MODULE + "/" + package for package in (
+        "cmd/synaps3", "internal/task", "internal/admin", "internal/backend",
+        "internal/db/repository", "internal/worker", "internal/empty",
+    )
+]
+
+
+def worker_results(plan, source_sha=SOURCE_SHA):
+    results = {"publish": {"result": "skipped"}}
+    for worker in ci_plan.WORKER_CHECKS:
+        outputs = {
+            "plan": json.dumps(plan), "source-sha": source_sha,
+            "verified": "true",
+        }
+        results[worker] = {"result": "success", "outputs": outputs}
+    return results
+
+
+class OrdinaryPackagesTest(unittest.TestCase):
+    def test_inventory_keeps_all_packages_with_task_first_and_rejects_invalid_input(self):
+        packages = PACKAGES + [MODULE + "/internal/new"]
+        selected = ci_plan.ordered_packages(list(reversed(packages)), MODULE)
+        task = MODULE + "/internal/task"
+        self.assertEqual(selected, [task, *sorted(set(packages) - {task})])
+        self.assertEqual(len(selected), len(packages))
+        self.assertIn(MODULE + "/internal/empty", selected)
+        for invalid, module in (
+            ([], MODULE), (PACKAGES + [PACKAGES[0]], MODULE),
+            (PACKAGES + ["other.test/pkg"], MODULE),
+            (PACKAGES + [None], MODULE), (PACKAGES, ""),
+            ([package for package in PACKAGES if package != task], MODULE),
+        ):
+            with self.subTest(packages=invalid, module=module), self.assertRaises(ValueError):
+                ci_plan.ordered_packages(invalid, module)
+
+
 class ResultGateTest(unittest.TestCase):
     def setUp(self):
-        self.plan = ci_plan.plan_for_paths(["tests/system/main_test.go"])
-        self.results = {"changes": {"result": "success"}}
-        self.results.update({job: {"result": "success" if self.plan[job] else "skipped"} for job in ci_plan.CORE_JOBS})
+        self.plan = ci_plan.full_plan()
+        self.results = worker_results(self.plan)
 
-    def test_expected_skips_and_selected_success_pass(self):
-        self.assertEqual(ci_plan.check_job_results(self.plan, self.results), [])
-        plan = ci_plan.plan_for_paths(["docs/index.md"])
-        results = {"changes": "success", **{job: "skipped" for job in ci_plan.CORE_JOBS}}
-        self.assertEqual(ci_plan.check_job_results(plan, results), [])
+    def check(self, results=None, plan=None, event_name="pull_request"):
+        return ci_plan.check_job_results(
+            self.plan if plan is None else plan, self.results if results is None else results,
+            SOURCE_SHA, event_name,
+        )
 
-    def test_selected_failure_cancel_skip_or_missing_never_pass(self):
-        for job in ("system", "s3_compatibility"):
+    def test_selected_success_and_explicit_unselected_checks_pass(self):
+        self.assertEqual(self.check(), [])
+        for paths in (["docs/index.md"], ["tests/system/main_test.go"], ["ui/src/main.tsx"], []):
+            plan = ci_plan.plan_for_paths(paths)
+            with self.subTest(paths=paths):
+                self.assertEqual(self.check(worker_results(plan), plan), [])
+
+    def test_failed_cancelled_skipped_or_missing_workers_never_pass(self):
+        for worker in ci_plan.WORKER_CHECKS:
             for result in ("failure", "cancelled", "skipped", None):
-                with self.subTest(job=job, result=result):
-                    results = {**self.results, job: {"result": result}}
-                    self.assertTrue(ci_plan.check_job_results(self.plan, results))
+                with self.subTest(worker=worker, result=result):
+                    results = worker_results(self.plan)
+                    results[worker]["result"] = result
+                    self.assertTrue(self.check(results))
+            results = worker_results(self.plan)
+            del results[worker]
+            self.assertTrue(self.check(results))
 
-    def test_main_push_ci_expects_the_separate_s3_run(self):
-        results = {**self.results, "s3_compatibility": {"result": "skipped"}}
-        self.assertEqual(ci_plan.check_job_results(self.plan, results, event_name="push"), [])
-        self.assertTrue(ci_plan.check_job_results(self.plan, results, event_name="pull_request"))
-        self.assertTrue(ci_plan.check_job_results(self.plan, self.results, event_name="push"))
+    def test_missing_malformed_or_mismatched_worker_outputs_fail(self):
+        for worker in ci_plan.WORKER_CHECKS:
+            for field, value in (
+                ("plan", ""), ("plan", "null"), ("plan", json.dumps(ci_plan.plan_for_paths(["docs/index.md"]))),
+                ("source-sha", ""), ("source-sha", "2" * 40),
+                *(("verified", value) for value in (None, "", "false", "True", True, 1)),
+            ):
+                results = worker_results(self.plan)
+                results[worker]["outputs"][field] = value
+                with self.subTest(worker=worker, field=field, value=value):
+                    self.assertTrue(self.check(results))
+            results = worker_results(self.plan)
+            del results[worker]["outputs"]
+            self.assertTrue(self.check(results))
+            results = worker_results(self.plan)
+            del results[worker]["outputs"]["verified"]
+            self.assertTrue(self.check(results))
+        self.assertTrue(ci_plan.check_job_results(self.plan, self.results, ""))
 
-    def test_unplanned_execution_and_unsuccessful_selector_fail(self):
-        self.results["verify"] = {"result": "success"}
-        self.assertTrue(ci_plan.check_job_results(self.plan, self.results))
-        self.results["verify"] = {"result": "skipped"}
-        for result in ("failure", "cancelled", "skipped", None):
-            with self.subTest(result=result):
-                self.results["changes"] = {"result": result}
-                self.assertTrue(ci_plan.check_job_results(self.plan, self.results))
+    def test_main_publish_must_match_plan_sha_and_selected_image(self):
+        results = worker_results(self.plan)
+        results["publish"] = {
+            "result": "success",
+            "outputs": {"plan": json.dumps(self.plan), "source-sha": SOURCE_SHA, "docker-image": "success"},
+        }
+        self.assertEqual(self.check(results, event_name="push"), [])
+        for field, value in (
+            ("plan", "{}"), ("plan", json.dumps(ci_plan.plan_for_paths(["docs/index.md"]))),
+            ("source-sha", "2" * 40), ("docker-image", "failure"),
+            ("docker-image", "skipped"), ("docker-image", None),
+        ):
+            broken = json.loads(json.dumps(results))
+            broken["publish"]["outputs"][field] = value
+            with self.subTest(field=field, value=value):
+                self.assertTrue(self.check(broken, event_name="push"))
+        for status in ("cancelled", "failure", "skipped", None):
+            broken = json.loads(json.dumps(results))
+            broken["publish"]["result"] = status
+            self.assertTrue(self.check(broken, event_name="push"))
+        del results["publish"]
+        self.assertTrue(self.check(results, event_name="push"))
 
-    def test_incomplete_or_nonboolean_plans_fail(self):
-        for malformed in ({}, {**self.plan, "verify": "false"}, {**self.plan, "modules_writer": "verify"}):
+    def test_main_without_image_requires_explicit_skip(self):
+        plan = ci_plan.plan_for_paths(["README.md"])
+        results = worker_results(plan)
+        results["publish"] = {
+            "result": "success",
+            "outputs": {"plan": json.dumps(plan), "source-sha": SOURCE_SHA, "docker-image": "not_selected"},
+        }
+        self.assertEqual(self.check(results, plan, "push"), [])
+        for actual in (None, "success", "failure"):
+            results["publish"]["outputs"]["docker-image"] = actual
+            with self.subTest(actual=actual):
+                self.assertTrue(self.check(results, plan, "push"))
+
+    def test_pr_publish_must_explicitly_skip_and_plans_must_be_complete_booleans(self):
+        self.assertEqual(self.check(), [])
+        for actual in (None, {}, {"result": "success"}, {"result": "cancelled"}):
+            results = worker_results(self.plan)
+            results["publish"] = actual
+            with self.subTest(publish=actual):
+                self.assertTrue(self.check(results))
+        results = worker_results(self.plan)
+        del results["publish"]
+        self.assertTrue(self.check(results))
+        for malformed in ({}, {**self.plan, "verify": "false"}, {**self.plan, "modules_writer": ""}):
             with self.subTest(plan=malformed):
-                self.assertTrue(ci_plan.check_job_results(malformed, self.results))
+                self.assertTrue(self.check(plan=malformed))
 
     def test_action_outputs_are_strict_booleans_and_complete_json(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -249,9 +347,88 @@ class ResultGateTest(unittest.TestCase):
             values = dict(line.split("=", 1) for line in output.read_text().splitlines())
         self.assertEqual(json.loads(payload), self.plan)
         self.assertEqual(json.loads(values["plan"]), self.plan)
-        self.assertEqual(values["modules_writer"], "system")
+        self.assertEqual(values["modules_writer"], "verify")
         self.assertEqual({flag: values[flag] for flag in ci_plan.FLAGS},
                          {flag: str(self.plan[flag]).lower() for flag in ci_plan.FLAGS})
+
+    def record(self, plan, worker, checks, event_name="pull_request", source_sha=SOURCE_SHA):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(ci_plan, "git", return_value=(source_sha + "\n").encode()), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            output = Path(temp) / "output"
+            errors = ci_plan.record_worker(plan, worker, checks, output, event_name)
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines()) if output.exists() else {}
+        return errors, values, log.getvalue()
+
+    def test_record_logs_actual_checks_and_only_attests_success(self):
+        plan = ci_plan.plan_for_paths(["docs/index.md"])
+        for worker, expected in ci_plan.WORKER_CHECKS.items():
+            checks = {check: "success" if plan[flag] else "skipped" for check, flag in expected.items()}
+            with self.subTest(worker=worker):
+                errors, values, log = self.record(plan, worker, checks)
+                self.assertEqual(errors, [])
+                self.assertEqual(values, {"plan": json.dumps(plan, separators=(",", ":")),
+                                          "source-sha": SOURCE_SHA, "verified": "true"})
+                self.assertIn(json.dumps(checks, sort_keys=True), log)
+
+    def test_record_rejects_failed_missing_and_unexpected_checks_without_outputs(self):
+        for worker, expected in ci_plan.WORKER_CHECKS.items():
+            successful = {check: "success" for check in expected}
+            for check in expected:
+                for actual in ("failure", "cancelled", "skipped", None):
+                    checks = dict(successful, **{check: actual})
+                    with self.subTest(worker=worker, check=check, actual=actual):
+                        errors, values, _ = self.record(self.plan, worker, checks)
+                        self.assertTrue(errors)
+                        self.assertEqual(values, {})
+            for malformed in (None, [], {}, {**successful, "unexpected": "success"},
+                              {check: actual for check, actual in successful.items() if check != next(iter(expected))}):
+                with self.subTest(worker=worker, checks=malformed):
+                    errors, values, _ = self.record(self.plan, worker, malformed)
+                    self.assertTrue(errors)
+                    self.assertEqual(values, {})
+        plan = ci_plan.plan_for_paths(["docs/index.md"])
+        for worker, expected in ci_plan.WORKER_CHECKS.items():
+            checks = {check: "success" if plan[flag] else "not_selected" for check, flag in expected.items()}
+            for check, flag in expected.items():
+                if plan[flag]:
+                    continue
+                with self.subTest(worker=worker, unexpected=check):
+                    errors, values, _ = self.record(plan, worker, dict(checks, **{check: "success"}))
+                    self.assertTrue(errors)
+                    self.assertEqual(values, {})
+
+    def test_record_invalid_source_never_attests_success(self):
+        checks = {check: "success" for check in ci_plan.WORKER_CHECKS["verify"]}
+        for source_sha in ("", "invalid", "0" * 40):
+            with self.subTest(source_sha=source_sha):
+                errors, values, _ = self.record(self.plan, "verify", checks, source_sha=source_sha)
+                self.assertTrue(errors)
+                self.assertEqual(values, {})
+
+    def test_record_image_expectations_follow_event_and_plan(self):
+        for paths in (["Makefile"], ["docs/index.md"]):
+            plan = ci_plan.plan_for_paths(paths)
+            for event in ("pull_request", "push", "workflow_dispatch"):
+                checks = {check: "success" if plan[flag] else "skipped"
+                          for check, flag in ci_plan.WORKER_CHECKS["package"].items()}
+                for actual in ("success", "skipped", "not_selected", "failure"):
+                    checks["docker_image"] = actual
+                    selected = plan["docker_image"] and event == "pull_request"
+                    expected = actual == "success" if selected else actual in ("skipped", "not_selected")
+                    with self.subTest(paths=paths, event=event, actual=actual):
+                        errors, values, _ = self.record(plan, "package", checks, event)
+                        self.assertEqual(not errors, expected)
+                        self.assertEqual(values.get("verified"), "true" if expected else None)
+
+    def test_record_retains_s3_requirement_on_main(self):
+        plan = ci_plan.plan_for_paths(["README.md"])
+        checks = {check: "success" if plan[flag] else "skipped"
+                  for check, flag in ci_plan.WORKER_CHECKS["verify"].items()}
+        checks["s3_compatibility"] = "skipped"
+        errors, values, _ = self.record(plan, "verify", checks, "push")
+        self.assertTrue(any("s3_compatibility" in error for error in errors))
+        self.assertEqual(values, {})
 
     def test_command_line_consumes_event_environment_and_rejects_cancelled_jobs(self):
         script = Path(ci_plan.__file__).resolve()
@@ -267,10 +444,10 @@ class ResultGateTest(unittest.TestCase):
                                              check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     self.assertEqual(json.loads(process.stdout), ci_plan.full_plan())
                     self.assertIn("docker_image=true\n", output.read_text())
-        self.results["system"] = {"result": "cancelled"}
+        self.results["verify"]["result"] = "cancelled"
         process = subprocess.run([
             sys.executable, str(script), "check", "--plan", json.dumps(self.plan),
-            "--results", json.dumps(self.results),
+            "--results", json.dumps(self.results), "--sha", SOURCE_SHA, "--event-name", "pull_request",
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(process.returncode, 1)
         self.assertIn("expected success, got cancelled", process.stderr)
@@ -286,53 +463,114 @@ class ResultGateTest(unittest.TestCase):
                                  "--event-name", "pull_request", "--event-path", str(event_path),
                                  "--output", str(output)]
                     stdout = io.StringIO()
-                    docs_plan = ci_plan.plan_for_paths(["docs/index.md"])
                     with self.subTest(parent=parent, event=event_path.name), patch.object(sys, "argv", arguments), \
-                            patch.object(ci_plan, "event_plan", return_value=docs_plan) as recompute, \
-                            contextlib.redirect_stdout(stdout):
+                            patch.object(ci_plan, "event_plan") as recompute, contextlib.redirect_stdout(stdout):
                         self.assertEqual(ci_plan.main(), 0)
                     recompute.assert_not_called()
                     self.assertEqual(json.loads(stdout.getvalue()), parent)
-                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-                    self.assertEqual(json.loads(values["plan"]), parent)
-                    self.assertEqual(values["s3_compatibility"], "true")
 
     def test_command_line_rejects_invalid_parent_plans_without_outputs(self):
         script = Path(ci_plan.__file__).resolve()
         malformed = ("{", "{}", "null", json.dumps({**self.plan, "s3_compatibility": "false"}),
-                     json.dumps({**self.plan, "modules_writer": "verify"}))
+                     json.dumps({**self.plan, "modules_writer": ""}))
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "output"
             for parent in malformed:
                 with self.subTest(parent=parent):
                     process = subprocess.run([
-                        sys.executable, str(script), "plan", "--input-plan", parent,
-                        "--output", str(output),
+                        sys.executable, str(script), "plan", "--input-plan", parent, "--output", str(output),
                     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     self.assertEqual(process.returncode, 1)
                     self.assertIn("Invalid input CI plan", process.stderr)
                     self.assertEqual(process.stdout, "")
                     self.assertFalse(output.exists())
 
-    def test_check_command_uses_event_environment(self):
-        script = Path(ci_plan.__file__).resolve()
-        results = {**self.results, "s3_compatibility": {"result": "skipped"}}
-        command = [sys.executable, str(script), "check", "--plan", json.dumps(self.plan),
-                   "--results", json.dumps(results)]
-        for event_name, expected in (("push", 0), ("pull_request", 1)):
-            with self.subTest(event=event_name):
-                process = subprocess.run(command,
-                                         env=dict(os.environ, GITHUB_EVENT_NAME=event_name),
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                self.assertEqual(process.returncode, expected, process.stderr)
-        env = dict(os.environ)
+    def test_check_command_uses_sha_and_event_environment_with_explicit_override(self):
+        command = [sys.executable, ci_plan.__file__, "check", "--plan", json.dumps(self.plan),
+                   "--results", json.dumps(self.results)]
+        for event, expected in (("pull_request", 0), ("push", 1)):
+            env = dict(os.environ, GITHUB_EVENT_NAME=event, GITHUB_SHA=SOURCE_SHA)
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(process.returncode, expected, process.stderr)
+        env = dict(os.environ, GITHUB_EVENT_NAME="push", GITHUB_SHA="2" * 40)
+        process = subprocess.run(command + ["--event-name", "pull_request", "--sha", SOURCE_SHA],
+                                 env=env, capture_output=True, text=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
         env.pop("GITHUB_EVENT_NAME", None)
-        process = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.assertEqual(process.returncode, 1)
-        process = subprocess.run(command + ["--event-name", "push"], env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        env["GITHUB_SHA"] = SOURCE_SHA
+        process = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertEqual(process.returncode, 0, process.stderr)
 
+    def test_record_command_consumes_environment_and_rejects_invalid_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            arguments = [ci_plan.__file__, "record", "--worker", "package", "--output", str(output),
+                         "--event-name", "pull_request"]
+            checks = {check: "success" for check in ci_plan.WORKER_CHECKS["package"]}
+            env = {"CI_PLAN": json.dumps(self.plan), "CI_CHECKS": json.dumps(checks)}
+            with patch.object(sys, "argv", arguments), patch.dict(os.environ, env), \
+                    patch.object(ci_plan, "git", return_value=(SOURCE_SHA + "\n").encode()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ci_plan.main(), 0)
+            self.assertEqual(dict(line.split("=", 1) for line in output.read_text().splitlines())["source-sha"], SOURCE_SHA)
+            output.unlink()
+            with patch.object(sys, "argv", arguments), patch.dict(os.environ, {"CI_PLAN": "{"}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ci_plan.main(), 1)
+            self.assertFalse(output.exists())
+            with patch.object(sys, "argv", arguments), patch.dict(os.environ, env), \
+                    patch.object(ci_plan, "git", side_effect=ci_plan.DiffUnavailable("checkout unavailable")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ci_plan.main(), 1)
+            self.assertFalse(output.exists())
+
+    def test_test_command_executes_complete_dynamic_inventory(self):
+        packages = PACKAGES + [MODULE + "/internal/new"]
+        selected = ci_plan.ordered_packages(packages, MODULE)
+        for worker_arguments in ([], ["--worker", "verify"]):
+            arguments = [ci_plan.__file__, "test", *worker_arguments, "--json"]
+            with self.subTest(worker_arguments=worker_arguments), patch.object(sys, "argv", arguments), \
+                    patch.object(ci_plan.subprocess, "check_output", side_effect=[MODULE + "\n", "\n".join(packages)]) as go, \
+                    patch.object(ci_plan.os, "execvpe") as execute, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(ci_plan.main(), 0)
+            self.assertEqual([call.args[0] for call in go.call_args_list],
+                             [["go", "list", "-m"], ["go", "list", "./cmd/...", "./internal/..."]])
+            executable, command, environment = execute.call_args.args
+            self.assertEqual(executable, "go")
+            self.assertEqual(command[:6], ["go", "run", "-trimpath", "./internal/testpg/cmd/testrun", "--", "-trimpath"])
+            self.assertEqual(command[6:12], ["-p", "2", "-parallel", "2", "-count=1", "-json"])
+            self.assertEqual(command[12:], selected)
+            self.assertEqual(environment["CGO_ENABLED"], "1")
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("\n".join(selected), stderr.getvalue())
+        with patch.object(sys, "argv", arguments + ["--package-parallelism", "0"]), \
+                patch.object(ci_plan.subprocess, "check_output") as go, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ci_plan.main(), 1)
+            go.assert_not_called()
+
+    def test_test_command_does_not_start_tests_when_go_list_fails(self):
+        for responses in (
+            [subprocess.CalledProcessError(1, ["go", "list", "-m"])],
+            [MODULE + "\n", subprocess.CalledProcessError(1, ["go", "list", "./cmd/...", "./internal/..."])],
+            [MODULE + "\n", ""],
+            [MODULE + "\n", MODULE + "/internal/worker\n"],
+        ):
+            with self.subTest(responses=responses), patch.object(sys, "argv", [ci_plan.__file__, "test"]), \
+                    patch.object(ci_plan.subprocess, "check_output", side_effect=responses), \
+                    patch.object(ci_plan.os, "execvpe") as execute, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ci_plan.main(), 1)
+            execute.assert_not_called()
+
+    def test_commands_reject_removed_test_worker(self):
+        for command in ("test", "record"):
+            arguments = [ci_plan.__file__, command, "--worker", "tests"]
+            with self.subTest(command=command), patch.object(sys, "argv", arguments), \
+                    patch.object(ci_plan.os, "execvpe") as execute, contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                ci_plan.main()
+            self.assertEqual(error.exception.code, 2)
+            execute.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ func TestRepositoryTransactionContentionPreservesCause(t *testing.T) {
 		{"task_identity", repository.ErrTaskIdentityContended, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			repos := repository.NewRepositories(testDB(t))
 			calls := 0
 			err := repos.WithTx(t.Context(), func(*repository.Repositories) error {

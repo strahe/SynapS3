@@ -1,12 +1,20 @@
 name: Docker
 
 on:
+  workflow_call:
+    outputs:
+      plan:
+        description: CI selection plan shared by both native builds.
+        value: ${{ jobs.image_amd64.outputs.plan == jobs.image_arm64.outputs.plan && jobs.image_amd64.outputs.plan || '' }}
+      source-sha:
+        description: Exact checked-out commit shared by both native builds.
+        value: ${{ jobs.image_amd64.outputs.source-sha == jobs.image_arm64.outputs.source-sha && jobs.image_amd64.outputs.source-sha || '' }}
+      docker-image:
+        description: Aggregate outcome of selected native image builds and publishing.
+        value: ${{ fromJSON(jobs.image_amd64.outputs.plan || '{}').docker_image == true && ((jobs.image_amd64.outputs.outcome == 'success' && jobs.image_arm64.outputs.outcome == 'success' && (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'build-only' || jobs.image_manifest.outputs.outcome == 'success')) && 'success' || 'failure') || 'skipped' }}
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-  pull_request:
   workflow_dispatch:
     inputs:
       mode:
@@ -24,37 +32,14 @@ permissions:
 env:
   DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  changes:
-    name: changes
-    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 2
-    outputs:
-      docker_image: ${{ steps.plan.outputs.docker_image }}
-      docker_deployment: ${{ steps.plan.outputs.docker_deployment }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
-      - name: Select Docker checks
-        id: plan
-        uses: ./.github/actions/ci-plan
-
   deployment:
     name: deployment
-    needs: changes
-    if: needs.changes.outputs.docker_deployment == 'true'
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 10
-
     steps:
-      - &checkout
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Validate Docker deployment
@@ -62,229 +47,83 @@ jobs:
           SYNAPS3_REQUIRE_DOCKER_DAEMON: '1'
         run: make test-docker-entrypoint test-docker-deployment
 
-  image_pr:
-    name: image-pr
-    needs: changes
-    if: needs.changes.outputs.docker_image == 'true' && github.event_name == 'pull_request'
-    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 20
-    env:
-      IMAGE_ARCH: amd64
-
-    steps:
-      - *checkout
-
-      - &setup-buildx
-        name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v4
-
-      - &resolve-go-cache
-        name: Resolve Docker Go cache environment
-        id: go-cache
-        shell: bash
-        timeout-minutes: 1
-        continue-on-error: true
-        run: |
-          builder_image=$(sed -n 's/^ARG GO_BUILD_IMAGE=//p' Dockerfile)
-          printf 'go-build-image=%s\n' "$builder_image" >> "$GITHUB_OUTPUT"
-          digest=$(timeout 30s docker buildx imagetools inspect "$builder_image" --format '{{ .Manifest.Digest }}') || digest=''
-          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo '::warning::Could not resolve the Go builder digest; continuing without the archived Go build cache.'
-            exit 0
-          fi
-          printf 'go-build-image=%s@%s\n' "$builder_image" "$digest" >> "$GITHUB_OUTPUT"
-          export GO_BUILD_DIGEST="$digest"
-          python3 .github/scripts/docker-build-cache.py >> "$GITHUB_OUTPUT"
-
-      - &restore-go-cache
-        name: Restore Docker Go build cache
-        id: go-cache-restore
-        if: runner.environment == 'github-hosted' && steps.go-cache.outputs.cache-key != ''
-        uses: actions/cache@v5
-        timeout-minutes: 2
-        continue-on-error: true
-        env:
-          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
-        with:
-          path: ${{ runner.temp }}/docker-go-cache/${{ env.IMAGE_ARCH }}
-          key: ${{ steps.go-cache.outputs.cache-key }}
-          restore-keys: ${{ steps.go-cache.outputs.restore-key }}
-
-      # Post steps extract before cache save, while the Buildx builder still exists.
-      - &inject-go-cache
-        name: Inject Docker Go build cache
-        if: runner.environment == 'github-hosted' && steps.go-cache-restore.outcome == 'success'
-        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
-        timeout-minutes: 2
-        continue-on-error: true
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          scratch-dir: ${{ runner.temp }}/docker-go-cache-scratch/${{ env.IMAGE_ARCH }}
-          skip-extraction: ${{ steps.go-cache-restore.outputs.cache-hit == 'true' }}
-          utility-image: ghcr.io/containerd/busybox@sha256:52f73a0a43a16cf37cd0720c90887ce972fe60ee06a687ee71fb93a7ca601df7
-          cache-map: |
-            {
-              "${{ runner.temp }}/docker-go-cache/${{ env.IMAGE_ARCH }}": {
-                "target": "/root/.cache/go-build",
-                "id": "synaps3-go-${{ env.IMAGE_ARCH }}-musl",
-                "sharing": "locked"
-              }
-            }
-
-      - &resolve-build-date
-        name: Resolve build date
-        id: build-date
-        run: echo "build_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
-
-      - &resolve-image-name
-        name: Resolve image name
-        id: image
-        shell: bash
-        run: printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - &docker-metadata
-        name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=raw,value=ci-manual-test,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'publish-test' }}
-            type=ref,event=tag,enable=${{ github.event_name == 'push' }}
-            type=ref,event=pr,enable=${{ github.event_name == 'pull_request' }}
-
-      - name: Build image
-        uses: docker/build-push-action@v7
-        timeout-minutes: 10
-        with:
-          context: .
-          platforms: linux/amd64
-          push: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=synaps3-image-amd64,timeout=2m
-          cache-to: type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true,timeout=2m
-          build-args: |
-            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
-            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'edge' }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ steps.build-date.outputs.build_date }}
-
   image_amd64:
     name: image-amd64
-    needs: changes
-    if: needs.changes.outputs.docker_image == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 20
-    env:
-      IMAGE_ARCH: amd64
     permissions:
       contents: read
       packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
-
+      plan: ${{ steps.plan.outputs.plan }}
+      source-sha: ${{ steps.source.outputs.sha }}
+      outcome: ${{ steps.build.outcome }}
     steps:
-      - *checkout
-
-      - *setup-buildx
-
-      - *resolve-go-cache
-
-      - *restore-go-cache
-
-      - *inject-go-cache
-
-      - &login-ghcr
-        name: Log in to GHCR
-        if: github.event_name == 'push' || github.event.inputs.mode == 'publish-test'
-        uses: docker/login-action@v4
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 2
 
-      - *resolve-build-date
+      - name: Resolve source revision
+        id: source
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - *resolve-image-name
-
-      - *docker-metadata
+      - name: Select image checks
+        id: plan
+        uses: ./.github/actions/ci-plan
 
       - name: Build image
         id: build
-        uses: docker/build-push-action@v7
-        timeout-minutes: 10
+        if: steps.plan.outputs.docker_image == 'true'
+        uses: ./.github/actions/docker-image
         with:
-          context: .
-          platforms: linux/amd64
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
-          cache-from: type=gha,scope=synaps3-image-amd64,timeout=2m
-          cache-to: type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true,timeout=2m
-          build-args: |
-            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
-            VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ steps.build-date.outputs.build_date }}
+          arch: amd64
+          publish: ${{ github.event_name == 'push' || github.event.inputs.mode == 'publish-test' }}
 
   image_arm64:
     name: image-arm64
-    needs: changes
-    if: needs.changes.outputs.docker_image == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ vars.RUNS_ON_ARM64 || 'ubuntu-24.04-arm' }}
     timeout-minutes: 20
-    env:
-      IMAGE_ARCH: arm64
     permissions:
       contents: read
       packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
-
+      plan: ${{ steps.plan.outputs.plan }}
+      source-sha: ${{ steps.source.outputs.sha }}
+      outcome: ${{ steps.build.outcome }}
     steps:
-      - *checkout
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
 
-      - *setup-buildx
+      - name: Resolve source revision
+        id: source
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - *resolve-go-cache
-
-      - *restore-go-cache
-
-      - *inject-go-cache
-
-      - *login-ghcr
-
-      - *resolve-build-date
-
-      - *resolve-image-name
-
-      - *docker-metadata
+      - name: Select image checks
+        id: plan
+        uses: ./.github/actions/ci-plan
 
       - name: Build image
         id: build
-        uses: docker/build-push-action@v7
-        timeout-minutes: 10
+        if: steps.plan.outputs.docker_image == 'true'
+        uses: ./.github/actions/docker-image
         with:
-          context: .
-          platforms: linux/arm64
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
-          cache-from: type=gha,scope=synaps3-image-arm64,timeout=2m
-          cache-to: type=gha,scope=synaps3-image-arm64,mode=max,ignore-error=true,timeout=2m
-          build-args: |
-            GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
-            VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ steps.build-date.outputs.build_date }}
+          arch: arm64
+          publish: ${{ github.event_name == 'push' || github.event.inputs.mode == 'publish-test' }}
 
   image_manifest:
     name: image-manifest
     if: >-
       !cancelled() &&
       (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') &&
-      needs.image_amd64.result == 'success' && needs.image_arm64.result == 'success'
+      needs.image_amd64.result == 'success' && needs.image_arm64.result == 'success' &&
+      needs.image_amd64.outputs.digest != '' && needs.image_arm64.outputs.digest != ''
     needs:
       - image_amd64
       - image_arm64
@@ -293,20 +132,42 @@ jobs:
     permissions:
       contents: read
       packages: write
-
+    outputs:
+      outcome: ${{ steps.manifest.outcome == 'success' && steps.inspect.outcome == 'success' && 'success' || 'failure' }}
     steps:
-      - *setup-buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
-      - *login-ghcr
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - *resolve-image-name
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - *docker-metadata
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=ci-manual-test,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'publish-test' }}
+            type=ref,event=tag,enable=${{ github.event_name == 'push' }}
 
       - name: Create manifest
+        id: manifest
         shell: bash
         env:
           DOCKER_METADATA_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          AMD64_DIGEST: ${{ needs.image_amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.image_arm64.outputs.digest }}
         run: |
           tag_args=()
           while IFS= read -r tag; do
@@ -319,8 +180,11 @@ jobs:
           fi
 
           docker buildx imagetools create "${tag_args[@]}" \
-            "${{ steps.image.outputs.name }}@${{ needs.image_amd64.outputs.digest }}" \
-            "${{ steps.image.outputs.name }}@${{ needs.image_arm64.outputs.digest }}"
+            "$IMAGE_NAME@$AMD64_DIGEST" "$IMAGE_NAME@$ARM64_DIGEST"
 
       - name: Inspect manifest
-        run: docker buildx imagetools inspect ${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}
+        id: inspect
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION"

@@ -16,6 +16,12 @@ inputs:
   build-cache-hit:
     description: Whether the exact compiled package cache was restored.
     required: true
+  build-cache-restored:
+    description: Whether any compiled package archive was successfully restored, including fallback matches.
+    default: 'false'
+  build-cache-policy:
+    description: Compiled package writes (write-through, or pr-read-only after a successful restore).
+    default: write-through
   modules-cache-hit:
     description: Whether the exact module cache was restored.
     required: true
@@ -37,7 +43,7 @@ runs:
         key: ${{ inputs.modules-primary-key }}
 
     - name: Save compiled Go packages
-      if: ${{ !cancelled() && inputs.build-cache-hit != 'true' && inputs.gocache != '' && inputs.build-primary-key != '' }}
+      if: ${{ !cancelled() && inputs.build-cache-hit != 'true' && inputs.gocache != '' && inputs.build-primary-key != '' && !(inputs.build-cache-policy == 'pr-read-only' && github.event_name == 'pull_request' && inputs.build-cache-restored == 'true') }}
       continue-on-error: true
       uses: actions/cache/save@v5
       with:

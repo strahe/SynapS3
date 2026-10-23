@@ -1,5 +1,5 @@
-// Package testpg provides isolated PostgreSQL schemas for tests and the
-// system-test server.
+// Package testpg provides isolated PostgreSQL schemas and migrated template
+// databases for tests and the system-test server.
 package testpg
 
 import (
@@ -30,12 +30,12 @@ var (
 	closeErr  error
 )
 
-// Main runs a package's tests and then terminates the container this process
-// started. Call it from TestMain.
+// Main runs a package's tests, cleans up this process's registered databases
+// and schemas, then terminates its own container. Call it from TestMain.
 func Main(m *testing.M) {
 	code := m.Run()
 	if err := Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "clean up PostgreSQL test container: %v\n", err)
+		fmt.Fprintf(os.Stderr, "clean up PostgreSQL test resources: %v\n", err)
 		code = 1
 	}
 	os.Exit(code)
@@ -166,7 +166,8 @@ func withSchema(dsn, schema string) string {
 	return dsn + " search_path=" + schema
 }
 
-// Close terminates only the container created by this process. Call after m.Run.
+// Close cleans up this process's registered databases and schemas, then
+// terminates only the container it created. Call after m.Run.
 func Close() error {
 	closeOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)

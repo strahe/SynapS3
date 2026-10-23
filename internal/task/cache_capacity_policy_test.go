@@ -320,6 +320,7 @@ func TestCacheCapacityLRUPlansEachFailedCandidateOnceAcrossBatches(t *testing.T)
 	const plannerWatchdog = 30 * time.Second
 	for _, failedCount := range []int{50, 100} {
 		t.Run(fmt.Sprintf("%d_failed", failedCount), func(t *testing.T) {
+			t.Parallel()
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{policy: cache.EvictionPolicyLRU, maxBytes: 200, highPercent: 50, lowPercent: 10, cache: &testutil.MockCache{
 				CapacitySnapshotFunc: func() cache.CapacitySnapshot { return cache.CapacitySnapshot{UsedBytes: 150, MaxBytes: 200} },
 				DeleteFunc:           func(ctx context.Context, _, _ string) error { <-ctx.Done(); return ctx.Err() },

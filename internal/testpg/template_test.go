@@ -56,16 +56,15 @@ func TestCloneCancellationWhileWaitingReclaimsResources(t *testing.T) {
 		return databases, registered
 	}
 	beforeDatabases, beforeRegistered := countClones()
-	if capacity := cap(template.cloneGate); capacity != 2 {
-		t.Fatalf("clone capacity = %d, want 2", capacity)
+	for range cap(template.cloneGate) {
+		template.cloneGate <- struct{}{}
 	}
-	template.cloneGate <- struct{}{}
-	template.cloneGate <- struct{}{}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 	defer cancel()
 	config, drop, err := template.Clone(ctx)
-	<-template.cloneGate
-	<-template.cloneGate
+	for range cap(template.cloneGate) {
+		<-template.cloneGate
+	}
 	if !errors.Is(err, context.DeadlineExceeded) || config != nil || drop != nil {
 		t.Fatalf("clone waiting for capacity: config=%v, cleanup=%v, err=%v; want deadline cancellation", config != nil, drop != nil, err)
 	}

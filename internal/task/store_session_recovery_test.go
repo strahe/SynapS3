@@ -369,6 +369,7 @@ func TestStoreSessionCheckpointFailureStopsNextRequest(t *testing.T) {
 func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 	for _, unknown := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unknown=%t", unknown), func(t *testing.T) {
+			t.Parallel()
 			payload := strings.Repeat("o", 128)
 			parked := parkedPieceCheckerFunc(func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error) {
 				if unknown {
@@ -419,6 +420,7 @@ func TestStoreSessionObservationStartsAfterUploadAdmission(t *testing.T) {
 	}
 	for _, outcome := range []string{"unknown", "processing", "contention", "canceled invocation", "canceled settlement rollback"} {
 		t.Run("resubmission/"+outcome, func(t *testing.T) {
+			t.Parallel()
 			payload := strings.Repeat("o", 128)
 			var state atomic.Value
 			state.Store(synapse.ParkedPieceMissing)

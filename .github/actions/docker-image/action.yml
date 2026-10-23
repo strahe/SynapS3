@@ -1,0 +1,125 @@
+name: Build Docker image
+description: Build one native architecture with isolated musl Go and BuildKit caches.
+inputs:
+  arch:
+    description: Native image architecture.
+    required: true
+  publish:
+    description: Push the image by digest to GHCR.
+    default: 'false'
+  read-only-go-cache:
+    description: Keep restored Go archives read-only, saving an archive on a complete miss.
+    default: 'false'
+outputs:
+  digest:
+    description: Built image digest.
+    value: ${{ steps.build.outputs.digest }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      id: buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Resolve Docker Go cache environment
+      id: go-cache
+      continue-on-error: true
+      shell: bash
+      env:
+        IMAGE_ARCH: ${{ inputs.arch }}
+      run: |
+        builder_image=$(sed -n 's/^ARG GO_BUILD_IMAGE=//p' Dockerfile)
+        printf 'go-build-image=%s\n' "$builder_image" >> "$GITHUB_OUTPUT"
+        digest=$(timeout 30s docker buildx imagetools inspect "$builder_image" --format '{{ .Manifest.Digest }}') || digest=''
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo '::warning::Could not resolve the Go builder digest; continuing without the archived Go build cache.'
+          exit 0
+        fi
+        printf 'go-build-image=%s@%s\n' "$builder_image" "$digest" >> "$GITHUB_OUTPUT"
+        export GO_BUILD_DIGEST="$digest"
+        python3 .github/scripts/docker-build-cache.py >> "$GITHUB_OUTPUT"
+
+    - name: Restore read-only Docker Go build cache
+      id: read-cache
+      if: runner.environment == 'github-hosted' && inputs.read-only-go-cache == 'true' && steps.go-cache.outputs.cache-key != ''
+      uses: actions/cache/restore@v5
+      continue-on-error: true
+      env:
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+      with:
+        path: ${{ runner.temp }}/docker-go-cache/${{ inputs.arch }}
+        key: ${{ steps.go-cache.outputs.cache-key }}
+        restore-keys: ${{ steps.go-cache.outputs.restore-key }}
+
+    - name: Restore and save Docker Go build cache
+      id: write-cache
+      if: runner.environment == 'github-hosted' && (inputs.read-only-go-cache != 'true' || steps.read-cache.outcome != 'success' || steps.read-cache.outputs.cache-matched-key == '') && steps.go-cache.outputs.cache-key != ''
+      uses: actions/cache@v5
+      continue-on-error: true
+      env:
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+      with:
+        path: ${{ runner.temp }}/docker-go-cache/${{ inputs.arch }}
+        key: ${{ steps.go-cache.outputs.cache-key }}
+        restore-keys: ${{ steps.go-cache.outputs.restore-key }}
+
+    - name: Inject Docker Go build cache
+      if: runner.environment == 'github-hosted' && (steps.read-cache.outcome == 'success' || steps.write-cache.outcome == 'success')
+      uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+      continue-on-error: true
+      with:
+        builder: ${{ steps.buildx.outputs.name }}
+        scratch-dir: ${{ runner.temp }}/docker-go-cache-scratch/${{ inputs.arch }}
+        skip-extraction: ${{ (inputs.read-only-go-cache == 'true' && steps.read-cache.outcome == 'success' && steps.read-cache.outputs.cache-matched-key != '') || steps.write-cache.outputs.cache-hit == 'true' }}
+        utility-image: ghcr.io/containerd/busybox@sha256:52f73a0a43a16cf37cd0720c90887ce972fe60ee06a687ee71fb93a7ca601df7
+        cache-map: |
+          {
+            "${{ runner.temp }}/docker-go-cache/${{ inputs.arch }}": {
+              "target": "/root/.cache/go-build",
+              "id": "synaps3-go-${{ inputs.arch }}-musl",
+              "sharing": "locked"
+            }
+          }
+
+    - name: Log in to GHCR
+      if: inputs.publish == 'true'
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - name: Resolve build metadata
+      id: image
+      shell: bash
+      run: |
+        printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        printf 'build-date=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+    - name: Docker metadata
+      id: meta
+      uses: docker/metadata-action@v6
+      with:
+        images: ${{ steps.image.outputs.name }}
+        tags: |
+          type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          type=raw,value=ci-manual-test,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'publish-test' }}
+          type=ref,event=tag,enable=${{ github.event_name == 'push' }}
+          type=ref,event=pr,enable=${{ github.event_name == 'pull_request' }}
+
+    - name: Build image
+      id: build
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        platforms: linux/${{ inputs.arch }}
+        tags: ${{ inputs.publish != 'true' && steps.meta.outputs.tags || '' }}
+        labels: ${{ steps.meta.outputs.labels }}
+        outputs: ${{ inputs.publish == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
+        cache-from: type=gha,scope=synaps3-image-${{ inputs.arch }},timeout=2m
+        cache-to: type=gha,scope=synaps3-image-${{ inputs.arch }},mode=max,ignore-error=true,timeout=2m
+        build-args: |
+          GO_BUILD_IMAGE=${{ steps.go-cache.outputs.go-build-image || 'golang:1.27.2-alpine' }}
+          VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
+          COMMIT=${{ github.sha }}
+          BUILD_DATE=${{ steps.image.outputs.build-date }}

@@ -14,8 +14,16 @@ FLAGS = (
     "docker_image", "docker_deployment", "docs",
 )
 CORE = {"verify", "go_tests", "race", "system", "s3_compatibility"}
-CORE_JOBS = ("verify", "race", "system", "s3_compatibility")
-WRITER_ORDER = ("verify", "system", "race")
+WORKER_CHECKS = {
+    "verify": {
+        "lint_config": "verify", "fmt": "verify", "lint": "verify", "build": "verify",
+        "go_tests": "go_tests", "race": "race", "system": "system", "s3_compatibility": "s3_compatibility",
+    },
+    "package": {
+        "docker_image": "docker_image", "docs": "docs",
+        "docker_entrypoint": "docker_deployment", "docker_deployment": "docker_deployment",
+    },
+}
 S3_DOCS = {
     "README.md",
     "docs/en/reference/s3-compatibility.md",
@@ -82,8 +90,12 @@ def plan_for_paths(paths):
     for path in paths:
         selected.update(selected_flags(path))
     plan = {flag: flag in selected for flag in FLAGS}
-    plan["modules_writer"] = next((job for job in WRITER_ORDER if plan[job]), "")
+    plan["modules_writer"] = module_writer(plan)
     return plan
+
+
+def module_writer(plan):
+    return "verify" if any(plan[flag] for flag in CORE) else ""
 
 
 def full_plan():
@@ -174,33 +186,136 @@ def validate_plan(plan):
         raise ValueError("plan flags must be JSON booleans")
     if plan["go_tests"] and not plan["verify"]:
         raise ValueError("Go tests require the verify job")
-    writer = next((job for job in WRITER_ORDER if plan[job]), "")
+    writer = module_writer(plan)
     if plan["modules_writer"] != writer:
         raise ValueError("modules_writer does not match the scheduled jobs")
 
 
-def check_job_results(plan, results, event_name="pull_request"):
+def check_worker_results(plan, worker, checks, event_name="pull_request"):
+    expected = WORKER_CHECKS[worker]
+    if not isinstance(checks, dict) or checks.keys() != expected.keys():
+        return [f"{worker}: check results must contain every expected check"]
+    errors = []
+    for check, flag in expected.items():
+        actual = checks[check]
+        selected = plan[flag] and (check != "docker_image" or event_name == "pull_request")
+        if selected:
+            if actual != "success":
+                errors.append(f"{worker}/{check}: expected success, got {actual}")
+        elif actual not in ("skipped", "not_selected"):
+            errors.append(f"{worker}/{check}: expected not_selected, got {actual}")
+    return errors
+
+
+def ordered_packages(packages, module):
+    if not isinstance(module, str) or not module:
+        raise ValueError("ordinary package inventory requires a module identity")
+    if not isinstance(packages, list) or not packages or any(not isinstance(package, str) for package in packages):
+        raise ValueError("ordinary package inventory must be a nonempty list of package names")
+    if len(packages) != len(set(packages)):
+        raise ValueError("ordinary package inventory is empty or contains duplicates")
+    roots = (module + "/cmd", module + "/internal")
+    if any(not isinstance(package, str) or not any(
+        package == root or package.startswith(root + "/") for root in roots
+    ) for package in packages):
+        raise ValueError("ordinary package inventory contains an unrelated package")
+    priority = module + "/internal/task"
+    if priority not in packages:
+        raise ValueError("ordinary package inventory is missing internal/task")
+    return [priority, *sorted(package for package in packages if package != priority)]
+
+
+def check_job_results(plan, results, source_sha, event_name="pull_request"):
     try:
         validate_plan(plan)
     except ValueError as error:
         return [f"Invalid CI plan: {error}"]
     if not isinstance(results, dict):
         return ["Job results must be a JSON object"]
-
-    def result(job):
-        value = results.get(job)
-        return value.get("result") if isinstance(value, dict) else value
-
+    if not valid_sha(source_sha):
+        return ["The expected source SHA is invalid"]
     errors = []
-    if result("changes") != "success":
-        errors.append("changes must succeed before job results can be accepted")
-    for job in CORE_JOBS:
-        selected = plan[job] and (job != "s3_compatibility" or event_name == "pull_request")
-        expected = "success" if selected else "skipped"
-        actual = result(job)
-        if actual != expected:
-            errors.append(f"{job}: expected {expected}, got {actual}")
+    publish = results.get("publish")
+    if event_name == "push":
+        if not isinstance(publish, dict) or publish.get("result") != "success":
+            actual = publish.get("result") if isinstance(publish, dict) else None
+            errors.append(f"publish: expected success, got {actual}")
+        else:
+            try:
+                outputs = publish.get("outputs", {})
+                reported_plan = json.loads(outputs.get("plan", ""))
+                validate_plan(reported_plan)
+                if reported_plan != plan:
+                    errors.append("publish: selection plan differs from the final check")
+                if outputs.get("source-sha") != source_sha:
+                    errors.append("publish: checkout differs from the requested source SHA")
+                actual_image = outputs.get("docker-image")
+                expected = ("success",) if plan["docker_image"] else ("skipped", "not_selected")
+                if actual_image not in expected:
+                    errors.append(f"publish/docker_image: expected {expected}, got {actual_image}")
+            except (ValueError, TypeError, AttributeError) as error:
+                errors.append(f"publish: invalid worker outputs: {error}")
+    elif not isinstance(publish, dict) or publish.get("result") != "skipped":
+        errors.append("publish: image publishing must be skipped outside a main push")
+    for worker in WORKER_CHECKS:
+        job = results.get(worker)
+        if not isinstance(job, dict) or job.get("result") != "success":
+            actual = job.get("result") if isinstance(job, dict) else None
+            errors.append(f"{worker}: expected success, got {actual}")
+            continue
+        outputs = job.get("outputs", {})
+        if not isinstance(outputs, dict):
+            errors.append(f"{worker}: worker outputs are missing")
+            continue
+        try:
+            reported_plan = json.loads(outputs.get("plan", ""))
+            validate_plan(reported_plan)
+            if reported_plan != plan:
+                errors.append(f"{worker}: selection plan differs from the final check")
+            if outputs.get("source-sha") != source_sha:
+                errors.append(f"{worker}: checkout differs from the requested source SHA")
+            if outputs.get("verified") != "true":
+                errors.append(f"{worker}: checks were not verified")
+        except (ValueError, TypeError, KeyError) as error:
+            errors.append(f"{worker}: invalid worker outputs: {error}")
     return errors
+
+
+def record_worker(plan, worker, checks, output_path, event_name="pull_request"):
+    validate_plan(plan)
+    print(f"{worker} check results: {json.dumps(checks, sort_keys=True)}")
+    errors = check_worker_results(plan, worker, checks, event_name)
+    if errors:
+        return errors
+    source_sha = git("rev-parse", "HEAD").decode().strip()
+    if not valid_sha(source_sha):
+        return [f"{worker}: checkout source SHA is invalid"]
+    outputs = {
+        "plan": json.dumps(plan, separators=(",", ":")),
+        "source-sha": source_sha,
+        "verified": "true",
+    }
+    if output_path:
+        with Path(output_path).open("a", encoding="utf-8") as output:
+            output.write("".join(f"{name}={value}\n" for name, value in outputs.items()))
+    return errors
+
+
+def run_ordinary_tests(worker, parallelism, json_output):
+    if worker != "verify":
+        raise ValueError("ordinary tests require the verify worker")
+    if parallelism < 1:
+        raise ValueError("package parallelism must be positive")
+    environment = dict(os.environ, CGO_ENABLED="1")
+    module = subprocess.check_output(["go", "list", "-m"], env=environment, text=True).strip()
+    packages = subprocess.check_output(["go", "list", "./cmd/...", "./internal/..."], env=environment, text=True).splitlines()
+    selected = ordered_packages(packages, module)
+    print("Ordinary test packages:\n" + "\n".join(selected), file=sys.stderr, flush=True)
+    command = ["go", "run", "-trimpath", "./internal/testpg/cmd/testrun", "--", "-trimpath",
+               "-p", str(parallelism), "-parallel", "2", "-count=1"]
+    if json_output:
+        command.append("-json")
+    os.execvpe(command[0], [*command, *selected], environment)
 
 
 def write_outputs(plan, output_path):
@@ -228,10 +343,38 @@ def main():
     check.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME") or "pull_request")
     check.add_argument("--plan", required=True)
     check.add_argument("--results", required=True)
+    check.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
+    record = commands.add_parser("record")
+    record.add_argument("--worker", choices=tuple(WORKER_CHECKS), required=True)
+    record.add_argument("--output", default=os.environ.get("GITHUB_OUTPUT", ""))
+    record.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME") or "pull_request")
+    test = commands.add_parser("test")
+    test.add_argument("--worker", choices=("verify",), default="verify")
+    test.add_argument("--package-parallelism", type=int, default=2)
+    test.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    if args.command == "test":
+        try:
+            run_ordinary_tests(args.worker, args.package_parallelism, args.json)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"Could not run ordinary tests: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "record":
+        try:
+            errors = record_worker(
+                json.loads(os.environ.get("CI_PLAN", "")), args.worker,
+                json.loads(os.environ.get("CI_CHECKS", "")), args.output, args.event_name,
+            )
+        except (OSError, ValueError, TypeError, DiffUnavailable) as error:
+            errors = [f"Invalid CI worker input: {error}"]
+        if errors:
+            print("\n".join(errors), file=sys.stderr)
+            return 1
+        return 0
     if args.command == "check":
         try:
-            errors = check_job_results(json.loads(args.plan), json.loads(args.results), args.event_name)
+            errors = check_job_results(json.loads(args.plan), json.loads(args.results), args.sha, args.event_name)
         except (ValueError, TypeError) as error:
             errors = [f"Invalid CI check input: {error}"]
         if errors:

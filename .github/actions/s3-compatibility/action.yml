@@ -1,0 +1,81 @@
+name: Test S3 compatibility
+description: Test documented operations and pinned clients, and publish the compatibility report.
+inputs:
+  source-sha:
+    description: Source commit shown in the compatibility report.
+    required: true
+outputs:
+  rules:
+    description: Report-rule test outcome.
+    value: ${{ steps.rules.outcome }}
+  matrix:
+    description: S3 operation test outcome.
+    value: ${{ steps.matrix.outcome }}
+  clients:
+    description: Pinned S3 client test outcome.
+    value: ${{ steps.client-tests.outcome }}
+runs:
+  using: composite
+  steps:
+    - name: Validate report rules
+      id: rules
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        PYTHONDONTWRITEBYTECODE: '1'
+      run: python3 -m unittest discover -s scripts -p 'test_s3_compatibility_report.py'
+
+    - name: Restore S3 clients
+      id: clients-cache
+      if: ${{ !cancelled() }}
+      uses: actions/cache/restore@v5
+      continue-on-error: true
+      env:
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+      with:
+        path: ${{ runner.temp }}/synaps3-s3-clients
+        key: s3-clients-v1-${{ runner.os }}-${{ runner.arch }}-aws-2.31.0-rclone-1.71.0-mc-2025-08-13-${{ hashFiles('.github/actions/setup-s3-clients/action.yml') }}
+
+    - name: Set up pinned S3 clients
+      id: clients
+      if: ${{ !cancelled() }}
+      uses: ./.github/actions/setup-s3-clients
+
+    - name: Save S3 clients
+      if: ${{ !cancelled() && steps.clients.outcome == 'success' && steps.clients-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v5
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/synaps3-s3-clients
+        key: s3-clients-v1-${{ runner.os }}-${{ runner.arch }}-aws-2.31.0-rclone-1.71.0-mc-2025-08-13-${{ hashFiles('.github/actions/setup-s3-clients/action.yml') }}
+
+    - name: Test documented S3 operations
+      id: matrix
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -json -trimpath -tags='dev systemtest s3compat' -count=1 \
+          -run '^TestS3CompatibilityMatrix$' ./tests/system | tee "$RUNNER_TEMP/s3-matrix.json"
+
+    - name: Test AWS CLI, rclone, and MinIO Client
+      id: client-tests
+      if: ${{ !cancelled() && steps.clients.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -json -trimpath -tags='dev systemtest s3compat' -count=1 \
+          -run '^TestS3Clients$' ./tests/system | tee "$RUNNER_TEMP/s3-clients.json"
+
+    - name: Publish compatibility summary
+      if: ${{ always() }}
+      shell: bash
+      env:
+        SOURCE_SHA: ${{ inputs.source-sha }}
+      run: |
+        python3 scripts/s3_compatibility_report.py \
+          --matrix-json "$RUNNER_TEMP/s3-matrix.json" \
+          --clients-json "$RUNNER_TEMP/s3-clients.json" \
+          --summary "$GITHUB_STEP_SUMMARY" \
+          --source-sha "$SOURCE_SHA" \
+          --checkout-sha "$(git rev-parse HEAD)"

@@ -94,10 +94,6 @@ func localRefusal(t *testing.T, db *bun.DB, repos *repository.Repositories, sour
 	return json.RawMessage(encoded)
 }
 
-func TestUncreatedReplacementAdmissionAndFencing(t *testing.T) {
-	uncreatedReplacementAdmissionAndFencing(t, testDB(t))
-}
-
 func uncreatedReplacementAdmissionAndFencing(t *testing.T, db *bun.DB) {
 	for _, tc := range []struct {
 		name    string
@@ -248,10 +244,6 @@ func localWaitingCopy(t *testing.T, repos *repository.Repositories, source *mode
 	return &copies[0]
 }
 
-func TestLocalReplacementBatchesPreserveFrozenCopyObligations(t *testing.T) {
-	localReplacementBatchesPreserveFrozenCopyObligations(t, testDB(t))
-}
-
 func localReplacementBatchesPreserveFrozenCopyObligations(t *testing.T, db *bun.DB) {
 	repos, original, _ := localReplacementSource(t, db, "local-copy-batches")
 	historical := localWaitingCopy(t, repos, original, "historical-one-copy")
@@ -340,10 +332,6 @@ func localReplacementBatchesPreserveFrozenCopyObligations(t *testing.T, db *bun.
 	}
 }
 
-func TestLocalReplacementRetryAndCompletion(t *testing.T) {
-	localReplacementRetryAndCompletion(t, testDB(t))
-}
-
 func localReplacementRetryAndCompletion(t *testing.T, db *bun.DB) {
 	repos, source, _ := localReplacementSource(t, db, "local-completion")
 	row, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "202"), ClientRequestID: "complete"})
@@ -385,14 +373,6 @@ func localReplacementRetryAndCompletion(t *testing.T, db *bun.DB) {
 	if completed.Status != storagereplacement.StatusCompleted || completed.TaskID != nil || completed.TerminationEpoch != nil {
 		t.Fatalf("completion=%#v", completed)
 	}
-}
-
-func TestRejectedLocalTargetCanBeReplacedAgain(t *testing.T) {
-	rejectedLocalTargetCanBeReplacedAgain(t, testDB(t))
-}
-
-func TestReplacementUploadWakeScope(t *testing.T) {
-	replacementUploadWakeScope(t, testDB(t))
 }
 
 func replacementUploadWakeScope(t *testing.T, db *bun.DB) {
@@ -538,10 +518,6 @@ func activateReplacement(t *testing.T, repos *repository.Repositories, id int64)
 	return repos.Replacements.CompleteTask(t.Context(), id, row.TaskGeneration, task.ID)
 }
 
-func TestReadyTargetRejectsStaleInitializationFailure(t *testing.T) {
-	readyTargetRejectsStaleInitializationFailure(t, testDB(t))
-}
-
 func readyTargetRejectsStaleInitializationFailure(t *testing.T, db *bun.DB) {
 	repos, source, _ := localReplacementSource(t, db, "stale-initialization-failure")
 	row, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{BucketID: source.BucketID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual, TargetProviderID: onChainID(t, "202"), ClientRequestID: "first"})
@@ -565,10 +541,6 @@ func readyTargetRejectsStaleInitializationFailure(t *testing.T, db *bun.DB) {
 	if err != nil || current.Status != storagereplacement.StatusPreparingTarget || current.FailureReason != nil {
 		t.Fatalf("stale initialization failure changed replacement: %#v %v", current, err)
 	}
-}
-
-func TestRemoteSourceCannotCompleteLocally(t *testing.T) {
-	remoteSourceCannotCompleteLocally(t, testDB(t))
 }
 
 func remoteSourceCannotCompleteLocally(t *testing.T, db *bun.DB) {

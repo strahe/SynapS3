@@ -20,8 +20,8 @@ type Template struct {
 	config      *pgx.ConnConfig
 }
 
-// NewTemplate prepares a private schema and closes every template connection
-// before allowing clones. prepare must close the connections it opens.
+// NewTemplate prepares a database with a private schema for cloning.
+// prepare must close all connections it opens before returning.
 func NewTemplate(ctx context.Context, prepare func(context.Context, *pgx.ConnConfig) error) (_ *Template, result error) {
 	dsn, err := BaseDSNContext(ctx)
 	if err != nil {
