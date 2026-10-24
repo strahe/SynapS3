@@ -204,7 +204,7 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, ib.db, "test-bucket")
-	content := "hello world"
+	content := validTestObjectBody("hello world")
 
 	// PutObject
 	putObject(t, ib.backend, "test-bucket", "test-key", content)

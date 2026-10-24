@@ -26,6 +26,13 @@ func ParseEvictionPolicy(value string) (EvictionPolicy, bool) {
 	}
 }
 
+// RehydratesColdReads reports whether a complete read from a storage provider
+// restores the object to the local cache. Under after_upload nothing would
+// release such a copy again.
+func (p EvictionPolicy) RehydratesColdReads() bool {
+	return p != EvictionPolicyAfterUpload
+}
+
 // EnqueuesAfterUploadEviction reports whether upload finalization must create
 // an eviction task in the same transaction.
 func (p EvictionPolicy) EnqueuesAfterUploadEviction() bool {

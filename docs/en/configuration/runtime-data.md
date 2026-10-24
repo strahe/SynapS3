@@ -5,7 +5,7 @@ description: Find where SynapS3 keeps its data, and back it up and restore it as
 
 # Runtime Data
 
-SynapS3 keeps its configuration and cached objects on local disk and its metadata in PostgreSQL. The cache can hold objects that are not on Filecoin yet, and the database records where every object is stored. Put both on durable storage, and back them up and restore them together.
+SynapS3 keeps its configuration and cached objects on local disk and its metadata in PostgreSQL. The cache can hold objects that are not on Filecoin yet, and the database records where every object is stored. Put both on durable storage, and back them up and restore them together. The cache directory must be on a filesystem that supports `fsync` on directories, such as a local disk; otherwise SynapS3 does not start.
 
 ## Layout
 

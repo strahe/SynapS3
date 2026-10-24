@@ -62,12 +62,20 @@ type Result struct {
 	CacheMiss      bool
 }
 
+// LimitToRange narrows Body to length bytes starting at start. A provider body
+// is still read to its end so piece verification decides whether the range
+// completes.
+func (r *Result) LimitToRange(start, length int64) {
+	r.Body = newRangeReadCloser(r.Body, start, length, r.Source == SourceProvider)
+}
+
 type Reader struct {
 	repos         *repository.Repositories
 	cache         cache.Cache
 	storage       synapse.StorageClient
 	cacheGate     *cacheaccess.Gate
 	accessTracker *cacheaccess.Tracker
+	rehydrate     bool
 	logger        *slog.Logger
 }
 
@@ -77,6 +85,7 @@ func New(
 	storage synapse.StorageClient,
 	cacheGate *cacheaccess.Gate,
 	accessTracker *cacheaccess.Tracker,
+	evictionPolicy cache.EvictionPolicy,
 	logger *slog.Logger,
 ) *Reader {
 	if cacheGate == nil {
@@ -94,6 +103,7 @@ func New(
 		storage:       storage,
 		cacheGate:     cacheGate,
 		accessTracker: accessTracker,
+		rehydrate:     evictionPolicy.RehydratesColdReads(),
 		logger:        logger,
 	}
 	return r
@@ -157,7 +167,7 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 	}
 
 	body = rc
-	if rehydrate {
+	if rehydrate && r.rehydrate {
 		body = r.streamAndRehydrate(
 			ctx,
 			bucketName,
@@ -224,7 +234,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 	}
 
 	body = rc
-	if dbErr == nil && cur != nil && cur.VersionID == version.VersionID {
+	if r.rehydrate && dbErr == nil && cur != nil && cur.VersionID == version.VersionID {
 		body = r.streamAndRehydrate(
 			ctx,
 			bucketName,
@@ -237,6 +247,9 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 }
 
 func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source Source, cacheMiss bool) *Result {
+	if source == SourceProvider {
+		body = newRangeReadCloser(body, 0, version.Size, true)
+	}
 	return &Result{
 		Body:           body,
 		Size:           version.Size,

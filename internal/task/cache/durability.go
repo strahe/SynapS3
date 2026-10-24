@@ -71,6 +71,11 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 			}
 			return retryTask(err, "durability_scan_failed")
 		}
+		if h.deps.EvictionPolicy != cache.EvictionPolicyAfterUpload {
+			return taskengine.Complete("Cache release after upload is disabled", func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.CacheEvictions.ReleaseBucketDurability(ctx, input.BucketID, input.Generation, execution.ID())
+			})
+		}
 		if len(candidates) == 0 {
 			return taskengine.Complete("Cache release checked", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.CacheEvictions.CompleteBucketDurability(ctx, input.BucketID, input.Generation, execution.ID())
@@ -83,9 +88,6 @@ func (h *DurabilityHandler) newHandler() *taskengine.FuncHandler {
 			candidates, err := repos.CacheEvictions.ListBucketDurabilityCandidates(ctx, input.BucketID, input.Generation, execution.ID(), 100)
 			if err != nil {
 				return err
-			}
-			if h.deps.EvictionPolicy != cache.EvictionPolicyAfterUpload {
-				return nil
 			}
 			if h.deps.Scheduler == nil {
 				return errors.New("task service is unavailable")

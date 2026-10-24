@@ -281,6 +281,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithObjectUploader(appBackend).
 		WithObjectVersionRestorer(appBackend).
 		WithObjectStorage(opts.Filecoin.Storage).
+		WithEvictionPolicy(evictionPolicy).
 		WithSettings(opts.Settings).
 		WithCommitPolicy(cfg.Worker.Tasks, synapse.LegacyPieceStorageIDLimit(cfg.Filecoin.Network)).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).

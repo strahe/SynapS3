@@ -2164,6 +2164,7 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 			s.objectStorage,
 			s.cacheGate,
 			s.cacheAccessTracker,
+			s.evictionPolicy,
 			s.logger,
 		)
 	}

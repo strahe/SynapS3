@@ -230,7 +230,7 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 			return nil, rangeErr
 		}
 		if valid {
-			out.Body = newRangeReadCloser(out.Body, start, count, out.Source == objectreader.SourceProvider)
+			out.LimitToRange(start, count)
 			length = count
 			rangeValue := fmt.Sprintf("bytes %d-%d/%d", start, start+count-1, out.Size)
 			contentRange = &rangeValue

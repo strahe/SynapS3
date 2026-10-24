@@ -107,6 +107,7 @@ func New(
 		sc,
 		cacheGate,
 		cacheAccessTracker,
+		b.evictionPolicy,
 		logger,
 	)
 	return b

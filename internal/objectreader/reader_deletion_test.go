@@ -87,7 +87,7 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 	}
 	gate := cacheaccess.NewGate()
 	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
-	reader := New(repos, mc, storageClient, gate, tracker, slog.Default())
+	reader := New(repos, mc, storageClient, gate, tracker, "", slog.Default())
 
 	type openResult struct {
 		result *Result

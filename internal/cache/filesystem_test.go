@@ -840,6 +840,68 @@ func TestPutPartOverwrite(t *testing.T) {
 	}
 }
 
+// stalledBody delivers its first chunk, reports that, and waits for release
+// before ending, like a slow client in the middle of a part upload.
+type stalledBody struct {
+	first    []byte
+	started  chan struct{}
+	released chan struct{}
+}
+
+func (b *stalledBody) Read(p []byte) (int, error) {
+	if len(b.first) > 0 {
+		n := copy(p, b.first)
+		b.first = b.first[n:]
+		close(b.started)
+		return n, nil
+	}
+	<-b.released
+	return 0, io.EOF
+}
+
+func TestDeleteDoesNotWaitForPartBodyOnSharedShard(t *testing.T) {
+	fs := newTestCache(t)
+	ctx := context.Background()
+	partShard := fs.shardFor(".multipart/up-slow", "1")
+	key := ""
+	for i := 0; key == ""; i++ {
+		if candidate := fmt.Sprintf("content-%d", i); fs.shardFor("bkt", candidate) == partShard {
+			key = candidate
+		}
+	}
+	if _, err := fs.Put(ctx, "bkt", key, strings.NewReader("cached"), 6); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	body := &stalledBody{first: []byte("part"), started: make(chan struct{}), released: make(chan struct{})}
+	putErr := make(chan error, 1)
+	go func() {
+		_, err := fs.PutPart(ctx, "up-slow", 1, body, 4)
+		putErr <- err
+	}()
+	<-body.started
+
+	deleted := make(chan error, 1)
+	go func() { deleted <- fs.Delete(ctx, "bkt", key) }()
+	select {
+	case err := <-deleted:
+		if err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(body.released)
+		t.Fatal("Delete waited for a part upload body on the same shard")
+	}
+
+	close(body.released)
+	if err := <-putErr; err != nil {
+		t.Fatalf("PutPart: %v", err)
+	}
+	if fs.UsedBytes() != 4 {
+		t.Fatalf("UsedBytes = %d, want only the part", fs.UsedBytes())
+	}
+}
+
 func TestDeleteUpload(t *testing.T) {
 	fs := newTestCache(t)
 	ctx := context.Background()
@@ -1018,5 +1080,77 @@ func TestPutStagedCommitAndRollbackCanOverlap(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("Get data = %q, want %q", got, data)
+	}
+}
+
+func failDirectorySync(t *testing.T) error {
+	t.Helper()
+	original := syncDir
+	syncErr := errors.New("directory sync is not supported")
+	syncDir = func(string) error { return syncErr }
+	t.Cleanup(func() { syncDir = original })
+	return syncErr
+}
+
+func TestNewFilesystemRequiresDirectorySync(t *testing.T) {
+	syncErr := failDirectorySync(t)
+	if _, err := NewFilesystem(t.TempDir(), 0); !errors.Is(err, syncErr) {
+		t.Fatalf("NewFilesystem err = %v, want %v", err, syncErr)
+	}
+}
+
+func TestStagedCommitFailsWhenDirectorySyncFails(t *testing.T) {
+	ctx := context.Background()
+	writes := []struct {
+		name  string
+		stage func(*testing.T, *Filesystem) *StagedObject
+	}{
+		{"put", func(t *testing.T, fs *Filesystem) *StagedObject {
+			staged, err := fs.PutStaged(ctx, "bkt", "staging", strings.NewReader("cached"), 6)
+			if err != nil {
+				t.Fatalf("PutStaged: %v", err)
+			}
+			return staged
+		}},
+		{"assemble", func(t *testing.T, fs *Filesystem) *StagedObject {
+			for i, part := range []string{"cac", "hed"} {
+				if _, err := fs.PutPart(ctx, "up-sync", i+1, strings.NewReader(part), 3); err != nil {
+					t.Fatalf("PutPart: %v", err)
+				}
+			}
+			staged, _, err := fs.AssemblePartsStaged(ctx, "bkt", "staging", "up-sync", []int{1, 2})
+			if err != nil {
+				t.Fatalf("AssemblePartsStaged: %v", err)
+			}
+			return staged
+		}},
+	}
+	for _, write := range writes {
+		for _, existed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/destination_existed_%t", write.name, existed), func(t *testing.T) {
+				fs := newTestCache(t)
+				if existed {
+					if _, err := fs.Put(ctx, "bkt", "content", strings.NewReader("cached"), 6); err != nil {
+						t.Fatalf("Put: %v", err)
+					}
+				}
+				staged := write.stage(t, fs)
+				usedBefore := fs.UsedBytes()
+				syncErr := failDirectorySync(t)
+
+				if err := staged.CommitAs("bkt", "content"); !errors.Is(err, syncErr) {
+					t.Fatalf("CommitAs err = %v, want %v", err, syncErr)
+				}
+				if err := staged.Rollback(); err != nil {
+					t.Fatalf("Rollback: %v", err)
+				}
+				if got := fs.CapacitySnapshot(); got.UsedBytes != usedBefore || got.ReservedBytes != 0 {
+					t.Fatalf("capacity = %+v, want used %d and nothing reserved", got, usedBefore)
+				}
+				if fs.Exists(ctx, "bkt", "content") != existed {
+					t.Fatalf("destination exists = %t, want %t", !existed, existed)
+				}
+			})
+		}
 	}
 }
