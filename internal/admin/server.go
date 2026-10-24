@@ -45,6 +45,7 @@ type Server struct {
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
 	objectStorage            synapse.StorageClient
+	evictionPolicy           cache.EvictionPolicy
 	cacheGate                *cacheaccess.Gate
 	cacheAccessTracker       *cacheaccess.Tracker
 	objectUploader           objectUploader
@@ -135,7 +136,7 @@ func New(
 		cache:                    c,
 		cacheGate:                cacheGate,
 		cacheAccessTracker:       cacheAccessTracker,
-		objectReader:             objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
+		objectReader:             objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, "", logger),
 		cacheMaxBytes:            cacheMaxBytes,
 		repos:                    repos,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, boundedBucketCopies(filecoinDefaultCopies), logger),
@@ -159,6 +160,13 @@ func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
 	return s
 }
 
+// WithEvictionPolicy applies the cache eviction policy to admin downloads.
+func (s *Server) WithEvictionPolicy(policy cache.EvictionPolicy) *Server {
+	s.evictionPolicy = policy
+	s.resetObjectReader()
+	return s
+}
+
 func (s *Server) resetObjectReader() {
 	s.objectReader = objectreader.New(
 		s.repos,
@@ -166,6 +174,7 @@ func (s *Server) resetObjectReader() {
 		s.objectStorage,
 		s.cacheGate,
 		s.cacheAccessTracker,
+		s.evictionPolicy,
 		s.logger,
 	)
 }

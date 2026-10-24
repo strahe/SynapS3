@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -21,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -36,6 +39,7 @@ import (
 	idtypes "github.com/strahe/synaps3/internal/types"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/chain"
+	"github.com/strahe/synapse-go/storage"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
@@ -5366,6 +5370,7 @@ func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 		nil,
 		srv.cacheGate,
 		srv.cacheAccessTracker,
+		"",
 		testLogger(),
 	)
 
@@ -5386,6 +5391,65 @@ func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 	}
 }
 
+// unverifiedPieceBody delivers every byte without an error and reports the
+// piece verification failure only on the Read after them, as the SDK does.
+type unverifiedPieceBody struct {
+	io.Reader
+	verdict error
+}
+
+func (b *unverifiedPieceBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		return n, b.verdict
+	}
+	return n, err
+}
+
+func (*unverifiedPieceBody) Close() error { return nil }
+
+func TestAPIBucketObjectDownload_FailsWhenRemotePieceDoesNotVerify(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	bucket := &model.Bucket{Name: "verify-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(t.Context(), bucket); err != nil {
+		t.Fatal(err)
+	}
+	// Larger than the response buffer, so the client has the status and most
+	// of the body before verification fails.
+	const size = 128 << 10
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "report.bin", size, "etag", "checksum", "application/octet-stream", model.ObjectStateCached)
+	hash, err := mh.Sum([]byte("piece"), mh.SHA2_256, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptAdminVersionUpload(t, srv.db, repos, versionID, cid.NewCidV1(cid.Raw, hash).String(), "https://provider.example/piece")
+	mockCache := &testutil.MockCache{
+		GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+	}
+	storageClient := &testutil.MockStorageClient{
+		DownloadFunc: func(context.Context, cid.Cid, *storage.DownloadOptions) (io.ReadCloser, error) {
+			return &unverifiedPieceBody{Reader: bytes.NewReader(make([]byte, size)), verdict: errors.New("piece CID mismatch")}, nil
+		},
+	}
+	srv.objectReader = objectreader.New(repos, mockCache, storageClient, srv.cacheGate, srv.cacheAccessTracker, "", testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/buckets/verify-bucket/objects/download?key=report.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	got, readErr := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || readErr == nil || len(got) >= size {
+		t.Fatalf("download = %d, %d/%d bytes, %v; want the transfer to fail before the last bytes", resp.StatusCode, len(got), size, readErr)
+	}
+}
+
 func TestAPIBucketObjectDownload_PreservesRedactedFailure(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	bucket := &model.Bucket{Name: "failed-download-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
@@ -5398,7 +5462,7 @@ func TestAPIBucketObjectDownload_PreservesRedactedFailure(t *testing.T) {
 			return nil, nil, errors.New("GET https://user:password@provider.example/piece/17?token=secret#private: HTTP 503 eid=download-17 storage unavailable")
 		},
 	}
-	srv.objectReader = objectreader.New(repos, mockCache, nil, srv.cacheGate, srv.cacheAccessTracker, testLogger())
+	srv.objectReader = objectreader.New(repos, mockCache, nil, srv.cacheGate, srv.cacheAccessTracker, "", testLogger())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/failed-download-bucket/objects/download?key=report.txt", nil)
 	req.SetPathValue("name", bucket.Name)
 	rr := httptest.NewRecorder()

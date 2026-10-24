@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -40,7 +41,11 @@ type Filesystem struct {
 	root      string
 	maxBytes  int64 // 0 means unlimited
 	usedBytes atomic.Int64
-	keyShards [256]sync.Mutex // fixed-size shard locks to serialize per-key operations
+	// keyShards serialize per-key file replacement and accounting. Delete takes
+	// one inside database transactions, so a holder only renames, removes, or
+	// syncs a single file and never waits on request data; the only lock it may
+	// take is capacityMu, which is held only for counter updates.
+	keyShards [256]sync.Mutex
 
 	// capacityMu admits writes against usedBytes plus reservedBytes, so
 	// committed and in-progress bytes together never exceed maxBytes.
@@ -118,6 +123,9 @@ func NewFilesystem(dir string, maxBytes int64) (*Filesystem, error) {
 	}
 	if err := ensurePrivateDir(absRoot); err != nil {
 		return nil, fmt.Errorf("creating cache root %s: %w", absRoot, err)
+	}
+	if err := syncDir(absRoot); err != nil {
+		return nil, fmt.Errorf("cache directory %s does not support directory sync: %w", absRoot, err)
 	}
 
 	f := &Filesystem{root: absRoot, maxBytes: maxBytes}
@@ -215,6 +223,28 @@ func (f *Filesystem) safePath(parts ...string) (string, error) {
 		}
 	}
 	return abs, nil
+}
+
+var syncDir = fsyncDir
+
+// syncCommittedEntry makes a rename into destPath durable. When the sync fails
+// and destPath held nothing before, the new entry is removed so the failed
+// commit leaves the cache as it was; a destination that existed is kept, since
+// content-addressed keys mean it already held the same bytes. It reports
+// whether destPath still holds the staged bytes.
+func syncCommittedEntry(destDir, destPath string, existed bool) (bool, error) {
+	syncErr := syncDir(destDir)
+	if syncErr == nil {
+		return true, nil
+	}
+	err := fmt.Errorf("syncing cache directory: %w", syncErr)
+	if existed {
+		return true, err
+	}
+	if rmErr := os.Remove(destPath); rmErr != nil {
+		return true, errors.Join(err, fmt.Errorf("removing unsynced cache entry: %w", rmErr))
+	}
+	return false, err
 }
 
 // fsyncDir fsyncs a directory to ensure rename/unlink durability.
@@ -331,22 +361,26 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 
 		// Determine old file size for accounting.
 		var oldSize int64
-		if stat, statErr := os.Stat(destPath); statErr == nil {
+		stat, statErr := os.Stat(destPath)
+		existed := statErr == nil
+		if existed {
 			oldSize = stat.Size()
 		}
 
 		if err := os.Rename(tmpPath, destPath); err != nil {
 			return fmt.Errorf("renaming temp to final: %w", err)
 		}
-
-		// Fsync parent directory to ensure the rename is durable.
-		if err := fsyncDir(destDir); err != nil {
-			slog.Warn("fsync parent dir failed", "dir", destDir, "error", err)
+		kept, syncErr := syncCommittedEntry(destDir, destPath, existed)
+		if !kept {
+			return syncErr
 		}
 
 		res.settle(n - oldSize)
 		committed = true
 		info.Path = destPath
+		if syncErr != nil {
+			return syncErr
+		}
 		slog.Debug("cached object", "bucket", destBucket, "key", destKey, "size", n)
 		return nil
 	}
@@ -424,7 +458,7 @@ func (f *Filesystem) Delete(_ context.Context, bucket, key string) error {
 
 	// Fsync parent directory to ensure the unlink is durable.
 	if dir := filepath.Dir(p); dir != "" {
-		if syncErr := fsyncDir(dir); syncErr != nil {
+		if syncErr := syncDir(dir); syncErr != nil {
 			slog.Warn("fsync parent dir after delete failed", "dir", dir, "error", syncErr)
 		}
 	}
@@ -536,16 +570,6 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 	}
 	defer res.release()
 
-	// Use shard lock keyed on uploadID+partNumber for per-part serialization.
-	mu := f.shardFor(".multipart/"+uploadID, fmt.Sprintf("%d", partNumber))
-	mu.Lock()
-	defer mu.Unlock()
-
-	var oldSize int64
-	if stat, statErr := os.Stat(dst); statErr == nil {
-		oldSize = stat.Size()
-	}
-
 	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("creating temp file: %w", err)
@@ -575,12 +599,22 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 	}
 	file = nil
 
+	// Serialize the replacement of this part number with its accounting.
+	mu := f.shardFor(".multipart/"+uploadID, fmt.Sprintf("%d", partNumber))
+	mu.Lock()
+	defer mu.Unlock()
+
+	var oldSize int64
+	if stat, statErr := os.Stat(dst); statErr == nil {
+		oldSize = stat.Size()
+	}
+
 	if err := os.Rename(tmpPath, dst); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("renaming part to final: %w", err)
 	}
 
-	if err := fsyncDir(dir); err != nil {
+	if err := syncDir(dir); err != nil {
 		slog.Warn("fsync multipart dir failed", "dir", dir, "error", err)
 	}
 
@@ -696,22 +730,24 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 		defer mu.Unlock()
 
 		var oldSize int64
-		if stat, statErr := os.Stat(destPath); statErr == nil {
+		stat, statErr := os.Stat(destPath)
+		existed := statErr == nil
+		if existed {
 			oldSize = stat.Size()
 		}
 
 		if err := os.Rename(tmpPath, destPath); err != nil {
 			return fmt.Errorf("renaming assembled to final: %w", err)
 		}
-
-		if err := fsyncDir(destDir); err != nil {
-			slog.Warn("fsync dir after assemble failed", "dir", destDir, "error", err)
+		kept, syncErr := syncCommittedEntry(destDir, destPath, existed)
+		if !kept {
+			return syncErr
 		}
 
 		res.settle(totalSize - oldSize)
 		committed = true
 		info.Path = destPath
-		return nil
+		return syncErr
 	}
 	return &StagedObject{
 		Info:     info,

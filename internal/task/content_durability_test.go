@@ -125,3 +125,43 @@ func TestDurabilityReconciliationBatchesAndRollsBack(t *testing.T) {
 		})
 	}
 }
+
+func TestDurabilityReconciliationFinishesWithoutAfterUploadPolicy(t *testing.T) {
+	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyNone} {
+		t.Run(string(policy), func(t *testing.T) {
+			f := newRegistrationFixture(t, 2, nil, 0, func(options *handlerRuntimeOptions) {
+				options.policy, options.maxBytes, options.highPercent, options.lowPercent = policy, 1<<30, 90, 50
+			})
+			ctx := t.Context()
+			for _, copy := range f.copies {
+				testutil.CommitStorageCopy(t, f.runtime.db, f.runtime.repos, testutil.CommitCopyInput{StorageCopyID: copy.ID, ContentID: copy.ContentID, CopyIndex: copy.CopyIndex})
+				if err := f.runtime.repos.Objects.RecordContentCacheCommit(ctx, copy.ContentID, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			generation, err := f.runtime.repos.CacheEvictions.NextDurabilityGeneration(ctx, f.dataSet.BucketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, _, err := f.runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{Type: model.TaskTypeCacheReconcileDurability, Input: cacheeviction.DurabilityInput{BucketID: f.dataSet.BucketID, Generation: generation}}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+				return repos.CacheEvictions.BindDurabilityTask(ctx, f.dataSet.BucketID, generation, row.ID)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if candidate, err := f.runtime.repos.CacheEvictions.NextBucketDurabilityCandidate(ctx, f.dataSet.BucketID, generation, row.ID); err != nil || candidate == nil {
+				t.Fatalf("durability candidate = %v, %v; want cached content that meets durability", candidate, err)
+			}
+
+			runOneStorageTask(t, f.runtime, row, model.TaskStatusCompleted)
+			bucket, err := f.runtime.repos.Buckets.GetByID(ctx, f.dataSet.BucketID)
+			if err != nil || bucket == nil || bucket.DurabilityTaskID != nil {
+				t.Fatalf("bucket durability owner = %v, %v; want released", bucket, err)
+			}
+			count, err := f.runtime.db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeCacheEvict).Count(ctx)
+			if err != nil || count != 0 {
+				t.Fatalf("eviction tasks = %d, %v; want none", count, err)
+			}
+		})
+	}
+}

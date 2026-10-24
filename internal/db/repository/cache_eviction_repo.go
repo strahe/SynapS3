@@ -43,6 +43,10 @@ type CacheEvictionRepository interface {
 	NextBucketDurabilityCandidate(ctx context.Context, bucketID, generation, taskID int64) (*model.StorageContent, error)
 	ListBucketDurabilityCandidates(ctx context.Context, bucketID, generation, taskID int64, limit int) ([]model.StorageContent, error)
 	CompleteBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error
+	// ReleaseBucketDurability ends the bucket's reconciliation without
+	// requiring its candidates to be released, for policies that never release
+	// cache after upload.
+	ReleaseBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error
 }
 
 type CacheEvictionReservation struct {
@@ -494,6 +498,14 @@ func (r *BunCacheEvictionRepo) ListBucketDurabilityCandidates(ctx context.Contex
 }
 
 func (r *BunCacheEvictionRepo) CompleteBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error {
+	return r.finishBucketDurability(ctx, bucketID, generation, taskID, true)
+}
+
+func (r *BunCacheEvictionRepo) ReleaseBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error {
+	return r.finishBucketDurability(ctx, bucketID, generation, taskID, false)
+}
+
+func (r *BunCacheEvictionRepo) finishBucketDurability(ctx context.Context, bucketID, generation, taskID int64, requireDrained bool) error {
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		bucket, err := lockBucketByID(ctx, db, bucketID)
 		if err != nil {
@@ -502,12 +514,14 @@ func (r *BunCacheEvictionRepo) CompleteBucketDurability(ctx context.Context, buc
 		if bucket == nil || bucket.DurabilityGeneration != generation || bucket.DurabilityTaskID == nil || *bucket.DurabilityTaskID != taskID {
 			return ErrConflict
 		}
-		candidate, err := nextBucketDurabilityCandidate(ctx, db, bucketID)
-		if err != nil {
-			return err
-		}
-		if candidate != nil {
-			return ErrConflict
+		if requireDrained {
+			candidate, err := nextBucketDurabilityCandidate(ctx, db, bucketID)
+			if err != nil {
+				return err
+			}
+			if candidate != nil {
+				return ErrConflict
+			}
 		}
 		result, err := db.NewUpdate().Model((*model.Bucket)(nil)).
 			Set("durability_task_id = NULL").Set("updated_at = ?", time.Now()).

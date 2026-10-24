@@ -16,7 +16,7 @@ SynapS3 returns success for an S3 write only after the object data is stored in 
 
 ## Reads
 
-`GetObject` reads from the local cache. On a cache miss, SynapS3 reads a committed replica from a storage provider, verifies the complete object before delivering the last bytes, and after a complete read attempts to restore it to the cache. A range request on a cache miss still downloads the whole object for verification. A read that the client closes early leaves no partial cache entry.
+`GetObject` reads from the local cache. On a cache miss, SynapS3 reads a committed replica from a storage provider, verifies the complete object before delivering the last bytes, and after a complete read attempts to restore it to the cache unless `cache.eviction_policy` is `after_upload`. A range request on a cache miss still downloads the whole object for verification. A read that the client closes early leaves no partial cache entry.
 
 These reads mark a cached version as recently used for `lru` eviction: S3 reads, including range reads; `CopyObject` sources read from the cache; dashboard downloads; and version restores. `HeadObject` and background uploads do not.
 

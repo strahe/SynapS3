@@ -37,96 +37,116 @@ func newTestReader(
 		storageClient,
 		gate,
 		tracker,
+		"",
 		logger,
 	)
 }
 
 func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
-	var rehydrated []byte
-	mc := &testutil.MockCache{
-		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
-			return nil, nil, os.ErrNotExist
-		},
-		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
-			data, err := io.ReadAll(r)
+	for _, tc := range []struct {
+		policy    cache.EvictionPolicy
+		rehydrate bool
+	}{
+		{cache.EvictionPolicyLRU, true},
+		{cache.EvictionPolicyAfterUpload, false},
+	} {
+		t.Run(string(tc.policy), func(t *testing.T) {
+			var rehydrated []byte
+			putCalls := 0
+			mc := &testutil.MockCache{
+				GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+					return nil, nil, os.ErrNotExist
+				},
+				PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
+					putCalls++
+					data, err := io.ReadAll(r)
+					if err != nil {
+						t.Fatalf("reading rehydrate body: %v", err)
+					}
+					rehydrated = data
+					return &cache.ObjectInfo{Path: "/cache/remote.txt", Size: int64(len(data)), ETag: "etag", Checksum: "checksum"}, nil
+				},
+			}
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			bucket := &model.Bucket{Name: "reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+			if err := repos.Buckets.Create(ctx, bucket); err != nil {
+				t.Fatalf("Buckets.Create: %v", err)
+			}
+			pieceCID := buildTestCID(t)
+			version := &model.ObjectVersion{
+				VersionID:   "01J0000000000000000000OR01",
+				BucketID:    bucket.ID,
+				Key:         "remote.txt",
+				Size:        6,
+				ETag:        "object-etag",
+				Checksum:    "object-checksum",
+				ContentType: "text/plain",
+			}
+			_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version))
 			if err != nil {
-				t.Fatalf("reading rehydrate body: %v", err)
+				t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 			}
-			rehydrated = data
-			return &cache.ObjectInfo{Path: "/cache/remote.txt", Size: int64(len(data)), ETag: "etag", Checksum: "checksum"}, nil
-		},
-	}
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	pieceCID := buildTestCID(t)
-	version := &model.ObjectVersion{
-		VersionID:   "01J0000000000000000000OR01",
-		BucketID:    bucket.ID,
-		Key:         "remote.txt",
-		Size:        6,
-		ETag:        "object-etag",
-		Checksum:    "object-checksum",
-		ContentType: "text/plain",
-	}
-	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version))
-	if err != nil {
-		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
-	}
-	acceptReaderVersionUpload(t, db, repos, version.VersionID, pieceCID, "https://provider.example/piece")
-	previousAccess := time.Now().Add(-24 * time.Hour)
-	if err := repos.Objects.RecordContentCacheAccess(ctx, *version.ContentID, previousAccess); err != nil {
-		t.Fatalf("RecordContentCacheAccess before rehydrate: %v", err)
-	}
-
-	storageClient := &testutil.MockStorageClient{
-		DownloadFunc: func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
-			if opts == nil || opts.URL != "https://provider.example/piece" {
-				t.Fatalf("DownloadOptions = %#v, want retrieval URL", opts)
+			acceptReaderVersionUpload(t, db, repos, version.VersionID, pieceCID, "https://provider.example/piece")
+			previousAccess := time.Now().Add(-24 * time.Hour)
+			if err := repos.Objects.RecordContentCacheAccess(ctx, *version.ContentID, previousAccess); err != nil {
+				t.Fatalf("RecordContentCacheAccess before rehydrate: %v", err)
 			}
-			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
-		},
-	}
-	reader := newTestReader(repos, mc, storageClient, slog.Default())
 
-	got, err := reader.Open(ctx, "reader-bucket", "remote.txt", S3Visibility)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	body, err := io.ReadAll(got.Body)
-	closeErr := got.Body.Close()
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if closeErr != nil {
-		t.Fatalf("Body.Close: %v", closeErr)
-	}
+			storageClient := &testutil.MockStorageClient{
+				DownloadFunc: func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
+					if opts == nil || opts.URL != "https://provider.example/piece" {
+						t.Fatalf("DownloadOptions = %#v, want retrieval URL", opts)
+					}
+					return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
+				},
+			}
+			tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
+			reader := New(repos, mc, storageClient, cacheaccess.NewGate(), tracker, tc.policy, slog.Default())
 
-	if string(body) != "remote" {
-		t.Fatalf("body = %q, want remote", string(body))
-	}
-	if string(rehydrated) != "remote" {
-		t.Fatalf("rehydrated = %q, want remote", string(rehydrated))
-	}
-	if got.Source != SourceProvider {
-		t.Fatalf("source = %q, want %q", got.Source, SourceProvider)
-	}
-	if got.ContentType != "text/plain" || got.ETag != "object-etag" || got.Size != 6 {
-		t.Fatalf("metadata = %#v", got)
-	}
-	dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
-	if err != nil || dbVersion == nil {
-		t.Fatalf("version after rehydrate: version=%v err=%v", dbVersion, err)
-	}
-	if !dbVersion.InCache {
-		t.Fatal("version in_cache = false, want true after successful rehydrate")
-	}
-	if dbVersion.CacheAccessedAt == nil || !dbVersion.CacheAccessedAt.After(previousAccess) {
-		t.Fatalf("cache_accessed_at = %v, want refreshed after %v", dbVersion.CacheAccessedAt, previousAccess)
+			got, err := reader.Open(ctx, "reader-bucket", "remote.txt", S3Visibility)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			body, err := io.ReadAll(got.Body)
+			closeErr := got.Body.Close()
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if closeErr != nil {
+				t.Fatalf("Body.Close: %v", closeErr)
+			}
+
+			if string(body) != "remote" {
+				t.Fatalf("body = %q, want remote", string(body))
+			}
+			if got.Source != SourceProvider {
+				t.Fatalf("source = %q, want %q", got.Source, SourceProvider)
+			}
+			if got.ContentType != "text/plain" || got.ETag != "object-etag" || got.Size != 6 {
+				t.Fatalf("metadata = %#v", got)
+			}
+			dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+			if err != nil || dbVersion == nil {
+				t.Fatalf("version after read: version=%v err=%v", dbVersion, err)
+			}
+			if !tc.rehydrate {
+				if putCalls != 0 || dbVersion.InCache {
+					t.Fatalf("cache writes = %d, in_cache = %t; want the cold read left out of the cache", putCalls, dbVersion.InCache)
+				}
+				return
+			}
+			if string(rehydrated) != "remote" {
+				t.Fatalf("rehydrated = %q, want remote", string(rehydrated))
+			}
+			if !dbVersion.InCache {
+				t.Fatal("version in_cache = false, want true after successful rehydrate")
+			}
+			if dbVersion.CacheAccessedAt == nil || !dbVersion.CacheAccessedAt.After(previousAccess) {
+				t.Fatalf("cache_accessed_at = %v, want refreshed after %v", dbVersion.CacheAccessedAt, previousAccess)
+			}
+		})
 	}
 }
 
@@ -537,7 +557,7 @@ func TestOpenCacheMissDoesNotOverwriteConcurrentCommitPresence(t *testing.T) {
 
 	gate := cacheaccess.NewGate()
 	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
-	reader := New(repos, mc, nil, gate, tracker, slog.Default())
+	reader := New(repos, mc, nil, gate, tracker, "", slog.Default())
 	openDone := make(chan error, 1)
 	go func() {
 		result, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
@@ -631,6 +651,87 @@ func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 	}
 	if dbVersion.InCache {
 		t.Fatal("version in_cache = true, want false when rehydrate fails")
+	}
+}
+
+// verifiedPieceBody reports piece verification the way the SDK does: every
+// byte arrives without an error and the verdict comes from the Read after them.
+type verifiedPieceBody struct {
+	chunks  [][]byte
+	verdict error
+}
+
+func (b *verifiedPieceBody) Read(p []byte) (int, error) {
+	if len(b.chunks) == 0 {
+		return 0, b.verdict
+	}
+	n := copy(p, b.chunks[0])
+	b.chunks[0] = b.chunks[0][n:]
+	if len(b.chunks[0]) == 0 {
+		b.chunks = b.chunks[1:]
+	}
+	return n, nil
+}
+
+func (*verifiedPieceBody) Close() error { return nil }
+
+func TestOpenWithholdsProviderBytesUntilPieceVerification(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader, _ int64) (*cache.ObjectInfo, error) {
+			if _, err := io.Copy(io.Discard, r); err != nil {
+				return nil, err
+			}
+			return &cache.ObjectInfo{Size: 6}, nil
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "verify-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR11",
+		BucketID:    bucket.ID,
+		Key:         "remote.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	acceptReaderVersionUpload(t, db, repos, version.VersionID, buildTestCID(t), "https://provider.example/piece")
+
+	mismatch := errors.New("piece CID mismatch")
+	storageClient := &testutil.MockStorageClient{
+		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
+			return &verifiedPieceBody{chunks: [][]byte{[]byte("rem"), []byte("ote")}, verdict: mismatch}, nil
+		},
+	}
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
+	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	delivered, readErr := io.ReadAll(got.Body)
+	if closeErr := got.Body.Close(); closeErr != nil {
+		t.Fatalf("Body.Close: %v", closeErr)
+	}
+	if !errors.Is(readErr, mismatch) || string(delivered) != "rem" {
+		t.Fatalf("read = %q, %v; want the final bytes withheld and %v", delivered, readErr, mismatch)
+	}
+	dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || dbVersion == nil {
+		t.Fatalf("version after failed verification: version=%v err=%v", dbVersion, err)
+	}
+	if dbVersion.InCache {
+		t.Fatal("version in_cache = true, want false when piece verification fails")
 	}
 }
 
