@@ -441,6 +441,7 @@ export interface ProviderReplacementTerminationAttempt {
   tx_hash: string | null
   confirmed_tx_hash: string | null
   receipt_status: 0 | 1 | null
+  unsent_at: string | null
 }
 
 export interface ProviderReplacementDataSet {

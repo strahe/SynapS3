@@ -10,7 +10,9 @@ import (
 
 const (
 	MinFOCUploadSize = int64(chain.MinUploadSize)
-	MaxFOCUploadSize = int64(chain.MaxUploadSize)
+	// MaxFOCUploadSize is the raw payload of a 1 GiB padded piece. It is the
+	// stable object size limit, independent of the larger SDK upload maximum.
+	MaxFOCUploadSize = int64(chain.GiB * 127 / 128)
 )
 
 var (

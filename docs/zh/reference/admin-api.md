@@ -160,9 +160,9 @@ description: 查询 SynapS3 Admin API 的认证方式、端点、请求字段和
 
 存储桶响应中的数据集条目包含 `replaceable`、`replacement_blocked_reason` 和 `setup_error`。副本的数据集已就绪，或其创建任务已失败时，可以替换该副本。
 
-替换记录的 `source.termination` 和 `target.termination` 包含最新交易哈希、终止 `epoch`，以及记录各次终止尝试的 `attempts` 数组。各次尝试的 `receipt_status` 为 `0`（失败）、`1`（成功）或 `null`（未知）；`confirmed_tx_hash` 表示已上链的交易，不代表执行成功。
+替换记录的 `source.termination` 和 `target.termination` 包含最新交易哈希、终止 `epoch`，以及记录各次终止尝试的 `attempts` 数组。各次尝试的 `receipt_status` 为 `0`（失败）、`1`（成功）或 `null`（未知）；`confirmed_tx_hash` 表示已上链的交易，不代表执行成功。`unsent_at` 不为空表示该次尝试没有发出交易。
 
-终止交易回执失败后，Retry 会先检查服务；如果服务仍未终止，可能提交一笔新的付费交易。结果未知时，Retry 只检查已记录的尝试。
+终止交易回执失败后，Retry 会先检查服务；如果服务仍未终止，可能提交一笔新的付费交易。结果未知时，Retry 只检查已记录的尝试；但如果经存储提供方发送的终止一直没有执行，且服务仍未终止，Retry 会改由付款钱包发送终止交易。如果什么都没有发出（例如付款账户欠费），解决原因后 Retry 会重新提交终止。
 
 #### 替换状态
 

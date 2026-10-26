@@ -323,7 +323,10 @@ func Cancel(message string, settlement Settlement) Result {
 	return Result{kind: resultCancel, message: message, settlement: settlement}
 }
 
-type checkpointWriter func(context.Context, any, Settlement, bool) error
+type checkpointWriter func(ctx context.Context, value any, settlement Settlement, startWork, obtainedEvidence bool) error
+
+// effectEvidenceTimeout bounds a write that outlives its caller's cancellation.
+const effectEvidenceTimeout = 10 * time.Second
 
 // Execution is an immutable view of one fenced claim.
 type Execution struct {
@@ -355,7 +358,19 @@ func (e Execution) WriteCheckpointWith(ctx context.Context, value any, settlemen
 	if e.checkpoint == nil {
 		return errors.New("checkpoint writer is unavailable")
 	}
-	return e.checkpoint(ctx, value, settlement, false)
+	return e.checkpoint(ctx, value, settlement, false, false)
+}
+
+// RecordEffectEvidence persists evidence an external effect already returned.
+// It survives caller cancellation so shutdown cannot drop an obtained
+// credential; the claim fence is still checked in the same transaction.
+func (e Execution) RecordEffectEvidence(ctx context.Context, value any, settlement Settlement) error {
+	if e.checkpoint == nil {
+		return errors.New("checkpoint writer is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), effectEvidenceTimeout)
+	defer cancel()
+	return e.checkpoint(ctx, value, settlement, false, true)
 }
 
 // WithCheckpointedEffect admits an external effect, persists its recovery

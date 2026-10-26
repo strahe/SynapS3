@@ -614,6 +614,8 @@ func (r *BunStorageReplacementRepo) BeginRetirement(ctx context.Context, replace
 
 // BeginTerminationAttempt admits one request for the current retirement owner.
 // A new attempt requires a reverted predecessor; repeating its admission is inert.
+// A released attempt is admitted again in place, by its task or a successor, and
+// so is an unresolved one by a successor when ResumeUnresolved.
 func (r *BunStorageReplacementRepo) BeginTerminationAttempt(ctx context.Context, input BeginTerminationAttemptInput) error {
 	if input.AttemptNo <= 0 || input.PreviousAttemptNo < 0 || input.AttemptedAt.IsZero() {
 		return fmt.Errorf("admitting termination attempt: %w", ErrInvalidInput)
@@ -634,7 +636,15 @@ func (r *BunStorageReplacementRepo) BeginTerminationAttempt(ctx context.Context,
 			return err
 		}
 		if previous != nil && previous.AttemptNo == input.AttemptNo {
-			if previous.TaskID == nil || *previous.TaskID != input.TaskID {
+			owned := previous.TaskID != nil && *previous.TaskID == input.TaskID
+			unresolved := input.ResumeUnresolved && !owned && previous.TxHash == nil && previous.ConfirmedTxHash == nil && previous.ReceiptStatus == nil
+			if previous.UnsentAt != nil || unresolved {
+				_, err := db.NewUpdate().Model((*storagereplacement.TerminationAttempt)(nil)).
+					Set("task_id = ?", input.TaskID).Set("attempted_at = ?", input.AttemptedAt).
+					Set("unsent_at = NULL").Set("updated_at = ?", time.Now().UTC()).Where("id = ?", previous.ID).Exec(ctx)
+				return err
+			}
+			if !owned {
 				return ErrConflict
 			}
 			return nil
@@ -695,6 +705,36 @@ func (r *BunStorageReplacementRepo) RecordTerminationEvidence(ctx context.Contex
 		}
 		_, err = db.NewUpdate().Model((*storagereplacement.Termination)(nil)).
 			Set("epoch = ?", input.Epoch).Set("updated_at = ?", time.Now().UTC()).Where("id = ?", termination.ID).Exec(ctx)
+		return err
+	})
+}
+
+// RecordTerminationUnsent releases the latest admission after the current
+// retirement owner proved that no transaction from it can land. Releasing again
+// is inert; an attempt with any transaction evidence cannot be released.
+func (r *BunStorageReplacementRepo) RecordTerminationUnsent(ctx context.Context, input RecordTerminationEvidenceInput) error {
+	if input.AttemptNo <= 0 || input.TxHash != "" || input.ConfirmedTxHash != "" || input.ReceiptStatus != nil || input.Epoch != nil {
+		return fmt.Errorf("releasing termination attempt: %w", ErrInvalidInput)
+	}
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		termination, err := authorizeTerminationEvidence(ctx, db, input)
+		if err != nil {
+			return err
+		}
+		attempt, err := latestTerminationAttempt(ctx, db, termination.ID)
+		if err != nil {
+			return err
+		}
+		if termination.Epoch != nil || attempt == nil || attempt.AttemptNo != input.AttemptNo || attempt.TaskID == nil ||
+			attempt.TxHash != nil || attempt.ConfirmedTxHash != nil || attempt.ReceiptStatus != nil {
+			return ErrConflict
+		}
+		if attempt.UnsentAt != nil {
+			return nil
+		}
+		now := time.Now().UTC()
+		_, err = db.NewUpdate().Model((*storagereplacement.TerminationAttempt)(nil)).
+			Set("unsent_at = ?", now).Set("updated_at = ?", now).Where("id = ?", attempt.ID).Exec(ctx)
 		return err
 	})
 }
@@ -798,7 +838,7 @@ func mergeTerminationAttempt(ctx context.Context, db bun.IDB, attempt *storagere
 	}
 	_, err := db.NewUpdate().Model((*storagereplacement.TerminationAttempt)(nil)).
 		Set("tx_hash = ?", attempt.TxHash).Set("confirmed_tx_hash = ?", attempt.ConfirmedTxHash).
-		Set("receipt_status = ?", attempt.ReceiptStatus).Set("updated_at = ?", time.Now().UTC()).Where("id = ?", attempt.ID).Exec(ctx)
+		Set("receipt_status = ?", attempt.ReceiptStatus).Set("unsent_at = NULL").Set("updated_at = ?", time.Now().UTC()).Where("id = ?", attempt.ID).Exec(ctx)
 	return err
 }
 

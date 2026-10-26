@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"time"
 
 	"github.com/strahe/synapse-go/pdp"
 
@@ -39,6 +40,8 @@ type StorageServiceAdapter struct {
 	cleanup          *cleanupPieceReader
 	providerHTTP     *http.Client
 	transferCounters *observability.TransferCounters
+	// relayWaitSlice overrides terminationWaitSlice when positive.
+	relayWaitSlice time.Duration
 }
 
 // AdaptStorageService wraps the SDK storage service. dataSets reads the FWSS

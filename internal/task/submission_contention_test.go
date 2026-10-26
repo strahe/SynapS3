@@ -78,7 +78,7 @@ func submissionContention(t *testing.T, runtime *handlerTestRuntime, taskType mo
 func TestDataSetCreationRetainsSubmissionThroughDatabaseContention(t *testing.T) {
 	providerID := testOnChainID(t, 51000+storedObjectSequence.Add(1))
 	var creates, observations atomic.Int64
-	target := &testutil.MockStorageTarget{
+	target := chainRecordsCreatedDataSets(&testutil.MockStorageTarget{
 		ProviderIDValue: providerID.SDK(),
 		CreateDataSetFunc: func(ctx context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 			creates.Add(1)
@@ -89,7 +89,7 @@ func TestDataSetCreationRetainsSubmissionThroughDatabaseContention(t *testing.T)
 			observations.Add(1)
 			return nil, nil
 		},
-	}
+	})
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 			return target, nil

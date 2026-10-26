@@ -458,8 +458,8 @@ github.com/smira/go-statsd v1.3.4 h1:kBYWcLSGT+qC6JVbvfz48kX7mQys32fjDOPrfmsSx2c
 github.com/smira/go-statsd v1.3.4/go.mod h1:RjdsESPgDODtg1VpVVf9MJrEW2Hw0wtRNbmB1CAhu6A=
 github.com/spaolacci/murmur3 v1.1.0 h1:7c1g84S4BPRrfL5Xrdp6fOJ206sU9y293DDHaoy0bLI=
 github.com/spaolacci/murmur3 v1.1.0/go.mod h1:JwIasOWyU6f++ZhiEuf87xNszmSA2myDM2Kzu9HwQUA=
-github.com/strahe/synapse-go v0.7.0 h1:2ZTuUsz/QSdEUnww2fHQRuhTQAu/F/7wHhYu2Gx4gQ0=
-github.com/strahe/synapse-go v0.7.0/go.mod h1:wwiO1EItmR5JoUiJzLh438xrqwvZCPwY5CI8dC+XQGw=
+github.com/strahe/synapse-go v0.7.1 h1:z7OtuQbx8XfS3PNgDWfHqBfhvBXbX6i07inEzeDnpLY=
+github.com/strahe/synapse-go v0.7.1/go.mod h1:wwiO1EItmR5JoUiJzLh438xrqwvZCPwY5CI8dC+XQGw=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
 github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=

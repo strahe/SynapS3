@@ -813,6 +813,45 @@ func TestRemovalRetainsReturnedHashThroughSettlementContention(t *testing.T) {
 	}
 }
 
+// A hash the provider returns while the gateway shuts down is still recorded,
+// so recovery observes it and does not send the request again.
+func TestRemovalRetainsHashReturnedDuringShutdown(t *testing.T) {
+	var calls atomic.Int64
+	hash := common.HexToHash("0x444")
+	reached := make(chan struct{})
+	f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {
+		options.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return testCleanupContext{deletePieces: func(ctx context.Context, _ []sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				if calls.Add(1) == 1 {
+					close(reached)
+					<-ctx.Done()
+				}
+				return &sdktypes.WriteResult{Hash: hash}, nil
+			}}, nil
+		}
+	})
+	f.step(t, model.TaskStatusPending)
+	f.step(t, model.TaskStatusPending)
+	cancel, done := f.start(t)
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("removal did not send")
+	}
+	stopHandlerEngine(t, cancel, done)
+	evidence := f.sends(t)
+	if calls.Load() != 1 || len(evidence) != 1 || evidence[0].TxHash == nil || *evidence[0].TxHash != hash.Hex() {
+		t.Fatalf("shutdown lost the returned hash: sends=%#v calls=%d", evidence, calls.Load())
+	}
+	if _, err := f.runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("lease_until = ?", time.Now().Add(-time.Second)).Where("id = ?", f.row.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.step(t, model.TaskStatusPending)
+	if calls.Load() != 1 {
+		t.Fatalf("recovery resent a removal with a saved hash: task=%#v calls=%d", f.row, calls.Load())
+	}
+}
+
 func TestRemovalPersistentEvidenceFailureRecoversFromAdmissionWithoutExtraSend(t *testing.T) {
 	var calls atomic.Int64
 	f := newRemovalFixture(t, 1, func(options *handlerRuntimeOptions) {

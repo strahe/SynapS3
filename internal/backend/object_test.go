@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
@@ -560,7 +561,7 @@ func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
 		{
 			name:          "known length above maximum",
 			body:          "short body",
-			contentLength: ptrInt64(chain.MaxUploadSize + 1),
+			contentLength: ptrInt64(objectlimits.MaxFOCUploadSize + 1),
 			wantCode:      s3err.ErrEntityTooLarge,
 		},
 		{

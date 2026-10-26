@@ -563,7 +563,7 @@ func (h *Handler) send(ctx context.Context, r run) taskengine.Result {
 		settlement := func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.StorageRemoval.RecordSendSubmission(ctx, evidence)
 		}
-		if err := r.execution.WriteCheckpointWith(ctx, cp, settlement); err != nil {
+		if err := r.execution.RecordEffectEvidence(ctx, cp, settlement); err != nil {
 			return observe(errors.Join(sendErr, err), settlement).WithContentionSettlement(settlement)
 		}
 		return observe(sendErr, nil)
@@ -574,7 +574,7 @@ func (h *Handler) send(ctx context.Context, r run) taskengine.Result {
 		settlement := func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.StorageRemoval.RecordSendRefused(ctx, evidence)
 		}
-		if err := r.execution.WriteCheckpointWith(ctx, cp, settlement); err != nil {
+		if err := r.execution.RecordEffectEvidence(ctx, cp, settlement); err != nil {
 			return observe(errors.Join(sendErr, err), settlement).WithContentionSettlement(settlement)
 		}
 		if rejection == synapse.RemovalRejectedPieceNotFound && r.accepted == nil {

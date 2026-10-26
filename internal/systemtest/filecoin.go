@@ -1031,7 +1031,7 @@ func (m *MemoryFilecoin) VerifyServicePayer(context.Context, sdktypes.BigInt) er
 // TerminateService ends a data set's service. The fake reports an end of term
 // the chain has already reached, because a system test exercises the operator
 // flow rather than chain timing; use terminationDelay to make retirement wait.
-func (m *MemoryFilecoin) TerminateService(_ context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*synapse.TerminationResult, error) {
+func (m *MemoryFilecoin) TerminateService(_ context.Context, dataSetID sdktypes.BigInt, hooks synapse.TerminationHooks) (*synapse.TerminationResult, error) {
 	m.mu.Lock()
 	key := dataSetID.String()
 	endEpoch, ok := m.terminated[key]
@@ -1041,8 +1041,8 @@ func (m *MemoryFilecoin) TerminateService(_ context.Context, dataSetID sdktypes.
 	}
 	m.mu.Unlock()
 	result := &synapse.TerminationResult{TxHash: "0xterminate" + key}
-	if onSubmitted != nil {
-		if err := onSubmitted(result.TxHash); err != nil {
+	if hooks.OnSubmitted != nil {
+		if err := hooks.OnSubmitted(result.TxHash); err != nil {
 			return result, err
 		}
 	}

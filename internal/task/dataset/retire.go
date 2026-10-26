@@ -42,11 +42,21 @@ type retirementCheckpoint struct {
 	ReceiptStatus    *uint64   `json:"receipt_status,omitempty"`
 	// Only a manual Retry may authorize a new transaction after a failed receipt.
 	RetryFailedTransaction bool `json:"retry_failed_transaction,omitempty"`
+	// RetryUnresolvedRelay records a manual Retry authorizing the payer wallet
+	// to complete an attempt whose relayed request may still land. Once that
+	// transaction is admitted, the attempt is observed from it alone.
+	RetryUnresolvedRelay bool `json:"retry_unresolved_relay,omitempty"`
 	// Sends counts admitted termination requests.
 	Sends                     int       `json:"sends,omitempty"`
 	NextResendAt              time.Time `json:"next_resend_at,omitzero"`
 	ProtocolNextObservationAt time.Time `json:"protocol_next_observation_at,omitzero"`
 	ObservationDiagnostic     string    `json:"observation_diagnostic,omitempty"`
+	// Unsent means the latest admission was released: none of its requests can
+	// land, so the same attempt is admitted again.
+	Unsent bool `json:"unsent,omitempty"`
+	// RelayOnly means the latest admission can have sent only a provider relay
+	// request. Only then does the provider reporting no request release it.
+	RelayOnly bool `json:"relay_only,omitempty"`
 	// Creation identity binds observations and termination requests to the same signing domain.
 	Identity    *storage.ContextIdentity `json:"identity,omitempty"`
 	PDPVerifier *common.Address          `json:"pdp_verifier,omitempty"`
@@ -88,12 +98,22 @@ func (h *RetireHandler) dataSetRetireHandler() *taskengine.FuncHandler {
 		BindSuccessor: transferRetirementOwner,
 		PrepareRetry: func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
 			checkpoint := source.Checkpoint
-			if source.FailureReason != nil && *source.FailureReason == "termination_confirmation_failed" {
-				var recovery retirementCheckpoint
+			var recovery retirementCheckpoint
+			authorized := false
+			switch {
+			case source.FailureReason == nil:
+			case *source.FailureReason == "termination_confirmation_failed":
 				if err := json.Unmarshal(checkpoint, &recovery); err != nil {
 					return taskengine.RetryPreparation{}, err
 				}
-				recovery.RetryFailedTransaction = true
+				recovery.RetryFailedTransaction, authorized = true, true
+			case *source.FailureReason == "attempts_exhausted":
+				// An unreadable checkpoint is left for the handler to report.
+				if json.Unmarshal(checkpoint, &recovery) == nil && recovery.relayUnresolved() {
+					recovery.RetryUnresolvedRelay, authorized = true, true
+				}
+			}
+			if authorized {
 				var err error
 				checkpoint, err = json.Marshal(recovery)
 				if err != nil {
@@ -262,8 +282,7 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		))
 	}
 	if terminationEpoch == nil {
-		knownSubmission := checkpoint.TxHash != "" || checkpoint.ConfirmedTxHash != ""
-		knownAttempt := checkpoint.AttemptNo != 0 || knownSubmission || checkpoint.Sends > 0 || !checkpoint.AttemptedAt.IsZero()
+		knownAttempt := checkpoint.attemptMayLand()
 		if time.Now().Before(checkpoint.ProtocolNextObservationAt) {
 			if knownAttempt {
 				var diagnostic error
@@ -275,9 +294,9 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			return taskengine.WaitUntil(model.TaskResumeModeRecover, checkpoint.ProtocolNextObservationAt, "provider_confirmation", "Waiting to check data set retirement", nil)
 		}
 		var diagnostic error
-		freshAfterFailure := false
+		freshAttempt, resumeRelay := false, false
 		var observe func(context.Context, sdktypes.BigInt, synapse.TerminationResult) (*synapse.TerminationResult, bool, error)
-		if checkpoint.AttemptNo > 1 {
+		if checkpoint.AttemptNo > 1 || (checkpoint.RetryUnresolvedRelay && !checkpoint.RelayOnly) {
 			if observer, ok := h.deps.Terminator.(interface {
 				ObserveTerminationDirect(context.Context, sdktypes.BigInt, synapse.TerminationResult) (*synapse.TerminationResult, bool, error)
 			}); ok {
@@ -292,6 +311,11 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			observed, pending, err := observe(ctx, dataSet.DataSetID.SDK(), synapse.TerminationResult{
 				TxHash: checkpoint.TxHash, ConfirmedTxHash: checkpoint.ConfirmedTxHash, ReceiptStatus: checkpoint.ReceiptStatus,
 			})
+			absentErr := err
+			absent := errors.Is(err, synapse.ErrTerminationRequestAbsent)
+			if absent {
+				err = nil
+			}
 			if mergeErr := mergeRetirementEvidence(&checkpoint, observed); mergeErr != nil {
 				return stopRetirement(abandoned, row.ID, mergeErr, "termination_evidence_conflict")
 			}
@@ -314,16 +338,30 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 				// The failed attempt remains in its ledger while this manual authorization
 				// proceeds to a separately admitted transaction.
 				knownAttempt = false
-				freshAfterFailure, pending = true, false
+				freshAttempt, pending = true, false
 				diagnostic = nil
 				err = nil
 			}
 			if knownAttempt && errors.Is(err, synapse.ErrServicePaidByAnother) {
 				return stopRetirement(abandoned, row.ID, err, "termination_payer_mismatch", retirementEvidenceSettlement(execution, input, abandoned, checkpoint))
 			}
-			if !freshAfterFailure {
-				knownSubmission = checkpoint.TxHash != "" || checkpoint.ConfirmedTxHash != ""
-				knownAttempt = checkpoint.AttemptNo != 0 || knownSubmission || checkpoint.Sends > 0 || !checkpoint.AttemptedAt.IsZero()
+			if !freshAttempt {
+				knownAttempt = checkpoint.attemptMayLand()
+			}
+			if absent && knownAttempt && checkpoint.RelayOnly && checkpoint.TxHash == "" && checkpoint.ConfirmedTxHash == "" {
+				checkpoint.Unsent = true
+				release := retirementReleaseSettlement(execution, input, abandoned, checkpoint)
+				return taskengine.RetryInMode(fmt.Errorf("data set termination request was not received; sending it again: %w", absentErr),
+					"termination_not_sent", model.TaskResumeModeExecute, release).WithContentionSettlement(release)
+			}
+			if knownAttempt && checkpoint.RetryUnresolvedRelay && checkpoint.relayUnresolved() && ctx.Err() == nil {
+				if !mayTerminate {
+					return taskengine.Wait(model.TaskResumeModeExecute, "safe_to_execute", "Data set is ready for a direct termination attempt", nil)
+				}
+				// The payer wallet completes this attempt, which the provider's
+				// relayed request may still land alongside.
+				knownAttempt, resumeRelay, pending = false, true, false
+				diagnostic, err = nil, nil
 			}
 			if err != nil {
 				diagnostic = err
@@ -376,24 +414,27 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 		nextAttempt := checkpoint.AttemptNo
 		if nextAttempt == 0 {
 			nextAttempt = 1
-		} else if freshAfterFailure {
+		} else if freshAttempt {
 			nextAttempt++
 		}
+		resumeAuthorized := previous.RetryUnresolvedRelay && !freshAttempt
+		direct := freshAttempt || nextAttempt > 1 || resumeAuthorized
 		checkpoint = retirementCheckpoint{
-			AttemptedAt: time.Now().UTC(), AttemptNo: nextAttempt, Sends: checkpoint.Sends + 1, Identity: &identity, PDPVerifier: recordedIdentity.PDPVerifier,
+			AttemptedAt: time.Now().UTC(), AttemptNo: nextAttempt, Sends: checkpoint.Sends + 1, RelayOnly: !direct,
+			RetryUnresolvedRelay: resumeAuthorized, Identity: &identity, PDPVerifier: recordedIdentity.PDPVerifier,
 		}
 		terminate := h.deps.Terminator.TerminateService
-		if freshAfterFailure {
-			direct, ok := h.deps.Terminator.(interface {
-				TerminateServiceDirect(context.Context, sdktypes.BigInt, func(string) error) (*synapse.TerminationResult, error)
+		if direct {
+			directTerminator, ok := h.deps.Terminator.(interface {
+				TerminateServiceDirect(context.Context, sdktypes.BigInt, synapse.TerminationHooks) (*synapse.TerminationResult, error)
 			})
 			if !ok {
 				return stopRetirement(abandoned, row.ID, errors.New("direct data set termination is unavailable"), "dependency_unavailable")
 			}
-			terminate = direct.TerminateServiceDirect
+			terminate = directTerminator.TerminateServiceDirect
 		}
 		attempted, err := execution.WithCheckpointedEffect(ctx, fmt.Sprintf("retire:%d", dataSet.ID), checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
-			if freshAfterFailure {
+			if freshAttempt {
 				if err := repos.Replacements.RecordTerminationEvidence(ctx, retirementEvidenceInput(input, execution.ID(), abandoned, previous)); err != nil {
 					return err
 				}
@@ -404,25 +445,52 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 			}
 			return repos.Replacements.BeginTerminationAttempt(ctx, repository.BeginTerminationAttemptInput{
 				ReplacementID: input.ReplacementID, DataSetID: input.DataSetID, Generation: input.Generation, TaskID: execution.ID(), Role: role,
-				AttemptNo: nextAttempt, PreviousAttemptNo: previous.AttemptNo, AttemptedAt: checkpoint.AttemptedAt,
+				AttemptNo: nextAttempt, PreviousAttemptNo: previous.AttemptNo, ResumeUnresolved: resumeRelay, AttemptedAt: checkpoint.AttemptedAt,
 			})
 		}, func(ctx context.Context) error {
-			result, terminateErr := terminate(ctx, dataSet.DataSetID.SDK(), func(hash string) error {
-				if err := mergeRetirementEvidence(&checkpoint, &synapse.TerminationResult{TxHash: hash}); err != nil {
-					return err
-				}
-				return execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
-					return repos.Replacements.RecordTerminationEvidence(ctx, retirementEvidenceInput(input, execution.ID(), abandoned, checkpoint))
-				})
+			result, terminateErr := terminate(ctx, dataSet.DataSetID.SDK(), synapse.TerminationHooks{
+				OnSubmitted: func(hash string) error {
+					if err := mergeRetirementEvidence(&checkpoint, &synapse.TerminationResult{TxHash: hash}); err != nil {
+						return err
+					}
+					return execution.RecordEffectEvidence(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+						return repos.Replacements.RecordTerminationEvidence(ctx, retirementEvidenceInput(input, execution.ID(), abandoned, checkpoint))
+					})
+				},
+				// Once the payer wallet may broadcast, the provider's answer does
+				// not cover every transaction this attempt can put on chain.
+				BeforeDirect: func() error {
+					if !checkpoint.RelayOnly {
+						return nil
+					}
+					checkpoint.RelayOnly = false
+					return execution.WriteCheckpoint(ctx, checkpoint)
+				},
 			})
 			return errors.Join(terminateErr, mergeRetirementEvidence(&checkpoint, result))
 		})
 		if err != nil && !attempted {
 			return retryTask(err, "termination_not_started")
 		}
+		notSent := errors.Is(err, synapse.ErrTerminationNotSent)
+		if !direct && (notSent || errors.Is(err, synapse.ErrTerminationTransactionNotSent)) {
+			checkpoint.RelayOnly = true
+		}
 		settlement := retirementEvidenceSettlement(execution, input, abandoned, checkpoint)
 		if errors.Is(err, synapse.ErrTerminationEvidenceConflict) {
 			return stopRetirement(abandoned, row.ID, err, "termination_evidence_conflict", settlement)
+		}
+		if notSent {
+			checkpoint.Unsent = true
+			release := retirementReleaseSettlement(execution, input, abandoned, checkpoint)
+			switch {
+			case synapse.IsTerminationBlocked(err):
+				return stopRetirement(abandoned, row.ID, err, "termination_blocked", release)
+			case errors.Is(err, synapse.ErrServicePaidByAnother):
+				return stopRetirement(abandoned, row.ID, err, "termination_payer_mismatch", release)
+			default:
+				return taskengine.RetryInMode(err, "termination_not_sent", model.TaskResumeModeExecute, release).WithContentionSettlement(release)
+			}
 		}
 		if synapse.IsTerminationBlocked(err) {
 			return stopRetirement(abandoned, row.ID, err, "termination_blocked", settlement)
@@ -478,6 +546,21 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 	})
 }
 
+// relayUnresolved reports whether the latest admission sent only a provider
+// relay request whose outcome no evidence settles.
+func (c retirementCheckpoint) relayUnresolved() bool {
+	return c.RelayOnly && c.attemptMayLand() && c.TxHash == "" && c.ConfirmedTxHash == "" && c.ReceiptStatus == nil
+}
+
+// attemptMayLand reports whether the latest admission can still put a
+// termination transaction on chain.
+func (c retirementCheckpoint) attemptMayLand() bool {
+	if c.TxHash != "" || c.ConfirmedTxHash != "" {
+		return true
+	}
+	return !c.Unsent && (c.AttemptNo != 0 || c.Sends > 0 || !c.AttemptedAt.IsZero())
+}
+
 func mergeRetirementEvidence(checkpoint *retirementCheckpoint, result *synapse.TerminationResult) error {
 	if result == nil {
 		return nil
@@ -505,6 +588,9 @@ func mergeRetirementEvidence(checkpoint *retirementCheckpoint, result *synapse.T
 
 func (h *RetireHandler) waitForRetirementEvidence(execution taskengine.Execution, input storagereplacement.RetireInput, abandoned bool, checkpoint retirementCheckpoint, diagnostic error) taskengine.Result {
 	timeoutErr := fmt.Errorf("data set termination is still unconfirmed after %s", execution.Policy().ObservationWindow)
+	if checkpoint.relayUnresolved() {
+		timeoutErr = fmt.Errorf("data set termination is still unconfirmed after %s. Once retries run out, Retry may submit a paid termination from your wallet; the provider may still terminate the data set", execution.Policy().ObservationWindow)
+	}
 	return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set retirement", retirementEvidenceSettlement(execution, input, abandoned, checkpoint)).
 		WithObservationWindow("termination_confirmation", timeoutErr, model.TaskResumeModeRecover).
 		WithDiagnostic(diagnostic).
@@ -541,6 +627,21 @@ func retirementEvidenceSettlement(execution taskengine.Execution, input storager
 			return err
 		}
 		return repos.Replacements.RecordTerminationEvidence(ctx, retirementEvidenceInput(input, execution.ID(), abandoned, checkpoint))
+	}
+}
+
+// retirementReleaseSettlement releases the latest admission together with the
+// checkpoint that marks it unsent.
+func retirementReleaseSettlement(execution taskengine.Execution, input storagereplacement.RetireInput, abandoned bool, checkpoint retirementCheckpoint) taskengine.Settlement {
+	return func(ctx context.Context, repos *repository.Repositories) error {
+		raw, err := json.Marshal(checkpoint)
+		if err != nil {
+			return err
+		}
+		if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), raw); err != nil {
+			return err
+		}
+		return repos.Replacements.RecordTerminationUnsent(ctx, retirementEvidenceInput(input, execution.ID(), abandoned, checkpoint))
 	}
 }
 

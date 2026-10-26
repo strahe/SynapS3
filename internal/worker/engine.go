@@ -250,8 +250,10 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	execution := Execution{
 		task:   *claimed,
 		policy: policy,
-		checkpoint: func(ctx context.Context, value any, settlement Settlement, startWork bool) error {
-			if !leaseSafe.Load() {
+		checkpoint: func(ctx context.Context, value any, settlement Settlement, startWork, obtainedEvidence bool) error {
+			// Evidence an effect already returned is fenced by ValidateClaim alone:
+			// shutdown marks the lease unsafe before the claim actually expires.
+			if !obtainedEvidence && !leaseSafe.Load() {
 				return repository.ErrTaskLeaseLost
 			}
 			checkpoint, err := json.Marshal(value)

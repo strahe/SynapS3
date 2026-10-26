@@ -164,6 +164,40 @@ func TestWalletOperationRepoUnknownRequiresAttemptEvidence(t *testing.T) {
 	}
 }
 
+func TestWalletOperationRepoSubmissionUnknownKeepsTransactionEvidence(t *testing.T) {
+	repos := repository.NewRepositories(testDB(t))
+	ctx := t.Context()
+	op := createWalletOperation(t, repos, model.WalletOperationTypeFund, "displaced", "100")
+	taskID := createWalletTask(t, repos, op.ID, "displaced")
+	if err := repos.WalletOperations.BindTask(ctx, op.ID, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.WalletOperations.MarkSubmissionUnknown(ctx, op.ID, taskID, "nonce used"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("pending operation marked as an unknown submission: %v", err)
+	}
+	raw := []byte{0x02, 0x00, 0xff}
+	if err := repos.WalletOperations.RecordSubmission(ctx, op.ID, taskID, "0xdisplaced", raw, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.WalletOperations.MarkSubmissionUnknown(ctx, op.ID, taskID+1, "nonce used"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("stale task marked the submission unknown: %v", err)
+	}
+	if err := repos.WalletOperations.MarkSubmissionUnknown(ctx, op.ID, taskID, "nonce used"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+	if err != nil || got.Status != model.WalletOperationStatusUnknown || got.TxHash == nil || *got.TxHash != "0xdisplaced" ||
+		!bytes.Equal(got.SignedTransaction, raw) || got.TaskID != nil || got.CompletedAt == nil {
+		t.Fatalf("unknown submission = %#v err=%v", got, err)
+	}
+	if err := repos.WalletOperations.MarkSubmissionUnknown(ctx, op.ID, taskID, "nonce used"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("terminal operation changed again: %v", err)
+	}
+}
+
 func TestWalletOperationRepoConfirmedWithoutTransaction(t *testing.T) {
 	repos := repository.NewRepositories(testDB(t))
 	ctx := t.Context()

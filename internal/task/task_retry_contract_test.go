@@ -77,6 +77,8 @@ func TestStaticManualRetryPreservesEvidenceStops(t *testing.T) {
 		{model.TaskTypeStorageTransferPlan, "copy_cache_missing", true},
 		{model.TaskTypeWalletOperation, "wallet_broadcast_unknown", false},
 		{model.TaskTypeWalletOperation, "wallet_transaction_reverted", false},
+		{model.TaskTypeWalletOperation, "wallet_permit_expired", false},
+		{model.TaskTypeWalletOperation, "wallet_transaction_displaced", false},
 		{model.TaskTypeWalletOperation, "invalid_checkpoint", false},
 		{model.TaskTypeWalletOperation, "handler_panic", true},
 		{model.TaskTypeWalletOperation, "dependency_unavailable", true},
