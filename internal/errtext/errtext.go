@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/strahe/synapse-go/pdp"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
@@ -110,6 +111,11 @@ func (r *Redactor) redact(text string) string {
 			text = pattern.ReplaceAllString(text, placeholder)
 		} else {
 			text = strings.ReplaceAll(text, secret, placeholder)
+			// Provider text arrives Go-escaped, which changes how a secret
+			// containing quotes, backslashes, or control characters appears.
+			if quoted := strconv.Quote(secret); quoted[1:len(quoted)-1] != secret {
+				text = strings.ReplaceAll(text, quoted[1:len(quoted)-1], placeholder)
+			}
 		}
 	}
 	text = safeText(text)
@@ -171,6 +177,22 @@ func truncate(text string) string {
 	return text[:head] + marker + text[tail:]
 }
 
+// withProviderBody puts a provider's whole response body into text. The SDK's
+// HTTPError.Error shows only a prefix, which would truncate before redaction.
+func withProviderBody(text string, provider *pdp.HTTPError) string {
+	quoted := strconv.Quote(provider.Body)
+	body := quoted[1 : len(quoted)-1]
+	rendered := provider.Error()
+	if body == "" || strings.Contains(rendered, body) {
+		return text
+	}
+	full := fmt.Sprintf("pdp: %s %s: HTTP %d: %s", provider.Method, provider.URL, provider.StatusCode, body)
+	if strings.Contains(text, rendered) {
+		return strings.ReplaceAll(text, rendered, full)
+	}
+	return text + "\nProvider response: " + body
+}
+
 // Format keeps error context and supported RPC diagnostics, then redacts and bounds it.
 func Format(err error) string {
 	r := active.Load()
@@ -204,6 +226,9 @@ func (r *Redactor) Format(err error) string {
 		}
 		if _, rendered := current.(*redactedError); rendered {
 			return
+		}
+		if provider, ok := current.(*pdp.HTTPError); ok {
+			text = withProviderBody(text, provider)
 		}
 		if coded, ok := current.(interface{ ErrorCode() int }); ok {
 			detail := fmt.Sprintf("\nRPC code: %d", coded.ErrorCode())

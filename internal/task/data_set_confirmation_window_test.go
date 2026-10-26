@@ -100,8 +100,8 @@ func TestDataSetConfirmationSuccessWinsAfterWindowExpires(t *testing.T) {
 	if err != nil || binding == nil || binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.String() != fixture.dataSetID.String() || completed.RetryCount != 0 {
 		t.Fatalf("confirmed success lost to the expired observation window: task=%#v binding=%#v err=%v", completed, binding, err)
 	}
-	if fixture.creates.Load() != 1 || fixture.confirmations.Load() != 2 {
-		t.Fatalf("late confirmation performed extra sends: creates=%d confirmations=%d", fixture.creates.Load(), fixture.confirmations.Load())
+	if fixture.creates.Load() != 1 || fixture.confirmations.Load() != 1 {
+		t.Fatalf("late confirmation performed extra reads: creates=%d confirmations=%d", fixture.creates.Load(), fixture.confirmations.Load())
 	}
 }
 
@@ -112,7 +112,7 @@ func TestDataSetGenerationCreatesOwnRequestAfterReturningToProvider(t *testing.T
 	var createsA, createsB, metadataReads atomic.Int64
 	var oldRequest atomic.Value
 	var lateResultAvailable atomic.Bool
-	targetA := &testutil.MockStorageTarget{
+	targetA := chainRecordsCreatedDataSets(&testutil.MockStorageTarget{
 		ProviderIDValue: providerA.SDK(),
 		CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 			if createsA.Add(1) == 1 {
@@ -122,15 +122,15 @@ func TestDataSetGenerationCreatesOwnRequestAfterReturningToProvider(t *testing.T
 			ref, err := storage.NewDataSetRef(providerA.SDK(), newDataSetID, *options.ClientDataSetID)
 			return &storage.CreateDataSetResult{DataSet: ref}, err
 		},
-	}
-	targetB := &testutil.MockStorageTarget{
+	})
+	targetB := chainRecordsCreatedDataSets(&testutil.MockStorageTarget{
 		ProviderIDValue: providerB.SDK(),
 		CreateDataSetFunc: func(_ context.Context, options *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 			createsB.Add(1)
 			ref, err := storage.NewDataSetRef(providerB.SDK(), sdktypes.NewBigInt(uint64(135000+sequence)), *options.ClientDataSetID)
 			return &storage.CreateDataSetResult{DataSet: ref}, err
 		},
-	}
+	})
 	budget := 1
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		policy: cache.EvictionPolicyNone, maxAttempts: &budget,
@@ -238,8 +238,13 @@ func newDataSetConfirmationFixture(t *testing.T, budget int) *dataSetConfirmatio
 			ref, err := storage.NewDataSetRef(providerID.SDK(), fixture.dataSetID, clientID)
 			return &storage.CreateDataSetResult{DataSet: ref}, err
 		},
-		FindDataSetByClientIDFunc: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {
-			return storage.DataSetRef{}, false, nil
+		// The created data set reaches the chain when the provider reports it.
+		FindDataSetByClientIDFunc: func(_ context.Context, clientID sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+			if !fixture.ready.Load() {
+				return storage.DataSetRef{}, false, nil
+			}
+			ref, err := storage.NewDataSetRef(providerID.SDK(), fixture.dataSetID, clientID)
+			return ref, err == nil, err
 		},
 	}
 	fixture.runtime = newHandlerTestRuntime(t, handlerRuntimeOptions{

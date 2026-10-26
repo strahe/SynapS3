@@ -189,11 +189,7 @@ func (h *EnsureHandler) runDataSetEnsure(ctx context.Context, execution taskengi
 		if binding.ClientDataSetID != nil && !binding.ClientDataSetID.Equal(idtypes.OnChainIDFromSDK(clientDataSetID)) {
 			return taskengine.Fail(errors.New("data set creation identity changed"), "dataset_identity_mismatch", nil)
 		}
-		if !checkpoint.TransactionRejected && checkpoint.StatusURL != "" {
-			startedAt := time.Now().UTC()
-			return h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID).WithWorkStartedAt(startedAt)
-		}
-		return h.findRequestedDataSet(ctx, execution, binding, provider, checkpoint, clientDataSetID, mayCreate)
+		return h.recoverDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID, mayCreate)
 	}
 	if dataSetCreationSent(binding) {
 		return taskengine.Fail(errors.New("data set creation checkpoint is missing"), "invalid_checkpoint", nil)
@@ -257,7 +253,7 @@ func (h *EnsureHandler) sendDataSetCreation(
 						cancelCreate()
 						return
 					}
-					evidenceErr = execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+					evidenceErr = execution.RecordEffectEvidence(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 						if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, binding.ID, execution.ID()); err != nil {
 							return err
 						}
@@ -296,13 +292,29 @@ func (h *EnsureHandler) sendDataSetCreation(
 			settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, cause)
 			return taskengine.RetryInMode(cause, "provider_confirmation", model.TaskResumeModeRecover, settlement).WithContentionSettlement(settlement)
 		}
-		dataSetID, createdClientID, identityErr := bindings.DataSetResultIDs(binding, created)
-		if identityErr != nil {
+		if _, _, identityErr := bindings.DataSetResultIDs(binding, created); identityErr != nil {
 			cause := errors.Join(createErr, evidenceErr, identityErr)
 			settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, cause)
 			return taskengine.Fail(cause, "dataset_identity_mismatch", settlement).WithContentionSettlement(settlement)
 		}
-		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, createdClientID, created)
+		ref, found, lookupErr := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
+		if errors.Is(lookupErr, storage.ErrDataSetCorrelationConflict) {
+			cause := errors.Join(createErr, evidenceErr, lookupErr)
+			settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, cause)
+			return taskengine.Fail(cause, "dataset_correlation_conflict", settlement).WithContentionSettlement(settlement)
+		}
+		if lookupErr == nil && found {
+			chainID, chainClientID, identityErr := bindings.DataSetRefIDs(binding, ref)
+			if identityErr != nil {
+				cause := errors.Join(createErr, evidenceErr, identityErr)
+				settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, cause)
+				return taskengine.Fail(cause, "dataset_identity_mismatch", settlement).WithContentionSettlement(settlement)
+			}
+			return h.completeDataSetEnsure(binding, execution.ID(), chainID, chainClientID, created)
+		}
+		settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, nil)
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set confirmation", settlement).
+			WithDiagnostic(errors.Join(createErr, evidenceErr, lookupErr))
 	}
 	if evidenceErr != nil {
 		cause := errors.Join(createErr, evidenceErr)
@@ -310,7 +322,7 @@ func (h *EnsureHandler) sendDataSetCreation(
 		return taskengine.RetryInMode(cause, "dataset_submission_record_failed", model.TaskResumeModeRecover, settlement).WithContentionSettlement(settlement)
 	}
 	if submission.StatusURL != "" {
-		return h.waitDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID)
+		return h.recoverDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID, false)
 	}
 	if createErr == nil {
 		createErr = errors.New("data set creation has no confirmed result")
@@ -327,7 +339,10 @@ func (h *EnsureHandler) sendDataSetCreation(
 		})
 }
 
-func (h *EnsureHandler) findRequestedDataSet(
+// recoverDataSetCreation settles a sent request from the chain: only the data
+// set found by its client ID completes it. Provider status supplies transaction
+// evidence and rejection, never completion.
+func (h *EnsureHandler) recoverDataSetCreation(
 	ctx context.Context,
 	execution taskengine.Execution,
 	binding *model.StorageDataSet,
@@ -336,32 +351,39 @@ func (h *EnsureHandler) findRequestedDataSet(
 	clientDataSetID sdktypes.BigInt,
 	mayCreate bool,
 ) taskengine.Result {
-	ref, found, err := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
-	if errors.Is(err, storage.ErrDataSetCorrelationConflict) {
-		return taskengine.Fail(err, "dataset_correlation_conflict", nil)
+	ref, found, lookupErr := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
+	if errors.Is(lookupErr, storage.ErrDataSetCorrelationConflict) {
+		return taskengine.Fail(lookupErr, "dataset_correlation_conflict", nil)
 	}
-	if err != nil {
-		return retryTask(err, "dataset_observation_failed")
-	}
-	if found {
+	if lookupErr == nil && found {
 		dataSetID, foundClientID, identityErr := bindings.DataSetRefIDs(binding, ref)
 		if identityErr != nil {
 			return taskengine.Fail(identityErr, "dataset_identity_mismatch", nil)
 		}
-		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID, nil)
+		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID, checkpoint.creationEvidence())
+	}
+	// A sent request that was not rejected is only observed, so a failed
+	// lookup is a diagnostic of that observation rather than a spent attempt.
+	if !checkpoint.TransactionRejected && checkpoint.StatusURL != "" {
+		startedAt := time.Now().UTC()
+		return h.observeDataSetCreation(ctx, execution, binding, provider, checkpoint, clientDataSetID, lookupErr).WithWorkStartedAt(startedAt)
 	}
 	if !checkpoint.TransactionRejected && (checkpoint.TxHash != "" || checkpoint.ConfirmedTxHash != "") {
 		startedAt, err := execution.ObserveOperation(ctx, fmt.Sprintf("ensure:%d", binding.ID))
 		if err != nil {
-			return retryTask(err, "dataset_observation_failed")
+			return retryTask(errors.Join(err, lookupErr), "dataset_observation_failed")
 		}
 		// A missing status URL does not prove that the submitted transaction failed.
 		if time.Since(startedAt) < execution.Policy().ObservationWindow {
-			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set confirmation", nil)
+			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set confirmation", nil).WithDiagnostic(lookupErr)
 		}
-		return retryTask(errors.New("data set creation is awaiting confirmation without a status URL"), "provider_confirmation")
+		return retryTask(errors.Join(errors.New("data set creation is awaiting confirmation without a status URL"), lookupErr), "provider_confirmation")
+	}
+	if lookupErr != nil {
+		return retryTask(lookupErr, "dataset_observation_failed")
 	}
 	if checkpoint.NextResendAt.IsZero() {
+		var err error
 		checkpoint.NextResendAt, err = execution.ResendAt(checkpoint.AttemptedAt, checkpoint.Sends)
 		if err != nil {
 			return taskengine.Fail(err, "invalid_checkpoint", nil)
@@ -409,46 +431,36 @@ func contextIdentityComplete(identity storage.ContextIdentity) bool {
 	return identity.Payer != (common.Address{}) && identity.ChainID.IsValid() && identity.RecordKeeper != (common.Address{})
 }
 
-func (h *EnsureHandler) waitDataSetCreation(
+// observeDataSetCreation reads the provider's status after this round found no
+// data set on chain, or could not look it up (lookupErr). It keeps the evidence
+// and detects rejection.
+func (h *EnsureHandler) observeDataSetCreation(
 	ctx context.Context,
 	execution taskengine.Execution,
 	binding *model.StorageDataSet,
 	provider synapse.ProviderTarget,
 	checkpoint dataSetCreationCheckpoint,
 	clientDataSetID sdktypes.BigInt,
+	lookupErr error,
 ) taskengine.Result {
 	startedAt, err := execution.ObserveOperation(ctx, fmt.Sprintf("ensure:%d", binding.ID))
 	if err != nil {
-		return retryTask(err, "dataset_observation_failed")
+		return retryTask(errors.Join(err, lookupErr), "dataset_observation_failed")
 	}
+	recordedID := idtypes.OnChainIDFromSDK(clientDataSetID)
+	previous := checkpoint
 	result, err := provider.WaitForDataSetCreated(ctx, checkpoint.StatusURL, clientDataSetID)
+	err = errors.Join(lookupErr, err)
 	if result != nil {
 		if evidenceErr := checkpoint.mergeEvidence(result.TransactionID, result.ConfirmedTransactionID, ""); evidenceErr != nil {
 			cause := errors.Join(err, evidenceErr)
-			settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, idtypes.OnChainIDFromSDK(clientDataSetID), checkpoint, cause)
+			settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, cause)
 			return taskengine.Fail(cause, "dataset_identity_mismatch", settlement).WithContentionSettlement(settlement)
 		}
 	}
 	if errors.Is(err, synapse.ErrProviderTransactionRejected) {
 		checkpoint.TransactionRejected = true
-		recordedID := idtypes.OnChainIDFromSDK(clientDataSetID)
-		ref, found, lookupErr := provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
-		recordEvidence := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, errors.Join(err, lookupErr))
-		if errors.Is(lookupErr, storage.ErrDataSetCorrelationConflict) {
-			return taskengine.Fail(errors.Join(err, lookupErr), "dataset_correlation_conflict", recordEvidence).WithContentionSettlement(recordEvidence)
-		}
-		if lookupErr != nil {
-			return taskengine.RetryInMode(errors.Join(err, lookupErr), "dataset_observation_failed", model.TaskResumeModeRecover, recordEvidence).WithContentionSettlement(recordEvidence)
-		}
-		if found {
-			dataSetID, foundClientID, identityErr := bindings.DataSetRefIDs(binding, ref)
-			if identityErr != nil {
-				return taskengine.Fail(errors.Join(err, identityErr), "dataset_identity_mismatch", recordEvidence).WithContentionSettlement(recordEvidence)
-			}
-			return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, foundClientID, &storage.CreateDataSetResult{
-				TransactionID: checkpoint.TxHash, ConfirmedTransactionID: checkpoint.ConfirmedTxHash,
-			})
-		}
+		recordEvidence := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, err)
 		history, encodeErr := json.Marshal(map[string]any{
 			"tx_hash": checkpoint.TxHash, "confirmed_tx_hash": checkpoint.ConfirmedTxHash, "status_url": checkpoint.StatusURL,
 			"client_data_set_id": checkpoint.ClientDataSetID, "identity": checkpoint.Identity,
@@ -466,35 +478,30 @@ func (h *EnsureHandler) waitDataSetCreation(
 				return repos.Tasks.AppendEvent(ctx, execution.ID(), "dataset_transaction_rejected", history)
 			}).WithContentionSettlement(recordEvidence)
 	}
-	if result != nil {
-		if !result.DataSet.DataSetID().IsZero() {
-			dataSetID, createdClientID, identityErr := bindings.DataSetResultIDs(binding, result)
-			if identityErr != nil {
-				cause := errors.Join(err, identityErr)
-				settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, idtypes.OnChainIDFromSDK(clientDataSetID), checkpoint, cause)
-				return taskengine.Fail(cause, "dataset_identity_mismatch", settlement).WithContentionSettlement(settlement)
-			}
-			return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, createdClientID, result)
-		}
-		if err == nil {
-			err = errors.New("data set confirmation has no identity")
+	if result != nil && !result.DataSet.DataSetID().IsZero() {
+		if _, _, identityErr := bindings.DataSetResultIDs(binding, result); identityErr != nil {
+			cause := errors.Join(err, identityErr)
+			settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, cause)
+			return taskengine.Fail(cause, "dataset_identity_mismatch", settlement).WithContentionSettlement(settlement)
 		}
 	}
-	if err != nil {
-		settlement := dataSetCreationEvidenceSettlement(execution, binding.ID, idtypes.OnChainIDFromSDK(clientDataSetID), checkpoint, err)
-		return taskengine.RetryInMode(err, "provider_confirmation", model.TaskResumeModeRecover, settlement).WithContentionSettlement(settlement)
+	var settlement taskengine.Settlement
+	if checkpoint.TxHash != previous.TxHash || checkpoint.ConfirmedTxHash != previous.ConfirmedTxHash {
+		settlement = dataSetCreationEvidenceSettlement(execution, binding.ID, recordedID, checkpoint, nil)
 	}
-	if result == nil {
-		if time.Since(startedAt) < execution.Policy().ObservationWindow {
-			return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set confirmation", nil)
-		}
-		return retryTask(errors.New("data set creation is awaiting confirmation"), "provider_confirmation")
+	// A confirmed provider status still waits for the chain lookup of a later round.
+	if time.Since(startedAt) < execution.Policy().ObservationWindow {
+		return taskengine.WaitForObservation(model.TaskResumeModeRecover, "provider_confirmation", "Waiting for data set confirmation", settlement).WithDiagnostic(err)
 	}
-	dataSetID, createdClientID, err := bindings.DataSetResultIDs(binding, result)
-	if err != nil {
-		return taskengine.Fail(err, "dataset_identity_mismatch", nil)
+	return taskengine.Retry(errors.Join(errors.New("data set creation is awaiting confirmation"), err), "provider_confirmation", settlement)
+}
+
+// creationEvidence returns the recorded transaction pair for a data set found on chain.
+func (c dataSetCreationCheckpoint) creationEvidence() *storage.CreateDataSetResult {
+	if c.TxHash == "" && c.ConfirmedTxHash == "" {
+		return nil
 	}
-	return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, createdClientID, result)
+	return &storage.CreateDataSetResult{TransactionID: c.TxHash, ConfirmedTransactionID: c.ConfirmedTxHash}
 }
 
 func (c *dataSetCreationCheckpoint) recordSubmission(txHash string) {

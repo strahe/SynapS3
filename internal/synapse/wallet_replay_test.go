@@ -16,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/walletoperation"
@@ -172,21 +173,38 @@ func TestValidateWalletSubmissionRequiresReliableHashAndCanonicalBytes(t *testin
 	}
 }
 
+const walletReplayFinalizedHeight = 1000
+
 type walletReplayRPC struct {
-	chainID     *big.Int
-	receipt     *ethtypes.Receipt
-	receiptErr  error
-	receiptWait bool
-	visible     *ethtypes.Transaction
-	visibleErr  error
-	latest      uint64
-	pending     uint64
-	latestErr   error
-	pendingErr  error
-	chainErr    error
-	sendErr     error
-	readCalls   int
-	sent        [][]byte
+	chainID       *big.Int
+	receipt       *ethtypes.Receipt
+	receiptErr    error
+	receiptWait   bool
+	visible       *ethtypes.Transaction
+	visibleErr    error
+	finalized     uint64
+	finalizedTime uint64
+	latest        uint64
+	pending       uint64
+	headerErr     error
+	finalizedErr  error
+	latestErr     error
+	pendingErr    error
+	chainErr      error
+	sendErr       error
+	readCalls     int
+	sent          [][]byte
+}
+
+func (c *walletReplayRPC) HeaderByNumber(_ context.Context, number *big.Int) (*ethtypes.Header, error) {
+	c.readCalls++
+	if number == nil || number.Int64() != int64(rpc.FinalizedBlockNumber) {
+		return nil, fmt.Errorf("unexpected header request for block %v", number)
+	}
+	if c.headerErr != nil {
+		return nil, c.headerErr
+	}
+	return &ethtypes.Header{Number: big.NewInt(walletReplayFinalizedHeight), Time: c.finalizedTime}, nil
 }
 
 func (c *walletReplayRPC) ChainID(context.Context) (*big.Int, error) {
@@ -208,9 +226,15 @@ func (c *walletReplayRPC) TransactionByHash(context.Context, common.Hash) (*etht
 	return c.visible, true, c.visibleErr
 }
 
-func (c *walletReplayRPC) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+func (c *walletReplayRPC) NonceAt(_ context.Context, _ common.Address, block *big.Int) (uint64, error) {
 	c.readCalls++
-	return c.latest, c.latestErr
+	if block == nil {
+		return c.latest, c.latestErr
+	}
+	if block.Int64() != walletReplayFinalizedHeight {
+		return 0, fmt.Errorf("nonce read at unexpected block %s", block)
+	}
+	return c.finalized, c.finalizedErr
 }
 
 func (c *walletReplayRPC) PendingNonceAt(context.Context, common.Address) (uint64, error) {
@@ -254,8 +278,13 @@ func TestWalletReplayGuardsAndPreservesSignedBytes(t *testing.T) {
 			c.visible = new(ethtypes.Transaction)
 			_ = c.visible.UnmarshalBinary(r.submission(t).SignedTransaction)
 		}, wantErr: ErrWalletReplaySkipped},
-		{name: "expired permit", setup: func(r *walletReplayRequest, _ *walletReplayRPC) { r.args[3] = big.NewInt(1) }, wantErr: ErrWalletReplaySkipped},
-		{name: "latest nonce", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.latest = 8 }, wantErr: ErrWalletReplaySkipped},
+		{name: "permit expired at finality", setup: func(r *walletReplayRequest, _ *walletReplayRPC) { r.args[3] = big.NewInt(1) }, wantErr: ErrWalletPermitExpired},
+		{name: "permit expired before finality", setup: func(r *walletReplayRequest, c *walletReplayRPC) {
+			r.args[3] = big.NewInt(time.Now().Add(-time.Minute).Unix())
+			c.finalizedTime = uint64(time.Now().Add(-time.Hour).Unix())
+		}, wantErr: ErrWalletReplaySkipped},
+		{name: "nonce used at finality", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.finalized, c.latest, c.pending = 8, 8, 8 }, wantErr: ErrWalletTransactionDisplaced},
+		{name: "latest nonce ahead of finality", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.latest = 8 }, wantErr: ErrWalletReplaySkipped},
 		{name: "pending nonce", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.pending = 8 }, wantErr: ErrWalletReplaySkipped},
 		{name: "chain error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.chainErr = rpcFailure }, wantErr: rpcFailure},
 		{name: "receipt error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.receiptErr = rpcFailure }, wantErr: rpcFailure},
@@ -263,6 +292,8 @@ func TestWalletReplayGuardsAndPreservesSignedBytes(t *testing.T) {
 			c.receiptErr = fmt.Errorf("RPC rejected %x: %w", r.submission(t).SignedTransaction, rpcFailure)
 		}, wantErr: rpcFailure},
 		{name: "visibility error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.visibleErr = rpcFailure }, wantErr: rpcFailure},
+		{name: "finalized block error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.headerErr = rpcFailure }, wantErr: rpcFailure},
+		{name: "finalized nonce error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.finalizedErr = rpcFailure }, wantErr: rpcFailure},
 		{name: "latest nonce error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.latestErr = rpcFailure }, wantErr: rpcFailure},
 		{name: "pending nonce error", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.pendingErr = rpcFailure }, wantErr: rpcFailure},
 		{name: "RPC wrong chain", setup: func(_ *walletReplayRequest, c *walletReplayRPC) { c.chainID = big.NewInt(1) }, wantErr: ErrWalletReplayInvalidEvidence},
@@ -274,7 +305,10 @@ func TestWalletReplayGuardsAndPreservesSignedBytes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newWalletReplayRequest(t, "depositWithPermit")
-			client := &walletReplayRPC{chainID: r.tx.ChainID, receiptErr: ethereum.NotFound, visibleErr: ethereum.NotFound, latest: 7, pending: 7}
+			client := &walletReplayRPC{
+				chainID: r.tx.ChainID, receiptErr: ethereum.NotFound, visibleErr: ethereum.NotFound,
+				finalized: 7, finalizedTime: uint64(time.Now().Add(-time.Minute).Unix()), latest: 7, pending: 7,
+			}
 			if tc.setup != nil {
 				tc.setup(&r, client)
 			}

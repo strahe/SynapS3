@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/observability"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
@@ -186,7 +187,7 @@ func TestUploadPartRejectsDeclaredLengthAboveObjectLimit(t *testing.T) {
 		UploadId:      aws.String(initResult.UploadId),
 		PartNumber:    &partNum,
 		Body:          unreadObjectBody{t},
-		ContentLength: ptrInt64(chain.MaxUploadSize + 1),
+		ContentLength: ptrInt64(objectlimits.MaxFOCUploadSize + 1),
 	})
 	requireAPIErrorCode(t, err, s3err.GetAPIError(s3err.ErrEntityTooLarge))
 }
@@ -448,7 +449,7 @@ func TestCompleteMultipartUploadRejectsFOCSizeAboveMaximum(t *testing.T) {
 	if err := tb.repos.Multiparts.CreatePart(ctx, &model.MultipartPart{
 		UploadID:   initResult.UploadId,
 		PartNumber: 1,
-		Size:       chain.MaxUploadSize + 1,
+		Size:       objectlimits.MaxFOCUploadSize + 1,
 		ETag:       etag,
 	}); err != nil {
 		t.Fatalf("CreatePart: %v", err)

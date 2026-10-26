@@ -160,9 +160,9 @@ The candidate list (`replacement/providers`) includes every storage provider wit
 
 Data set entries in bucket responses include `replaceable`, `replacement_blocked_reason`, and `setup_error`. A replica can be replaced when its data set is ready or its setup task has failed.
 
-Replacement `source.termination` and `target.termination` include the latest transaction hashes, end `epoch`, and an `attempts` array of termination attempts. Each attempt's `receipt_status` is `0` for failed, `1` for succeeded, or `null` when unknown; `confirmed_tx_hash` identifies a mined transaction and does not imply successful execution.
+Replacement `source.termination` and `target.termination` include the latest transaction hashes, end `epoch`, and an `attempts` array of termination attempts. Each attempt's `receipt_status` is `0` for failed, `1` for succeeded, or `null` when unknown; `confirmed_tx_hash` identifies a mined transaction and does not imply successful execution. `unsent_at` is set on an attempt that sent no transaction.
 
-After a failed termination receipt, Retry checks the service and may submit a new paid transaction if it is still active. When the outcome is unknown, Retry only checks the recorded attempt.
+After a failed termination receipt, Retry checks the service and may submit a new paid transaction if it is still active. When the outcome is unknown, Retry only checks the recorded attempt, unless the storage provider never carried out a termination sent through it: then, if the service is still active, Retry sends the termination from the payer wallet. When nothing was sent, for example because of payment debt, Retry submits the termination again after you resolve the cause.
 
 #### Replacement Status
 

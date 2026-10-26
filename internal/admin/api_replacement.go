@@ -108,6 +108,7 @@ type replacementTerminationAttemptResponse struct {
 	TxHash          *string    `json:"tx_hash"`
 	ConfirmedTxHash *string    `json:"confirmed_tx_hash"`
 	ReceiptStatus   *uint64    `json:"receipt_status"`
+	UnsentAt        *time.Time `json:"unsent_at"`
 }
 
 type replacementDataSetResponse struct {
@@ -761,7 +762,7 @@ func replacementTerminationView(row *storagereplacement.Replacement, role storag
 		}
 		result.Attempts = append(result.Attempts, replacementTerminationAttemptResponse{
 			ID: attempt.ID, AttemptNo: attempt.AttemptNo, TaskID: attempt.TaskID, AttemptedAt: attempt.AttemptedAt,
-			TxHash: attempt.TxHash, ConfirmedTxHash: attempt.ConfirmedTxHash, ReceiptStatus: attempt.ReceiptStatus,
+			TxHash: attempt.TxHash, ConfirmedTxHash: attempt.ConfirmedTxHash, ReceiptStatus: attempt.ReceiptStatus, UnsentAt: attempt.UnsentAt,
 		})
 		if result.AttemptNo == nil || attempt.AttemptNo >= *result.AttemptNo {
 			result.AttemptNo = new(attempt.AttemptNo)

@@ -221,6 +221,27 @@ func (r *BunWalletOperationRepo) MarkUnknown(ctx context.Context, id, taskID int
 	return requireRows(res, err, "marking wallet operation unknown")
 }
 
+// MarkSubmissionUnknown stops a submitted operation whose transaction can no
+// longer land when what took its place is unknown. Its transaction evidence is kept.
+func (r *BunWalletOperationRepo) MarkSubmissionUnknown(ctx context.Context, id, taskID int64, lastError string) error {
+	if lastError == "" {
+		return ErrInvalidInput
+	}
+	now := time.Now()
+	res, err := r.db.NewUpdate().
+		Model((*model.WalletOperation)(nil)).
+		Set("status = ?", model.WalletOperationStatusUnknown).
+		Set("last_error = ?", errtext.Redact(lastError)).
+		Set("task_id = NULL").
+		Set("completed_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("id = ? AND task_id = ?", id, taskID).
+		Where("status = ?", model.WalletOperationStatusSubmitted).
+		Where("broadcast_attempted_at IS NOT NULL").
+		Exec(ctx)
+	return requireRows(res, err, "marking submitted wallet operation unknown")
+}
+
 func (r *BunWalletOperationRepo) ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error) {
 	limit = normalizeWalletOperationLimit(limit)
 	var ops []model.WalletOperation

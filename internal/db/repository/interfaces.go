@@ -695,6 +695,7 @@ type StorageReplacementRepository interface {
 	BeginRetirement(ctx context.Context, replacementID int64) error
 	BeginTerminationAttempt(ctx context.Context, input BeginTerminationAttemptInput) error
 	RecordTerminationEvidence(ctx context.Context, input RecordTerminationEvidenceInput) error
+	RecordTerminationUnsent(ctx context.Context, input RecordTerminationEvidenceInput) error
 	ListTerminationAttempts(ctx context.Context, replacementIDs []int64) ([]storagereplacement.TerminationAttempt, error)
 	CompleteAbandonedTargetTermination(ctx context.Context, replacementID int64) error
 	// EvaluateRetirementGate reports every blocker by name so the API and UI can
@@ -799,7 +800,11 @@ type BeginTerminationAttemptInput struct {
 	Role              storagereplacement.TerminationRole
 	AttemptNo         int64
 	PreviousAttemptNo int64
-	AttemptedAt       time.Time
+	// ResumeUnresolved lets a successor take over the latest attempt while it
+	// holds no transaction evidence, which only an operator's Retry authorizes
+	// after the attempt's relayed request stayed unresolved.
+	ResumeUnresolved bool
+	AttemptedAt      time.Time
 }
 
 // RetirementGate reports each safety predicate separately so a recoverable
@@ -946,6 +951,7 @@ type WalletOperationRepository interface {
 	MarkConfirmedWithoutTransaction(ctx context.Context, id, taskID int64) error
 	MarkFailed(ctx context.Context, id, taskID int64, lastError string) error
 	MarkUnknown(ctx context.Context, id, taskID int64, lastError string) error
+	MarkSubmissionUnknown(ctx context.Context, id, taskID int64, lastError string) error
 	ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error)
 }
 

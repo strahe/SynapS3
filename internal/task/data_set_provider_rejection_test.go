@@ -275,7 +275,7 @@ func TestRejectedDataSetCreationKeepsEvidenceUntilANewSubmission(t *testing.T) {
 				tc.nextResult.DataSet = ref
 			}
 			var creates atomic.Int64
-			target := &testutil.MockStorageTarget{
+			target := chainRecordsCreatedDataSets(&testutil.MockStorageTarget{
 				ProviderIDValue: providerID.SDK(),
 				WaitDataSetFunc: func(_ context.Context, statusURL string, id sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 					if !id.Equal(clientID.SDK()) {
@@ -303,7 +303,7 @@ func TestRejectedDataSetCreationKeepsEvidenceUntilANewSubmission(t *testing.T) {
 					}
 					return tc.nextResult, tc.nextError
 				},
-			}
+			})
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 				return target, nil
 			}}, policy: cache.EvictionPolicyNone})
@@ -428,6 +428,9 @@ func TestDataSetCreationPreservesEvidenceOnConflictingResults(t *testing.T) {
 				WaitDataSetFunc: func(_ context.Context, _ string, id sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 					return result(id)
 				},
+				FindDataSetByClientIDFunc: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+					return storage.DataSetRef{}, false, nil
+				},
 			}
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 				return target, nil
@@ -489,7 +492,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 			var creates atomic.Int64
 			createStarted, allowCreate := make(chan struct{}), make(chan struct{})
 			terminator := &testServiceTerminator{err: errors.New("unexpected remote retirement")}
-			target := &testutil.MockStorageTarget{
+			target := chainRecordsCreatedDataSets(&testutil.MockStorageTarget{
 				ProviderIDValue: targetProvider.SDK(),
 				WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 					return nil, synapse.ErrProviderTransactionRejected
@@ -513,7 +516,7 @@ func TestUncreatedReplacementCoordinatorWaitsForReadyTarget(t *testing.T) {
 					ref, err := storage.NewDataSetRef(targetProvider.SDK(), sdktypes.NewBigInt(2002), *options.ClientDataSetID)
 					return &storage.CreateDataSetResult{DataSet: ref}, err
 				},
-			}
+			})
 			attempts := 2
 			if state == "provider rejected" {
 				attempts = 1

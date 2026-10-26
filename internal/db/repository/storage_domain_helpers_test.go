@@ -982,11 +982,12 @@ func TestRecordedTerminationEpochIsVisibleToTheRetirementGate(t *testing.T) {
 	}
 }
 
-func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
+// abandonedTermination seeds a superseded replacement whose unused target is
+// being retired by a newly bound task.
+func abandonedTermination(t *testing.T, db *bun.DB, repos *repository.Repositories, name string) (*storagereplacement.Replacement, repository.RecordTerminationEvidenceInput) {
+	t.Helper()
 	ctx := t.Context()
-	bucket := seedBucket(t, db, "termination-attempts")
+	bucket := seedBucket(t, db, name)
 	source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
 	})
@@ -996,7 +997,7 @@ func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
 	markSourceReady(t, repos, source.ID)
 	replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
-		TargetProviderID: onChainID(t, "202"), ClientRequestID: "termination-attempts",
+		TargetProviderID: onChainID(t, "202"), ClientRequestID: name,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1006,6 +1007,33 @@ func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
 	}
 	evidence := terminationTestInput(t, repos, replacement, storagereplacement.TerminationRoleAbandonedTarget)
 	evidence.AttemptNo = 1
+	return replacement, evidence
+}
+
+// retirementSuccessor fails the current retirement owner and binds its retry.
+func retirementSuccessor(t *testing.T, db *bun.DB, repos *repository.Repositories, evidence repository.RecordTerminationEvidenceInput) int64 {
+	t.Helper()
+	ctx := t.Context()
+	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
+		Set("finished_at = ?", time.Now().UTC()).Where("id = ?", evidence.TaskID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := repos.Tasks.GetByID(ctx, evidence.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := repositorySuccessor(t, repos, previous)
+	if err := repos.Contents.TransferRetireTaskOwner(ctx, evidence.DataSetID, evidence.Generation, previous.ID, next.ID); err != nil {
+		t.Fatal(err)
+	}
+	return next.ID
+}
+
+func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	replacement, evidence := abandonedTermination(t, db, repos, "termination-attempts")
 	admission := repository.BeginTerminationAttemptInput{
 		ReplacementID: evidence.ReplacementID, DataSetID: evidence.DataSetID, Generation: evidence.Generation,
 		TaskID: evidence.TaskID, Role: evidence.Role, AttemptNo: 1, AttemptedAt: time.Now().UTC(),
@@ -1032,26 +1060,15 @@ func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousTaskID := evidence.TaskID
-	if _, err := db.NewUpdate().Model((*model.Task)(nil)).Set("status = ?", model.TaskStatusFailed).
-		Set("finished_at = ?", time.Now().UTC()).Where("id = ?", previousTaskID).Exec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	previousTask, err := repos.Tasks.GetByID(ctx, previousTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	next := repositorySuccessor(t, repos, previousTask)
-	if err := repos.Contents.TransferRetireTaskOwner(ctx, evidence.DataSetID, evidence.Generation, previousTaskID, next.ID); err != nil {
-		t.Fatal(err)
-	}
-	admission.TaskID, admission.PreviousAttemptNo, admission.AttemptNo = next.ID, 1, 2
+	nextID := retirementSuccessor(t, db, repos, evidence)
+	admission.TaskID, admission.PreviousAttemptNo, admission.AttemptNo = nextID, 1, 2
 	if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("admit another request before a failed receipt: %v", err)
 	}
 	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("record from a superseded owner: %v", err)
 	}
-	evidence.TaskID, evidence.ConfirmedTxHash, evidence.ReceiptStatus = next.ID, "0xreverted", new(uint64(0))
+	evidence.TaskID, evidence.ConfirmedTxHash, evidence.ReceiptStatus = nextID, "0xreverted", new(uint64(0))
 	if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
 		t.Fatalf("retain reverted receipt: %v", err)
 	}
@@ -1112,5 +1129,132 @@ func TestTerminationAttemptAdmissionPreservesRevertedEvidence(t *testing.T) {
 	admission.PreviousAttemptNo, admission.AttemptNo = 2, 3
 	if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("admit a request after service termination: %v", err)
+	}
+}
+
+// An attempt whose relayed request stayed unresolved passes to a successor only
+// when it says an operator authorized completing it, and only while the attempt
+// holds no transaction evidence. The attempt keeps its number in the history.
+func TestUnresolvedTerminationAttemptIsResumedByAnAuthorizedSuccessor(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		authorized bool
+		txHash     string
+		wantErr    error
+	}{
+		{name: "authorized successor", authorized: true},
+		{name: "unauthorized successor", wantErr: repository.ErrConflict},
+		{name: "relayed transaction known", authorized: true, txHash: "0xrelayed", wantErr: repository.ErrConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := t.Context()
+			replacement, evidence := abandonedTermination(t, db, repos, "unresolved-relay")
+			admission := repository.BeginTerminationAttemptInput{
+				ReplacementID: evidence.ReplacementID, DataSetID: evidence.DataSetID, Generation: evidence.Generation,
+				TaskID: evidence.TaskID, Role: evidence.Role, AttemptNo: 1, AttemptedAt: time.Now().UTC(),
+			}
+			if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); err != nil {
+				t.Fatal(err)
+			}
+			if tc.txHash != "" {
+				evidence.TxHash = tc.txHash
+				if err := repos.Replacements.RecordTerminationEvidence(ctx, evidence); err != nil {
+					t.Fatal(err)
+				}
+			}
+			firstTaskID := evidence.TaskID
+			admission.TaskID = retirementSuccessor(t, db, repos, evidence)
+			admission.PreviousAttemptNo, admission.ResumeUnresolved = 1, tc.authorized
+			for range 2 {
+				if err := repos.Replacements.BeginTerminationAttempt(ctx, admission); !errors.Is(err, tc.wantErr) {
+					t.Fatalf("resume the unresolved attempt: %v, want %v", err, tc.wantErr)
+				}
+			}
+			attempts, err := repos.Replacements.ListTerminationAttempts(ctx, []int64{replacement.ID})
+			if err != nil || len(attempts) != 1 || attempts[0].AttemptNo != 1 || attempts[0].ReceiptStatus != nil || attempts[0].UnsentAt != nil {
+				t.Fatalf("attempt history = %#v err=%v", attempts, err)
+			}
+			wantOwner := admission.TaskID
+			if tc.wantErr != nil {
+				wantOwner = firstTaskID
+			}
+			if attempts[0].TaskID == nil || *attempts[0].TaskID != wantOwner || (tc.txHash == "") != (attempts[0].TxHash == nil) {
+				t.Fatalf("attempt = %#v, want owner %d", attempts[0], wantOwner)
+			}
+		})
+	}
+}
+
+// A released admission sent nothing that can land, so its task or a successor
+// admits the same attempt again. An admission with any evidence stays bound.
+// The current owner may release an admission it inherited. A transaction that
+// appears after a release reopens the admission with its evidence.
+func TestReleasedTerminationAttemptIsAdmittedAgainInPlace(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	replacement, evidence := abandonedTermination(t, db, repos, "termination-release")
+	admit := func(taskID int64) error {
+		return repos.Replacements.BeginTerminationAttempt(ctx, repository.BeginTerminationAttemptInput{
+			ReplacementID: evidence.ReplacementID, DataSetID: evidence.DataSetID, Generation: evidence.Generation,
+			TaskID: taskID, Role: evidence.Role, AttemptNo: 1, PreviousAttemptNo: 1, AttemptedAt: time.Now().UTC(),
+		})
+	}
+	attempt := func() storagereplacement.TerminationAttempt {
+		t.Helper()
+		attempts, err := repos.Replacements.ListTerminationAttempts(ctx, []int64{replacement.ID})
+		if err != nil || len(attempts) != 1 {
+			t.Fatalf("attempt history = %#v, err=%v", attempts, err)
+		}
+		return attempts[0]
+	}
+	if err := repos.Replacements.BeginTerminationAttempt(ctx, repository.BeginTerminationAttemptInput{
+		ReplacementID: evidence.ReplacementID, DataSetID: evidence.DataSetID, Generation: evidence.Generation,
+		TaskID: evidence.TaskID, Role: evidence.Role, AttemptNo: 1, AttemptedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := repos.Replacements.RecordTerminationUnsent(ctx, evidence); err != nil {
+			t.Fatalf("release admission: %v", err)
+		}
+	}
+	if released := attempt(); released.UnsentAt == nil {
+		t.Fatalf("released attempt = %#v", released)
+	}
+	if err := admit(evidence.TaskID); err != nil {
+		t.Fatalf("readmit by the same task: %v", err)
+	}
+	if reopened := attempt(); reopened.UnsentAt != nil || *reopened.TaskID != evidence.TaskID {
+		t.Fatalf("reopened attempt = %#v", reopened)
+	}
+	evidence.TaskID = retirementSuccessor(t, db, repos, evidence)
+	if err := repos.Replacements.RecordTerminationUnsent(ctx, evidence); err != nil {
+		t.Fatalf("successor releases the inherited admission: %v", err)
+	}
+	if err := admit(evidence.TaskID); err != nil {
+		t.Fatalf("readmit by a successor: %v", err)
+	}
+	if reopened := attempt(); reopened.UnsentAt != nil || *reopened.TaskID != evidence.TaskID {
+		t.Fatalf("successor attempt = %#v", reopened)
+	}
+	if err := repos.Replacements.RecordTerminationUnsent(ctx, evidence); err != nil {
+		t.Fatalf("release the successor's admission: %v", err)
+	}
+	sent := evidence
+	sent.TxHash = "0xsent"
+	if err := repos.Replacements.RecordTerminationEvidence(ctx, sent); err != nil {
+		t.Fatalf("record a transaction for a released admission: %v", err)
+	}
+	if err := repos.Replacements.RecordTerminationUnsent(ctx, evidence); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("release an attempt with a transaction: %v", err)
+	}
+	if err := admit(retirementSuccessor(t, db, repos, evidence)); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("readmit an unreleased attempt by another task: %v", err)
+	}
+	if kept := attempt(); kept.UnsentAt != nil || kept.TxHash == nil || *kept.TxHash != "0xsent" {
+		t.Fatalf("sent attempt = %#v", kept)
 	}
 }

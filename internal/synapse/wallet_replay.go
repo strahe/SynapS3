@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/walletoperation"
 )
@@ -23,6 +24,12 @@ var (
 	ErrWalletReplayInvalidEvidence = errors.New("could not verify the saved wallet transaction")
 	ErrWalletReplaySkipped         = errors.New("wallet transaction replay skipped")
 	ErrWalletReplayBroadcast       = errors.New("wallet transaction replay broadcast failed")
+	// ErrWalletTransactionDisplaced means a finalized transaction used the saved
+	// transaction's nonce, so it can never land. What that transaction did is unknown.
+	ErrWalletTransactionDisplaced = errors.New("wallet transaction nonce was used by another transaction")
+	// ErrWalletPermitExpired means the saved transaction's permit expired before
+	// the finalized block, so it cannot succeed in any later block.
+	ErrWalletPermitExpired = errors.New("wallet transaction permit expired")
 )
 
 // WalletReplayClient observes and sends the exact transaction retained by the ledger.
@@ -30,6 +37,7 @@ type WalletReplayClient interface {
 	ChainID(context.Context) (*big.Int, error)
 	TransactionReceipt(context.Context, common.Hash) (*ethtypes.Receipt, error)
 	TransactionByHash(context.Context, common.Hash) (*ethtypes.Transaction, bool, error)
+	HeaderByNumber(context.Context, *big.Int) (*ethtypes.Header, error)
 	NonceAt(context.Context, common.Address, *big.Int) (uint64, error)
 	PendingNonceAt(context.Context, common.Address) (uint64, error)
 	SendTransaction(context.Context, *ethtypes.Transaction) error
@@ -202,8 +210,21 @@ func (o *walletOperator) RebroadcastSignedTransaction(ctx context.Context, opera
 	if !errors.Is(err, ethereum.NotFound) {
 		return fmt.Errorf("read replay transaction: %w", err)
 	}
-	if deadline != nil && deadline.Cmp(big.NewInt(time.Now().Unix())) <= 0 {
-		return fmt.Errorf("%w: permit has expired", ErrWalletReplaySkipped)
+	// Only finalized state proves that the original can never land; anything
+	// newer can still be reorganized.
+	finalized, err := o.replay.HeaderByNumber(readCtx, big.NewInt(int64(rpc.FinalizedBlockNumber)))
+	if err != nil {
+		return fmt.Errorf("read replay finalized block: %w", err)
+	}
+	if finalized == nil || finalized.Number == nil {
+		return errors.New("read replay finalized block: no header")
+	}
+	settled, err := o.replay.NonceAt(readCtx, o.identity.Identity.Payer, finalized.Number)
+	if err != nil {
+		return fmt.Errorf("read replay finalized nonce: %w", err)
+	}
+	if settled > tx.Nonce() {
+		return fmt.Errorf("%w: nonce %d is finalized at block %s", ErrWalletTransactionDisplaced, tx.Nonce(), finalized.Number)
 	}
 	latest, err := o.replay.NonceAt(readCtx, o.identity.Identity.Payer, nil)
 	if err != nil {
@@ -215,6 +236,12 @@ func (o *walletOperator) RebroadcastSignedTransaction(ctx context.Context, opera
 	}
 	if latest > tx.Nonce() || pending > tx.Nonce() {
 		return fmt.Errorf("%w: sender nonce has advanced", ErrWalletReplaySkipped)
+	}
+	if deadline != nil && deadline.Cmp(new(big.Int).SetUint64(finalized.Time)) <= 0 {
+		return fmt.Errorf("%w: permit deadline %s is not after finalized block %s", ErrWalletPermitExpired, deadline, finalized.Number)
+	}
+	if deadline != nil && deadline.Cmp(big.NewInt(time.Now().Unix())) <= 0 {
+		return fmt.Errorf("%w: permit has expired", ErrWalletReplaySkipped)
 	}
 	if err := o.replay.SendTransaction(ctx, tx); err != nil {
 		return fmt.Errorf("%w: %w", ErrWalletReplayBroadcast, err)

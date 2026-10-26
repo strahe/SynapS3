@@ -642,11 +642,9 @@ func (h *Handler) recordCommitEvidence(ctx context.Context, run commitRun, sends
 		if submission.TransactionID == "" || submission.StatusURL == "" {
 			return
 		}
-		evidenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
 		checkpoint := run.checkpoint
 		checkpoint.TxHash = submission.TransactionID
-		err := run.execution.WriteCheckpointWith(evidenceCtx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+		err := run.execution.RecordEffectEvidence(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.Contents.RecordCommitSubmission(ctx, repository.CommitSubmissionInput{
 				CommitSendInput: repository.CommitSendInput{RequestID: run.request.RequestID, TaskID: run.taskID(), Sends: sends},
 				TxHash:          submission.TransactionID, StatusURL: submission.StatusURL,

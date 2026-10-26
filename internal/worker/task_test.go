@@ -911,6 +911,71 @@ func TestEngineShutdownDiscardsHandlerResultAndForcesRecovery(t *testing.T) {
 	}
 }
 
+// Evidence an external effect already returned must survive shutdown. Only the
+// database claim fence decides whether it may still be written.
+func TestRecordEffectEvidenceSurvivesShutdownButNotAnExpiredLease(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		expire bool
+	}{
+		{name: "shutdown"},
+		{name: "expired lease", expire: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limit := 5
+			var harness taskHarness
+			var settled atomic.Bool
+			var recordErr error
+			parent, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			harness = newTaskHarness(t, scriptedHandler{
+				definition: testDefinition(&limit, true),
+				execute: func(ctx context.Context, execution Execution) Result {
+					cancel()
+					deadline := time.Now().Add(5 * time.Second)
+					for !errors.Is(execution.WriteCheckpoint(context.WithoutCancel(ctx), map[string]string{"stage": "sending"}), repository.ErrTaskLeaseLost) {
+						if time.Now().After(deadline) {
+							recordErr = errors.New("shutdown never marked the lease unsafe")
+							return Complete("", nil)
+						}
+						time.Sleep(time.Millisecond)
+					}
+					if tc.expire {
+						if _, err := harness.db.ExecContext(context.WithoutCancel(ctx), `UPDATE tasks SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), execution.ID()); err != nil {
+							recordErr = err
+							return Complete("", nil)
+						}
+					}
+					recordErr = execution.RecordEffectEvidence(ctx, map[string]string{"stage": "submitted"}, func(context.Context, *repository.Repositories) error {
+						settled.Store(true)
+						return nil
+					})
+					return Complete("discarded on shutdown", nil)
+				},
+			}, nil)
+			row := enqueueTestTask(t, harness, tc.name)
+			harness.engine.executeClaim(parent, claimTestTask(t, harness))
+			stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var checkpoint map[string]string
+			if err := json.Unmarshal(stored.Checkpoint, &checkpoint); err != nil {
+				t.Fatalf("checkpoint %s: %v", stored.Checkpoint, err)
+			}
+			if tc.expire {
+				if !errors.Is(recordErr, repository.ErrTaskLeaseLost) || settled.Load() || checkpoint["stage"] == "submitted" {
+					t.Fatalf("expired claim wrote evidence: err=%v settled=%t checkpoint=%v", recordErr, settled.Load(), checkpoint)
+				}
+				return
+			}
+			if recordErr != nil || !settled.Load() || checkpoint["stage"] != "submitted" || stored.Status != model.TaskStatusRunning {
+				t.Fatalf("evidence after shutdown: err=%v settled=%t checkpoint=%v task=%#v", recordErr, settled.Load(), checkpoint, stored)
+			}
+		})
+	}
+}
+
 func TestRecoverCannotStartExternalEffect(t *testing.T) {
 	limit := 5
 	var called atomic.Bool

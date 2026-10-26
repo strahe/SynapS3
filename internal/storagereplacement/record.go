@@ -93,8 +93,12 @@ type TerminationAttempt struct {
 	TxHash          *string    `bun:"type:text,nullzero"`
 	ConfirmedTxHash *string    `bun:"type:text,nullzero"`
 	ReceiptStatus   *uint64    `bun:"type:smallint"`
-	CreatedAt       time.Time  `bun:",nullzero,notnull"`
-	UpdatedAt       time.Time  `bun:",nullzero,notnull"`
+	// UnsentAt marks an admission proven not to put a transaction on chain.
+	// Admitting the same attempt again, or recording its transaction, reopens
+	// this row.
+	UnsentAt  *time.Time `bun:",nullzero"`
+	CreatedAt time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt time.Time  `bun:",nullzero,notnull"`
 
 	ReplacementID int64           `bun:",scanonly"`
 	Role          TerminationRole `bun:",scanonly"`

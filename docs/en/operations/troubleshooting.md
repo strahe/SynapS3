@@ -107,6 +107,8 @@ After you review a failure, select **Acknowledge** or run `synaps3 admin task ac
 
 **Awaiting confirmation** means the transaction is recorded but its outcome is unresolved, even if the RPC rejected the broadcast. SynapS3 checks every 30 seconds; five minutes without a receipt consumes one retry. It can resend the same signed transaction when available, without creating another payment. If automatic confirmation stops, use **Retry** on the **Tasks** page to continue the same transaction. A stopped task does not cancel a transaction on chain.
 
+When a transaction can never be included, its operation stops on its own and cannot be retried. If the transaction's permit expired before it was included, the operation is marked failed and no funds moved; start the operation again. If another transaction from this wallet used the same nonce, the outcome is marked unknown; check the wallet's transactions on chain to see whether the operation happened.
+
 Check the balances and FWSS approval on the **Wallet** page, or with:
 
 ```bash

@@ -544,11 +544,11 @@ func (m *MockServiceTerminator) ContextIdentity() storage.ContextIdentity {
 	return DefaultContextIdentity
 }
 
-func (m *MockServiceTerminator) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*synapse.TerminationResult, error) {
+func (m *MockServiceTerminator) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, hooks synapse.TerminationHooks) (*synapse.TerminationResult, error) {
 	if m.TerminateServiceFunc != nil {
 		result, err := m.TerminateServiceFunc(ctx, dataSetID)
-		if result != nil && result.TxHash != "" && onSubmitted != nil {
-			err = errors.Join(err, onSubmitted(result.TxHash))
+		if result != nil && result.TxHash != "" && hooks.OnSubmitted != nil {
+			err = errors.Join(err, hooks.OnSubmitted(result.TxHash))
 		}
 		return result, err
 	}

@@ -147,12 +147,48 @@ func TestFormatPreservesProviderContextAndIdentity(t *testing.T) {
 	cause := &pdp.HTTPError{Method: "POST", URL: "https://provider.example/pdp/data-sets/7/pieces?token=secret", StatusCode: 500, Body: "failed to add pieces:\n  piece not found"}
 	err := fmt.Errorf("could not register pieces: %w", cause)
 	got := RedactError(err)
-	for _, want := range []string{"could not register pieces", "https://provider.example/pdp/data-sets/7/pieces", "HTTP 500", "failed to add pieces:\n  piece not found"} {
+	// The SDK escapes control characters in the provider's response.
+	for _, want := range []string{"could not register pieces", "https://provider.example/pdp/data-sets/7/pieces", "HTTP 500", `failed to add pieces:\n  piece not found`} {
 		if !strings.Contains(got.Error(), want) {
 			t.Fatalf("diagnostic missing %q: %s", want, got)
 		}
 	}
 	if strings.Contains(got.Error(), "secret") || !errors.Is(got, cause) || Format(got) != got.Error() {
 		t.Fatal("diagnostic redaction or identity is unstable")
+	}
+}
+
+// A provider body reaches the diagnostic whole and escaped: redaction covers
+// all of it, in either form of a secret, before the shared limit truncates the
+// middle.
+func TestFormatKeepsTheWholeProviderResponse(t *testing.T) {
+	previous := active.Load()
+	t.Cleanup(func() { active.Store(previous) })
+	secret := `provider-"secret\`
+	Configure("", secret)
+	for _, tc := range []struct {
+		name      string
+		body      string
+		truncated bool
+	}{
+		{name: "within the SDK rendering", body: "rejected\n " + secret + " tail-marker"},
+		{name: "beyond the SDK rendering", body: strings.Repeat("a", 5000) + "\n " + secret + " tail-marker"},
+		{name: "beyond the diagnostic limit", body: "head-marker " + strings.Repeat("b", 2*MaxBytes) + "\n " + secret + " tail-marker", truncated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cause := &pdp.HTTPError{Method: "POST", URL: "https://provider.example/pdp/data-sets/7/pieces", StatusCode: 500, Body: tc.body}
+			got := Format(fmt.Errorf("could not register pieces: %w", cause))
+			for _, want := range []string{"could not register pieces: pdp: POST https://provider.example/pdp/data-sets/7/pieces: HTTP 500: ", `\n ` + placeholder + " tail-marker"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("diagnostic missing %q: %.200s ... %s", want, got, got[max(0, len(got)-200):])
+				}
+			}
+			if strings.Contains(got, "secret") || strings.Contains(got, "bytes omitted") || len(got) > MaxBytes {
+				t.Fatalf("diagnostic leaked, kept the SDK prefix, or exceeded the limit: %d bytes", len(got))
+			}
+			if strings.Contains(got, "[truncated: redacted text was") != tc.truncated || (tc.truncated && !strings.Contains(got, "head-marker")) {
+				t.Fatalf("unexpected truncation: %.200s", got)
+			}
+		})
 	}
 }

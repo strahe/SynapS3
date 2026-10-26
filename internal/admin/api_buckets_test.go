@@ -28,6 +28,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
@@ -5014,7 +5015,7 @@ func TestAPIBucketObjectUpload_RejectsFOCSizeLimits(t *testing.T) {
 		{
 			name:          "above maximum",
 			body:          "short body",
-			contentLength: chain.MaxUploadSize + 1,
+			contentLength: objectlimits.MaxFOCUploadSize + 1,
 			wantStatus:    http.StatusRequestEntityTooLarge,
 			wantError:     "EntityTooLarge",
 		},
@@ -5121,7 +5122,7 @@ func TestAPIBucketObjectUpload_MapsUploaderErrors(t *testing.T) {
 		},
 		{
 			name:      "http max bytes",
-			err:       fmt.Errorf("staging object: %w", &http.MaxBytesError{Limit: int64(chain.MaxUploadSize)}),
+			err:       fmt.Errorf("staging object: %w", &http.MaxBytesError{Limit: objectlimits.MaxFOCUploadSize}),
 			status:    http.StatusRequestEntityTooLarge,
 			wantError: "EntityTooLarge",
 		},

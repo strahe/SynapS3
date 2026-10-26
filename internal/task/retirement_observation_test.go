@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -102,13 +103,13 @@ func (f *failedRetirementTerminator) ObserveTermination(_ context.Context, _ sdk
 	return &synapse.TerminationResult{TxHash: "0xattempt-a", ConfirmedTxHash: "0xmined-a", ReceiptStatus: new(uint64(0))}, false, synapse.ErrTerminationTransactionFailed
 }
 
-func (f *failedRetirementTerminator) TerminateServiceDirect(_ context.Context, _ sdktypes.BigInt, onSubmitted func(string) error) (*synapse.TerminationResult, error) {
+func (f *failedRetirementTerminator) TerminateServiceDirect(_ context.Context, _ sdktypes.BigInt, hooks synapse.TerminationHooks) (*synapse.TerminationResult, error) {
 	f.directCalls.Add(1)
 	if f.payerChecks.Load() < 2 {
 		return nil, errors.New("direct termination was sent without checking the service payer again")
 	}
 	result := &synapse.TerminationResult{TxHash: "0xattempt-b"}
-	return result, errors.Join(context.DeadlineExceeded, onSubmitted(result.TxHash))
+	return result, errors.Join(context.DeadlineExceeded, hooks.OnSubmitted(result.TxHash))
 }
 
 func (f *failedRetirementTerminator) ObserveTerminationDirect(_ context.Context, _ sdktypes.BigInt, known synapse.TerminationResult) (*synapse.TerminationResult, bool, error) {
@@ -120,6 +121,99 @@ func (f *failedRetirementTerminator) ObserveTerminationDirect(_ context.Context,
 		return &known, true, nil
 	}
 	return &synapse.TerminationResult{TxHash: "0xattempt-b", ConfirmedTxHash: "0xmined-b", ReceiptStatus: new(uint64(1)), EndEpoch: new(int64(84))}, false, nil
+}
+
+// relayRetirementTerminator leaves its first request's outcome unknown while
+// the provider reports holding no request. With fallback it first announces
+// that the payer wallet may broadcast. The first observation precedes the
+// request and the second releases its admission; with late set, later
+// observations report a request with that hash.
+type relayRetirementTerminator struct {
+	testServiceTerminator
+	fallback     bool
+	late         string
+	observations atomic.Int64
+}
+
+func (r *relayRetirementTerminator) TerminateService(_ context.Context, _ sdktypes.BigInt, hooks synapse.TerminationHooks) (*synapse.TerminationResult, error) {
+	if r.calls.Add(1) > 1 {
+		return &synapse.TerminationResult{TxHash: "0xresent", EndEpoch: new(int64(84))}, nil
+	}
+	if r.fallback {
+		if err := hooks.BeforeDirect(); err != nil {
+			return nil, err
+		}
+		return &synapse.TerminationResult{}, errors.New("direct broadcast outcome unknown")
+	}
+	return &synapse.TerminationResult{}, fmt.Errorf("%w: %w", synapse.ErrTerminationTransactionNotSent, errors.New("relay connection reset"))
+}
+
+func (r *relayRetirementTerminator) ObserveTermination(context.Context, sdktypes.BigInt, synapse.TerminationResult) (*synapse.TerminationResult, bool, error) {
+	if r.observations.Add(1) > 2 && r.late != "" {
+		return &synapse.TerminationResult{TxHash: r.late}, true, nil
+	}
+	return nil, false, fmt.Errorf("%w: %w", synapse.ErrTerminationRequestAbsent, &pdp.HTTPError{StatusCode: 404})
+}
+
+// A relayed request the provider reports never holding is released and sent
+// again. Once the payer wallet may have broadcast, the provider's answer no
+// longer covers the attempt, so it is only observed.
+func TestRetirementResendsRelayOnlyWhenProviderHasNoRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fallback bool
+	}{
+		{name: "relay only"},
+		{name: "direct fallback may have broadcast", fallback: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			terminator := &relayRetirementTerminator{fallback: tc.fallback}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator, epochs: testEpochReader{epoch: 90}, retireOnly: true})
+			replacement, row := seedAbandonedTargetRetirement(t, runtime, storedObjectSequence.Add(1))
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			if !tc.fallback {
+				waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+				attempts, err := runtime.repos.Replacements.ListTerminationAttempts(t.Context(), []int64{replacement.ID})
+				if err != nil || len(attempts) != 1 || attempts[0].UnsentAt != nil || attempts[0].TxHash == nil || *attempts[0].TxHash != "0xresent" || terminator.calls.Load() != 2 {
+					t.Fatalf("released relay request: attempts=%#v requests=%d err=%v", attempts, terminator.calls.Load(), err)
+				}
+				return
+			}
+			settled := waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool {
+				return terminator.observations.Load() >= 3 && task.Status == model.TaskStatusPending
+			})
+			var checkpoint struct {
+				Unsent    bool `json:"unsent"`
+				RelayOnly bool `json:"relay_only"`
+			}
+			if err := json.Unmarshal(settled.Checkpoint, &checkpoint); err != nil || checkpoint.Unsent || checkpoint.RelayOnly {
+				t.Fatalf("direct fallback checkpoint = %s err=%v", settled.Checkpoint, err)
+			}
+			attempts, err := runtime.repos.Replacements.ListTerminationAttempts(t.Context(), []int64{replacement.ID})
+			if err != nil || len(attempts) != 1 || attempts[0].UnsentAt != nil || terminator.calls.Load() != 1 {
+				t.Fatalf("possibly broadcast attempt was released: attempts=%#v requests=%d err=%v", attempts, terminator.calls.Load(), err)
+			}
+		})
+	}
+}
+
+// A request the provider reports after the admission was released means it
+// was sent after all: the hash is recorded and the attempt is only observed.
+func TestRetirementKeepsARelayHashReportedAfterRelease(t *testing.T) {
+	terminator := &relayRetirementTerminator{late: "0xlate"}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator, epochs: testEpochReader{epoch: 90}, retireOnly: true})
+	replacement, row := seedAbandonedTargetRetirement(t, runtime, storedObjectSequence.Add(1))
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, row.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && strings.Contains(string(task.Checkpoint), terminator.late)
+	})
+	attempts, err := runtime.repos.Replacements.ListTerminationAttempts(t.Context(), []int64{replacement.ID})
+	if err != nil || len(attempts) != 1 || attempts[0].UnsentAt != nil || attempts[0].TxHash == nil || *attempts[0].TxHash != terminator.late ||
+		terminator.calls.Load() != 1 || terminator.observations.Load() < 3 {
+		t.Fatalf("late relay hash: attempts=%#v requests=%d observations=%d err=%v", attempts, terminator.calls.Load(), terminator.observations.Load(), err)
+	}
 }
 
 func expireRetirementObservation(t *testing.T, runtime handlerTestRuntime, row *model.Task) *model.Task {
@@ -285,12 +379,130 @@ func TestRetirementManualRetryFindsServiceEndedWithoutChangingFailedReceipt(t *t
 	}
 }
 
+// unresolvedRelayTerminator leaves its relayed request without an outcome:
+// the provider cannot be reached, or it reports relayHash once that is set.
+// A direct transaction ends the service on its first observation.
+type unresolvedRelayTerminator struct {
+	testServiceTerminator
+	relayHash                atomic.Value
+	directCalls              atomic.Int64
+	providerReadsAfterDirect atomic.Int64
+}
+
+func (u *unresolvedRelayTerminator) TerminateService(context.Context, sdktypes.BigInt, synapse.TerminationHooks) (*synapse.TerminationResult, error) {
+	u.calls.Add(1)
+	return &synapse.TerminationResult{}, fmt.Errorf("%w: %w", synapse.ErrTerminationTransactionNotSent, errors.New("provider sent no transaction in time"))
+}
+
+func (u *unresolvedRelayTerminator) ObserveTermination(context.Context, sdktypes.BigInt, synapse.TerminationResult) (*synapse.TerminationResult, bool, error) {
+	if u.directCalls.Load() > 0 {
+		u.providerReadsAfterDirect.Add(1)
+	}
+	if u.calls.Load() == 0 {
+		return nil, false, nil
+	}
+	if hash, _ := u.relayHash.Load().(string); hash != "" {
+		return &synapse.TerminationResult{TxHash: hash}, true, nil
+	}
+	return nil, false, fmt.Errorf("%w: connection refused", synapse.ErrTerminationObservationUnavailable)
+}
+
+func (u *unresolvedRelayTerminator) TerminateServiceDirect(_ context.Context, _ sdktypes.BigInt, hooks synapse.TerminationHooks) (*synapse.TerminationResult, error) {
+	u.directCalls.Add(1)
+	return &synapse.TerminationResult{TxHash: "0xdirect"}, hooks.OnSubmitted("0xdirect")
+}
+
+func (u *unresolvedRelayTerminator) ObserveTerminationDirect(_ context.Context, _ sdktypes.BigInt, known synapse.TerminationResult) (*synapse.TerminationResult, bool, error) {
+	if known.TxHash != "0xdirect" {
+		return nil, false, errors.New("direct observation did not use the direct transaction")
+	}
+	return &synapse.TerminationResult{TxHash: "0xdirect", ConfirmedTxHash: "0xdirect", ReceiptStatus: new(uint64(1)), EndEpoch: new(int64(84))}, false, nil
+}
+
+// A relayed request that never resolves stops the task once its retries run
+// out. Retry then lets the payer wallet complete the same attempt unless the
+// provider has since reported the relay's transaction.
+func TestRetirementManualRetryCompletesAnUnresolvedRelayDirectly(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		relayedLater bool
+	}{
+		{name: "provider stays unreachable"},
+		{name: "relay reported before the direct send", relayedLater: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			terminator := &unresolvedRelayTerminator{}
+			maxAttempts := 2
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator, epochs: testEpochReader{epoch: 90}, retireOnly: true, maxAttempts: &maxAttempts})
+			replacement, row := seedSourceRetirement(t, runtime, storedObjectSequence.Add(1))
+			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+			wakeTask(t, runtime, row.ID)
+			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+			var state model.TaskRuntime
+			if err := json.Unmarshal(row.Runtime, &state); err != nil || state.Observation == nil {
+				t.Fatalf("observation window missing: %s err=%v", row.Runtime, err)
+			}
+			state.Observation.StartedAt = time.Now().Add(-time.Hour)
+			raw, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ?, available_at = ? WHERE id = ?`, json.RawMessage(raw), time.Now().Add(-time.Second), row.ID).Exec(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			failed := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || failed.LastError == nil ||
+				!strings.Contains(*failed.LastError, "data set termination is still unconfirmed") ||
+				!strings.Contains(*failed.LastError, "Retry may submit a paid termination from your wallet") ||
+				!strings.Contains(*failed.LastError, "the provider may still terminate the data set") || terminator.calls.Load() != 1 || terminator.directCalls.Load() != 0 {
+				t.Fatalf("unresolved relay stopped as %#v after relays=%d direct=%d", failed, terminator.calls.Load(), terminator.directCalls.Load())
+			}
+			if tc.relayedLater {
+				terminator.relayHash.Store("0xrelayed")
+			}
+			next, err := runtime.service.Retry(t.Context(), failed.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+			if tc.relayedLater {
+				attempts, err := runtime.repos.Replacements.ListTerminationAttempts(t.Context(), []int64{replacement.ID})
+				if err != nil || len(attempts) != 1 || attempts[0].TxHash == nil || *attempts[0].TxHash != "0xrelayed" || next.ResumeMode != model.TaskResumeModeRecover || terminator.directCalls.Load() != 0 {
+					t.Fatalf("reported relay was raced: task=%#v attempts=%#v direct=%d err=%v", next, attempts, terminator.directCalls.Load(), err)
+				}
+				return
+			}
+			if next.ResumeMode != model.TaskResumeModeExecute || terminator.directCalls.Load() != 0 {
+				t.Fatalf("authorized Retry bypassed its read-only check: task=%#v direct=%d", next, terminator.directCalls.Load())
+			}
+			wakeTask(t, runtime, next.ID)
+			next = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+			wakeTask(t, runtime, next.ID)
+			next = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+			wakeTask(t, runtime, next.ID)
+			runOneStorageTask(t, runtime, next, model.TaskStatusCompleted)
+			if terminator.calls.Load() != 1 || terminator.directCalls.Load() != 1 || terminator.providerReadsAfterDirect.Load() != 0 {
+				t.Fatalf("relays=%d direct=%d provider reads after direct=%d, want one of each send and none", terminator.calls.Load(), terminator.directCalls.Load(), terminator.providerReadsAfterDirect.Load())
+			}
+			attempts, err := runtime.repos.Replacements.ListTerminationAttempts(t.Context(), []int64{replacement.ID})
+			if err != nil || len(attempts) != 1 || attempts[0].AttemptNo != 1 || attempts[0].TaskID == nil || *attempts[0].TaskID != next.ID ||
+				attempts[0].TxHash == nil || *attempts[0].TxHash != "0xdirect" || attempts[0].ReceiptStatus == nil || *attempts[0].ReceiptStatus != 1 {
+				t.Fatalf("completed attempt = %#v err=%v", attempts, err)
+			}
+			stored, err := runtime.repos.Replacements.GetByID(t.Context(), replacement.ID)
+			if err != nil || stored.TerminationEpoch == nil || *stored.TerminationEpoch != 84 {
+				t.Fatalf("retirement = %#v err=%v", stored, err)
+			}
+		})
+	}
+}
+
 func TestRetirementRecoversLegacyUnknownSubmissionWithoutSending(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		diagnostic error
 	}{
-		{name: "provider request not found"},
+		{name: "provider request not found", diagnostic: synapse.ErrTerminationRequestAbsent},
 		{name: "provider unavailable", diagnostic: synapse.ErrTerminationObservationUnavailable},
 		{name: "RPC unavailable", diagnostic: retirementRPCDiagnosticError{}},
 	} {
@@ -353,7 +565,7 @@ func TestRetirementObservationPreservesSafeTerminationAndProtocolWait(t *testing
 		minimumDelay time.Duration
 	}{
 		{name: "provider observation unavailable", observeErr: errors.Join(synapse.ErrTerminationObservationUnavailable, &synapse.ProviderUnavailableError{Cause: errors.New("provider unavailable")}), wantRequests: 1},
-		{name: "no provider request", wantRequests: 1},
+		{name: "no provider request", observeErr: synapse.ErrTerminationRequestAbsent, wantRequests: 1},
 		{name: "pending provider relay", pending: true},
 		{name: "backpressure", observeErr: &synapse.ProviderUnavailableError{Cause: &pdp.HTTPError{StatusCode: 429, RetryAfter: time.Hour}}, minimumDelay: time.Hour},
 		{name: "unavailable with Retry-After", observeErr: errors.Join(synapse.ErrTerminationObservationUnavailable, &pdp.HTTPError{StatusCode: 503, RetryAfter: time.Hour}), minimumDelay: time.Hour},

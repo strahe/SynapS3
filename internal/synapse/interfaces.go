@@ -101,7 +101,10 @@ type ParkedPieceChecker interface {
 // have both passed.
 type ServiceTerminator interface {
 	PDPVerifierAddress() common.Address
-	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*TerminationResult, error)
+	// TerminateService wraps its error with ErrTerminationNotSent when nothing
+	// left the process, and with ErrTerminationTransactionNotSent when only a
+	// provider relay request may have.
+	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, hooks TerminationHooks) (*TerminationResult, error)
 	// VerifyServicePayer reads the data set's record and fails with
 	// ErrServicePaidByAnother when this wallet does not pay for it; any other
 	// error means the record could not be read. It sends nothing, so a caller can

@@ -2009,7 +2009,9 @@ function ProviderReplacementProgressCard({
                             ? 'Failed'
                             : attempt.receipt_status === 1
                               ? 'Succeeded'
-                              : 'Outcome unknown'}
+                              : attempt.unsent_at
+                                ? 'Not sent'
+                                : 'Outcome unknown'}
                         </StatusBadge>
                         {attempt.attempted_at && <RelativeTime value={attempt.attempted_at} />}
                       </div>

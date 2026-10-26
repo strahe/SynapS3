@@ -63,7 +63,18 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		Identity:       taskengine.IdentityFromInput("wallet_operation", func(input walletoperation.Input) (int64, int64) { return input.OperationID, 0 }),
 		Policy:         taskengine.ExecutionPolicy{MaxAttempts: 10, ObservationWindow: 5 * time.Minute, ObservationInterval: 30 * time.Second, Backoff: taskengine.BackoffPolicy{InitialDelay: 30 * time.Second, Multiplier: 2, MaximumDelay: 5 * time.Minute, Jitter: 0.2}}, AllowRetry: true,
 		CanManualRetry: func(source *model.Task) bool {
-			return source != nil && (source.FailureReason == nil || (*source.FailureReason != "invalid_checkpoint" && *source.FailureReason != "wallet_broadcast_unknown" && *source.FailureReason != "wallet_transaction_reverted"))
+			if source == nil {
+				return false
+			}
+			if source.FailureReason == nil {
+				return true
+			}
+			switch *source.FailureReason {
+			case "invalid_checkpoint", "wallet_broadcast_unknown", "wallet_transaction_reverted", "wallet_permit_expired", "wallet_transaction_displaced":
+				return false
+			default:
+				return true
+			}
 		},
 	}
 
@@ -247,6 +258,18 @@ func (h *Handler) processWalletOperation(ctx context.Context, execution taskengi
 	if errors.Is(replayErr, taskengine.ErrEffectAlreadyAdmitted) {
 		return h.walletObservation(execution, op, submission, nil)
 	}
+	if errors.Is(replayErr, synapse.ErrWalletPermitExpired) {
+		message := fmt.Sprintf("Transaction %s expired before it was included in a block, so no funds moved. Start the operation again.", submission.TxHash)
+		return taskengine.Fail(replayErr, "wallet_permit_expired", func(ctx context.Context, repos *repository.Repositories) error {
+			return repos.WalletOperations.MarkFailed(ctx, op.ID, execution.ID(), message)
+		})
+	}
+	if errors.Is(replayErr, synapse.ErrWalletTransactionDisplaced) {
+		message := fmt.Sprintf("Another transaction from this wallet took the place of transaction %s, so it will not be included. Check the wallet's recent transactions on chain to see whether the operation happened.", submission.TxHash)
+		return taskengine.Fail(replayErr, "wallet_transaction_displaced", func(ctx context.Context, repos *repository.Repositories) error {
+			return repos.WalletOperations.MarkSubmissionUnknown(ctx, op.ID, execution.ID(), message)
+		})
+	}
 	if errors.Is(replayErr, synapse.ErrWalletReplayInvalidEvidence) {
 		return taskengine.Fail(replayErr, "wallet_evidence_conflict", nil)
 	}
@@ -339,7 +362,7 @@ func (h *Handler) broadcastWalletOperation(ctx context.Context, execution tasken
 	persist := func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.WalletOperations.RecordSubmission(ctx, op.ID, execution.ID(), submission.TxHash, submission.SignedTransaction, lastError)
 	}
-	if err := execution.WriteCheckpointWith(ctx, checkpoint, persist); err != nil {
+	if err := execution.RecordEffectEvidence(ctx, checkpoint, persist); err != nil {
 		rawCheckpoint, marshalErr := json.Marshal(checkpoint)
 		if marshalErr != nil {
 			return taskengine.Fail(marshalErr, "invalid_checkpoint", nil)

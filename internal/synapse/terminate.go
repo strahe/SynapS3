@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"time"
 
@@ -18,10 +19,17 @@ import (
 	"github.com/strahe/synapse-go/warmstorage"
 )
 
-const providerTerminationWaitTimeout = 30 * time.Second
+const (
+	providerTerminationWaitTimeout = 30 * time.Second
+	// terminationWaitSlice bounds how long a relayed hash the SDK has seen can
+	// stay unrecorded.
+	terminationWaitSlice    = 3 * time.Second
+	terminationPollInterval = time.Second
+)
 
 type storageServiceTerminator interface {
-	TerminateService(context.Context, sdktypes.BigInt, *storage.TerminateServiceOptions) (*storage.TerminateServiceResult, error)
+	SubmitTerminateService(context.Context, sdktypes.BigInt, *storage.TerminateServiceOptions) (*storage.TerminateServiceSubmission, error)
+	WaitForTerminateService(context.Context, storage.TerminateServiceSubmission, *storage.TerminateServiceWaitOptions) (*storage.TerminateServiceResult, error)
 }
 
 // dataSetStateReader reads a data set's FWSS service state from the chain.
@@ -42,7 +50,25 @@ func (s *StorageServiceAdapter) ConfigureTerminationChain(chain terminationTrans
 var (
 	ErrTerminationEvidenceConflict  = errors.New("termination evidence conflicts with the saved transaction")
 	ErrTerminationTransactionFailed = errors.New("termination transaction failed on chain")
+	// ErrTerminationNotSent means no termination request or transaction left
+	// the process during the failed call.
+	ErrTerminationNotSent = errors.New("this termination request was not sent")
+	// ErrTerminationTransactionNotSent means the payer wallet broadcast no
+	// termination transaction, although a provider relay request may have left.
+	ErrTerminationTransactionNotSent = errors.New("the payer wallet sent no termination transaction; the provider may still terminate the data set")
+	// ErrTerminationRequestAbsent means the provider holds no client termination
+	// request for a data set whose service the chain shows still running.
+	ErrTerminationRequestAbsent = errors.New("provider has no termination request")
 )
+
+// TerminationHooks lets the caller persist termination progress synchronously.
+type TerminationHooks struct {
+	// OnSubmitted receives a transaction hash as soon as one is known.
+	OnSubmitted func(hash string) error
+	// BeforeDirect runs before the payer wallet may broadcast a transaction. An
+	// error prevents the direct submission.
+	BeforeDirect func() error
+}
 
 // TerminationBlockedError means the service cannot be terminated until an
 // operator resolves something the gateway must not decide on its own, such as
@@ -89,45 +115,55 @@ var ErrServicePaidByAnother = errors.New("data set is paid for by another wallet
 var ErrTerminationObservationUnavailable = errors.New("provider termination status unavailable")
 
 // TerminateService is a destructive boundary used only after the retirement safety gate passes.
-// It reads the payer-checked chain record before sending and records a known submission
-// through onSubmitted before waiting. Direct fallback requires no submission evidence.
-func (s *StorageServiceAdapter) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*TerminationResult, error) {
-	return s.terminateService(ctx, dataSetID, onSubmitted, false)
+// It reads the payer-checked chain record before sending and records each transaction hash
+// through hooks as soon as it is known. Direct fallback requires proof that the relay
+// holds no request from this call.
+func (s *StorageServiceAdapter) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt, hooks TerminationHooks) (*TerminationResult, error) {
+	return s.terminateService(ctx, dataSetID, hooks, false)
 }
 
-// TerminateServiceDirect submits a fresh transaction after the caller has verified
-// that the preceding attempt reverted and explicitly authorized another paid attempt.
-func (s *StorageServiceAdapter) TerminateServiceDirect(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error) (*TerminationResult, error) {
-	return s.terminateService(ctx, dataSetID, onSubmitted, true)
+// TerminateServiceDirect submits a fresh transaction after an operator authorized
+// another paid attempt, after a reverted one or to complete one whose relayed
+// request stayed unresolved.
+func (s *StorageServiceAdapter) TerminateServiceDirect(ctx context.Context, dataSetID sdktypes.BigInt, hooks TerminationHooks) (*TerminationResult, error) {
+	return s.terminateService(ctx, dataSetID, hooks, true)
 }
 
-func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID sdktypes.BigInt, onSubmitted func(string) error, skipProvider bool) (*TerminationResult, error) {
+func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID sdktypes.BigInt, hooks TerminationHooks, skipProvider bool) (*TerminationResult, error) {
 	if s == nil || s.terminator == nil || s.dataSets == nil {
-		return nil, errors.New("data set terminator is not configured")
+		return nil, fmt.Errorf("%w: data set terminator is not configured", ErrTerminationNotSent)
 	}
 	if ended, err := s.recordedTermination(ctx, dataSetID); err != nil || ended != nil {
-		return ended, err
+		return ended, unsentTermination(err, ErrTerminationNotSent)
 	}
 	requestCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var evidence TerminationResult
 	var callbackErr error
-	callback := func(hash common.Hash) {
-		if hash == (common.Hash{}) {
+	callback := func(sub storage.TerminateServiceSubmission) {
+		hash := submissionHash(sub.TransactionID)
+		if hash == "" || hash == evidence.TxHash {
 			return
 		}
-		if evidence.TxHash != "" && evidence.TxHash != hash.Hex() {
+		if evidence.TxHash != "" {
 			callbackErr = ErrTerminationEvidenceConflict
 			cancel()
 			return
 		}
-		evidence.TxHash = hash.Hex()
-		if onSubmitted != nil {
-			callbackErr = onSubmitted(evidence.TxHash)
+		evidence.TxHash = hash
+		if hooks.OnSubmitted != nil {
+			callbackErr = hooks.OnSubmitted(evidence.TxHash)
 			if callbackErr != nil {
 				cancel()
 			}
 		}
+	}
+	hasEvidence := func() bool { return evidence.TxHash != "" || evidence.ConfirmedTxHash != "" }
+	beforeDirect := func() error {
+		if hooks.BeforeDirect == nil {
+			return nil
+		}
+		return hooks.BeforeDirect()
 	}
 	merge := func(res *storage.TerminateServiceResult, confirmed bool) {
 		if res == nil {
@@ -153,42 +189,173 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 			}
 		}
 	}
-	res, err := s.terminator.TerminateService(requestCtx, dataSetID, &storage.TerminateServiceOptions{ProviderWaitTimeout: providerTerminationWaitTimeout, OnSubmitted: callback, SkipProvider: skipProvider})
+	// retained passes on a transaction hash that only the SDK's error carries.
+	retained := func(err error) {
+		if failure, ok := errors.AsType[*storage.TerminateServiceError](err); ok && failure.Submission != nil {
+			callback(*failure.Submission)
+		}
+	}
+	// send submits once and waits for the outcome. The SDK reports a relayed
+	// hash only in a wait's result or error, so the relay wait runs in slices
+	// and each hash is recorded before the next slice starts.
+	send := func(direct bool) (*storage.TerminateServiceResult, error) {
+		opts := &storage.TerminateServiceOptions{SkipProvider: direct, OnSubmitted: callback}
+		deadline := time.Now().Add(providerTerminationWaitTimeout)
+		if !direct {
+			opts.ProviderWaitTimeout = providerTerminationWaitTimeout
+		}
+		sub, err := s.terminator.SubmitTerminateService(requestCtx, dataSetID, opts)
+		retained(err)
+		if sub != nil {
+			callback(*sub)
+		}
+		if callbackErr != nil {
+			return nil, err
+		}
+		submitErr := err
+		if err != nil {
+			// A relayed request with an unknown outcome is resumed, not resent:
+			// only its status can show that the provider holds no request.
+			failure, ok := errors.AsType[*storage.TerminateServiceError](err)
+			if direct || !ok || failure.Stage != storage.TerminateServiceStageSubmit || failure.Submission == nil || relayNeverConnected(err) {
+				return nil, err
+			}
+			sub = failure.Submission
+		}
+		if sub == nil {
+			return nil, errors.New("data set termination returned no submission")
+		}
+		handle := *sub
+		waitOpts := &storage.TerminateServiceWaitOptions{}
+		if !direct {
+			waitOpts.PollInterval = terminationPollInterval
+		}
+		for {
+			waitCtx, cancelWait := requestCtx, context.CancelFunc(func() {})
+			final := true
+			if !direct {
+				end := deadline
+				if slice := time.Now().Add(s.terminationWaitSlice()); evidence.TxHash == "" && slice.Before(end) {
+					end, final = slice, false
+				}
+				waitCtx, cancelWait = context.WithDeadline(requestCtx, end)
+			}
+			res, err := s.terminator.WaitForTerminateService(waitCtx, handle, waitOpts)
+			sliceEnded := waitCtx.Err() != nil && requestCtx.Err() == nil
+			cancelWait()
+			retained(err)
+			if res != nil && res.TxHash != nil {
+				callback(storage.TerminateServiceSubmission{TransactionID: res.TxHash.Hex()})
+			}
+			if final || err == nil || !sliceEnded || callbackErr != nil {
+				if err != nil && submitErr != nil {
+					err = errors.Join(err, submitErr)
+				}
+				return res, err
+			}
+			if failure, ok := errors.AsType[*storage.TerminateServiceError](err); ok && failure.Submission != nil {
+				handle = *failure.Submission
+			}
+		}
+	}
+	if skipProvider {
+		if err := beforeDirect(); err != nil {
+			return &evidence, unsentTermination(err, ErrTerminationNotSent)
+		}
+	}
+	res, err := send(skipProvider)
 	merge(res, err == nil)
+	merge(failedSubmission(err), false)
 	if callbackErr != nil {
 		return &evidence, errors.Join(callbackErr, normalizeTerminationError(ctx, err))
 	}
 	if err != nil {
 		providerErr := normalizeTerminationError(ctx, err)
-		if skipProvider || evidence.TxHash != "" || evidence.ConfirmedTxHash != "" || IsTerminationBlocked(providerErr) || terminationPending(err) || ctx.Err() != nil {
-			return &evidence, providerErr
+		// What the failed first call proves about the attempt as a whole.
+		neverSent := terminationPrepared(err) || relayNeverConnected(err)
+		var unsent error
+		switch {
+		case hasEvidence():
+		case neverSent:
+			unsent = ErrTerminationNotSent
+		case !skipProvider:
+			unsent = ErrTerminationTransactionNotSent
+		}
+		if skipProvider || hasEvidence() || IsTerminationBlocked(providerErr) || terminationPending(err) || ctx.Err() != nil {
+			return &evidence, unsentTermination(providerErr, unsent)
 		}
 		ended, readErr := s.recordedTermination(ctx, dataSetID)
 		if readErr != nil {
-			return &evidence, fmt.Errorf("provider termination failed and service state is unknown: %w", errors.Join(providerErr, readErr))
+			return &evidence, unsentTermination(fmt.Errorf("provider termination failed and service state is unknown: %w", errors.Join(providerErr, readErr)), unsent)
 		}
 		if ended != nil {
 			return ended, nil
 		}
-		res, err = s.terminator.TerminateService(requestCtx, dataSetID, &storage.TerminateServiceOptions{SkipProvider: true, OnSubmitted: callback})
+		// The payer wallet transacts only when the relay cannot also land; any
+		// other relay outcome is observed rather than raced.
+		if !neverSent && !relayRequestAbsent(err) {
+			return &evidence, unsentTermination(providerErr, unsent)
+		}
+		if err := beforeDirect(); err != nil {
+			return &evidence, unsentTermination(errors.Join(err, providerErr), unsent)
+		}
+		res, err = send(true)
 		merge(res, err == nil)
+		merge(failedSubmission(err), false)
 		if callbackErr != nil {
 			return &evidence, errors.Join(callbackErr, normalizeTerminationError(ctx, err))
 		}
 		if err != nil {
 			directErr := NormalizeProviderOperationError(ctx, err)
-			if evidence.TxHash == "" && evidence.ConfirmedTxHash == "" {
+			if !hasEvidence() {
 				if ended, readErr := s.recordedTermination(ctx, dataSetID); readErr == nil && ended != nil {
 					return ended, nil
 				}
 			}
-			return &evidence, fmt.Errorf("direct termination failed after provider relay error: %w", errors.Join(providerErr, directErr))
+			failure := fmt.Errorf("direct termination failed after provider relay error: %w", errors.Join(providerErr, directErr))
+			if hasEvidence() || !terminationPrepared(err) {
+				return &evidence, failure
+			}
+			return &evidence, unsentTermination(failure, unsent)
 		}
 	}
 	if res == nil {
 		return &evidence, errors.New("data set termination returned no result")
 	}
 	return &evidence, nil
+}
+
+func (s *StorageServiceAdapter) terminationWaitSlice() time.Duration {
+	if s.relayWaitSlice > 0 {
+		return s.relayWaitSlice
+	}
+	return terminationWaitSlice
+}
+
+// failedSubmission returns the transaction hashes a failed SDK termination
+// retained. A relayed transaction hash is reported only here or in the result.
+func failedSubmission(err error) *storage.TerminateServiceResult {
+	failure, ok := errors.AsType[*storage.TerminateServiceError](err)
+	if !ok || failure.Submission == nil {
+		return nil
+	}
+	out := &storage.TerminateServiceResult{}
+	if hash := submissionHash(failure.Submission.TransactionID); hash != "" {
+		value := common.HexToHash(hash)
+		out.TxHash = &value
+	}
+	if hash := submissionHash(failure.Submission.ConfirmedTransactionID); hash != "" {
+		value := common.HexToHash(hash)
+		out.ConfirmedTxHash = &value
+	}
+	return out
+}
+
+func submissionHash(id string) string {
+	if id == "" || common.HexToHash(id) == (common.Hash{}) {
+		return ""
+	}
+	return common.HexToHash(id).Hex()
 }
 
 // VerifyServicePayer checks ownership without sending a transaction.
@@ -223,6 +390,39 @@ func (s *StorageServiceAdapter) recordedTermination(ctx context.Context, dataSet
 	return &TerminationResult{EndEpoch: &epoch}, nil
 }
 
+// terminationPrepared reports whether the SDK failed before sending a
+// termination authorization or transaction.
+func terminationPrepared(err error) bool {
+	failure, ok := errors.AsType[*storage.TerminateServiceError](err)
+	return ok && failure.Stage == storage.TerminateServiceStagePrepare
+}
+
+// relayNeverConnected reports whether a relayed submission failed before a
+// connection to the provider was established, so its request never left.
+func relayNeverConnected(err error) bool {
+	failure, ok := errors.AsType[*storage.TerminateServiceError](err)
+	if !ok || failure.Stage != storage.TerminateServiceStageSubmit || failure.Submission == nil || failure.Submission.Direct {
+		return false
+	}
+	dial, ok := errors.AsType[*net.OpError](failure.Cause)
+	return ok && dial.Op == "dial"
+}
+
+// relayRequestAbsent reports whether the provider showed that it holds no
+// request for the data set, so no relayed transaction can follow.
+func relayRequestAbsent(err error) bool {
+	_, ok := errors.AsType[*pdp.WaitForTerminateServiceNotFoundError](err)
+	return ok && !terminationPending(err)
+}
+
+// unsentTermination marks err with what it proves was not sent, if anything.
+func unsentTermination(err, unsent error) error {
+	if err == nil || unsent == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", unsent, err)
+}
+
 func terminationPending(err error) bool {
 	var pending *pdp.TerminateServicePendingError
 	return errors.As(err, &pending)
@@ -249,7 +449,8 @@ func (s *StorageServiceAdapter) ObserveTermination(ctx context.Context, dataSetI
 }
 
 // ObserveTerminationDirect checks the admitted transaction without consulting a
-// provider request that can still describe a preceding failed attempt.
+// provider request that can still describe a preceding failed attempt or an
+// unresolved relay.
 func (s *StorageServiceAdapter) ObserveTerminationDirect(ctx context.Context, dataSetID sdktypes.BigInt, known TerminationResult) (*TerminationResult, bool, error) {
 	return s.observeTermination(ctx, dataSetID, known, true)
 }
@@ -267,7 +468,7 @@ func (s *StorageServiceAdapter) observeTermination(ctx context.Context, dataSetI
 	}
 	if known.TxHash == "" && known.ConfirmedTxHash == "" {
 		if httpErr, ok := errors.AsType[*pdp.HTTPError](providerErr); ok && httpErr.StatusCode == http.StatusNotFound {
-			return nil, false, nil
+			return nil, false, fmt.Errorf("%w: %w", ErrTerminationRequestAbsent, providerErr)
 		}
 		return observed, pending, providerErr
 	}
