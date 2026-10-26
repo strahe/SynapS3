@@ -69,7 +69,24 @@ func (r *BunStorageContentRepo) TransferCommitTaskOwner(ctx context.Context, id 
 		if err := json.Unmarshal(task.Input, &input); err != nil || input.RequestID != id {
 			return ErrConflict
 		}
-		result, err := db.NewUpdate().Model((*storagecommit.Request)(nil)).Set("task_id = ?", newID).Set("updated_at = ?", time.Now()).Where("request_id = ? AND task_id = ?", id, oldID).Exec(ctx)
+		request, err := lockCommitRequest(ctx, db, id, "")
+		if err != nil {
+			return err
+		}
+		if request.TaskID == nil || *request.TaskID != oldID {
+			return ErrConflict
+		}
+		//exhaustive:enforce
+		switch request.Status {
+		case storagecommit.RequestStatusCollecting, storagecommit.RequestStatusReady, storagecommit.RequestStatusSubmitted:
+		case storagecommit.RequestStatusConfirmed, storagecommit.RequestStatusAbandoned:
+			return ErrConflict
+		default:
+			return ErrConflict
+		}
+		result, err := db.NewUpdate().Model((*storagecommit.Request)(nil)).
+			Set("task_id = ?", newID).Set("updated_at = ?", time.Now()).
+			Where("request_id = ? AND task_id = ? AND status = ?", id, oldID, request.Status).Exec(ctx)
 		return requireTaskFenceRows(result, err, "transferring registration task")
 	})
 }

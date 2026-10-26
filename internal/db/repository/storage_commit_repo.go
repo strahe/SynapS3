@@ -759,6 +759,7 @@ func abandonCommitRequest(ctx context.Context, db bun.IDB, input AbandonCommitRe
 		Set("attention_at = NULL").
 		Set("updated_at = ?", now).
 		Where("request_id = ? AND status = ?", input.RequestID, request.Status).
+		Where("task_id IS NOT DISTINCT FROM ?", request.TaskID).
 		Exec(ctx)
 	if err := requireCommitRows(res, err, "abandoning storage commit request"); err != nil {
 		return nil, err
@@ -1059,7 +1060,7 @@ func releaseCollectingCommitMembership(ctx context.Context, db bun.IDB, copyID i
 	if err != nil || remaining > 0 {
 		return err
 	}
-	if _, err := db.NewUpdate().
+	res, err = db.NewUpdate().
 		Model((*storagecommit.Request)(nil)).
 		Set("status = ?", storagecommit.RequestStatusAbandoned).
 		Set("task_id = NULL").
@@ -1067,8 +1068,10 @@ func releaseCollectingCommitMembership(ctx context.Context, db bun.IDB, copyID i
 		Set("seal_requested_at = NULL").
 		Set("updated_at = ?", now).
 		Where("request_id = ? AND status = ?", requestID, storagecommit.RequestStatusCollecting).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("abandoning empty storage commit request: %w", err)
+		Where("task_id IS NOT DISTINCT FROM ?", request.TaskID).
+		Exec(ctx)
+	if err := requireCommitRows(res, err, "abandoning empty storage commit request"); err != nil {
+		return err
 	}
 	if request.TaskID != nil {
 		return wakeCommitTasks(ctx, db, []int64{*request.TaskID})

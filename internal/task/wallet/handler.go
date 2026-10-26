@@ -87,7 +87,7 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		if err != nil {
 			return err
 		}
-		if row == nil || row.TaskID == nil || *row.TaskID != source.ID || row.Status == model.WalletOperationStatusUnknown || row.Status == model.WalletOperationStatusConfirmed {
+		if row == nil {
 			return repository.ErrConflict
 		}
 		var checkpoint walletoperation.Checkpoint
@@ -101,6 +101,18 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 			if err := checkpoint.Match(input.ExecutionIdentity); err != nil {
 				return fmt.Errorf("%w: %w", repository.ErrConflict, err)
 			}
+		}
+		if checkpoint.BroadcastNotSent {
+			amount, validAmount := new(big.Int).SetString(row.Amount, 10)
+			if source.Status != model.TaskStatusFailed || !checkpoint.BroadcastAttempted || checkpoint.TransactionHash != "" ||
+				row.Status != model.WalletOperationStatusFailed || row.TaskID != nil || row.BroadcastAttemptedAt == nil || row.TxHash != nil || len(row.SignedTransaction) != 0 ||
+				!validAmount || !validTaskWalletAmount(row.Type, amount) {
+				return repository.ErrConflict
+			}
+			return nil
+		}
+		if row.TaskID == nil || *row.TaskID != source.ID || row.Status == model.WalletOperationStatusUnknown || row.Status == model.WalletOperationStatusConfirmed {
+			return repository.ErrConflict
 		}
 		submission, err := walletSubmission(row, checkpoint)
 		if err != nil {
@@ -122,7 +134,32 @@ func (h *Handler) newHandler() *taskengine.FuncHandler {
 		if err := json.Unmarshal(old.Input, &input); err != nil {
 			return err
 		}
+		var checkpoint walletoperation.Checkpoint
+		if len(old.Checkpoint) != 0 {
+			if err := json.Unmarshal(old.Checkpoint, &checkpoint); err != nil {
+				return repository.ErrConflict
+			}
+		}
+		if checkpoint.BroadcastNotSent {
+			return repos.WalletOperations.ReopenUnsentForRetry(ctx, input.OperationID, old.ID, next.ID)
+		}
 		return repos.WalletOperations.TransferTaskOwner(ctx, input.OperationID, old.ID, next.ID)
+	}
+	definition.PrepareRetry = func(_ context.Context, _ *repository.Repositories, source *model.Task) (taskengine.RetryPreparation, error) {
+		preparation := taskengine.RetryPreparation{
+			Request:    taskengine.EnqueueRequest{Type: source.Type, Input: source.Input},
+			Checkpoint: source.Checkpoint, ResumeMode: model.TaskResumeModeRecover, Bind: definition.BindSuccessor,
+		}
+		var checkpoint walletoperation.Checkpoint
+		if len(source.Checkpoint) != 0 {
+			if err := json.Unmarshal(source.Checkpoint, &checkpoint); err != nil {
+				return taskengine.RetryPreparation{}, repository.ErrConflict
+			}
+		}
+		if checkpoint.BroadcastNotSent {
+			preparation.Checkpoint = nil
+		}
+		return preparation, nil
 	}
 	return taskengine.NewFuncHandler(definition, func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		return h.executeWalletOperation(ctx, execution)
@@ -341,6 +378,23 @@ func (h *Handler) broadcastWalletOperation(ctx context.Context, execution tasken
 			broadcastErr = fmt.Errorf("wallet transaction %s: %w", submission.TxHash, broadcastErr)
 		}
 		return taskengine.Fail(broadcastErr, "wallet_evidence_conflict", nil)
+	}
+	if submission.NotSent {
+		if broadcastErr == nil || submission.TxHash != "" || len(submission.SignedTransaction) != 0 {
+			return taskengine.Fail(errors.Join(errors.New("wallet submission has conflicting send evidence"), broadcastErr), "wallet_evidence_conflict", nil)
+		}
+		checkpoint.BroadcastNotSent = true
+		rawCheckpoint, err := json.Marshal(checkpoint)
+		if err != nil {
+			return taskengine.Fail(err, "invalid_checkpoint", nil)
+		}
+		message := fmt.Sprintf("Wallet operation was not sent: %v", broadcastErr)
+		return taskengine.Fail(broadcastErr, "wallet_broadcast_not_sent", func(ctx context.Context, repos *repository.Repositories) error {
+			if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), rawCheckpoint); err != nil {
+				return err
+			}
+			return repos.WalletOperations.MarkFailed(ctx, op.ID, execution.ID(), message)
+		})
 	}
 	if submission.TxHash == "" && len(submission.SignedTransaction) == 0 {
 		if broadcastErr == nil {

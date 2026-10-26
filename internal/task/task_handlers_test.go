@@ -3406,6 +3406,92 @@ func TestWalletRecoveryObservesTransactionWithoutRebroadcast(t *testing.T) {
 	}
 }
 
+func TestWalletUnsentFailureCanRetryWithoutReplacingOperation(t *testing.T) {
+	var calls, broadcasts atomic.Int64
+	transactionHash := common.HexToHash("0x1234").Hex()
+	preflightErr := errors.New("insufficient balance")
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		wallet: testWalletOperator{fund: func(context.Context, *big.Int) (synapse.WalletSubmission, error) {
+			if calls.Add(1) == 1 {
+				return synapse.WalletSubmission{NotSent: true}, preflightErr
+			}
+			broadcasts.Add(1)
+			return synapse.WalletSubmission{TxHash: transactionHash}, nil
+		}},
+		receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
+			return &ethtypes.Receipt{TxHash: hash, Status: ethtypes.ReceiptStatusSuccessful}, nil
+		}},
+	})
+	operation, source := seedWalletTask(t, runtime, "wallet-unsent-retry")
+	source = runOneStorageTask(t, runtime, source, model.TaskStatusFailed)
+	if source.FailureReason == nil || *source.FailureReason != "wallet_broadcast_not_sent" || !handlerTaskRetryable(t, runtime, source) {
+		t.Fatalf("unsent failure = %#v", source)
+	}
+	proof := bytes.Clone(source.Checkpoint)
+	var checkpoint walletoperation.Checkpoint
+	if err := json.Unmarshal(proof, &checkpoint); err != nil || !checkpoint.BroadcastAttempted || !checkpoint.BroadcastNotSent || checkpoint.TransactionHash != "" {
+		t.Fatalf("unsent checkpoint = %#v, error=%v", checkpoint, err)
+	}
+	failed, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || failed.Status != model.WalletOperationStatusFailed || failed.TaskID != nil || failed.BroadcastAttemptedAt == nil || failed.CompletedAt == nil || failed.LastError == nil || !strings.Contains(*failed.LastError, preflightErr.Error()) {
+		t.Fatalf("failed operation = %#v, error=%v", failed, err)
+	}
+	type retryResult struct {
+		task *model.Task
+		err  error
+	}
+	results := make(chan retryResult, 2)
+	var retries sync.WaitGroup
+	for range 2 {
+		retries.Go(func() {
+			row, err := runtime.service.Retry(t.Context(), source.ID)
+			results <- retryResult{task: row, err: err}
+		})
+	}
+	retries.Wait()
+	close(results)
+	var next *model.Task
+	for result := range results {
+		if result.err != nil || result.task == nil {
+			t.Fatalf("retry = %#v, error=%v", result.task, result.err)
+		}
+		if next != nil && next.ID != result.task.ID {
+			t.Fatalf("concurrent retries created different successors: %d/%d", next.ID, result.task.ID)
+		}
+		next = result.task
+	}
+	if len(next.Checkpoint) != 0 || next.ResumeMode != model.TaskResumeModeRecover || next.RetryOfTaskID == nil || *next.RetryOfTaskID != source.ID {
+		t.Fatalf("retry successor = %#v", next)
+	}
+	reopened, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || reopened.Status != model.WalletOperationStatusPending || reopened.TaskID == nil || *reopened.TaskID != next.ID || reopened.BroadcastAttemptedAt != nil || reopened.CompletedAt != nil || reopened.LastError != nil || reopened.StartedAt == nil || !reopened.StartedAt.Equal(*failed.StartedAt) || reopened.ClientRequestID != operation.ClientRequestID {
+		t.Fatalf("reopened operation = %#v, error=%v", reopened, err)
+	}
+	next = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+	if next.ResumeMode != model.TaskResumeModeExecute || calls.Load() != 1 || broadcasts.Load() != 0 {
+		t.Fatalf("recovery called wallet: task=%#v calls=%d broadcasts=%d", next, calls.Load(), broadcasts.Load())
+	}
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), next.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	next = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
+	if calls.Load() != 2 || broadcasts.Load() != 1 {
+		t.Fatalf("retry wallet calls=%d broadcasts=%d", calls.Load(), broadcasts.Load())
+	}
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), next.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	runOneStorageTask(t, runtime, next, model.TaskStatusCompleted)
+	confirmed, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || confirmed.Status != model.WalletOperationStatusConfirmed || confirmed.TaskID != nil || confirmed.TxHash == nil || *confirmed.TxHash != transactionHash {
+		t.Fatalf("confirmed operation = %#v, error=%v", confirmed, err)
+	}
+	preserved, err := runtime.repos.Tasks.GetByID(t.Context(), source.ID)
+	if err != nil || preserved.SupersededAt == nil || !bytes.Equal(preserved.Checkpoint, proof) || preserved.LastError == nil || !strings.Contains(*preserved.LastError, preflightErr.Error()) {
+		t.Fatalf("source proof = %#v, error=%v", preserved, err)
+	}
+}
+
 func TestWalletBroadcastHasIndependentDeadline(t *testing.T) {
 	var broadcasts atomic.Int64
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
@@ -3609,7 +3695,7 @@ func TestWalletRecoveryRequiresConsistentTransactionEvidence(t *testing.T) {
 
 func TestWalletRetryRejectsUnverifiableTransactionEvidence(t *testing.T) {
 	transactionHash := common.HexToHash("0x1234").Hex()
-	for _, scenario := range []string{"missing hash", "conflicting identity", "conflicting hash", "invalid signed transaction", "invalid checkpoint"} {
+	for _, scenario := range []string{"missing hash", "conflicting identity", "conflicting hash", "invalid signed transaction", "invalid checkpoint", "unsent proof missing", "unsent operation unknown", "unsent transaction present", "unsent identity changed"} {
 		t.Run(scenario, func(t *testing.T) {
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{wallet: testWalletOperator{}})
 			operation, row := seedWalletTask(t, runtime, scenario)
@@ -3617,7 +3703,8 @@ func TestWalletRetryRejectsUnverifiableTransactionEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkpoint := walletoperation.Checkpoint{ExecutionIdentity: testutil.DefaultWalletExecutionIdentity(), BroadcastAttempted: true}
-			if scenario != "missing hash" {
+			unsent := strings.HasPrefix(scenario, "unsent ")
+			if scenario != "missing hash" && (!unsent || scenario == "unsent transaction present") {
 				checkpoint.TransactionHash = transactionHash
 				var raw []byte
 				if scenario == "invalid signed transaction" {
@@ -3628,12 +3715,24 @@ func TestWalletRetryRejectsUnverifiableTransactionEvidence(t *testing.T) {
 				}
 			}
 			switch scenario {
-			case "conflicting identity":
+			case "conflicting identity", "unsent identity changed":
 				identity := *checkpoint.Identity
 				identity.Payer = common.HexToAddress("0x9999")
 				checkpoint.Identity = &identity
 			case "conflicting hash":
 				checkpoint.TransactionHash = common.HexToHash("0x9999").Hex()
+			}
+			if unsent {
+				checkpoint.BroadcastNotSent = scenario != "unsent proof missing"
+				var err error
+				if scenario == "unsent operation unknown" {
+					err = runtime.repos.WalletOperations.MarkUnknown(t.Context(), operation.ID, row.ID, "broadcast outcome is unknown")
+				} else {
+					err = runtime.repos.WalletOperations.MarkFailed(t.Context(), operation.ID, row.ID, "wallet operation failed")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			var err error
 			row.Checkpoint, err = json.Marshal(checkpoint)
@@ -5163,11 +5262,10 @@ func TestRetirementWithUnknownSubmissionDoesNotResend(t *testing.T) {
 	replacement, row := seedAbandonedTargetRetirement(t, runtime, storedObjectSequence.Add(1))
 	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 	row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-	if row.RetryCount != 1 || terminator.calls.Load() != 1 {
+	if row.RetryCount != 0 || terminator.calls.Load() != 1 {
 		t.Fatalf("unknown submission did not retain its observation budget: task=%#v sends=%d", row, terminator.calls.Load())
 	}
-	row = expireRetirementObservation(t, runtime, row)
-	row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+	row = exhaustRetirementObservationWindows(t, runtime, row, budget)
 	if row.FailureReason == nil || *row.FailureReason != "attempts_exhausted" || terminator.calls.Load() != 1 {
 		t.Fatalf("unknown submission was resent after its observation window: task=%#v sends=%d", row, terminator.calls.Load())
 	}

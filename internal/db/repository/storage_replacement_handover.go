@@ -36,6 +36,8 @@ func (r *BunStorageReplacementRepo) HandOverSourceWritesBatch(ctx context.Contex
 	var targets []model.StorageCopy
 	done := false
 	err = runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		targets = nil
+		done = false
 		if _, err := lockBucketByID(ctx, db, row.BucketID); err != nil {
 			return err
 		}
@@ -52,10 +54,14 @@ func (r *BunStorageReplacementRepo) HandOverSourceWritesBatch(ctx context.Contex
 			OrderExpr("storage_copy.content_id ASC, storage_copy.id ASC").Limit(int64(limit)).Scan(ctx, &copies); err != nil {
 			return err
 		}
+		contentIDs := make([]int64, 0, len(copies))
 		for _, copyRow := range copies {
-			if err := lockStorageContentForCopyMutation(ctx, db, copyRow.ContentID); err != nil {
-				return err
-			}
+			contentIDs = append(contentIDs, copyRow.ContentID)
+		}
+		if _, err := lockStorageContentsByID(ctx, db, contentIDs); err != nil {
+			return err
+		}
+		for _, copyRow := range copies {
 			// Sealing and pull reservation sign a write under the same content
 			// lock, so this check sees any signature that won the lock.
 			unsigned, err := unsignedSourceWrites(db, source.ID).Where("storage_copy.id = ?", copyRow.ID).Exists(ctx)
@@ -84,7 +90,10 @@ func (r *BunStorageReplacementRepo) HandOverSourceWritesBatch(ctx context.Contex
 		done = len(copies) < limit
 		return nil
 	})
-	return targets, done, err
+	if err != nil {
+		return nil, false, err
+	}
+	return targets, done, nil
 }
 
 func unsignedSourceWrites(db bun.IDB, sourceDataSetID int64) *bun.SelectQuery {

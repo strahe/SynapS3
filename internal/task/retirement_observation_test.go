@@ -304,7 +304,7 @@ func TestRetirementManualRetryKeepsFailedAttemptAndObservesDirectTransaction(t *
 			}
 			wakeTask(t, runtime, next.ID)
 			next = runOneStorageTask(t, runtime, next, model.TaskStatusPending)
-			if terminator.directObservations.Load() != 1 || terminator.directCalls.Load() != 1 || next.RetryCount != 1 {
+			if terminator.directObservations.Load() != 1 || terminator.directCalls.Load() != 1 || next.RetryCount != 0 {
 				t.Fatalf("second transaction did not remain in direct observation: task=%#v reads=%d sends=%d", next, terminator.directObservations.Load(), terminator.directCalls.Load())
 			}
 			terminator.directSucceeded.Store(true)
@@ -438,19 +438,7 @@ func TestRetirementManualRetryCompletesAnUnresolvedRelayDirectly(t *testing.T) {
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
 			wakeTask(t, runtime, row.ID)
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-			var state model.TaskRuntime
-			if err := json.Unmarshal(row.Runtime, &state); err != nil || state.Observation == nil {
-				t.Fatalf("observation window missing: %s err=%v", row.Runtime, err)
-			}
-			state.Observation.StartedAt = time.Now().Add(-time.Hour)
-			raw, err := json.Marshal(state)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ?, available_at = ? WHERE id = ?`, json.RawMessage(raw), time.Now().Add(-time.Second), row.ID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			failed := runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			failed := exhaustRetirementObservationWindows(t, runtime, row, maxAttempts)
 			if failed.FailureReason == nil || *failed.FailureReason != "attempts_exhausted" || failed.LastError == nil ||
 				!strings.Contains(*failed.LastError, "data set termination is still unconfirmed") ||
 				!strings.Contains(*failed.LastError, "Retry may submit a paid termination from your wallet") ||
@@ -638,7 +626,7 @@ func TestRetirementSubmittedEvidenceSurvivesObservationLossAndManualRetry(t *tes
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{terminator: terminator, epochs: testEpochReader{epoch: 90}, retireOnly: true, maxAttempts: &maxAttempts})
 			replacement, row := seedAbandonedTargetRetirement(t, runtime, storedObjectSequence.Add(1))
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-			if terminator.calls.Load() != 1 || row.RetryCount != 1 {
+			if terminator.calls.Load() != 1 || row.RetryCount != 0 {
 				t.Fatalf("initial submission task=%#v requests=%d", row, terminator.calls.Load())
 			}
 
@@ -657,7 +645,7 @@ func TestRetirementSubmittedEvidenceSurvivesObservationLossAndManualRetry(t *tes
 			}
 			terminator.pending, terminator.observeErr = tc.pending, tc.err
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-			if terminator.calls.Load() != 1 || row.RetryCount != 1 || row.ResumeMode != model.TaskResumeModeRecover || !strings.Contains(string(row.Checkpoint), `"transaction_hash": "0xoriginal"`) {
+			if terminator.calls.Load() != 1 || row.RetryCount != 0 || row.ResumeMode != model.TaskResumeModeRecover || !strings.Contains(string(row.Checkpoint), `"transaction_hash": "0xoriginal"`) {
 				t.Fatalf("saved submission was not restored: task=%#v requests=%d", row, terminator.calls.Load())
 			}
 			if throttled, ok := errors.AsType[*pdp.HTTPError](tc.err); ok {
@@ -669,19 +657,7 @@ func TestRetirementSubmittedEvidenceSurvivesObservationLossAndManualRetry(t *tes
 				}
 			}
 
-			var state model.TaskRuntime
-			if err := json.Unmarshal(row.Runtime, &state); err != nil || state.Observation == nil {
-				t.Fatalf("observation window missing: %s err=%v", row.Runtime, err)
-			}
-			state.Observation.StartedAt = time.Now().Add(-time.Hour)
-			raw, err = json.Marshal(state)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ?, available_at = ? WHERE id = ?`, json.RawMessage(raw), time.Now().Add(-time.Second), row.ID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			row = exhaustRetirementObservationWindows(t, runtime, row, maxAttempts)
 			if row.LastError == nil || !strings.Contains(*row.LastError, "still unconfirmed") || terminator.calls.Load() != 1 {
 				t.Fatalf("unconfirmed transaction did not stop safely: task=%#v requests=%d", row, terminator.calls.Load())
 			}
@@ -787,19 +763,7 @@ func TestSourceRetirementObservationExhaustionRetainsEvidenceAndDiagnostics(t *t
 			terminator.observeErr = errors.Join(tc.diagnostic, retirementRPCDiagnosticError{})
 			wakeTask(t, runtime, row.ID)
 			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
-			var state model.TaskRuntime
-			if err := json.Unmarshal(row.Runtime, &state); err != nil || state.Observation == nil {
-				t.Fatalf("observation window missing: %s err=%v", row.Runtime, err)
-			}
-			state.Observation.StartedAt = time.Now().Add(-time.Hour)
-			raw, err := json.Marshal(state)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := runtime.db.NewRaw(`UPDATE tasks SET runtime_json = ?, available_at = ? WHERE id = ?`, json.RawMessage(raw), time.Now().Add(-time.Second), row.ID).Exec(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			row = runOneStorageTask(t, runtime, row, model.TaskStatusFailed)
+			row = exhaustRetirementObservationWindows(t, runtime, row, maxAttempts)
 			stored, err := runtime.repos.Replacements.GetByID(t.Context(), replacement.ID)
 			if err != nil || stored.Status != storagereplacement.StatusCleanupAttention || stored.TerminationEpoch != nil || stored.TerminationTxHash == nil || *stored.TerminationTxHash != "0xoriginal" || stored.TerminationConfirmedTxHash == nil || *stored.TerminationConfirmedTxHash != "0xconfirmed" || terminator.calls.Load() != 1 {
 				t.Fatalf("source retirement stopped without its evidence: replacement=%#v error=%v requests=%d", stored, err, terminator.calls.Load())
@@ -811,4 +775,21 @@ func TestSourceRetirementObservationExhaustionRetainsEvidenceAndDiagnostics(t *t
 			}
 		})
 	}
+}
+
+func exhaustRetirementObservationWindows(t *testing.T, runtime handlerTestRuntime, row *model.Task, maxAttempts int) *model.Task {
+	t.Helper()
+	for attempt := row.RetryCount; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			wakeTask(t, runtime, row.ID)
+			row = runOneStorageTask(t, runtime, row, model.TaskStatusPending)
+		}
+		row = expireRetirementObservation(t, runtime, row)
+		status := model.TaskStatusPending
+		if attempt == maxAttempts-1 {
+			status = model.TaskStatusFailed
+		}
+		row = runOneStorageTask(t, runtime, row, status)
+	}
+	return row
 }

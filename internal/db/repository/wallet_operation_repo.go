@@ -105,6 +105,55 @@ func (r *BunWalletOperationRepo) BindTask(ctx context.Context, id, taskID int64)
 	})
 }
 
+func (r *BunWalletOperationRepo) ReopenUnsentForRetry(ctx context.Context, id, oldTaskID, newTaskID int64) error {
+	if id < 1 {
+		return ErrInvalidInput
+	}
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		if err := validateTransferredTask(ctx, db, oldTaskID, newTaskID); err != nil {
+			return err
+		}
+		previous, err := (&BunTaskRepo{db: db}).GetByID(ctx, oldTaskID)
+		if err != nil {
+			return err
+		}
+		if previous == nil || previous.Status != model.TaskStatusFailed || previous.Type != model.TaskTypeWalletOperation || previous.SubjectType != "wallet_operation" || previous.SubjectKey != strconv.FormatInt(id, 10) {
+			return ErrConflict
+		}
+		next, err := taskForBinding(ctx, db, newTaskID, "wallet_operation", strconv.FormatInt(id, 10), model.TaskTypeWalletOperation)
+		if err != nil {
+			return err
+		}
+		var previousInput, nextInput walletoperation.Input
+		var checkpoint walletoperation.Checkpoint
+		if json.Unmarshal(previous.Input, &previousInput) != nil || json.Unmarshal(next.Input, &nextInput) != nil ||
+			previousInput.OperationID != id || nextInput.OperationID != id || previousInput.Match(nextInput.ExecutionIdentity) != nil ||
+			json.Unmarshal(previous.Checkpoint, &checkpoint) != nil || checkpoint.Match(previousInput.ExecutionIdentity) != nil ||
+			!checkpoint.BroadcastAttempted || !checkpoint.BroadcastNotSent || checkpoint.TransactionHash != "" {
+			return ErrConflict
+		}
+		var operation model.WalletOperation
+		if err := db.NewSelect().Model(&operation).Where("id = ?", id).For("NO KEY UPDATE").Scan(ctx); err != nil {
+			return mapNotFound(err)
+		}
+		if operation.Status != model.WalletOperationStatusFailed || operation.TaskID != nil || operation.BroadcastAttemptedAt == nil || operation.TxHash != nil || len(operation.SignedTransaction) != 0 || !validWalletOperationAmount(operation.Type, operation.Amount) {
+			return ErrConflict
+		}
+		res, err := db.NewUpdate().Model((*model.WalletOperation)(nil)).
+			Set("status = ?", model.WalletOperationStatusPending).
+			Set("task_id = ?", newTaskID).
+			Set("broadcast_attempted_at = NULL").
+			Set("completed_at = NULL").
+			Set("last_error = NULL").
+			Set("updated_at = ?", time.Now()).
+			Where("id = ? AND status = ? AND task_id IS NULL", id, model.WalletOperationStatusFailed).
+			Where("tx_hash IS NULL AND signed_transaction IS NULL").
+			Where("broadcast_attempted_at = ?", operation.BroadcastAttemptedAt).
+			Exec(ctx)
+		return requireRows(res, err, "reopening unsent wallet operation")
+	})
+}
+
 func (r *BunWalletOperationRepo) MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().

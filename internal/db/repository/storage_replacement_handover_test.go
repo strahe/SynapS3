@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -266,5 +268,114 @@ func TestPostgresReplacementHandoverSerializesWithSigning(t *testing.T) {
 				t.Fatalf("handed-over write = %#v, attempts=%d, signing err=%v, want signing refused", got, attempts, secondErr)
 			}
 		})
+	}
+}
+
+func TestPostgresReplacementHandoverLocksContentsBeforeCommitRequests(t *testing.T) {
+	db := testDB(t)
+	f := newCommitFixture(t, db)
+	ctx := t.Context()
+	collected := f.transferredCopy(t, "collected")
+	f.collecting(t, "collecting", collected)
+	joining := f.transferredCopy(t, "joining")
+	row, coordinator := f.activateReplacement(t)
+
+	hold := newPostgresRaceHold("transfer", func(query string) bool {
+		return strings.Contains(query, "storage_contents") && strings.Contains(query, "for no key update")
+	})
+	testutil.AddQueryHook(db, hold)
+	defer hold.Release()
+	transferred, handedOver := make(chan error, 1), make(chan error, 1)
+	transferCtx := postgresRaceContext(ctx, "transfer")
+	go func() {
+		transferred <- runPostgresRaceTx(transferCtx, db, make(chan int, 1), func(repos *repository.Repositories) error {
+			if err := repos.Contents.MarkUploadCopyPieceReady(transferCtx, repository.MarkUploadCopyPieceReadyInput{
+				StorageCopyID: joining.ID, ContentID: joining.ContentID, CopyIndex: joining.CopyIndex,
+				PieceCID: "piece-joining", RequireEligibleCopy: true,
+			}); err != nil {
+				return err
+			}
+			requestID, members, err := repos.Contents.JoinCollectingCommitRequest(transferCtx, repository.JoinCommitRequestInput{
+				CopyID: joining.ID, StorageDataSetID: f.dataSetID,
+			})
+			if err != nil {
+				return err
+			}
+			if requestID != "collecting" || members != 2 {
+				return fmt.Errorf("joined request %q with %d members", requestID, members)
+			}
+			return nil
+		})
+	}()
+	waitPostgresSignal(t, hold.reached, "transfer holds the later content lock")
+	handoverPID := make(chan int, 1)
+	var targets []model.StorageCopy
+	var done bool
+	go func() {
+		handedOver <- runPostgresRaceTx(ctx, db, handoverPID, func(repos *repository.Repositories) error {
+			var err error
+			targets, done, err = repos.Replacements.HandOverSourceWritesBatch(ctx, row.ID, row.TaskGeneration, coordinator.ID, 128)
+			return err
+		})
+	}()
+	waitForPostgresLockWait(t, db, "storage_contents", handoverPID)
+	hold.Release()
+	if err := waitPostgresResult(t, transferred, "transfer joins the collecting request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitPostgresResult(t, handedOver, "hand-over after transfer"); err != nil {
+		t.Fatal(err)
+	}
+	if !done || len(targets) != 2 || targets[0].ContentID == targets[1].ContentID {
+		t.Fatalf("hand-over targets=%#v done=%v, want both contents once", targets, done)
+	}
+	for _, source := range []*model.StorageCopy{collected, joining} {
+		got := f.copy(t, source.ID)
+		if got.Status != model.StorageCopyStatusFailed || got.CommitRequestID != nil {
+			t.Fatalf("source copy = %#v, want it released", got)
+		}
+		target, err := f.repos.Contents.GetUploadCopyForDataSet(ctx, source.ContentID, row.TargetDataSetID)
+		if err != nil || target == nil || target.Status != model.StorageCopyStatusPending {
+			t.Fatalf("target for content %d = %#v, err=%v", source.ContentID, target, err)
+		}
+	}
+	request, err := f.repos.Contents.GetCommitRequest(ctx, "collecting")
+	if err != nil || request == nil || request.Status != storagecommit.RequestStatusAbandoned || request.TaskID != nil {
+		t.Fatalf("released request = %#v, err=%v", request, err)
+	}
+}
+
+func TestPostgresReplacementHandoverDiscardsRolledBackTargets(t *testing.T) {
+	db := testDB(t)
+	f := newCommitFixture(t, db)
+	source := f.transferredCopy(t, "rollback")
+	row, coordinator := f.activateReplacement(t)
+	ctx, cancel := context.WithCancel(postgresRaceContext(t.Context(), "handover"))
+	defer cancel()
+	hold := newPostgresRaceHold("handover", func(query string) bool {
+		return strings.Contains(query, "insert into") && strings.Contains(query, "storage_replacement_items")
+	})
+	testutil.AddQueryHook(db, hold)
+	defer hold.Release()
+	result := make(chan error, 1)
+	go func() {
+		targets, done, err := f.repos.Replacements.HandOverSourceWritesBatch(ctx, row.ID, row.TaskGeneration, coordinator.ID, 128)
+		if err == nil || len(targets) != 0 || done {
+			result <- fmt.Errorf("rolled-back hand-over targets=%#v done=%v err=%v", targets, done, err)
+			return
+		}
+		result <- nil
+	}()
+	waitPostgresSignal(t, hold.reached, "hand-over creates an uncommitted target")
+	cancel()
+	hold.Release()
+	if err := waitPostgresResult(t, result, "canceled hand-over"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.copy(t, source.ID); got.Status != model.StorageCopyStatusPieceReady {
+		t.Fatalf("rolled-back source = %#v", got)
+	}
+	if target, err := f.repos.Contents.GetUploadCopyForDataSet(t.Context(), source.ContentID, row.TargetDataSetID); err != nil || target != nil {
+		t.Fatalf("rolled-back target = %#v, err=%v", target, err)
 	}
 }

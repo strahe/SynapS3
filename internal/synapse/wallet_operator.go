@@ -54,7 +54,9 @@ func WalletSubmissionFromWriteResult(res *sdktypes.WriteResult, err error, actio
 		submission.TxHash = res.Hash.Hex()
 	}
 	if err != nil {
-		if broadcast, ok := errors.AsType[*sdktypes.BroadcastError](err); ok && broadcast != nil && broadcast.Transaction != nil {
+		broadcast, isBroadcast := errors.AsType[*sdktypes.BroadcastError](err)
+		submission.NotSent = res == nil && !isBroadcast
+		if isBroadcast && broadcast != nil && broadcast.Transaction != nil {
 			raw, marshalErr := broadcast.Transaction.MarshalBinary()
 			if marshalErr != nil {
 				return submission, fmt.Errorf("%s: %w", action, errors.Join(err, marshalErr))

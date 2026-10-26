@@ -52,6 +52,7 @@ var commitLedgerCases = []struct {
 	{"SignedSingleMemberIsDecidedByItsRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 1) }},
 	{"SignedBatchMembersAreDecidedByTheirRequest", func(t *testing.T, f commitFixture) { testSignedCommitMembersAreDecidedByTheirRequest(t, f, 2) }},
 	{"RetainedCommitTaskIsKeptWhileItsRequestIsOpen", testRetainedCommitTaskIsKeptWhileItsRequestIsOpen},
+	{"CommitOwnerTransferFencesPreviousTask", testCommitOwnerTransferFencesPreviousTask},
 	{"StoppedRequestDoesNotHoldTheQueue", testStoppedRequestDoesNotHoldTheQueue},
 	{"LateTransferOfACommittedMemberCompletes", testLateTransferOfACommittedMemberCompletes},
 	{"ManualSealIsDurableAndIdempotent", testManualSealIsDurableAndIdempotent},
@@ -574,6 +575,46 @@ func testRetainedCommitTaskIsKeptWhileItsRequestIsOpen(t *testing.T, f commitFix
 	}
 	if stored, err := f.repos.Tasks.GetByID(ctx, taskID); err != nil || stored == nil {
 		t.Fatalf("task history missing: %#v, %v", stored, err)
+	}
+}
+
+func testCommitOwnerTransferFencesPreviousTask(t *testing.T, f commitFixture) {
+	ctx := t.Context()
+	copyRow := f.transferredCopy(t, "owner-transfer")
+	source := commitTask("owner-transfer")
+	source.SubjectType = model.TaskSubjectStorageCommitRequest
+	source, _, err := f.repos.Tasks.Enqueue(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := source.ID
+	if err := f.repos.Contents.CreateCollectingCommitRequest(ctx, repository.CreateCommitRequestInput{
+		RequestID: "owner-transfer", TaskID: oldID, StorageDataSetID: f.dataSetID, CopyIDs: []int64{copyRow.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failLocalEnsure(t, f.db, source)
+	next := repositorySuccessor(t, f.repos, source)
+	if err := f.repos.Contents.TransferCommitTaskOwner(ctx, "owner-transfer", oldID, next.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repos.Contents.TransferCommitTaskOwner(ctx, "owner-transfer", oldID, next.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("replayed old owner transfer = %v, want conflict", err)
+	}
+	request, err := f.repos.Contents.RequestCommitSeal(ctx, "owner-transfer")
+	if err != nil || request == nil || request.TaskID == nil || *request.TaskID != next.ID || request.SealRequestedAt == nil {
+		t.Fatalf("manual seal intent = %#v, err=%v", request, err)
+	}
+	if _, err := f.repos.Contents.SealCommitRequest(ctx, repository.SealCommitRequestInput{
+		RequestID: "owner-transfer", TaskID: oldID, ExtraDataHex: "abcd",
+		Members: []repository.SealMember{{CopyID: copyRow.ID, ContentID: copyRow.ContentID, PieceCID: fmt.Sprintf("piece-%d", copyRow.ContentID)}},
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("seal by previous owner = %v, want conflict", err)
+	}
+	f.seal(t, "owner-transfer", next.ID, copyRow)
+	request = f.request(t, "owner-transfer")
+	if request.Status != storagecommit.RequestStatusReady || request.TaskID == nil || *request.TaskID != next.ID {
+		t.Fatalf("sealed successor request = %#v", request)
 	}
 }
 
