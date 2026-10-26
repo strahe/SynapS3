@@ -943,6 +943,7 @@ type WalletOperationRepository interface {
 	GetByID(ctx context.Context, id int64) (*model.WalletOperation, error)
 	BindTask(ctx context.Context, id, taskID int64) error
 	TransferTaskOwner(ctx context.Context, id, oldTaskID, newTaskID int64) error
+	ReopenUnsentForRetry(ctx context.Context, id, oldTaskID, newTaskID int64) error
 	MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error
 	MarkSubmitted(ctx context.Context, id, taskID int64, txHash string) error
 	RecordSubmission(ctx context.Context, id, taskID int64, txHash string, signedTransaction []byte, lastError string) error

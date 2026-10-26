@@ -13,6 +13,7 @@ type Input struct {
 type Checkpoint struct {
 	ExecutionIdentity
 	BroadcastAttempted bool   `json:"broadcast_attempted"`
+	BroadcastNotSent   bool   `json:"broadcast_not_sent,omitempty"`
 	TransactionHash    string `json:"transaction_hash,omitempty"`
 }
 

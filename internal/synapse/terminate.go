@@ -165,7 +165,7 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 		}
 		return hooks.BeforeDirect()
 	}
-	merge := func(res *storage.TerminateServiceResult, confirmed bool) {
+	merge := func(res *storage.TerminateServiceResult, directConfirmed bool) {
 		if res == nil {
 			return
 		}
@@ -180,13 +180,11 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 		if res.ConfirmedTxHash != nil && *res.ConfirmedTxHash != (common.Hash{}) {
 			evidence.ConfirmedTxHash = res.ConfirmedTxHash.Hex()
 		}
-		if confirmed {
+		if directConfirmed && res.EndEpoch > 0 && res.ConfirmedTxHash != nil && *res.ConfirmedTxHash != (common.Hash{}) {
 			epoch := int64(res.EndEpoch)
 			evidence.EndEpoch = &epoch
-			if evidence.ConfirmedTxHash != "" {
-				status := uint64(ethtypes.ReceiptStatusSuccessful)
-				evidence.ReceiptStatus = &status
-			}
+			status := uint64(ethtypes.ReceiptStatusSuccessful)
+			evidence.ReceiptStatus = &status
 		}
 	}
 	// retained passes on a transaction hash that only the SDK's error carries.
@@ -263,8 +261,9 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 			return &evidence, unsentTermination(err, ErrTerminationNotSent)
 		}
 	}
-	res, err := send(skipProvider)
-	merge(res, err == nil)
+	usedDirect := skipProvider
+	res, err := send(usedDirect)
+	merge(res, usedDirect && err == nil)
 	merge(failedSubmission(err), false)
 	if callbackErr != nil {
 		return &evidence, errors.Join(callbackErr, normalizeTerminationError(ctx, err))
@@ -299,7 +298,8 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 		if err := beforeDirect(); err != nil {
 			return &evidence, unsentTermination(errors.Join(err, providerErr), unsent)
 		}
-		res, err = send(true)
+		usedDirect = true
+		res, err = send(usedDirect)
 		merge(res, err == nil)
 		merge(failedSubmission(err), false)
 		if callbackErr != nil {
@@ -321,6 +321,15 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 	}
 	if res == nil {
 		return &evidence, errors.New("data set termination returned no result")
+	}
+	if !usedDirect {
+		ended, err := s.recordedTermination(ctx, dataSetID)
+		if err != nil {
+			return &evidence, err
+		}
+		if ended != nil {
+			evidence.EndEpoch = ended.EndEpoch
+		}
 	}
 	return &evidence, nil
 }

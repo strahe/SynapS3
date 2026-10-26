@@ -103,7 +103,8 @@ func (r *BunStorageContentRepo) RequestCommitSeal(ctx context.Context, requestID
 		now := time.Now().UTC()
 		res, err := db.NewUpdate().Model((*storagecommit.Request)(nil)).
 			Set("seal_requested_at = ?", now).Set("updated_at = ?", now).
-			Where("request_id = ? AND status = ?", requestID, storagecommit.RequestStatusCollecting).Exec(ctx)
+			Where("request_id = ? AND status = ?", requestID, storagecommit.RequestStatusCollecting).
+			Where("task_id IS NOT DISTINCT FROM ?", request.TaskID).Exec(ctx)
 		if err := requireCommitRows(res, err, "requesting collection to end"); err != nil {
 			return err
 		}

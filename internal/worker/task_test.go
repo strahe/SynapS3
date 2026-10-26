@@ -1229,6 +1229,33 @@ func (r *delayedShortenRepository) ShortenLease(ctx context.Context, id, generat
 	return err
 }
 
+func runLeaseShorteningRecovery(t *testing.T, engine *Engine, shortener *delayedShortenRepository) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	done := make(chan struct{})
+	go func() {
+		engine.runRecoveryQueue(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("lease shortening recovery queue did not stop")
+		}
+	}()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !shortener.shortened.Load() {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("recovery did not shorten the task lease")
+		}
+	}
+}
+
 func TestEngineRenewalFailureCancelsBeforeSafetyBoundary(t *testing.T) {
 	limit := 5
 	config := EngineConfig{
@@ -1327,6 +1354,10 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 	if got := ordered.renewalsAfterShort.Load(); got != 0 {
 		t.Fatalf("lease renewed %d times after it was shortened", got)
 	}
+	if !ordered.shortened.Load() {
+		ordered.delay = 0
+		runLeaseShorteningRecovery(t, harness.engine, ordered)
+	}
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
 	if err != nil || stored.Status != model.TaskStatusRunning || stored.ResumeMode != model.TaskResumeModeRecover || stored.LeaseUntil == nil {
 		t.Fatalf("uncertain settlement task = %#v, err=%v", stored, err)
@@ -1351,21 +1382,40 @@ func TestEngineSettlementFailureShortensLeaseAndRecovers(t *testing.T) {
 
 func TestEngineSettlementPanicRollsBackAndShortensLease(t *testing.T) {
 	limit := 5
+	var settlementPanicked atomic.Bool
 	harness := newTaskHarness(t, scriptedHandler{
 		definition: testDefinition(&limit, true),
-		execute: func(context.Context, Execution) Result {
-			return Complete("must not settle", func(context.Context, *repository.Repositories) error {
+		execute: func(_ context.Context, execution Execution) Result {
+			return Complete("must not settle", func(ctx context.Context, repos *repository.Repositories) error {
+				if err := repos.Tasks.WriteCheckpoint(ctx, execution.ID(), execution.ClaimGeneration(), []byte(`{"uncommitted":true}`)); err != nil {
+					return err
+				}
+				settlementPanicked.Store(true)
 				panic("settlement boom")
 			})
 		},
 	}, nil)
 	row := enqueueTestTask(t, harness, "settlement-panic")
 	claimed := claimTestTask(t, harness)
+	shortener := &delayedShortenRepository{TaskRepository: harness.repos.Tasks}
+	controlled := &controlledShortenRepository{TaskRepository: shortener}
+	controlled.fail.Store(true)
+	harness.repos.Tasks = controlled
 	harness.engine.settlementRetryDelays = []time.Duration{0, 0, 0, 0}
 
 	harness.engine.executeClaim(t.Context(), claimed)
+	if !settlementPanicked.Load() {
+		t.Fatal("settlement did not reach the injected panic")
+	}
 
 	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || stored.Status != model.TaskStatusRunning || len(stored.Checkpoint) != 0 {
+		t.Fatalf("settlement panic escaped rollback: task=%#v err=%v", stored, err)
+	}
+	controlled.fail.Store(false)
+	runLeaseShorteningRecovery(t, harness.engine, shortener)
+
+	stored, err = harness.repos.Tasks.GetByID(t.Context(), row.ID)
 	if err != nil || stored.Status != model.TaskStatusRunning || stored.ResumeMode != model.TaskResumeModeRecover || stored.LeaseUntil == nil {
 		t.Fatalf("task after settlement panic = %#v, err=%v", stored, err)
 	}

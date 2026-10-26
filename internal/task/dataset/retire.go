@@ -504,10 +504,13 @@ func (h *RetireHandler) runDataSetRetirement(ctx context.Context, execution task
 					"task_id", execution.ID(), "storage_data_set_id", dataSet.ID, "sends", checkpoint.Sends,
 					"error", errtext.Format(err))
 			}
+			if checkpoint.TerminationEpoch == nil {
+				return h.waitForRetirementEvidence(execution, input, abandoned, checkpoint, err)
+			}
 			return taskengine.RetryInMode(err, "provider_confirmation", model.TaskResumeModeRecover, settlement).WithContentionSettlement(settlement)
 		}
 		if checkpoint.TerminationEpoch == nil {
-			return taskengine.RetryInMode(errors.New("data set retirement has no confirmed result"), "provider_confirmation", model.TaskResumeModeRecover, settlement).WithContentionSettlement(settlement)
+			return h.waitForRetirementEvidence(execution, input, abandoned, checkpoint, nil)
 		}
 		if *checkpoint.TerminationEpoch < 0 {
 			checkpoint.TerminationEpoch = nil

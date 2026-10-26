@@ -28,11 +28,14 @@ func TestWalletSubmissionAcceptsSDKPaymentTransactions(t *testing.T) {
 		kind          model.WalletOperationType
 		needsApproval bool
 		signature     string
+		failureStage  string
 	}{
 		{name: "fund", kind: model.WalletOperationTypeFund, signature: "depositWithPermit(address,address,uint256,uint256,uint8,bytes32,bytes32)"},
 		{name: "fund and approve", kind: model.WalletOperationTypeFund, needsApproval: true, signature: "depositWithPermitAndApproveOperator(address,address,uint256,uint256,uint8,bytes32,bytes32,address,uint256,uint256,uint256)"},
 		{name: "approve", kind: model.WalletOperationTypeApprove, needsApproval: true, signature: "setOperatorApproval(address,address,bool,uint256,uint256,uint256)"},
 		{name: "withdraw", kind: model.WalletOperationTypeWithdraw, signature: "withdraw(address,uint256)"},
+		{name: "fund nonce unavailable", kind: model.WalletOperationTypeFund, failureStage: "nonce"},
+		{name: "withdraw gas unavailable", kind: model.WalletOperationTypeWithdraw, failureStage: "gas"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sg, err := signer.NewSecp256k1SignerFromBytes(common.FromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
@@ -43,6 +46,13 @@ func TestWalletSubmissionAcceptsSDKPaymentTransactions(t *testing.T) {
 				Payer: sg.EVMAddress(), ChainID: sdktypes.ChainID(314159), RecordKeeper: common.HexToAddress("0x222"),
 			}, common.HexToAddress("0x333"), common.HexToAddress("0x444"))
 			backend := newWalletSDKBackend(t, *identity.USDFC)
+			preflightErr := errors.New("transaction preparation unavailable")
+			switch tc.failureStage {
+			case "nonce":
+				backend.nonceErr = preflightErr
+			case "gas":
+				backend.gasErr = preflightErr
+			}
 			service, err := payments.New(payments.Options{
 				Backend: backend, Signer: sg, ChainID: identity.Identity.ChainID,
 				FilPayAddress: *identity.Payments, WarmStorageAddress: identity.Identity.RecordKeeper, USDFCTokenAddress: *identity.USDFC,
@@ -61,6 +71,13 @@ func TestWalletSubmissionAcceptsSDKPaymentTransactions(t *testing.T) {
 				}
 				result, err = service.Fund(t.Context(), amount, payments.WithFundNeedsFwssApproval(tc.needsApproval), payments.WithSkipPrecheck())
 			}
+			if tc.failureStage != "" {
+				submission, submissionErr := WalletSubmissionFromWriteResult(result, err, tc.name)
+				if result != nil || backend.sent != nil || !errors.Is(submissionErr, preflightErr) || !submission.NotSent || submission.TxHash != "" || len(submission.SignedTransaction) != 0 {
+					t.Fatalf("SDK preparation result=%v sent=%v submission=%#v error=%v", result, backend.sent, submission, submissionErr)
+				}
+				return
+			}
 			if !errors.Is(err, backend.sendErr) || result != nil || backend.sent == nil {
 				t.Fatalf("SDK broadcast result = %v, transaction = %v, error = %v", result, backend.sent, err)
 			}
@@ -72,7 +89,7 @@ func TestWalletSubmissionAcceptsSDKPaymentTransactions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if submission.TxHash != backend.sent.Hash().Hex() || !bytes.Equal(submission.SignedTransaction, raw) {
+			if submission.NotSent || submission.TxHash != backend.sent.Hash().Hex() || !bytes.Equal(submission.SignedTransaction, raw) {
 				t.Fatal("submission does not retain the SDK's signed transaction")
 			}
 			selector := crypto.Keccak256([]byte(tc.signature))[:4]
@@ -97,6 +114,8 @@ type walletSDKBackend struct {
 	token          common.Address
 	replies        map[[4]byte][]byte
 	sendErr        error
+	nonceErr       error
+	gasErr         error
 	sent           *ethtypes.Transaction
 	receiptChecked chan struct{}
 }
@@ -150,8 +169,8 @@ func (*walletSDKBackend) HeaderByNumber(context.Context, *big.Int) (*ethtypes.He
 	return &ethtypes.Header{BaseFee: big.NewInt(1), Number: big.NewInt(1)}, nil
 }
 
-func (*walletSDKBackend) PendingNonceAt(context.Context, common.Address) (uint64, error) {
-	return 7, nil
+func (b *walletSDKBackend) PendingNonceAt(context.Context, common.Address) (uint64, error) {
+	return 7, b.nonceErr
 }
 
 func (*walletSDKBackend) SuggestGasPrice(context.Context) (*big.Int, error) {
@@ -162,8 +181,8 @@ func (*walletSDKBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
 	return big.NewInt(1), nil
 }
 
-func (*walletSDKBackend) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
-	return 100000, nil
+func (b *walletSDKBackend) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
+	return 100000, b.gasErr
 }
 
 func (b *walletSDKBackend) SendTransaction(_ context.Context, tx *ethtypes.Transaction) error {

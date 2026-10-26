@@ -2,6 +2,7 @@ package synapse
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ func TestWalletSubmissionRetainsTransactionEvidenceAndError(t *testing.T) {
 		err          error
 		wantHash     string
 		wantRaw      bool
+		wantNotSent  bool
 		wantErr      bool
 		wantCause    error
 		wantMessage  string
@@ -46,16 +48,18 @@ func TestWalletSubmissionRetainsTransactionEvidenceAndError(t *testing.T) {
 		{name: "invalid UTF-8 prefix", err: &sdktypes.BroadcastError{Transaction: tx, Cause: invalidUTF8Cause}, wantHash: tx.Hash().Hex(), wantRaw: true, wantErr: true, wantCause: invalidUTF8Cause, wantMessage: "\xff\xfe bad bytes: [signed transaction]"},
 		{name: "repeated mixed-case bytes", err: &sdktypes.BroadcastError{Transaction: tx, Cause: repeatedCause}, wantHash: tx.Hash().Hex(), wantRaw: true, wantErr: true, wantCause: repeatedCause, wantMessage: "RPC rejected [signed transaction]; [signed transaction]"},
 		{name: "hash with receipt error", result: &sdktypes.WriteResult{Hash: tx.Hash()}, err: cause, wantHash: tx.Hash().Hex(), wantErr: true, wantCause: cause},
-		{name: "preflight error", err: cause, wantErr: true, wantCause: cause},
-		{name: "approval already satisfied", err: payments.ErrNothingToFund, wantErr: true, wantCause: payments.ErrNothingToFund},
+		{name: "preflight error", err: cause, wantErr: true, wantCause: cause, wantNotSent: true},
+		{name: "preflight deadline", err: context.DeadlineExceeded, wantErr: true, wantCause: context.DeadlineExceeded, wantNotSent: true},
+		{name: "broadcast without transaction", err: &sdktypes.BroadcastError{Cause: cause}, wantErr: true, wantCause: cause},
+		{name: "approval already satisfied", err: payments.ErrNothingToFund, wantErr: true, wantCause: payments.ErrNothingToFund, wantNotSent: true},
 		{name: "missing result", wantErr: true},
 		{name: "missing hash", result: &sdktypes.WriteResult{}, wantErr: true},
 		{name: "conflicting evidence", result: &sdktypes.WriteResult{Hash: conflictingHash}, err: &sdktypes.BroadcastError{Transaction: tx, Cause: echoedCause}, wantErr: true, wantCause: echoedCause, wantMessage: fmt.Sprintf("result hash %s, signed transaction hash %s", conflictingHash.Hex(), tx.Hash().Hex()), wantConflict: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := WalletSubmissionFromWriteResult(tc.result, tc.err, "wallet write")
-			if (err != nil) != tc.wantErr || got.TxHash != tc.wantHash || (len(got.SignedTransaction) > 0) != tc.wantRaw {
-				t.Fatalf("submission = hash %q, raw %t, error %v", got.TxHash, len(got.SignedTransaction) > 0, err)
+			if (err != nil) != tc.wantErr || got.TxHash != tc.wantHash || (len(got.SignedTransaction) > 0) != tc.wantRaw || got.NotSent != tc.wantNotSent {
+				t.Fatalf("submission = hash %q, raw %t, not sent %t, error %v", got.TxHash, len(got.SignedTransaction) > 0, got.NotSent, err)
 			}
 			if tc.wantCause != nil && !errors.Is(err, tc.wantCause) {
 				t.Fatalf("error %v lost cause %v", err, tc.wantCause)

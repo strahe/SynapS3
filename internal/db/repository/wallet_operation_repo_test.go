@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/walletoperation"
 )
 
 func TestWalletOperationRepoCreateOrGet(t *testing.T) {
@@ -250,6 +253,89 @@ func TestWalletTaskBindingRejectsInvalidLogicalReferences(t *testing.T) {
 			stored, err := repos.WalletOperations.GetByID(t.Context(), op.ID)
 			if err != nil || stored == nil || stored.TaskID != nil || stored.Status != model.WalletOperationStatusPending {
 				t.Fatalf("rejected binding changed owner: %#v, %v", stored, err)
+			}
+		})
+	}
+}
+
+func TestWalletOperationRepoReopensOnlyProvenUnsentRetry(t *testing.T) {
+	for _, scenario := range []string{"allowed", "unrelated successor", "different identity", "missing proof", "source active", "submitted", "unknown", "transaction evidence"} {
+		t.Run(scenario, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := t.Context()
+			op := createWalletOperation(t, repos, model.WalletOperationTypeFund, scenario, "100")
+			sourceID := createWalletTask(t, repos, op.ID, scenario)
+			if err := repos.WalletOperations.BindTask(ctx, op.ID, sourceID); err != nil {
+				t.Fatal(err)
+			}
+			if err := repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, sourceID); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "submitted" || scenario == "transaction evidence" {
+				if err := repos.WalletOperations.RecordSubmission(ctx, op.ID, sourceID, "known-transaction", nil, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "unknown" {
+				if err := repos.WalletOperations.MarkUnknown(ctx, op.ID, sourceID, "outcome unknown"); err != nil {
+					t.Fatal(err)
+				}
+			} else if scenario != "submitted" {
+				if err := repos.WalletOperations.MarkFailed(ctx, op.ID, sourceID, "not sent"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			identity := testutil.DefaultWalletExecutionIdentity()
+			input := walletoperation.Input{ExecutionIdentity: identity, OperationID: op.ID}
+			checkpoint := walletoperation.Checkpoint{ExecutionIdentity: identity, BroadcastAttempted: true, BroadcastNotSent: scenario != "missing proof"}
+			rawInput, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rawCheckpoint, err := json.Marshal(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			query := db.NewUpdate().Model((*model.Task)(nil)).Set("input_json = ?", json.RawMessage(rawInput)).Set("checkpoint_json = ?", json.RawMessage(rawCheckpoint)).Where("id = ?", sourceID)
+			if scenario != "source active" {
+				query = query.Set("status = ?", model.TaskStatusFailed).Set("finished_at = ?", time.Now()).Set("superseded_at = ?", time.Now()).Set("failure_reason = ?", "wallet_broadcast_not_sent")
+			}
+			if _, err := query.Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			nextID := createWalletTask(t, repos, op.ID, scenario+"-next")
+			if scenario == "different identity" {
+				changed := *input.Identity
+				changed.Payer[0] ^= 0xff
+				input.Identity = &changed
+				rawInput, err = json.Marshal(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			query = db.NewUpdate().Model((*model.Task)(nil)).Set("input_json = ?", json.RawMessage(rawInput)).Where("id = ?", nextID)
+			if scenario != "unrelated successor" {
+				query = query.Set("retry_of_task_id = ?", sourceID)
+			}
+			if _, err := query.Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			before, err := repos.WalletOperations.GetByID(ctx, op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = repos.WalletOperations.ReopenUnsentForRetry(ctx, op.ID, sourceID, nextID)
+			stored, readErr := repos.WalletOperations.GetByID(ctx, op.ID)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if scenario == "allowed" {
+				if err != nil || stored.Status != model.WalletOperationStatusPending || stored.TaskID == nil || *stored.TaskID != nextID || stored.BroadcastAttemptedAt != nil || stored.CompletedAt != nil || stored.LastError != nil || stored.StartedAt == nil || !stored.StartedAt.Equal(*before.StartedAt) {
+					t.Fatalf("reopened operation = %#v, error=%v", stored, err)
+				}
+			} else if !errors.Is(err, repository.ErrConflict) || stored.Status != before.Status || !reflect.DeepEqual(stored.TaskID, before.TaskID) || !reflect.DeepEqual(stored.TxHash, before.TxHash) || !reflect.DeepEqual(stored.CompletedAt, before.CompletedAt) {
+				t.Fatalf("rejected retry changed operation: before=%#v after=%#v error=%v", before, stored, err)
 			}
 		})
 	}

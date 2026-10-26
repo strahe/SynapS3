@@ -136,7 +136,8 @@ func TestStorageServiceAdapterTerminationFallsBackOnlyWhenTheRelayHoldsNoRequest
 	absent := terminationFailure(storage.TerminateServiceStageWait, common.Hash{}, &pdp.WaitForTerminateServiceNotFoundError{})
 	unsettled := relaySubmitFailure(errors.New("provider returned 502"))
 	ended := func(context.Context, storage.TerminateServiceSubmission) (*storage.TerminateServiceResult, error) {
-		return &storage.TerminateServiceResult{EndEpoch: 84}, nil
+		hash := common.HexToHash("0x456")
+		return &storage.TerminateServiceResult{TxHash: &hash, ConfirmedTxHash: &hash, EndEpoch: 84}, nil
 	}
 	for _, tc := range []struct {
 		name       string
@@ -163,7 +164,8 @@ func TestStorageServiceAdapterTerminationFallsBackOnlyWhenTheRelayHoldsNoRequest
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &stubStorageServiceTerminator{errors: tc.errs, waits: tc.waits}
-			adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
+			state := runningService()
+			adapter := &StorageServiceAdapter{terminator: stub, dataSets: state}
 			got, err := adapter.TerminateService(t.Context(), sdktypes.NewBigInt(42), TerminationHooks{})
 			if stub.calls[0].opts.SkipProvider || stub.calls[0].opts.ProviderWaitTimeout != providerTerminationWaitTimeout {
 				t.Fatalf("first request = %#v, want a relay bounded by %s", stub.calls[0].opts, providerTerminationWaitTimeout)
@@ -176,6 +178,9 @@ func TestStorageServiceAdapterTerminationFallsBackOnlyWhenTheRelayHoldsNoRequest
 			}
 			if err != nil || len(stub.calls) != 2 || !stub.calls[1].opts.SkipProvider || got == nil || got.EndEpoch == nil || *got.EndEpoch != 84 {
 				t.Fatalf("requests=%d result=%#v err=%v, want a direct termination after the relay", len(stub.calls), got, err)
+			}
+			if state.reads != 2 {
+				t.Fatalf("service state reads = %d, want only the initial and fallback prechecks", state.reads)
 			}
 		})
 	}
@@ -650,7 +655,11 @@ func TestStorageServiceAdapterTerminationRetainsSubmittedEvidence(t *testing.T) 
 			if tc.confirmed {
 				stub.results = []*storage.TerminateServiceResult{{TxHash: &original, ConfirmedTxHash: &confirmed, EndEpoch: 84}}
 			}
-			adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService()}
+			state := &stubDataSetStateReader{endEpochs: []int64{0, 84}}
+			if tc.direct {
+				state = &stubDataSetStateReader{err: errors.New("unexpected service state read"), errFrom: 1}
+			}
+			adapter := &StorageServiceAdapter{terminator: stub, dataSets: state}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			calls := 0
@@ -672,11 +681,88 @@ func TestStorageServiceAdapterTerminationRetainsSubmittedEvidence(t *testing.T) 
 				t.Fatalf("SkipProvider = %t, want %t", stub.calls[0].opts.SkipProvider, tc.direct)
 			}
 			if tc.confirmed {
-				if err != nil || got.ConfirmedTxHash != confirmed.Hex() || got.EndEpoch == nil || *got.EndEpoch != 84 || got.ReceiptStatus == nil || *got.ReceiptStatus != ethtypes.ReceiptStatusSuccessful {
+				if err != nil || got.ConfirmedTxHash != confirmed.Hex() || got.EndEpoch == nil || *got.EndEpoch != 84 {
 					t.Fatalf("confirmed evidence=%#v error=%v", got, err)
+				}
+				if tc.direct {
+					if got.ReceiptStatus == nil || *got.ReceiptStatus != ethtypes.ReceiptStatusSuccessful || state.reads != 1 {
+						t.Fatalf("direct evidence=%#v reads=%d", got, state.reads)
+					}
+				} else if got.ReceiptStatus != nil {
+					t.Fatalf("provider status inferred a receipt: %#v", got)
 				}
 			} else if err == nil || got.EndEpoch != nil || (tc.callbackErr != nil && !errors.Is(err, writeErr)) {
 				t.Fatalf("pending evidence=%#v error=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestStorageServiceAdapterTerminationConfirmsRelayOnChain(t *testing.T) {
+	original, confirmed := common.HexToHash("0x123"), common.HexToHash("0x456")
+	rpcErr := errors.New("rpc unavailable after relay success")
+	for _, tc := range []struct {
+		name      string
+		chain     *stubDataSetStateReader
+		wantEpoch *int64
+		wantErr   error
+	}{
+		{name: "provider reports termination while chain is running", chain: runningService()},
+		{name: "chain records a different termination epoch", chain: &stubDataSetStateReader{endEpochs: []int64{0, 91}}, wantEpoch: new(int64(91))},
+		{name: "chain query fails after relay success", chain: &stubDataSetStateReader{err: rpcErr, errFrom: 1}, wantErr: rpcErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubStorageServiceTerminator{results: []*storage.TerminateServiceResult{{TxHash: &original, ConfirmedTxHash: &confirmed, EndEpoch: 84}}}
+			adapter := &StorageServiceAdapter{terminator: stub, dataSets: tc.chain}
+			got, err := adapter.TerminateService(t.Context(), sdktypes.NewBigInt(42), TerminationHooks{})
+			if !errors.Is(err, tc.wantErr) || errors.Is(err, ErrTerminationNotSent) || errors.Is(err, ErrTerminationTransactionNotSent) {
+				t.Fatalf("error=%v, want %v without an unsent marker", err, tc.wantErr)
+			}
+			if got == nil || got.TxHash != original.Hex() || got.ConfirmedTxHash != confirmed.Hex() || got.ReceiptStatus != nil {
+				t.Fatalf("relay evidence=%#v, error=%v", got, err)
+			}
+			if tc.wantEpoch == nil {
+				if got.EndEpoch != nil {
+					t.Fatalf("unconfirmed relay epoch=%d", *got.EndEpoch)
+				}
+			} else if got.EndEpoch == nil || *got.EndEpoch != *tc.wantEpoch {
+				t.Fatalf("termination evidence=%#v, want epoch=%d", got, *tc.wantEpoch)
+			}
+			if len(stub.calls) != 1 || stub.calls[0].opts.SkipProvider || tc.chain.reads != 2 {
+				t.Fatalf("requests=%#v, chain reads=%d", stub.calls, tc.chain.reads)
+			}
+		})
+	}
+}
+
+func TestStorageServiceAdapterTerminationRequiresDirectConfirmationEvidence(t *testing.T) {
+	original := common.HexToHash("0x123")
+	for _, tc := range []struct {
+		name      string
+		confirmed *common.Hash
+		epoch     sdktypes.Epoch
+	}{
+		{name: "missing confirmation hash", epoch: 84},
+		{name: "zero confirmation hash", confirmed: new(common.Hash), epoch: 84},
+		{name: "zero termination epoch", confirmed: &original},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubStorageServiceTerminator{
+				submittedHash: original,
+				results:       []*storage.TerminateServiceResult{{TxHash: &original, ConfirmedTxHash: tc.confirmed, EndEpoch: tc.epoch}},
+			}
+			state := &stubDataSetStateReader{err: errors.New("unexpected service state read"), errFrom: 1}
+			adapter := &StorageServiceAdapter{terminator: stub, dataSets: state}
+			got, err := adapter.TerminateServiceDirect(t.Context(), sdktypes.NewBigInt(42), TerminationHooks{})
+			confirmed := ""
+			if tc.confirmed != nil && *tc.confirmed != (common.Hash{}) {
+				confirmed = tc.confirmed.Hex()
+			}
+			if err != nil || got == nil || got.TxHash != original.Hex() || got.ConfirmedTxHash != confirmed || got.EndEpoch != nil || got.ReceiptStatus != nil {
+				t.Fatalf("incomplete direct confirmation=%#v, error=%v", got, err)
+			}
+			if len(stub.calls) != 1 || !stub.calls[0].opts.SkipProvider || state.reads != 1 {
+				t.Fatalf("requests=%#v, chain reads=%d", stub.calls, state.reads)
 			}
 		})
 	}
@@ -710,7 +796,7 @@ func TestStorageServiceAdapterTerminationRecordsRelayHashBetweenWaitSlices(t *te
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &stubStorageServiceTerminator{waits: []wait{polled, tc.next}}
-			adapter := &StorageServiceAdapter{terminator: stub, dataSets: runningService(), relayWaitSlice: 20 * time.Millisecond}
+			adapter := &StorageServiceAdapter{terminator: stub, dataSets: &stubDataSetStateReader{endEpochs: []int64{0, 84}}, relayWaitSlice: 20 * time.Millisecond}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			var recorded []string
