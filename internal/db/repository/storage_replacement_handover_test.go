@@ -1,7 +1,6 @@
 package repository_test
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -348,34 +347,58 @@ func TestPostgresReplacementHandoverLocksContentsBeforeCommitRequests(t *testing
 func TestPostgresReplacementHandoverDiscardsRolledBackTargets(t *testing.T) {
 	db := testDB(t)
 	f := newCommitFixture(t, db)
-	source := f.transferredCopy(t, "rollback")
+	ctx := t.Context()
+	sources := []*model.StorageCopy{f.transferredCopy(t, "replay-first"), f.transferredCopy(t, "replay-second")}
 	row, coordinator := f.activateReplacement(t)
-	ctx, cancel := context.WithCancel(postgresRaceContext(t.Context(), "handover"))
-	defer cancel()
-	hold := newPostgresRaceHold("handover", func(query string) bool {
-		return strings.Contains(query, "insert into") && strings.Contains(query, "storage_replacement_items")
-	})
-	testutil.AddQueryHook(db, hold)
-	defer hold.Release()
-	result := make(chan error, 1)
-	go func() {
-		targets, done, err := f.repos.Replacements.HandOverSourceWritesBatch(ctx, row.ID, row.TaskGeneration, coordinator.ID, 128)
-		if err == nil || len(targets) != 0 || done {
-			result <- fmt.Errorf("rolled-back hand-over targets=%#v done=%v err=%v", targets, done, err)
-			return
+	// PostgreSQL sequences retain attempt counts across transaction rollback.
+	for _, statement := range []string{
+		"CREATE SEQUENCE handover_attempts",
+		`CREATE FUNCTION retry_handover_once() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF nextval('handover_attempts') = 1 THEN
+				RAISE EXCEPTION 'injected handover serialization failure' USING ERRCODE = '40001';
+			END IF;
+			RETURN NEW;
+		END $$`,
+		fmt.Sprintf(`CREATE TRIGGER retry_handover BEFORE INSERT ON storage_replacement_items
+			FOR EACH ROW WHEN (NEW.content_id = %d) EXECUTE FUNCTION retry_handover_once()`, sources[1].ContentID),
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
 		}
-		result <- nil
-	}()
-	waitPostgresSignal(t, hold.reached, "hand-over creates an uncommitted target")
-	cancel()
-	hold.Release()
-	if err := waitPostgresResult(t, result, "canceled hand-over"); err != nil {
-		t.Fatal(err)
 	}
-	if got := f.copy(t, source.ID); got.Status != model.StorageCopyStatusPieceReady {
-		t.Fatalf("rolled-back source = %#v", got)
+
+	targets, done, err := f.repos.Replacements.HandOverSourceWritesBatch(ctx, row.ID, row.TaskGeneration, coordinator.ID, 128)
+	if err != nil || !done || len(targets) != len(sources) {
+		t.Fatalf("replayed hand-over targets=%#v done=%v err=%v, want both contents once", targets, done, err)
 	}
-	if target, err := f.repos.Contents.GetUploadCopyForDataSet(t.Context(), source.ContentID, row.TargetDataSetID); err != nil || target != nil {
-		t.Fatalf("rolled-back target = %#v, err=%v", target, err)
+	var attempts int
+	if err := db.NewRaw("SELECT last_value FROM handover_attempts").Scan(ctx, &attempts); err != nil || attempts != 2 {
+		t.Fatalf("hand-over attempts=%d, err=%v, want one rollback and one commit", attempts, err)
+	}
+	returned := make(map[int64]int64, len(targets))
+	for _, target := range targets {
+		if _, duplicate := returned[target.ContentID]; duplicate {
+			t.Fatalf("duplicate returned target for content %d", target.ContentID)
+		}
+		returned[target.ContentID] = target.ID
+	}
+	for _, source := range sources {
+		target, err := f.repos.Contents.GetUploadCopyForDataSet(ctx, source.ContentID, row.TargetDataSetID)
+		if err != nil || target == nil || target.ID != returned[source.ContentID] || target.Status != model.StorageCopyStatusPending {
+			t.Fatalf("committed target for content %d = %#v, returned=%v, err=%v", source.ContentID, target, returned, err)
+		}
+		if got := f.copy(t, source.ID); got.Status != model.StorageCopyStatusFailed || got.WorkGeneration != source.WorkGeneration+1 {
+			t.Fatalf("handed-over source = %#v, want one committed release", got)
+		}
+	}
+	items, err := f.repos.Replacements.ListPendingReplacementItemsAfter(ctx, row.ID, 0, 128)
+	if err != nil || len(items) != len(sources) {
+		t.Fatalf("committed replacement items=%#v, err=%v", items, err)
+	}
+	for _, item := range items {
+		if _, exists := returned[item.ContentID]; !exists {
+			t.Fatalf("replacement item for unexpected content %d", item.ContentID)
+		}
 	}
 }

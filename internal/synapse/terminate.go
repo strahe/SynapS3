@@ -180,7 +180,7 @@ func (s *StorageServiceAdapter) terminateService(ctx context.Context, dataSetID 
 		if res.ConfirmedTxHash != nil && *res.ConfirmedTxHash != (common.Hash{}) {
 			evidence.ConfirmedTxHash = res.ConfirmedTxHash.Hex()
 		}
-		if directConfirmed && res.ConfirmedTxHash != nil && *res.ConfirmedTxHash != (common.Hash{}) {
+		if directConfirmed && res.EndEpoch > 0 && res.ConfirmedTxHash != nil && *res.ConfirmedTxHash != (common.Hash{}) {
 			epoch := int64(res.EndEpoch)
 			evidence.EndEpoch = &epoch
 			status := uint64(ethtypes.ReceiptStatusSuccessful)

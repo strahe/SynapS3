@@ -735,24 +735,30 @@ func TestStorageServiceAdapterTerminationConfirmsRelayOnChain(t *testing.T) {
 	}
 }
 
-func TestStorageServiceAdapterTerminationRequiresDirectConfirmationIdentity(t *testing.T) {
+func TestStorageServiceAdapterTerminationRequiresDirectConfirmationEvidence(t *testing.T) {
 	original := common.HexToHash("0x123")
 	for _, tc := range []struct {
 		name      string
 		confirmed *common.Hash
+		epoch     sdktypes.Epoch
 	}{
-		{name: "missing confirmation hash"},
-		{name: "zero confirmation hash", confirmed: new(common.Hash)},
+		{name: "missing confirmation hash", epoch: 84},
+		{name: "zero confirmation hash", confirmed: new(common.Hash), epoch: 84},
+		{name: "zero termination epoch", confirmed: &original},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &stubStorageServiceTerminator{
 				submittedHash: original,
-				results:       []*storage.TerminateServiceResult{{TxHash: &original, ConfirmedTxHash: tc.confirmed, EndEpoch: 84}},
+				results:       []*storage.TerminateServiceResult{{TxHash: &original, ConfirmedTxHash: tc.confirmed, EndEpoch: tc.epoch}},
 			}
 			state := &stubDataSetStateReader{err: errors.New("unexpected service state read"), errFrom: 1}
 			adapter := &StorageServiceAdapter{terminator: stub, dataSets: state}
 			got, err := adapter.TerminateServiceDirect(t.Context(), sdktypes.NewBigInt(42), TerminationHooks{})
-			if err != nil || got == nil || got.TxHash != original.Hex() || got.EndEpoch != nil || got.ReceiptStatus != nil {
+			confirmed := ""
+			if tc.confirmed != nil && *tc.confirmed != (common.Hash{}) {
+				confirmed = tc.confirmed.Hex()
+			}
+			if err != nil || got == nil || got.TxHash != original.Hex() || got.ConfirmedTxHash != confirmed || got.EndEpoch != nil || got.ReceiptStatus != nil {
 				t.Fatalf("incomplete direct confirmation=%#v, error=%v", got, err)
 			}
 			if len(stub.calls) != 1 || !stub.calls[0].opts.SkipProvider || state.reads != 1 {

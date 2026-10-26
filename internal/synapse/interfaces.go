@@ -150,7 +150,7 @@ type WalletOperator interface {
 type WalletSubmission struct {
 	TxHash            string
 	SignedTransaction []byte
-	// NotSent requires positive SDK evidence; missing transaction IDs are insufficient.
+	// NotSent reports SDK proof that this invocation did not send a transaction.
 	NotSent bool
 }
 
