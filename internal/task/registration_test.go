@@ -11,7 +11,7 @@ func TestProductionRegistrationClosesAllTaskDependencies(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
 	want := []model.TaskType{
 		model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull,
-		model.TaskTypeCacheCapacityReconcile, model.TaskTypeCacheEvict, model.TaskTypeCacheReconcileDurability,
+		model.TaskTypeCacheCapacityReconcile, model.TaskTypeCacheLocalReconcile, model.TaskTypeCacheEvict, model.TaskTypeCacheReconcileDurability,
 		model.TaskTypeObservabilityRefresh, model.TaskTypeApprovedProviderRefresh, model.TaskTypeEndorsedProviderRefresh,
 		model.TaskTypeProviderUploadSpeedTest, model.TaskTypeWalletOperation,
 		model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageDataSetRetire, model.TaskTypeStorageCommit,

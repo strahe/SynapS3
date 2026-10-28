@@ -4,14 +4,123 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 )
+
+func TestGateDeletionWaitExpiresWithoutBlockingLaterReaders(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		callerLimit time.Duration
+		wantBusy    bool
+		wantElapsed time.Duration
+	}{
+		{name: "deletion wait limit", wantBusy: true, wantElapsed: DeletionWaitLimit},
+		{name: "caller deadline", callerLimit: time.Second, wantElapsed: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				gate := NewGate()
+				release, err := gate.HoldRead(t.Context(), "slow-reader")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer release()
+				ctx := t.Context()
+				if tc.callerLimit > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.callerLimit)
+					defer cancel()
+				}
+				started := time.Now()
+				err = gate.GuardDeletion(ctx, "slow-reader", func() { t.Error("deletion ran while the body was open") })
+				if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrDeletionBusy) != tc.wantBusy {
+					t.Fatalf("deletion wait = %v, want busy = %v", err, tc.wantBusy)
+				}
+				if elapsed := time.Since(started); elapsed != tc.wantElapsed {
+					t.Fatalf("waited %s, want %s", elapsed, tc.wantElapsed)
+				}
+				later, ok := gate.TryHoldRead("slow-reader")
+				if !ok {
+					t.Fatal("expired deletion still blocked a later reader")
+				}
+				later()
+			})
+		})
+	}
+}
+
+func TestGateTryPermitsSkipBusyKeysAndRetireReferences(t *testing.T) {
+	gate := NewGate()
+	release, ok := gate.TryHoldDeletion("busy")
+	if !ok {
+		t.Fatal("exclusive permit unavailable")
+	}
+	if releaseRead, ok := gate.TryHoldRead("busy"); ok {
+		releaseRead()
+		t.Fatal("read bypassed exclusive permit")
+	}
+	release()
+	assertGateRetired(t, gate, "busy")
+	releaseUpload, err := gate.HoldUpload(t.Context(), "upload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if competing, ok := gate.TryHoldUpload("upload"); ok {
+		competing()
+		t.Fatal("upload gate was not exclusive")
+	}
+	releaseUpload()
+	assertGateRetired(t, gate, "multipart:upload")
+}
+
+func TestGatePreservesSeekingOnlyForSeekableBodies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "object")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, seekable := range []bool{true, false} {
+		t.Run(fmt.Sprint(seekable), func(t *testing.T) {
+			gate := NewGate()
+			opened, err := gate.Open(t.Context(), "key", func() (io.ReadCloser, *cache.ObjectInfo, error) {
+				if seekable {
+					file, err := os.Open(path)
+					return file, &cache.ObjectInfo{Size: 6}, err
+				}
+				return io.NopCloser(bytes.NewBufferString("abcdef")), &cache.ObjectInfo{Size: 6}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			seeker, ok := opened.Body.(io.Seeker)
+			if ok != seekable {
+				t.Fatalf("seekable=%t, want %t", ok, seekable)
+			}
+			if ok {
+				if _, err := seeker.Seek(4, io.SeekStart); err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(opened.Body)
+				if err != nil || string(data) != "ef" {
+					t.Fatalf("seek read=%q, %v", data, err)
+				}
+			}
+			if err := opened.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assertGateRetired(t, gate, "key")
+		})
+	}
+}
 
 func TestGateWaitsForOpenedBodyBeforeDeletion(t *testing.T) {
 	gate := NewGate()
@@ -69,7 +178,7 @@ func TestGateHoldReadProtectsMultipleOpensAsOneOperation(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	cancel()
-	if err := waitForGateResult(t, canceledDeleteDone, "canceled deletion"); !errors.Is(err, context.Canceled) {
+	if err := waitForGateResult(t, canceledDeleteDone, "canceled deletion"); !errors.Is(err, context.Canceled) || errors.Is(err, ErrDeletionBusy) {
 		t.Fatalf("canceled deletion error = %v, want context.Canceled", err)
 	}
 	if canceledDeleteCalled.Load() {

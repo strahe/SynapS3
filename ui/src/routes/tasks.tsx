@@ -55,6 +55,7 @@ const taskOperations = [
   { value: 'wallet_operation', label: taskOperationLabel('wallet_operation') },
   { value: 'provider_upload_speed_test', label: taskOperationLabel('provider_upload_speed_test') },
   { value: 'cache_capacity_reconcile', label: taskOperationLabel('cache_capacity_reconcile') },
+  { value: 'cache_local_reconcile', label: taskOperationLabel('cache_local_reconcile') },
   { value: 'observability_refresh', label: taskOperationLabel('observability_refresh') },
   { value: 'approved_provider_refresh', label: taskOperationLabel('approved_provider_refresh') },
   { value: 'endorsed_provider_refresh', label: taskOperationLabel('endorsed_provider_refresh') },

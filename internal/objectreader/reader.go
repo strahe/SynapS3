@@ -109,12 +109,12 @@ func New(
 	return r
 }
 
-func (r *Reader) Open(ctx context.Context, bucketName, key string, visible BucketVisibility) (*Result, error) {
-	return r.open(ctx, bucketName, key, visible, true, false)
+func (r *Reader) Open(ctx context.Context, bucketName, key string, visible BucketVisibility, check ...func(*model.ObjectVersion) error) (*Result, error) {
+	return r.open(ctx, bucketName, key, visible, true, false, check...)
 }
 
-func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility) (*Result, error) {
-	return r.openVersion(ctx, bucketName, key, versionID, visible, true)
+func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility, check ...func(*model.ObjectVersion) error) (*Result, error) {
+	return r.openVersion(ctx, bucketName, key, versionID, visible, true, check...)
 }
 
 // OpenVersionForCopy opens an explicit version without rehydrating a missing source cache entry.
@@ -122,7 +122,7 @@ func (r *Reader) OpenVersionForCopy(ctx context.Context, bucketName, key, versio
 	return r.openVersion(ctx, bucketName, key, versionID, visible, false)
 }
 
-func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility, rehydrate bool) (*Result, error) {
+func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility, rehydrate bool, check ...func(*model.ObjectVersion) error) (*Result, error) {
 	if versionID == "" {
 		return nil, ErrInvalidArgument
 	}
@@ -147,6 +147,14 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 	}
 	if version.IsDeleteMarker {
 		return nil, ErrMethodNotAllowed
+	}
+
+	for _, checkVersion := range check {
+		if checkVersion != nil {
+			if err := checkVersion(version); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	body, cacheErr := r.openCached(ctx, bucketName, version)
@@ -179,7 +187,7 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 	return resultFromVersion(version, body, SourceProvider, true), nil
 }
 
-func (r *Reader) open(ctx context.Context, bucketName, key string, visible BucketVisibility, allowRestart bool, cacheMiss bool) (*Result, error) {
+func (r *Reader) open(ctx context.Context, bucketName, key string, visible BucketVisibility, allowRestart bool, cacheMiss bool, check ...func(*model.ObjectVersion) error) (*Result, error) {
 	if r == nil || r.repos == nil || r.cache == nil || bucketName == "" || visible == nil {
 		return nil, ErrInvalidArgument
 	}
@@ -201,6 +209,14 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 	}
 	if version.IsDeleteMarker {
 		return nil, ErrNoSuchKey
+	}
+
+	for _, checkVersion := range check {
+		if checkVersion != nil {
+			if err := checkVersion(version); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	body, cacheErr := r.openCached(ctx, bucketName, version)
@@ -228,7 +244,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 	if dbErr == nil && (cur == nil || cur.VersionID != version.VersionID) {
 		_ = rc.Close()
 		if allowRestart && cur != nil {
-			return r.open(ctx, bucketName, key, visible, false, true)
+			return r.open(ctx, bucketName, key, visible, false, true, check...)
 		}
 		return nil, cacheMissError(ErrNoSuchKey)
 	}

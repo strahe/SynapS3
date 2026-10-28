@@ -334,7 +334,7 @@ func TestPathTraversal(t *testing.T) {
 		t.Errorf("DeleteBucketDir dot bucket: err = %v, want ErrInvalidPath", err)
 	}
 
-	_, err = fs.PutPart(ctx, "../upload-escape", 1, strings.NewReader("bad"), 3)
+	_, err = putPart(fs, ctx, "../upload-escape", 1, strings.NewReader("bad"), 3)
 	if err != ErrInvalidPath {
 		t.Errorf("PutPart traversal upload: err = %v, want ErrInvalidPath", err)
 	}
@@ -425,14 +425,14 @@ func TestPutPartCapacityEnforcement(t *testing.T) {
 		t.Fatalf("NewFilesystem: %v", err)
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 1, strings.NewReader("12345678"), 8); err != nil {
+	if _, err := putPart(fs, ctx, "up-cap", 1, strings.NewReader("12345678"), 8); err != nil {
 		t.Fatalf("PutPart within capacity: %v", err)
 	}
 	if fs.UsedBytes() != 8 {
 		t.Fatalf("UsedBytes after first part = %d, want 8", fs.UsedBytes())
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 2, strings.NewReader("12345"), 5); err != ErrCacheFull {
+	if _, err := putPart(fs, ctx, "up-cap", 2, strings.NewReader("12345"), 5); err != ErrCacheFull {
 		t.Fatalf("PutPart over capacity err = %v, want ErrCacheFull", err)
 	}
 	if fs.UsedBytes() != 8 {
@@ -446,14 +446,14 @@ func TestPutPartCapacityEnforcement(t *testing.T) {
 		t.Fatalf("failed part exists: %v", err)
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 1, strings.NewReader("ab"), 2); err != nil {
+	if _, err := putPart(fs, ctx, "up-cap", 1, strings.NewReader("ab"), 2); err != nil {
 		t.Fatalf("PutPart overwrite within capacity: %v", err)
 	}
 	if fs.UsedBytes() != 2 {
 		t.Fatalf("UsedBytes after smaller overwrite = %d, want 2", fs.UsedBytes())
 	}
 
-	if _, err := fs.PutPart(ctx, "up-cap", 2, strings.NewReader("12345"), 5); err != nil {
+	if _, err := putPart(fs, ctx, "up-cap", 2, strings.NewReader("12345"), 5); err != nil {
 		t.Fatalf("PutPart after freeing space: %v", err)
 	}
 	if fs.UsedBytes() != 7 {
@@ -470,10 +470,10 @@ func TestAssemblePartsCapacityEnforcement(t *testing.T) {
 		t.Fatalf("NewFilesystem: %v", err)
 	}
 
-	if _, err := fs.PutPart(ctx, "up-assemble-cap", 1, strings.NewReader("12345"), 5); err != nil {
+	if _, err := putPart(fs, ctx, "up-assemble-cap", 1, strings.NewReader("12345"), 5); err != nil {
 		t.Fatalf("PutPart 1: %v", err)
 	}
-	if _, err := fs.PutPart(ctx, "up-assemble-cap", 2, strings.NewReader("67890"), 5); err != nil {
+	if _, err := putPart(fs, ctx, "up-assemble-cap", 2, strings.NewReader("67890"), 5); err != nil {
 		t.Fatalf("PutPart 2: %v", err)
 	}
 	if fs.UsedBytes() != 10 {
@@ -595,7 +595,7 @@ func TestWriteRejectsBodyLongerThanDeclaredSize(t *testing.T) {
 			return err
 		}},
 		{name: "PutPart", write: func(fs *Filesystem, body string, size int64) error {
-			_, err := fs.PutPart(ctx, "upload", 1, strings.NewReader(body), size)
+			_, err := putPart(fs, ctx, "upload", 1, strings.NewReader(body), size)
 			return err
 		}},
 	}
@@ -744,7 +744,7 @@ func TestPutPartAndAssemble(t *testing.T) {
 	part1Data := []byte("hello ")
 	part2Data := []byte("world")
 
-	info1, err := fs.PutPart(ctx, "upload-1", 1, bytes.NewReader(part1Data), int64(len(part1Data)))
+	info1, err := putPart(fs, ctx, "upload-1", 1, bytes.NewReader(part1Data), int64(len(part1Data)))
 	if err != nil {
 		t.Fatalf("PutPart 1: %v", err)
 	}
@@ -756,7 +756,7 @@ func TestPutPartAndAssemble(t *testing.T) {
 		t.Errorf("PutPart 1 ETag wrong")
 	}
 
-	info2, err := fs.PutPart(ctx, "upload-1", 2, bytes.NewReader(part2Data), int64(len(part2Data)))
+	info2, err := putPart(fs, ctx, "upload-1", 2, bytes.NewReader(part2Data), int64(len(part2Data)))
 	if err != nil {
 		t.Fatalf("PutPart 2: %v", err)
 	}
@@ -821,13 +821,13 @@ func TestPutPartOverwrite(t *testing.T) {
 	data1 := []byte("version1")
 	data2 := []byte("v2")
 
-	_, _ = fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data1), int64(len(data1)))
+	_, _ = putPart(fs, ctx, "up-ow", 1, bytes.NewReader(data1), int64(len(data1)))
 	if fs.UsedBytes() != int64(len(data1)) {
 		t.Errorf("UsedBytes = %d, want %d", fs.UsedBytes(), len(data1))
 	}
 
 	// Overwrite same part
-	info, err := fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data2), int64(len(data2)))
+	info, err := putPart(fs, ctx, "up-ow", 1, bytes.NewReader(data2), int64(len(data2)))
 	if err != nil {
 		t.Fatalf("PutPart overwrite: %v", err)
 	}
@@ -876,7 +876,7 @@ func TestDeleteDoesNotWaitForPartBodyOnSharedShard(t *testing.T) {
 	body := &stalledBody{first: []byte("part"), started: make(chan struct{}), released: make(chan struct{})}
 	putErr := make(chan error, 1)
 	go func() {
-		_, err := fs.PutPart(ctx, "up-slow", 1, body, 4)
+		_, err := putPart(fs, ctx, "up-slow", 1, body, 4)
 		putErr <- err
 	}()
 	<-body.started
@@ -906,8 +906,8 @@ func TestDeleteUpload(t *testing.T) {
 	fs := newTestCache(t)
 	ctx := context.Background()
 
-	_, _ = fs.PutPart(ctx, "up-del", 1, strings.NewReader("aaa"), 3)
-	_, _ = fs.PutPart(ctx, "up-del", 2, strings.NewReader("bbbbb"), 5)
+	_, _ = putPart(fs, ctx, "up-del", 1, strings.NewReader("aaa"), 3)
+	_, _ = putPart(fs, ctx, "up-del", 2, strings.NewReader("bbbbb"), 5)
 
 	if fs.UsedBytes() != 8 {
 		t.Fatalf("UsedBytes = %d, want 8", fs.UsedBytes())
@@ -938,8 +938,8 @@ func TestAssemblePartsUsedBytes(t *testing.T) {
 
 	p1 := []byte("part1")
 	p2 := []byte("part2")
-	_, _ = fs.PutPart(ctx, "up-ub", 1, bytes.NewReader(p1), int64(len(p1)))
-	_, _ = fs.PutPart(ctx, "up-ub", 2, bytes.NewReader(p2), int64(len(p2)))
+	_, _ = putPart(fs, ctx, "up-ub", 1, bytes.NewReader(p1), int64(len(p1)))
+	_, _ = putPart(fs, ctx, "up-ub", 2, bytes.NewReader(p2), int64(len(p2)))
 	partsSize := int64(len(p1) + len(p2))
 
 	staged, _, err := fs.AssemblePartsStaged(ctx, "bkt", "key", "up-ub", []int{1, 2})
@@ -1114,7 +1114,7 @@ func TestStagedCommitFailsWhenDirectorySyncFails(t *testing.T) {
 		}},
 		{"assemble", func(t *testing.T, fs *Filesystem) *StagedObject {
 			for i, part := range []string{"cac", "hed"} {
-				if _, err := fs.PutPart(ctx, "up-sync", i+1, strings.NewReader(part), 3); err != nil {
+				if _, err := putPart(fs, ctx, "up-sync", i+1, strings.NewReader(part), 3); err != nil {
 					t.Fatalf("PutPart: %v", err)
 				}
 			}
@@ -1153,4 +1153,149 @@ func TestStagedCommitFailsWhenDirectorySyncFails(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestPartStagedCommitRestoresExistingPartAfterSyncFailure(t *testing.T) {
+	ctx := t.Context()
+	fs, err := NewFilesystem(t.TempDir(), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := putPart(fs, ctx, "up-sync", 1, strings.NewReader("old"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := fs.PutPartStaged(ctx, "up-sync", 1, strings.NewReader("new-data"), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = staged.Rollback() }()
+	original := syncDir
+	syncErr := errors.New("directory sync failed")
+	calls := 0
+	syncDir = func(dir string) error {
+		calls++
+		if calls == 1 {
+			return syncErr
+		}
+		return original(dir)
+	}
+	t.Cleanup(func() { syncDir = original })
+	err = staged.Commit()
+	syncDir = original
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("Commit = %v, want %v", err, syncErr)
+	}
+	if err := staged.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	assertPart := func(want string) {
+		t.Helper()
+		got, err := os.ReadFile(old.Path)
+		if err != nil || string(got) != want {
+			t.Fatalf("part = %q, %v; want %q", got, err, want)
+		}
+		if snapshot := fs.CapacitySnapshot(); snapshot.UsedBytes != int64(len(want)) || snapshot.ReservedBytes != 0 {
+			t.Fatalf("capacity = %+v; want used %d and nothing reserved", snapshot, len(want))
+		}
+		entries, err := os.ReadDir(filepath.Dir(old.Path))
+		if err != nil || len(entries) != 1 || entries[0].Name() != "1" {
+			t.Fatalf("upload entries = %v, %v; want only part 1", entries, err)
+		}
+	}
+	assertPart("old")
+	assembled, etags, err := fs.AssemblePartsStaged(ctx, "bkt", "assembled", "up-sync", []int{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = assembled.Rollback() }()
+	if len(etags) != 1 || etags[0] != old.ETag || assembled.Info.Size != old.Size || assembled.Info.Checksum != old.Checksum {
+		t.Fatalf("assembled = %+v, etags = %v; want existing part %+v", assembled.Info, etags, old)
+	}
+	if err := assembled.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := putPart(fs, ctx, "up-sync", 1, strings.NewReader("new-data"), 8); err != nil {
+		t.Fatal(err)
+	}
+	assertPart("new-data")
+	if err := fs.DeleteUpload(ctx, "up-sync"); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := fs.CapacitySnapshot(); snapshot.UsedBytes != 0 || snapshot.ReservedBytes != 0 {
+		t.Fatalf("capacity after DeleteUpload = %+v, want zero", snapshot)
+	}
+}
+
+func TestPartStagedCommitAccountsForFailedRestore(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("requires directory write permissions to be enforced")
+	}
+	ctx := t.Context()
+	fs, err := NewFilesystem(t.TempDir(), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := putPart(fs, ctx, "up-restore", 1, strings.NewReader("old"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := fs.PutPartStaged(ctx, "up-restore", 1, strings.NewReader("new-data"), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = staged.Rollback() }()
+	dir := filepath.Dir(old.Path)
+	original := syncDir
+	t.Cleanup(func() {
+		syncDir = original
+		if err := os.Chmod(dir, 0o700); err != nil && !os.IsNotExist(err) {
+			t.Error(err)
+		}
+	})
+	syncErr := errors.New("directory sync failed")
+	var chmodErr error
+	syncDir = func(string) error {
+		chmodErr = os.Chmod(dir, 0o500)
+		return errors.Join(syncErr, chmodErr)
+	}
+	err = staged.Commit()
+	syncDir = original
+	if chmodErr != nil {
+		t.Fatal(chmodErr)
+	}
+	if !errors.Is(err, syncErr) || !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Commit = %v; want sync and restore permission errors", err)
+	}
+	if err := staged.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := fs.CapacitySnapshot(); snapshot.UsedBytes != 11 || snapshot.ReservedBytes != 0 {
+		t.Fatalf("capacity = %+v; want both parts charged and nothing reserved", snapshot)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("upload entries = %v, %v; want retained old and new parts", entries, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.DeleteUpload(ctx, "up-restore"); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := fs.CapacitySnapshot(); snapshot.UsedBytes != 0 || snapshot.ReservedBytes != 0 {
+		t.Fatalf("capacity after DeleteUpload = %+v, want zero", snapshot)
+	}
+}
+
+func putPart(f *Filesystem, ctx context.Context, uploadID string, partNumber int, body io.Reader, size int64) (*ObjectInfo, error) {
+	staged, err := f.PutPartStaged(ctx, uploadID, partNumber, body, size)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = staged.Rollback() }()
+	if err := staged.Commit(); err != nil {
+		return nil, err
+	}
+	return staged.Info, nil
 }

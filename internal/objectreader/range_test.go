@@ -60,3 +60,39 @@ func TestCachedRangeStopsAtRequestedLength(t *testing.T) {
 		t.Fatalf("range body = %q, %v; want cde", got, err)
 	}
 }
+
+type countedSeekSource struct {
+	*bytes.Reader
+	readBytes int
+	seekErr   error
+}
+
+func (s *countedSeekSource) Read(p []byte) (int, error) {
+	n, err := s.Reader.Read(p)
+	s.readBytes += n
+	return n, err
+}
+
+func (s *countedSeekSource) Seek(offset int64, whence int) (int64, error) {
+	if s.seekErr != nil {
+		return 0, s.seekErr
+	}
+	return s.Reader.Seek(offset, whence)
+}
+
+func (*countedSeekSource) Close() error { return nil }
+
+func TestCachedRangeSeeksWithoutReadingPrefix(t *testing.T) {
+	source := &countedSeekSource{Reader: bytes.NewReader(bytes.Repeat([]byte("x"), 1024*1024))}
+	body := newRangeReadCloser(source, 1024*1024-1, 1, false)
+	defer func() { _ = body.Close() }()
+	got, err := io.ReadAll(body)
+	if err != nil || string(got) != "x" || source.readBytes != 1 {
+		t.Fatalf("range = %q, %v; read %d bytes", got, err, source.readBytes)
+	}
+	source.seekErr = errors.New("seek failed")
+	body = newRangeReadCloser(source, 1, 1, false)
+	if _, err := body.Read(make([]byte, 1)); !errors.Is(err, source.seekErr) {
+		t.Fatalf("seek error = %v", err)
+	}
+}

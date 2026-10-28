@@ -51,9 +51,9 @@ type cacheEvictionCheckpoint struct {
 
 func (h *EvictHandler) newHandler() *taskengine.FuncHandler {
 	definition := taskengine.Definition{
-		Type: model.TaskTypeCacheEvict, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect,
+		Type: model.TaskTypeCacheEvict, InputVersion: 1, WorkStart: taskengine.WorkStartOnEffect, MaxConcurrency: 2,
 		Codec:  taskengine.StrictJSONCodec(cacheeviction.ValidateEvictInput),
-		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy()}, AllowRetry: true,
+		Policy: taskengine.ExecutionPolicy{MaxAttempts: 6, Backoff: taskengine.DefaultBackoffPolicy(), InvocationTimeout: 2 * time.Minute}, AllowRetry: true,
 		Identity: taskengine.IdentityFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) (int64, int64) {
 			return input.ContentID, input.Generation
 		}),
@@ -127,6 +127,9 @@ func (h *EvictHandler) runCacheEviction(
 		}
 		result = h.deleteAuthorizedCacheEntry(ctx, execution, input, allowDelete)
 	}); err != nil {
+		if errors.Is(err, cacheaccess.ErrDeletionBusy) {
+			return taskengine.Wait(execution.Mode(), "cache_busy", "Waiting for cache access to finish", nil)
+		}
 		return h.retryCacheEviction(execution, input, err, "cache_lock_failed")
 	}
 	return result

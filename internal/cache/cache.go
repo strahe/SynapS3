@@ -106,11 +106,9 @@ type Cache interface {
 	// Returns ErrInvalidPath if bucket would escape the cache root.
 	DeleteBucketDir(ctx context.Context, bucket string) error
 
-	// PutPart writes a multipart upload part to the cache.
-	// Parts are stored under .multipart/<uploadID>/<partNumber>.
-	// size bounds and reserves the part as in Put.
-	// Returns ObjectInfo with the part's Size, ETag (MD5), and Checksum (SHA-256).
-	PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*ObjectInfo, error)
+	// PutPartStaged reserves and writes a part beside its final upload path.
+	// Commit publishes the part; Rollback releases an unpublished reservation.
+	PutPartStaged(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*StagedObject, error)
 
 	// AssemblePartsStaged concatenates the specified parts in order into a
 	// staged file next to bucket/key, plus the ordered list of individual part

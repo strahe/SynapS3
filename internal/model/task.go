@@ -22,6 +22,7 @@ const (
 	TaskTypeStorageCommit                 TaskType = "storage_commit"
 	TaskTypeProviderReplacementCoordinate TaskType = "provider_replacement_coordinate"
 	TaskTypeCacheCapacityReconcile        TaskType = "cache_capacity_reconcile"
+	TaskTypeCacheLocalReconcile           TaskType = "cache_local_reconcile"
 	TaskTypeCacheEvict                    TaskType = "cache_evict"
 	TaskTypeCacheReconcileDurability      TaskType = "cache_reconcile_durability"
 	TaskTypeStorageCleanup                TaskType = "storage_cleanup"
@@ -46,7 +47,7 @@ const (
 
 // RecurringSystemTaskTypes returns the scheduled maintenance task types.
 func RecurringSystemTaskTypes() []TaskType {
-	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeObservabilityRefresh, TaskTypeApprovedProviderRefresh, TaskTypeEndorsedProviderRefresh}
+	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeCacheLocalReconcile, TaskTypeObservabilityRefresh, TaskTypeApprovedProviderRefresh, TaskTypeEndorsedProviderRefresh}
 }
 
 // IsRecurringSystem reports whether the task is a perpetual maintenance loop

@@ -23,6 +23,7 @@ type Repositories struct {
 	Tasks               TaskRepository
 	TaskSchedules       TaskScheduleRepository
 	CacheEvictions      CacheEvictionRepository
+	CacheLocal          CacheLocalRepository
 	Multiparts          MultipartUploadRepository
 	WalletOperations    WalletOperationRepository
 	Observability       ObservabilityRepository
@@ -46,6 +47,7 @@ func NewRepositories(db bun.IDB) *Repositories {
 		Tasks:               &BunTaskRepo{db: db},
 		TaskSchedules:       &BunTaskScheduleRepo{db: db},
 		CacheEvictions:      &BunCacheEvictionRepo{db: db},
+		CacheLocal:          NewBunCacheLocalRepo(db),
 		Multiparts:          &BunMultipartRepo{db: db},
 		WalletOperations:    &BunWalletOperationRepo{db: db},
 		Observability:       &BunObservabilityRepo{db: db},

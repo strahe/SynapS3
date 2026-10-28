@@ -153,7 +153,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("creating cleanup scheduler: %w", err)
 	}
-	cacheScheduler, err := service.Scheduler("cache", model.TaskTypeCacheCapacityReconcile, model.TaskTypeCacheEvict, model.TaskTypeCacheReconcileDurability)
+	cacheScheduler, err := service.Scheduler("cache", model.TaskTypeCacheLocalReconcile, model.TaskTypeCacheCapacityReconcile, model.TaskTypeCacheEvict, model.TaskTypeCacheReconcileDurability)
 	if err != nil {
 		return points, fmt.Errorf("creating cache scheduler: %w", err)
 	}
@@ -228,6 +228,14 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing commitHandler: %w", err)
 	}
+	local, err := cachetask.NewLocalHandler(cachetask.LocalDependencies{
+		Repositories: deps.Repositories, Cache: deps.Cache, CacheGate: deps.CacheGate,
+		CacheTracker: deps.CacheTracker, Scheduler: cacheScheduler,
+		EvictionPolicy: deps.EvictionPolicy, Logger: deps.Logger,
+	})
+	if err != nil {
+		return points, fmt.Errorf("constructing local cache maintenance: %w", err)
+	}
 	capacity, err := cachetask.NewCapacityHandler(cachetask.CapacityDependencies{Repositories: deps.Repositories, Cache: deps.Cache, CacheTracker: deps.CacheTracker, EvictionPolicy: deps.EvictionPolicy, MaxCacheBytes: deps.MaxCacheBytes, MaxWriteBytes: deps.MaxWriteBytes, LRUHighPercent: deps.LRUHighPercent, LRULowPercent: deps.LRULowPercent, CommitSealOnCachePressure: deps.CommitSealOnCachePressure, Scheduler: cacheScheduler, State: state, PressureListener: commitHandler})
 	if err != nil {
 		return points, fmt.Errorf("constructing capacity: %w", err)
@@ -300,7 +308,7 @@ func Register(registry *taskengine.Registry, service *taskengine.Service, deps D
 	if err != nil {
 		return points, fmt.Errorf("constructing speed: %w", err)
 	}
-	for _, handler := range []taskengine.Handler{commitHandler, capacity, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, removalHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
+	for _, handler := range []taskengine.Handler{commitHandler, capacity, local, evict, durability, plan, store, pull, ensure, retire, bucketHandler, uploadHandler, replacementHandler, cleanupHandler, removalHandler, walletHandler, observabilityHandler, approved, endorsed, speed} {
 		if deps.DecorateTaskHandler != nil {
 			handler = deps.DecorateTaskHandler(handler)
 		}

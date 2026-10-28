@@ -26,12 +26,12 @@ type BunObjectRepo struct {
 
 var _ ObjectRepository = (*BunObjectRepo)(nil)
 
-func (r *BunObjectRepo) CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (int64, error) {
+func (r *BunObjectRepo) CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion, conditions ...ObjectCondition) (int64, error) {
 	var objectID int64
 	_, canRestartTx := r.db.(*bun.DB)
 	for attempt := 0; ; attempt++ {
 		err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-			id, err := createVersionAndSetCurrent(ctx, db, version)
+			id, err := createVersionAndSetCurrent(ctx, db, version, conditions...)
 			objectID = id
 			return err
 		})
@@ -108,7 +108,7 @@ func (r *BunObjectRepo) CreateRestoredVersionAndSetCurrent(ctx context.Context, 
 	}
 }
 
-func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error) {
+func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string, conditions ...ObjectCondition) (*model.ObjectVersion, error) {
 	if bucketID == 0 || key == "" || versionID == "" {
 		return nil, fmt.Errorf("creating delete marker: %w", ErrInvalidInput)
 	}
@@ -126,7 +126,7 @@ func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, buc
 	_, canRestartTx := r.db.(*bun.DB)
 	for attempt := 0; ; attempt++ {
 		err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-			return createDeleteMarkerAndSetCurrent(ctx, db, marker)
+			return createDeleteMarkerAndSetCurrent(ctx, db, marker, conditions...)
 		})
 		if err == nil {
 			return marker, nil
@@ -145,12 +145,12 @@ func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, buc
 	}
 }
 
-func (r *BunObjectRepo) DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error {
+func (r *BunObjectRepo) DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string, conditions ...ObjectCondition) error {
 	if bucketID == 0 || key == "" || versionID == "" {
 		return fmt.Errorf("deleting marker version: %w", ErrInvalidInput)
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		return deleteMarkerVersion(ctx, db, bucketID, key, versionID)
+		return deleteMarkerVersion(ctx, db, bucketID, key, versionID, conditions...)
 	})
 }
 
@@ -193,6 +193,9 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 		}
 		if version.IsDeleteMarker {
 			return ErrConflict
+		}
+		if err := checkObjectConditions(version, []ObjectCondition{input.Condition}); err != nil {
+			return err
 		}
 		if err := objectVersionPermanentDeleteStateError(version.State); err != nil {
 			return err
@@ -682,6 +685,14 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 }
 
 func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error) {
+	return r.listVersionsByBucket(ctx, bucketID, prefix, keyMarker, versionIDMarker, maxKeys, false)
+}
+
+func (r *BunObjectRepo) ListVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix, fromKey string, maxKeys int) ([]ObjectVersionListItem, error) {
+	return r.listVersionsByBucket(ctx, bucketID, prefix, fromKey, "", maxKeys, true)
+}
+
+func (r *BunObjectRepo) listVersionsByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, versionIDMarker string, maxKeys int, inclusive bool) ([]ObjectVersionListItem, error) {
 	var rows []ObjectVersionListItem
 	keyExpr := keyOrderExpr("object_version.key")
 	q := r.db.NewSelect().
@@ -698,7 +709,11 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 	}
 	if keyMarker != "" {
 		if versionIDMarker == "" {
-			q = q.Where(keyComparisonSQL("object_version.key", ">"), keyMarker)
+			op := ">"
+			if inclusive {
+				op = ">="
+			}
+			q = q.Where(keyComparisonSQL("object_version.key", op), keyMarker)
 		} else {
 			marker, err := r.GetVersionByBucketKeyAndID(ctx, bucketID, keyMarker, versionIDMarker)
 			if err != nil {
@@ -1363,7 +1378,7 @@ func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, versio
 	return result, nil
 }
 
-func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (int64, error) {
+func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.ObjectVersion, conditions ...ObjectCondition) (int64, error) {
 	normalizeObjectVersion(version)
 	if err := prepareNewObjectVersionStorageReference(ctx, db, version); err != nil {
 		return 0, fmt.Errorf("preparing object version storage reference: %w", err)
@@ -1374,6 +1389,10 @@ func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.
 	existing, err := selectObjectByBucketAndKey(ctx, db, version.BucketID, version.Key)
 	if err != nil && err != sql.ErrNoRows {
 		return 0, fmt.Errorf("checking existing object: %w", err)
+	}
+
+	if err := checkCurrentObjectConditions(ctx, db, version.BucketID, version.Key, conditions); err != nil {
+		return 0, err
 	}
 
 	result, err := createVersionAndSetCurrentFromExisting(ctx, db, version, existing, err)
@@ -1513,7 +1532,7 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 	}, nil
 }
 
-func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *model.ObjectVersion) error {
+func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *model.ObjectVersion, conditions ...ObjectCondition) error {
 	now := time.Now()
 	if err := lockCurrentObjectIfExists(ctx, db, marker.BucketID, marker.Key); err != nil {
 		return err
@@ -1521,6 +1540,9 @@ func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *mo
 	existing, err := selectObjectByBucketAndKey(ctx, db, marker.BucketID, marker.Key)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("checking existing object: %w", err)
+	}
+	if err := checkCurrentObjectConditions(ctx, db, marker.BucketID, marker.Key, conditions); err != nil {
+		return err
 	}
 	if err == sql.ErrNoRows {
 		obj := objectIdentityFromVersion(marker)
@@ -1574,7 +1596,7 @@ func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *mo
 	return nil
 }
 
-func deleteMarkerVersion(ctx context.Context, db bun.IDB, bucketID int64, key string, versionID string) error {
+func deleteMarkerVersion(ctx context.Context, db bun.IDB, bucketID int64, key string, versionID string, conditions ...ObjectCondition) error {
 	if err := lockCurrentObjectIfExists(ctx, db, bucketID, key); err != nil {
 		return err
 	}
@@ -1587,6 +1609,9 @@ func deleteMarkerVersion(ctx context.Context, db bun.IDB, bucketID int64, key st
 	}
 	if !version.IsDeleteMarker {
 		return fmt.Errorf("deleting marker version: %w", ErrInvalidInput)
+	}
+	if err := checkObjectConditions(version, conditions); err != nil {
+		return err
 	}
 
 	// The object's pointer has to leave this version before the row can go.
@@ -1736,6 +1761,7 @@ func selectObjectByBucketAndKey(ctx context.Context, db bun.IDB, bucketID int64,
 	err := db.NewSelect().
 		Model(obj).
 		Where("bucket_id = ? AND key = ?", bucketID, key).
+		For("NO KEY UPDATE").
 		Scan(ctx)
 	if err != nil {
 		return nil, err

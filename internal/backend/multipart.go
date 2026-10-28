@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
@@ -113,7 +114,18 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		return nil, objectSizeAPIError(&objectlimits.SizeError{Size: *input.ContentLength, Err: objectlimits.ErrTooLarge})
 	}
 
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(b.transferCounters.WrapReader(observability.ClientUpload, input.Body)), declaredWriteSize(input.ContentLength))
+	body, err := withWriteChecksum(input.Body, writeChecksums{
+		CRC32: input.ChecksumCRC32, CRC32C: input.ChecksumCRC32C,
+		SHA1: input.ChecksumSHA1, SHA256: input.ChecksumSHA256,
+		CRC64NVME: input.ChecksumCRC64NVME, SHA512: input.ChecksumSHA512,
+		MD5: input.ChecksumMD5, XXHASH64: input.ChecksumXXHASH64,
+		XXHASH3: input.ChecksumXXHASH3, XXHASH128: input.ChecksumXXHASH128,
+	})
+	if err != nil {
+		return nil, contentWriteError(err)
+	}
+
+	staged, err := b.cache.PutPartStaged(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(b.transferCounters.WrapReader(observability.ClientUpload, body)), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {
 			return nil, objectSizeAPIError(err)
@@ -121,15 +133,10 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		return nil, contentWriteError(fmt.Errorf("caching part: %w", err))
 	}
 
-	part := &model.MultipartPart{
-		UploadID:   *input.UploadId,
-		PartNumber: partNum,
-		Size:       cacheInfo.Size,
-		ETag:       cacheInfo.ETag,
-		Checksum:   &cacheInfo.Checksum,
-	}
-	if err := b.repos.Multiparts.CreatePart(ctx, part); err != nil {
-		return nil, fmt.Errorf("recording part: %w", err)
+	defer func() { _ = staged.Rollback() }()
+	cacheInfo, err := b.publishPart(ctx, *input.Bucket, *input.Key, *input.UploadId, partNum, staged)
+	if err != nil {
+		return nil, err
 	}
 
 	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
@@ -181,18 +188,24 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 		return s3response.CopyPartResult{}, s3err.GetInvalidArgumentErr(s3err.InvalidArgCopySourceObject, *input.CopySource)
 	}
 
+	check := func(version *model.ObjectVersion) error {
+		return evaluateReadConditions(version.ETag, version.CreatedAt, versitybackend.PreConditions{
+			IfMatch: input.CopySourceIfMatch, IfNoneMatch: input.CopySourceIfNoneMatch,
+			IfModSince: input.CopySourceIfModifiedSince, IfUnmodeSince: input.CopySourceIfUnmodifiedSince,
+		}, true)
+	}
 	var srcResult *objectreader.Result
 	if srcVersionID != "" {
-		srcResult, err = b.objectReader.OpenVersion(ctx, srcBucketName, srcKey, srcVersionID, objectreader.S3Visibility)
+		srcResult, err = b.objectReader.OpenVersion(ctx, srcBucketName, srcKey, srcVersionID, objectreader.S3Visibility, check)
 	} else {
-		srcResult, err = b.objectReader.Open(ctx, srcBucketName, srcKey, objectreader.S3Visibility)
+		srcResult, err = b.objectReader.Open(ctx, srcBucketName, srcKey, objectreader.S3Visibility, check)
 	}
 	if err != nil {
 		return s3response.CopyPartResult{}, b.objectReaderError(err)
 	}
 	defer func() { _ = srcResult.Body.Close() }()
 
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(srcResult.Body), srcResult.Size)
+	staged, err := b.cache.PutPartStaged(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(srcResult.Body), srcResult.Size)
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {
 			return s3response.CopyPartResult{}, objectSizeAPIError(err)
@@ -200,15 +213,13 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 		return s3response.CopyPartResult{}, contentWriteError(fmt.Errorf("caching copied part: %w", err))
 	}
 
-	part := &model.MultipartPart{
-		UploadID:   *input.UploadId,
-		PartNumber: partNum,
-		Size:       cacheInfo.Size,
-		ETag:       cacheInfo.ETag,
-		Checksum:   &cacheInfo.Checksum,
+	defer func() { _ = staged.Rollback() }()
+	if err := srcResult.Body.Close(); err != nil {
+		return s3response.CopyPartResult{}, err
 	}
-	if err := b.repos.Multiparts.CreatePart(ctx, part); err != nil {
-		return s3response.CopyPartResult{}, fmt.Errorf("recording copied part: %w", err)
+	cacheInfo, err := b.publishPart(ctx, *input.Bucket, *input.Key, *input.UploadId, partNum, staged)
+	if err != nil {
+		return s3response.CopyPartResult{}, err
 	}
 
 	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
@@ -218,6 +229,31 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 		LastModified:        now,
 		CopySourceVersionId: srcResult.VersionID,
 	}, nil
+}
+
+func (b *SynapseBackend) publishPart(ctx context.Context, bucket, key, uploadID string, partNumber int, staged *cache.StagedObject) (*cache.ObjectInfo, error) {
+	release, err := b.cacheGate.HoldUpload(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	upload, err := b.getActiveUpload(ctx, uploadID, bucket)
+	if err != nil {
+		return nil, err
+	}
+	if upload.Key != key {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	if err := staged.Commit(); err != nil {
+		return nil, contentWriteError(err)
+	}
+	info := staged.Info
+	if err := b.repos.Multiparts.CreatePart(ctx, &model.MultipartPart{
+		UploadID: uploadID, PartNumber: partNumber, Size: info.Size, ETag: info.ETag, Checksum: &info.Checksum,
+	}); err != nil {
+		return nil, fmt.Errorf("recording part: %w", err)
+	}
+	return info, nil
 }
 
 func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
@@ -243,6 +279,12 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	bucketName := *input.Bucket
 	keyName := *input.Key
 	uploadID := *input.UploadId
+
+	release, err := b.cacheGate.HoldUpload(ctx, uploadID)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	defer release()
 
 	upload, err := b.getActiveUpload(ctx, uploadID, bucketName)
 	if err != nil {
@@ -328,12 +370,21 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 
 	// Assemble into a staged file; the destination is content-addressed and
 	// only nameable once the assembled checksum resolves a content row.
-	staged, _, err := b.cache.AssemblePartsStaged(ctx, bucketName, stagingCacheKey(versionID), uploadID, partNumbers)
+	staged, assembledETags, err := b.cache.AssemblePartsStaged(ctx, bucketName, stagingCacheKey(versionID), uploadID, partNumbers)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", contentWriteError(fmt.Errorf("assembling parts: %w", err))
 	}
 	defer func() { _ = staged.Rollback() }()
 	cacheInfo := staged.Info
+
+	if cacheInfo.Size != totalSize || len(assembledETags) != len(partNumbers) {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+	}
+	for i, pn := range partNumbers {
+		if assembledETags[i] != dbPartMap[pn].ETag {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+	}
 
 	// Compute S3 multipart ETag from DB-recorded ETags (source of truth, not re-derived from files)
 	orderedETags := make([]string, len(partNumbers))
@@ -363,11 +414,6 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		}
 		cacheCommitted = true
 		return b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-			state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
-			if err != nil {
-				return err
-			}
-
 			version := &model.ObjectVersion{
 				VersionID:         versionID,
 				BucketID:          upload.BucketID,
@@ -380,11 +426,11 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 				MultipartUploadID: &uploadID,
 				ContentID:         &content.ID,
 			}
-			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version, writeObjectCondition(input.IfMatch, input.IfNoneMatch))
 			if err != nil {
 				return fmt.Errorf("creating assembled object version: %w", err)
 			}
-			if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state); err != nil {
+			if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID); err != nil {
 				return err
 			}
 
@@ -437,6 +483,12 @@ func (b *SynapseBackend) AbortMultipartUpload(ctx context.Context, input *s3.Abo
 			requiredArg("UploadId", input.UploadId == nil),
 		)
 	}
+
+	release, err := b.cacheGate.HoldUpload(ctx, *input.UploadId)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
 	if err != nil {

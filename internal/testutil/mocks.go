@@ -410,6 +410,10 @@ func (m *MockWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.WalletI
 // MockCache is a configurable test double for cache.Cache.
 // Use for fault injection tests; for happy-path tests prefer real cache.NewFilesystem.
 type MockCache struct {
+	ListUploadIDsFunc            func(context.Context) ([]string, error)
+	WalkContentFilesFunc         func(context.Context, bool, func(string, int64) error) error
+	QuarantineFunc               func(context.Context, string, int64) error
+	DeleteQuarantinedFunc        func(context.Context, string, int64) error
 	PutFunc                      func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.ObjectInfo, error)
 	PutStagedFunc                func(ctx context.Context, bucket, key string, r io.Reader, size int64) (*cache.StagedObject, error)
 	GetFunc                      func(ctx context.Context, bucket, key string) (io.ReadCloser, *cache.ObjectInfo, error)
@@ -420,7 +424,7 @@ type MockCache struct {
 	ConsumeRefusedWriteBytesFunc func() int64
 	CreateBucketDirFunc          func(ctx context.Context, bucket string) error
 	DeleteBucketDirFunc          func(ctx context.Context, bucket string) error
-	PutPartFunc                  func(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.ObjectInfo, error)
+	PutPartStagedFunc            func(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.StagedObject, error)
 	AssemblePartsFunc            func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error)
 	DeleteUploadFunc             func(ctx context.Context, uploadID string) error
 }
@@ -495,11 +499,11 @@ func (m *MockCache) DeleteBucketDir(ctx context.Context, bucket string) error {
 	return nil
 }
 
-func (m *MockCache) PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.ObjectInfo, error) {
-	if m.PutPartFunc != nil {
-		return m.PutPartFunc(ctx, uploadID, partNumber, r, size)
+func (m *MockCache) PutPartStaged(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*cache.StagedObject, error) {
+	if m.PutPartStagedFunc != nil {
+		return m.PutPartStagedFunc(ctx, uploadID, partNumber, r, size)
 	}
-	return nil, errors.New("MockCache.PutPart not configured")
+	return nil, errors.New("MockCache.PutPartStaged not configured")
 }
 
 func (m *MockCache) AssemblePartsStaged(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error) {
@@ -598,3 +602,31 @@ func (m *MockWalletQuerier) WalletIdentity() walletoperation.ExecutionIdentity {
 }
 
 func (m *MockServiceTerminator) PDPVerifierAddress() common.Address { return DefaultPDPVerifierAddress }
+
+func (m *MockCache) ListUploadIDs(ctx context.Context) ([]string, error) {
+	if m.ListUploadIDsFunc != nil {
+		return m.ListUploadIDsFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *MockCache) WalkContentFiles(ctx context.Context, quarantined bool, visit func(string, int64) error) error {
+	if m.WalkContentFilesFunc != nil {
+		return m.WalkContentFilesFunc(ctx, quarantined, visit)
+	}
+	return nil
+}
+
+func (m *MockCache) Quarantine(ctx context.Context, bucket string, contentID int64) error {
+	if m.QuarantineFunc != nil {
+		return m.QuarantineFunc(ctx, bucket, contentID)
+	}
+	return errors.New("MockCache.Quarantine not configured")
+}
+
+func (m *MockCache) DeleteQuarantined(ctx context.Context, bucket string, contentID int64) error {
+	if m.DeleteQuarantinedFunc != nil {
+		return m.DeleteQuarantinedFunc(ctx, bucket, contentID)
+	}
+	return errors.New("MockCache.DeleteQuarantined not configured")
+}

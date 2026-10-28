@@ -1042,45 +1042,49 @@ func TestStorageCleanupLeavesUnknownCopyStatusUntouched(t *testing.T) {
 // TestStorageCleanupRetriesCacheRelease checks that a failed cache release
 // keeps the content bound to its cleanup, and a later run finishes it.
 func TestStorageCleanupRetriesCacheRelease(t *testing.T) {
-	var cacheDeletes atomic.Int64
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: removedPieceStorageClient(),
-		cache: &testutil.MockCache{DeleteFunc: func(context.Context, string, string) error {
-			if cacheDeletes.Add(1) == 1 {
-				return errors.New("cache volume is busy")
-			}
-			return nil
-		}},
-	})
-	ctx := t.Context()
-	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
-	cancel, done := runHandlerEngine(t, runtime)
-	defer stopHandlerEngine(t, cancel, done)
+	for _, releaseErr := range []error{errors.New("cache volume is busy"), context.DeadlineExceeded} {
+		t.Run(releaseErr.Error(), func(t *testing.T) {
+			var cacheDeletes atomic.Int64
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: removedPieceStorageClient(),
+				cache: &testutil.MockCache{DeleteFunc: func(context.Context, string, string) error {
+					if cacheDeletes.Add(1) == 1 {
+						return releaseErr
+					}
+					return nil
+				}},
+			})
+			ctx := t.Context()
+			content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
 
-	releaseFailed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusPending && task.RetryCount == 1
-	})
-	if releaseFailed.WorkStartedAt == nil {
-		t.Fatal("local cache release failure lost its actual start time")
-	}
-	stored, err := runtime.repos.Contents.GetByID(ctx, content.ID)
-	if err != nil || stored == nil || stored.CleanupTaskID == nil || *stored.CleanupTaskID != taskRow.ID {
-		t.Fatalf("content after failed cache release = %#v, err=%v", stored, err)
-	}
-	if _, err := runtime.repos.Tasks.WakePending(ctx, []int64{taskRow.ID}); err != nil {
-		t.Fatalf("WakePending: %v", err)
-	}
-	releaseCompleted := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusCompleted
-	})
-	if releaseCompleted.WorkStartedAt == nil || !releaseCompleted.WorkStartedAt.Equal(*releaseFailed.WorkStartedAt) {
-		t.Fatal("local cache release retry reset its actual start time")
-	}
-	if stored, err := runtime.repos.Contents.GetByID(ctx, content.ID); stored != nil {
-		t.Fatalf("content after cleanup = %#v, err=%v", stored, err)
-	}
-	if cacheDeletes.Load() < 2 {
-		t.Fatalf("cache deletes = %d, want the failed release and at least one retry", cacheDeletes.Load())
+			releaseFailed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.RetryCount == 1
+			})
+			if releaseFailed.WorkStartedAt == nil {
+				t.Fatal("local cache release failure lost its actual start time")
+			}
+			stored, err := runtime.repos.Contents.GetByID(ctx, content.ID)
+			if err != nil || stored == nil || stored.CleanupTaskID == nil || *stored.CleanupTaskID != taskRow.ID {
+				t.Fatalf("content after failed cache release = %#v, err=%v", stored, err)
+			}
+			if _, err := runtime.repos.Tasks.WakePending(ctx, []int64{taskRow.ID}); err != nil {
+				t.Fatalf("WakePending: %v", err)
+			}
+			releaseCompleted := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusCompleted
+			})
+			if releaseCompleted.WorkStartedAt == nil || !releaseCompleted.WorkStartedAt.Equal(*releaseFailed.WorkStartedAt) {
+				t.Fatal("local cache release retry reset its actual start time")
+			}
+			if stored, err := runtime.repos.Contents.GetByID(ctx, content.ID); stored != nil {
+				t.Fatalf("content after cleanup = %#v, err=%v", stored, err)
+			}
+			if cacheDeletes.Load() < 2 {
+				t.Fatalf("cache deletes = %d, want the failed release and at least one retry", cacheDeletes.Load())
+			}
+		})
 	}
 }
 
