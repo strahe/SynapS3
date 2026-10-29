@@ -157,8 +157,8 @@ func TestInitAppDataDir_DefaultCreatesReferenceConfigAndRuntimeDirs(t *testing.T
 	if loaded.Admin.Auth.SessionSecret == "" {
 		t.Fatal("Admin.Auth.SessionSecret is empty")
 	}
-	if result.AdminInitialPassword == "" {
-		t.Fatal("AdminInitialPassword is empty")
+	if len(result.AdminInitialPassword) != 20 {
+		t.Fatalf("admin password length = %d, want 20", len(result.AdminInitialPassword))
 	}
 	configData, err := os.ReadFile(result.ConfigPath)
 	if err != nil {
@@ -243,23 +243,23 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 	for _, want := range []string{
 		"# SynapS3 configuration",
 		"[server]",
-		"# port = \":8080\"",
+		"# port = ':8080'",
 		"[server.tls]",
 		"[worker.tasks]",
 		"[logging]",
 		"[logging.s3_access]",
 		"[admin.auth]",
 		"enabled = true",
-		"username = \"admin\"",
+		"username = 'admin'",
 		"password_hash = ",
 		"session_secret = ",
-		"# session_ttl = \"12h0m0s\"",
+		"# session_ttl = '12h0m0s'",
 		"[filecoin]",
-		"private_key = \"\"",
-		"# network = \"calibration\"",
+		"private_key = ''",
+		"# network = 'calibration'",
 		"[database]",
-		"# driver = \"postgres\"",
-		"dsn = \"\"",
+		"# driver = 'postgres'",
+		"dsn = ''",
 		"# max_open_conns = 32",
 		"[cache]",
 		"dir = ",
@@ -274,13 +274,13 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 	assertGeneratedTOMLOnlyEnablesInitFields(t, text)
 
 	for _, disabled := range []string{
-		"port = \":8080\"",
-		"network = \"calibration\"",
-		"level = \"info\"",
-		"format = \"text\"",
+		"port = ':8080'",
+		"network = 'calibration'",
+		"level = 'info'",
+		"format = 'text'",
 		"max_open_conns = 4",
 		"max_size_gb = 100",
-		"eviction_policy = \"lru\"",
+		"eviction_policy = 'lru'",
 		"lru_high_watermark_percent = 80",
 		"lru_low_watermark_percent = 50",
 	} {
@@ -298,8 +298,8 @@ func TestInitAppDataDir_CommentedFieldsCanBeUncommentedInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	text := strings.ReplaceAll(string(data), "# port = \":8080\"", "port = \":9191\"")
-	text = strings.ReplaceAll(text, "# level = \"info\"", "level = \"debug\"")
+	text := strings.ReplaceAll(string(data), "# port = ':8080'", "port = ':9191'")
+	text = strings.ReplaceAll(text, "# level = 'info'", "level = 'debug'")
 	text = strings.ReplaceAll(text, "# concurrency = 12", "concurrency = 6")
 	if err := os.WriteFile(result.ConfigPath, []byte(text), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -361,31 +361,31 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	for _, want := range []string{
 		"# Host and port where the S3-compatible API listens.",
 		"[server]",
-		"port = \":9091\"",
+		"port = ':9091'",
 		"[filecoin]",
-		"network = \"mainnet\"",
+		"network = 'mainnet'",
 		"with_cdn = true",
 		"allow_private_networks = true",
 		"[filecoin.upload_speed_test]",
-		"auto_scope = \"all\"",
-		"retest_interval = \"2h0m0s\"",
+		"auto_scope = 'all'",
+		"retest_interval = '2h0m0s'",
 		"[filecoin.observability]",
-		"interval = \"5m0s\"",
-		"timeout = \"5s\"",
+		"interval = '5m0s'",
+		"timeout = '5s'",
 		"concurrency = 8",
 		"[worker.tasks]",
-		"poll_interval = \"7s\"",
+		"poll_interval = '7s'",
 		"upload_concurrency = 6",
-		"commit_max_wait = \"30m0s\"",
+		"commit_max_wait = '30m0s'",
 		"commit_seal_on_cache_pressure = true",
 		"[cache]",
-		"eviction_policy = \"none\"",
+		"eviction_policy = 'none'",
 		"lru_high_watermark_percent = 87",
 		"lru_low_watermark_percent = 72",
-		"lease_duration = \"2m0s\"",
+		"lease_duration = '2m0s'",
 		"[logging.s3_access]",
 		"enabled = false",
-		"level = \"debug\"",
+		"level = 'debug'",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated TOML missing %q:\n%s", want, text)
@@ -425,9 +425,37 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		loaded.Cache.LRULowWatermarkPercent != 72 {
 		t.Fatalf("loaded cache config = %#v, want canonical none with 87/72 watermarks", loaded.Cache)
 	}
+
+	for _, tt := range []struct {
+		name  string
+		value string
+	}{
+		{name: "quotes_and_backslash", value: `region "double" 'single' \path`},
+		{name: "controls", value: "region\a\v\b\f\n\r\t\x00\x1f\x7fend"},
+		{name: "unicode", value: "region 世界 🌍"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg.S3.Region = tt.value
+			cfg.Admin.TrustedProxies = []string{"127.0.0.1", tt.value}
+			if err := Save(path, cfg); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			loaded, err := LoadFile(path)
+			if err != nil {
+				t.Fatalf("LoadFile: %v", err)
+			}
+			if loaded.S3.Region != tt.value {
+				t.Errorf("region = %q, want %q", loaded.S3.Region, tt.value)
+			}
+			if !slices.Equal(loaded.Admin.TrustedProxies, cfg.Admin.TrustedProxies) {
+				t.Errorf("trusted proxies = %q, want %q", loaded.Admin.TrustedProxies, cfg.Admin.TrustedProxies)
+			}
+		})
+	}
 }
 
 func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *testing.T) {
+	t.Setenv("SYNAPS3_WORKER_TASKS_CONCURRENCY", "not-a-number")
 	cfg := validConfig()
 	cfg.Filecoin.AnchorProviderTier = "endorsed"
 	cfg.Database.DSN = "postgres://synaps3:password@example.invalid:5432/synaps3"
@@ -449,11 +477,11 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 	text := string(data)
 	for _, want := range []string{
 		"# PostgreSQL connection URL for the metadata database.",
-		"# dsn = \"\"",
+		"# dsn = ''",
 		"# max_open_conns = 32",
-		"driver = \"postgres\"",
-		"anchor_provider_tier = \"endorsed\"",
-		"dir = \"/var/lib/synaps3/cache\"",
+		"driver = 'postgres'",
+		"anchor_provider_tier = 'endorsed'",
+		"dir = '/var/lib/synaps3/cache'",
 	} {
 		assertConfigContains(t, text, want)
 	}
@@ -461,7 +489,7 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 		t.Fatalf("disabled secret value leaked into TOML comment:\n%s", text)
 	}
 	for _, disabled := range []string{
-		"dsn = \"postgres://synaps3:password@example.invalid:5432/synaps3\"",
+		"dsn = 'postgres://synaps3:password@example.invalid:5432/synaps3'",
 		"max_open_conns = 4",
 		"max_idle_conns = 2",
 	} {
@@ -472,6 +500,62 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 		"session_secret = ",
 	} {
 		assertConfigLacksEnabledPrefix(t, text, disabledPrefix)
+	}
+}
+
+func TestGeneratedConfigRejectsInvalidUTF8BeforePublication(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		existing bool
+		write    func(string, *Config) error
+	}{
+		{name: "save", existing: true, write: Save},
+		{name: "save_for_settings", existing: true, write: func(path string, cfg *Config) error {
+			return SaveForSettings(path, cfg, fullPersistedFieldPresence())
+		}},
+		{name: "init", write: func(path string, _ *Config) error {
+			return writeInitConfig(path, string([]byte{0xff}), AdminAuthBootstrap{})
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			cfg := validConfig()
+			if tt.existing {
+				if err := Save(path, cfg); err != nil {
+					t.Fatalf("Save original: %v", err)
+				}
+			}
+			var original []byte
+			if tt.existing {
+				var err error
+				original, err = os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("ReadFile original: %v", err)
+				}
+			}
+			cfg.S3.Region = string([]byte{0xff})
+			if err := tt.write(path, cfg); err == nil {
+				t.Fatal("expected invalid generated TOML to fail")
+			}
+			if !tt.existing {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("invalid init created config: %v", err)
+				}
+			} else {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("ReadFile after failure: %v", err)
+				}
+				if string(data) != string(original) {
+					t.Fatal("failed save changed the original config")
+				}
+			}
+			pending, err := filepath.Glob(filepath.Join(dir, ".synaps3-config-*.tmp"))
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("temporary files after failure = %v, error = %v", pending, err)
+			}
+		})
 	}
 }
 
@@ -504,14 +588,14 @@ func assertGeneratedTOMLOnlyEnablesInitFields(t *testing.T, text string) {
 	t.Helper()
 	for _, want := range []string{
 		"[filecoin]\n# Filecoin network used by synapse-go.",
-		"private_key = \"\"",
+		"private_key = ''",
 		"[database]\n# Database backend used for metadata persistence.",
-		"dsn = \"\"",
+		"dsn = ''",
 		"[cache]\n# Filesystem directory used for cached object data.",
 		"dir = ",
 		"[admin.auth]\n# Requires login for the Admin UI and Admin API.",
 		"enabled = true",
-		"username = \"admin\"",
+		"username = 'admin'",
 		"password_hash = ",
 		"session_secret = ",
 	} {

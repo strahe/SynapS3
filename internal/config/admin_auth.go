@@ -21,7 +21,7 @@ type AdminAuthBootstrap struct {
 
 // NewAdminAuthBootstrap generates a password, bcrypt hash, and session secret.
 func NewAdminAuthBootstrap() (AdminAuthBootstrap, error) {
-	password, err := securetoken.URL(32)
+	password, err := securetoken.URL(15)
 	if err != nil {
 		return AdminAuthBootstrap{}, fmt.Errorf("generating admin password: %w", err)
 	}

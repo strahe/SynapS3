@@ -18,6 +18,7 @@ require (
 	github.com/knadh/koanf/v2 v2.3.4
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/oklog/ulid/v2 v2.1.2
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/strahe/synapse-go v0.7.1
@@ -143,7 +144,6 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
-	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.30 // indirect
 	github.com/polydawn/refmt v0.89.0 // indirect

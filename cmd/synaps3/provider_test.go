@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +14,44 @@ import (
 	"github.com/strahe/synaps3/internal/provider"
 	"github.com/strahe/synaps3/internal/types"
 )
+
+func TestProviderListKeepsRPCAddressOutOfProgressOutput(t *testing.T) {
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "provider-test-unavailable")
+	}))
+	t.Cleanup(rpcServer.Close)
+	cfgPath := writeWalletTestConfig(t, "")
+
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStderr := os.Stderr
+	os.Stderr = writeEnd
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		_ = writeEnd.Close()
+		_ = readEnd.Close()
+	})
+	_, err = runWalletCommand(t, []string{
+		"synaps3", "--config", cfgPath, "provider", "list", "--network", "calibration",
+		"--rpc-url", rpcServer.URL + "/rpc-path-key", "--no-health",
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider-test-unavailable") {
+		t.Fatalf("expected RPC diagnostic details, got %v", err)
+	}
+	if err := writeEnd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(readEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := string(output); strings.Contains(text, rpcServer.URL) || strings.Contains(text, "rpc-path-key") || !strings.Contains(text, "Querying calibration network") {
+		t.Fatalf("progress output did not protect the RPC address: %s", text)
+	}
+}
 
 func TestProviderOutputJSONPreservesPartialResultsAndStringIDs(t *testing.T) {
 	id, err := types.ParseOnChainID("provider id", "18446744073709551616")
