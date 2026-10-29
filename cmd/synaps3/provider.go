@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -84,7 +83,7 @@ func runProviderList(ctx context.Context, cmd *cli.Command) (resultErr error) {
 	}
 
 	redactor = errtext.New(rpcURL)
-	_, _ = fmt.Fprintf(os.Stderr, "Querying %s network (%s)...\n", network, maskRPCURL(rpcURL))
+	_, _ = fmt.Fprintf(os.Stderr, "Querying %s network...\n", network)
 
 	c, err := parseChain(network)
 	if err != nil {
@@ -156,12 +155,12 @@ func resolveRPCAndNetwork(cmd *cli.Command) (rpcURL, network string, err error) 
 	var cfg *config.Config
 	var src config.Source
 	if resolved, err := configSourceFromCommand(cmd); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to resolve config: %v, using defaults\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to resolve config: %s, using defaults\n", errtext.Format(err))
 	} else {
 		src = resolved
 		if loaded, err := config.LoadSource(src); err != nil {
 			if src.Exists || src.Explicit {
-				_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to load config %s: %v, using defaults\n", src.Path, err)
+				_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to load config %s: %s, using defaults\n", src.Path, errtext.Format(err))
 			}
 		} else {
 			cfg = loaded
@@ -305,14 +304,4 @@ func outputTable(providers []provider.ProviderDetail) error {
 			len(providers), pdpCount)
 	}
 	return nil
-}
-
-// maskRPCURL returns only the scheme and host of a URL to avoid leaking API keys
-// embedded in the URL path or query parameters.
-func maskRPCURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "<invalid-url>"
-	}
-	return u.Scheme + "://" + u.Host
 }

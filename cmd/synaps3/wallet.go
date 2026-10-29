@@ -17,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synapse-go/payments"
 	"github.com/urfave/cli/v3"
@@ -558,6 +559,7 @@ func loadWalletConfig(cmd *cli.Command) (*config.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
+	errtext.Configure(cfg.Filecoin.RPCURL, cfg.Filecoin.PrivateKey, cfg.Admin.Auth.SessionSecret, cfg.Admin.Auth.PasswordHash)
 	if strings.TrimSpace(cfg.Filecoin.PrivateKey) == "" {
 		return nil, fmt.Errorf("filecoin.private_key must be set in config or SYNAPS3_FILECOIN_PRIVATE_KEY")
 	}

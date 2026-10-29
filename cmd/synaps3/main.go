@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/buildinfo"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
+	"github.com/strahe/synaps3/internal/errtext"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/provider"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -32,7 +33,7 @@ const configEnvVar = "SYNAPS3_CONFIG"
 
 func main() {
 	if err := newRootCommand().Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "fatal: %s\n", errtext.Format(err))
 		os.Exit(1)
 	}
 }
@@ -224,6 +225,7 @@ func loadConfigAndDB(ctx context.Context, src config.Source) (*config.Config, *b
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
+	errtext.Configure(cfg.Filecoin.RPCURL, cfg.Filecoin.PrivateKey, cfg.Admin.Auth.SessionSecret, cfg.Admin.Auth.PasswordHash)
 
 	database, err := db.New(cfg.Database)
 	if err != nil {
@@ -504,7 +506,7 @@ func setupLogger(cfg config.LoggingConfig) *slog.Logger {
 		level = slog.LevelInfo
 	}
 
-	opts := &slog.HandlerOptions{Level: level}
+	opts := &slog.HandlerOptions{Level: level, ReplaceAttr: redactLogAttr}
 
 	var handler slog.Handler
 	switch cfg.Format {
@@ -515,4 +517,16 @@ func setupLogger(cfg config.LoggingConfig) *slog.Logger {
 	}
 
 	return slog.New(handler)
+}
+
+func redactLogAttr(_ []string, attr slog.Attr) slog.Attr {
+	switch attr.Value.Kind() {
+	case slog.KindString:
+		attr.Value = slog.StringValue(errtext.Redact(attr.Value.String()))
+	case slog.KindAny:
+		if err, ok := attr.Value.Any().(error); ok {
+			attr.Value = slog.StringValue(errtext.Format(err))
+		}
+	}
+	return attr
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
+	"net/url"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -39,10 +41,30 @@ func TestRedact(t *testing.T) {
 			without: []string{"user", "pass", "auth=abc", "frag"},
 		},
 		{
-			name:    "RPC URL keeps only its origin",
+			name:    "RPC URL is replaced entirely",
 			text:    `reading receipt: Post "https://rpc.example/v1/rpc-path-key?token=rpc-query-token": connection refused`,
-			want:    `reading receipt: Post "https://rpc.example": connection refused`,
-			without: []string{"rpc-path-key", "rpc-query-token"},
+			want:    `reading receipt: Post "[redacted]": connection refused`,
+			without: []string{"rpc.example", "rpc-path-key", "rpc-query-token"},
+		},
+		{
+			name: "bare RPC hosts are replaced case insensitively",
+			text: "lookup RPC.EXAMPLE: rpc.example has no such host",
+			want: "lookup [redacted]: [redacted] has no such host",
+		},
+		{
+			name: "other provider hostnames are kept",
+			text: "https://other-rpc.example/pdp and https://rpc.example.provider/pdp",
+			want: "https://other-rpc.example/pdp and https://rpc.example.provider/pdp",
+		},
+		{
+			name: "sentence punctuation follows a bare RPC host",
+			text: "DNS lookup failed for rpc.example.",
+			want: "DNS lookup failed for [redacted].",
+		},
+		{
+			name: "provider paths are not scanned as bare hosts",
+			text: "https://sp.example/pdp/rpc.example/piece",
+			want: "https://sp.example/pdp/rpc.example/piece",
 		},
 		{
 			name:    "configured secrets are replaced with or without hex prefix",
@@ -68,6 +90,59 @@ func TestRedact(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFormatRedactsRPCNetworkErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, rpcURL, hostname string
+	}{
+		{"hostname", "https://user:password@rpc-host-token.example:8545/v1/path-token?key=query-token#fragment-token", "rpc-host-token.example"},
+		{"IPv6", "https://user:password@[2001:db8::1]:8545/v1/path-token?key=query-token#fragment-token", "2001:db8::1"},
+		{"DNS root dot", "https://user:password@rpc-host-token.example.", "rpc-host-token.example."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRedactor(tc.rpcURL)
+			err := fmt.Errorf("reading receipt: %w", &url.Error{
+				Op:  "Post",
+				URL: tc.rpcURL,
+				Err: &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{
+					Name: tc.hostname, Err: "no such host",
+				}},
+			})
+			got := r.Format(err)
+			for _, secret := range []string{"user", "password", tc.hostname, "path-token", "query-token", "fragment-token"} {
+				if strings.Contains(got, secret) {
+					t.Fatalf("network error contains %q: %s", secret, got)
+				}
+			}
+			for _, want := range []string{"reading receipt", "Post", "dial tcp", "lookup", "no such host", placeholder} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("network error lost %q: %s", want, got)
+				}
+			}
+			if r.Redact(got) != got {
+				t.Fatal("network error redaction is not idempotent")
+			}
+		})
+	}
+}
+
+func TestRPCHostRedactionBoundariesAndPlaceholders(t *testing.T) {
+	for _, tc := range []struct {
+		rpc, text, want string
+	}{
+		{"https://[2001:db8::1]:8545/rpc", "https://[2001:db8::1:2]/pdp", "https://[2001:db8::1:2]/pdp"},
+		{"https://[2001:db8::1]:8545/rpc", "dial tcp [2001:db8::1]:8545: refused", "dial tcp [redacted]: refused"},
+		{"https://[2001:db8::1]:8545/rpc", "address 2001:db8::1:2 refused", "address 2001:db8::1:2 refused"},
+		{"https://tenant-secret.example.", `Post "https://tenant-secret.example.": refused`, `Post "[redacted]": refused`},
+		{"https://tenant-secret.example.", "endpoint failed (https://tenant-secret.example.).", "endpoint failed ([redacted])."},
+		{"http://redacted:8545", "http://redacted:8545/rpc", "[redacted]"},
+	} {
+		r := newRedactor(tc.rpc)
+		if got := r.Redact(tc.text); got != tc.want || r.Redact(got) != got {
+			t.Errorf("Redact(%q) = %q, want stable %q", tc.text, got, tc.want)
+		}
 	}
 }
 
@@ -144,17 +219,36 @@ func TestScopedRedactorCombinesRuntimeAndDraftSecrets(t *testing.T) {
 }
 
 func TestFormatPreservesProviderContextAndIdentity(t *testing.T) {
-	cause := &pdp.HTTPError{Method: "POST", URL: "https://provider.example/pdp/data-sets/7/pieces?token=secret", StatusCode: 500, Body: "failed to add pieces:\n  piece not found"}
-	err := fmt.Errorf("could not register pieces: %w", cause)
-	got := RedactError(err)
-	// The SDK escapes control characters in the provider's response.
-	for _, want := range []string{"could not register pieces", "https://provider.example/pdp/data-sets/7/pieces", "HTTP 500", `failed to add pieces:\n  piece not found`} {
-		if !strings.Contains(got.Error(), want) {
-			t.Fatalf("diagnostic missing %q: %s", want, got)
-		}
-	}
-	if strings.Contains(got.Error(), "secret") || !errors.Is(got, cause) || Format(got) != got.Error() {
-		t.Fatal("diagnostic redaction or identity is unstable")
+	previous := active.Load()
+	t.Cleanup(func() { active.Store(previous) })
+	for _, tc := range []struct {
+		name, rpcURL, providerURL, safeURL, secretHost string
+	}{
+		{"separate provider", "https://rpc.example:8545/rpc", "https://url-user:url-password@provider.example/pdp/data-sets/7/pieces?token=query-secret#fragment-secret", "https://provider.example/pdp/data-sets/7/pieces", "rpc.example"},
+		{"shared hostname", "https://shared.example:8545/rpc", "https://url-user:url-password@shared.example:8080/pdp/data-sets/7/pieces?token=query-secret#fragment-secret", ":8080/pdp/data-sets/7/pieces", "shared.example"},
+		{"shared IPv4", "http://127.0.0.1:1234/rpc/v1", "http://url-user:url-password@127.0.0.1:8080/pdp/data-sets/7/pieces?token=query-secret#fragment-secret", ":8080/pdp/data-sets/7/pieces", "127.0.0.1"},
+		{"shared IPv6", "https://[2001:db8::1]:8545/rpc", "https://url-user:url-password@[2001:db8::1]:8080/pdp/data-sets/7/pieces?token=query-secret#fragment-secret", ":8080/pdp/data-sets/7/pieces", "2001:db8::1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			Configure(tc.rpcURL)
+			cause := &pdp.HTTPError{Method: "POST", URL: tc.providerURL, StatusCode: 500, Body: "failed to add pieces:\n  piece not found"}
+			err := fmt.Errorf("could not register pieces: %w", cause)
+			got := RedactError(err)
+			// The SDK escapes control characters in the provider's response.
+			for _, want := range []string{"could not register pieces", tc.safeURL, "HTTP 500", `failed to add pieces:\n  piece not found`} {
+				if !strings.Contains(got.Error(), want) {
+					t.Fatalf("diagnostic missing %q: %s", want, got)
+				}
+			}
+			for _, secret := range []string{tc.secretHost, "url-user", "url-password", "query-secret", "fragment-secret"} {
+				if strings.Contains(got.Error(), secret) {
+					t.Fatalf("diagnostic contains %q: %s", secret, got)
+				}
+			}
+			if !errors.Is(got, cause) || Format(got) != got.Error() {
+				t.Fatalf("diagnostic redaction or identity is unstable: identity=%t, first=%q, second=%q", errors.Is(got, cause), got.Error(), Format(got))
+			}
+		})
 	}
 }
 

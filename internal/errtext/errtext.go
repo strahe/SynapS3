@@ -31,16 +31,26 @@ var urlPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>]+`)
 type Redactor struct {
 	// secrets are replaced longest first so a secret containing another is
 	// never left partly visible.
-	secrets []string
-	// rpcHosts URLs keep only their origin: RPC endpoints commonly carry an
-	// API key in the path.
-	rpcHosts []string
+	secrets []secretRule
+	// RPC endpoint identities may contain credentials, including in the host.
+	rpcHosts []rpcHostRule
+}
+
+type secretRule struct {
+	value      string
+	hexPattern *regexp.Regexp
+}
+
+type rpcHostRule struct {
+	value    string
+	pattern  *regexp.Regexp
+	endpoint bool
 }
 
 var active atomic.Pointer[Redactor]
 
 // Configure registers the chain RPC URL and other configured secret values.
-// Call it once at startup, before any error text is persisted; until then only
+// Call it before clients are initialized; until then only
 // URL credentials, queries, and fragments are removed.
 func Configure(rpcURL string, secrets ...string) {
 	active.Store(newRedactor(rpcURL, secrets...))
@@ -72,7 +82,8 @@ func New(rpcURL string, secrets ...string) *Redactor {
 	if configured := active.Load(); configured != nil {
 		r.secrets = append(r.secrets, configured.secrets...)
 		r.rpcHosts = append(r.rpcHosts, configured.rpcHosts...)
-		slices.SortFunc(r.secrets, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+		slices.SortFunc(r.secrets, func(a, b secretRule) int { return cmp.Compare(len(b.value), len(a.value)) })
+		slices.SortFunc(r.rpcHosts, func(a, b rpcHostRule) int { return cmp.Compare(len(b.value), len(a.value)) })
 	}
 	return r
 }
@@ -81,7 +92,11 @@ func newRedactor(rpcURL string, secrets ...string) *Redactor {
 	r := &Redactor{}
 	if parsed, err := url.Parse(strings.TrimSpace(rpcURL)); err == nil {
 		if parsed.Host != "" {
-			r.rpcHosts = []string{strings.ToLower(parsed.Host)}
+			host := strings.ToLower(parsed.Host)
+			r.rpcHosts = []rpcHostRule{{value: host, pattern: regexp.MustCompile("(?i)" + regexp.QuoteMeta(host)), endpoint: true}}
+			if hostname := strings.ToLower(parsed.Hostname()); hostname != "" && hostname != host {
+				r.rpcHosts = append(r.rpcHosts, rpcHostRule{value: hostname, pattern: regexp.MustCompile("(?i)" + regexp.QuoteMeta(hostname))})
+			}
 		}
 	}
 	for _, secret := range secrets {
@@ -89,13 +104,22 @@ func newRedactor(rpcURL string, secrets ...string) *Redactor {
 		if secret == "" {
 			continue
 		}
-		r.secrets = append(r.secrets, secret)
+		r.secrets = append(r.secrets, newSecretRule(secret))
 		if hex, ok := strings.CutPrefix(strings.ToLower(secret), "0x"); ok && hex != "" {
-			r.secrets = append(r.secrets, secret[2:])
+			r.secrets = append(r.secrets, newSecretRule(secret[2:]))
 		}
 	}
-	slices.SortFunc(r.secrets, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+	slices.SortFunc(r.secrets, func(a, b secretRule) int { return cmp.Compare(len(b.value), len(a.value)) })
 	return r
+}
+
+func newSecretRule(value string) secretRule {
+	rule := secretRule{value: value}
+	encoded := strings.TrimPrefix(strings.TrimPrefix(value, "0x"), "0X")
+	if _, err := hex.DecodeString(encoded); err == nil && len(encoded) >= 32 {
+		rule.hexPattern = regexp.MustCompile("(?i)(?:0x)?" + regexp.QuoteMeta(encoded))
+	}
+	return rule
 }
 
 // Redact prepares diagnostic text for operator-facing output.
@@ -105,22 +129,64 @@ func (r *Redactor) Redact(text string) string {
 
 func (r *Redactor) redact(text string) string {
 	for _, secret := range r.secrets {
-		encoded := strings.TrimPrefix(strings.TrimPrefix(secret, "0x"), "0X")
-		if _, err := hex.DecodeString(encoded); err == nil && len(encoded) >= 32 {
-			pattern := regexp.MustCompile("(?i)(?:0x)?" + regexp.QuoteMeta(encoded))
-			text = pattern.ReplaceAllString(text, placeholder)
+		if secret.hexPattern != nil {
+			text = secret.hexPattern.ReplaceAllString(text, placeholder)
 		} else {
-			text = strings.ReplaceAll(text, secret, placeholder)
+			text = strings.ReplaceAll(text, secret.value, placeholder)
 			// Provider text arrives Go-escaped, which changes how a secret
 			// containing quotes, backslashes, or control characters appears.
-			if quoted := strconv.Quote(secret); quoted[1:len(quoted)-1] != secret {
+			if quoted := strconv.Quote(secret.value); quoted[1:len(quoted)-1] != secret.value {
 				text = strings.ReplaceAll(text, quoted[1:len(quoted)-1], placeholder)
 			}
 		}
 	}
 	text = safeText(text)
-	text = urlPattern.ReplaceAllStringFunc(text, r.redactURL)
-	return truncate(text)
+	var result strings.Builder
+	previous := 0
+	for _, match := range urlPattern.FindAllStringIndex(text, -1) {
+		result.WriteString(r.redactRPCHosts(text[previous:match[0]]))
+		result.WriteString(r.redactURL(text[match[0]:match[1]]))
+		previous = match[1]
+	}
+	result.WriteString(r.redactRPCHosts(text[previous:]))
+	return truncate(result.String())
+}
+
+func (r *Redactor) redactRPCHosts(text string) string {
+	for _, host := range r.rpcHosts {
+		var result strings.Builder
+		previous := 0
+		for _, match := range host.pattern.FindAllStringIndex(text, -1) {
+			if match[0] > 0 && match[1] < len(text) && text[match[0]-1:match[1]+1] == placeholder {
+				continue
+			}
+			after := strings.TrimLeft(text[match[1]:], ".")
+			if match[0] > 0 && hostnameByte(text[match[0]-1]) ||
+				len(after) > 0 && hostnameByte(after[0]) {
+				continue
+			}
+			if strings.Count(host.value, ":") > 1 && !strings.HasPrefix(host.value, "[") {
+				beforeColon := match[0] > 0 && text[match[0]-1] == ':'
+				afterColon := len(after) > 1 && after[0] == ':' && strings.ContainsAny(after[1:2], "0123456789abcdefABCDEF:")
+				if beforeColon || afterColon {
+					continue
+				}
+			}
+			result.WriteString(text[previous:match[0]])
+			result.WriteString(placeholder)
+			previous = match[1]
+		}
+		if previous > 0 {
+			result.WriteString(text[previous:])
+			text = result.String()
+		}
+	}
+	return text
+}
+
+func hostnameByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' ||
+		b >= '0' && b <= '9' || b == '.' || b == '-' || b == '_'
 }
 
 // safeText preserves invalid database text as visible escapes.
@@ -155,8 +221,25 @@ func (r *Redactor) redactURL(raw string) string {
 	parsed.User = nil
 	parsed.RawQuery, parsed.ForceQuery = "", false
 	parsed.Fragment, parsed.RawFragment = "", ""
-	if slices.Contains(r.rpcHosts, strings.ToLower(parsed.Host)) {
-		parsed.Path, parsed.RawPath = "", ""
+	for _, host := range r.rpcHosts {
+		if host.endpoint && strings.EqualFold(strings.TrimSuffix(parsed.Host, "."), strings.TrimSuffix(host.value, ".")) {
+			if parsed.Path == "" && strings.HasSuffix(host.value, ".") {
+				suffix = strings.TrimPrefix(suffix, ".")
+			}
+			return placeholder + suffix
+		}
+	}
+	for _, host := range r.rpcHosts {
+		if strings.EqualFold(strings.TrimSuffix(parsed.Hostname(), "."), strings.TrimSuffix(host.value, ".")) {
+			port := parsed.Port()
+			authority := placeholder
+			if port != "" {
+				authority += ":" + port
+			}
+			// A redacted authority stays outside URL matching on subsequent passes.
+			parsed.Scheme, parsed.Host = "", ""
+			return authority + parsed.String() + suffix
+		}
 	}
 	return parsed.String() + suffix
 }
@@ -217,11 +300,13 @@ func (r *Redactor) Format(err error) string {
 			return
 		}
 		if sensitive, ok := current.(interface{ SensitiveErrorValues() []string }); ok {
-			redactor.secrets = append(redactor.secrets, sensitive.SensitiveErrorValues()...)
+			for _, value := range sensitive.SensitiveErrorValues() {
+				redactor.secrets = append(redactor.secrets, newSecretRule(value))
+			}
 		}
 		if broadcast, ok := current.(*sdktypes.BroadcastError); ok && broadcast.Transaction != nil {
 			if raw, marshalErr := broadcast.Transaction.MarshalBinary(); marshalErr == nil {
-				redactor.secrets = append(redactor.secrets, hex.EncodeToString(raw))
+				redactor.secrets = append(redactor.secrets, newSecretRule(hex.EncodeToString(raw)))
 			}
 		}
 		if _, rendered := current.(*redactedError); rendered {
@@ -250,7 +335,7 @@ func (r *Redactor) Format(err error) string {
 		}
 	}
 	collect(err)
-	slices.SortFunc(redactor.secrets, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+	slices.SortFunc(redactor.secrets, func(a, b secretRule) int { return cmp.Compare(len(b.value), len(a.value)) })
 	return redactor.redact(text)
 }
 

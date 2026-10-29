@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 const generatedConfigFileName = "config.toml"
@@ -158,7 +159,10 @@ func SaveForSettings(path string, cfg *Config, presence PersistedFieldPresence) 
 }
 
 func writeInitConfig(path, appDir string, auth AdminAuthBootstrap) error {
-	data := []byte(renderInitConfig(appDir, auth))
+	data, err := renderInitConfig(appDir, auth)
+	if err != nil {
+		return err
+	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -175,7 +179,7 @@ func writeInitConfig(path, appDir string, auth AdminAuthBootstrap) error {
 		}
 	}()
 
-	if _, err := f.Write(data); err != nil {
+	if _, err := f.Write([]byte(data)); err != nil {
 		return fmt.Errorf("writing config file %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
@@ -193,12 +197,12 @@ type initSectionDescriptor struct {
 type initFieldDescriptor struct {
 	Field   string
 	Key     string
-	Value   string
+	Value   any
 	Enabled bool
 	Notes   []string
 }
 
-func renderInitConfig(appDir string, auth AdminAuthBootstrap) string {
+func renderInitConfig(appDir string, auth AdminAuthBootstrap) (string, error) {
 	defaults := defaultConfig()
 	defaults.Cache.Dir = filepath.Join(appDir, "cache")
 	defaults.Admin.Auth.PasswordHash = auth.PasswordHash
@@ -214,124 +218,124 @@ func renderInitConfig(appDir string, auth AdminAuthBootstrap) string {
 	}, false)
 }
 
-func renderSavedConfig(cfg *Config, presence PersistedFieldPresence) string {
+func renderSavedConfig(cfg *Config, presence PersistedFieldPresence) (string, error) {
 	return renderTOMLConfig(cfg, presence, true)
 }
 
-func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode bool) string {
+func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode bool) (string, error) {
 	sections := []initSectionDescriptor{
 		{
 			Name: "server",
 			Fields: []initFieldDescriptor{
-				{Field: "server.port", Key: "port", Value: quoteTOMLString(cfg.Server.Port), Enabled: saveMode},
-				{Field: "server.max_connections", Key: "max_connections", Value: strconv.Itoa(cfg.Server.MaxConnections), Enabled: saveMode},
-				{Field: "server.max_requests", Key: "max_requests", Value: strconv.Itoa(cfg.Server.MaxRequests), Enabled: saveMode},
+				{Field: "server.port", Key: "port", Value: cfg.Server.Port, Enabled: saveMode},
+				{Field: "server.max_connections", Key: "max_connections", Value: cfg.Server.MaxConnections, Enabled: saveMode},
+				{Field: "server.max_requests", Key: "max_requests", Value: cfg.Server.MaxRequests, Enabled: saveMode},
 			},
 		},
 		{
 			Name: "server.tls",
 			Fields: []initFieldDescriptor{
-				{Field: "server.tls.enabled", Key: "enabled", Value: strconv.FormatBool(cfg.Server.TLS.Enabled), Enabled: saveMode},
-				{Field: "server.tls.cert_file", Key: "cert_file", Value: quoteTOMLString(cfg.Server.TLS.CertFile), Enabled: saveMode, Notes: []string{"Required when server.tls.enabled is true."}},
-				{Field: "server.tls.key_file", Key: "key_file", Value: quoteTOMLString(cfg.Server.TLS.KeyFile), Enabled: saveMode, Notes: []string{"Required when server.tls.enabled is true."}},
+				{Field: "server.tls.enabled", Key: "enabled", Value: cfg.Server.TLS.Enabled, Enabled: saveMode},
+				{Field: "server.tls.cert_file", Key: "cert_file", Value: cfg.Server.TLS.CertFile, Enabled: saveMode, Notes: []string{"Required when server.tls.enabled is true."}},
+				{Field: "server.tls.key_file", Key: "key_file", Value: cfg.Server.TLS.KeyFile, Enabled: saveMode, Notes: []string{"Required when server.tls.enabled is true."}},
 			},
 		},
 		{
 			Name: "s3",
 			Fields: []initFieldDescriptor{
-				{Field: "s3.region", Key: "region", Value: quoteTOMLString(cfg.S3.Region), Enabled: saveMode},
+				{Field: "s3.region", Key: "region", Value: cfg.S3.Region, Enabled: saveMode},
 			},
 		},
 		{
 			Name: "filecoin",
 			Fields: []initFieldDescriptor{
-				{Field: "filecoin.network", Key: "network", Value: quoteTOMLString(cfg.Filecoin.Network), Enabled: saveMode, Notes: []string{"Allowed: calibration, mainnet."}},
-				{Field: "filecoin.rpc_url", Key: "rpc_url", Value: quoteTOMLString(cfg.Filecoin.RPCURL), Enabled: saveMode},
-				{Field: "filecoin.private_key", Key: "private_key", Value: quoteTOMLString(cfg.Filecoin.PrivateKey), Enabled: !saveMode || presence.FilecoinPrivateKey, Notes: []string{"Required before serving unless SYNAPS3_FILECOIN_PRIVATE_KEY is set."}},
-				{Field: "filecoin.with_cdn", Key: "with_cdn", Value: strconv.FormatBool(cfg.Filecoin.WithCDN), Enabled: saveMode},
-				{Field: "filecoin.allow_private_networks", Key: "allow_private_networks", Value: strconv.FormatBool(cfg.Filecoin.AllowPrivateNetworks), Enabled: saveMode, Notes: []string{"Enable only for trusted private deployments."}},
-				{Field: "filecoin.anchor_provider_tier", Key: "anchor_provider_tier", Value: quoteTOMLString(cfg.Filecoin.AnchorProviderTier), Enabled: saveMode, Notes: []string{"approved | endorsed | none. Restart required."}},
-				{Field: "filecoin.default_copies", Key: "default_copies", Value: strconv.Itoa(cfg.Filecoin.DefaultCopies), Enabled: saveMode, Notes: []string{fmt.Sprintf("Allowed range: 1-%d.", MaxFilecoinDefaultCopies)}},
+				{Field: "filecoin.network", Key: "network", Value: cfg.Filecoin.Network, Enabled: saveMode, Notes: []string{"Allowed: calibration, mainnet."}},
+				{Field: "filecoin.rpc_url", Key: "rpc_url", Value: cfg.Filecoin.RPCURL, Enabled: saveMode},
+				{Field: "filecoin.private_key", Key: "private_key", Value: cfg.Filecoin.PrivateKey, Enabled: !saveMode || presence.FilecoinPrivateKey, Notes: []string{"Required before serving unless SYNAPS3_FILECOIN_PRIVATE_KEY is set."}},
+				{Field: "filecoin.with_cdn", Key: "with_cdn", Value: cfg.Filecoin.WithCDN, Enabled: saveMode},
+				{Field: "filecoin.allow_private_networks", Key: "allow_private_networks", Value: cfg.Filecoin.AllowPrivateNetworks, Enabled: saveMode, Notes: []string{"Enable only for trusted private deployments."}},
+				{Field: "filecoin.anchor_provider_tier", Key: "anchor_provider_tier", Value: cfg.Filecoin.AnchorProviderTier, Enabled: saveMode, Notes: []string{"approved | endorsed | none. Restart required."}},
+				{Field: "filecoin.default_copies", Key: "default_copies", Value: cfg.Filecoin.DefaultCopies, Enabled: saveMode, Notes: []string{fmt.Sprintf("Allowed range: 1-%d.", MaxFilecoinDefaultCopies)}},
 			},
 		},
 		{
 			Name: "filecoin.upload_speed_test",
 			Fields: []initFieldDescriptor{
-				{Field: "filecoin.upload_speed_test.auto_scope", Key: "auto_scope", Value: quoteTOMLString(cfg.Filecoin.UploadSpeedTest.AutoScope), Enabled: saveMode, Notes: []string{"trusted | all. Restart required."}},
-				{Field: "filecoin.upload_speed_test.retest_interval", Key: "retest_interval", Value: quoteTOMLString(cfg.Filecoin.UploadSpeedTest.RetestInterval.String()), Enabled: saveMode},
+				{Field: "filecoin.upload_speed_test.auto_scope", Key: "auto_scope", Value: cfg.Filecoin.UploadSpeedTest.AutoScope, Enabled: saveMode, Notes: []string{"trusted | all. Restart required."}},
+				{Field: "filecoin.upload_speed_test.retest_interval", Key: "retest_interval", Value: cfg.Filecoin.UploadSpeedTest.RetestInterval.String(), Enabled: saveMode},
 			},
 		},
 		{
 			Name: "filecoin.observability",
 			Fields: []initFieldDescriptor{
-				{Field: "filecoin.observability.interval", Key: "interval", Value: quoteTOMLString(cfg.Filecoin.Observability.Interval.String()), Enabled: saveMode},
-				{Field: "filecoin.observability.timeout", Key: "timeout", Value: quoteTOMLString(cfg.Filecoin.Observability.Timeout.String()), Enabled: saveMode},
-				{Field: "filecoin.observability.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Filecoin.Observability.Concurrency), Enabled: saveMode},
+				{Field: "filecoin.observability.interval", Key: "interval", Value: cfg.Filecoin.Observability.Interval.String(), Enabled: saveMode},
+				{Field: "filecoin.observability.timeout", Key: "timeout", Value: cfg.Filecoin.Observability.Timeout.String(), Enabled: saveMode},
+				{Field: "filecoin.observability.concurrency", Key: "concurrency", Value: cfg.Filecoin.Observability.Concurrency, Enabled: saveMode},
 			},
 		},
 		{
 			Name: "database",
 			Fields: []initFieldDescriptor{
-				{Field: "database.driver", Key: "driver", Value: quoteTOMLString(cfg.Database.Driver), Enabled: presence.DatabaseDriver, Notes: []string{"Allowed: postgres."}},
-				{Field: "database.dsn", Key: "dsn", Value: quoteTOMLString(cfg.Database.DSN), Enabled: !saveMode || presence.DatabaseDSN, Notes: []string{"Example: postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable", "Required before serving unless SYNAPS3_DATABASE_DSN is set."}},
-				{Field: "database.max_open_conns", Key: "max_open_conns", Value: strconv.Itoa(cfg.Database.MaxOpenConns), Enabled: saveMode && presence.DatabaseMaxOpen},
-				{Field: "database.max_idle_conns", Key: "max_idle_conns", Value: strconv.Itoa(cfg.Database.MaxIdleConns), Enabled: saveMode && presence.DatabaseMaxIdle},
+				{Field: "database.driver", Key: "driver", Value: cfg.Database.Driver, Enabled: presence.DatabaseDriver, Notes: []string{"Allowed: postgres."}},
+				{Field: "database.dsn", Key: "dsn", Value: cfg.Database.DSN, Enabled: !saveMode || presence.DatabaseDSN, Notes: []string{"Example: postgres://synaps3:PASSWORD@127.0.0.1:5432/synaps3?sslmode=disable", "Required before serving unless SYNAPS3_DATABASE_DSN is set."}},
+				{Field: "database.max_open_conns", Key: "max_open_conns", Value: cfg.Database.MaxOpenConns, Enabled: saveMode && presence.DatabaseMaxOpen},
+				{Field: "database.max_idle_conns", Key: "max_idle_conns", Value: cfg.Database.MaxIdleConns, Enabled: saveMode && presence.DatabaseMaxIdle},
 			},
 		},
 		{
 			Name: "cache",
 			Fields: []initFieldDescriptor{
-				{Field: "cache.dir", Key: "dir", Value: quoteTOMLString(cfg.Cache.Dir), Enabled: !saveMode || presence.CacheDir, Notes: []string{"Enabled so this installation uses the initialized cache directory."}},
-				{Field: "cache.max_size_gb", Key: "max_size_gb", Value: strconv.Itoa(cfg.Cache.MaxSizeGB), Enabled: saveMode},
-				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: quoteTOMLString(cfg.Cache.EvictionPolicy), Enabled: saveMode, Notes: []string{"Allowed: lru, after_upload, none."}},
-				{Field: "cache.lru_high_watermark_percent", Key: "lru_high_watermark_percent", Value: strconv.Itoa(cfg.Cache.LRUHighWatermarkPercent), Enabled: saveMode},
-				{Field: "cache.lru_low_watermark_percent", Key: "lru_low_watermark_percent", Value: strconv.Itoa(cfg.Cache.LRULowWatermarkPercent), Enabled: saveMode},
+				{Field: "cache.dir", Key: "dir", Value: cfg.Cache.Dir, Enabled: !saveMode || presence.CacheDir, Notes: []string{"Enabled so this installation uses the initialized cache directory."}},
+				{Field: "cache.max_size_gb", Key: "max_size_gb", Value: cfg.Cache.MaxSizeGB, Enabled: saveMode},
+				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: cfg.Cache.EvictionPolicy, Enabled: saveMode, Notes: []string{"Allowed: lru, after_upload, none."}},
+				{Field: "cache.lru_high_watermark_percent", Key: "lru_high_watermark_percent", Value: cfg.Cache.LRUHighWatermarkPercent, Enabled: saveMode},
+				{Field: "cache.lru_low_watermark_percent", Key: "lru_low_watermark_percent", Value: cfg.Cache.LRULowWatermarkPercent, Enabled: saveMode},
 			},
 		},
 		{
 			Name: "worker.tasks",
 			Fields: []initFieldDescriptor{
-				{Field: "worker.tasks.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.Concurrency), Enabled: saveMode},
-				{Field: "worker.tasks.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.Tasks.PollInterval.String()), Enabled: saveMode},
-				{Field: "worker.tasks.lease_duration", Key: "lease_duration", Value: quoteTOMLString(cfg.Worker.Tasks.LeaseDuration.String()), Enabled: saveMode},
-				{Field: "worker.tasks.upload_concurrency", Key: "upload_concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.UploadConcurrency), Enabled: saveMode},
-				{Field: "worker.tasks.commit_max_pieces", Key: "commit_max_pieces", Value: strconv.Itoa(cfg.Worker.Tasks.CommitMaxPieces), Enabled: saveMode},
-				{Field: "worker.tasks.commit_max_wait", Key: "commit_max_wait", Value: quoteTOMLString(cfg.Worker.Tasks.CommitMaxWait.String()), Enabled: saveMode},
-				{Field: "worker.tasks.removal_max_pieces", Key: "removal_max_pieces", Value: strconv.Itoa(cfg.Worker.Tasks.RemovalMaxPieces), Enabled: saveMode},
-				{Field: "worker.tasks.removal_max_wait", Key: "removal_max_wait", Value: quoteTOMLString(cfg.Worker.Tasks.RemovalMaxWait.String()), Enabled: saveMode},
-				{Field: "worker.tasks.commit_max_backlog", Key: "commit_max_backlog", Value: strconv.Itoa(cfg.Worker.Tasks.CommitMaxBacklog), Enabled: saveMode},
-				{Field: "worker.tasks.commit_seal_on_cache_pressure", Key: "commit_seal_on_cache_pressure", Value: strconv.FormatBool(cfg.Worker.Tasks.CommitSealOnCachePressure), Enabled: saveMode},
+				{Field: "worker.tasks.concurrency", Key: "concurrency", Value: cfg.Worker.Tasks.Concurrency, Enabled: saveMode},
+				{Field: "worker.tasks.poll_interval", Key: "poll_interval", Value: cfg.Worker.Tasks.PollInterval.String(), Enabled: saveMode},
+				{Field: "worker.tasks.lease_duration", Key: "lease_duration", Value: cfg.Worker.Tasks.LeaseDuration.String(), Enabled: saveMode},
+				{Field: "worker.tasks.upload_concurrency", Key: "upload_concurrency", Value: cfg.Worker.Tasks.UploadConcurrency, Enabled: saveMode},
+				{Field: "worker.tasks.commit_max_pieces", Key: "commit_max_pieces", Value: cfg.Worker.Tasks.CommitMaxPieces, Enabled: saveMode},
+				{Field: "worker.tasks.commit_max_wait", Key: "commit_max_wait", Value: cfg.Worker.Tasks.CommitMaxWait.String(), Enabled: saveMode},
+				{Field: "worker.tasks.removal_max_pieces", Key: "removal_max_pieces", Value: cfg.Worker.Tasks.RemovalMaxPieces, Enabled: saveMode},
+				{Field: "worker.tasks.removal_max_wait", Key: "removal_max_wait", Value: cfg.Worker.Tasks.RemovalMaxWait.String(), Enabled: saveMode},
+				{Field: "worker.tasks.commit_max_backlog", Key: "commit_max_backlog", Value: cfg.Worker.Tasks.CommitMaxBacklog, Enabled: saveMode},
+				{Field: "worker.tasks.commit_seal_on_cache_pressure", Key: "commit_seal_on_cache_pressure", Value: cfg.Worker.Tasks.CommitSealOnCachePressure, Enabled: saveMode},
 			},
 		},
 		{
 			Name: "logging",
 			Fields: []initFieldDescriptor{
-				{Field: "logging.level", Key: "level", Value: quoteTOMLString(cfg.Logging.Level), Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},
-				{Field: "logging.format", Key: "format", Value: quoteTOMLString(cfg.Logging.Format), Enabled: saveMode, Notes: []string{"Allowed: json, text."}},
+				{Field: "logging.level", Key: "level", Value: cfg.Logging.Level, Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},
+				{Field: "logging.format", Key: "format", Value: cfg.Logging.Format, Enabled: saveMode, Notes: []string{"Allowed: json, text."}},
 			},
 		},
 		{
 			Name: "logging.s3_access",
 			Fields: []initFieldDescriptor{
-				{Field: "logging.s3_access.enabled", Key: "enabled", Value: strconv.FormatBool(cfg.Logging.S3Access.Enabled), Enabled: saveMode},
-				{Field: "logging.s3_access.level", Key: "level", Value: quoteTOMLString(cfg.Logging.S3Access.Level), Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},
+				{Field: "logging.s3_access.enabled", Key: "enabled", Value: cfg.Logging.S3Access.Enabled, Enabled: saveMode},
+				{Field: "logging.s3_access.level", Key: "level", Value: cfg.Logging.S3Access.Level, Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},
 			},
 		},
 		{
 			Name: "admin",
 			Fields: []initFieldDescriptor{
-				{Field: "admin.addr", Key: "addr", Value: quoteTOMLString(cfg.Admin.Addr), Enabled: saveMode && presence.AdminAddr},
-				{Field: "admin.trusted_proxies", Key: "trusted_proxies", Value: quoteTOMLStringArray(cfg.Admin.TrustedProxies), Enabled: presence.AdminTrustedProxies, Notes: []string{"Use only for proxies that strip untrusted forwarded headers."}},
+				{Field: "admin.addr", Key: "addr", Value: cfg.Admin.Addr, Enabled: saveMode && presence.AdminAddr},
+				{Field: "admin.trusted_proxies", Key: "trusted_proxies", Value: cfg.Admin.TrustedProxies, Enabled: presence.AdminTrustedProxies, Notes: []string{"Use only for proxies that strip untrusted forwarded headers."}},
 			},
 		},
 		{
 			Name: "admin.auth",
 			Fields: []initFieldDescriptor{
-				{Field: "admin.auth.enabled", Key: "enabled", Value: strconv.FormatBool(cfg.Admin.Auth.Enabled), Enabled: saveMode || presence.AdminAuthEnabled},
-				{Field: "admin.auth.username", Key: "username", Value: quoteTOMLString(cfg.Admin.Auth.Username), Enabled: saveMode || presence.AdminAuthUsername},
-				{Field: "admin.auth.password_hash", Key: "password_hash", Value: quoteTOMLString(cfg.Admin.Auth.PasswordHash), Enabled: presence.AdminAuthPasswordHash, Notes: []string{"Generated by synaps3 init or synaps3 admin-auth reset-password."}},
-				{Field: "admin.auth.session_secret", Key: "session_secret", Value: quoteTOMLString(cfg.Admin.Auth.SessionSecret), Enabled: presence.AdminAuthSessionSecret, Notes: []string{"Secret used to sign Admin UI session cookies."}},
-				{Field: "admin.auth.session_ttl", Key: "session_ttl", Value: quoteTOMLString(cfg.Admin.Auth.SessionTTL.String()), Enabled: saveMode && presence.AdminAuthSessionTTL},
+				{Field: "admin.auth.enabled", Key: "enabled", Value: cfg.Admin.Auth.Enabled, Enabled: saveMode || presence.AdminAuthEnabled},
+				{Field: "admin.auth.username", Key: "username", Value: cfg.Admin.Auth.Username, Enabled: saveMode || presence.AdminAuthUsername},
+				{Field: "admin.auth.password_hash", Key: "password_hash", Value: cfg.Admin.Auth.PasswordHash, Enabled: presence.AdminAuthPasswordHash, Notes: []string{"Generated by synaps3 init or synaps3 admin-auth reset-password."}},
+				{Field: "admin.auth.session_secret", Key: "session_secret", Value: cfg.Admin.Auth.SessionSecret, Enabled: presence.AdminAuthSessionSecret, Notes: []string{"Secret used to sign Admin UI session cookies."}},
+				{Field: "admin.auth.session_ttl", Key: "session_ttl", Value: cfg.Admin.Auth.SessionTTL.String(), Enabled: saveMode && presence.AdminAuthSessionTTL},
 			},
 		},
 	}
@@ -349,22 +353,31 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		renderTOMLSection(&b, section)
+		if err := renderTOMLSection(&b, section); err != nil {
+			return "", err
+		}
 	}
-	return b.String()
+	var parsed map[string]any
+	if err := toml.Unmarshal(b.Bytes(), &parsed); err != nil {
+		return "", fmt.Errorf("validating generated config: %w", err)
+	}
+	return b.String(), nil
 }
 
-func renderTOMLSection(b *bytes.Buffer, section initSectionDescriptor) {
+func renderTOMLSection(b *bytes.Buffer, section initSectionDescriptor) error {
 	writeTOMLValueLine(b, false, "["+section.Name+"]")
 	for i, field := range section.Fields {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		renderTOMLField(b, field)
+		if err := renderTOMLField(b, field); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func renderTOMLField(b *bytes.Buffer, field initFieldDescriptor) {
+func renderTOMLField(b *bytes.Buffer, field initFieldDescriptor) error {
 	meta := fieldMetadataByPath[field.Field]
 	writeTOMLComment(b, meta.Description)
 	if meta.Env != "" {
@@ -375,9 +388,14 @@ func renderTOMLField(b *bytes.Buffer, field initFieldDescriptor) {
 	}
 	value := field.Value
 	if !field.Enabled && meta.Secret {
-		value = quoteTOMLString("")
+		value = ""
 	}
-	writeTOMLValueLine(b, !field.Enabled, field.Key+" = "+value)
+	encoded, err := toml.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("encoding config field %s: %w", field.Field, err)
+	}
+	writeTOMLValueLine(b, !field.Enabled, field.Key+" = "+string(encoded))
+	return nil
 }
 
 func writeTOMLComment(b *bytes.Buffer, text string) {
@@ -397,26 +415,6 @@ func writeTOMLValueLine(b *bytes.Buffer, commented bool, text string) {
 	b.WriteByte('\n')
 }
 
-func quoteTOMLString(s string) string {
-	return strconv.Quote(s)
-}
-
-func quoteTOMLStringArray(values []string) string {
-	if len(values) == 0 {
-		return "[]"
-	}
-	var b strings.Builder
-	b.WriteByte('[')
-	for i, value := range values {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(quoteTOMLString(value))
-	}
-	b.WriteByte(']')
-	return b.String()
-}
-
 func save(path string, cfg *Config, opts saveOptions) error {
 	presence := fullPersistedFieldPresence()
 	if opts.presence != nil {
@@ -424,7 +422,10 @@ func save(path string, cfg *Config, opts saveOptions) error {
 	}
 	normalized := *cfg
 	normalized.Normalize()
-	data := []byte(renderSavedConfig(&normalized, presence))
+	data, err := renderSavedConfig(&normalized, presence)
+	if err != nil {
+		return err
+	}
 
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
@@ -444,7 +445,7 @@ func save(path string, cfg *Config, opts saveOptions) error {
 		_ = tmp.Close()
 		return fmt.Errorf("setting temporary config permissions: %w", err)
 	}
-	if _, err := tmp.Write(data); err != nil {
+	if _, err := tmp.Write([]byte(data)); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("writing temporary config file: %w", err)
 	}
@@ -453,9 +454,6 @@ func save(path string, cfg *Config, opts saveOptions) error {
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("replacing config file %s: %w", path, err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("setting config permissions: %w", err)
 	}
 	return nil
 }

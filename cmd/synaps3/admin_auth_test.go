@@ -51,6 +51,9 @@ func TestAdminAuthResetPasswordUpdatesConfigAndWritesPasswordFile(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ReadFile(%q): %v", passwordPath, err)
 	}
+	if length := len(strings.TrimSpace(string(password))); length != 20 {
+		t.Fatalf("admin password length = %d, want 20", length)
+	}
 	if bcrypt.CompareHashAndPassword([]byte(after.Admin.Auth.PasswordHash), []byte(strings.TrimSpace(string(password)))) != nil {
 		t.Fatal("password file does not match updated hash")
 	}
@@ -75,6 +78,7 @@ func TestAdminAuthResetPasswordUsesSYNAPS3Config(t *testing.T) {
 		t.Fatalf("Load before reset: %v", err)
 	}
 	t.Setenv(configEnvVar, cfgPath)
+	t.Setenv("SYNAPS3_WORKER_TASKS_MAX_RETRIES", "1")
 
 	var out bytes.Buffer
 	cmd := newRootCommand()
@@ -83,7 +87,7 @@ func TestAdminAuthResetPasswordUsesSYNAPS3Config(t *testing.T) {
 		t.Fatalf("reset-password command error = %v", err)
 	}
 
-	after, err := config.Load(cfgPath)
+	after, _, err := config.LoadFileForSettings(cfgPath)
 	if err != nil {
 		t.Fatalf("Load after reset: %v", err)
 	}
