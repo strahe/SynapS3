@@ -174,6 +174,7 @@ func validTaskType(taskType model.TaskType) bool {
 		model.TaskTypeStorageCommit,
 		model.TaskTypeProviderReplacementCoordinate,
 		model.TaskTypeCacheCapacityReconcile,
+		model.TaskTypeCacheLocalReconcile,
 		model.TaskTypeCacheEvict,
 		model.TaskTypeCacheReconcileDurability,
 		model.TaskTypeStorageCleanup,
@@ -321,6 +322,8 @@ func taskOperationLabel(taskType model.TaskType) string {
 		return "Replace provider"
 	case model.TaskTypeCacheCapacityReconcile:
 		return "Manage cache capacity"
+	case model.TaskTypeCacheLocalReconcile:
+		return "Maintain local cache"
 	case model.TaskTypeCacheEvict:
 		return "Release cache"
 	case model.TaskTypeCacheReconcileDurability:

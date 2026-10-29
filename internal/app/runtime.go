@@ -30,6 +30,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/systemtask"
 	"github.com/strahe/synaps3/internal/task"
+	cachetask "github.com/strahe/synaps3/internal/task/cache"
 	"github.com/strahe/synaps3/internal/task/wallet"
 	taskengine "github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
@@ -213,6 +214,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 	for _, schedule := range []taskengine.ScheduleDefinition{
 		{Key: systemtask.CacheCapacityKey, Type: model.TaskTypeCacheCapacityReconcile, Interval: capacityInterval},
+		{Key: systemtask.CacheLocalKey, Type: model.TaskTypeCacheLocalReconcile, Interval: cachetask.LocalReconcileInterval},
 		{Key: "system:observability-refresh", Type: model.TaskTypeObservabilityRefresh, Interval: observabilityService.RefreshInterval()},
 		{Key: "system:approved-provider-refresh", Type: model.TaskTypeApprovedProviderRefresh, Interval: observabilityService.RefreshInterval()},
 		{Key: "system:endorsed-provider-refresh", Type: model.TaskTypeEndorsedProviderRefresh, Interval: observabilityService.RefreshInterval()},

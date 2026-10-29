@@ -9,6 +9,8 @@ import (
 func TestRegisteredTaskConcurrencyDefaults(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{})
 	limits := map[model.TaskType]int{
+		model.TaskTypeCacheLocalReconcile:     1,
+		model.TaskTypeCacheEvict:              2,
 		model.TaskTypeStorageTransferPlan:     2,
 		model.TaskTypeStorageStore:            4,
 		model.TaskTypeStoragePull:             4,

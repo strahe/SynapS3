@@ -3,15 +3,156 @@ package repository_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
+
+type conditionalLockContextKey struct{}
+
+type createAfterEmptyObjectLock struct {
+	create func() error
+	done   bool
+	err    error
+}
+
+func (*createAfterEmptyObjectLock) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *createAfterEmptyObjectLock) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if ctx.Value(conditionalLockContextKey{}) != true || h.done || !strings.Contains(event.Query, `SELECT "object"."id" FROM "objects" AS "object"`) || !strings.Contains(event.Query, "FOR NO KEY UPDATE") {
+		return
+	}
+	h.done = true
+	h.err = h.create()
+}
+
+func TestObjectRepo_ConditionalWriteLocksObjectCreatedAfterEmptyLock(t *testing.T) {
+	for _, marker := range []bool{false, true} {
+		name := "version"
+		if marker {
+			name = "delete marker"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			bucket := seedBucket(t, db, "conditional-created-after-lock")
+			versions := make([]*model.ObjectVersion, 3)
+			for i := range versions {
+				versions[i] = withContent(t, repos, newObjectVersion(bucket.ID, "key", model.NewVersionID(), 10))
+			}
+			hook := &createAfterEmptyObjectLock{create: func() error { _, err := repos.Objects.CreateVersionAndSetCurrent(t.Context(), versions[1]); return err }}
+			testutil.AddQueryHook(db, hook)
+			condition := func(current *model.ObjectVersion) error {
+				if current == nil || current.VersionID != versions[1].VersionID {
+					return errors.New("condition did not observe the committed object")
+				}
+				err := db.RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
+					if _, err := tx.ExecContext(ctx, "SET LOCAL lock_timeout = '50ms'"); err != nil {
+						return err
+					}
+					_, err := repository.NewRepositories(tx).Objects.CreateVersionAndSetCurrent(ctx, versions[2])
+					return err
+				})
+				pgErr, ok := errors.AsType[*pgconn.PgError](err)
+				if !ok || pgErr.Code != "55P03" {
+					return errors.New("concurrent writer was not blocked by the condition lock")
+				}
+				return nil
+			}
+			ctx := context.WithValue(t.Context(), conditionalLockContextKey{}, true)
+			var err error
+			if marker {
+				_, err = repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "key", model.NewVersionID(), condition)
+			} else {
+				_, err = repos.Objects.CreateVersionAndSetCurrent(ctx, versions[0], condition)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hook.done || hook.err != nil {
+				t.Fatalf("concurrent creation hook: done=%v err=%v", hook.done, hook.err)
+			}
+		})
+	}
+}
+
+func TestObjectRepo_ConditionalConcurrentFirstCreate(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "conditional-first-create")
+	versions := []*model.ObjectVersion{
+		withContent(t, repos, newObjectVersion(bucket.ID, "key", model.NewVersionID(), 10)),
+		withContent(t, repos, newObjectVersion(bucket.ID, "key", model.NewVersionID(), 10)),
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	arrived := make(chan struct{}, 2)
+	proceed := make(chan struct{})
+	results := make(chan error, 2)
+	conditionFailed := errors.New("current object already exists")
+	for _, version := range versions {
+		go func() {
+			first := true
+			condition := func(current *model.ObjectVersion) error {
+				if current != nil {
+					return conditionFailed
+				}
+				if first {
+					first = false
+					arrived <- struct{}{}
+					select {
+					case <-proceed:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+				return nil
+			}
+			_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version, condition)
+			results <- err
+		}()
+	}
+	for range 2 {
+		select {
+		case <-arrived:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	close(proceed)
+	succeeded, rejected := 0, 0
+	for range 2 {
+		select {
+		case err := <-results:
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, conditionFailed):
+				rejected++
+			default:
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("success=%d rejected=%d", succeeded, rejected)
+	}
+	rows, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "", "", 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("versions=%d err=%v", len(rows), err)
+	}
+}
 
 // seedContent creates the byte identity a data version needs before it exists.
 func seedContent(t *testing.T, repos *repository.Repositories, bucketID int64, checksum string, size int64) int64 {

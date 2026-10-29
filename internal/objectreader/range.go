@@ -28,8 +28,14 @@ func (r *rangeReadCloser) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	if r.skip > 0 {
-		if _, err := io.CopyN(io.Discard, r.source, r.skip); err != nil {
-			return 0, err
+		if seeker, ok := r.source.(io.Seeker); ok && !r.validate {
+			if _, err := seeker.Seek(r.skip, io.SeekStart); err != nil {
+				return 0, err
+			}
+		} else {
+			if _, err := io.CopyN(io.Discard, r.source, r.skip); err != nil {
+				return 0, err
+			}
 		}
 		r.skip = 0
 	}

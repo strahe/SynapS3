@@ -15,15 +15,15 @@ func applyCaseSensitivePrefixFilter(q *bun.SelectQuery, column string, prefix st
 	return q.Where(condition, args...)
 }
 
-func caseSensitivePrefixSQL(column string, prefix string) (string, []interface{}) {
+func caseSensitivePrefixSQL(column string, prefix string) (string, []any) {
 	if prefix == "" {
 		return "", nil
 	}
 	keyExpr := keyOrderExpr(column)
-	if upper, ok := stringPrefixUpperBound(prefix); ok {
-		return fmt.Sprintf("%s >= ? AND %s < ?", keyExpr, keyExpr), []interface{}{prefix, upper}
+	if upper, ok := PrefixUpperBound(prefix); ok {
+		return fmt.Sprintf("%s >= ? AND %s < ?", keyExpr, keyExpr), []any{prefix, upper}
 	}
-	return fmt.Sprintf("%s >= ? AND substr(%s, 1, ?) = ?", keyExpr, column), []interface{}{prefix, utf8.RuneCountInString(prefix), prefix}
+	return fmt.Sprintf("%s >= ? AND substr(%s, 1, ?) = ?", keyExpr, column), []any{prefix, utf8.RuneCountInString(prefix), prefix}
 }
 
 func keyOrderExpr(column string) string {
@@ -34,7 +34,8 @@ func keyComparisonSQL(column string, operator string) string {
 	return fmt.Sprintf("%s %s ?", keyOrderExpr(column), operator)
 }
 
-func stringPrefixUpperBound(prefix string) (string, bool) {
+// PrefixUpperBound returns the first key beyond all keys with prefix.
+func PrefixUpperBound(prefix string) (string, bool) {
 	runes := []rune(prefix)
 	for i := len(runes) - 1; i >= 0; i-- {
 		if runes[i] == utf8.MaxRune {

@@ -120,6 +120,7 @@ type DeleteObjectVersionInput struct {
 	BucketID  int64
 	Key       string
 	VersionID string
+	Condition ObjectCondition
 }
 
 type StorageCleanupReservation struct {
@@ -154,16 +155,20 @@ type DeleteDeletedObjectResult struct {
 	StorageCleanups       []StorageCleanupReservation
 }
 
+// ObjectCondition evaluates a locked version, or nil when the key has no
+// current version. It must be pure because a transaction may be replayed.
+type ObjectCondition func(*model.ObjectVersion) error
+
 // ObjectRepository defines persistence operations for object identities and versions.
 type ObjectRepository interface {
 	GetContentFileSample(ctx context.Context, contentID int64) (*ContentFileSample, error)
-	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
+	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion, conditions ...ObjectCondition) (objectID int64, err error)
 	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
 	// CreateRestoredVersionAndSetCurrent creates a new current data version only
 	// when the selected source still exists and the expected version is current.
 	CreateRestoredVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion, sourceVersionID, expectedCurrentVersionID string) (objectID int64, err error)
-	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key, versionID string) (*model.ObjectVersion, error)
-	DeleteMarkerVersion(ctx context.Context, bucketID int64, key, versionID string) error
+	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key, versionID string, conditions ...ObjectCondition) (*model.ObjectVersion, error)
+	DeleteMarkerVersion(ctx context.Context, bucketID int64, key, versionID string, conditions ...ObjectCondition) error
 	DeleteObjectVersionPermanently(ctx context.Context, input DeleteObjectVersionInput) (DeleteObjectVersionResult, error)
 	DeleteDeletedObjectPermanently(ctx context.Context, input DeleteDeletedObjectInput) (DeleteDeletedObjectResult, error)
 	// ClearContentCachePresence records that a content payload no longer has
@@ -189,6 +194,7 @@ type ObjectRepository interface {
 	ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix, afterKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
+	ListVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix, fromKey string, maxKeys int) ([]ObjectVersionListItem, error)
 	ListVersionsByKey(ctx context.Context, bucketID int64, key, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
 	ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error)
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error

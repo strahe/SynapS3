@@ -20,10 +20,18 @@ func (b *SynapseBackend) listCurrentObjects(ctx context.Context, bucketID int64,
 	var prefixes []types.CommonPrefix
 	seenPrefixes := make(map[string]struct{})
 	cursor := afterKey
+	inclusive := false
 	lastMarker := afterKey
 
 	for {
-		rows, err := b.repos.Objects.ListCurrentVersionsByBucket(ctx, bucketID, prefix, cursor, listingBatchSize)
+		var rows []model.ObjectVersion
+		var err error
+		if inclusive {
+			rows, err = b.repos.Objects.ListCurrentVersionsByBucketAtOrAfter(ctx, bucketID, prefix, cursor, listingBatchSize)
+		} else {
+			rows, err = b.repos.Objects.ListCurrentVersionsByBucket(ctx, bucketID, prefix, cursor, listingBatchSize)
+		}
+		inclusive = false
 		if err != nil {
 			return nil, nil, false, "", err
 		}
@@ -31,24 +39,28 @@ func (b *SynapseBackend) listCurrentObjects(ctx context.Context, bucketID int64,
 			return objects, prefixes, false, "", nil
 		}
 
+		skipUntil := ""
 		for _, obj := range rows {
-			cursor = obj.Key
+			if skipUntil != "" && obj.Key < skipUntil {
+				continue
+			}
+			cursor, inclusive = obj.Key, false
 			if commonPrefix, ok := listingCommonPrefix(obj.Key, prefix, delimiter); ok {
-				if afterKey != "" && commonPrefix <= afterKey {
-					lastMarker = obj.Key
-					continue
+				_, seen := seenPrefixes[commonPrefix]
+				if !seen && (afterKey == "" || commonPrefix > afterKey) {
+					if len(objects)+len(prefixes) >= maxKeys {
+						return objects, prefixes, true, lastMarker, nil
+					}
+					seenPrefixes[commonPrefix] = struct{}{}
+					cp := commonPrefix
+					prefixes = append(prefixes, types.CommonPrefix{Prefix: &cp})
 				}
-				if _, exists := seenPrefixes[commonPrefix]; exists {
-					lastMarker = obj.Key
-					continue
-				}
-				if len(objects)+len(prefixes) >= maxKeys {
-					return objects, prefixes, true, lastMarker, nil
-				}
-				seenPrefixes[commonPrefix] = struct{}{}
-				cp := commonPrefix
-				prefixes = append(prefixes, types.CommonPrefix{Prefix: &cp})
 				lastMarker = obj.Key
+				upper, ok := repository.PrefixUpperBound(commonPrefix)
+				if !ok {
+					return objects, prefixes, false, "", nil
+				}
+				cursor, inclusive, skipUntil = upper, true, upper
 				continue
 			}
 
@@ -75,11 +87,19 @@ func (b *SynapseBackend) listVersions(ctx context.Context, bucketID int64, prefi
 	seenPrefixes := make(map[string]struct{})
 	cursorKey := keyMarker
 	cursorVersion := versionIDMarker
+	inclusive := false
 	lastKeyMarker := keyMarker
 	lastVersionMarker := versionIDMarker
 
 	for {
-		rows, err := b.repos.Objects.ListVersionsByBucket(ctx, bucketID, prefix, cursorKey, cursorVersion, listingBatchSize)
+		var rows []repository.ObjectVersionListItem
+		var err error
+		if inclusive {
+			rows, err = b.repos.Objects.ListVersionsByBucketAtOrAfter(ctx, bucketID, prefix, cursorKey, listingBatchSize)
+		} else {
+			rows, err = b.repos.Objects.ListVersionsByBucket(ctx, bucketID, prefix, cursorKey, cursorVersion, listingBatchSize)
+		}
+		inclusive = false
 		if err != nil {
 			return nil, nil, false, "", "", err
 		}
@@ -87,28 +107,31 @@ func (b *SynapseBackend) listVersions(ctx context.Context, bucketID int64, prefi
 			return versions, prefixes, false, "", "", nil
 		}
 
+		skipUntil := ""
 		for _, row := range rows {
+			if skipUntil != "" && row.Key < skipUntil {
+				continue
+			}
 			cursorKey = row.Key
+			inclusive = false
 			cursorVersion = row.VersionID
 			if commonPrefix, ok := listingCommonPrefix(row.Key, prefix, delimiter); ok {
-				if keyMarker != "" && commonPrefix <= keyMarker {
-					lastKeyMarker = row.Key
-					lastVersionMarker = row.VersionID
-					continue
+				_, seen := seenPrefixes[commonPrefix]
+				if !seen && (keyMarker == "" || commonPrefix > keyMarker) {
+					if len(versions)+len(prefixes) >= maxKeys {
+						return versions, prefixes, true, lastKeyMarker, lastVersionMarker, nil
+					}
+					seenPrefixes[commonPrefix] = struct{}{}
+					cp := commonPrefix
+					prefixes = append(prefixes, types.CommonPrefix{Prefix: &cp})
 				}
-				if _, exists := seenPrefixes[commonPrefix]; exists {
-					lastKeyMarker = row.Key
-					lastVersionMarker = row.VersionID
-					continue
+				lastKeyMarker, lastVersionMarker = row.Key, row.VersionID
+				upper, ok := repository.PrefixUpperBound(commonPrefix)
+				if !ok {
+					return versions, prefixes, false, "", "", nil
 				}
-				if len(versions)+len(prefixes) >= maxKeys {
-					return versions, prefixes, true, lastKeyMarker, lastVersionMarker, nil
-				}
-				seenPrefixes[commonPrefix] = struct{}{}
-				cp := commonPrefix
-				prefixes = append(prefixes, types.CommonPrefix{Prefix: &cp})
-				lastKeyMarker = row.Key
-				lastVersionMarker = row.VersionID
+				cursorKey, cursorVersion = upper, ""
+				inclusive, skipUntil = true, upper
 				continue
 			}
 

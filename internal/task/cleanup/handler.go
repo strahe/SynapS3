@@ -270,6 +270,9 @@ func (h *Handler) finishStorageCleanup(ctx context.Context, execution taskengine
 		ctx, h.deps.Cache, h.deps.CacheGate, h.deps.CacheTracker, h.deps.Repositories.Objects, bucket.Name, input.ContentID,
 		func() { workStartedAt = time.Now().UTC() },
 	); err != nil {
+		if errors.Is(err, cacheaccess.ErrDeletionBusy) {
+			return taskengine.Wait(model.TaskResumeModeRecover, "cache_busy", "Waiting for cache access to finish", nil)
+		}
 		return retryTask(err, "cleanup_cache_release_failed")
 	}
 	finalized := cleanupCheckpoint{AttemptedAt: time.Now().UTC(), Finalized: true}

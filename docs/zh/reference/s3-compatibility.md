@@ -45,7 +45,7 @@ description: 查询 SynapS3 支持哪些 S3 操作、对象限制，以及版本
 | Object | `ListObjects` | 支持 | Marker 分页。 |
 | Object | `ListObjectsV2` | 支持 | Continuation token 分页。 |
 | Object | `ListObjectVersions` | 支持 | 列出版本和删除标记。 |
-| Object | `GetObjectAttributes` | 部分支持 | 对分段上传的对象返回 `ObjectParts`，但不含 `TotalPartsCount`。 |
+| Object | `GetObjectAttributes` | 部分支持 | 对分段上传的对象，`ObjectParts` 不含 `TotalPartsCount`，也不返回整体 `Checksum`。 |
 | Multipart | `CreateMultipartUpload` | 支持 | |
 | Multipart | `UploadPart` | 支持 | |
 | Multipart | `UploadPartCopy` | 部分支持 | 只支持复制整个对象；指定源范围时返回 `NotImplemented`。 |

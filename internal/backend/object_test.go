@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1837,6 +1838,11 @@ func TestGetObjectAttributes_WithVersionID(t *testing.T) {
 	if out.LastModified == nil || !out.LastModified.Equal(firstVersion.CreatedAt) {
 		t.Fatalf("LastModified = %v, want version CreatedAt %s", out.LastModified, firstVersion.CreatedAt)
 	}
+	sum := sha256.Sum256([]byte("old"))
+	wantChecksum := base64.StdEncoding.EncodeToString(sum[:])
+	if out.Checksum == nil || out.Checksum.ChecksumSHA256 == nil || *out.Checksum.ChecksumSHA256 != wantChecksum {
+		t.Fatalf("Checksum = %#v, want base64 SHA256 %s", out.Checksum, wantChecksum)
+	}
 }
 
 type completedMultipartTestObject struct {
@@ -1909,8 +1915,13 @@ func assertObjectPartMatchesMultipartPart(t *testing.T, got types.ObjectPart, wa
 	if want.Checksum == nil {
 		t.Fatal("expected test multipart part checksum")
 	}
-	if got.ChecksumSHA256 == nil || *got.ChecksumSHA256 != *want.Checksum {
-		t.Fatalf("ChecksumSHA256 = %v, want %s", got.ChecksumSHA256, *want.Checksum)
+	digest, err := hex.DecodeString(*want.Checksum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantChecksum := base64.StdEncoding.EncodeToString(digest)
+	if got.ChecksumSHA256 == nil || *got.ChecksumSHA256 != wantChecksum {
+		t.Fatalf("ChecksumSHA256 = %v, want base64 %s", got.ChecksumSHA256, wantChecksum)
 	}
 }
 
@@ -1934,6 +1945,9 @@ func TestGetObjectAttributes_ObjectParts(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("GetObjectAttributes(ObjectParts): %v", err)
+	}
+	if out.Checksum != nil {
+		t.Fatalf("multipart object returned an overall checksum: %#v", out.Checksum)
 	}
 	if out.ObjectParts == nil {
 		t.Fatal("ObjectParts = nil, want page")

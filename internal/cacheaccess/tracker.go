@@ -281,9 +281,12 @@ func (t *Tracker) sweep(ctx context.Context, gate *Gate) (int, error) {
 		if ctx.Err() != nil {
 			break
 		}
-		err := gate.guardAccess(ctx, model.ContentCacheKey(contentID), func() error {
-			return t.flush(ctx, contentID, now, false)
-		})
+		release, ok := gate.TryHoldRead(model.ContentCacheKey(contentID))
+		if !ok {
+			continue
+		}
+		err := t.flush(ctx, contentID, now, false)
+		release()
 		if err != nil {
 			failed++
 			if firstErr == nil {

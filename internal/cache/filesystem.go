@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -227,11 +228,9 @@ func (f *Filesystem) safePath(parts ...string) (string, error) {
 
 var syncDir = fsyncDir
 
-// syncCommittedEntry makes a rename into destPath durable. When the sync fails
-// and destPath held nothing before, the new entry is removed so the failed
-// commit leaves the cache as it was; a destination that existed is kept, since
-// content-addressed keys mean it already held the same bytes. It reports
-// whether destPath still holds the staged bytes.
+// syncCommittedEntry syncs the renamed entry's directory. On failure it keeps
+// replacements and removes new entries. The boolean reports whether destPath
+// still holds the staged bytes.
 func syncCommittedEntry(destDir, destPath string, existed bool) (bool, error) {
 	syncErr := syncDir(destDir)
 	if syncErr == nil {
@@ -285,6 +284,10 @@ func (f *Filesystem) stagedDestination(bucket, key string) (string, string, erro
 }
 
 func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Reader, size int64) (*StagedObject, error) {
+	return f.putStaged(ctx, bucket, key, r, size, false)
+}
+
+func (f *Filesystem) putStaged(ctx context.Context, bucket, key string, r io.Reader, size int64, replacePart bool) (*StagedObject, error) {
 	dst, err := f.safePath(bucket, key)
 	if err != nil {
 		return nil, err
@@ -366,13 +369,53 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 		if existed {
 			oldSize = stat.Size()
 		}
+		if replacePart && statErr != nil && !os.IsNotExist(statErr) {
+			return fmt.Errorf("checking existing part: %w", statErr)
+		}
+		backupPath := ""
+		if replacePart && existed {
+			// Part numbers are mutable; keep the old inode until publication is durable.
+			backupPath = tmpPath + ".previous"
+			if err := os.Link(destPath, backupPath); err != nil {
+				return fmt.Errorf("preserving existing part: %w", err)
+			}
+		}
 
 		if err := os.Rename(tmpPath, destPath); err != nil {
-			return fmt.Errorf("renaming temp to final: %w", err)
+			renameErr := fmt.Errorf("renaming temp to final: %w", err)
+			if backupPath != "" {
+				if removeErr := os.Remove(backupPath); removeErr != nil {
+					f.capacityMu.Lock()
+					f.usedBytes.Add(oldSize)
+					f.capacityMu.Unlock()
+					renameErr = errors.Join(renameErr, fmt.Errorf("removing preserved part: %w", removeErr))
+				}
+			}
+			return renameErr
 		}
 		kept, syncErr := syncCommittedEntry(destDir, destPath, existed)
 		if !kept {
 			return syncErr
+		}
+		if backupPath != "" {
+			if syncErr == nil {
+				if err := os.Remove(backupPath); err != nil {
+					syncErr = fmt.Errorf("removing preserved part: %w", err)
+				}
+			}
+			if syncErr != nil {
+				if err := os.Rename(backupPath, destPath); err != nil {
+					// Both directory entries remain charged until upload cleanup removes them.
+					res.settle(n)
+					committed = true
+					info.Path = destPath
+					return errors.Join(syncErr, fmt.Errorf("restoring existing part: %w", err))
+				}
+				if err := syncDir(destDir); err != nil {
+					syncErr = errors.Join(syncErr, fmt.Errorf("syncing restored part: %w", err))
+				}
+				return syncErr
+			}
 		}
 
 		res.settle(n - oldSize)
@@ -554,78 +597,8 @@ func (f *Filesystem) partPath(uploadID string, partNumber int) (string, error) {
 	return f.safePath(".multipart", uploadID, fmt.Sprintf("%d", partNumber))
 }
 
-func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*ObjectInfo, error) {
-	dst, err := f.partPath(uploadID, partNumber)
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Dir(dst)
-	if err := ensurePrivateDir(dir); err != nil {
-		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
-	}
-
-	res, err := f.reserve(size)
-	if err != nil {
-		return nil, err
-	}
-	defer res.release()
-
-	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
-	if err != nil {
-		return nil, fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpPath := file.Name()
-	defer func() {
-		if file != nil {
-			_ = file.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	md5Hash := md5.New()
-	sha256Hash := sha256.New()
-	w := &sizeLimitWriter{w: io.MultiWriter(file, md5Hash, sha256Hash), remaining: size}
-
-	n, err := io.Copy(w, r)
-	if err != nil {
-		return nil, fmt.Errorf("writing part file: %w", err)
-	}
-
-	if err := file.Sync(); err != nil {
-		return nil, fmt.Errorf("fsync part file: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return nil, fmt.Errorf("closing part file: %w", err)
-	}
-	file = nil
-
-	// Serialize the replacement of this part number with its accounting.
-	mu := f.shardFor(".multipart/"+uploadID, fmt.Sprintf("%d", partNumber))
-	mu.Lock()
-	defer mu.Unlock()
-
-	var oldSize int64
-	if stat, statErr := os.Stat(dst); statErr == nil {
-		oldSize = stat.Size()
-	}
-
-	if err := os.Rename(tmpPath, dst); err != nil {
-		_ = os.Remove(tmpPath)
-		return nil, fmt.Errorf("renaming part to final: %w", err)
-	}
-
-	if err := syncDir(dir); err != nil {
-		slog.Warn("fsync multipart dir failed", "dir", dir, "error", err)
-	}
-
-	res.settle(n - oldSize)
-
-	return &ObjectInfo{
-		Path:     dst,
-		Size:     n,
-		ETag:     hex.EncodeToString(md5Hash.Sum(nil)),
-		Checksum: hex.EncodeToString(sha256Hash.Sum(nil)),
-	}, nil
+func (f *Filesystem) PutPartStaged(ctx context.Context, uploadID string, partNumber int, r io.Reader, size int64) (*StagedObject, error) {
+	return f.putStaged(ctx, ".multipart", filepath.Join(uploadID, fmt.Sprintf("%d", partNumber)), r, size, true)
 }
 
 func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadID string, partNumbers []int) (*StagedObject, []string, error) {
@@ -769,33 +742,53 @@ func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadI
 	}, partETags, nil
 }
 
-func (f *Filesystem) DeleteUpload(_ context.Context, uploadID string) error {
+func (f *Filesystem) DeleteUpload(ctx context.Context, uploadID string) error {
 	mpDir, err := f.multipartDir(uploadID)
 	if err != nil {
 		return err
 	}
-
-	// Walk without global lock — sum sizes first, then remove and adjust atomically.
-	var totalSize int64
-	_ = filepath.WalkDir(mpDir, func(_ string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
+	var dirs []string
+	err = filepath.WalkDir(mpDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if os.IsNotExist(walkErr) {
 			return nil
 		}
-		if strings.HasPrefix(d.Name(), ".synaps3-") && strings.HasSuffix(d.Name(), ".tmp") {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
 			return nil
 		}
-		if info, infoErr := d.Info(); infoErr == nil {
-			totalSize += info.Size()
+		info, err := d.Info()
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		f.capacityMu.Lock()
+		defer f.capacityMu.Unlock()
+		if err := os.Remove(path); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !strings.HasPrefix(d.Name(), ".synaps3-") || !strings.HasSuffix(d.Name(), ".tmp") {
+			f.usedBytes.Add(-info.Size())
 		}
 		return nil
 	})
-
-	if err := os.RemoveAll(mpDir); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing upload dir %s: %w", mpDir, err)
+	if err != nil {
+		return fmt.Errorf("removing upload files: %w", err)
 	}
-
-	if totalSize > 0 {
-		f.usedBytes.Add(-totalSize)
+	for _, dir := range slices.Backward(dirs) {
+		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing upload directory: %w", err)
+		}
 	}
 	return nil
 }

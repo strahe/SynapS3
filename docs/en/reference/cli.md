@@ -125,6 +125,7 @@ synaps3 admin storage-confirmation list
 | `cache_evict` | **Release cache** |
 | `cache_reconcile_durability` | **Recheck cache release** |
 | `cache_capacity_reconcile` | **Manage cache capacity** |
+| `cache_local_reconcile` | **Maintain local cache** |
 | `storage_cleanup` | **Clean up deleted data** |
 | `storage_removal` | **Remove batch** |
 | `storage_dataset_retire` | **Terminate data set** |

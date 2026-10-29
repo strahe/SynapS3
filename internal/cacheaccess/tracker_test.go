@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -143,31 +144,58 @@ func TestTrackerSweepDoesNotPersistForgottenCommitAfterDeletion(t *testing.T) {
 	}()
 	waitForGateSignal(t, deleteStarted, time.Second, "deletion start")
 
-	sweepDone := make(chan error, 1)
-	go func() {
-		_, err := tracker.sweep(context.Background(), gate)
-		sweepDone <- err
-	}()
-	select {
-	case err := <-sweepDone:
-		t.Fatalf("sweep completed before deletion released the gate: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	if failed, err := tracker.sweep(t.Context(), gate); err != nil || failed != 0 {
+		t.Fatalf("sweep of busy content: failed=%d err=%v", failed, err)
 	}
 
 	close(releaseDelete)
 	waitForGateSignal(t, deleteDone, time.Second, "deletion completion")
-	select {
-	case err := <-sweepDone:
-		if err != nil {
-			t.Fatalf("sweep: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for sweep")
+	if failed, err := tracker.sweep(t.Context(), gate); err != nil || failed != 0 {
+		t.Fatalf("sweep after deletion: failed=%d err=%v", failed, err)
 	}
 	accessCalls, commitCalls := store.callCounts(3)
 	if accessCalls != 0 || commitCalls != 1 {
 		t.Fatalf("store calls = access %d commit %d, want only the initial failed commit", accessCalls, commitCalls)
 	}
+}
+
+func TestTrackerSweepSkipsQueuedDeletionAndRetainsPendingCommit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := newRecordingAccessStore()
+		store.setFail(true)
+		tracker := NewTracker(0, store)
+		gate := NewGate()
+		if err := tracker.RecordCommit(t.Context(), 3, nil); err == nil {
+			t.Fatal("expected initial commit persistence failure")
+		}
+		store.setFail(false)
+		release, err := gate.HoldRead(t.Context(), model.ContentCacheKey(3))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer release()
+		deleteDone := make(chan error, 1)
+		go func() {
+			deleteDone <- gate.GuardDeletion(t.Context(), model.ContentCacheKey(3), func() {})
+		}()
+		synctest.Wait()
+		if failed, err := tracker.sweep(t.Context(), gate); err != nil || failed != 0 {
+			t.Fatalf("sweep of queued deletion: failed=%d err=%v", failed, err)
+		}
+		if _, commits := store.callCounts(3); commits != 1 {
+			t.Fatalf("busy content was persisted: commits=%d", commits)
+		}
+		release()
+		if err := <-deleteDone; err != nil {
+			t.Fatal(err)
+		}
+		if failed, err := tracker.sweep(t.Context(), gate); err != nil || failed != 0 {
+			t.Fatalf("sweep after deletion: failed=%d err=%v", failed, err)
+		}
+		if _, commits := store.callCounts(3); commits != 2 {
+			t.Fatalf("skipped commit was not retried: commits=%d", commits)
+		}
+	})
 }
 
 func TestTrackerStaysBoundedAndPausesLRUWhenDirtyAccessCannotPersist(t *testing.T) {

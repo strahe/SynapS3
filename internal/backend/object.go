@@ -60,9 +60,20 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		}
 	}
 
+	body, err := withWriteChecksum(input.Body, writeChecksums{
+		CRC32: input.ChecksumCRC32, CRC32C: input.ChecksumCRC32C,
+		SHA1: input.ChecksumSHA1, SHA256: input.ChecksumSHA256,
+		CRC64NVME: input.ChecksumCRC64NVME, SHA512: input.ChecksumSHA512,
+		MD5: input.ChecksumMD5, XXHASH64: input.ChecksumXXHASH64,
+		XXHASH3: input.ChecksumXXHASH3, XXHASH128: input.ChecksumXXHASH128,
+	})
+	if err != nil {
+		return s3response.PutObjectOutput{}, contentWriteError(err)
+	}
+
 	// Stage beside the content directory: the destination is content-addressed
 	// and only nameable once the staged checksum resolves a content row.
-	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(b.transferCounters.WrapReader(observability.ClientUpload, input.Body)), declaredWriteSize(input.ContentLength))
+	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(b.transferCounters.WrapReader(observability.ClientUpload, body)), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		if errors.Is(err, objectlimits.ErrTooLarge) {
@@ -102,11 +113,6 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		}
 		cacheCommitted = true
 		return b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-			state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
-			if err != nil {
-				return err
-			}
-
 			version := &model.ObjectVersion{
 				VersionID:   versionID,
 				BucketID:    bucket.ID,
@@ -124,11 +130,11 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 				},
 				ContentID: &content.ID,
 			}
-			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version, writeObjectCondition(input.IfMatch, input.IfNoneMatch))
 			if err != nil {
 				return fmt.Errorf("creating object version: %w", err)
 			}
-			return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
+			return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID)
 		})
 	})
 	if err != nil {
@@ -179,12 +185,18 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
+	check := func(version *model.ObjectVersion) error {
+		return evaluateReadConditions(version.ETag, version.CreatedAt, versitybackend.PreConditions{
+			IfMatch: input.IfMatch, IfNoneMatch: input.IfNoneMatch,
+			IfModSince: input.IfModifiedSince, IfUnmodeSince: input.IfUnmodifiedSince,
+		}, false)
+	}
 	var out *objectreader.Result
 	var err error
 	if input.VersionId != nil && *input.VersionId != "" {
-		out, err = b.objectReader.OpenVersion(ctx, *input.Bucket, *input.Key, *input.VersionId, objectreader.S3Visibility)
+		out, err = b.objectReader.OpenVersion(ctx, *input.Bucket, *input.Key, *input.VersionId, objectreader.S3Visibility, check)
 	} else {
-		out, err = b.objectReader.Open(ctx, *input.Bucket, *input.Key, objectreader.S3Visibility)
+		out, err = b.objectReader.Open(ctx, *input.Bucket, *input.Key, objectreader.S3Visibility, check)
 	}
 	if err != nil {
 		if errors.Is(err, objectreader.ErrCacheMiss) {
@@ -281,6 +293,12 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 		return nil, err
 	}
 
+	if err := evaluateReadConditions(meta.QuotedETag, meta.LastModified, versitybackend.PreConditions{
+		IfMatch: input.IfMatch, IfNoneMatch: input.IfNoneMatch,
+		IfModSince: input.IfModifiedSince, IfUnmodeSince: input.IfUnmodifiedSince,
+	}, false); err != nil {
+		return nil, err
+	}
 	return &s3.HeadObjectOutput{
 		ContentLength:      &meta.Size,
 		ETag:               &meta.QuotedETag,
@@ -323,14 +341,19 @@ func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetO
 		return s3response.GetObjectAttributesResponse{}, err
 	}
 
-	checksum := types.Checksum{ChecksumSHA256: &meta.Checksum}
 	resp := s3response.GetObjectAttributesResponse{
 		ETag:         &meta.QuotedETag,
 		ObjectSize:   &meta.Size,
 		StorageClass: types.StorageClassStandard,
-		Checksum:     &checksum,
 		VersionId:    &meta.VersionID,
 		LastModified: &meta.LastModified,
+	}
+	if meta.MultipartUploadID == nil {
+		checksum, err := base64Checksum(meta.Checksum)
+		if err != nil {
+			return s3response.GetObjectAttributesResponse{}, fmt.Errorf("decoding object checksum: %w", err)
+		}
+		resp.Checksum = &types.Checksum{ChecksumSHA256: &checksum}
 	}
 	if objectPartsRequested(input.ObjectAttributes) {
 		objectParts, err := b.getObjectAttributeParts(ctx, meta.MultipartUploadID, input)
@@ -510,7 +533,11 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 	if err != nil {
 		return nil, err
 	}
-	return b.deleteObjectInBucket(ctx, bucket, *input.Key, derefStr(input.VersionId))
+	out, err := b.deleteObjectInBucket(ctx, bucket, *input.Key, derefStr(input.VersionId), deleteObjectCondition(versitybackend.ObjectDeletePreconditions{IfMatch: input.IfMatch, IfMatchLastModTime: input.IfMatchLastModifiedTime, IfMatchSize: input.IfMatchSize}))
+	if s3Err, ok := errors.AsType[s3err.S3Error](err); ok {
+		return nil, s3Err
+	}
+	return out, err
 }
 
 func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
@@ -541,7 +568,7 @@ func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObje
 			continue
 		}
 
-		out, err := b.deleteObjectInBucket(ctx, bucket, *obj.Key, derefStr(obj.VersionId))
+		out, err := b.deleteObjectInBucket(ctx, bucket, *obj.Key, derefStr(obj.VersionId), deleteObjectCondition(versitybackend.ObjectDeletePreconditions{IfMatch: obj.ETag, IfMatchLastModTime: obj.LastModifiedTime, IfMatchSize: obj.Size}))
 		if err != nil {
 			result.Error = append(result.Error, deleteObjectsEntryError(obj.Key, obj.VersionId, err))
 			continue
@@ -552,12 +579,12 @@ func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObje
 	return result, nil
 }
 
-func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model.Bucket, key string, versionID string) (*s3.DeleteObjectOutput, error) {
+func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model.Bucket, key string, versionID string, conditions ...repository.ObjectCondition) (*s3.DeleteObjectOutput, error) {
 	if versionID == "" {
 		if err := validateObjectKey(key); err != nil {
 			return nil, err
 		}
-		marker, err := b.repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, key, model.NewVersionID())
+		marker, err := b.repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, key, model.NewVersionID(), conditions...)
 		if err != nil {
 			return nil, fmt.Errorf("creating delete marker: %w", err)
 		}
@@ -581,6 +608,16 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 			var deleteErr error
 			result, deleteErr = txRepos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
 				BucketID: bucket.ID, Key: key, VersionID: versionID,
+				Condition: func(v *model.ObjectVersion) error {
+					for _, c := range conditions {
+						if c != nil {
+							if err := c(v); err != nil {
+								return err
+							}
+						}
+					}
+					return nil
+				},
 			})
 			if deleteErr != nil {
 				return deleteErr
@@ -612,7 +649,7 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 			VersionId: &versionID,
 		}, nil
 	}
-	if err := b.repos.Objects.DeleteMarkerVersion(ctx, bucket.ID, key, versionID); err != nil {
+	if err := b.repos.Objects.DeleteMarkerVersion(ctx, bucket.ID, key, versionID, conditions...); err != nil {
 		return nil, fmt.Errorf("deleting marker version: %w", err)
 	}
 	deleteMarker := true
@@ -728,6 +765,12 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		return s3response.CopyObjectOutput{}, err
 	}
 
+	if err := evaluateReadConditions(srcVersion.ETag, srcVersion.CreatedAt, versitybackend.PreConditions{
+		IfMatch: input.CopySourceIfMatch, IfNoneMatch: input.CopySourceIfNoneMatch,
+		IfModSince: input.CopySourceIfModifiedSince, IfUnmodeSince: input.CopySourceIfUnmodifiedSince,
+	}, true); err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
 	result, err := b.copyObjectVersion(ctx, copyObjectVersionInput{
 		SourceBucket:      srcBucket,
 		SourceKey:         srcKey,
@@ -744,6 +787,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 			ContentLanguage:    derefStr(input.ContentLanguage),
 			Expires:            derefStr(input.Expires),
 		},
+		Condition:        writeObjectCondition(input.IfMatch, input.IfNoneMatch),
 		SourceVisibility: objectreader.S3Visibility,
 	})
 	if err != nil {
@@ -767,6 +811,7 @@ type restoreVersionPrecondition struct {
 }
 
 type copyObjectVersionInput struct {
+	Condition         repository.ObjectCondition
 	SourceBucket      *model.Bucket
 	SourceKey         string
 	SourceVersion     *model.ObjectVersion
@@ -839,11 +884,6 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 		}
 		cacheCommitted = true
 		return b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-			state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
-			if err != nil {
-				return err
-			}
-
 			version := &model.ObjectVersion{
 				VersionID:      versionID,
 				BucketID:       input.DestinationBucket.ID,
@@ -856,7 +896,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 				ContentID:      &content.ID,
 			}
 			if input.Restore == nil {
-				objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+				objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version, input.Condition)
 			} else {
 				objectID, err = txRepos.Objects.CreateRestoredVersionAndSetCurrent(
 					ctx,
@@ -868,7 +908,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 			if err != nil {
 				return fmt.Errorf("creating copy destination version: %w", err)
 			}
-			return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
+			return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID)
 		})
 	})
 	if err != nil {
@@ -1268,7 +1308,10 @@ func (b *SynapseBackend) getObjectAttributeParts(ctx context.Context, contentID 
 			Size:       &size,
 		}
 		if p.Checksum != nil && *p.Checksum != "" {
-			checksum := *p.Checksum
+			checksum, err := base64Checksum(*p.Checksum)
+			if err != nil {
+				return nil, fmt.Errorf("decoding part checksum: %w", err)
+			}
 			part.ChecksumSHA256 = &checksum
 		}
 		result.Parts = append(result.Parts, part)
@@ -1336,9 +1379,16 @@ func (b *SynapseBackend) ensureContentForBytes(
 	return content, nil
 }
 
-func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *repository.Repositories, _ int64, versionID string, contentID *int64, state model.ObjectState) error {
+func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *repository.Repositories, _ int64, versionID string, contentID *int64) error {
 	if b.taskService == nil {
 		return errors.New("task service is unavailable")
+	}
+	if contentID == nil {
+		return nil
+	}
+	state, err := repos.Contents.ContentPipelineState(ctx, *contentID)
+	if err != nil {
+		return err
 	}
 	switch state {
 	case model.ObjectStateCached:

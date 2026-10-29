@@ -30,6 +30,7 @@ export const taskOperationLabels: Record<string, string> = {
   wallet_operation: 'Wallet operation',
   provider_upload_speed_test: 'Test upload speed',
   cache_capacity_reconcile: 'Manage cache capacity',
+  cache_local_reconcile: 'Maintain local cache',
   observability_refresh: 'Refresh storage health',
   approved_provider_refresh: 'Refresh approved providers',
   endorsed_provider_refresh: 'Refresh endorsed providers',
@@ -66,6 +67,7 @@ export function isTaskSubjectType(value: string): value is TaskSubjectInfo['subj
 export function taskSystemDescription(type: string) {
   const descriptions: Record<string, string> = {
     cache_capacity_reconcile: 'Keeps local cache usage within its limit.',
+    cache_local_reconcile: 'Checks cached files and removes unused upload data.',
     observability_refresh: 'Updates storage health information.',
     approved_provider_refresh: 'Updates approved providers.',
     endorsed_provider_refresh: 'Updates endorsed providers.',

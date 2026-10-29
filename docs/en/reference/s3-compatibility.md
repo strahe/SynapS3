@@ -45,7 +45,7 @@ description: Look up which S3 operations SynapS3 supports, its object limits, an
 | Object | `ListObjects` | Supported | Marker pagination. |
 | Object | `ListObjectsV2` | Supported | Continuation-token pagination. |
 | Object | `ListObjectVersions` | Supported | Lists versions and delete markers. |
-| Object | `GetObjectAttributes` | Partial | Returns `ObjectParts` for multipart objects without `TotalPartsCount`. |
+| Object | `GetObjectAttributes` | Partial | For multipart objects, omits `TotalPartsCount` from `ObjectParts` and the overall `Checksum`. |
 | Multipart | `CreateMultipartUpload` | Supported | |
 | Multipart | `UploadPart` | Supported | |
 | Multipart | `UploadPartCopy` | Partial | Whole-object copy only; a source range returns `NotImplemented`. |

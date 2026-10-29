@@ -2,9 +2,11 @@ package cacheaccess
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"golang.org/x/sync/semaphore"
@@ -13,7 +15,12 @@ import (
 const (
 	gateShardCount       = 256
 	gateCapacity   int64 = 1<<63 - 1
+	// DeletionWaitLimit bounds exclusive cache permit acquisition.
+	DeletionWaitLimit = 30 * time.Second
 )
+
+// ErrDeletionBusy reports that the deletion permit wait limit expired.
+var ErrDeletionBusy = errors.New("cache deletion permit wait limit exceeded")
 
 // OpenedCacheEntry keeps a cache entry protected from deletion until Body is
 // closed.
@@ -60,11 +67,13 @@ func (g *Gate) Open(
 		return nil, err
 	}
 
+	guarded := &guardedReadCloser{body: body, release: release}
+	var protected io.ReadCloser = guarded
+	if seeker, ok := body.(io.Seeker); ok {
+		protected = &guardedReadSeekCloser{guardedReadCloser: guarded, seeker: seeker}
+	}
 	return &OpenedCacheEntry{
-		Body: &guardedReadCloser{
-			body:    body,
-			release: release,
-		},
+		Body: protected,
 		Info: info,
 	}, nil
 }
@@ -73,6 +82,41 @@ func (g *Gate) Open(
 // returned release function is idempotent and must be called by the holder.
 func (g *Gate) HoldRead(ctx context.Context, cacheKey string) (func(), error) {
 	return g.hold(ctx, cacheKey, 1)
+}
+
+// TryHoldRead acquires a read permit without queuing behind deletion.
+func (g *Gate) TryHoldRead(cacheKey string) (func(), bool) {
+	return g.tryHold(cacheKey, 1)
+}
+
+// HoldUpload serializes publication and completion of one multipart upload.
+func (g *Gate) HoldUpload(ctx context.Context, uploadID string) (func(), error) {
+	return g.hold(ctx, "multipart:"+uploadID, gateCapacity)
+}
+
+// TryHoldUpload skips a multipart upload that is being changed by a request.
+func (g *Gate) TryHoldUpload(uploadID string) (func(), bool) {
+	return g.tryHold("multipart:"+uploadID, gateCapacity)
+}
+
+// TryHoldDeletion acquires exclusive access without delaying active readers.
+func (g *Gate) TryHoldDeletion(cacheKey string) (func(), bool) {
+	return g.tryHold(cacheKey, gateCapacity)
+}
+
+func (g *Gate) tryHold(cacheKey string, weight int64) (func(), bool) {
+	shard, entry := g.acquire(cacheKey)
+	if !entry.permits.TryAcquire(weight) {
+		g.release(shard, cacheKey, entry)
+		return nil, false
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.permits.Release(weight)
+			g.release(shard, cacheKey, entry)
+		})
+	}, true
 }
 
 func (g *Gate) hold(ctx context.Context, cacheKey string, weight int64) (func(), error) {
@@ -98,8 +142,13 @@ func (g *Gate) Commit(ctx context.Context, cacheKey string, commit func() error)
 // GuardDeletion waits for open bodies and serializes final checks and physical
 // deletion for one cache key.
 func (g *Gate) GuardDeletion(ctx context.Context, cacheKey string, remove func()) error {
-	release, err := g.hold(ctx, cacheKey, gateCapacity)
+	waitCtx, cancel := context.WithTimeout(ctx, DeletionWaitLimit)
+	defer cancel()
+	release, err := g.hold(waitCtx, cacheKey, gateCapacity)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return errors.Join(ErrDeletionBusy, err)
+		}
 		return err
 	}
 	defer release()
@@ -157,6 +206,15 @@ type guardedReadCloser struct {
 	release  func()
 	once     sync.Once
 	closeErr error
+}
+
+type guardedReadSeekCloser struct {
+	*guardedReadCloser
+	seeker io.Seeker
+}
+
+func (r *guardedReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
+	return r.seeker.Seek(offset, whence)
 }
 
 func (r *guardedReadCloser) Read(p []byte) (int, error) {
